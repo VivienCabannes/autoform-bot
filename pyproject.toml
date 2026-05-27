@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "autoform"
+version = "0.1.0"
+description = "Autoformalization pipeline — translating LaTeX mathematics into verified Lean 4 proofs"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40",
+    "openai>=1.0",
+    "fastmcp>=0.4",
+    "mcp>=1.0",
+    "httpx>=0.25",
+    "pyyaml>=6.0",
+    "fire>=0.5",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+    "psutil>=5.9",
+    "pyzmq>=26.0",
+]
+
+[project.optional-dependencies]
+webapp = [
+    "fastapi>=0.100",
+    "flask>=3.0",
+    "jinja2>=3.1",
+    "uvicorn>=0.20",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "tools", "autoform"]
+
+[tool.ruff]
+line-length = 120
+exclude = [".venv", "runs", "submodules", "template"]
+extend-exclude = ["autoform/data"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["core", "tools", "autoform", "tests"]
+python_files = ["*_test.py", "test_*.py"]
