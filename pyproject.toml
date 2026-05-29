@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 pdf = [
     "pypdfium2>=4.0",
+]
 aristotle = [
     "aristotlelib>=2.0",
 ]
