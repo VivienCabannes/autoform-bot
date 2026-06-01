@@ -20,9 +20,13 @@ dependencies = [
     "rich>=13.0",
     "psutil>=5.9",
     "pyzmq>=26.0",
+    "zulip>=0.9",
 ]
 
 [project.optional-dependencies]
+pdf = [
+    "pypdfium2>=4.0",
+]
 webapp = [
     "fastapi>=0.100",
     "flask>=3.0",
@@ -36,7 +40,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["core", "tools", "autoform"]
+packages = ["core", "tools", "autoform", "skills"]
 
 [tool.ruff]
 line-length = 120
