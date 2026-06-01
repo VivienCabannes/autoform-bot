@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "autoform"
 version = "0.1.0"
 description = "Autoformalization pipeline — translating LaTeX mathematics into verified Lean 4 proofs"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.40",
