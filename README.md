@@ -1,4 +1,4 @@
-# Autoformalization Pipeline
+# Fork of AutoformBot to make it an AI coding assistant Plugin
 
 Multi-agent system for translating LaTeX mathematics into verified Lean 4 proofs using Mathlib.
 
