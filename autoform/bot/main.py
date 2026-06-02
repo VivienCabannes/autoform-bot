@@ -255,6 +255,24 @@ async def run_coordinator(
         coordinator._merge_eval_tasks.append(task)
         task.add_done_callback(coordinator._merge_eval_tasks.remove)
 
+        # Refresh formalization.yaml (mathlib-initiative v0.2 schema)
+        # in the code workspace, then commit the change as a follow-on
+        # commit on main. No-op when the project hasn't opted in
+        # (file missing — initialize via `autoform formalization-init`).
+        try:
+            from .formalization import update_formalization
+            written = update_formalization(
+                coordinator.code_path,
+                models=[str(coordinator.config.llm.get("model", ""))]
+                       if hasattr(coordinator.config, "llm") else None,
+                framework="autoform-bot",
+            )
+            if written is not None:
+                logger.info("formalization.yaml refreshed at %s", written)
+        except Exception:  # noqa: BLE001 — soft-warning
+            logger.exception("formalization.yaml refresh failed; "
+                             "continuing without it")
+
     def _on_merge_step(phase: str, agent_id: str, success: bool, duration_ms: float, error: str | None) -> None:
         """Record per-agent merge queue steps into the active trace context."""
         from core.trace.step_trace import _current_step_ctx, StepRecord
@@ -638,6 +656,61 @@ if __name__ == "__main__":
         review_verify,
     )
     from autoform.bot.rejection_sync import sync_rejections
+    from autoform.bot.formalization import (
+        FORMALIZATION_FILENAME,
+        update_formalization,
+    )
+
+    def formalization_init(
+        code_dir: str = ".",
+        force: bool = False,
+        framework: str = "autoform-bot",
+    ) -> None:
+        """Create formalization.yaml from the v0.2 template.
+
+        Args:
+            code_dir: Workspace's Lean code repo (where the yaml lives).
+                Default: current directory.
+            force: Overwrite an existing formalization.yaml.
+            framework: Stamped into automation.framework.
+        """
+        from pathlib import Path as _P
+        code_path = _P(code_dir).resolve()
+        target = code_path / FORMALIZATION_FILENAME
+        if target.is_file() and not force:
+            print(f"refusing to overwrite existing {target} "
+                  "(use --force to allow)")
+            raise SystemExit(2)
+        written = update_formalization(
+            code_path, framework=framework, create_if_missing=True,
+            commit=False,
+        )
+        print(f"wrote {written}")
+
+    def formalization_update(
+        code_dir: str = ".",
+        models: list[str] | None = None,
+        framework: str = "autoform-bot",
+        no_commit: bool = False,
+    ) -> None:
+        """Refresh formalization.yaml's auto-fields (no-op if file missing).
+
+        Args:
+            code_dir: Workspace's Lean code repo. Default: current dir.
+            models: Model identifiers for automation.models.
+            framework: Stamped into automation.framework.
+            no_commit: Skip the follow-on git commit.
+        """
+        from pathlib import Path as _P
+        written = update_formalization(
+            _P(code_dir).resolve(),
+            models=models, framework=framework, commit=not no_commit,
+        )
+        if written is None:
+            print(f"no formalization.yaml at {code_dir}; "
+                  "run `autoform formalization-init` first")
+            raise SystemExit(1)
+        print(f"refreshed {written}")
 
     fire.Fire({
         "run": run,
@@ -645,4 +718,6 @@ if __name__ == "__main__":
         "review-verify": review_verify,
         "review-reject": review_reject,
         "sync-rejections": sync_rejections,
+        "formalization-init": formalization_init,
+        "formalization-update": formalization_update,
     })
