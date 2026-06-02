@@ -629,4 +629,18 @@ def run(
 
 
 if __name__ == "__main__":
-    fire.Fire({"run": run})
+    # Human-paced review subcommands are imported lazily so the heavy
+    # `run` import path doesn't pull github_issues' subprocess machinery
+    # when it's not needed.
+    from autoform.bot.review import (
+        review_open,
+        review_reject,
+        review_verify,
+    )
+
+    fire.Fire({
+        "run": run,
+        "review-open": review_open,
+        "review-verify": review_verify,
+        "review-reject": review_reject,
+    })
