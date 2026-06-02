@@ -131,11 +131,28 @@ def read_formalization(path: Path) -> dict[str, Any]:
 
 def write_formalization(path: Path, data: dict[str, Any]) -> None:
     """Write with deterministic key order (matches template) — minimizes
-    diff noise across runs."""
+    diff noise across runs.
+
+    Multi-line strings are emitted as literal block scalars (``|-``)
+    rather than the default expanded-plain style, which preserves
+    paragraph structure for the human-curated ``notes`` / ``scope`` /
+    ``divergences`` fields.
+    """
     yaml = _try_import_yaml()
     ordered = _reorder_to_template(data)
-    text = yaml.safe_dump(
+
+    def _str_representer(dumper, value: str):
+        if "\n" in value:
+            return dumper.represent_scalar(
+                "tag:yaml.org,2002:str", value, style="|"
+            )
+        return dumper.represent_scalar("tag:yaml.org,2002:str", value)
+
+    dumper = yaml.SafeDumper
+    dumper.add_representer(str, _str_representer)
+    text = yaml.dump(
         ordered,
+        Dumper=dumper,
         sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,
