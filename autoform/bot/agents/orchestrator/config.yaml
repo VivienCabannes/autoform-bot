@@ -5,6 +5,8 @@ compact_threshold: 0.85
 tool_timeout_s: 120
 tools:
   servers: [filesystem, dag-store, todo]
+skills:
+  prompt: [project/project_rubric]
 inference:
     cache:
       # Anthropic: explicit cache breakpoints

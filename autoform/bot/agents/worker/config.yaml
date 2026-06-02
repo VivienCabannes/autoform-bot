@@ -5,6 +5,8 @@ max_turns: 250
 tool_timeout_s: 300
 tools:
   servers: [lsp, lean_repl, filesystem, mathlib, git]
+skills:
+  prompt: [project/project_rubric]
 
 inference:
     cache:

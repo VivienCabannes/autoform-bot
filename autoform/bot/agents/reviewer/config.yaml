@@ -5,6 +5,8 @@ max_turns: 40
 tool_timeout_s: 120
 tools:
   servers: [lsp, filesystem, git]
+skills:
+  prompt: [project/project_rubric]
 inference:
     cache:
       # Anthropic: explicit cache breakpoints
