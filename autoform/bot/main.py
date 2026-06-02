@@ -259,6 +259,9 @@ async def run_coordinator(
         # in the code workspace, then commit the change as a follow-on
         # commit on main. No-op when the project hasn't opted in
         # (file missing — initialize via `autoform formalization-init`).
+        # Axiom check is enabled here: the merge queue's lake-build
+        # gate guarantees the build is current at this point, so
+        # `#print axioms` will resolve every main_results decl.
         try:
             from .formalization import update_formalization
             written = update_formalization(
@@ -266,6 +269,7 @@ async def run_coordinator(
                 models=[str(coordinator.config.llm.get("model", ""))]
                        if hasattr(coordinator.config, "llm") else None,
                 framework="autoform-bot",
+                check_axioms_on_build=True,
             )
             if written is not None:
                 logger.info("formalization.yaml refreshed at %s", written)
@@ -692,6 +696,7 @@ if __name__ == "__main__":
         models: list[str] | None = None,
         framework: str = "autoform-bot",
         no_commit: bool = False,
+        check_axioms: bool = False,
     ) -> None:
         """Refresh formalization.yaml's auto-fields (no-op if file missing).
 
@@ -700,17 +705,25 @@ if __name__ == "__main__":
             models: Model identifiers for automation.models.
             framework: Stamped into automation.framework.
             no_commit: Skip the follow-on git commit.
+            check_axioms: If True, run `#print axioms` on every
+                declaration in `status.main_results` and refresh
+                their `axioms` lists. Requires the workspace's Lean
+                code to be built; safe after a successful
+                `autoform run` since the merge queue's build gate
+                ensures freshness.
         """
         from pathlib import Path as _P
         written = update_formalization(
             _P(code_dir).resolve(),
             models=models, framework=framework, commit=not no_commit,
+            check_axioms_on_build=check_axioms,
         )
         if written is None:
             print(f"no formalization.yaml at {code_dir}; "
                   "run `autoform formalization-init` first")
             raise SystemExit(1)
-        print(f"refreshed {written}")
+        suffix = " (with axioms)" if check_axioms else ""
+        print(f"refreshed {written}{suffix}")
 
     fire.Fire({
         "run": run,

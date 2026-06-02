@@ -247,6 +247,138 @@ def compute_auto_fields(
     return out
 
 
+# --- axiom checking ------------------------------------------------------
+#
+# ``status.main_results[].axioms`` is the per-declaration axiom set
+# Mathlib's ``#print axioms`` reports. Auto-checking requires the
+# workspace to be built (.olean files present, which is true after a
+# successful merge-queue lake build). The checker batches every
+# main-result decl into one Lean invocation to avoid N process spawns
+# per merge.
+
+
+def _module_from_file_path(file_path: str) -> str | None:
+    """Convert a source path (``GeometricAnalysis/LeeSM/Chapter16/
+    StokesTheorem.lean``) to a Lean module (``GeometricAnalysis.LeeSM.
+    Chapter16.StokesTheorem``). Returns ``None`` for non-Lean /
+    absolute / empty inputs."""
+    if not file_path or not file_path.endswith(".lean"):
+        return None
+    if file_path.startswith("/"):
+        return None
+    stem = file_path[: -len(".lean")]
+    return stem.replace("/", ".")
+
+
+_AXIOMS_LIST_RE = re.compile(
+    r"'(?P<decl>[^']+)' depends on axioms:\s*\[(?P<axioms>.*?)\]",
+    re.DOTALL,
+)
+_AXIOMS_NONE_RE = re.compile(
+    r"'(?P<decl>[^']+)' does not depend on any axioms"
+)
+
+
+def check_axioms(
+    code_dir: Path,
+    decl_to_module: list[tuple[str, str]],
+    *,
+    timeout: int = 120,
+) -> dict[str, list[str] | None]:
+    """Run ``#print axioms`` on a batch of declarations in one Lean
+    invocation. Returns ``{decl_name: axioms | None}``; ``None`` means
+    the declaration's axioms couldn't be determined (build missing,
+    decl not in scope, timeout). Decls that genuinely depend on no
+    axioms return an empty list.
+
+    Architecturally distinct from autoform-bot's existing
+    ``autoform.eval.lean_checks.AxiomsChecker``: this one runs in the
+    merge-queue post-hook (cheap, batched, async to the eval loop);
+    that one runs in the per-statement eval phase (precise,
+    integrated with the matching agent). They share the parsing
+    shape but not the call surface.
+    """
+    if not decl_to_module:
+        return {}
+    modules_seen: set[str] = set()
+    modules_ordered: list[str] = []
+    for _, mod in decl_to_module:
+        if mod not in modules_seen:
+            modules_seen.add(mod)
+            modules_ordered.append(mod)
+    lines = [f"import {m}" for m in modules_ordered]
+    lines.append("")
+    for decl, _ in decl_to_module:
+        lines.append(f"#print axioms {decl}")
+    tmp_path = code_dir / ".autoform-axioms-check.lean"
+    out: dict[str, list[str] | None] = {decl: None for decl, _ in decl_to_module}
+    try:
+        tmp_path.write_text("\n".join(lines) + "\n")
+        try:
+            proc = subprocess.run(
+                ["lake", "env", "lean", str(tmp_path.name)],
+                cwd=str(code_dir),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "axiom check timed out after %ds for %d decls",
+                timeout, len(decl_to_module),
+            )
+            return out
+        text = proc.stdout
+        for m in _AXIOMS_LIST_RE.finditer(text):
+            decl = m.group("decl")
+            ax_blob = m.group("axioms")
+            axs = [a.strip() for a in ax_blob.split(",") if a.strip()]
+            out[decl] = axs
+        for m in _AXIOMS_NONE_RE.finditer(text):
+            out[m.group("decl")] = []
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return out
+
+
+def update_main_results_axioms(
+    data: dict[str, Any], code_dir: Path
+) -> int:
+    """Walk ``data['status']['main_results']`` and replace each entry's
+    ``axioms`` list with the verified set. Returns the count of
+    updated entries; entries whose axioms can't be determined are
+    left unchanged."""
+    main_results = (data.get("status") or {}).get("main_results") or []
+    decl_to_module: list[tuple[str, str]] = []
+    for entry in main_results:
+        decl = entry.get("declaration") if isinstance(entry, dict) else None
+        file_path = entry.get("file") if isinstance(entry, dict) else None
+        if not decl or not file_path:
+            continue
+        module = _module_from_file_path(file_path)
+        if module is None:
+            continue
+        decl_to_module.append((decl, module))
+    if not decl_to_module:
+        return 0
+    axioms_by_decl = check_axioms(code_dir, decl_to_module)
+    updated = 0
+    for entry in main_results:
+        if not isinstance(entry, dict):
+            continue
+        decl = entry.get("declaration")
+        result = axioms_by_decl.get(decl)
+        if result is None:
+            continue
+        entry["axioms"] = result
+        updated += 1
+    return updated
+
+
 # --- orchestrator + auto-commit ------------------------------------------
 
 
@@ -258,6 +390,7 @@ def update_formalization(
     create_if_missing: bool = False,
     commit: bool = True,
     commit_message: str | None = None,
+    check_axioms_on_build: bool = False,
 ) -> Path | None:
     """Read, update the auto-fields, write back, optionally commit.
 
@@ -282,6 +415,13 @@ def update_formalization(
             commit only stages formalization.yaml.
         commit_message: Override the default commit message. Default
             is ``"formalization: auto-refresh after merge"``.
+        check_axioms_on_build: If True, run ``#print axioms`` on every
+            declaration in ``status.main_results`` and replace their
+            ``axioms`` lists with the verified set. Costs one
+            ``lake env lean`` invocation (batched across all main
+            results). Safe to enable at the merge-hook call site —
+            the merge queue's `lake build` gate guarantees the build
+            is current. Default False.
     """
     yaml_path = yaml_path or (code_dir / FORMALIZATION_FILENAME)
     if not yaml_path.is_file() and not create_if_missing:
@@ -290,6 +430,18 @@ def update_formalization(
     current = read_formalization(yaml_path)
     auto = compute_auto_fields(code_dir, models=models, framework=framework)
     merged = _overlay_auto_fields(current, auto)
+    if check_axioms_on_build:
+        try:
+            updated = update_main_results_axioms(merged, code_dir)
+            if updated:
+                logger.info(
+                    "formalization: refreshed axioms for %d main_result(s)",
+                    updated,
+                )
+        except Exception:  # noqa: BLE001 — soft-warning
+            logger.exception(
+                "formalization: axiom check failed; existing axioms preserved"
+            )
 
     # Detect no-op: serialize candidate + on-disk, compare. Skips both
     # the disk write and the follow-on commit when nothing changed.
