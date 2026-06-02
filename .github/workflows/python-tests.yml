@@ -1,0 +1,46 @@
+name: Python tests
+
+# Runs the Python unit test suite for the Aristotle inference backend
+# on every PR + push to main/additional-infra. Scoped narrow on
+# purpose: each SDK backend (anthropic, openai, gemini, aristotle)
+# carries its own dep set, and Lean-touching tests need a built
+# Mathlib toolchain (~20 min). Future PRs touching other backends
+# should add matching CI jobs here.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - additional-infra
+  push:
+    branches:
+      - main
+      - additional-infra
+
+jobs:
+  aristotle:
+    name: Aristotle backend (mocked aristotlelib)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev + aristotle deps
+        run: |
+          python -m pip install --upgrade pip
+          # `dev` brings in pytest + pytest-asyncio; `aristotle`
+          # brings in aristotlelib (for type imports). The tests
+          # inject a fake aristotlelib via the `lib=` constructor
+          # arg, so no live API key is needed.
+          pip install -e ".[dev,aristotle]"
+
+      - name: Run aristotle_test.py
+        run: |
+          python -m pytest core/inference/sdk/aristotle_test.py -v --tb=short
