@@ -637,10 +637,12 @@ if __name__ == "__main__":
         review_reject,
         review_verify,
     )
+    from autoform.bot.rejection_sync import sync_rejections
 
     fire.Fire({
         "run": run,
         "review-open": review_open,
         "review-verify": review_verify,
         "review-reject": review_reject,
+        "sync-rejections": sync_rejections,
     })
