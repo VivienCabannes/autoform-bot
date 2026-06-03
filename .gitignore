@@ -2,3 +2,7 @@
 node_modules/
 dist/
 *.skill
+__pycache__/
+*.pyc
+.venv/
+traces/
