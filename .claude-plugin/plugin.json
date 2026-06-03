@@ -1,11 +1,35 @@
 {
   "name": "autoform",
   "description": "Turn any AI coding assistant into a Lean 4 formalization agent. Mathlib conventions, proof strategies, review checklists, and statement extraction — distilled from 94k PR reviews.",
+  "version": "0.1.0",
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/vivc"
   },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start\"",
+            "timeout": 5,
+            "statusMessage": "Loading AutoForm context"
+          }
+        ]
+      }
+    ]
+  },
   "mcpServers": {
+    "autoform-workspace": {
+      "command": "python",
+      "args": ["-m", "servers.workspace.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      },
+      "description": "Workspace inspection — scan project structure, sorry/axiom counts, targets"
+    },
     "autoform-repl": {
       "command": "python",
       "args": ["-m", "servers.repl.server"],

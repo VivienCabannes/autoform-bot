@@ -2,7 +2,7 @@
 
 ## What it does
 
-Autoform turns any AI coding assistant into a Lean 4 formalization agent. It provides Mathlib conventions, proof strategies, structured review checklists, statement extraction, and MCP tool servers for Lean REPL, Mathlib search, LSP diagnostics, and execution tracing.
+Autoform turns any AI coding assistant into a Lean 4 formalization agent. It provides Mathlib conventions, proof strategies, structured review checklists, statement extraction, and MCP tool servers for workspace inspection, Lean REPL, Mathlib search, LSP diagnostics, execution tracing, and Aristotle delegation.
 
 ## Layout
 
@@ -18,15 +18,26 @@ autoform-bot/
 ├── gemini-extension.json              # Gemini CLI extension manifest
 │
 ├── .claude-plugin/                    # Claude Code plugin manifest
-│   ├── plugin.json                    #   Plugin + MCP server declarations
+│   ├── plugin.json                    #   Plugin + hooks + MCP server declarations
 │   └── marketplace.json               #   Marketplace listing
+│
+├── .codex-plugin/                     # Codex CLI plugin manifest
+│   └── plugin.json                    #   Rich metadata (interface, icons, defaultPrompt)
+│
+├── hooks/                             # Session hooks
+│   └── session-start                  #   Bash — injects autoform context on session start
+│
+├── assets/                            # Icons and branding
+│   ├── autoform.svg                   #   512x512 logo
+│   └── autoform-small.svg             #   64x64 composer icon
 │
 ├── skills/                            # All skills (single source of truth)
 │   ├── autoform/SKILL.md              #   Core Mathlib & Lean 4 conventions
 │   ├── autoform-prove/SKILL.md        #   Proof strategies & workflow
 │   ├── autoform-review/SKILL.md       #   Formalization review checklist
 │   ├── autoform-quality/SKILL.md      #   Code quality / style review
-│   └── autoform-extract/SKILL.md      #   Statement extraction from LaTeX
+│   ├── autoform-extract/SKILL.md      #   Statement extraction from LaTeX
+│   └── autoform-crew/SKILL.md         #   Parallel orchestration with subagent teams
 │
 ├── agents/                            # Subagent definitions
 │   ├── autoform-worker.md             #   Formalization (opus) → repl, mathlib, trace
@@ -38,21 +49,27 @@ autoform-bot/
 │   ├── autoform-prove.toml
 │   ├── autoform-review.toml
 │   ├── autoform-quality.toml
-│   └── autoform-extract.toml
+│   ├── autoform-extract.toml
+│   └── autoform-crew.toml
 │
 ├── servers/                           # MCP tool servers (Python/FastMCP)
+│   ├── workspace/                     #   Workspace inspection — project scan, targets, declarations
+│   │   ├── core.py                    #     Pure logic (no MCP imports)
+│   │   └── server.py                  #     FastMCP server
 │   ├── repl/                          #   Lean REPL pool — run code, verify proofs
 │   │   ├── core.py                    #     LeanRepl subprocess + response formatting
 │   │   ├── pool.py                    #     LeanReplPool thread pool
-│   │   └── server.py                  #     FastMCP server (run_lean_code, get_repl_status)
+│   │   └── server.py                  #     FastMCP server
 │   ├── mathlib/                       #   Mathlib search — grep, find_name, read_file
 │   │   ├── core.py                    #     Pure search logic (ripgrep-based)
-│   │   └── server.py                  #     FastMCP server (mathlib_grep, mathlib_find_name, mathlib_read_file)
+│   │   └── server.py                  #     FastMCP server
 │   ├── lsp/                           #   Lean LSP — file diagnostics, hover
 │   │   └── server.py                  #     LeanLspSession + FastMCP server
-│   └── trace/                         #   Execution tracing — JSONL event store
-│       ├── core.py                    #     TraceStore append-only JSONL
-│       └── server.py                  #     FastMCP server (record_*, get_progress, get_*_attempts)
+│   ├── trace/                         #   Execution tracing — JSONL event store
+│   │   ├── core.py                    #     TraceStore append-only JSONL
+│   │   └── server.py                  #     FastMCP server
+│   └── aristotle/                     #   Aristotle (Harmonic) — autonomous prover delegation
+│       └── server.py                  #     AristotleManager + FastMCP server
 │
 └── viewer/                            # Standalone trace viewer (not part of plugin)
     └── (TODO)
@@ -64,12 +81,18 @@ Each MCP server is independent and can run in a separate process:
 
 | Server | Process cost | When needed | Agent |
 |--------|-------------|-------------|-------|
+| `autoform-workspace` | Stateless file scan, lightweight | First step — triage a project | any |
 | `autoform-repl` | Spawns Lean processes, pools them, ~500MB+ RAM | Proving, compilation checking | worker |
 | `autoform-mathlib` | Reads index on disk, stateless | Any agent searching Mathlib | worker, reviewer |
 | `autoform-lsp` | Long-running language server, stateful sessions | Diagnostics, type info | reviewer |
 | `autoform-trace` | Append-only JSONL, lightweight | Any agent recording progress | worker, reviewer |
+| `autoform-aristotle` | HTTP calls to Harmonic API | Hard proofs delegated externally | worker (via crew) |
 
-Agents declare their server subset in the `mcpServers` frontmatter field. The reader agent uses no MCP servers — it only reads files.
+Agents declare their server subset in the `mcpServers` frontmatter field. The reader agent uses no MCP servers.
+
+## Hooks
+
+**`hooks/session-start`** — Bash script run on Claude Code session start. Injects a one-liner reminding the assistant that autoform skills and tools are available. Silent-fails on errors.
 
 ## Single source of truth
 
@@ -77,6 +100,7 @@ Agents declare their server subset in the `mcpServers` frontmatter field. The re
 - **Agents:** edit `agents/<name>.md`. Frontmatter declares tools, mcpServers, and model.
 - **MCP servers:** edit `servers/<name>/`. Each server has `core.py` (logic) and `server.py` (FastMCP wrapper).
 - **Commands:** edit `commands/<name>.toml`.
+- **Hooks:** edit `hooks/<name>`. Bash scripts, must be executable.
 
 ## Adding a new skill
 
@@ -96,8 +120,10 @@ Agents declare their server subset in the `mcpServers` frontmatter field. The re
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `LEAN_PROJECT_DIR` | `.` | repl, mathlib, lsp |
+| `LEAN_PROJECT_DIR` | `.` | workspace, repl, mathlib, lsp |
 | `LEAN_REPL_CMD` | `lake exe repl` | repl |
 | `LEAN_NUM_REPLS` | auto (from RAM) | repl |
 | `AUTOFORM_TRACE_DIR` | `./traces` | trace |
 | `AUTOFORM_RUN_ID` | `default` | trace |
+| `ARISTOTLE_API_KEY` | — | aristotle |
+| `ARISTOTLE_DOWNLOAD_DIR` | `./aristotle-output` | aristotle |
