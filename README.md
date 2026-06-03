@@ -45,6 +45,7 @@ claude plugin add vivc/autoform-bot
 | Code review | `/autoform-review` | Review Lean formalization for correctness, faithfulness, and cheating patterns |
 | Quality check | `/autoform-quality` | Mathlib style lint — naming, tactics, code structure |
 | Statement extraction | `/autoform-extract` | Extract formalizable statements from LaTeX/Markdown source material |
+| Crew orchestration | `/autoform-crew` | Parallel formalization with subagent teams — wave-based chapter proving |
 
 ## Skills in detail
 
@@ -90,6 +91,15 @@ Activate with `/autoform-quality`.
 Extract definitions, theorems, lemmas, and corollaries from LaTeX or Markdown source material into structured YAML targets for formalization.
 
 Activate with `/autoform-extract`.
+
+</details>
+
+<details>
+<summary><strong>autoform-crew</strong> — Parallel formalization</summary>
+
+Orchestration guide for subagent teams. Fan out workers across independent targets, batch reviews, wave-based chapter formalization. Tells the main thread when to delegate vs. do it inline.
+
+Activate with `/autoform-crew`.
 
 </details>
 

@@ -3,3 +3,4 @@
 @skills/autoform-review/SKILL.md
 @skills/autoform-quality/SKILL.md
 @skills/autoform-extract/SKILL.md
+@skills/autoform-crew/SKILL.md
