@@ -113,6 +113,25 @@ Autoform includes specialized subagents for multi-agent workflows:
 | `autoform-reviewer` | opus | Reviews changes for correctness, faithfulness, and cheating patterns |
 | `autoform-reader` | haiku | Lightweight file reader for large files (small context, fast) |
 
+## Aristotle Integration
+
+The plugin can delegate formalization tasks to [Aristotle](https://aristotle.harmonic.fun) (Harmonic), an autonomous formal-reasoning agent that runs its own Lean builds, proof search, and file edits.
+
+**Setup:**
+```bash
+pip install aristotlelib
+export ARISTOTLE_API_KEY=arstl_...   # from https://aristotle.harmonic.fun/dashboard/keys
+```
+
+**Usage:** Submit hard proofs to Aristotle while keeping quick tasks local:
+```
+aristotle_submit("thm-2-3", "Prove Theorem 2.3: for all convex sets C, ...")
+# ... do other work while Aristotle runs ...
+aristotle_wait("thm-2-3")   # collect results
+```
+
+See `/autoform-crew` for the full hybrid local + Aristotle orchestration pattern.
+
 ## License
 
 [MIT](LICENSE)

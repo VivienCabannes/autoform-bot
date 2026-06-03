@@ -16,6 +16,9 @@ dependencies = [
 repl = [
     "psutil>=5.9",
 ]
+aristotle = [
+    "aristotlelib>=2.0",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",

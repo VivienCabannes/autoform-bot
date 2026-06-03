@@ -41,6 +41,15 @@
         "AUTOFORM_TRACE_DIR": "${AUTOFORM_TRACE_DIR:-./traces}"
       },
       "description": "Execution tracing — record proof attempts, steps, reviews"
+    },
+    "autoform-aristotle": {
+      "command": "python",
+      "args": ["-m", "servers.aristotle.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
+      },
+      "description": "Aristotle (Harmonic) — delegate formalization to an autonomous prover"
     }
   }
 }

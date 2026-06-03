@@ -21,6 +21,65 @@ Autoform-crew orchestrates multiple subagents for parallel formalization. The ma
 | `autoform-reviewer` | opus | Review: check faithfulness, cheating, conventions | lsp, mathlib, trace |
 | `autoform-reader` | haiku | Read: summarize large files cheaply | none |
 
+## Aristotle delegation
+
+**Aristotle** (Harmonic) is an autonomous formal-reasoning agent — not a subagent you spawn, but a tool you call. It runs its own Lean builds, proof search, and file edits on Harmonic's servers, then returns finished files.
+
+Use Aristotle when:
+- The theorem is self-contained (no dependencies on your in-progress code)
+- You want to offload a hard proof entirely — Aristotle is built for multi-hour proving sessions
+- You're parallelizing aggressively and want to mix local workers with Aristotle tasks
+
+Don't use Aristotle when:
+- The proof depends on definitions you've written (Aristotle can't see your workspace unless you pass `project_dir`)
+- You need fine-grained control over the proof approach
+- The task is a quick definition or trivial lemma (Aristotle overhead isn't worth it)
+
+### Aristotle tools
+
+| Tool | What it does |
+|------|-------------|
+| `aristotle_submit` | Submit a task — creates a project or continues an existing session |
+| `aristotle_wait` | Block until the task completes (up to max_wait_seconds) |
+| `aristotle_poll` | Non-blocking status check |
+| `aristotle_steer` | Redirect a running task with new instructions |
+| `aristotle_events` | Inspect what Aristotle is doing (proof attempts, builds, edits) |
+| `aristotle_sessions` | List all active sessions |
+
+### Aristotle + local workers pattern
+
+The most powerful pattern combines local workers for quick tasks with Aristotle for hard proofs:
+
+```
+Chapter 5 targets:
+  Quick (local autoform-worker):
+    - def-5.1, def-5.2, def-5.3 (definitions, likely in Mathlib)
+    - lem-5.4 (simple lemma)
+
+  Hard (delegate to Aristotle):
+    - thm-5.5 (complex, self-contained, 100+ line proof expected)
+    - thm-5.6 (deep Mathlib search needed)
+
+Plan:
+1. Spawn local workers for def-5.1, def-5.2, def-5.3, lem-5.4 in parallel
+2. aristotle_submit("thm-5-5", "Prove Theorem 5.5: ...", project_dir=".")
+3. aristotle_submit("thm-5-6", "Prove Theorem 5.6: ...")
+4. While Aristotle works, review local workers' output
+5. aristotle_wait("thm-5-5") — collect results
+6. aristotle_wait("thm-5-6") — collect results
+7. Review Aristotle's output with autoform-reviewer
+```
+
+### Steering Aristotle
+
+If you see (via `aristotle_events`) that Aristotle is going down the wrong path:
+
+```
+aristotle_steer("thm-5-5", "Don't use manual induction — use Finset.sum_le_sum from Mathlib instead")
+```
+
+This injects the instruction into Aristotle's running session without restarting.
+
 ## When to use crew vs main thread
 
 | Task | Use |

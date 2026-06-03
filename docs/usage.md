@@ -117,6 +117,46 @@ spawn an autoform-worker subagent to formalize it.
 Search Mathlib first, write to MyBook/Chapter1/.
 ```
 
+## Delegating to Aristotle
+
+For hard, self-contained proofs, delegate to [Aristotle](https://aristotle.harmonic.fun) (Harmonic's autonomous prover):
+
+```bash
+# One-time setup
+pip install aristotlelib
+export ARISTOTLE_API_KEY=arstl_...
+```
+
+Then in a Claude Code session:
+
+```
+Submit Theorem 5.5 to Aristotle:
+
+aristotle_submit("thm-5-5",
+    "Prove: for all convex sets C in ℝⁿ, if C is bounded then C is compact.
+     Write to MyBook/Compactness.lean. Use Mathlib's IsCompact and IsBounded.",
+    project_dir=".")
+```
+
+While Aristotle works (can take minutes to hours), do other work. Check progress:
+
+```
+aristotle_events("thm-5-5")   # see what Aristotle is doing
+aristotle_poll("thm-5-5")     # check status
+```
+
+Steer if needed:
+
+```
+aristotle_steer("thm-5-5", "Use Metric.isCompact_iff_isClosed_bounded instead of manual epsilon-net")
+```
+
+Collect the result:
+
+```
+aristotle_wait("thm-5-5")     # block until done
+```
+
 ## Slash commands reference
 
 | Command | What it does |
@@ -126,6 +166,7 @@ Search Mathlib first, write to MyBook/Chapter1/.
 | `/autoform-review` | Review formalization for correctness and integrity |
 | `/autoform-quality` | Check code quality against Mathlib conventions |
 | `/autoform-extract` | Extract statements from source material |
+| `/autoform-crew` | Orchestrate parallel formalization with subagent teams |
 
 ## MCP tools available
 
@@ -144,6 +185,12 @@ Search Mathlib first, write to MyBook/Chapter1/.
 | `get_progress` | trace | Get run summary |
 | `get_proof_attempts` | trace | Get recent proof attempts |
 | `get_reviews` | trace | Get recent reviews |
+| `aristotle_submit` | aristotle | Submit a formalization task to Aristotle |
+| `aristotle_wait` | aristotle | Block until an Aristotle task completes |
+| `aristotle_poll` | aristotle | Non-blocking status check |
+| `aristotle_steer` | aristotle | Redirect a running task with new instructions |
+| `aristotle_events` | aristotle | Inspect what Aristotle is doing |
+| `aristotle_sessions` | aristotle | List all active Aristotle sessions |
 
 ## Environment variables
 
@@ -154,6 +201,8 @@ Search Mathlib first, write to MyBook/Chapter1/.
 | `LEAN_NUM_REPLS` | auto (from RAM) | Number of parallel REPL instances |
 | `AUTOFORM_TRACE_DIR` | `./traces` | Directory for trace JSONL files |
 | `AUTOFORM_RUN_ID` | `default` | Current run identifier |
+| `ARISTOTLE_API_KEY` | — | Harmonic API key (required for Aristotle) |
+| `ARISTOTLE_DOWNLOAD_DIR` | `./aristotle-output` | Where Aristotle downloads result files |
 
 ## Comparison with the full autoform bot
 
