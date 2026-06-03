@@ -1,113 +1,111 @@
-# Fork of AutoformBot to make it an AI coding assistant Plugin
+# Autoform
 
-Multi-agent system for translating LaTeX mathematics into verified Lean 4 proofs using Mathlib.
+Turn any AI coding assistant into a Lean 4 formalization agent.
 
-![Visualizer Dashboard](docs/assets/visualizer.png)
+Autoform gives your coding assistant the knowledge and tools to translate mathematics from LaTeX into verified Lean 4 proofs using Mathlib — from statement extraction through proof completion and review.
 
-## Setup
+## Before / After
+
+**Before** — you paste a theorem and your assistant writes broken Lean:
+```
+You: "Formalize Theorem 2.3 from this chapter"
+Assistant: *writes Lean with wrong types, missing imports, sorry everywhere*
+```
+
+**After** — your assistant knows Mathlib conventions, searches before proving, and self-reviews:
+```
+You: "Formalize Theorem 2.3 from this chapter"
+Assistant: *searches Mathlib for existing lemmas, uses correct typeclasses,
+           writes idiomatic proofs, flags what the book leaves unproved*
+```
+
+## Install
+
+### Claude Code
 
 ```bash
-make setup    # creates venv, installs deps, builds Lean + REPL (~20 min)
+claude plugin add vivc/autoform-bot
 ```
 
-Create `.env` with the API key for your chosen provider:
-```
-ANTHROPIC_API_KEY=your-key-here   # for Claude models
-OPENAI_API_KEY=your-key-here      # for GPT models
-GEMINI_API_KEY=your-key-here      # for Gemini models
-```
+### Other agents (via npx skills)
 
-## Quick Start
+| Agent | Install |
+|-------|---------|
+| Cursor | `npx skills add vivc/autoform-bot -a cursor` |
+| Windsurf | `npx skills add vivc/autoform-bot -a windsurf` |
+| Copilot | `npx skills add vivc/autoform-bot -a github-copilot` |
+| Cline | `npx skills add vivc/autoform-bot -a cline` |
 
-**1. Prepare book data** — place `book.md` (and optionally `book.pdf`) in `autoform/data/<name>/`. See `autoform/data/example/` for a sample.
+## What You Get
 
-**2. Extract targets:**
-```bash
-python -m autoform.statement_extraction run \
-    --book-dir=autoform/data/my_book \
-    --output=autoform/data/my_book/targets.yaml
-```
+| Skill | Slash command | What it does |
+|-------|--------------|--------------|
+| Mathlib conventions | `/autoform` | Lean 4 + Mathlib style, tactics, naming, pitfalls — distilled from 94k PR reviews |
+| Proof strategies | `/autoform-prove` | Incremental proving workflow: search → prototype → prove → commit |
+| Code review | `/autoform-review` | Review Lean formalization for correctness, faithfulness, and cheating patterns |
+| Quality check | `/autoform-quality` | Mathlib style lint — naming, tactics, code structure |
+| Statement extraction | `/autoform-extract` | Extract formalizable statements from LaTeX/Markdown source material |
 
-**3. Create a config** (see `autoform/bot/configs/` for examples):
-```yaml
-workspace:
-  path: ../my-workspace
-  mathlib_path: submodules/mathlib
-  lib_name: My_Book
+## Skills in detail
 
-book:
-  path: my_book
-  files: [book.md]
-  targets: targets.yaml
+<details>
+<summary><strong>autoform</strong> — Mathlib & Lean 4 conventions</summary>
 
-llm:
-  model: Opus 4.6
+Core knowledge base: proof style, naming, types, tactics, simp conventions, API design, code style, and common pitfalls. Distilled from ~94k GitHub PR review comments and ~165k Zulip messages from the Mathlib community.
 
-workers:
-  agents_per_node: 5
-  num_repls_per_node: 5
-  min_agents_per_task: 3
-  max_agents_per_task: 5
-```
+Activate with `/autoform` or by asking about Lean 4 conventions.
 
-**4. Run:**
-```bash
-# Start fresh
-python -m autoform.bot.main run --config=path/to/config.yaml --name=my-run --fresh
+</details>
 
-# Resume an interrupted run (omit --fresh)
-python -m autoform.bot.main run --config=path/to/config.yaml --name=my-run
+<details>
+<summary><strong>autoform-prove</strong> — Proof strategies & workflow</summary>
 
-# Multi-node with SLURM
-srun --nodes=N --ntasks-per-node=1 python -m autoform.bot.main run --config=... --name=my-run
-```
+How to approach Lean proofs: search Mathlib first, prototype in REPL, work incrementally, handle sorry/axiom correctly, detect false statements. Includes the `unproved` macro policy for statements the source material leaves unproven.
 
-**5. Monitor:**
-```bash
-python -m autoform.visualizer.app --runs-dir=../my-workspace --port=8003
-```
+Activate with `/autoform-prove`.
 
-**6. Evaluate:**
-```bash
-python -m autoform.eval run \
-    --repo-dir=../my-workspace/my-run/code \
-    --task-file=autoform/data/my_book/targets.yaml \
-    --book-dir=autoform/data/my_book
-```
+</details>
 
-## Architecture
+<details>
+<summary><strong>autoform-review</strong> — Formalization review</summary>
 
-```
-autoform-pipeline/
-├── autoform/
-│   ├── bot/                  Multi-agent pipeline (orchestrator, workers, reviewers)
-│   ├── eval/                 Evaluation (grading, lean checks, metrics, rubrics)
-│   ├── visualizer/           Web dashboard for inspecting runs and traces
-│   ├── statement_extraction/ Statement chunking and extraction from LaTeX
-│   └── data/                 Book datasets (book.md + targets.yaml)
-├── core/                     Framework (agent, inference, trace, coordination)
-├── tools/                    MCP tool servers (filesystem, git, bash, Lean REPL/LSP, mathlib)
-├── template/                 Lean 4 + Mathlib workspace template
-├── submodules/               Git submodules (mathlib, repl, lean-lsp-mcp)
-└── docs/                     Documentation
-```
+Structured review checklist: compilation, faithfulness to source, mathematical correctness, conventions, and anti-cheating detection (trivial substitution, smuggled assumptions, weakened content, modeling avoidance, hidden sorry/axiom).
 
-## Documentation
+Activate with `/autoform-review`.
 
-**Pipeline:**
-- [Bot](docs/pipeline/bot.md) — multi-agent architecture, DAG workflow, multi-node SLURM, agent roles, config reference
-- [Evaluation](docs/pipeline/eval.md) — matching, axiom checking, LLM grading rubrics, dependency graphs
-- [Statement Extraction](docs/pipeline/statement_extraction.md) — chunking, multi-agent extraction, deduplication
-- [Visualizer](docs/pipeline/visualizer.md) — dashboard views, API endpoints, hub mode
+</details>
 
-**Tools:**
-- [Tools Overview](docs/tools/overview.md) — MCP tool system, available servers, adding new tools
-- [REPL Reference](docs/tools/repl.md) — Lean REPL architecture, pooled server, Python API
+<details>
+<summary><strong>autoform-quality</strong> — Code quality inspection</summary>
+
+Pure style review — naming, tactic usage, proof structure, Mathlib conventions. Does not evaluate mathematical correctness (that's autoform-review's job).
+
+Activate with `/autoform-quality`.
+
+</details>
+
+<details>
+<summary><strong>autoform-extract</strong> — Statement extraction</summary>
+
+Extract definitions, theorems, lemmas, and corollaries from LaTeX or Markdown source material into structured YAML targets for formalization.
+
+Activate with `/autoform-extract`.
+
+</details>
+
+## Agents
+
+Autoform includes specialized subagents for multi-agent workflows:
+
+| Agent | Model | Role |
+|-------|-------|------|
+| `autoform-worker` | opus | Lean 4 formalization — reads source, searches Mathlib, writes proofs |
+| `autoform-reviewer` | opus | Reviews changes for correctness, faithfulness, and cheating patterns |
+| `autoform-reader` | haiku | Lightweight file reader for large files (small context, fast) |
 
 ## License
 
-This project is licensed under the [MIT](LICENSE) license.
-
+[MIT](LICENSE)
 
 ## Citation
 
@@ -115,12 +113,12 @@ If you find this work useful, please cite our paper:
 
 ```bibtex
 @misc{rammal2026formalizingmathematicsscale,
-      title={Formalizing Mathematics at Scale}, 
+      title={Formalizing Mathematics at Scale},
       author={Ahmad Rammal and Niket Patel and Fabian Gloeckle and Amaury Hayat and Julia Kempe and Remi Munos and Charles Arnal and Vivien Cabannes},
       year={2026},
       eprint={2605.29955},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2605.29955}, 
+      url={https://arxiv.org/abs/2605.29955},
 }
 ```
