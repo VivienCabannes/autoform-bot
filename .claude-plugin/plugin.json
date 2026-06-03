@@ -4,5 +4,43 @@
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/vivc"
+  },
+  "mcpServers": {
+    "autoform-repl": {
+      "command": "python",
+      "args": ["-m", "servers.repl.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      },
+      "description": "Lean 4 REPL — run code, verify proofs, check compilation"
+    },
+    "autoform-mathlib": {
+      "command": "python",
+      "args": ["-m", "servers.mathlib.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      },
+      "description": "Mathlib source search — grep, find by name, read files"
+    },
+    "autoform-lsp": {
+      "command": "python",
+      "args": ["-m", "servers.lsp.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      },
+      "description": "Lean 4 LSP — file diagnostics and type information"
+    },
+    "autoform-trace": {
+      "command": "python",
+      "args": ["-m", "servers.trace.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "AUTOFORM_TRACE_DIR": "${AUTOFORM_TRACE_DIR:-./traces}"
+      },
+      "description": "Execution tracing — record proof attempts, steps, reviews"
+    }
   }
 }

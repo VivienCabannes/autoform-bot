@@ -5,6 +5,7 @@ description: >
   Returns structured summaries of file contents. Use for reading large
   Lean files or book chapters without consuming context.
 tools: [Read]
+mcpServers: []
 model: haiku
 ---
 

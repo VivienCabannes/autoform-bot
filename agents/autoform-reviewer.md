@@ -4,6 +4,7 @@ description: >
   Reviews Lean 4 formalization for correctness, faithfulness to source material,
   and cheating patterns. Returns APPROVED or REJECTED with specific issues.
 tools: [Read, Grep, Glob, Bash]
+mcpServers: [autoform-lsp, autoform-mathlib, autoform-trace]
 model: opus
 ---
 
