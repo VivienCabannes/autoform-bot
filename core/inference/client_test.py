@@ -19,6 +19,7 @@ from .client import (
     Model,
     Opus_4_6,
     Sonnet_4_6,
+    create_inference,
     lookup_model,
 )
 
@@ -81,3 +82,35 @@ class TestModelHelpers:
     def test_lookup_model_invalid(self):
         with pytest.raises(ValueError, match="not available"):
             lookup_model("nonexistent-model")
+
+
+class TestCreateInferenceMaxRouting:
+    """Anthropic backend can route through a proxy / bearer token (e.g. Max)."""
+
+    @staticmethod
+    def _clear(monkeypatch):
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_requires_key_without_proxy(self, monkeypatch):
+        self._clear(monkeypatch)
+        with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+            create_inference(Opus_4_6)
+
+    def test_api_key_path_unchanged(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        inf = create_inference(Opus_4_6)
+        assert inf._client.api_key == "sk-test"
+
+    def test_base_url_override_relaxes_key(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://localhost:4000")
+        inf = create_inference(Opus_4_6)  # no ANTHROPIC_API_KEY set
+        assert str(inf._client.base_url).rstrip("/") == "http://localhost:4000"
+
+    def test_auth_token_relaxes_key(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat-xyz")
+        inf = create_inference(Opus_4_6)  # no ANTHROPIC_API_KEY set
+        assert inf._client.auth_token == "sk-ant-oat-xyz"

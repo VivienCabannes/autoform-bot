@@ -26,11 +26,24 @@ class Backend(StrEnum):
     OPENAI_CHAT = "openai_chat"
 
     def create(
-        self, *, api_key: str, url: str, model_name: str, is_local: bool, pricing: ModelPricing | None = None
+        self,
+        *,
+        api_key: str,
+        url: str,
+        model_name: str,
+        is_local: bool,
+        pricing: ModelPricing | None = None,
+        auth_token: str = "",
     ) -> InferenceProtocol:
         """Construct the inference backend for this enum member.
 
         Imports are lazy so that only the required SDK is loaded.
+
+        ``url`` (when non-empty) overrides the provider's default base URL —
+        e.g. a local proxy that authenticates against a Claude Max
+        subscription. For Anthropic, ``auth_token`` sends a bearer token
+        instead of an ``x-api-key`` header. See ``create_inference`` and
+        ``docs/inference/max-routing.md``.
         """
         match self:
             case Backend.ANTHROPIC:
@@ -38,7 +51,18 @@ class Backend(StrEnum):
 
                 from .sdk.anthropic import AnthropicInference
 
-                client = AsyncAnthropic(api_key=api_key)
+                kwargs: dict[str, Any] = {}
+                if url:
+                    kwargs["base_url"] = url
+                if api_key:
+                    kwargs["api_key"] = api_key
+                elif auth_token:
+                    kwargs["auth_token"] = auth_token
+                else:
+                    # A proxy supplies its own credentials (e.g. Max OAuth);
+                    # the SDK still requires a value to construct the client.
+                    kwargs["api_key"] = "no-key"
+                client = AsyncAnthropic(**kwargs)
                 return AnthropicInference(client, model_name=model_name)
 
             case Backend.GEMINI:
@@ -363,24 +387,50 @@ del _m
 # Public factory
 # ---------------------------------------------------------------------------
 
+# Per-backend env var that overrides the provider's default base URL. Point it
+# at a local proxy that authenticates against a Claude Max subscription to route
+# the engine through Max instead of paying per token. See
+# ``docs/inference/max-routing.md``.
+_BASE_URL_OVERRIDE_ENV: dict[Backend, str] = {
+    Backend.ANTHROPIC: "ANTHROPIC_BASE_URL",
+}
+
 
 def create_inference(model: type[Model]) -> InferenceProtocol:
     """Create the appropriate inference backend for a Model class.
 
-    Resolves the API key from the environment and delegates construction
-    to ``model.backend.create()``.
+    Resolves credentials from the environment and delegates construction to
+    ``model.backend.create()``.
+
+    Max routing: set ``ANTHROPIC_BASE_URL`` to a proxy that injects your Claude
+    Max OAuth (and/or ``ANTHROPIC_AUTH_TOKEN`` for a bearer token). When either
+    is set, ``ANTHROPIC_API_KEY`` is no longer required.
     """
+    override_env = _BASE_URL_OVERRIDE_ENV.get(model.backend)
+    override_url = os.environ.get(override_env, "") if override_env else ""
+    base_url = override_url or model.provider_url
+    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "") if model.backend is Backend.ANTHROPIC else ""
+
     api_key = os.environ.get(model.env_key, "")
     if not api_key:
         if model.is_local:
             api_key = "no-key"
+        elif override_url or auth_token:
+            # Routed through a proxy / bearer endpoint that supplies its own
+            # credentials (e.g. Claude Max OAuth); no provider API key needed.
+            api_key = ""
         else:
-            raise RuntimeError(f"Set {model.env_key}")
+            raise RuntimeError(
+                f"Set {model.env_key} — or route through a proxy by setting "
+                "ANTHROPIC_BASE_URL (and optionally ANTHROPIC_AUTH_TOKEN) to use a "
+                "Claude Max subscription."
+            )
 
     return model.backend.create(
         api_key=api_key,
-        url=model.provider_url,
+        url=base_url,
         model_name=model.model_name,
         is_local=model.is_local,
         pricing=model.pricing,
+        auth_token=auth_token,
     )
