@@ -1,0 +1,18 @@
+{
+  "name": "autoform-suite",
+  "owner": {
+    "name": "Jack McCarthy",
+    "url": "https://github.com/Deicyde"
+  },
+  "metadata": {
+    "description": "Claude Code front-end for the autoform-bot Lean 4 / Mathlib formalization pipeline.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "autoform",
+      "source": "./plugins/autoform",
+      "description": "Drive autoform-bot's multi-agent pipeline (extract -> formalize -> review -> eval -> orchestrate) from Claude Code, defaulting to the Python engine. Bundles the Lean/Mathlib conventions, workflow, and evaluation-rubric skills."
+    }
+  ]
+}

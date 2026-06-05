@@ -1,0 +1,10 @@
+{
+  "name": "autoform",
+  "version": "0.1.0",
+  "description": "Front-end for autoform-bot's multi-agent pipeline that formalizes math textbooks into verified Lean 4 / Mathlib: statement extraction, the worker/review/merge formalization loop, rubric evaluation, and DAG orchestration. Commands drive the autoform-bot Python engine by default; pass --backend native to run a lighter in-session loop with no autoform-bot checkout. Bundles the lean-conventions, formalization-workflow, and eval-rubrics skills (auto-discovered when editing .lean files).",
+  "author": {
+    "name": "Jack McCarthy",
+    "url": "https://github.com/Deicyde"
+  },
+  "keywords": ["lean", "mathlib", "autoformalization", "multi-agent", "autoform-bot"]
+}
