@@ -17,11 +17,10 @@
   },
   "mcpServers": {
     "lean-informal-planner-mathlib": {
-      "command": "/usr/local/bin/python3",
-      "args": ["-m", "servers.mathlib.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/run-mathlib-server.sh"],
       "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-${CLAUDE_PROJECT_DIR}}"
       }
     }
   }
