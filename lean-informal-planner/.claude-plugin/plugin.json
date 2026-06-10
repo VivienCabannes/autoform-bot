@@ -2,9 +2,22 @@
   "name": "lean-informal-planner",
   "description": "Plan Lean formalization efforts by mapping textbook concepts to Mathlib",
   "version": "0.1.0",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
   "mcpServers": {
     "lean-informal-planner-mathlib": {
-      "command": "python",
+      "command": "/usr/local/bin/python3",
       "args": ["-m", "servers.mathlib.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {

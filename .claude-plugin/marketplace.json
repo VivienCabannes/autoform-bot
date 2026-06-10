@@ -1,0 +1,7 @@
+{
+  "name": "lean-local",
+  "owner": { "name": "Charles Arnal" },
+  "plugins": [
+    { "name": "lean-informal-planner", "source": "./lean-informal-planner" }
+  ]
+}
