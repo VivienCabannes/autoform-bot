@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# SessionStart hook — introduce the Lean Informal Planner plugin.
+# Silent-fails on all errors (never blocks session start).
+
+set -euo pipefail
+
+context="The Lean Informal Planner plugin is active. This plugin helps plan Lean 4 formalization efforts by building a dependency graph of mathematical concepts from textbooks and mapping them to Mathlib. When the user first interacts, introduce the plugin briefly and ask which textbook(s) to analyze (LaTeX, Markdown, or PDF) and which concepts or chapters are the formalization targets. Available skills: /lean-informal-planner:plan (full planning pipeline: extract concepts, build dependency graph, check Mathlib, review, visualize) and /lean-informal-planner:plan-view (regenerate and open the interactive graph visualization)."
+
+escape_for_json() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+escaped_context="$(escape_for_json "$context")"
+printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$escaped_context"

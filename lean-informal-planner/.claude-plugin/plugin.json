@@ -1,0 +1,15 @@
+{
+  "name": "lean-informal-planner",
+  "description": "Plan Lean formalization efforts by mapping textbook concepts to Mathlib",
+  "version": "0.1.0",
+  "mcpServers": {
+    "lean-informal-planner-mathlib": {
+      "command": "python",
+      "args": ["-m", "servers.mathlib.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      }
+    }
+  }
+}
