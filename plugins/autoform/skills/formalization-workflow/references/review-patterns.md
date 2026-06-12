@@ -12,4 +12,4 @@ Understand what reviewers check and why they reject.
 
 - Don't flip-flop between approaches in the same attempt. If approach A is rejected, refine it rather than switching to B.
 - Don't acknowledge mismatches between task prompt and book content in docstrings — reviewers cite worker acknowledgment as ammunition for rejection.
-- If contradictory feedback arises after 2+ rejections on the same approach, the task may be fundamentally broken. Flag for orchestrator re-scoping.
+- If contradictory feedback arises after 2+ rejections on the same approach, the task may be fundamentally broken. Flag for re-scoping by the coordinating session.

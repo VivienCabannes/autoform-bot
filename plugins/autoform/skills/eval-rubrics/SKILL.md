@@ -49,4 +49,4 @@ diagnosis. Use it for a fast read; use the jury rubrics above for a gating verdi
 ## Related
 
 Consumes **lean-conventions** (the code_quality/style yardstick) and **formalization-workflow**
-(the axiom/sorry honesty gates). Invoked by `autoform:eval`.
+(the axiom/sorry honesty gates). Invoked by `autoform:review --score`.

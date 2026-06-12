@@ -4,7 +4,7 @@ description: >-
   Lean 4 formalization worker. Use to formalize a specific excerpt of a math textbook —
   definitions, theorem statements, and full proofs — faithfully into Lean 4 / Mathlib. Invoke
   with a precise task: which statements to formalize, where the source is, and where code goes.
-tools: Read, Write, Edit, Bash, Grep, Glob
+tools: Read, Write, Edit, Bash, Grep, Glob, Skill
 model: opus
 ---
 
@@ -15,7 +15,8 @@ the theorems, and prove them fully.
 ## Before writing any code
 
 1. Load the **lean-conventions** and **formalization-workflow** skills (and **eval-rubrics** so
-   you know how your output is graded). If a task-specific lessons file exists (e.g.
+   you know how your output is graded); if the Skill tool is unavailable, Read their SKILL.md
+   from the autoform plugin's `skills/` directory. If a task-specific lessons file exists (e.g.
    `skills/tasks/<task-id>/guide.md`), read it first — it captures what failed before.
 2. Read `lakefile.toml` to find the `[[lean_lib]]` name — that is your source directory (e.g.
    `name = "BooleanFourier"` ⇒ create `BooleanFourier/MetricSpaces.lean`).
@@ -47,10 +48,11 @@ project for `sorry`/`axiom`, not just the main file.
 - `sorry` and raw `axiom` are **never** acceptable in a finished proof (they poison the kernel
   via `sorryAx` and fail evaluation). If stuck, keep going: break the proof into `have` steps
   mirroring the informal argument, search Mathlib, read the error messages.
-- The **only** sanctioned gap is the `unproved` macro — and only when the *book itself* omits the
-  proof (says "omitted"/"exercise", or points to a reference). Syntax:
-  `unproved theoremName (args : Types) : Conclusion`. Never use it as an escape hatch for a hard
-  proof.
+- The **only** sanctioned gap is the project's placeholder convention — and only when the *book
+  itself* omits the proof (says "omitted"/"exercise", or points to a reference). In autoform-bot
+  projects that is the `unproved` macro (`unproved theoremName (args : Types) : Conclusion`); if
+  the project doesn't define one, ask the coordinating session to pick/bootstrap the convention
+  rather than inventing your own. Never use it as an escape hatch for a hard proof.
 - Faithfulness outweighs completeness: an honest `sorry` on a *correct* statement is better than
   a fully proved *weaker* statement — but neither is a finished formalization.
 

@@ -45,6 +45,18 @@ writing proofs. Each phase has a reference guide in `references/`.
 
 - Name commits after the task/topic; keep diffs scoped; follow the submit/merge protocol.
 
+## Phase 5 — The reviewer packet (`reviewer-packet.md`)
+
+- Finished work ships with a packet a human expert can verify in minutes: spec sheet
+  (statements = the trust surface), kernel evidence (`lake env lean`, `#print axioms` deltas),
+  faithfulness argument, and a 5-minute reading guide. Spec-first discipline makes it cheap.
+
+## Axiom-discharge repos (`axiom-discharge.md`)
+
+- Challenge repos with an audited axiom layer (ledger + per-axiom plans + soundness CI) have
+  stricter rules: statement must stay verbatim, ledger/report updates land in the same commit,
+  new axioms need satisfiability vetting. Read this before touching any `AX_*`.
+
 ## Reviewing others' work (`review-patterns.md`)
 
 - The correctness reviewer checks faithfulness to the source and genuine proofs; the quality
@@ -53,4 +65,4 @@ writing proofs. Each phase has a reference guide in `references/`.
 ## Related
 
 Pairs with **lean-conventions** (how to write the code) and **eval-rubrics** (how it's scored).
-The `autoform:formalize` and `autoform:review` commands lean on this discipline.
+The `autoform:run` and `autoform:review` commands lean on this discipline.

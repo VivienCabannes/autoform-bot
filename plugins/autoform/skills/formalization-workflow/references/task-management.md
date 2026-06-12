@@ -10,12 +10,12 @@ Stay focused on the task as stated. Avoid scope creep.
 
 ## Blocked tasks
 
-- If 2+ workers use all 250 turns without submitting, the task is too hard.
+- If 2+ worker attempts exhaust their effort budget without a commit, the task is too hard as scoped.
 - If every attempt gets the same rejection, the task can't be completed as stated.
-- If workers converge on axiom introduction, the proof requires missing infrastructure. Report to orchestrator.
+- If workers converge on axiom introduction, the proof requires missing infrastructure. Report to the coordinating session for re-scoping.
 
-## Turn budget
+## Effort budget
 
-- Avoid repeated `lean_diagnostic_messages` calls on large files (75s+ each).
-- Use `lean_verify` instead of `lake build` for speed.
+- Avoid repeated full-file diagnostics on large files (each pass is expensive); check the one file you changed.
+- Prefer `lake env lean <file>` over a full `lake build` for speed.
 - Batch edits and commit early. Plan all edits before making any.
