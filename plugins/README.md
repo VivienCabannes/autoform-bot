@@ -56,3 +56,14 @@ idiom), `matcher` (informal statement → Lean decl), `judge` (one rubric, one d
 A Lean 4 / Mathlib project (`lake` on PATH). Optional: Lean LSP / REPL MCP tools (used when
 present), `gh` for PR/issue flows, the `marathon` CLI + `ARISTOTLE_API_KEY` for `--aristotle`,
 an autoform-bot checkout + API keys for `--engine python`.
+
+## Validation
+
+The plugin is markdown + JSON, so validation is static + behavioural rather than unit tests:
+
+- **`autoform/scripts/lint_plugin.py`** (stdlib only, run in CI by
+  `.github/workflows/plugin-lint.yml`) — checks JSON validity, command/agent/skill frontmatter,
+  that every `*.md` a skill cites exists, and that no reference survives to a command/agent
+  removed in 0.2.0. Run locally: `python plugins/autoform/scripts/lint_plugin.py`.
+- **`autoform/SMOKE_TEST.md`** — the repeatable end-to-end eval procedure (prove mode, review
+  packet, formalize mode), with the 2026-06 jacobian-challenge reference run.

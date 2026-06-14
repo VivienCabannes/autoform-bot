@@ -1,0 +1,29 @@
+name: plugin-lint
+
+# Static validation of the autoform Claude Code plugin (markdown + JSON): JSON
+# validity, command/agent/skill frontmatter, skill->reference links, and no
+# leftover references to commands/agents removed in the 0.2.0 redesign. Pure
+# stdlib, so no install step.
+
+on:
+  pull_request:
+    paths:
+      - 'plugins/**'
+      - '.claude-plugin/**'
+      - '.github/workflows/plugin-lint.yml'
+  push:
+    paths:
+      - 'plugins/**'
+      - '.claude-plugin/**'
+      - '.github/workflows/plugin-lint.yml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Lint the autoform plugin
+        run: python plugins/autoform/scripts/lint_plugin.py
