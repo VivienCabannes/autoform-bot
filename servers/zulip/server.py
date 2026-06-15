@@ -22,6 +22,18 @@ def create_zulip_server() -> FastMCP:
             _client = get_client()
         return _client
 
+    def _not_configured_response() -> str:
+        """Return a helpful error message when Zulip is not set up."""
+        return json.dumps({
+            "error": "Zulip is not configured.",
+            "setup": (
+                "Run /setup-zulip to configure Zulip access, or manually:\n"
+                "1. Get your API key at https://leanprover.zulipchat.com/#settings/account\n"
+                "2. Create ~/.zuliprc with [api] email, key, and site fields\n"
+                "3. Ensure the 'zulip' Python package is installed (handled by uv)"
+            ),
+        })
+
     @server.tool
     def zulip_search(query: str, stream: str = "", topic: str = "", limit: int = 20) -> str:
         """Search Zulip messages for discussions relevant to a formalization task.
@@ -35,7 +47,10 @@ def create_zulip_server() -> FastMCP:
             topic: Restrict to a specific topic within a stream.
             limit: Maximum number of messages to return (default: 20).
         """
-        return json.dumps(_get_client().search_messages(query, stream=stream, topic=topic, limit=limit), indent=2)
+        try:
+            return json.dumps(_get_client().search_messages(query, stream=stream, topic=topic, limit=limit), indent=2)
+        except (FileNotFoundError, RuntimeError):
+            return _not_configured_response()
 
     @server.tool
     def zulip_messages(stream: str, topic: str = "", limit: int = 30) -> str:
@@ -48,7 +63,10 @@ def create_zulip_server() -> FastMCP:
             topic: Optional topic name (e.g., "Hoeffding's inequality").
             limit: Maximum number of messages to return (default: 30).
         """
-        return json.dumps(_get_client().get_messages(stream, topic, limit=limit), indent=2)
+        try:
+            return json.dumps(_get_client().get_messages(stream, topic, limit=limit), indent=2)
+        except (FileNotFoundError, RuntimeError):
+            return _not_configured_response()
 
     @server.tool
     def zulip_streams(filter_text: str = "") -> str:
@@ -57,7 +75,10 @@ def create_zulip_server() -> FastMCP:
         Args:
             filter_text: Optional case-insensitive filter on stream names.
         """
-        return json.dumps(_get_client().list_streams(filter_text=filter_text), indent=2)
+        try:
+            return json.dumps(_get_client().list_streams(filter_text=filter_text), indent=2)
+        except (FileNotFoundError, RuntimeError):
+            return _not_configured_response()
 
     @server.tool
     def zulip_topics(stream: str, limit: int = 20) -> str:
@@ -67,7 +88,10 @@ def create_zulip_server() -> FastMCP:
             stream: Stream name (e.g., "mathlib4").
             limit: Maximum number of topics to return (default: 20).
         """
-        return json.dumps(_get_client().get_topics(stream, limit=limit), indent=2)
+        try:
+            return json.dumps(_get_client().get_topics(stream, limit=limit), indent=2)
+        except (FileNotFoundError, RuntimeError):
+            return _not_configured_response()
 
     @server.tool
     def zulip_status() -> str:

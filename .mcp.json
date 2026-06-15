@@ -1,32 +1,32 @@
 {
   "mcpServers": {
     "autoform-repl": {
-      "command": "python",
-      "args": ["-m", "servers.repl.server"],
+      "command": "uv",
+      "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       }
     },
     "autoform-lsp": {
-      "command": "python",
-      "args": ["-m", "servers.lsp.server"],
+      "command": "uv",
+      "args": ["run", "python", "-m", "servers.lsp.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       }
     },
     "autoform-aristotle": {
-      "command": "python",
-      "args": ["-m", "servers.aristotle.server"],
+      "command": "uv",
+      "args": ["run", "--extra", "aristotle", "python", "-m", "servers.aristotle.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
       }
     },
     "autoform-zulip": {
-      "command": "python",
-      "args": ["-m", "servers.zulip.server"],
+      "command": "uv",
+      "args": ["run", "--extra", "zulip", "python", "-m", "servers.zulip.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"

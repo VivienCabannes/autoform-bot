@@ -27,14 +27,14 @@ Or naturally: "search Zulip for Hoeffding", "check if there's a Zulip discussion
 
 ## Setup
 
-Authenticates via a `.zuliprc` file. Searched in order (first found wins):
+Run `/setup-zulip` to check prerequisites and configure access, or set up manually:
 
-1. `$ZULIPRC` env var (explicit override)
-2. `$LEAN_PROJECT_DIR/.zuliprc` (project-specific)
-3. `~/.zuliprc` (standard Zulip client location)
-4. `~/.config/.zuliprc`
-5. `~/.config/zulip/.zuliprc`
-6. `~/.config/zuliprc`
+### Prerequisites
+
+- **uv** — Python package manager (handles dependencies automatically)
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
 
 ### Creating a `.zuliprc`
 
@@ -55,8 +55,18 @@ chmod 600 ~/.zuliprc
 > **Tip:** Use a project-local `.zuliprc` if you work with multiple Zulip
 > organizations. Add `.zuliprc` to your `.gitignore`.
 
+### Config file search order
+
+The `.zuliprc` file is searched in order (first found wins):
+
+1. `$ZULIPRC` env var (explicit override)
+2. `$LEAN_PROJECT_DIR/.zuliprc` (project-specific)
+3. `~/.zuliprc` (standard Zulip client location)
+4. `~/.config/.zuliprc`
+5. `~/.config/zulip/.zuliprc`
+6. `~/.config/zuliprc`
+
 ## Dependencies
 
-```bash
-pip install zulip
-```
+Python dependencies (`zulip`, `fastmcp`) are managed automatically by `uv`
+from the plugin's `pyproject.toml` — no manual `pip install` needed.
