@@ -13,7 +13,7 @@ The plan lives in the user's project directory (alongside `lakefile.toml`) and i
 
 Structure and content are kept apart, because they have different owners, different change patterns, and different readers.
 
-- **`graph.json`** — a single JSON object: top-level metadata plus a map of nodes keyed by `id`. Each node carries only *structural* fields (tier, parent, edges, Mathlib correspondence, bookkeeping). It has a **single writer**: each result is folded in incrementally through one deterministic merge step, which serializes concurrent subagents and keeps the file valid throughout, so a long run stays durable and persisting a node costs nothing as the graph grows. The derived (quotient) edges are a function of the whole graph, recomputed at re-projection and at export rather than on each merge.
+- **`graph.json`** — a single JSON object: top-level metadata plus a map of nodes keyed by `id`. Each node carries only *structural* fields (tier, parent, edges, Mathlib correspondence, bookkeeping). All writes go through a **single locked merge step** (`merge_node.py`): each change is folded in incrementally, which serializes concurrent writers and keeps the file valid throughout, so a long run stays durable and persisting a node costs nothing as the graph grows. The derived (quotient) edges are a function of the whole graph, recomputed at re-projection and at export rather than on each merge.
 - **`informal_content/<id>.md`** — one Markdown file per node, holding that node's mathematical prose: the paraphrased universal-voice statement, and its proof when the node is not in Mathlib. Subagents write these. The filename is a slug derived from the node's `id`, and a node's `content` field records the path. Keeping prose out of `graph.json` keeps the structure file readable and diffable, and maps each node directly onto a blueprint environment at export time.
 
 The two files are linked only by `id`: a node in `graph.json` names its prose file via `content`, and that field is `null` until the prose has been written.
@@ -44,12 +44,12 @@ Schema version. Currently `2`. Increment on breaking changes.
   "created_at": "2026-06-10T14:30:00Z",
   "last_updated": "2026-06-10T15:45:00Z",
   "sources": [
-    {"file": "high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
+    {"file": "sources/high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
   ]
 }
 ```
 
-`created_at` and `last_updated` are ISO 8601 timestamps. `sources` lists the textbooks the plan is built from; each entry has `file` (path relative to the project root), `title`, and `format` (one of `"latex"`, `"markdown"`, `"pdf"`).
+`created_at` and `last_updated` are ISO 8601 timestamps. `sources` lists the textbooks the plan is built from; each entry has `file` (the book's path in the plan's `sources/` subfolder), `title`, and `format` (one of `"latex"`, `"markdown"`, `"pdf"`).
 
 ## Node (structural) fields
 
@@ -92,7 +92,7 @@ The tiers are kept in sync by a single rule: **`parent` is the only authored hie
 - **Coarser-tier edges are the quotient of the finer tier's edges.** A tier-1 cluster A has an edge to a tier-1 cluster B (with A ≠ B) **iff some tier-2 node inside A depends on some tier-2 node inside B**. The same rule relates tier-2 to tier-3 once tier 3 exists.
 - **A coarse node's metadata is curated, not derived.** Its name, description, and `mathlib_status` rollup are judgments about the grouping, re-curated to match whatever membership the finer tier dictates.
 
-Because the coarse graph is a function of the fine graph, the two can never drift out of sync. This is what makes parallel construction safe: subagents author only fine `parent`/`depends_on` edges, and the orchestrator — the single serialization point — re-projects the coarse tier from the whole graph.
+Because the coarse graph is a function of the fine graph, the two can never drift out of sync. This is what makes parallel construction safe: all writes serialize through the locked merge step, subagents author only fine `parent`/`depends_on` edges, and the orchestrator re-projects the coarse tier from the whole graph.
 
 The finest built tier is authoritative. During Phase 1 there is no tier 2 yet, so tier 1 is authored directly — but only as a **scaffold**. Phase 2 builds the authoritative tier-2 graph (free to add, drop, and re-parent nodes), after which tier 1 is **re-projected** from it: node set and edges recomputed mechanically, metadata re-curated. When tier 3 arrives it is built from tier 2 the same way, and tiers 2 and 1 re-projected from it.
 
@@ -119,7 +119,7 @@ A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depend
     "created_at": "2026-06-10T14:30:00Z",
     "last_updated": "2026-06-10T15:45:00Z",
     "sources": [
-      {"file": "high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
+      {"file": "sources/high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
     ]
   },
   "nodes": {
@@ -133,7 +133,7 @@ A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depend
       "mathlib_declarations": [],
       "mathlib_file": "Mathlib/Probability/Moments/Basic.lean",
       "mathlib_notes": "Moment generating functions present; cluster assembled from several files.",
-      "source_refs": [{"file": "high_dim_stats.pdf", "location": "Ch 1, §1.2"}],
+      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, §1.2"}],
       "content": null
     },
     "Concentration inequalities": {
@@ -146,7 +146,7 @@ A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depend
       "mathlib_declarations": [],
       "mathlib_file": "Mathlib/Probability/Moments/SubGaussian.lean",
       "mathlib_notes": "Markov/Chernoff present; sub-Gaussian theory partially formalized.",
-      "source_refs": [{"file": "high_dim_stats.pdf", "location": "Ch 1, §1.3"}],
+      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, §1.3"}],
       "content": null
     },
 
@@ -160,7 +160,7 @@ A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depend
       "mathlib_declarations": ["ProbabilityTheory.mgf"],
       "mathlib_file": "Mathlib/Probability/Moments/Basic.lean",
       "mathlib_notes": "Defined as the expectation of exp(t·X).",
-      "source_refs": [{"file": "high_dim_stats.pdf", "location": "Ch 1, Def 1.2"}],
+      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, Def 1.2"}],
       "content": "informal_content/moment-generating-function.md"
     },
     "Markov's inequality": {
@@ -173,7 +173,7 @@ A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depend
       "mathlib_declarations": ["MeasureTheory.mul_meas_ge_le_lintegral"],
       "mathlib_file": "Mathlib/MeasureTheory/Integral/Lebesgue.lean",
       "mathlib_notes": "Markov's inequality for nonnegative measurable functions.",
-      "source_refs": [{"file": "high_dim_stats.pdf", "location": "Ch 1, Thm 1.5"}],
+      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, Thm 1.5"}],
       "content": "informal_content/markovs-inequality.md"
     },
     "Chernoff bound": {
@@ -186,7 +186,7 @@ A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depend
       "mathlib_declarations": ["ProbabilityTheory.measure_ge_le_exp_mul_mgf"],
       "mathlib_file": "Mathlib/Probability/Moments/Basic.lean",
       "mathlib_notes": "Generic exponential-Markov bound present; the optimized form is assembled.",
-      "source_refs": [{"file": "high_dim_stats.pdf", "location": "Ch 1, Thm 1.6"}],
+      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, Thm 1.6"}],
       "content": "informal_content/chernoff-bound.md"
     }
   }

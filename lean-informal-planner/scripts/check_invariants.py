@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Deterministic structural check for a formalization plan's graph.json.
 
-A review wave partitions the graph for responsibility, so each reviewer sees
-only its own slice; the global structural invariants that span the whole graph
-are nobody's local view. This checker is that global view. The orchestrator runs
-it after each review wave to confirm the wave kept the graph well-formed.
+A review wave partitions the graph by responsibility; this checker verifies the
+global structural invariants that span the whole graph. The orchestrator runs it
+after each review wave to confirm the graph stayed well-formed.
 
 It verifies, against skills/plan/references/plan-json-schema.md:
 

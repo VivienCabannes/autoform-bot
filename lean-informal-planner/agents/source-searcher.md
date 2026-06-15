@@ -42,7 +42,7 @@ or a one-line note on how the book frames it. Omit if the statement stands on it
 (e.g. "Theorem 2.4") when it has one.]
 ```
 
-Quote the essential statement; do not reproduce whole sections or proofs unless the query asks for the proof.
+Quote the essential statement; reproduce a full section or proof only when the query asks for it.
 
 ## Self-Critique
 

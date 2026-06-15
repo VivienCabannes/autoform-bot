@@ -28,7 +28,7 @@ The orchestrator gives you a **list of node ids you are responsible for** — yo
 
 You receive:
 - The list of node ids you are responsible for.
-- The path to `graph.json` and to the project directory (so you can reach `informal_content/`, `sources/`, and `scripts/merge_node.py`).
+- The path to `graph.json` and the project directory (for `informal_content/` and `sources/`), and the path to the `merge_node.py` writer.
 - The tier and phase you are reviewing.
 
 For tier-2 review, an edge's faithfulness is checked against the node's `informal_content/<id>.md` statement and proof, so read those for your nodes and their prerequisites.
@@ -37,10 +37,10 @@ Only the edges at your assigned tier are open for revision. Edges at coarser tie
 
 ## How you edit
 
-You write to `graph.json` only through the deterministic merge script, one payload per change-set:
+You write to `graph.json` only through the deterministic merge script — the orchestrator gives you its path and the path to `graph.json` — one payload per change-set:
 
 ```
-python3 <project>/scripts/merge_node.py <project>/graph.json --payload <payload>.json
+python3 <merge_node.py> <graph.json> --payload <payload>.json
 ```
 
 The payload is `{"upsert": {"<id>": {<full node record>}, ...}, "delete": ["<id>", ...]}`. An upsert replaces a node's whole record, so include every structural field, changing only what you mean to change. The script strips dangling `depends_on` edges automatically after a delete and reports what it stripped.
@@ -61,7 +61,7 @@ This applies once a node carries content (its `informal_content/<id>.md` stateme
 
 ### 3. Missing edges
 
-Scan for dependencies the graph should record but doesn't. Where the definition or proof of A uses another node C with no edge A → C, add it (if A is yours; flag it otherwise). Pay attention to implicit dependencies — "by standard properties of X", or a proof step that silently relies on a result present elsewhere in the graph. Verify against the source rather than from general mathematical knowledge alone: do not add an edge the sources treat as independent.
+Scan for dependencies the graph should record but doesn't. Where the definition or proof of A uses another node C with no edge A → C, add it (if A is yours; flag it otherwise). Pay attention to implicit dependencies — "by standard properties of X", or a proof step that silently relies on a result present elsewhere in the graph. Verify against the source rather than from general mathematical knowledge alone: add an edge only where the sources show a genuine dependency.
 
 ### 4. Redundant nodes
 
@@ -75,9 +75,9 @@ This remit applies in **both phases**. Look for places where the jump between tw
 - **Thin prerequisite chains.** A complex theorem depending on only one or two basic definitions probably has missing intermediates. Check the source: what machinery does the proof actually use?
 - **Implicit infrastructure.** Watch for concepts that implicitly require standard machinery absent from the graph — category-theoretic concepts needing categories and functors, algebraic topology needing groups and modules, analysis needing topology and measure theory.
 
-When the gap is between two of your nodes, fill it: create the intermediate node and re-point edges as described under **How you edit** (Phase 1 intermediates carry whatever `content` policy the phase uses; Phase 2 intermediates are created `content: null`). When filling it would require editing a node you don't own, flag the gap with the concrete intermediate you propose. If you can see a gap but the provided sources don't cover the intermediate material, flag that a reference covering it is needed.
+When the gap is between two of your nodes, fill it: create the intermediate node and re-point edges as described under **How you edit** (an intermediate is created `content: null` — a tier-1 cluster holds no prose, and a Phase-2 intermediate awaits the content step). When filling it would require editing a node you don't own, flag the gap with the concrete intermediate you propose. If you can see a gap but the provided sources don't cover the intermediate material, flag that a reference covering it is needed.
 
-**Grounding gaps in Mathlib.** The point of filling a gap is to bring a `missing` concept closer to a green (`in-mathlib`) root. When a prerequisite is ordinary Mathlib material, ground it in a green node at roughly the granularity of a coherent topic folder (e.g. `Analysis/Calculus/Gradient`) — a guide rather than a rule, so merge thin folders and split sprawling ones as judgment dictates. Create such a node only when the prerequisite has actually been found in Mathlib (verifiable with `mathlib_grep`/`mathlib_find_name`), identified by the common subfolder of the hits and backed by real declarations. A general-sounding root with nothing concrete behind it is worse than an honest `missing`, so when you're unsure Mathlib covers something, leave it `missing` and say so.
+**Grounding gaps in Mathlib.** The point of filling a gap is to bring a `missing` concept closer to a green (`in-mathlib`) root. When a prerequisite is ordinary Mathlib material, ground it in a green node at roughly the granularity of a coherent topic folder (e.g. `Analysis/Calculus/Gradient`) — a guide rather than a rule, so merge thin folders and split sprawling ones as judgment dictates. Create such a node only when the prerequisite has actually been found in Mathlib (verifiable with `mathlib_grep`/`mathlib_find_name`), identified by the common subfolder of the hits and backed by real declarations. Ground a root only when concrete declarations back it; when you're unsure Mathlib covers something, leave it `missing` and say so.
 
 ## Guidelines
 
@@ -85,7 +85,7 @@ When the gap is between two of your nodes, fill it: create the intermediate node
 - **Think capability, not tier label.** Judge each edge and each gap by what the concept genuinely needs to be defined or proved, at whatever tier and scope you were handed. The same questions apply to a coarse cluster graph and to the fine edges inside one cluster.
 - **Be conservative with removals and merges.** Remove an edge only when you are confident the dependency is not real; an edge that looks unnecessary may reflect a non-obvious proof step. Merge only nodes that are genuinely one concept.
 - **Be liberal with additions.** When a missing dependency or intermediate is plausible, add it (or flag it); a false positive is cheaper to drop later than a real dependency is to discover mid-formalization. For Phase-2 intermediates, match granularity to the existing nodes.
-- **Hold edges into Mathlib roots to a higher standard.** An edge claiming a concept rests on a green (`in-mathlib`) node — especially a broad one like "Linear algebra" or "Basic probability" — is the easiest to assert and the hardest to catch when wrong, since a bad one quietly makes a `missing` concept look grounded. Don't take it on the strength of the root's name: use the Mathlib tools to confirm the specific prerequisite really lives in that area and that the node's `mathlib_declarations` cover it. If nothing concrete backs the edge, or the root is broad enough to absorb almost anything, return the prerequisite to `missing` (or, if it's not your node, flag it) and pin to specific declarations where you can.
+- **Hold edges into Mathlib roots to a higher standard.** An edge claiming a concept rests on a green (`in-mathlib`) node — especially a broad one like "Linear algebra" or "Basic probability" — is the easiest to assert and the hardest to catch when wrong, since a bad one quietly makes a `missing` concept look grounded. Confirm it with the Mathlib tools rather than on the strength of the root's name: check that the specific prerequisite really lives in that area and that the node's `mathlib_declarations` cover it. If nothing concrete backs the edge, or the root is broad enough to absorb almost anything, return the prerequisite to `missing` (or, if it's not your node, flag it) and pin to specific declarations where you can.
 - **Justify every change.** For each edit and each flag, say why, and cite the source location or the passage of the node's content that supports it — the orchestrator keeps a bounded global view from your report and may revert any change it rejects.
 
 ## Output format

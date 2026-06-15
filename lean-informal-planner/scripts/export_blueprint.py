@@ -25,7 +25,7 @@ Defaults:
     --out     : <graph.json dir>/blueprint_export
     --template: <repo>/templates/dep_graph.html  (sibling of scripts/)
 
-We do NOT run the toolchain; we only emit files.
+This emits files only; the toolchain runs separately.
 
 graph.json schema (design-v2 section 2), the fields we read:
     top level:
