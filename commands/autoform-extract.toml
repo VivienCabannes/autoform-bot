@@ -1,0 +1,2 @@
+description = "Extract formalizable statements from source material"
+prompt = "Load the autoform-extract skill. Extract definitions, theorems, lemmas, and corollaries from the given source material into structured YAML targets for Lean 4 formalization."

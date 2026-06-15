@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">AutoForm Bot</title>
+  <desc id="desc">A Lean formalization plugin icon with a theorem page and proof check.</desc>
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+  <rect x="104" y="72" width="304" height="368" rx="36" fill="#f8fafc"/>
+  <path d="M152 144h208M152 192h140M152 240h208M152 288h92" stroke="#2563eb" stroke-width="24" stroke-linecap="round"/>
+  <path d="M206 360l46 46 88-112" fill="none" stroke="#16a34a" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="374" cy="122" r="46" fill="#2563eb"/>
+  <path d="M352 122h44M374 100v44" stroke="#f8fafc" stroke-width="14" stroke-linecap="round"/>
+</svg>

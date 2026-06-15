@@ -1,0 +1,2 @@
+description = "Review Lean 4 formalization for correctness and integrity"
+prompt = "Load the autoform-review skill. Review the current Lean 4 code for: compilation, faithfulness to source, mathematical correctness, Mathlib conventions, cheating patterns, and proper use of unproved declarations."
