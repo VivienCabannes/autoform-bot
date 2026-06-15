@@ -5,9 +5,10 @@
 
 # Skils and Commands
 ## Before a project
-- [ ] Setup a Lean project repo
-- [ ] Find relevant content on Zulip
-- [ ] Map a curriculum of results
+- [Vivien] Setup a Lean project repo
+- [Vivien] Find relevant content on Zulip
+    - [Vivien] Debug the Zulip MCP, how to make sure "zulip Python" library is installed
+- [Charles] Map a curriculum of results
 
 ## During a project
 - [ ] Formalize incrementally in a DAG fashion
