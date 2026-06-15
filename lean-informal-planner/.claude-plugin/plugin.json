@@ -1,7 +1,7 @@
 {
   "name": "lean-informal-planner",
   "description": "Plan Lean formalization efforts by mapping textbook concepts to Mathlib",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "hooks": {
     "SessionStart": [
       {

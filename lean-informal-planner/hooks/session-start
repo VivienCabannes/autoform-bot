@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-context="The Lean Informal Planner plugin is active. This plugin helps plan Lean 4 formalization efforts by building a dependency graph of mathematical concepts from textbooks and mapping them to Mathlib. When the user first interacts, introduce the plugin briefly and ask which textbook(s) to analyze (LaTeX, Markdown, or PDF) and which concepts or chapters are the formalization targets. Available skills: /lean-informal-planner:plan (full planning pipeline: extract concepts, build dependency graph, check Mathlib, review, visualize) and /lean-informal-planner:plan-view (regenerate and open the interactive graph visualization)."
+context="The Lean Informal Planner plugin is active. This plugin helps plan Lean 4 formalization efforts by building a tiered dependency graph from textbooks — coarse concept clusters first, then fine definitions and statements with their own paraphrased content — mapping it to Mathlib and rendering it as an interactive blueprint. When the user first interacts, introduce the plugin briefly and ask which textbook(s) to analyze (LaTeX, Markdown, or PDF) and which concepts or chapters are the formalization targets. Available skills: /lean-informal-planner:plan (the full two-phase planning pipeline) and /lean-informal-planner:plan-view (build and open the interactive blueprint, with a tier toggle)."
 
 escape_for_json() {
   local value="$1"

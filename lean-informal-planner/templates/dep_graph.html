@@ -1,0 +1,283 @@
+{# Tier-toggle dependency-graph template for the Lean Informal Planner.
+
+   Adapted from plastexdepgraph's stock templates/dep_graph.html. Differences:
+     * loads the generated blueprint/web/tier_dots.js sidecar (DOTS / DOT_TIERn,
+       TIERS_PRESENT, TIER_CLUSTER_MEMBERS, TIER_NODE_NAMES);
+     * adds a tier <select> control;
+     * replaces the single hard-coded renderDot(...) with a render(tier) function;
+     * defaults to the finest tier present;
+     * clicking a tier-1 "cluster" node (which has no per-statement modal) shows a
+       simple cluster summary instead of erroring;
+     * keeps the stock modal behavior for tier-2 (per-statement) nodes.
+
+   The per-statement modals below are still rendered by plasTeX from the parsed
+   tier-2 content, exactly as in the stock template, so tier-2 clicks work as
+   before. #}
+{% macro icon(icon, id='', class='') %}
+<svg  {% if id %}id="{{id}}" {% endif %}class="icon icon-{{ icon }} {{ class }}"><use xlink:href="symbol-defs.svg#icon-{{ icon }}"></use></svg>
+{% endmacro %}
+{% macro modal(id) %}
+    <div class="dep-modal-container" id="{{ id }}">
+      <div class="dep-modal-content">
+          <button class="dep-closebtn">{{ icon('cross') }}</button>
+        {{ caller() }}
+      </div>
+    </div>
+{% endmacro %}
+<!DOCTYPE html>
+<html>
+<head>
+  <title>{{ context.terms.get('Dependency graph', 'Dependency graph') }}</title>
+  <meta name="generator" content="plasTeX" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="styles/theme-{{ config['html5']['theme-css'] }}.css" />
+  <link rel="stylesheet" href="styles/dep_graph.css" />
+  {% if config.html5['use-mathjax'] %}
+  <script type="text/x-mathjax-config">
+  {% if config.html5['mathjax-dollars'] %}
+    MathJax.Hub.Config({tex2jax: {inlineMath: [['$','$'], ['\\(','\\)']]}});
+  {% else %}
+    MathJax.Hub.Config({tex2jax: {inlineMath: [ ['\\(','\\)']]}});
+  {% endif %}
+  </script>
+{% if config['mathjax-macros']['macros'] %}
+<script>
+  MathJax = {
+    tex: {
+      macros: { {% for key, val in config['mathjax-macros']['macros'].items() %}
+        {{ key }}: {{ val }},
+        {% endfor %}
+      } } }
+  </script>
+{% endif %}
+  <script type="text/javascript" src="{{ config.html5['mathjax-url'] }}">  </script>
+{% endif %}
+{% for css in config.html5.get('extra-css', []) %}
+<link rel="stylesheet" href="styles/{{ css }}" />
+{% endfor %}
+  <style>
+    #tier_controls { margin: 8px 0; font-size: 14px; }
+    #tier_controls select { font-size: 14px; padding: 2px 6px; }
+    .dep-cluster-summary { max-width: 32em; }
+    .dep-cluster-summary h3 { margin-top: 0; }
+    .dep-cluster-summary ul { margin: 0.4em 0 0 1.2em; }
+  </style>
+</head>
+
+<body>
+<header>
+  <a class="toc" href="index.html">Home</a>
+  <h1 id="doc_title">{{ title }}</h1>
+</header>
+<div class="wrapper">
+<div class="content">
+  <div id="Legend">
+    <span id="legend_title" class="title">Legend
+    <div class="btn">
+       <div class="bar"></div>
+       <div class="bar"></div>
+       <div class="bar"></div>
+    </div></span>
+    <dl class="legend">
+      {% for k, v in legend %}
+      <dt>{{ k }}</dt><dd>{{ v }}</dd>
+      {% endfor %}
+    </dl>
+  </div>
+    <div id="tier_controls">
+      <label for="tier_select">Tier:</label>
+      <select id="tier_select"></select>
+    </div>
+    <div id="graph"></div>
+<div id="statements">
+{# Cluster-summary modal: reused for any tier-1 (collapsed) node click. #}
+    {% call modal("dep_cluster_modal") %}
+      <div class="dep-cluster-summary" id="dep_cluster_body"></div>
+    {% endcall %}
+{%- for thm in graph.nodes | sort(attribute='id') %}
+
+    {% call modal(thm.id + "_modal") %}
+  <div class="thm" id="{{ thm.id }}" style="display: none">
+    <div class="thm_thmheading">
+      <span class="{{ thm.thmName }}_thmcaption">
+      {{ thm.caption }}
+      </span>
+      {% if thm.ref -%}
+      <span class="{{thm.thmName}}_thmlabel">{{thm.ref}}</span>
+      {%- endif -%}
+      {% if thm.title -%}
+      <span class="{{thm.thmName}}_thmtitle">{{ thm.title }}</span>
+      {%- endif -%}
+    </div>
+    <div class="thm_thmcontent">{{ thm }}</div>
+
+    <a class="latex_link" href="{{ thm.url }}">LaTeX</a>
+    {% for extra in extra_modal_links %}
+    {% include extra %}
+    {% endfor %}
+  </div>
+    {% endcall %}
+{%- endfor -%}
+</div>
+</div> <!-- content -->
+</div> <!-- wrapper -->
+<script src="js/jquery.min.js" type="text/javascript"></script>
+
+<script src="js/d3.min.js"></script>
+<script src="js/hpcc.min.js"></script>
+<script src="js/d3-graphviz.js"></script>
+
+{# Our generated per-tier DOT strings + cluster metadata. #}
+<script src="js/tier_dots.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const graphContainer = d3.select("#graph");
+
+// tier_dots.js defines DOTS, TIERS_PRESENT, TIER_CLUSTER_MEMBERS, TIER_NODE_NAMES,
+// TIER_NODE_DESC, TIER_PROVISIONAL.
+// Guard against a missing sidecar so the page degrades instead of throwing.
+const _DOTS = (typeof DOTS !== "undefined") ? DOTS : {};
+const _TIERS = (typeof TIERS_PRESENT !== "undefined" && TIERS_PRESENT.length)
+    ? TIERS_PRESENT
+    : Object.keys(_DOTS).map(Number).sort((a, b) => a - b);
+const _CLUSTER_MEMBERS = (typeof TIER_CLUSTER_MEMBERS !== "undefined") ? TIER_CLUSTER_MEMBERS : {};
+const _NODE_NAMES = (typeof TIER_NODE_NAMES !== "undefined") ? TIER_NODE_NAMES : {};
+const _NODE_DESC = (typeof TIER_NODE_DESC !== "undefined") ? TIER_NODE_DESC : {};
+const _PROVISIONAL = (typeof TIER_PROVISIONAL !== "undefined") ? TIER_PROVISIONAL : {};
+
+// Finest tier present = the largest tier number we have a DOT for.
+const FINEST_TIER = _TIERS.length ? _TIERS[_TIERS.length - 1] : null;
+let currentTier = FINEST_TIER;
+
+const _gv = graphContainer.graphviz({useWorker: true});
+
+function render(tier) {
+    if (tier === null || tier === undefined || !(tier in _DOTS)) {
+        return;
+    }
+    currentTier = Number(tier);
+    const w = graphContainer.node().clientWidth;
+    const h = graphContainer.node().clientHeight;
+    _gv.width(w)
+       .height(h)
+       .fit(true)
+       .renderDot(_DOTS[tier])
+       .on("end", interactive);
+}
+
+latexLabelEscaper = function(label) {
+  return label.replace(/\./g, '\\.').replace(/:/g, '\\:')
+}
+
+// A tier-1 cluster node has no per-statement modal; show its description, plus the
+// statements it contains (its split tier-2 nodes, or — in Phase 1, before it has
+// been split — its planned contents).
+function showClusterSummary(slug) {
+    const esc = function(s) { return $('<div>').text(s).html(); };
+    const name = _NODE_NAMES[slug] || slug;
+    const desc = _NODE_DESC[slug] || '';
+    const members = (_CLUSTER_MEMBERS[1] && _CLUSTER_MEMBERS[1][slug]) || [];
+    const planned = _PROVISIONAL[slug] || [];
+
+    let html = '<h3>' + esc(name) + '</h3>';
+    if (desc) {
+        html += '<p>' + esc(desc) + '</p>';
+    }
+    if (members.length) {
+        html += '<p>Contains ' + members.length + ' statement' +
+                (members.length === 1 ? '' : 's') + ':</p><ul>';
+        members.forEach(function(m) { html += '<li>' + esc(m) + '</li>'; });
+        html += '</ul><p>Switch to a finer tier to see individual statements.</p>';
+    } else if (planned.length) {
+        html += '<p>Planned contents (' + planned.length + '):</p><ul>';
+        planned.forEach(function(m) { html += '<li>' + esc(m) + '</li>'; });
+        html += '</ul>';
+    } else if (!desc) {
+        html += '<p>This cluster has no detailed statements yet.</p>';
+    }
+    $('#statements > div').hide();
+    $('.thm').hide();
+    $('#dep_cluster_body').html(html);
+    $('#dep_cluster_modal').show().children().show().children().show();
+    $('#statements').show();
+}
+
+clickNode = function() {
+  $("#statements div").hide()
+  var node_id = $('text', this).text();
+  $('.thm').hide();
+  $('#'+latexLabelEscaper(node_id)).show().children().show();
+}
+
+function interactive() {
+    $("span#legend_title").on("click", function () {
+           $(this).siblings('dl').toggle();
+        })
+
+    d3.selectAll('.node')
+        .attr('pointer-events', 'fill')
+        .on('click', function () {
+           var title = d3.select(this).selectAll('title').text().trim();
+           $('#statements > div').hide()
+           $('.thm').hide();
+           // Tier-1 cluster nodes (no per-statement modal): show a summary.
+           // We treat a node as a cluster if we're on tier 1 OR it has a known
+           // member list and no matching per-statement modal in the DOM.
+           var modalSel = '#' + latexLabelEscaper(title) + '_modal';
+           var isCluster = (Number(currentTier) === 1) ||
+                           ((_CLUSTER_MEMBERS[1] && _CLUSTER_MEMBERS[1][title]) &&
+                            $(modalSel).length === 0);
+           if (isCluster) {
+               showClusterSummary(title);
+               return;
+           }
+           if ($(modalSel).length === 0) {
+               // No modal and not a known cluster: no-op rather than erroring.
+               return;
+           }
+           $(modalSel).show().children().show().children().show();
+           $('#statements').show()
+        });
+
+    d3.selectAll('.dep-closebtn').on('click', function() {
+        var modal =
+            d3.select(this).node().parentNode.parentNode.parentNode ;
+        d3.select(modal).style('display', 'none');
+    });
+}
+
+// Populate the tier selector and wire it up.
+(function setupTierControl() {
+    const sel = document.getElementById('tier_select');
+    if (!_TIERS.length) {
+        sel.parentNode.style.display = 'none';
+        return;
+    }
+    if (_TIERS.length === 1) {
+        // Single tier: hide the control but still render it.
+        sel.parentNode.style.display = 'none';
+    }
+    _TIERS.forEach(function(t) {
+        const opt = document.createElement('option');
+        opt.value = String(t);
+        opt.textContent = 'Tier ' + t + (t === 1 ? ' (clusters)' : (t === FINEST_TIER ? ' (detailed)' : ''));
+        sel.appendChild(opt);
+    });
+    sel.value = String(FINEST_TIER);
+    sel.addEventListener('change', function() {
+        render(this.value);
+    });
+})();
+
+// Initial render: finest tier present.
+render(currentTier);
+</script>
+{% for js in config.html5.get('extra-js', []) %}
+{# tier_dots.js is loaded explicitly above; avoid loading it twice. #}
+{% if js != 'tier_dots.js' %}
+<script type="text/javascript" src="js/{{ js }}"></script>
+{% endif %}
+{% endfor %}
+</body>
+</html>
