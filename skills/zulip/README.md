@@ -5,8 +5,7 @@ Search the Lean/Mathlib community Zulip ([leanprover.zulipchat.com](https://lean
 ## What it does
 
 Searches Zulip for naming conventions, proof strategies, prior art, and
-API decisions. Available as both MCP tools (via the `autoform-zulip` server)
-and a standalone CLI script.
+API decisions via the `autoform-zulip` MCP server.
 
 ## Usage
 
@@ -16,19 +15,15 @@ and a standalone CLI script.
 
 Or naturally: "search Zulip for Hoeffding", "check if there's a Zulip discussion about this".
 
-## CLI commands
+## MCP tools
 
-The CLI script wraps `servers/zulip/core.py`:
-
-```bash
-python3 skills/zulip/zulip-search.py status                          # check config
-python3 skills/zulip/zulip-search.py search "query"                  # search messages
-python3 skills/zulip/zulip-search.py search "query" --stream mathlib4  # scoped search
-python3 skills/zulip/zulip-search.py streams                         # list streams
-python3 skills/zulip/zulip-search.py streams --filter math           # filter streams
-python3 skills/zulip/zulip-search.py topics "mathlib4"               # list topics
-python3 skills/zulip/zulip-search.py messages "stream" "topic"       # read thread
-```
+| Tool | Purpose |
+|------|---------|
+| `zulip_search` | Full-text search across messages (with optional stream/topic scope) |
+| `zulip_messages` | Read a conversation thread by stream + topic |
+| `zulip_streams` | List available streams (filterable) |
+| `zulip_topics` | List recent topics in a stream |
+| `zulip_status` | Check if `.zuliprc` is configured |
 
 ## Setup
 

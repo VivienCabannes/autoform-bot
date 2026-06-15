@@ -19,28 +19,10 @@ Search the Lean/Mathlib community Zulip before proving or naming anything non-tr
 
 ## How to use
 
-Run the script via bash:
-
-```bash
-# Check configuration
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" status
-
-# Search messages
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" search "Hoeffding inequality"
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" search "concentration" --stream mathlib4 --limit 10
-
-# List streams
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" streams
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" streams --filter math
-
-# List topics in a stream
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" topics "mathlib4"
-
-# Read a conversation thread
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/zulip/zulip-search.py" messages "Autoformalization" "Trellis"
-```
-
-All commands output JSON to stdout.
+1. Run `zulip_status` to verify configuration.
+2. Use `zulip_search` with mathematical terms (e.g., `"Hoeffding bound"`, `"concentration inequality"`).
+3. If a relevant topic is found, use `zulip_messages` to read the full thread.
+4. Use `zulip_streams` to discover available streams if unsure where to look.
 
 ## Key streams for Mathlib work
 
