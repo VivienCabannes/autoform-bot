@@ -56,7 +56,7 @@ The zulip server (`servers/zulip/`) is the reference implementation. Study its s
 
 6. **Test standalone.**
    ```bash
-   python -m servers.<name>
+   uv run python -m servers.<name>
    ```
    This starts the MCP server on stdio. You can test it with any MCP client.
 

@@ -3,7 +3,7 @@
 Pure logic, no MCP or CLI dependencies. Handles .zuliprc discovery
 and wraps the ``zulip`` Python package.
 
-Requires: pip install zulip
+Dependency: ``zulip`` (provided by the ``zulip`` extra in pyproject.toml).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def _zulip_module():
     except ImportError:
         raise RuntimeError(
             "The 'zulip' package is required for Zulip search.\n"
-            "Install it with: pip install 'autoform[zulip]' or pip install zulip"
+            "It should be installed automatically via uv. Run: /setup-autoform"
         )
     return zulip
 

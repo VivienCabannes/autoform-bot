@@ -9,7 +9,7 @@ This MCP server wraps ``aristotlelib`` to let any coding assistant delegate
 formalization tasks to Aristotle as a tool call. The assistant submits a task,
 polls for completion, retrieves results, and optionally steers a running task.
 
-Requires: pip install aristotlelib
+Dependency: ``aristotlelib`` (provided by the ``aristotle`` extra in pyproject.toml).
 API key: ARISTOTLE_API_KEY env var (mint at https://aristotle.harmonic.fun/dashboard/keys)
 """
 
@@ -74,7 +74,7 @@ class AristotleManager:
                 import aristotlelib
             except ImportError:
                 raise RuntimeError(
-                    "aristotlelib is not installed. Install with: pip install aristotlelib\n"
+                    "aristotlelib is not installed. Run: /setup-autoform\n"
                     "Get an API key at: https://aristotle.harmonic.fun/dashboard/keys"
                 )
             self._lib = aristotlelib

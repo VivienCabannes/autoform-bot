@@ -112,8 +112,7 @@ Search Mathlib first, write to MyBook/Chapter1/.
 For hard, self-contained proofs, delegate to [Aristotle](https://aristotle.harmonic.fun) (Harmonic's autonomous prover):
 
 ```bash
-# One-time setup
-pip install aristotlelib
+# One-time setup (handled automatically by uv if using the plugin)
 export ARISTOTLE_API_KEY=arstl_...
 ```
 

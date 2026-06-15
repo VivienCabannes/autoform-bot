@@ -37,5 +37,5 @@ This directory contains full reference implementations for stubbed components in
    ```
 5. If you changed any server wiring, test the server standalone:
    ```bash
-   python -m servers.repl
+   uv run python -m servers.repl
    ```
