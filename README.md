@@ -120,7 +120,7 @@ or reinstalling so the new skills and MCP servers are loaded.
 |-------|--------------|--------------|
 | Install Lean | `/install-lean` | Install Lean 4, elan, lake — auto-runs via hook |
 | Setup project | `/setup-project` | Create a new Lean 4 + Mathlib project from the LeanProject template |
-| Zulip search | `/zulip-search` | Search Lean Zulip for community discussions |
+| Zulip | `/zulip` | Search Lean Zulip for community discussions |
 
 ## MCP Servers
 
