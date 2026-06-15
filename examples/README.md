@@ -1,6 +1,6 @@
 # Examples
 
-This directory contains the full reference implementations for every stubbed component in the autoform plugin. Each subdirectory mirrors the top-level layout (`servers/`, `skills/`, `agents/`) and provides a complete, working version that you can copy into the corresponding stub location and adapt.
+This directory contains full reference implementations for stubbed components in the autoform plugin. Each subdirectory mirrors the top-level layout (`servers/`, `skills/`, `agents/`) and provides a complete, working version that you can copy into the corresponding stub location and adapt.
 
 ## Directory map
 
@@ -9,18 +9,16 @@ This directory contains the full reference implementations for every stubbed com
 | `servers/repl/core.py` | Lean REPL subprocess with non-blocking I/O, import caching, memory monitoring, auto-restart | `servers/repl/core.py` |
 | `servers/repl/pool.py` | Thread pool with queue-based dispatch, staggered startup, memory monitoring | `servers/repl/pool.py` |
 | `servers/repl/server.py` | FastMCP server wiring for the REPL pool | `servers/repl/server.py` |
-| `servers/mathlib/core.py` | Ripgrep-based Mathlib search, name finder, file reader | `servers/mathlib/core.py` |
-| `servers/mathlib/server.py` | FastMCP server wiring for Mathlib search | `servers/mathlib/server.py` |
 | `servers/lsp/server.py` | Lean LSP session (JSON-RPC), diagnostics, hover | `servers/lsp/server.py` |
-| `servers/trace/core.py` | Append-only JSONL trace store with filtering and summaries | `servers/trace/core.py` |
-| `servers/trace/server.py` | FastMCP server wiring for trace recording and querying | `servers/trace/server.py` |
 | `servers/aristotle/server.py` | AristotleManager with multi-session support, polling, steering | `servers/aristotle/server.py` |
-| `skills/autoform/SKILL.md` | Complete Mathlib conventions (full tactic tables, pitfall lists, simp rules) | `skills/autoform/SKILL.md` |
-| `skills/autoform-prove/SKILL.md` | Full proof strategies and workflow | `skills/autoform-prove/SKILL.md` |
-| `skills/autoform-review/SKILL.md` | Complete review checklist | `skills/autoform-review/SKILL.md` |
-| `skills/autoform-quality/SKILL.md` | Full quality inspection rules | `skills/autoform-quality/SKILL.md` |
-| `skills/autoform-extract/SKILL.md` | Complete extraction workflow | `skills/autoform-extract/SKILL.md` |
-| `skills/autoform-crew/SKILL.md` | Full crew orchestration protocol | `skills/autoform-crew/SKILL.md` |
+| `servers/mathlib/` | Ripgrep-based Mathlib search, name finder, file reader | *(no stub — standalone reference)* |
+| `servers/trace/` | Append-only JSONL trace store with filtering and summaries | *(no stub — standalone reference)* |
+| `skills/autoform/SKILL.md` | Complete Mathlib conventions (full tactic tables, pitfall lists, simp rules) | *(new skill — create `skills/autoform/`)* |
+| `skills/autoform-prove/SKILL.md` | Full proof strategies and workflow | *(new skill — create `skills/autoform-prove/`)* |
+| `skills/autoform-review/SKILL.md` | Complete review checklist | *(new skill — create `skills/autoform-review/`)* |
+| `skills/autoform-quality/SKILL.md` | Full quality inspection rules | *(new skill — create `skills/autoform-quality/`)* |
+| `skills/autoform-extract/SKILL.md` | Complete extraction workflow | *(new skill — create `skills/autoform-extract/`)* |
+| `skills/autoform-crew/SKILL.md` | Full crew orchestration protocol | *(new skill — create `skills/autoform-crew/`)* |
 | `agents/autoform-worker.md` | Rich worker prompt with 5-step workflow, rules, integrity checks | `agents/autoform-worker.md` |
 | `agents/autoform-reviewer.md` | Full reviewer prompt with 6-point checklist | `agents/autoform-reviewer.md` |
 | `agents/autoform-reader.md` | Complete reader prompt with reading strategies | `agents/autoform-reader.md` |

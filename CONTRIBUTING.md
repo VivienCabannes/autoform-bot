@@ -95,7 +95,7 @@ pytest tests/
 The test suite checks:
 - Every server module imports without error
 - Every `create_*_server()` function returns a FastMCP instance
-- The workspace server's `inspect_workspace()` returns a dict with expected keys
+- The zulip skill's config discovery and CLI work correctly
 
 ## Style
 

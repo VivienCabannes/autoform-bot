@@ -34,7 +34,27 @@ Put your book as `book.md` (or `book.pdf`) in the project directory.
 
 ## Workflow
 
-### Step 1: Extract targets
+> **Note:** The workflow below describes the full vision. Steps marked ⬜ use
+> skills or tools that are not yet implemented — see the tables at the bottom
+> for current status. Steps marked ✅ work today.
+
+### Step 0: Inspect the project ✅
+
+```
+/workspace
+```
+
+Scans your Lean project for sorry/axiom counts, declarations, and targets files.
+
+### Step 1: Search Zulip for prior art ✅
+
+```
+/zulip
+
+Search Zulip for "concentration inequality" to find naming conventions and existing work.
+```
+
+### Step 2: Extract targets ⬜
 
 ```
 /autoform-extract
@@ -44,7 +64,7 @@ Extract formalizable statements from book.md into targets.yaml
 
 This produces a structured YAML file with definitions, theorems, lemmas — each with an ID, source reference, LaTeX statement, dependencies, and whether the book provides a proof.
 
-### Step 2: Formalize definitions first
+### Step 3: Formalize definitions first ⬜
 
 Pick definitions in dependency order:
 
@@ -55,13 +75,7 @@ Formalize Definition 1.1 (Convex set) from targets.yaml.
 Search Mathlib first — this likely already exists.
 ```
 
-The agent will:
-1. Search Mathlib with `mathlib_grep` / `mathlib_find_name` to check if the concept exists
-2. If not, write the Lean 4 definition following Mathlib conventions
-3. Verify it compiles with `run_lean_code`
-4. Write the `.lean` file
-
-### Step 3: Prove theorems
+### Step 4: Prove theorems ⬜
 
 ```
 /autoform-prove
@@ -70,13 +84,7 @@ Prove Theorem 1.2 (Convex combination characterization).
 The definition it depends on is in MyBook/ConvexSets.lean.
 ```
 
-The agent will:
-1. Read the source statement from the book
-2. Search Mathlib for relevant lemmas
-3. Prototype proof fragments in the REPL (`run_lean_code`)
-4. Iterate until the proof compiles without `sorry`
-
-### Step 4: Review
+### Step 5: Review ⬜
 
 ```
 /autoform-review
@@ -84,24 +92,6 @@ The agent will:
 Review MyBook/ConvexSets.lean against Section 1 of book.md.
 Check faithfulness, cheating patterns, and sorry/axiom usage.
 ```
-
-The review checks:
-- Compilation (via LSP diagnostics)
-- Faithfulness to source material
-- Mathematical correctness
-- Mathlib conventions
-- Cheating patterns (trivial substitution, smuggled assumptions, etc.)
-- Proper use of `unproved` vs `sorry` vs `axiom`
-
-### Step 5: Quality check (optional)
-
-```
-/autoform-quality
-
-Check MyBook/ConvexSets.lean for Mathlib style compliance.
-```
-
-Pure style review — naming, tactics, proof structure. Does not evaluate mathematical correctness.
 
 ### Step 6: Repeat
 
@@ -211,7 +201,5 @@ aristotle_wait("thm-5-5")     # block until done
 | 5+ worker agents in parallel on separate worktrees | One agent at a time (subagents for batching) |
 | Automatic review → reject → retry loops | You run `/autoform-review` and decide |
 | Multi-node SLURM scaling | Single machine |
-| Persistent task tracker with status lifecycle | Trace server records progress |
-| Visualizer dashboard | Trace JSONL (viewer TODO) |
 
 The plugin is best for **focused formalization sessions** — a chapter at a time, interactively. For full-book autonomous formalization, rebuild the orchestration layer on top of the plugin's MCP servers.

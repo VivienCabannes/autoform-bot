@@ -6,12 +6,12 @@ Autoform gives your coding assistant the knowledge and tools to translate mathem
 
 ## Status: Template
 
-This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, discovery files) is complete. Domain-specific skills (conventions, proof strategies, review checklists) are left for future PRs:
+This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, MCP servers) is complete. Domain-specific skills (conventions, proof strategies, review checklists) are left for future PRs:
 
 | Component | Status | What's there | What PRs add |
 |-----------|--------|-------------|--------------|
 | **Setup skills** (install-lean, setup-project) | ✅ Full | Scripts + hook-driven auto-execution | — |
-| **Workspace** (skill + script) | ✅ Full | Project scan, sorry/axiom counts, declarations | — |
+| **Workspace** (skill + script) | ✅ Full | Scan project structure, sorry/axiom counts | — |
 | **Zulip** (server + skill) | ✅ Full | Search Lean Zulip for community discussions | — |
 | **Servers** (repl, lsp, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
 | **Formalization skills** | ⬜ Not yet | — | Conventions, proof strategies, review, extraction, orchestration |
