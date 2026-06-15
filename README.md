@@ -10,7 +10,7 @@ This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, M
 
 | Component | Status | What's there | What PRs add |
 |-----------|--------|-------------|--------------|
-| **Setup skills** (install-lean, setup-project) | ✅ Full | Scripts + hook-driven auto-execution | — |
+| **Setup skills** (install-lean, setup-project, setup-autoform) | ✅ Full | Scripts + hook-driven auto-execution | — |
 | **Workspace** (skill + script) | ✅ Full | Scan project structure, sorry/axiom counts | — |
 | **Zulip** (server + skill) | ✅ Full | Search Lean Zulip for community discussions | — |
 | **Servers** (repl, lsp, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
@@ -132,7 +132,7 @@ or reinstalling so the new skills and MCP servers are loaded.
 |-------|--------------|--------------|
 | Install Lean | `/install-lean` | Install Lean 4, elan, lake — auto-runs via hook |
 | Setup project | `/setup-project` | Create a new Lean 4 + Mathlib project from the LeanProject template |
-| Setup Zulip | `/setup-zulip` | Check uv, zulip package, .zuliprc credentials, and connectivity |
+| Setup autoform | `/setup-autoform` | Check uv, Python deps, Lean 4, and Zulip — install what's missing |
 | Workspace | `/workspace` | Scan project structure, sorry/axiom counts, declarations |
 | Zulip | `/zulip` | Search Lean Zulip for community discussions |
 

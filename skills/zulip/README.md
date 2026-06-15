@@ -27,7 +27,7 @@ Or naturally: "search Zulip for Hoeffding", "check if there's a Zulip discussion
 
 ## Setup
 
-Run `/setup-zulip` to check prerequisites and configure access, or set up manually:
+Run `/setup-autoform` to check prerequisites and configure access, or set up manually:
 
 ### Prerequisites
 

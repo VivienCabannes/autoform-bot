@@ -27,7 +27,7 @@ def create_zulip_server() -> FastMCP:
         return json.dumps({
             "error": "Zulip is not configured.",
             "setup": (
-                "Run /setup-zulip to configure Zulip access, or manually:\n"
+                "Run /setup-autoform to configure the full environment, or manually:\n"
                 "1. Get your API key at https://leanprover.zulipchat.com/#settings/account\n"
                 "2. Create ~/.zuliprc with [api] email, key, and site fields\n"
                 "3. Ensure the 'zulip' Python package is installed (handled by uv)"
