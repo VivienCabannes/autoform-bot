@@ -1,4 +1,6 @@
 .DS_Store
+.claude/
+.zuliprc
 node_modules/
 dist/
 *.skill
