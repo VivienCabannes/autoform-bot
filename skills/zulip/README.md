@@ -4,9 +4,9 @@ Search the Lean/Mathlib community Zulip ([leanprover.zulipchat.com](https://lean
 
 ## What it does
 
-A self-contained Python script that searches Zulip for naming conventions,
-proof strategies, prior art, and API decisions. No MCP server — just run
-the script via bash and read the JSON output.
+Searches Zulip for naming conventions, proof strategies, prior art, and
+API decisions. Available as both MCP tools (via the `autoform-zulip` server)
+and a standalone CLI script.
 
 ## Usage
 
@@ -16,7 +16,9 @@ the script via bash and read the JSON output.
 
 Or naturally: "search Zulip for Hoeffding", "check if there's a Zulip discussion about this".
 
-## Commands
+## CLI commands
+
+The CLI script wraps `servers/zulip/core.py`:
 
 ```bash
 python3 skills/zulip/zulip-search.py status                          # check config
@@ -30,8 +32,7 @@ python3 skills/zulip/zulip-search.py messages "stream" "topic"       # read thre
 
 ## Setup
 
-The script authenticates via a `.zuliprc` file. It searches these locations
-in order (first found wins):
+Authenticates via a `.zuliprc` file. Searched in order (first found wins):
 
 1. `$ZULIPRC` env var (explicit override)
 2. `$LEAN_PROJECT_DIR/.zuliprc` (project-specific)
@@ -56,11 +57,8 @@ EOF
 chmod 600 ~/.zuliprc
 ```
 
-Replace `YOUR_ZULIP_EMAIL` and `YOUR_API_KEY` with your actual credentials.
-
-> **Tip:** Use a project-local `.zuliprc` (at the root of your git repo) if you
-> work with multiple Zulip organizations. Add `.zuliprc` to your `.gitignore`
-> to avoid leaking credentials.
+> **Tip:** Use a project-local `.zuliprc` if you work with multiple Zulip
+> organizations. Add `.zuliprc` to your `.gitignore`.
 
 ## Dependencies
 

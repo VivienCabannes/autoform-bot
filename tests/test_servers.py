@@ -87,7 +87,7 @@ class TestAristotleServer:
 
 
 # ---------------------------------------------------------------------------
-# Zulip server — wraps skills/zulip/zulip-search.py
+# Zulip server
 # ---------------------------------------------------------------------------
 
 
@@ -97,6 +97,10 @@ class TestZulipServer:
     def test_import_server(self):
         """The Zulip server module should import without error."""
         from servers.zulip import server  # noqa: F401
+
+    def test_import_core(self):
+        """The Zulip core module should import without error."""
+        from servers.zulip import core  # noqa: F401
 
     def test_create_server(self):
         """create_zulip_server should return a FastMCP instance."""

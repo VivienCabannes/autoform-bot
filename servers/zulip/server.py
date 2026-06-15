@@ -1,46 +1,25 @@
-"""Zulip search MCP server — find community discussions about Lean and Mathlib.
-
-Thin FastMCP wrapper around skills/zulip/zulip-search.py.
-The skill script is the single source of truth for ZulipClient and config discovery.
-"""
+"""Zulip search MCP server — find community discussions about Lean and Mathlib."""
 
 from __future__ import annotations
 
-import importlib.util
+import configparser
 import json
-import sys
-from pathlib import Path
 
 from fastmcp.server import FastMCP
 
-
-def _load_skill():
-    """Import the zulip-search.py skill script."""
-    script = Path(__file__).resolve().parent.parent.parent / "skills" / "zulip" / "zulip-search.py"
-    spec = importlib.util.spec_from_file_location("zulip_search", str(script))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_skill = _load_skill()
+from .core import ZulipClient, find_zuliprc, get_client
 
 
 def create_zulip_server() -> FastMCP:
     """Create a FastMCP server for searching Zulip discussions."""
     server = FastMCP(name="autoform-zulip")
 
-    _client = None
+    _client: ZulipClient | None = None
 
-    def _get_client():
+    def _get_client() -> ZulipClient:
         nonlocal _client
         if _client is None:
-            rc = _skill.find_zuliprc()
-            if rc is None:
-                raise FileNotFoundError(
-                    "No .zuliprc found. Run zulip_status for search locations."
-                )
-            _client = _skill.ZulipClient(config_file=str(rc))
+            _client = get_client()
         return _client
 
     @server.tool
@@ -97,7 +76,7 @@ def create_zulip_server() -> FastMCP:
         Reports which .zuliprc file was found and which site it points to.
         Does not reveal the API key.
         """
-        rc = _skill.find_zuliprc()
+        rc = find_zuliprc()
         if rc is None:
             return json.dumps({
                 "configured": False,
@@ -106,7 +85,6 @@ def create_zulip_server() -> FastMCP:
                     "~/.zuliprc, ~/.config/.zuliprc, ~/.config/zulip/.zuliprc, ~/.config/zuliprc"
                 ),
             })
-        import configparser
         config = configparser.ConfigParser()
         config.read(str(rc))
         return json.dumps({
