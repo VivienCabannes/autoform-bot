@@ -34,6 +34,18 @@ Assistant: *searches Mathlib for existing lemmas, uses correct typeclasses,
            writes idiomatic proofs, flags what the book leaves unproved*
 ```
 
+## Prerequisites
+
+- **Python ≥ 3.10**
+- **[uv](https://docs.astral.sh/uv/)** — manages Python dependencies for MCP servers automatically
+
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+  All MCP servers run via `uv run`, which resolves dependencies from `pyproject.toml`
+  on first launch — no manual `pip install` needed.
+
 ## Install
 
 ### Claude Code
@@ -120,6 +132,7 @@ or reinstalling so the new skills and MCP servers are loaded.
 |-------|--------------|--------------|
 | Install Lean | `/install-lean` | Install Lean 4, elan, lake — auto-runs via hook |
 | Setup project | `/setup-project` | Create a new Lean 4 + Mathlib project from the LeanProject template |
+| Setup Zulip | `/setup-zulip` | Check uv, zulip package, .zuliprc credentials, and connectivity |
 | Workspace | `/workspace` | Scan project structure, sorry/axiom counts, declarations |
 | Zulip | `/zulip` | Search Lean Zulip for community discussions |
 
