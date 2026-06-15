@@ -5,7 +5,7 @@ description: >
   "show the graph", "open the visualization", "regenerate the graph",
   "refresh the plan view", or wants to see the interactive tiered
   dependency graph for a formalization plan.
-version: 0.2.0
+version: 0.3.0
 ---
 
 # Plan Visualization

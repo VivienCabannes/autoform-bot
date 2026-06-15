@@ -5,7 +5,7 @@ description: >
   "build a dependency graph", "map concepts to Mathlib", "analyze a textbook
   for formalization", "create a formalization plan", "chart mathematical concepts",
   or wants to plan Lean 4 formalization work from textbook sources.
-version: 0.2.0
+version: 0.3.0
 ---
 
 # Formalization Planning

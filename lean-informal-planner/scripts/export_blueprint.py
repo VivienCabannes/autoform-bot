@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export a leanblueprint project from a v2 graph.json + informal_content/*.md.
 
-Given a ``graph.json`` (schema in design-v2 section 2) and an ``informal_content/``
+Given a ``graph.json`` (schema in skills/plan/references/plan-json-schema.md) and an ``informal_content/``
 directory of ``<id>.md`` files, this generates a complete, ready-to-build blueprint
 project under an output directory:
 
@@ -27,7 +27,7 @@ Defaults:
 
 This emits files only; the toolchain runs separately.
 
-graph.json schema (design-v2 section 2), the fields we read:
+graph.json schema (see skills/plan/references/plan-json-schema.md), the fields we read:
     top level:
         nodes : either a dict keyed by id, OR a list of node objects.
                 (Design says "a map of nodes keyed by id"; we also accept a list
