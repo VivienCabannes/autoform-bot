@@ -11,7 +11,7 @@ This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, d
 | Component | Status | What's there | What PRs add |
 |-----------|--------|-------------|--------------|
 | **Setup skills** (install-lean, setup-project) | ✅ Full | Scripts + hook-driven auto-execution | — |
-| **Zulip search** (server + skill) | ✅ Full | Zulip API search for community discussions | — |
+| **Zulip** (skill + script) | ✅ Full | Search Lean Zulip for community discussions | — |
 | **Workspace server** | ✅ Full | Project scan, sorry/axiom counts, declarations | — |
 | **Other servers** (repl, mathlib, lsp, trace, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
 | **Formalization skills** | ⬜ Not yet | — | Conventions, proof strategies, review, extraction, orchestration |
@@ -127,7 +127,6 @@ or reinstalling so the new skills and MCP servers are loaded.
 | Server | Status | What it does |
 |--------|--------|-------------|
 | `autoform-workspace` | ✅ | Scan project structure, sorry/axiom counts, targets |
-| `autoform-zulip` | ✅ | Search Lean Zulip for community discussions |
 | `autoform-repl` | ⬜ | Lean 4 REPL — run code, verify proofs |
 | `autoform-mathlib` | ⬜ | Mathlib source search — grep, find by name, read files |
 | `autoform-lsp` | ⬜ | Lean 4 LSP — file diagnostics, type info |

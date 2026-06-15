@@ -73,15 +73,6 @@
         "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
       },
       "description": "Aristotle (Harmonic) — delegate formalization to an autonomous prover"
-    },
-    "autoform-zulip": {
-      "command": "python",
-      "args": ["-m", "servers.zulip.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Zulip search — find community discussions about naming, proofs, and prior art"
     }
   }
 }
