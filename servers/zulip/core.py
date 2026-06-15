@@ -34,8 +34,9 @@ def find_zuliprc(project_dir: str | None = None) -> Path | None:
     1. $ZULIPRC env var (explicit override)
     2. <project_dir>/.zuliprc (project-specific)
     3. ~/.zuliprc (standard Zulip client location)
-    4. ~/.config/zulip/.zuliprc
-    5. ~/.config/zuliprc
+    4. ~/.config/.zuliprc
+    5. ~/.config/zulip/.zuliprc
+    6. ~/.config/zuliprc
     """
     # 1. Explicit env var
     env_path = os.environ.get("ZULIPRC")
@@ -58,7 +59,7 @@ def find_zuliprc(project_dir: str | None = None) -> Path | None:
 
     # 3-5. Home directory locations
     home = Path.home()
-    for rel in (".zuliprc", ".config/zulip/.zuliprc", ".config/zuliprc"):
+    for rel in (".zuliprc", ".config/.zuliprc", ".config/zulip/.zuliprc", ".config/zuliprc"):
         candidate = home / rel
         if candidate.is_file():
             return candidate
@@ -224,8 +225,9 @@ def get_client(config_file: str | None = None) -> ZulipClient:
                 "  1. $ZULIPRC env var\n"
                 "  2. $LEAN_PROJECT_DIR/.zuliprc\n"
                 "  3. ~/.zuliprc\n"
-                "  4. ~/.config/zulip/.zuliprc\n"
-                "  5. ~/.config/zuliprc\n\n"
+                "  4. ~/.config/.zuliprc\n"
+                "  5. ~/.config/zulip/.zuliprc\n"
+                "  6. ~/.config/zuliprc\n\n"
                 "Create one with:\n"
                 "  [api]\n"
                 "  email=your-email@example.com\n"
