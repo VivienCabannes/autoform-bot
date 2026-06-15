@@ -1,7 +1,9 @@
 # TODO
 
 - Test installation instruction for Claude Code, Codex and others
+- Extend the skills and commands
 
+# Skils and Commands
 ## Before a project
 - [ ] Setup a Lean project repo
 - [ ] Find relevant content on Zulip
