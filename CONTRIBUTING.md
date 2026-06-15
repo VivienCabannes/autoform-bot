@@ -10,12 +10,9 @@ Autoform is a **template plugin** — the wiring (manifests, hooks, discovery fi
 
 | Component | Location | Status | Difficulty | Notes |
 |-----------|----------|--------|------------|-------|
-| **Workspace server** | `servers/workspace/` | ✅ Implemented | — | Reference implementation |
-| **Zulip server** | `servers/zulip/` | ✅ Implemented | — | Zulip API search |
+| **Zulip server** | `servers/zulip/` | ✅ Implemented | — | Wraps `skills/zulip/zulip-search.py` |
 | **REPL server** | `servers/repl/` | ⬜ Stub | Hard | Subprocess management, non-blocking I/O, memory monitoring |
-| **Mathlib server** | `servers/mathlib/` | ⬜ Stub | Medium | Ripgrep-based search; tools return "not implemented" |
 | **LSP server** | `servers/lsp/` | ⬜ Stub | Hard | JSON-RPC language server, Content-Length framing, diagnostics |
-| **Trace server** | `servers/trace/` | ⬜ Stub | Easy | JSONL append-only store; straightforward file I/O |
 | **Aristotle server** | `servers/aristotle/` | ⬜ Stub | Medium | Multi-session wrapper around `aristotlelib`; requires API key |
 
 ### Skills (new)
@@ -41,9 +38,9 @@ These skills don't exist yet. Create them from scratch — see `examples/skills/
 
 ## How to contribute a server
 
-The workspace server (`servers/workspace/`) is the reference implementation. Study its structure first.
+The zulip server (`servers/zulip/`) is the reference implementation. Study its structure first.
 
-1. **Read the reference.** Look at `servers/workspace/core.py` (pure logic, no MCP imports) and `servers/workspace/server.py` (FastMCP wrapper with `create_*_server()` factory and `__main__` block).
+1. **Read the reference.** Look at `servers/zulip/server.py` (FastMCP wrapper importing from a skill script) and `skills/zulip/zulip-search.py` (pure logic). For stubs, the server file already has tool definitions that return "not implemented".
 
 2. **Read the example.** The `examples/servers/<name>/` directory contains a full working implementation for the server you want to build. This is your primary reference.
 
@@ -73,9 +70,7 @@ Skills are Markdown files with YAML frontmatter. Each skill is a self-contained 
 
 3. **Add scripts if needed.** If the skill automates a task, put the script alongside the SKILL.md (e.g. `skills/<name>/<name>.sh`). Add a case to `hooks/user-prompt-submit` to auto-run it.
 
-4. **Update discovery files.** Add `@skills/<name>/SKILL.md` to `AGENTS.md` and `GEMINI.md`.
-
-5. **Preserve the YAML frontmatter.** The `name`, `description`, and trigger patterns control when the skill is loaded.
+4. **Preserve the YAML frontmatter.** The `name`, `description`, and trigger patterns control when the skill is loaded.
 
 ## How to contribute an agent prompt
 
@@ -106,7 +101,7 @@ The test suite checks:
 
 - **Python:** Follow `ruff` with 120-character line length. Run `ruff check servers/` before submitting.
 - **Markdown:** YAML frontmatter is required for all skills and agents. Follow the existing section structure.
-- **Follow existing patterns.** When in doubt, look at the workspace server (for Python) or `skills/install-lean/` (for skills with scripts).
+- **Follow existing patterns.** When in doubt, look at the zulip server (for Python) or `skills/install-lean/` (for skills with scripts).
 
 ## PR guidelines
 

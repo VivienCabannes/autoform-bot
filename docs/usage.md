@@ -159,48 +159,47 @@ aristotle_wait("thm-5-5")     # block until done
 
 ## Slash commands reference
 
-| Command | What it does |
-|---------|-------------|
-| `/autoform` | Load Mathlib & Lean 4 conventions |
-| `/autoform-prove` | Load proof strategies and workflow guidance |
-| `/autoform-review` | Review formalization for correctness and integrity |
-| `/autoform-quality` | Check code quality against Mathlib conventions |
-| `/autoform-extract` | Extract statements from source material |
-| `/autoform-crew` | Orchestrate parallel formalization with subagent teams |
+| Command | What it does | Status |
+|---------|-------------|--------|
+| `/install-lean` | Install Lean 4, elan, lake | ✅ |
+| `/setup-project` | Create new Lean 4 + Mathlib project | ✅ |
+| `/workspace` | Inspect project structure and health | ✅ |
+| `/zulip` | Search Lean Zulip for community discussions | ✅ |
+| `/autoform` | Load Mathlib & Lean 4 conventions | ⬜ Not yet |
+| `/autoform-prove` | Load proof strategies and workflow guidance | ⬜ Not yet |
+| `/autoform-review` | Review formalization for correctness and integrity | ⬜ Not yet |
+| `/autoform-quality` | Check code quality against Mathlib conventions | ⬜ Not yet |
+| `/autoform-extract` | Extract statements from source material | ⬜ Not yet |
+| `/autoform-crew` | Orchestrate parallel formalization with subagent teams | ⬜ Not yet |
 
 ## MCP tools available
 
-| Tool | Server | What it does |
-|------|--------|-------------|
-| `run_lean_code` | repl | Run Lean code and return diagnostics |
-| `get_repl_status` | repl | Check REPL pool health |
-| `mathlib_grep` | mathlib | Search Mathlib source by pattern |
-| `mathlib_find_name` | mathlib | Find declarations by name |
-| `mathlib_read_file` | mathlib | Read a Mathlib source file |
-| `lean_diagnostic_messages` | lsp | Get file compilation diagnostics |
-| `lean_hover` | lsp | Get type info at a position |
-| `record_proof_attempt` | trace | Record a proof attempt |
-| `record_step` | trace | Record an agent action |
-| `record_review` | trace | Record a review decision |
-| `get_progress` | trace | Get run summary |
-| `get_proof_attempts` | trace | Get recent proof attempts |
-| `get_reviews` | trace | Get recent reviews |
-| `aristotle_submit` | aristotle | Submit a formalization task to Aristotle |
-| `aristotle_wait` | aristotle | Block until an Aristotle task completes |
-| `aristotle_poll` | aristotle | Non-blocking status check |
-| `aristotle_steer` | aristotle | Redirect a running task with new instructions |
-| `aristotle_events` | aristotle | Inspect what Aristotle is doing |
-| `aristotle_sessions` | aristotle | List all active Aristotle sessions |
+| Tool | Server | What it does | Status |
+|------|--------|-------------|--------|
+| `zulip_search` | zulip | Search Zulip messages by keyword | ✅ |
+| `zulip_messages` | zulip | Fetch messages from a stream/topic | ✅ |
+| `zulip_streams` | zulip | List available streams | ✅ |
+| `zulip_topics` | zulip | List topics in a stream | ✅ |
+| `zulip_status` | zulip | Check .zuliprc configuration | ✅ |
+| `run_lean_code` | repl | Run Lean code and return diagnostics | ⬜ Stub |
+| `get_repl_status` | repl | Check REPL pool health | ⬜ Stub |
+| `lean_diagnostic_messages` | lsp | Get file compilation diagnostics | ⬜ Stub |
+| `lean_hover` | lsp | Get type info at a position | ⬜ Stub |
+| `aristotle_submit` | aristotle | Submit a formalization task to Aristotle | ⬜ Stub |
+| `aristotle_wait` | aristotle | Block until an Aristotle task completes | ⬜ Stub |
+| `aristotle_poll` | aristotle | Non-blocking status check | ⬜ Stub |
+| `aristotle_steer` | aristotle | Redirect a running task with new instructions | ⬜ Stub |
+| `aristotle_events` | aristotle | Inspect what Aristotle is doing | ⬜ Stub |
+| `aristotle_sessions` | aristotle | List all active Aristotle sessions | ⬜ Stub |
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `LEAN_PROJECT_DIR` | `.` | Lean project directory for REPL, mathlib, LSP |
+| `LEAN_PROJECT_DIR` | `.` | Lean project directory for REPL, LSP, Zulip config discovery |
 | `LEAN_REPL_CMD` | `lake exe repl` | Command to start the REPL |
 | `LEAN_NUM_REPLS` | auto (from RAM) | Number of parallel REPL instances |
-| `AUTOFORM_TRACE_DIR` | `./traces` | Directory for trace JSONL files |
-| `AUTOFORM_RUN_ID` | `default` | Current run identifier |
+| `ZULIPRC` | auto-discovered | Path to .zuliprc file (overrides discovery chain) |
 | `ARISTOTLE_API_KEY` | — | Harmonic API key (required for Aristotle) |
 | `ARISTOTLE_DOWNLOAD_DIR` | `./aristotle-output` | Where Aristotle downloads result files |
 

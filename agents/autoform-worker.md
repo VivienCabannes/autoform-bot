@@ -5,7 +5,7 @@ description: >
   writes proofs, and self-checks. Use for formalization tasks that
   require writing and compiling Lean code.
 tools: [Read, Grep, Glob, Bash, Edit, Write]
-mcpServers: [autoform-repl, autoform-mathlib, autoform-trace]
+mcpServers: [autoform-repl, autoform-zulip]
 model: opus
 ---
 
