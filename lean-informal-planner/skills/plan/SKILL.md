@@ -68,7 +68,10 @@ This step operates at **cluster grain**:
 
 The coarse graph passes through two sequential review waves — editing, then holistic. They run in sequence by necessity: the holistic wave needs the whole graph the editing wave produced (a genuine synchronization point, per the Parallelism section), while *within* a wave the reviewers run as a continuous pool. Each wave **loops until convergence** — a round that makes no substantive change (editing) or surfaces no new significant issue (holistic) — or until progress has clearly stalled.
 
-The helper scripts live under `${CLAUDE_PLUGIN_ROOT}/scripts/`. Before each wave the orchestrator snapshots `graph.json` (a plain file copy); after each wave it runs `check_invariants.py` — per-tier acyclicity, every `missing` node reaching an in-mathlib root, no dangling `depends_on`/`parent` references (invariants a partitioned reviewer cannot see on its own) — and fixes any offender it reports, or rolls the wave back from the snapshot, before continuing.
+The helper scripts live under `${CLAUDE_PLUGIN_ROOT}/scripts/`. Before each wave the orchestrator snapshots `graph.json` (a plain file copy); after each wave it runs `check_invariants.py`, which separates two things a partitioned reviewer cannot see on its own:
+
+- **Structural integrity** — reference integrity, tier discipline, per-tier acyclicity — must hold at every stage. On a violation the orchestrator fixes the offender or rolls the wave back from the snapshot before continuing.
+- **Grounding completeness** — every `missing` node tracing down to an in-mathlib root — is the *phase's* goal, not a per-wave gate. Mid-build, still-ungrounded nodes are simply the remaining work, and the check lists them as a worklist; the orchestrator requires full grounding (`--require-grounding`) only before the phase's export and sign-off.
 
 **Wave A — editing reviewer-correctors.** Run `graph-reviewer` over the coarse graph. Its remit is edge correctness, edge faithfulness, missing edges, spurious edges, redundant nodes, **and gap-finding** — the missing intermediate clusters. It edits `graph.json` directly through `scripts/merge_node.py`. When the graph is large, partition it and run one reviewer per subset. The partition is **responsibility only, not visibility**: each reviewer is given the list of node ids it is responsible for, the path to the `merge_node.py` writer, and full read access to everything (`graph.json`, `informal_content/`, `sources/`, Mathlib), and is encouraged to read as much surrounding context as the task needs, with "as needed" the governor. `graph.json` is itself the index; no precurated index is supplied. A reviewer edits only its own nodes' records, hence only those nodes' outgoing `depends_on` edges; anything outside its responsibility — a duplicate elsewhere, a node elsewhere that should depend on one of its nodes, a cross-partition merge — it **flags** in its report. Within-partition merges it performs by sending a complete payload (re-point neighbours to the survivor, then delete the absorbed node). Each reviewer returns a **concise change-report** enumerating the concrete changes it made (one line plus justification each) and its flags, so the orchestrator keeps a bounded global view and can revert any rejected change with a compensating `merge_node.py` edit. The orchestrator runs a `mathlib-checker` on any cluster a reviewer adds. Loop Wave A until convergence (or until progress has clearly stalled).
 
@@ -78,13 +81,13 @@ Throughout, apply high-confidence corrections and note each change; surface unce
 
 ### 1d. Export and view
 
-Export and open the blueprint for the user to review (`/plan-view`). Phase 1 ends here, with a user-approved coarse map. Confirm the user is happy with the scope before moving on — correcting a cluster now is far cheaper than after it has been split.
+Confirm full grounding with `check_invariants.py --require-grounding`, then export and open the blueprint for the user to review (`/plan-view`). Phase 1 ends here, with a user-approved coarse map. Confirm the user is happy with the scope before moving on — correcting a cluster now is far cheaper than after it has been split.
 
 ---
 
 ## Phase 2: Build the detailed (tier-2) graph
 
-Phase 2 splits each tier-1 cluster into its fine definitions and statements and writes the mathematical content for each. The **tier-1 graph is a scaffold, not a cage**: it guides the work, but tier-2 is what's being built and becomes the source of truth. Splitters may add tier-2 nodes a cluster didn't anticipate, drop ones that don't belong, re-parent, and add edges across clusters or to newly discovered prerequisites. Once tier-2 is stable, tier-1 is **re-projected** from it (step 2e). This phase is essentially writing a textbook in a single consistent voice, so it walks the graph in order and parallelizes carefully.
+Phase 2 splits each tier-1 cluster into its fine definitions and statements and writes the mathematical content for each. The **tier-1 graph is a scaffold, not a cage**: it guides the work, but tier-2 is what's being built and becomes the source of truth. Splitters may add tier-2 nodes a cluster didn't anticipate, drop ones that don't belong, re-parent, and add edges across clusters or to newly discovered prerequisites. Once tier-2 is final, tier-1 is **re-projected** from it (step 2f). This phase is essentially writing a textbook in a single consistent voice, so it walks the graph in order and parallelizes carefully.
 
 ### 2a. Split the clusters as a continuous pool
 
@@ -111,7 +114,7 @@ A `splitter` returns structural data and writes only its content files; `graph.j
 - Tracks which nodes still await content (forward references from later-discovered prerequisites).
 - Runs a `mathlib-checker` on any node whose status is a fresh guess.
 
-It does **not** recompute tier-1 or the derived coarse edges on each merge — those are a function of the whole tier-2 graph and are rebuilt once, at re-projection (2e). An incremental tier-2 merge needs only the single node record, not the graph in memory.
+It does **not** recompute tier-1 or the derived coarse edges on each merge — those are a function of the whole tier-2 graph and are rebuilt once, at re-projection (2f). An incremental tier-2 merge needs only the single node record, not the graph in memory.
 
 ### Content rules
 
@@ -130,20 +133,20 @@ Wave A runs two editing reviewer types together over the tier-2 graph. As in Pha
 
 Apply high-confidence corrections and note each change; surface uncertain or conflicting suggestions to the user with the reviewers' reasoning.
 
-### 2e. Re-project tier-1 from tier-2
+### 2e. Review — Wave B
 
-Once tier-2 is stable, rebuild tier-1 from it — tier-2 is now the source of truth, and the Phase-1 tier-1 was only ever a scaffold. This has a mechanical part and a curated part:
+Wave B is the holistic wave, same rules as Phase 1: snapshot `graph.json` first, launch at least 3 `holistic-reviewer`s independently in parallel over the detailed (tier-2) graph, and run `scripts/check_invariants.py` after. They judge **graph quality only** — coherence, granularity consistent by significance, root validity, and coverage (not formalization order) — and are flag-only: the orchestrator applies their corrections, small or local fixes directly via `merge_node.py`, larger structural fixes by dispatching a targeted `graph-reviewer` on the affected region. Loop until convergence (or until progress has clearly stalled).
+
+### 2f. Re-project tier-1, then export and view
+
+With tier-2 final — after both review waves — rebuild tier-1 from it: tier-2 is now the source of truth, and the Phase-1 tier-1 was only ever a scaffold. This has a mechanical part and a curated part:
 
 - **Mechanical.** The tier-1 node set is the distinct `parent` values of the tier-2 nodes: prune clusters left empty, and materialise a cluster for every orphan (`parent: null`) or newly proposed parent. Tier-1 edges are the quotient of the tier-2 edges (cluster A → B iff some tier-2 node in A depends on one in B).
 - **Curated.** A cluster's metadata is *not* mechanically derived — re-curate it to match the new membership: name any new cluster, update descriptions, roll up `mathlib_status`, and merge or split clusters whose composition no longer coheres. Run `graph-reviewer` and `holistic-reviewer` over the re-projected tier-1 so it stays a meaningful coarse map rather than decaying into a bare rollup.
 
+Confirm full grounding with `check_invariants.py --require-grounding`, then export and open the full tiered blueprint via `/plan-view`, where the tier toggle reveals the coarse map and the fine graph with content.
+
 (The same scaffold → build → re-project pattern will apply when tier 3 arrives: build tier-3 from tier-2, then re-project tier-2 and tier-1 from it.)
-
-### 2f. Review — Wave B, then export and view
-
-Wave B is the holistic wave, same rules as Phase 1: snapshot `graph.json` first, launch at least 3 `holistic-reviewer`s independently in parallel over the complete two-tier graph, and run `scripts/check_invariants.py` after. They judge **graph quality only** — coherence, granularity consistent by significance, root validity, and coverage (not formalization order) — and are flag-only: the orchestrator applies their corrections, small or local fixes directly via `merge_node.py`, larger structural fixes by dispatching a targeted `graph-reviewer` on the affected region. Loop until convergence (or until progress has clearly stalled).
-
-Then export and open the full tiered blueprint via `/plan-view`, where the tier toggle reveals the coarse map and the fine graph with content.
 
 ---
 

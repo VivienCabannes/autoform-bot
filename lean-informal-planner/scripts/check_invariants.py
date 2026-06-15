@@ -5,21 +5,27 @@ A review wave partitions the graph by responsibility; this checker verifies the
 global structural invariants that span the whole graph. The orchestrator runs it
 after each review wave to confirm the graph stayed well-formed.
 
-It verifies, against skills/plan/references/plan-json-schema.md:
+It separates two kinds of check, against skills/plan/references/plan-json-schema.md:
 
+  Structural integrity (must hold at every stage):
   - reference integrity: every depends_on target and every non-null parent
     resolves to an existing node;
   - tier discipline: depends_on edges stay within one tier, and a parent sits
     exactly one tier above its child;
-  - per-tier acyclicity: no cycles among same-tier depends_on edges;
-  - root reachability: every "missing" node reaches an "in-mathlib" node by
-    following depends_on, and every root (empty depends_on) is "in-mathlib".
+  - per-tier acyclicity: no cycles among same-tier depends_on edges.
 
-Each invariant prints a PASS/FAIL line naming the specific offending ids. The
-exit code is 0 only when every invariant passes, 1 when any fails.
+  Grounding completeness (the goal a phase reaches, not an every-wave gate):
+  - every "missing" node reaches an "in-mathlib" node by following depends_on,
+    and every root (empty depends_on) is "in-mathlib".
+
+Run it after each review wave for structural integrity; mid-build, still-ungrounded
+nodes are simply the remaining work, so grounding does not affect the exit code
+unless --require-grounding is given (use that at the end of a phase). Each check
+prints a PASS/FAIL line naming the offending ids. Exit code: 0 when the gating
+checks pass, 1 on a violation, 2 if the path is missing.
 
 Usage:
-    check_invariants.py <graph.json>
+    check_invariants.py <graph.json> [--require-grounding]
 """
 from __future__ import annotations
 
@@ -164,15 +170,19 @@ def check_reachability(nodes: dict) -> bool:
     return _report("root reachability", offenders)
 
 
-def check(graph_path: str) -> bool:
+def check(graph_path: str) -> tuple[bool, bool]:
+    """Run all checks; return (structural_ok, grounded_ok). The caller decides
+    which of the two gates the exit code."""
     nodes = _load_nodes(graph_path)
-    results = [
+    print("Structural integrity (must hold at every stage):")
+    structural = all([
         check_references(nodes),
         check_tiers(nodes),
         check_acyclic(nodes),
-        check_reachability(nodes),
-    ]
-    return all(results)
+    ])
+    print("\nGrounding completeness (required when a phase finishes):")
+    grounded = check_reachability(nodes)
+    return structural, grounded
 
 
 def main(argv=None) -> int:
@@ -180,15 +190,32 @@ def main(argv=None) -> int:
         description="Deterministic structural check of a plan's graph.json"
     )
     ap.add_argument("graph", help="path to graph.json")
+    ap.add_argument(
+        "--require-grounding",
+        action="store_true",
+        help="also fail if any 'missing' node is not yet grounded to an in-mathlib "
+             "root (use at the end of a phase; omit during intermediate review waves)",
+    )
     args = ap.parse_args(argv)
 
     if not os.path.exists(args.graph):
         print(f"error: {args.graph} does not exist", file=sys.stderr)
         return 2
 
-    ok = check(args.graph)
-    print("OK: all invariants hold" if ok else "FAILED: one or more invariants violated")
-    return 0 if ok else 1
+    structural, grounded = check(args.graph)
+    if not structural:
+        print("\nFAILED: structural integrity violated — fix or roll back before continuing.")
+        return 1
+    if not grounded and args.require_grounding:
+        print("\nFAILED: grounding incomplete — every 'missing' node must reach an "
+              "in-mathlib root before the phase ends.")
+        return 1
+    if not grounded:
+        print("\nOK: structurally well-formed. Grounding still incomplete — the nodes "
+              "listed above are the remaining grounding work.")
+        return 0
+    print("\nOK: structurally well-formed and fully grounded.")
+    return 0
 
 
 if __name__ == "__main__":

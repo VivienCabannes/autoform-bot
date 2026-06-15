@@ -35,18 +35,26 @@ The top-level agent — **the orchestrator** (a.k.a. the main agent) — runs th
 
 ## 3. The two phases
 
-**Phase 1 — coarse (tier-1) graph.** A cheap, user-reviewable scoping map that also hands Phase 2 its starting partition.
-1. **Extract** the book's mathematics into coarse clusters, each a tier-1 node (with a provisional list of the statements it will later contain).
-2. **Check and ground:** one `mathlib-checker` per cluster (parallel); ground every cluster down to green (`in-mathlib`) roots.
-3. **Review** in two waves (§5).
-4. **Export and approve:** render to the blueprint view; the user signs off before Phase 2.
+Read each step as *the orchestrator does X* — unless it spawns subagents, in which case the subagents return their results to the orchestrator, and **the orchestrator is what folds them into the plan** (structure through `merge_node.py`; prose is written by the subagents themselves).
 
-**Phase 2 — detailed (tier-2) graph.** The tier-1 graph is a *scaffold*; tier-2 is built and becomes the source of truth.
-1. **Split**, as a continuous pool (§4): each cluster goes to a `splitter` once its prerequisite clusters are split. The splitter produces the cluster's tier-2 nodes (structure) and writes their prose.
-2. **Persist:** the orchestrator merges each splitter's structure into `graph.json` as it lands, and runs a `mathlib-checker` on fresh status guesses.
-3. **Review — Wave A** (§5).
-4. **Re-project tier-1** from the finished tier-2: node set and edges recomputed mechanically (the quotient), metadata re-curated.
-5. **Review — Wave B**, then export the full tiered blueprint.
+### Phase 1 — coarse (tier-1) graph
+
+A cheap, user-reviewable scoping map that also hands Phase 2 its starting partition.
+
+1. **Extract.** The orchestrator reads the sources (delegating targeted look-ups to `source-searcher` so whole books stay out of its context) and writes the coarse clusters into `graph.json` as tier-1 nodes — each with a provisional list of the statements it will later contain.
+2. **Check & ground.** The orchestrator fans out one `mathlib-checker` per cluster; each returns that cluster's Mathlib status, which the orchestrator merges, then grounds every cluster down to green (`in-mathlib`) roots.
+3. **Review** (two waves, §5). `graph-reviewer`s edit the structure directly; `holistic-reviewer`s flag, and the orchestrator applies.
+4. **Export & approve.** The orchestrator renders the blueprint and waits for the user's sign-off before Phase 2.
+
+### Phase 2 — detailed (tier-2) graph
+
+The tier-1 graph is now a *scaffold*; tier-2 is built and becomes the source of truth.
+
+1. **Split** (a continuous pool, §4). The orchestrator hands each cluster to a `splitter` once its prerequisites are split, threading the prerequisite clusters' node ids into the splitter's prompt. The splitter writes its nodes' prose (`informal_content/`) itself and returns their *structure* to the orchestrator.
+2. **Persist.** The orchestrator merges each splitter's returned structure into `graph.json` (via `merge_node.py`) as it lands, and runs a `mathlib-checker` on any fresh status guess.
+3. **Review — Wave A** (§5). Per-cluster `content-reviewer`s edit the prose; `graph-reviewer`s edit the structure; both loop to convergence.
+4. **Review — Wave B** (§5). At least three `holistic-reviewer`s judge the whole graph and flag for the orchestrator to apply.
+5. **Re-project & export.** With tier-2 final, the orchestrator rebuilds tier-1 from it (membership and edges by the quotient; metadata re-curated), reviews the re-projected coarse map, and renders the full tiered blueprint.
 
 The same scaffold → build → re-project pattern will apply when tier 3 arrives.
 
@@ -77,7 +85,7 @@ Both phases review in **two waves** — an editing wave that fixes the graph in 
 
 **Wave B — holistic reviewers (flag-only):** at least three `holistic-reviewer`s run independently in parallel over the entire graph. They **do not edit**; they surface corrections to the orchestrator, which applies small fixes directly and dispatches a targeted `graph-reviewer` for larger structural ones.
 
-**Guard rails around editing.** Before each wave the orchestrator snapshots `graph.json` (enabling whole-wave rollback); after each wave it runs `check_invariants.py` and fixes any offender or rolls back. Each editing reviewer returns a **concise change-report** (the concrete changes it made), so the orchestrator keeps a bounded view of a large run and can revert any change it rejects.
+**Guard rails around editing.** Before each wave the orchestrator snapshots `graph.json` (enabling whole-wave rollback); after each wave it runs `check_invariants.py` — structural violations (reference, tier, acyclicity) it fixes or rolls back, while still-ungrounded `missing` nodes are just the remaining worklist (full grounding is required only at phase end). Each editing reviewer returns a **concise change-report** (the concrete changes it made), so the orchestrator keeps a bounded view of a large run and can revert any change it rejects.
 
 ---
 
@@ -100,7 +108,7 @@ In short: **splitter**, **graph-reviewer**, and **content-reviewer** change the 
 ## 7. Determinism and safety
 
 - **Single write path.** Every write to `graph.json` goes through the locked, atomic `merge_node.py` — used by the orchestrator and the editing `graph-reviewer`s — so concurrent writers serialize and never corrupt the file.
-- **Structural check.** `check_invariants.py` verifies the global invariants a partitioned reviewer cannot see — reference integrity, tier discipline, per-tier acyclicity, every `missing` node reaching an `in-mathlib` root — after each review wave.
+- **Structural check.** After each review wave, `check_invariants.py` verifies the global properties a partitioned reviewer cannot see. **Structural integrity** (reference integrity, tier discipline, per-tier acyclicity) must always hold; **grounding completeness** (every `missing` node reaching an `in-mathlib` root) is a phase-end goal (`--require-grounding`), so mid-build the ungrounded nodes are reported as the remaining worklist rather than a failure.
 - **Snapshots and revert.** A pre-wave file copy allows whole-wave rollback; per-change reports let the orchestrator reverse any individual edit.
 - **Derived-not-stored.** Membership and coarse edges are recomputed from the fine graph, so the tiers cannot drift.
 - **Context discipline.** Reviewers read on demand rather than holding the whole graph; the orchestrator delegates book searches to `source-searcher`; structure (`graph.json`) and bulky prose (`informal_content/`) are kept apart.
