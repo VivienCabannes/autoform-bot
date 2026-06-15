@@ -4,6 +4,7 @@
 # /install-lean          → runs install-lean.sh immediately
 # /setup-project MyProj  → runs setup-project.sh MyProj immediately
 # /setup-project         → passes through to the AI (which will ask for the name)
+# /workspace [path]      → runs inspect.py immediately
 
 set -euo pipefail
 
@@ -32,6 +33,11 @@ case "$cmd" in
       # No args — let the AI handle it (will ask for project name)
       printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit"}}\n'
     fi
+    ;;
+  /workspace)
+    output="$(python3 "$PLUGIN_ROOT/skills/workspace/inspect.py" $args 2>&1)" || true
+    escaped="$(printf '%s' "$output" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" | sed 's/^"//;s/"$//')"
+    printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$escaped"
     ;;
   *)
     # Not our command — pass through

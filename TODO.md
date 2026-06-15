@@ -1,5 +1,7 @@
 # TODO
 
+- Test installation instruction for Claude Code, Codex and others
+
 ## Before a project
 - [ ] Setup a Lean project repo
 - [ ] Find relevant content on Zulip

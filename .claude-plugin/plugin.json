@@ -20,15 +20,6 @@
     ]
   },
   "mcpServers": {
-    "autoform-workspace": {
-      "command": "python",
-      "args": ["-m", "servers.workspace.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Workspace inspection — scan project structure, sorry/axiom counts, targets"
-    },
     "autoform-repl": {
       "command": "python",
       "args": ["-m", "servers.repl.server"],
@@ -37,15 +28,6 @@
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       },
       "description": "Lean 4 REPL — run code, verify proofs, check compilation"
-    },
-    "autoform-mathlib": {
-      "command": "python",
-      "args": ["-m", "servers.mathlib.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Mathlib source search — grep, find by name, read files"
     },
     "autoform-lsp": {
       "command": "python",
@@ -56,15 +38,6 @@
       },
       "description": "Lean 4 LSP — file diagnostics and type information"
     },
-    "autoform-trace": {
-      "command": "python",
-      "args": ["-m", "servers.trace.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "AUTOFORM_TRACE_DIR": "${AUTOFORM_TRACE_DIR:-./traces}"
-      },
-      "description": "Execution tracing — record proof attempts, steps, reviews"
-    },
     "autoform-aristotle": {
       "command": "python",
       "args": ["-m", "servers.aristotle.server"],
@@ -73,6 +46,15 @@
         "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
       },
       "description": "Aristotle (Harmonic) — delegate formalization to an autonomous prover"
+    },
+    "autoform-zulip": {
+      "command": "python",
+      "args": ["-m", "servers.zulip.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      },
+      "description": "Zulip search — find community discussions about naming, proofs, and prior art"
     }
   }
 }

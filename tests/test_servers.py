@@ -218,3 +218,24 @@ class TestAristotleServer:
         server = create_aristotle_server()
         assert server is not None
         assert server.name == "autoform-aristotle"
+
+
+# ---------------------------------------------------------------------------
+# Zulip server — wraps skills/zulip/zulip-search.py
+# ---------------------------------------------------------------------------
+
+
+class TestZulipServer:
+    """Tests for the Zulip search server."""
+
+    def test_import_server(self):
+        """The Zulip server module should import without error."""
+        from servers.zulip import server  # noqa: F401
+
+    def test_create_server(self):
+        """create_zulip_server should return a FastMCP instance."""
+        from servers.zulip.server import create_zulip_server
+
+        server = create_zulip_server()
+        assert server is not None
+        assert server.name == "autoform-zulip"

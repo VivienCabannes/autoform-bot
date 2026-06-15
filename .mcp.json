@@ -1,24 +1,8 @@
 {
   "mcpServers": {
-    "autoform-workspace": {
-      "command": "python",
-      "args": ["-m", "servers.workspace.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      }
-    },
     "autoform-repl": {
       "command": "python",
       "args": ["-m", "servers.repl.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      }
-    },
-    "autoform-mathlib": {
-      "command": "python",
-      "args": ["-m", "servers.mathlib.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
@@ -32,20 +16,20 @@
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       }
     },
-    "autoform-trace": {
-      "command": "python",
-      "args": ["-m", "servers.trace.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "AUTOFORM_TRACE_DIR": "${AUTOFORM_TRACE_DIR:-./traces}"
-      }
-    },
     "autoform-aristotle": {
       "command": "python",
       "args": ["-m", "servers.aristotle.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
+      }
+    },
+    "autoform-zulip": {
+      "command": "python",
+      "args": ["-m", "servers.zulip.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       }
     }
   }

@@ -1,15 +1,21 @@
-"""Workspace inspection — scan a Lean project for structure, health, and readiness.
+#!/usr/bin/env python3
+"""Inspect a Lean 4 workspace — project structure, sorry/axiom counts, declarations.
 
-Answers "what does this workspace look like?" without modifying anything:
-sorry/axiom counts, targets file, toolchain, declarations, available tools.
+Usage:
+    python3 inspect.py [path]                  # Full workspace summary
+    python3 inspect.py --search "pattern" [path]  # Search .lean files
+    python3 inspect.py --declarations [path]      # List declarations
+    python3 inspect.py --targets [path]           # Read targets file
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +74,6 @@ def inspect_workspace(path: str | None = None) -> dict[str, Any]:
             "lean": shutil.which("lean") is not None,
             "rg": shutil.which("rg") is not None,
         },
-        "next_steps": _recommend_next_steps(project_root, lakefile, targets, book),
     }
 
 
@@ -83,7 +88,6 @@ def list_targets(path: str | None = None, limit: int = 50) -> dict[str, Any]:
 
     text = target_path.read_text(encoding="utf-8")
     if target_path.suffix == ".json":
-        import json
         raw_targets = json.loads(text)
     else:
         raw_targets = _parse_yaml_targets(text)
@@ -151,22 +155,6 @@ def list_lean_declarations(path: str | None = None, limit: int = 200) -> dict[st
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _recommend_next_steps(
-    project_root: Path, lakefile: Path | None, targets: Path | None, book: Path | None
-) -> list[str]:
-    steps = ["Inspect the target theorem or source statement before editing."]
-    if targets:
-        steps.append(f"Read targets from {_relative(targets, project_root)}.")
-    if book:
-        steps.append(f"Read source material in {_relative(book, project_root)}.")
-    if lakefile:
-        steps.append("Run `lake env lean <file>` or `lake build` after changes.")
-    else:
-        steps.append("Locate a Lake project before attempting Lean verification.")
-    return steps
-
 
 def _count_pattern(root: Path, pattern: str, *, regex: bool = False) -> int:
     if shutil.which("rg"):
@@ -240,7 +228,6 @@ def _parse_yaml_targets(text: str) -> list[dict[str, Any]]:
         parsed = yaml.safe_load(text)
         return parsed if isinstance(parsed, list) else []
     except Exception:
-        # Fallback: minimal YAML list parser
         items: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
         for raw_line in text.splitlines():
@@ -280,3 +267,25 @@ def _parse_rg_line(line: str, root: Path) -> dict[str, Any]:
         line_number = None
     text = parts[2].strip() if len(parts) > 2 else ""
     return {"path": str(_relative(Path(path), root)), "line": line_number, "text": text}
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Inspect a Lean 4 workspace")
+    parser.add_argument("path", nargs="?", default=None, help="Workspace path (default: $LEAN_PROJECT_DIR or cwd)")
+    parser.add_argument("--search", metavar="PATTERN", help="Search .lean files for a pattern")
+    parser.add_argument("--declarations", action="store_true", help="List Lean declarations")
+    parser.add_argument("--targets", action="store_true", help="Read targets file")
+    args = parser.parse_args()
+
+    if args.search:
+        result = search_lean(args.search, args.path)
+    elif args.declarations:
+        result = list_lean_declarations(args.path)
+    elif args.targets:
+        result = list_targets(args.path)
+    else:
+        result = inspect_workspace(args.path)
+
+    print(json.dumps(result, indent=2))

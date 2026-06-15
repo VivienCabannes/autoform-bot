@@ -11,9 +11,9 @@ This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, d
 | Component | Status | What's there | What PRs add |
 |-----------|--------|-------------|--------------|
 | **Setup skills** (install-lean, setup-project) | ✅ Full | Scripts + hook-driven auto-execution | — |
-| **Zulip** (skill + script) | ✅ Full | Search Lean Zulip for community discussions | — |
-| **Workspace server** | ✅ Full | Project scan, sorry/axiom counts, declarations | — |
-| **Other servers** (repl, mathlib, lsp, trace, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
+| **Workspace** (skill + script) | ✅ Full | Project scan, sorry/axiom counts, declarations | — |
+| **Zulip** (server + skill) | ✅ Full | Search Lean Zulip for community discussions | — |
+| **Servers** (repl, lsp, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
 | **Formalization skills** | ⬜ Not yet | — | Conventions, proof strategies, review, extraction, orchestration |
 | **Agents** (3) | ⬜ Stub | Correct frontmatter, one-paragraph prompts | Rich system prompts |
 
@@ -120,17 +120,16 @@ or reinstalling so the new skills and MCP servers are loaded.
 |-------|--------------|--------------|
 | Install Lean | `/install-lean` | Install Lean 4, elan, lake — auto-runs via hook |
 | Setup project | `/setup-project` | Create a new Lean 4 + Mathlib project from the LeanProject template |
+| Workspace | `/workspace` | Scan project structure, sorry/axiom counts, declarations |
 | Zulip | `/zulip` | Search Lean Zulip for community discussions |
 
 ## MCP Servers
 
 | Server | Status | What it does |
 |--------|--------|-------------|
-| `autoform-workspace` | ✅ | Scan project structure, sorry/axiom counts, targets |
+| `autoform-zulip` | ✅ | Search Lean Zulip for community discussions |
 | `autoform-repl` | ⬜ | Lean 4 REPL — run code, verify proofs |
-| `autoform-mathlib` | ⬜ | Mathlib source search — grep, find by name, read files |
 | `autoform-lsp` | ⬜ | Lean 4 LSP — file diagnostics, type info |
-| `autoform-trace` | ⬜ | Execution tracing — record proof attempts, reviews |
 | `autoform-aristotle` | ⬜ | Aristotle (Harmonic) — delegate to autonomous prover |
 
 ## Agents
