@@ -40,13 +40,22 @@ targets:
       $\lambda x + (1-\lambda) y \in C$.
     dependencies: []
     has_proof: false
-```
 
-<!-- TODO: Add additional YAML examples (theorem with dependencies, has_proof: true). See examples/skills/autoform-extract/SKILL.md for the full version. -->
+  - id: thm-1-2-convex-combination
+    type: theorem
+    title: Convex combination characterization
+    source: "Theorem 1.2, p.5"
+    latex: |
+      A set $C$ is convex if and only if it contains all convex
+      combinations of its elements.
+    dependencies: [def-1-1-convex-set]
+    has_proof: true
+```
 
 ## Guidelines
 
 - Preserve the exact mathematical notation from the source.
 - Include ALL statements, not just named theorems — unnumbered lemmas, remarks used later, and key examples matter.
-
-<!-- TODO: Add remaining guidelines (dependency ordering, has_proof: false policy, consistent ID prefixes). See examples/skills/autoform-extract/SKILL.md for the full version. -->
+- Order dependencies correctly — a statement should only depend on statements that appear before it.
+- Mark `has_proof: false` only when the source genuinely does not provide a proof. A sketch or outline counts as a proof.
+- Use consistent ID prefixes: `def-`, `thm-`, `prop-`, `lem-`, `cor-`, `ex-`.

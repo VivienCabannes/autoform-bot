@@ -10,6 +10,7 @@ Autoform turns any AI coding assistant into a Lean 4 formalization agent. It pro
 autoform-bot/
 ├── README.md                          # Product pitch
 ├── CLAUDE.md                          # This file (maintainer instructions)
+├── CONTRIBUTING.md                    # Contributor guide (stub → implementation workflow)
 ├── LICENSE                            # MIT
 ├── pyproject.toml                     # Python package (servers only)
 ├── package.json                       # npm package metadata
@@ -71,6 +72,16 @@ autoform-bot/
 │   └── aristotle/                     #   Aristotle (Harmonic) — autonomous prover delegation
 │       └── server.py                  #     AristotleManager + FastMCP server
 │
+├── examples/                          # Full reference implementations for all stubs
+│   ├── README.md                      #   Guide: what each example replaces, how to use
+│   ├── servers/                       #   Reference server implementations
+│   ├── skills/                        #   Complete skill content (full tactic tables, etc.)
+│   └── agents/                        #   Rich agent prompts with full workflows
+│
+├── tests/                             # Smoke tests
+│   ├── conftest.py                    #   Fixtures (repo_root)
+│   └── test_servers.py                #   Import, create, and basic behavior tests
+│
 └── viewer/                            # Standalone trace viewer (not part of plugin)
     └── (TODO)
 ```
@@ -89,6 +100,20 @@ Each MCP server is independent and can run in a separate process:
 | `autoform-aristotle` | HTTP calls to Harmonic API | Hard proofs delegated externally | worker (via crew) |
 
 Agents declare their server subset in the `mcpServers` frontmatter field. The reader agent uses no MCP servers.
+
+## Template vs Full Implementation
+
+The plugin ships as a template: wiring is complete, domain content is partially stubbed. The `examples/` directory contains complete reference implementations for every stub.
+
+**Servers.** The workspace server is fully implemented. All other servers (repl, mathlib, lsp, trace, aristotle) are stubs: they start, register tools with correct signatures, but each tool returns a "not implemented" string. Copy from `examples/servers/<name>/` to fill in a stub.
+
+**Skills.** All six skills have section headings and 2-3 concrete rules per section, with `<!-- TODO -->` markers where content is abbreviated. Copy from `examples/skills/<name>/SKILL.md` to get the full versions with all tactic tables, checklist items, and pitfall lists.
+
+**Agents.** All three agent prompts have correct frontmatter but abbreviated body text with `<!-- TODO -->` markers. Copy from `examples/agents/` for the full workflow descriptions.
+
+**Tests.** The `tests/` directory contains smoke tests for all servers. Run `pytest tests/` to verify that all modules import, all factories create valid servers, and the workspace server returns correct data.
+
+See `CONTRIBUTING.md` for the step-by-step workflow to fill in a stub.
 
 ## Hooks
 
@@ -112,9 +137,13 @@ Agents declare their server subset in the `mcpServers` frontmatter field. The re
 ## Adding a new MCP server
 
 1. Create `servers/<name>/` with `__init__.py`, `core.py`, and `server.py`
-2. `core.py` = pure logic (no MCP imports), `server.py` = FastMCP wrapper with `__main__` block
-3. Add to `.claude-plugin/plugin.json` under `mcpServers`
-4. Add to relevant agents' `mcpServers` frontmatter
+2. `core.py` = pure logic (no MCP imports), `server.py` = FastMCP wrapper with `create_*_server()` factory and `__main__` block
+3. Use the workspace server (`servers/workspace/`) as the structural reference
+4. If filling in an existing stub, copy the reference implementation from `examples/servers/<name>/` and adapt
+5. Add a test class in `tests/test_servers.py` with at minimum `test_import` and `test_create_server`
+6. Add to `.claude-plugin/plugin.json` under `mcpServers`
+7. Add to relevant agents' `mcpServers` frontmatter
+8. Run `pytest tests/test_servers.py` to verify
 
 ## Environment variables
 

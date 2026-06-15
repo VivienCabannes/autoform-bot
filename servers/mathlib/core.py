@@ -1,19 +1,12 @@
 """Mathlib source search — pure search logic over local Mathlib source.
 
-No MCP dependencies. Uses ripgrep for fast source search.
+Stub module. See examples/servers/mathlib/core.py for a full implementation
+with ripgrep-based search, TOML lakefile parsing, and line-numbered output.
 """
 
 from __future__ import annotations
 
-import subprocess
-from logging import getLogger
 from pathlib import Path
-
-logger = getLogger(__name__)
-
-DEFAULT_MAX_RESULTS = 50
-DEFAULT_SUBPROCESS_TIMEOUT = 30
-DEFAULT_MAX_NAME_RESULTS = 30
 
 
 def find_mathlib_path(repo_root: Path) -> Path | None:
@@ -21,31 +14,14 @@ def find_mathlib_path(repo_root: Path) -> Path | None:
 
     Checks lakefile.toml for a local path entry first,
     then falls back to .lake/packages/mathlib.
+
+    Args:
+        repo_root: Root of the Lean project.
+
+    Returns:
+        Path to Mathlib root, or None if not found.
     """
-    lakefile_toml = repo_root / "lakefile.toml"
-    if lakefile_toml.exists():
-        try:
-            import tomllib
-        except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore[no-redef]
-
-        try:
-            with open(lakefile_toml, "rb") as f:
-                lakefile = tomllib.load(f)
-
-            for req in lakefile.get("require", []):
-                if req.get("name") == "mathlib" and "path" in req:
-                    local_path = (repo_root / req["path"]).resolve()
-                    if local_path.exists() and (local_path / "Mathlib").exists():
-                        return local_path
-        except Exception:
-            pass
-
-    mathlib_path = repo_root / ".lake" / "packages" / "mathlib"
-    if mathlib_path.exists() and (mathlib_path / "Mathlib").exists():
-        return mathlib_path
-
-    return None
+    raise NotImplementedError("See examples/servers/mathlib/core.py for reference implementation.")
 
 
 def grep_mathlib(
@@ -53,58 +29,45 @@ def grep_mathlib(
     pattern: str,
     kind: str = "",
     subdir: str = "",
-    max_results: int = DEFAULT_MAX_RESULTS,
+    max_results: int = 50,
     context_lines: int = 0,
     literal: bool = False,
 ) -> str:
-    """Search Mathlib source code using ripgrep."""
-    mathlib_path = find_mathlib_path(repo_root)
-    if not mathlib_path:
-        return "Error: Mathlib not found. Check lakefile.toml or .lake/packages/mathlib."
+    """Search Mathlib source code using ripgrep.
 
-    search_path = mathlib_path / "Mathlib"
-    if subdir:
-        search_path = search_path / subdir
+    Args:
+        repo_root: Root of the Lean project.
+        pattern: Search pattern (regex by default).
+        kind: Filter by declaration kind (theorem, lemma, def, etc.).
+        subdir: Subdirectory to search (e.g. Algebra, Analysis, Topology).
+        max_results: Maximum results to return.
+        context_lines: Lines of context around matches.
+        literal: If true, treat pattern as literal string.
 
-    if not search_path.exists():
-        return f"Error: Path not found: {search_path}"
-
-    cmd = ["rg", "--line-number", "-m", str(max_results)]
-
-    if context_lines > 0:
-        cmd.extend(["-C", str(context_lines)])
-    if literal:
-        cmd.append("-F")
-    if kind:
-        cmd.extend(["--regexp", f"^{kind}\\s+.*{pattern}"])
-    else:
-        cmd.append(pattern)
-
-    cmd.extend(["-g", "*.lean", str(search_path)])
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=DEFAULT_SUBPROCESS_TIMEOUT)
-        output = result.stdout
-        if not output:
-            return "No matches found"
-        lines = output.strip().split("\n")
-        count = len([line for line in lines if line and not line.startswith("--")])
-        return f"Found {count} matches:\n\n{output}"
-    except subprocess.TimeoutExpired:
-        return "Error: Search timed out"
-    except FileNotFoundError:
-        return "Error: ripgrep (rg) not found. Please install it."
+    Returns:
+        Formatted match results string.
+    """
+    raise NotImplementedError("See examples/servers/mathlib/core.py for reference implementation.")
 
 
 def find_name_in_mathlib(
     repo_root: Path,
     name: str,
     exact: bool = False,
-    max_results: int = DEFAULT_MAX_NAME_RESULTS,
+    max_results: int = 30,
 ) -> str:
-    """Find a theorem, lemma, or definition by name in Mathlib."""
-    pattern = f"\\b{name}\\b" if exact else name
-    return grep_mathlib(repo_root, pattern=pattern, max_results=max_results)
+    """Find a theorem, lemma, or definition by name in Mathlib.
+
+    Args:
+        repo_root: Root of the Lean project.
+        name: Name to search for.
+        exact: Match exact name only.
+        max_results: Maximum results to return.
+
+    Returns:
+        Formatted search results string.
+    """
+    raise NotImplementedError("See examples/servers/mathlib/core.py for reference implementation.")
 
 
 def read_mathlib_file(
@@ -113,31 +76,15 @@ def read_mathlib_file(
     start_line: int | None = None,
     end_line: int | None = None,
 ) -> str:
-    """Read a Mathlib source file with optional line range."""
-    mathlib_path = find_mathlib_path(repo_root)
-    if not mathlib_path:
-        return "Error: Mathlib not found"
+    """Read a Mathlib source file with optional line range.
 
-    full_path = mathlib_path / file_path
-    if not full_path.exists():
-        return f"Error: File not found: {file_path}"
+    Args:
+        repo_root: Root of the Lean project.
+        file_path: Path relative to Mathlib root.
+        start_line: Starting line (1-indexed, optional).
+        end_line: Ending line (inclusive, optional).
 
-    try:
-        content = full_path.read_text()
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-    lines = content.split("\n")
-    total_lines = len(lines)
-
-    start = (start_line - 1) if start_line else 0
-    end = end_line if end_line else len(lines)
-    selected = lines[start:end]
-
-    numbered = [f"{i + start + 1:6}  {line}" for i, line in enumerate(selected)]
-
-    header = f"# {file_path} ({total_lines} lines)"
-    if start_line or end_line:
-        header += f" [lines {start + 1}-{end}]"
-
-    return header + "\n" + "\n".join(numbered)
+    Returns:
+        Numbered file content string with header.
+    """
+    raise NotImplementedError("See examples/servers/mathlib/core.py for reference implementation.")

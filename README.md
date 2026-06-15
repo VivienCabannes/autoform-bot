@@ -4,6 +4,19 @@ Turn any AI coding assistant into a Lean 4 formalization agent.
 
 Autoform gives your coding assistant the knowledge and tools to translate mathematics from LaTeX into verified Lean 4 proofs using Mathlib — from statement extraction through proof completion and review.
 
+## Status: Template
+
+This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, commands, discovery files) is complete. The domain content is stubbed:
+
+| Component | Status | What's there | What PRs add |
+|-----------|--------|-------------|--------------|
+| **Workspace server** | ✅ Full | Project scan, sorry/axiom counts, declarations | — |
+| **Other servers** (repl, mathlib, lsp, trace, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
+| **Skills** (6) | ⬜ Stub | Section headings + 2-3 rules each | Full tactic tables, checklists, pitfall lists |
+| **Agents** (3) | ⬜ Stub | Correct frontmatter, one-paragraph prompts | Rich system prompts |
+
+Full reference implementations for every stub live in [`examples/`](examples/). See [CONTRIBUTING.md](CONTRIBUTING.md) for how to pick up a stub and fill it in.
+
 ## Before / After
 
 **Before** — you paste a theorem and your assistant writes broken Lean:
@@ -23,9 +36,23 @@ Assistant: *searches Mathlib for existing lemmas, uses correct typeclasses,
 
 ### Claude Code
 
-```bash
-claude plugin add vivc/autoform-bot
+Inside Claude Code, add the marketplace and install:
+
 ```
+/plugin marketplace add https://github.com/vivc/autoform-bot.git
+/plugin install autoform@autoform
+```
+
+Or from a local checkout:
+
+```
+/plugin marketplace add /path/to/autoform-bot
+/plugin install autoform@autoform
+```
+
+### Codex CLI
+
+The plugin includes a `.codex-plugin/plugin.json` manifest and `commands/*.toml` slash commands.
 
 ### Other agents (via npx skills)
 
@@ -36,101 +63,39 @@ claude plugin add vivc/autoform-bot
 | Copilot | `npx skills add vivc/autoform-bot -a github-copilot` |
 | Cline | `npx skills add vivc/autoform-bot -a cline` |
 
-## What You Get
+## Skills
 
 | Skill | Slash command | What it does |
 |-------|--------------|--------------|
-| Mathlib conventions | `/autoform` | Lean 4 + Mathlib style, tactics, naming, pitfalls — distilled from 94k PR reviews |
+| Mathlib conventions | `/autoform` | Lean 4 + Mathlib style, tactics, naming, pitfalls |
 | Proof strategies | `/autoform-prove` | Incremental proving workflow: search → prototype → prove → commit |
-| Code review | `/autoform-review` | Review Lean formalization for correctness, faithfulness, and cheating patterns |
+| Code review | `/autoform-review` | Review for correctness, faithfulness, and cheating patterns |
 | Quality check | `/autoform-quality` | Mathlib style lint — naming, tactics, code structure |
-| Statement extraction | `/autoform-extract` | Extract formalizable statements from LaTeX/Markdown source material |
-| Crew orchestration | `/autoform-crew` | Parallel formalization with subagent teams — wave-based chapter proving |
+| Statement extraction | `/autoform-extract` | Extract formalizable statements from LaTeX/Markdown |
+| Crew orchestration | `/autoform-crew` | Parallel formalization with subagent teams |
 
-## Skills in detail
+## MCP Servers
 
-<details>
-<summary><strong>autoform</strong> — Mathlib & Lean 4 conventions</summary>
-
-Core knowledge base: proof style, naming, types, tactics, simp conventions, API design, code style, and common pitfalls. Distilled from ~94k GitHub PR review comments and ~165k Zulip messages from the Mathlib community.
-
-Activate with `/autoform` or by asking about Lean 4 conventions.
-
-</details>
-
-<details>
-<summary><strong>autoform-prove</strong> — Proof strategies & workflow</summary>
-
-How to approach Lean proofs: search Mathlib first, prototype in REPL, work incrementally, handle sorry/axiom correctly, detect false statements. Includes the `unproved` macro policy for statements the source material leaves unproven.
-
-Activate with `/autoform-prove`.
-
-</details>
-
-<details>
-<summary><strong>autoform-review</strong> — Formalization review</summary>
-
-Structured review checklist: compilation, faithfulness to source, mathematical correctness, conventions, and anti-cheating detection (trivial substitution, smuggled assumptions, weakened content, modeling avoidance, hidden sorry/axiom).
-
-Activate with `/autoform-review`.
-
-</details>
-
-<details>
-<summary><strong>autoform-quality</strong> — Code quality inspection</summary>
-
-Pure style review — naming, tactic usage, proof structure, Mathlib conventions. Does not evaluate mathematical correctness (that's autoform-review's job).
-
-Activate with `/autoform-quality`.
-
-</details>
-
-<details>
-<summary><strong>autoform-extract</strong> — Statement extraction</summary>
-
-Extract definitions, theorems, lemmas, and corollaries from LaTeX or Markdown source material into structured YAML targets for formalization.
-
-Activate with `/autoform-extract`.
-
-</details>
-
-<details>
-<summary><strong>autoform-crew</strong> — Parallel formalization</summary>
-
-Orchestration guide for subagent teams. Fan out workers across independent targets, batch reviews, wave-based chapter formalization. Tells the main thread when to delegate vs. do it inline.
-
-Activate with `/autoform-crew`.
-
-</details>
+| Server | Status | What it does |
+|--------|--------|-------------|
+| `autoform-workspace` | ✅ | Scan project structure, sorry/axiom counts, targets |
+| `autoform-repl` | ⬜ | Lean 4 REPL — run code, verify proofs |
+| `autoform-mathlib` | ⬜ | Mathlib source search — grep, find by name, read files |
+| `autoform-lsp` | ⬜ | Lean 4 LSP — file diagnostics, type info |
+| `autoform-trace` | ⬜ | Execution tracing — record proof attempts, reviews |
+| `autoform-aristotle` | ⬜ | Aristotle (Harmonic) — delegate to autonomous prover |
 
 ## Agents
 
-Autoform includes specialized subagents for multi-agent workflows:
-
 | Agent | Model | Role |
 |-------|-------|------|
-| `autoform-worker` | opus | Lean 4 formalization — reads source, searches Mathlib, writes proofs |
-| `autoform-reviewer` | opus | Reviews changes for correctness, faithfulness, and cheating patterns |
-| `autoform-reader` | haiku | Lightweight file reader for large files (small context, fast) |
+| `autoform-worker` | opus | Formalization — reads source, searches Mathlib, writes proofs |
+| `autoform-reviewer` | opus | Reviews for correctness, faithfulness, and cheating patterns |
+| `autoform-reader` | haiku | Lightweight file reader for large files |
 
-## Aristotle Integration
+## Contributing
 
-The plugin can delegate formalization tasks to [Aristotle](https://aristotle.harmonic.fun) (Harmonic), an autonomous formal-reasoning agent that runs its own Lean builds, proof search, and file edits.
-
-**Setup:**
-```bash
-pip install aristotlelib
-export ARISTOTLE_API_KEY=arstl_...   # from https://aristotle.harmonic.fun/dashboard/keys
-```
-
-**Usage:** Submit hard proofs to Aristotle while keeping quick tasks local:
-```
-aristotle_submit("thm-2-3", "Prove Theorem 2.3: for all convex sets C, ...")
-# ... do other work while Aristotle runs ...
-aristotle_wait("thm-2-3")   # collect results
-```
-
-See `/autoform-crew` for the full hybrid local + Aristotle orchestration pattern.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to pick up a stub, fill it in, and submit a PR. Each server, skill, and agent is independent — you can contribute one without touching the others.
 
 ## License
 

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from fastmcp.server import FastMCP
 
-_NOT_IMPLEMENTED = "Not yet implemented. See examples/servers/trace/ for reference implementation."
+from .core import TraceStore
 
 
-def create_trace_server() -> FastMCP:
-    """Create a FastMCP server with trace recording and querying tools.
+def create_trace_server(store: TraceStore) -> FastMCP:
+    """Create a FastMCP server wrapping a TraceStore.
 
     Provides tools for both recording events (used by agents during
     formalization) and querying them (used for review and analysis).
@@ -36,7 +37,15 @@ def create_trace_server() -> FastMCP:
             error: Error message if failed.
             agent: Agent ID that made the attempt.
         """
-        return _NOT_IMPLEMENTED
+        store.record(
+            "proof_attempt",
+            agent=agent,
+            theorem=theorem,
+            status=status,
+            lean_code=lean_code,
+            error=error,
+        )
+        return f"Recorded proof attempt for {theorem}: {status}"
 
     @server.tool
     def record_step(
@@ -51,7 +60,8 @@ def create_trace_server() -> FastMCP:
             result: Outcome or output.
             agent: Agent ID.
         """
-        return _NOT_IMPLEMENTED
+        store.record("step", agent=agent, action=action, result=result)
+        return "Step recorded."
 
     @server.tool
     def record_review(
@@ -68,7 +78,14 @@ def create_trace_server() -> FastMCP:
             feedback: Review feedback text.
             agent: Reviewer agent ID.
         """
-        return _NOT_IMPLEMENTED
+        store.record(
+            "review",
+            agent=agent,
+            target=target,
+            verdict=verdict,
+            feedback=feedback,
+        )
+        return f"Review recorded for {target}: {verdict}"
 
     # --- Query tools ---
 
@@ -79,7 +96,8 @@ def create_trace_server() -> FastMCP:
         Returns proof attempt counts, success/failure rates,
         and per-agent event counts.
         """
-        return _NOT_IMPLEMENTED
+        summary = store.get_summary()
+        return json.dumps(summary, indent=2)
 
     @server.tool
     def get_proof_attempts(
@@ -90,7 +108,10 @@ def create_trace_server() -> FastMCP:
         Args:
             last_n: Number of recent attempts to return.
         """
-        return _NOT_IMPLEMENTED
+        events = store.get_events(event_type="proof_attempt", last_n=last_n)
+        if not events:
+            return "No proof attempts recorded."
+        return json.dumps(events, indent=2)
 
     @server.tool
     def get_reviews(
@@ -101,12 +122,18 @@ def create_trace_server() -> FastMCP:
         Args:
             last_n: Number of recent reviews to return.
         """
-        return _NOT_IMPLEMENTED
+        events = store.get_events(event_type="review", last_n=last_n)
+        if not events:
+            return "No reviews recorded."
+        return json.dumps(events, indent=2)
 
     @server.tool
     def list_runs() -> str:
         """List all available trace runs."""
-        return _NOT_IMPLEMENTED
+        runs = store.list_runs()
+        if not runs:
+            return "No runs found."
+        return json.dumps(runs)
 
     @server.tool
     def load_run(run_id: str) -> str:
@@ -115,11 +142,22 @@ def create_trace_server() -> FastMCP:
         Args:
             run_id: The run identifier to load.
         """
-        return _NOT_IMPLEMENTED
+        try:
+            store.load_run(run_id)
+            summary = store.get_summary()
+            return f"Loaded run '{run_id}': {summary['total_events']} events, {summary['proof_attempts']} proof attempts"
+        except FileNotFoundError:
+            return f"Run '{run_id}' not found. Use list_runs to see available runs."
 
     return server
 
 
 if __name__ == "__main__":
-    server = create_trace_server()
+    trace_dir = os.environ.get("AUTOFORM_TRACE_DIR", "./traces")
+    store = TraceStore(trace_dir)
+
+    run_id = os.environ.get("AUTOFORM_RUN_ID", "default")
+    store.start_run(run_id)
+
+    server = create_trace_server(store)
     server.run(transport="stdio")

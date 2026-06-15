@@ -28,12 +28,57 @@ Autoform-crew orchestrates multiple subagents for parallel formalization. The ma
 Use Aristotle when:
 - The theorem is self-contained (no dependencies on your in-progress code)
 - You want to offload a hard proof entirely — Aristotle is built for multi-hour proving sessions
+- You're parallelizing aggressively and want to mix local workers with Aristotle tasks
 
 Don't use Aristotle when:
 - The proof depends on definitions you've written (Aristotle can't see your workspace unless you pass `project_dir`)
 - You need fine-grained control over the proof approach
+- The task is a quick definition or trivial lemma (Aristotle overhead isn't worth it)
 
-<!-- TODO: Add remaining Aristotle guidance (trivial lemma overhead, Aristotle tools table, Aristotle + local workers pattern, steering Aristotle). See examples/skills/autoform-crew/SKILL.md for the full version. -->
+### Aristotle tools
+
+| Tool | What it does |
+|------|-------------|
+| `aristotle_submit` | Submit a task — creates a project or continues an existing session |
+| `aristotle_wait` | Block until the task completes (up to max_wait_seconds) |
+| `aristotle_poll` | Non-blocking status check |
+| `aristotle_steer` | Redirect a running task with new instructions |
+| `aristotle_events` | Inspect what Aristotle is doing (proof attempts, builds, edits) |
+| `aristotle_sessions` | List all active sessions |
+
+### Aristotle + local workers pattern
+
+The most powerful pattern combines local workers for quick tasks with Aristotle for hard proofs:
+
+```
+Chapter 5 targets:
+  Quick (local autoform-worker):
+    - def-5.1, def-5.2, def-5.3 (definitions, likely in Mathlib)
+    - lem-5.4 (simple lemma)
+
+  Hard (delegate to Aristotle):
+    - thm-5.5 (complex, self-contained, 100+ line proof expected)
+    - thm-5.6 (deep Mathlib search needed)
+
+Plan:
+1. Spawn local workers for def-5.1, def-5.2, def-5.3, lem-5.4 in parallel
+2. aristotle_submit("thm-5-5", "Prove Theorem 5.5: ...", project_dir=".")
+3. aristotle_submit("thm-5-6", "Prove Theorem 5.6: ...")
+4. While Aristotle works, review local workers' output
+5. aristotle_wait("thm-5-5") — collect results
+6. aristotle_wait("thm-5-6") — collect results
+7. Review Aristotle's output with autoform-reviewer
+```
+
+### Steering Aristotle
+
+If you see (via `aristotle_events`) that Aristotle is going down the wrong path:
+
+```
+aristotle_steer("thm-5-5", "Don't use manual induction — use Finset.sum_le_sum from Mathlib instead")
+```
+
+This injects the instruction into Aristotle's running session without restarting.
 
 ## When to use crew vs main thread
 
@@ -67,7 +112,51 @@ They all depend on 3.1 and 3.2 which are in Mathlib, so they're independent.
 Write to MyBook/MetricSpaces.lean, MyBook/OpenSets.lean, MyBook/Hausdorff.lean.
 ```
 
-<!-- TODO: Add remaining parallelization patterns (read-plan-fan-out, parallel review, prove-review-fix pipeline, wave-based chapter formalization). See examples/skills/autoform-crew/SKILL.md for the full version. -->
+### Read → plan → fan-out
+
+When you haven't read the chapter yet:
+
+1. Spawn `autoform-reader` on the book chapter — get a structured summary cheaply
+2. Main thread reads `targets.yaml`, identifies the dependency graph
+3. Fan out `autoform-worker` on targets whose dependencies are all resolved
+
+### Parallel review
+
+After a batch of formalizations:
+
+```
+Review these 4 files against Chapter 3 of book.md:
+- MyBook/MetricSpaces.lean
+- MyBook/OpenSets.lean
+- MyBook/Hausdorff.lean
+- MyBook/Completeness.lean
+
+Spawn autoform-reviewer for each file in parallel.
+```
+
+### Pipeline: prove → review → fix
+
+For each target:
+1. `autoform-worker` formalizes and writes the file
+2. `autoform-reviewer` reviews against the source
+3. If rejected: main thread reads the feedback, spawns another `autoform-worker` with the feedback as context
+
+### Wave-based chapter formalization
+
+For a chapter with a dependency tree:
+
+**Wave 1:** Spawn workers for all leaf targets (no dependencies beyond Mathlib).
+**Wave 2:** Once wave 1 completes, spawn workers for targets that depended on wave 1.
+**Wave 3:** Continue up the dependency tree.
+
+```
+Chapter 5 dependency graph:
+  Wave 1 (parallel): def-5.1, def-5.2, def-5.3
+  Wave 2 (parallel, after wave 1): thm-5.4 (needs 5.1, 5.2), lem-5.5 (needs 5.2, 5.3)
+  Wave 3 (after wave 2): thm-5.6 (needs 5.4, 5.5)
+
+Start wave 1: spawn autoform-worker for def-5.1, def-5.2, def-5.3 in parallel.
+```
 
 ## Output contracts
 
@@ -97,12 +186,14 @@ Structured summary with section headings, theorem names, and line numbers. Conci
 
 - Don't spawn a worker for a target whose dependencies aren't formalized yet — it will waste turns trying to import nonexistent definitions.
 - Don't spawn parallel workers that write to the same file — they'll conflict.
-
-<!-- TODO: Add remaining anti-patterns (don't use reviewer for style-only checks, don't spawn reader for small files, don't expect workers to coordinate). See examples/skills/autoform-crew/SKILL.md for the full version. -->
+- Don't use `autoform-reviewer` for style-only checks — use `/autoform-quality` in the main thread or spawn a dedicated quality review.
+- Don't spawn `autoform-reader` for small files (< 100 lines) — just read them directly.
+- Don't expect workers to coordinate with each other — they're independent. Cross-cutting concerns (shared namespaces, import organization) are the main thread's job.
 
 ## Maximizing parallelism
 
 1. **Extract targets first** (`/autoform-extract`) and identify the dependency graph.
 2. **Separate independent clusters** — targets that share no definitions can be parallelized.
-
-<!-- TODO: Add remaining parallelism tips (one file per target, batch reviews, feed rejection feedback forward). See examples/skills/autoform-crew/SKILL.md for the full version. -->
+3. **One file per target** — avoid merge conflicts by giving each worker its own output file.
+4. **Batch reviews** — after a wave completes, review all files in parallel.
+5. **Feed rejection feedback forward** — when a review rejects, include the exact feedback in the retry worker's prompt.

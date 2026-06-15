@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from fastmcp.server import FastMCP
 
-_NOT_IMPLEMENTED = "Not yet implemented. See examples/servers/repl/ for reference implementation."
+from .core import format_repl_response
+from .pool import LeanReplPool, LeanReplPoolConfig
 
 
-def create_repl_server() -> FastMCP:
-    """Create a FastMCP server with Lean REPL tools.
+def create_repl_server(pool: LeanReplPool) -> FastMCP:
+    """Create a FastMCP server wrapping a LeanReplPool.
 
     Exposes two tools:
     - run_lean_code: Send Lean code to the REPL pool
@@ -33,7 +35,11 @@ def create_repl_server() -> FastMCP:
             Formatted diagnostic output: compilation status, errors,
             sorries with goals, and warnings.
         """
-        return _NOT_IMPLEMENTED
+        kwargs = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        result = pool.run(code, **kwargs)
+        return format_repl_response(result)
 
     @server.tool
     def get_repl_status() -> str:
@@ -42,11 +48,27 @@ def create_repl_server() -> FastMCP:
         Returns:
             JSON string with capacity, memory_usage_gb, and shutdown status.
         """
-        return _NOT_IMPLEMENTED
+        return json.dumps(
+            {
+                "capacity": pool.capacity,
+                "memory_usage_gb": round(pool.get_memory_usage(), 2),
+                "shutdown": pool._shutdown,
+            }
+        )
 
     return server
 
 
 if __name__ == "__main__":
-    server = create_repl_server()
-    server.run(transport="stdio")
+    cwd = os.environ.get("LEAN_PROJECT_DIR", ".")
+    repl_cmd = os.environ.get("LEAN_REPL_CMD", "lake exe repl").split()
+    num_repls = int(os.environ.get("LEAN_NUM_REPLS", "0")) or None
+
+    config = LeanReplPoolConfig(cwd=cwd, repl_command=repl_cmd, num_repls=num_repls)
+    pool = LeanReplPool(config)
+
+    try:
+        server = create_repl_server(pool)
+        server.run(transport="stdio")
+    finally:
+        pool.shutdown()

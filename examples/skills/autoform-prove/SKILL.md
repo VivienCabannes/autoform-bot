@@ -16,8 +16,7 @@ How to approach Lean 4 formalization: from reading source material through compl
 1. **Search first** — search Mathlib using `exact?`, `apply?`, `rw?`, `lean_loogle`, `mathlib_grep`, `mathlib_find_name` before writing proofs from scratch. Many standard results already exist.
 2. **Prototype in REPL** — use `run_lean_code` to test proof fragments before editing large files. Large files take 120+ seconds to build; testing in isolation saves time.
 3. **Work incrementally** — fix compilation errors first, then triage sorrys by difficulty (easy → medium → hard). Prove easy theorems first and commit each one.
-
-<!-- TODO: Add remaining workflow step (commit often, naming convention for commits). See examples/skills/autoform-prove/SKILL.md for the full version. -->
+4. **Commit often** — each proved theorem gets its own commit. Name commits after the task: `convex-sets-def: formalize convex set definitions`.
 
 ## Sorry Handling
 
@@ -27,8 +26,8 @@ The minimum bar for acceptance is net sorry reduction.
 - Never decompose a single sorry into multiple sorry'd helpers — reviewers reject if sorry count increases.
 - Never redistribute sorry by creating sorry'd helpers and proving the target from them — `lean_verify` detects `sorryAx` in the axiom list.
 - Never introduce a new sorry to close an existing one. If changing a definition breaks other proofs, fix ALL of them.
-
-<!-- TODO: Add remaining sorry handling rules (inline failed helpers, leaving sorry as-is is better than shuffling). See examples/skills/autoform-prove/SKILL.md for the full version. -->
+- If you can't prove a helper, inline the attempt instead of leaving it as a separate sorry'd lemma.
+- Leaving a sorry as-is is always better than shuffling it around.
 
 ## Axiom Policy
 
@@ -36,8 +35,8 @@ Never use the `axiom` keyword to replace `sorry` — it is a cheating pattern.
 
 - If an axiom exists in the code, convert it to `theorem ... := by sorry` preserving the exact signature.
 - When decomposing, split into genuinely distinct sub-results, not weaker versions of the main theorem.
-
-<!-- TODO: Add remaining axiom policy rules (axiom-to-sorry alone is not progress, never shuffle axioms). See examples/skills/autoform-prove/SKILL.md for the full version. -->
+- Axiom-to-sorry conversion alone is not progress — you must also attempt the proof.
+- Never shuffle axioms (rename, split, or recombine without proving anything).
 
 ## The `unproved` Macro
 
@@ -52,8 +51,14 @@ This compiles to `@[unproved] axiom theoremName ...` and marks the declaration a
 **When to use `unproved`:**
 - The book says "proof omitted" or "left as exercise"
 - The book references another source instead of a proof
+- The book states a result without any proof
 
-<!-- TODO: Add remaining "when to use" and "when NOT to use" cases, and the final policy on sorry vs raw axiom. See examples/skills/autoform-prove/SKILL.md for the full version. -->
+**When NOT to use `unproved`:**
+- The book provides a proof (even a sketch) — you must prove it
+- You find the proof too difficult — keep trying
+- A Mathlib lemma is needed but missing — prove it yourself
+
+**`sorry` and raw `axiom` are never acceptable** as final state. `sorry` introduces `sorryAx` which breaks soundness downstream. Raw `axiom` without `@[unproved]` is equally penalized.
 
 ## Detecting False Statements
 
@@ -61,8 +66,9 @@ Some formalized statements are mathematically false. Detect early:
 
 - Try small parameter instantiations (n=1, zero function, degenerate cases).
 - If three independent proof paths fail at the same point, investigate whether the statement is false.
+- Watch for type-space confusion where the same Lean type represents two different mathematical spaces.
 
-<!-- TODO: Add remaining detection guidance (type-space confusion, handling procedure: document counterexample, report, leave as sorry). See examples/skills/autoform-prove/SKILL.md for the full version. -->
+**Handling:** Document the counterexample in a comment, report the issue, and leave as sorry. Do NOT replace sorry with axiom or shuffle to helpers.
 
 ## Anti-Cheating Checklist
 
@@ -71,13 +77,15 @@ These patterns are always rejected:
 1. **Trivial substitution** — replacing a theorem's statement with `True` while keeping name/docstring.
 2. **Encoding theorems as definitions** — `def foo (...) : Prop := <statement>` for something the book proves.
 3. **Smuggling assumptions** — structure fields that include what should be proved as theorems.
-
-<!-- TODO: Add remaining anti-cheating patterns (weakening content, modeling avoidance, unacknowledged sorry/axiom). See examples/skills/autoform-prove/SKILL.md for the full version. -->
+4. **Weakening content** — proving a weaker numerical shadow instead of the actual result.
+5. **Modeling avoidance** — replacing mathematical objects with simpler algebraic proxies without proving faithfulness.
+6. **Unacknowledged sorry/axiom** — sorry in helper lemmas called by "proved" theorems. Always grep the entire project.
 
 ## When Stuck
 
 Every task is achievable given enough time. If stuck:
 1. Search Mathlib using `lean_loogle` or `mathlib_grep` for relevant lemma names
 2. Break the proof into smaller `have` steps that mirror the informal argument
-
-<!-- TODO: Add remaining "when stuck" strategies (exact?/apply?/simp?, read error messages, restructure approach). See examples/skills/autoform-prove/SKILL.md for the full version. -->
+3. Try `exact?`, `apply?`, `simp?` to discover the right tactics
+4. Read error messages carefully — they tell you exactly what Lean needs
+5. Restructure your approach rather than escalating
