@@ -1,2 +1,0 @@
-description = "Activate Lean 4 formalization mode with Mathlib conventions"
-prompt = "Load the autoform skill. I'm working on Lean 4 formalization with Mathlib. Apply all Mathlib conventions: proof style, naming, tactics, simp rules, API design, and common pitfalls."

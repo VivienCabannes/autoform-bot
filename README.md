@@ -6,13 +6,15 @@ Autoform gives your coding assistant the knowledge and tools to translate mathem
 
 ## Status: Template
 
-This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, commands, discovery files) is complete. The domain content is stubbed:
+This repo ships as a **working minimal plugin**. The wiring (manifests, hooks, discovery files) is complete. Domain-specific skills (conventions, proof strategies, review checklists) are left for future PRs:
 
 | Component | Status | What's there | What PRs add |
 |-----------|--------|-------------|--------------|
+| **Setup skills** (install-lean, setup-project) | ✅ Full | Scripts + hook-driven auto-execution | — |
+| **Zulip search** (server + skill) | ✅ Full | Zulip API search for community discussions | — |
 | **Workspace server** | ✅ Full | Project scan, sorry/axiom counts, declarations | — |
 | **Other servers** (repl, mathlib, lsp, trace, aristotle) | ⬜ Stub | Servers start, tools return "not implemented" | Real implementations |
-| **Skills** (6) | ⬜ Stub | Section headings + 2-3 rules each | Full tactic tables, checklists, pitfall lists |
+| **Formalization skills** | ⬜ Not yet | — | Conventions, proof strategies, review, extraction, orchestration |
 | **Agents** (3) | ⬜ Stub | Correct frontmatter, one-paragraph prompts | Rich system prompts |
 
 Full reference implementations for every stub live in [`examples/`](examples/). See [CONTRIBUTING.md](CONTRIBUTING.md) for how to pick up a stub and fill it in.
@@ -39,7 +41,7 @@ Assistant: *searches Mathlib for existing lemmas, uses correct typeclasses,
 Inside Claude Code, add the marketplace and install:
 
 ```
-/plugin marketplace add https://github.com/vivc/autoform-bot.git
+/plugin marketplace add https://github.com/facebookresearch/autoform-bot.git
 /plugin install autoform@autoform
 ```
 
@@ -52,33 +54,80 @@ Or from a local checkout:
 
 ### Codex CLI
 
-The plugin includes a `.codex-plugin/plugin.json` manifest and `commands/*.toml` slash commands.
+Codex installs plugins from a marketplace root. For a local checkout, create a
+small local marketplace that points back to this repo:
+
+```sh
+git clone https://github.com/facebookresearch/autoform-bot.git
+cd autoform-bot
+
+MARKETPLACE_ROOT="${CODEX_AUTOFORM_MARKETPLACE:-$HOME/.autoform-codex-marketplace}"
+mkdir -p "$MARKETPLACE_ROOT/plugins" "$MARKETPLACE_ROOT/.agents/plugins"
+
+if [ -L "$MARKETPLACE_ROOT/plugins/autoform" ]; then
+  rm "$MARKETPLACE_ROOT/plugins/autoform"
+fi
+ln -s "$PWD" "$MARKETPLACE_ROOT/plugins/autoform"
+
+cat > "$MARKETPLACE_ROOT/.agents/plugins/marketplace.json" <<'JSON'
+{
+  "name": "autoform-local",
+  "interface": {
+    "displayName": "AutoForm Local"
+  },
+  "plugins": [
+    {
+      "name": "autoform",
+      "source": {
+        "source": "local",
+        "path": "./plugins/autoform"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    }
+  ]
+}
+JSON
+
+codex plugin marketplace add "$MARKETPLACE_ROOT"
+codex plugin add autoform@autoform-local
+```
+
+Verify the install:
+
+```sh
+codex plugin list | grep autoform
+```
+
+The Codex plugin name is `autoform`. Start a new Codex thread after installing
+or reinstalling so the new skills and MCP servers are loaded.
 
 ### Other agents (via npx skills)
 
 | Agent | Install |
 |-------|---------|
-| Cursor | `npx skills add vivc/autoform-bot -a cursor` |
-| Windsurf | `npx skills add vivc/autoform-bot -a windsurf` |
-| Copilot | `npx skills add vivc/autoform-bot -a github-copilot` |
-| Cline | `npx skills add vivc/autoform-bot -a cline` |
+| Cursor | `npx skills add facebookresearch/autoform-bot -a cursor` |
+| Windsurf | `npx skills add facebookresearch/autoform-bot -a windsurf` |
+| Copilot | `npx skills add facebookresearch/autoform-bot -a github-copilot` |
+| Cline | `npx skills add facebookresearch/autoform-bot -a cline` |
 
 ## Skills
 
 | Skill | Slash command | What it does |
 |-------|--------------|--------------|
-| Mathlib conventions | `/autoform` | Lean 4 + Mathlib style, tactics, naming, pitfalls |
-| Proof strategies | `/autoform-prove` | Incremental proving workflow: search → prototype → prove → commit |
-| Code review | `/autoform-review` | Review for correctness, faithfulness, and cheating patterns |
-| Quality check | `/autoform-quality` | Mathlib style lint — naming, tactics, code structure |
-| Statement extraction | `/autoform-extract` | Extract formalizable statements from LaTeX/Markdown |
-| Crew orchestration | `/autoform-crew` | Parallel formalization with subagent teams |
+| Install Lean | `/install-lean` | Install Lean 4, elan, lake — auto-runs via hook |
+| Setup project | `/setup-project` | Create a new Lean 4 + Mathlib project from the LeanProject template |
+| Zulip search | `/zulip-search` | Search Lean Zulip for community discussions |
 
 ## MCP Servers
 
 | Server | Status | What it does |
 |--------|--------|-------------|
 | `autoform-workspace` | ✅ | Scan project structure, sorry/axiom counts, targets |
+| `autoform-zulip` | ✅ | Search Lean Zulip for community discussions |
 | `autoform-repl` | ⬜ | Lean 4 REPL — run code, verify proofs |
 | `autoform-mathlib` | ⬜ | Mathlib source search — grep, find by name, read files |
 | `autoform-lsp` | ⬜ | Lean 4 LSP — file diagnostics, type info |

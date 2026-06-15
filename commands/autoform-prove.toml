@@ -1,2 +1,0 @@
-description = "Activate proof strategies and workflow guidance"
-prompt = "Load the autoform-prove skill. I need help with Lean 4 proof strategy: search-first workflow, REPL prototyping, incremental proving, sorry/axiom handling, and the unproved macro policy."

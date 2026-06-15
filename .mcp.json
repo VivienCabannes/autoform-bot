@@ -1,24 +1,4 @@
 {
-  "name": "autoform",
-  "description": "Turn any AI coding assistant into a Lean 4 formalization agent. Mathlib conventions, proof strategies, review checklists, and statement extraction — distilled from 94k PR reviews.",
-  "version": "0.1.0",
-  "author": {
-    "name": "Vivien Cabannes",
-    "url": "https://github.com/facebookresearch/autoform-bot"
-  },
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/user-prompt-submit\"",
-            "timeout": 120
-          }
-        ]
-      }
-    ]
-  },
   "mcpServers": {
     "autoform-workspace": {
       "command": "python",
@@ -26,8 +6,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Workspace inspection — scan project structure, sorry/axiom counts, targets"
+      }
     },
     "autoform-repl": {
       "command": "python",
@@ -35,8 +14,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Lean 4 REPL — run code, verify proofs, check compilation"
+      }
     },
     "autoform-mathlib": {
       "command": "python",
@@ -44,8 +22,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Mathlib source search — grep, find by name, read files"
+      }
     },
     "autoform-lsp": {
       "command": "python",
@@ -53,8 +30,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Lean 4 LSP — file diagnostics and type information"
+      }
     },
     "autoform-trace": {
       "command": "python",
@@ -62,8 +38,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "AUTOFORM_TRACE_DIR": "${AUTOFORM_TRACE_DIR:-./traces}"
-      },
-      "description": "Execution tracing — record proof attempts, steps, reviews"
+      }
     },
     "autoform-aristotle": {
       "command": "python",
@@ -71,8 +46,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
-      },
-      "description": "Aristotle (Harmonic) — delegate formalization to an autonomous prover"
+      }
     },
     "autoform-zulip": {
       "command": "python",
@@ -80,8 +54,7 @@
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Zulip search — find community discussions about naming, proofs, and prior art"
+      }
     }
   }
 }

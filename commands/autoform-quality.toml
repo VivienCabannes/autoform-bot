@@ -1,2 +1,0 @@
-description = "Check Lean 4 code quality against Mathlib conventions"
-prompt = "Load the autoform-quality skill. Check the current Lean 4 code for Mathlib style compliance: naming, tactic usage, proof structure, code style. Do not evaluate mathematical correctness."

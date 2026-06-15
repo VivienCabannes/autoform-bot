@@ -1,6 +1,0 @@
-{
-  "name": "autoform",
-  "description": "Turn any AI coding assistant into a Lean 4 formalization agent with Mathlib conventions, proof strategies, and structured review.",
-  "version": "0.1.0",
-  "contextFileName": "GEMINI.md"
-}

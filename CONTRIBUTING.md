@@ -2,27 +2,42 @@
 
 ## Overview
 
-Autoform is a **template plugin** — the wiring (manifests, hooks, commands, discovery files) is complete, but the domain content is shipped as stubs. Contributions fill in these stubs with real implementations. Each server, skill, and agent is independent, so you can contribute one without touching the others.
+Autoform is a **template plugin** — the wiring (manifests, hooks, discovery files) is complete, but domain content is added via PRs. Each server, skill, and agent is independent, so you can contribute one without touching the others.
 
 ## What to work on
 
+### Servers (stub → implementation)
+
 | Component | Location | Status | Difficulty | Notes |
 |-----------|----------|--------|------------|-------|
-| **Workspace server** | `servers/workspace/` | Implemented | — | Reference implementation; do not need to touch |
-| **REPL server** | `servers/repl/` | Stub | Hard | Subprocess management, non-blocking I/O, memory monitoring |
-| **Mathlib server** | `servers/mathlib/` | Stub | Medium | Ripgrep-based search; tools return "not implemented" |
-| **LSP server** | `servers/lsp/` | Stub | Hard | JSON-RPC language server, Content-Length framing, diagnostics |
-| **Trace server** | `servers/trace/` | Stub | Easy | JSONL append-only store; straightforward file I/O |
-| **Aristotle server** | `servers/aristotle/` | Stub | Medium | Multi-session wrapper around `aristotlelib`; requires API key |
-| **autoform skill** | `skills/autoform/SKILL.md` | Stub | Medium | Has section headings + some rules; needs full tactic tables, pitfall lists |
-| **autoform-prove skill** | `skills/autoform-prove/SKILL.md` | Stub | Medium | Has workflow steps; needs full sorry/axiom/cheating details |
-| **autoform-review skill** | `skills/autoform-review/SKILL.md` | Stub | Medium | Has checklist headings; needs full cheating detection patterns |
-| **autoform-quality skill** | `skills/autoform-quality/SKILL.md` | Stub | Easy | Has style rules; needs full naming/tactic/code style details |
-| **autoform-extract skill** | `skills/autoform-extract/SKILL.md` | Stub | Easy | Has process steps; needs full YAML examples and guidelines |
-| **autoform-crew skill** | `skills/autoform-crew/SKILL.md` | Stub | Medium | Has agent table; needs full orchestration patterns and examples |
-| **Worker agent** | `agents/autoform-worker.md` | Stub | Easy | Frontmatter correct; needs rich system prompt |
-| **Reviewer agent** | `agents/autoform-reviewer.md` | Stub | Easy | Frontmatter correct; needs rich system prompt |
-| **Reader agent** | `agents/autoform-reader.md` | Stub | Easy | Frontmatter correct; needs rich system prompt |
+| **Workspace server** | `servers/workspace/` | ✅ Implemented | — | Reference implementation |
+| **Zulip server** | `servers/zulip/` | ✅ Implemented | — | Zulip API search |
+| **REPL server** | `servers/repl/` | ⬜ Stub | Hard | Subprocess management, non-blocking I/O, memory monitoring |
+| **Mathlib server** | `servers/mathlib/` | ⬜ Stub | Medium | Ripgrep-based search; tools return "not implemented" |
+| **LSP server** | `servers/lsp/` | ⬜ Stub | Hard | JSON-RPC language server, Content-Length framing, diagnostics |
+| **Trace server** | `servers/trace/` | ⬜ Stub | Easy | JSONL append-only store; straightforward file I/O |
+| **Aristotle server** | `servers/aristotle/` | ⬜ Stub | Medium | Multi-session wrapper around `aristotlelib`; requires API key |
+
+### Skills (new)
+
+These skills don't exist yet. Create them from scratch — see `examples/skills/` for reference content.
+
+| Skill | Suggested location | Difficulty | What it should cover |
+|-------|--------------------|------------|---------------------|
+| **Mathlib conventions** | `skills/autoform/` | Medium | Lean 4 + Mathlib style, tactics, naming, pitfalls |
+| **Proof strategies** | `skills/autoform-prove/` | Medium | Incremental proving, REPL prototyping, sorry/axiom handling |
+| **Code review** | `skills/autoform-review/` | Medium | Faithfulness, cheating detection, structured checklist |
+| **Quality check** | `skills/autoform-quality/` | Easy | Naming, tactic usage, proof structure, code style |
+| **Statement extraction** | `skills/autoform-extract/` | Easy | Extract formalizable statements from LaTeX/Markdown to YAML |
+| **Crew orchestration** | `skills/autoform-crew/` | Medium | When and how to spawn worker/reviewer/reader subagents |
+
+### Agents (stub → rich prompt)
+
+| Component | Location | Status | Difficulty | Notes |
+|-----------|----------|--------|------------|-------|
+| **Worker agent** | `agents/autoform-worker.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
+| **Reviewer agent** | `agents/autoform-reviewer.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
+| **Reader agent** | `agents/autoform-reader.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
 
 ## How to contribute a server
 
@@ -52,15 +67,15 @@ The workspace server (`servers/workspace/`) is the reference implementation. Stu
 
 Skills are Markdown files with YAML frontmatter. Each skill is a self-contained reference document that the AI assistant loads into context when triggered.
 
-1. **Read the example.** The `examples/skills/<name>/SKILL.md` contains the full reference version. Compare it with the stub at `skills/<name>/SKILL.md` to see what is missing.
+1. **Create the directory.** `skills/<name>/SKILL.md` with YAML frontmatter (`name`, `description` with trigger patterns).
 
-2. **Fill in the `<!-- TODO -->` sections.** Each TODO comment describes what content belongs there and points to the example file for reference.
+2. **Check examples.** The `examples/skills/<name>/SKILL.md` may contain a reference version.
 
-3. **Keep TODO markers** for sections you do not finish. This lets others pick up where you left off.
+3. **Add scripts if needed.** If the skill automates a task, put the script alongside the SKILL.md (e.g. `skills/<name>/<name>.sh`). Add a case to `hooks/user-prompt-submit` to auto-run it.
 
-4. **Preserve the YAML frontmatter.** The `name`, `description`, and trigger patterns must stay unchanged — they control when the skill is loaded.
+4. **Update discovery files.** Add `@skills/<name>/SKILL.md` to `AGENTS.md` and `GEMINI.md`.
 
-5. **Create or update `README.md`.** Each skill directory has a `README.md` for humans. Keep it in sync with the SKILL.md content.
+5. **Preserve the YAML frontmatter.** The `name`, `description`, and trigger patterns control when the skill is loaded.
 
 ## How to contribute an agent prompt
 
@@ -91,11 +106,11 @@ The test suite checks:
 
 - **Python:** Follow `ruff` with 120-character line length. Run `ruff check servers/` before submitting.
 - **Markdown:** YAML frontmatter is required for all skills and agents. Follow the existing section structure.
-- **Follow existing patterns.** When in doubt, look at the workspace server (for Python) or the autoform-prove skill (for Markdown).
+- **Follow existing patterns.** When in doubt, look at the workspace server (for Python) or `skills/install-lean/` (for skills with scripts).
 
 ## PR guidelines
 
-- **One stub at a time.** Each PR should fill in one server, one skill, or one agent. This keeps reviews focused.
+- **One component at a time.** Each PR should add one server, one skill, or one agent. This keeps reviews focused.
 - **Include tests.** If you add a new server, add corresponding tests in `tests/test_servers.py`. If you change existing server APIs, update the existing tests.
 - **Run the full test suite** before submitting: `pytest tests/`.
 - **Reference the example.** In your PR description, note which `examples/` file you used as reference.

@@ -4,7 +4,7 @@
   "description": "Turn any AI coding assistant into a Lean 4 formalization agent. Mathlib conventions, proof strategies, structured review, and statement extraction.",
   "owner": {
     "name": "Vivien Cabannes",
-    "url": "https://github.com/vivc"
+    "url": "https://github.com/facebookresearch/autoform-bot"
   },
   "plugins": [
     {

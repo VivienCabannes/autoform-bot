@@ -1,2 +1,0 @@
-description = "Orchestrate parallel formalization with subagent teams"
-prompt = "Load the autoform-crew skill. I want to parallelize formalization work by spawning autoform-worker, autoform-reviewer, and autoform-reader subagents. Show me the right patterns for my targets."

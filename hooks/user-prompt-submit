@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# UserPromptSubmit hook — auto-run skill scripts when triggered.
+#
+# /install-lean          → runs install-lean.sh immediately
+# /setup-project MyProj  → runs setup-project.sh MyProj immediately
+# /setup-project         → passes through to the AI (which will ask for the name)
+
+set -euo pipefail
+
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+input="$(cat)"
+prompt="$(printf '%s' "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('prompt',''))" 2>/dev/null || echo "")"
+
+# Extract the command and args
+cmd="${prompt%% *}"
+args="${prompt#"$cmd"}"
+args="${args# }"  # trim leading space
+
+case "$cmd" in
+  /install-lean)
+    output="$(bash "$PLUGIN_ROOT/skills/install-lean/install-lean.sh" 2>&1)" || true
+    escaped="$(printf '%s' "$output" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" | sed 's/^"//;s/"$//')"
+    printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$escaped"
+    ;;
+  /setup-project)
+    if [ -n "$args" ]; then
+      output="$(bash "$PLUGIN_ROOT/skills/setup-project/setup-project.sh" $args 2>&1)" || true
+      escaped="$(printf '%s' "$output" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" | sed 's/^"//;s/"$//')"
+      printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$escaped"
+    else
+      # No args — let the AI handle it (will ask for project name)
+      printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit"}}\n'
+    fi
+    ;;
+  *)
+    # Not our command — pass through
+    printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit"}}\n'
+    ;;
+esac
