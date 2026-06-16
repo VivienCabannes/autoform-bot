@@ -3,18 +3,25 @@
 
 Given a ``graph.json`` (schema in skills/plan/references/plan-json-schema.md) and an ``informal_content/``
 directory of ``<id>.md`` files, this generates a complete, ready-to-build blueprint
-project under an output directory:
+project under an output directory, following the standard leanblueprint project
+layout (matching the statmech project convention):
 
-    <out>/blueprint/src/web.tex
-    <out>/blueprint/src/plastex.cfg
-    <out>/blueprint/src/macros/common.tex
-    <out>/blueprint/src/macros/web.tex
-    <out>/blueprint/src/content.tex
-    <out>/blueprint/web/tier_dots.js
+    <out>/Makefile                            # build orchestration
+    <out>/blueprint/src/web.tex               # web entry point (plasTeX)
+    <out>/blueprint/src/print.tex             # PDF entry point (xelatex)
+    <out>/blueprint/src/plastex.cfg           # plasTeX config
+    <out>/blueprint/src/content.tex           # one environment per tier-2 node
+    <out>/blueprint/src/tier_dots.js          # per-tier DOT strings (tier toggle)
+    <out>/blueprint/src/blueprint.sty         # stub package
+    <out>/blueprint/src/latexmkrc             # PDF build config
+    <out>/blueprint/src/extra_styles.css      # theorem border styling
+    <out>/blueprint/src/macros/common.tex     # shared theorem environments
+    <out>/blueprint/src/macros/web.tex        # web-only macros
+    <out>/blueprint/src/macros/print.tex      # PDF dummy macros
 
 The dependency-graph page (``dep_graph_document.html``) is produced by plasTeX
-itself at build time from our custom template; we wire that template in through
-the supported ``tpl=`` package option (absolute path) in ``web.tex``.
+itself at build time from our custom template (with tier-toggle); we wire that
+template in through the supported ``tpl=`` package option in ``web.tex``.
 
 Usage:
     python export_blueprint.py <graph.json> [--content <dir>] [--out <dir>] \
@@ -79,6 +86,50 @@ READY_COLOR = "blue"  # auto "ready to state" border, blueprint's can_state colo
 
 # graphviz shapes by kind (definitions are boxes, everything else an ellipse).
 DEFINITION_KINDS = {"definition"}
+
+# ---------------------------------------------------------------------------
+# Dependency-graph layout & styling. These are the knobs to tune to make the
+# graph prettier; they are applied to every per-tier DOT we generate.
+#   rankdir   : flow direction. "TB" top->bottom, "LR" left->right,
+#               "BT" bottom->top, "RL" right->left.
+#   ranksep   : gap (inches) between dependency levels (default 0.5). Larger
+#               => more vertical breathing room.
+#   nodesep   : gap (inches) between sibling nodes on the same level
+#               (default 0.25). Larger => wider spacing.
+#   splines   : edge routing. "spline" (curved), "polyline", "ortho"
+#               (right angles), "line"/"false" (straight), "curved".
+#   font_*    : node label font. Any web-safe family + point size.
+#   node_margin: padding (x,y inches) inside each node around its label.
+#   penwidth  : border thickness of nodes.
+#   concentrate: "true" merges parallel edges into one for a cleaner look.
+# ---------------------------------------------------------------------------
+GRAPH_STYLE = {
+    "rankdir": "LR",
+    "ranksep": "0.9",
+    "nodesep": "0.5",
+    "splines": "curved",
+    "concentrate": "true",
+    "font_name": "Helvetica",
+    "font_size": "11",
+    "node_margin": "0.15,0.07",
+    "penwidth": "1.8",
+}
+
+
+def _graph_attr_lines() -> List[str]:
+    """Return the shared graph/node/edge attribute lines for a DOT digraph,
+    built from GRAPH_STYLE so every tier graph looks consistent."""
+    s = GRAPH_STYLE
+    return [
+        f"  graph [bgcolor=transparent, rankdir={s['rankdir']}, "
+        f"ranksep={s['ranksep']}, nodesep={s['nodesep']}, "
+        f"splines={s['splines']}, concentrate={s['concentrate']}];",
+        f'  node [label="\\N", penwidth={s["penwidth"]}, '
+        f'fontname="{s["font_name"]}", fontsize={s["font_size"]}, '
+        f'margin="{s["node_margin"]}"];',
+        '  edge [arrowhead=vee];',
+    ]
+
 
 VALID_STATUSES = {"in-mathlib", "partial", "missing"}
 
@@ -241,7 +292,6 @@ KIND_TO_ENV = {
     "proposition": "proposition",
     "lemma": "lemma",
     "corollary": "corollary",
-    "example": "example",
 }
 
 
@@ -306,6 +356,86 @@ def read_content(node: dict, content_dir: Path, slug: str, project_root: Path) -
     return f"% TODO: missing content for {node['id']}\n\\emph{{(statement pending)}}"
 
 
+def _split_proof(body: str) -> Tuple[str, Optional[str]]:
+    """Split markdown body into (statement, proof) if a proof section is present.
+
+    Looks for common proof markers: ## Proof, ### Proof, *Proof.*, **Proof.**
+    Returns (statement_text, proof_text) or (body, None) if no proof found.
+    """
+    proof_patterns = [
+        re.compile(r"^#{2,3}\s+Proof\b", re.MULTILINE),
+        re.compile(r"^\*\*?Proof[\.\:]\*\*?", re.MULTILINE),
+    ]
+    for pat in proof_patterns:
+        m = pat.search(body)
+        if m:
+            statement = body[:m.start()].rstrip()
+            proof = body[m.end():].strip()
+            if proof:
+                return statement, proof
+    return body, None
+
+
+def _emit_node_block(
+    nid: str,
+    node: dict,
+    slug: str,
+    nodes: Dict[str, dict],
+    name_to_slug: Dict[str, str],
+    tier2_ids: set,
+    content_dir: Path,
+    project_root: Path,
+) -> str:
+    """Emit a single blueprint environment block for one tier-2 node."""
+    env = KIND_TO_ENV.get((node.get("kind") or "theorem").lower(), "theorem")
+    status = node_status(node)
+
+    uses = [
+        name_to_slug[d]
+        for d in (node.get("depends_on", []) or [])
+        if d in tier2_ids and d != nid
+    ]
+
+    body = read_content(node, content_dir, slug, project_root)
+    statement_body, proof_body = _split_proof(body) if body else (body, None)
+
+    lines: List[str] = []
+    escaped_title = _latex_escape_title(nid)
+    # Each tier-2 node is a \section, so it appears as a nested TOC entry under
+    # its tier-1 chapter (giving the collapsible two-tier table of contents).
+    lines.append(f"\\section{{{escaped_title}}}")
+    lines.append(f"\\begin{{{env}}}[{escaped_title}]\\label{{{slug}}}")
+
+    if status == "in-mathlib":
+        decls = node.get("mathlib_declarations", []) or []
+        if decls:
+            lines.append(f"\\lean{{{', '.join(d.strip() for d in decls)}}}")
+        lines.append("\\mathlibok")
+    elif status == "partial":
+        lines.append("\\leanok")
+    else:
+        if not node_ready_from_deps(node, nodes):
+            lines.append("\\notready")
+
+    if uses:
+        lines.append(f"\\uses{{{', '.join(uses)}}}")
+
+    if statement_body:
+        lines.append(statement_body)
+
+    lines.append(f"\\end{{{env}}}")
+
+    if proof_body:
+        lines.append("")
+        lines.append("\\begin{proof}")
+        if uses:
+            lines.append(f"\\uses{{{', '.join(uses)}}}")
+        lines.append(proof_body)
+        lines.append("\\end{proof}")
+
+    return "\n".join(lines)
+
+
 def emit_content_tex(
     tier2_order: List[str],
     nodes: Dict[str, dict],
@@ -313,57 +443,80 @@ def emit_content_tex(
     content_dir: Path,
     project_root: Path,
 ) -> str:
-    """Build content.tex: one blueprint environment per tier-2 node, in
-    dependency order, with vanilla blueprint annotations.
+    r"""Build content.tex: tier-2 nodes grouped under tier-1 cluster chapters.
+
+    Each tier-1 cluster becomes a ``\chapter{}``, and its child tier-2 nodes
+    are emitted underneath in dependency order. This produces the standard
+    leanblueprint page structure: a table-of-contents index linking to
+    per-chapter pages, each containing the relevant theorem blocks.
+
+    Tier-2 nodes with no parent (orphans) are grouped in a final chapter.
     """
     tier2_ids = set(tier2_order)
+
+    # Build parent -> [child ids] mapping, preserving dependency order.
+    tier1_nodes: Dict[str, dict] = {
+        nid: node for nid, node in nodes.items() if node_tier(node) == 1
+    }
+    children_of: Dict[Optional[str], List[str]] = {}
+    for nid in tier2_order:
+        parent = nodes[nid].get("parent")
+        children_of.setdefault(parent, []).append(nid)
+
+    # Determine chapter order: tier-1 nodes in dependency order (those that
+    # have children first, then any that don't). Orphans go last.
+    tier1_with_children = [
+        cid for cid in topo_order(tier1_nodes) if cid in children_of
+    ]
+    tier1_without_children = [
+        cid for cid in topo_order(tier1_nodes)
+        if cid not in children_of and cid in tier1_nodes
+    ]
+    chapter_order = tier1_with_children + tier1_without_children
+    orphan_ids = children_of.get(None, [])
+    # Also catch children whose parent is not a tier-1 node.
+    for parent_id, kids in children_of.items():
+        if parent_id is not None and parent_id not in tier1_nodes:
+            orphan_ids.extend(kids)
+
     blocks: List[str] = [
         "% Generated by export_blueprint.py -- do not edit by hand.",
-        "% One blueprint environment per tier-2 node, in dependency order.",
+        "% Tier-2 nodes grouped under tier-1 cluster chapters.",
+        "%   * \\uses{...} inside a statement  = definitional dependency (solid edge)",
+        "%   * \\uses{...} inside a proof      = proof dependency        (dashed edge)",
         "",
     ]
 
-    for nid in tier2_order:
-        node = nodes[nid]
-        slug = name_to_slug[nid]
-        env = KIND_TO_ENV.get((node.get("kind") or "theorem").lower(), "theorem")
-        status = node_status(node)
-
-        # \uses targets: only tier-2 depends_on (within-tier edges) that are
-        # themselves emitted as labels in this document.
-        uses = [
-            name_to_slug[d]
-            for d in (node.get("depends_on", []) or [])
-            if d in tier2_ids and d != nid
-        ]
-
-        body = read_content(node, content_dir, slug, project_root)
-
-        lines: List[str] = []
-        lines.append(f"\\begin{{{env}}}\\label{{{slug}}}")
-        # Comment naming the human id for traceability (LaTeX-safe).
-        lines.append(f"  % node id: {node['id']}")
-        if body:
-            lines.append("  " + body.replace("\n", "\n  "))
-        if uses:
-            lines.append(f"  \\uses{{{','.join(uses)}}}")
-
-        # Status annotations per the design mapping.
-        if status == "in-mathlib":
-            decls = node.get("mathlib_declarations", []) or []
-            if decls:
-                lines.append(f"  \\lean{{{','.join(d.strip() for d in decls)}}}")
-            lines.append("  \\mathlibok")
-        elif status == "partial":
-            lines.append("  \\leanok")
-        else:  # missing
-            if not node_ready_from_deps(node, nodes):
-                lines.append("  \\notready")
-            # missing + ready: emit nothing (blueprint auto-derives the "ready" blue).
-
-        lines.append(f"\\end{{{env}}}")
-        blocks.append("\n".join(lines))
+    for cid in chapter_order:
+        cluster = tier1_nodes[cid]
+        escaped_chapter = _latex_escape_title(cid)
+        chapter_slug = name_to_slug[cid]
+        blocks.append(f"\\chapter{{{escaped_chapter}}}\\label{{{chapter_slug}}}")
+        desc = cluster.get("description", "")
+        if desc:
+            blocks.append(desc)
         blocks.append("")
+
+        for nid in children_of.get(cid, []):
+            node = nodes[nid]
+            slug = name_to_slug[nid]
+            blocks.append(_emit_node_block(
+                nid, node, slug, nodes, name_to_slug,
+                tier2_ids, content_dir, project_root,
+            ))
+            blocks.append("")
+
+    if orphan_ids:
+        blocks.append("\\chapter{Additional statements}")
+        blocks.append("")
+        for nid in orphan_ids:
+            node = nodes[nid]
+            slug = name_to_slug[nid]
+            blocks.append(_emit_node_block(
+                nid, node, slug, nodes, name_to_slug,
+                tier2_ids, content_dir, project_root,
+            ))
+            blocks.append("")
 
     return "\n".join(blocks) + "\n"
 
@@ -436,9 +589,7 @@ def build_tier2_dot(
     """Tier-2 DOT: all tier-2 nodes + within-tier edges, with status colors."""
     ready = _ready_set(tier2)
     lines: List[str] = ['strict digraph "" {']
-    lines.append("  graph [bgcolor=transparent];")
-    lines.append('  node [label="\\N", penwidth=1.8];')
-    lines.append("  edge [arrowhead=vee];")
+    lines.extend(_graph_attr_lines())
 
     ids = set(tier2)
     for nid in sorted(tier2):
@@ -478,9 +629,7 @@ def build_tier1_dot(
             parent_of[nid] = p
 
     lines: List[str] = ['strict digraph "" {']
-    lines.append("  graph [bgcolor=transparent];")
-    lines.append('  node [label="\\N", penwidth=1.8];')
-    lines.append("  edge [arrowhead=vee];")
+    lines.extend(_graph_attr_lines())
 
     for cid in sorted(tier1):
         members = [m for m, p in parent_of.items() if p == cid]
@@ -575,6 +724,58 @@ def emit_tier_dots_js(
             continue
         dots[t] = build_tier2_dot(by_tier[t], name_to_slug)
 
+    # Per-tier edge lists (as [src_slug, tgt_slug] pairs, src=prerequisite,
+    # tgt=dependent). The template uses these to compute a clicked node's full
+    # ancestor (dependency) + descendant (future-dependency) cone for highlighting.
+    edges: Dict[int, List[List[str]]] = {}
+    if tier2:
+        ids2 = set(tier2)
+        e2 = {
+            (name_to_slug[d], name_to_slug[nid])
+            for nid, node in tier2.items()
+            for d in (node.get("depends_on", []) or [])
+            if d in ids2 and d != nid
+        }
+        edges[2] = sorted([list(p) for p in e2])
+    if tier1:
+        # Quotient edges (cluster -> cluster), mirroring build_tier1_dot.
+        parent_of = {
+            nid: node.get("parent")
+            for nid, node in tier2.items()
+            if node.get("parent") in tier1
+        }
+        ids2 = set(tier2)
+        c_edges: set = set()
+        for nid, node in tier2.items():
+            src_c = parent_of.get(nid)
+            if src_c is None:
+                continue
+            for d in (node.get("depends_on", []) or []):
+                if d not in ids2:
+                    continue
+                tgt_c = parent_of.get(d)
+                if tgt_c is None or tgt_c == src_c:
+                    continue
+                c_edges.add((name_to_slug[tgt_c], name_to_slug[src_c]))
+        if not tier2:
+            for cid, node in tier1.items():
+                for d in (node.get("depends_on", []) or []):
+                    if d in tier1 and d != cid:
+                        c_edges.add((name_to_slug[d], name_to_slug[cid]))
+        edges[1] = sorted([list(p) for p in c_edges])
+    for t in tiers:
+        if t in (1, 2):
+            continue
+        bt = by_tier[t]
+        idst = set(bt)
+        et = {
+            (name_to_slug[d], name_to_slug[nid])
+            for nid, node in bt.items()
+            for d in (node.get("depends_on", []) or [])
+            if d in idst and d != nid
+        }
+        edges[t] = sorted([list(p) for p in et])
+
     # cluster -> member human ids, for the cluster-summary click handler.
     cluster_members: Dict[str, List[str]] = {}
     for nid, node in tier2.items():
@@ -616,6 +817,7 @@ def emit_tier_dots_js(
     parts.append(f"const TIER_NODE_NAMES = {json.dumps(node_names)};")
     parts.append(f"const TIER_NODE_DESC = {json.dumps(node_desc)};")
     parts.append(f"const TIER_PROVISIONAL = {json.dumps(provisional)};")
+    parts.append(f"const TIER_EDGES = {json.dumps({t: edges.get(t, []) for t in present})};")
     parts.append("")
     return "\n".join(parts), present
 
@@ -626,6 +828,9 @@ def emit_tier_dots_js(
 
 COMMON_TEX = r"""% Generated by export_blueprint.py -- do not edit by hand.
 % Shared math macros + theorem environments tracked by the dependency graph.
+% The configuration below uses the theorem counter for all environments
+% and never resets it. Add [chapter] at the end of the next line to
+% number within chapters.
 \newtheorem{theorem}{Theorem}
 \newtheorem{proposition}[theorem]{Proposition}
 \newtheorem{lemma}[theorem]{Lemma}
@@ -633,20 +838,79 @@ COMMON_TEX = r"""% Generated by export_blueprint.py -- do not edit by hand.
 
 \theoremstyle{definition}
 \newtheorem{definition}[theorem]{Definition}
-\newtheorem{example}[theorem]{Example}
 """
 
 WEB_MACROS_TEX = r"""% Generated by export_blueprint.py -- do not edit by hand.
 % Web-only macros (none needed yet).
 """
 
+PRINT_MACROS_TEX = r"""% Generated by export_blueprint.py -- do not edit by hand.
+% Macros used only by the printed (PDF) version.
+% This file starts with dummy macros that ensure the PDF compiler will
+% ignore macros provided by plasTeX that make sense only for the web
+% version, such as dependency-graph macros.
+
+% Dummy macros that make sense only for web version.
+\newcommand{\lean}[1]{}
+\newcommand{\discussion}[1]{}
+\newcommand{\leanok}{}
+\newcommand{\mathlibok}{}
+\newcommand{\notready}{}
+% Make sure that arguments of \uses and \proves are real labels, by using invisible refs:
+% latex prints a warning if the label is not defined, but nothing is shown in the pdf file.
+% It uses LaTeX3 programming, this is why we use the expl3 package.
+\ExplSyntaxOn
+\NewDocumentCommand{\uses}{m}
+ {\clist_map_inline:nn{#1}{\vphantom{\ref{##1}}}%
+  \ignorespaces}
+\NewDocumentCommand{\proves}{m}
+ {\clist_map_inline:nn{#1}{\vphantom{\ref{##1}}}%
+  \ignorespaces}
+\ExplSyntaxOff
+"""
+
+BLUEPRINT_STY = r"""\DeclareOption*{}
+\ProcessOptions
+
+\newcommand{\graphcolor}[3]{}
+"""
+
+LATEXMKRC = r"""$pdflatex = 'xelatex -synctex=1 %O %S';
+@default_files = ('print.tex');
+"""
+
+EXTRA_STYLES_CSS = """/* Generated by export_blueprint.py -- do not edit by hand.
+ * Vertical line on the left of theorem statements and proofs.
+ */
+
+div.theorem_thmcontent {
+\tborder-left: .15rem solid black;
+}
+
+div.proposition_thmcontent {
+\tborder-left: .15rem solid black;
+}
+
+div.lemma_thmcontent {
+\tborder-left: .1rem solid black;
+}
+
+div.corollary_thmcontent {
+\tborder-left: .1rem solid black;
+}
+
+div.proof_content {
+\tborder-left: .08rem solid grey;
+}
+"""
+
 PLASTEX_CFG = """[general]
 renderer=HTML5
 copy-theme-extras=yes
-plugins=plastexdepgraph leanblueprint
+plugins=plastexdepgraph  plastexshowmore  leanblueprint
 
 [document]
-toc-depth=2
+toc-depth=3
 toc-non-files=True
 
 [files]
@@ -654,23 +918,31 @@ directory=../web/
 split-level=0
 
 [html5]
-localtoc-level=1
+localtoc-level=0
 mathjax-dollars=False
 extra-js=tier_dots.js
+extra-css=extra_styles.css
 """
 
 
-def build_web_tex(template_abs: Path, title: str) -> Tuple[str, str]:
+def build_web_tex(template_abs: Path, title: str, metadata: dict) -> Tuple[str, str]:
     r"""Return (web.tex content, the exact blueprint package options line).
 
     The custom template is wired in via the supported ``tpl=`` package option,
     passed through the blueprint package to depgraph, using an ABSOLUTE path so it
     resolves under the leanblueprint CLI's chdir.
     """
-    options_line = f"\\usepackage[dep_graph,tpl={template_abs}]{{blueprint}}"
+    options_line = f"\\usepackage[showmore, dep_graph, tpl={template_abs}]{{blueprint}}"
+
+    home_url = metadata.get("home_url", "http://example.com")
+    github_url = metadata.get("github_url", "http://example.com")
+    docs_url = metadata.get("docs_url", "https://leanprover-community.github.io/mathlib4_docs")
+    author = metadata.get("author", "Lean Informal Planner")
+
     content = (
         "% Generated by export_blueprint.py -- do not edit by hand.\n"
-        "\\documentclass{article}\n"
+        "% This file makes a web version of the blueprint.\n"
+        "\\documentclass{report}\n"
         "\n"
         "\\usepackage{amssymb, amsthm, amsmath}\n"
         "\\usepackage{hyperref}\n"
@@ -679,12 +951,12 @@ def build_web_tex(template_abs: Path, title: str) -> Tuple[str, str]:
         "\\input{macros/common}\n"
         "\\input{macros/web}\n"
         "\n"
-        "\\home{http://example.com}\n"
-        "\\github{http://example.com}\n"
-        "\\dochome{https://leanprover-community.github.io/mathlib4_docs}\n"
+        f"\\home{{{home_url}}}\n"
+        f"\\github{{{github_url}}}\n"
+        f"\\dochome{{{docs_url}}}\n"
         "\n"
         f"\\title{{{_latex_escape_title(title)}}}\n"
-        "\\author{Lean Informal Planner}\n"
+        f"\\author{{{_latex_escape_title(author)}}}\n"
         "\n"
         "\\begin{document}\n"
         "\\maketitle\n"
@@ -692,6 +964,31 @@ def build_web_tex(template_abs: Path, title: str) -> Tuple[str, str]:
         "\\end{document}\n"
     )
     return content, options_line
+
+
+def build_print_tex(title: str, metadata: dict) -> str:
+    r"""Return print.tex content for PDF builds."""
+    author = metadata.get("author", "Lean Informal Planner")
+    return (
+        "% Generated by export_blueprint.py -- do not edit by hand.\n"
+        "% This file makes a print (PDF) version of the blueprint.\n"
+        "\\documentclass[a4paper]{report}\n"
+        "\n"
+        "\\usepackage{expl3}\n"
+        "\\usepackage{amssymb, amsthm, amsmath}\n"
+        "\\usepackage{hyperref}\n"
+        "\n"
+        "\\input{macros/common}\n"
+        "\\input{macros/print}\n"
+        "\n"
+        f"\\title{{{_latex_escape_title(title)}}}\n"
+        f"\\author{{{_latex_escape_title(author)}}}\n"
+        "\n"
+        "\\begin{document}\n"
+        "\\maketitle\n"
+        "\\input{content}\n"
+        "\\end{document}\n"
+    )
 
 
 def _latex_escape_title(title: str) -> str:
@@ -721,6 +1018,128 @@ def build_title(metadata: dict) -> str:
     if titles:
         return ", ".join(titles)
     return metadata.get("title", "Formalization Blueprint")
+
+
+def build_makefile() -> str:
+    """Generate a Makefile for the exported blueprint project."""
+    return """\
+# Makefile for Lean 4 formalization project + leanblueprint
+#
+# Usage:
+#   make setup       Full setup (Python venv + Mathlib)
+#   make web         Build the HTML blueprint (dependency graph)
+#   make serve       Serve the built blueprint locally
+#
+# The setup-venv target must be run first (once) to install Python
+# dependencies. setup-mathlib fetches Mathlib and builds the Lean project.
+
+ROOT := $(shell pwd)
+VENV := $(ROOT)/.venv
+DEPS := $(ROOT)/.lean-deps
+LAKE ?= lake
+
+# elan tools + venv on PATH. Graphviz runtime libs for pygraphviz.
+export PATH := $(HOME)/.elan/bin:$(VENV)/bin:$(DEPS)/bin:$(PATH)
+export LD_LIBRARY_PATH := $(DEPS)/gvlibs$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
+
+.PHONY: help setup setup-venv setup-gvlibs setup-mathlib update cache build web pdf blueprint serve clean
+
+help:
+\t@echo "Setup targets:"
+\t@echo "  setup         Full setup (setup-venv + setup-mathlib)"
+\t@echo "  setup-venv    Create Python venv and install blueprint toolchain"
+\t@echo "  setup-mathlib Fetch Mathlib + deps and build the Lean project (optional)"
+\t@echo ""
+\t@echo "Blueprint targets:"
+\t@echo "  web           Build the HTML blueprint -> blueprint/web/"
+\t@echo "  pdf           Build the PDF blueprint (needs a TeX distribution)"
+\t@echo "  blueprint     Build web + pdf (pdf skipped if no TeX distro)"
+\t@echo "  serve         Serve the built blueprint locally on port 8005"
+\t@echo ""
+\t@echo "Lean targets (optional — only if a lakefile is present):"
+\t@echo "  build         Build the Lean project (offline once setup is done)"
+\t@echo "  update        Re-resolve Lean dependencies (lake update)"
+\t@echo "  cache         Download prebuilt Mathlib oleans"
+
+# --- Setup ---
+setup: setup-venv setup-mathlib
+
+# Curate graphviz shared libs into .lean-deps/gvlibs/ so pygraphviz
+# loads without pulling in the system libc (needed on non-standard
+# platform Pythons where /lib64 is not in the default search path).
+setup-gvlibs:
+\t@mkdir -p $(DEPS)/gvlibs
+\t@DOT=$$(command -v dot 2>/dev/null); \\
+\tif [ -z "$$DOT" ]; then \\
+\t  echo "WARNING: dot not found on PATH; install graphviz first."; \\
+\telse \\
+\t  GV_LIB=$$(dirname "$$DOT")/../lib; \\
+\t  for lib in libcdt libcgraph libgvc libpathplan libxdot libexpat libltdl; do \\
+\t    src=$$(find "$$GV_LIB" /lib64 /usr/lib -name "$${lib}.so*" -type f 2>/dev/null | head -1); \\
+\t    if [ -n "$$src" ] && [ ! -e "$(DEPS)/gvlibs/$$(basename $$src)" ]; then \\
+\t      cp "$$src" $(DEPS)/gvlibs/; \\
+\t    fi; \\
+\t  done; \\
+\t  echo "Graphviz libs curated in $(DEPS)/gvlibs/"; \\
+\tfi
+
+setup-venv: setup-gvlibs
+\tpython3 -m venv $(VENV)
+\t$(VENV)/bin/pip install --upgrade pip
+\t$(VENV)/bin/pip install leanblueprint plastexdepgraph plastexshowmore plasTeX fastmcp
+\t@echo ""
+\t@echo "Attempting to install pygraphviz (needs graphviz headers)..."
+\t@if command -v brew >/dev/null 2>&1; then \\
+\t  CFLAGS="-I$$(brew --prefix graphviz)/include" \\
+\t  LDFLAGS="-L$$(brew --prefix graphviz)/lib" \\
+\t  $(VENV)/bin/pip install pygraphviz; \\
+\telif [ -d /usr/include/graphviz ]; then \\
+\t  $(VENV)/bin/pip install pygraphviz; \\
+\telse \\
+\t  echo "WARNING: graphviz headers not found. Install graphviz-dev (apt) or graphviz (brew) first."; \\
+\t  echo "  Then run: $(VENV)/bin/pip install pygraphviz"; \\
+\tfi
+\t@echo ""
+\t@echo "Venv ready at $(VENV)"
+\t@echo "Run 'source $(DEPS)/../.lean-deps/env.sh' or set LD_LIBRARY_PATH=$(DEPS)/gvlibs"
+
+# --- Lean ---
+setup-mathlib: update cache build
+
+update:
+\t$(LAKE) update
+
+cache:
+\t$(LAKE) exe cache get
+
+build:
+\t$(LAKE) build
+
+# --- Blueprint ---
+# The blueprint is standalone (no Lean project required), so we drive plasTeX
+# directly rather than via `leanblueprint web` (which requires a lakefile).
+web:
+\tcd blueprint/src && plastex -c plastex.cfg web.tex
+
+pdf:
+\t@command -v latexmk >/dev/null 2>&1 || { \\
+\t  echo "ERROR: latexmk not found. PDF build needs a TeX distribution"; \\
+\t  echo "       (latexmk + xelatex/lualatex + unicode-math, expl3, ...)."; \\
+\t  exit 1; }
+\tcd blueprint/src && latexmk print.tex
+
+blueprint: web
+\t@command -v latexmk >/dev/null 2>&1 && (cd blueprint/src && latexmk print.tex) || \\
+\t  echo "(skipping pdf: no TeX distribution; ran web only)"
+
+serve:
+\t@kill $$(lsof -ti :8005) 2>/dev/null || true
+\tcd blueprint/web && python3 -m http.server 8005
+
+clean:
+\t$(LAKE) clean
+\trm -rf blueprint/web blueprint/print blueprint/lean_decls
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -781,17 +1200,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir / "tier_dots.js").write_text(js_text)
 
-    # web.tex + plastex.cfg + macros.
-    web_tex, options_line = build_web_tex(template_path, title)
+    # web.tex + print.tex + plastex.cfg + macros + scaffolding.
+    web_tex, options_line = build_web_tex(template_path, title, metadata)
     (src_dir / "web.tex").write_text(web_tex)
+    (src_dir / "print.tex").write_text(build_print_tex(title, metadata))
     (src_dir / "plastex.cfg").write_text(PLASTEX_CFG)
+    (src_dir / "blueprint.sty").write_text(BLUEPRINT_STY)
+    (src_dir / "latexmkrc").write_text(LATEXMKRC)
+    (src_dir / "extra_styles.css").write_text(EXTRA_STYLES_CSS)
     (macros_dir / "common.tex").write_text(COMMON_TEX)
     (macros_dir / "web.tex").write_text(WEB_MACROS_TEX)
+    (macros_dir / "print.tex").write_text(PRINT_MACROS_TEX)
+
+    # Makefile at the output root (alongside blueprint/).
+    (out_dir / "Makefile").write_text(build_makefile())
 
     print(f"Exported blueprint project to: {out_dir}")
     print(f"  tier-2 nodes: {len(tier2)}  tiers present: {tiers_present}")
     print(f"  blueprint package options: {options_line}")
     print(f"  template: {template_path}")
+    print(f"  Makefile: {out_dir / 'Makefile'}")
     if not template_path.is_file():
         print(f"  WARNING: template not found at {template_path}; "
               "build will fall back to the stock plastexdepgraph template.",

@@ -59,6 +59,8 @@
   <style>
     #tier_controls { margin: 8px 0; font-size: 14px; }
     #tier_controls select { font-size: 14px; padding: 2px 6px; }
+    .tier_hint { margin-left: 10px; font-size: 12px; color: #777; }
+    #graph .node, #graph .edge { transition: opacity 0.15s ease; }
     .dep-cluster-summary { max-width: 32em; }
     .dep-cluster-summary h3 { margin-top: 0; }
     .dep-cluster-summary ul { margin: 0.4em 0 0 1.2em; }
@@ -88,6 +90,7 @@
     <div id="tier_controls">
       <label for="tier_select">Tier:</label>
       <select id="tier_select"></select>
+      <span class="tier_hint">Click a node to highlight its dependency tree · click empty space or press Esc to reset</span>
     </div>
     <div id="graph"></div>
 <div id="statements">
@@ -145,6 +148,62 @@ const _CLUSTER_MEMBERS = (typeof TIER_CLUSTER_MEMBERS !== "undefined") ? TIER_CL
 const _NODE_NAMES = (typeof TIER_NODE_NAMES !== "undefined") ? TIER_NODE_NAMES : {};
 const _NODE_DESC = (typeof TIER_NODE_DESC !== "undefined") ? TIER_NODE_DESC : {};
 const _PROVISIONAL = (typeof TIER_PROVISIONAL !== "undefined") ? TIER_PROVISIONAL : {};
+const _EDGES = (typeof TIER_EDGES !== "undefined") ? TIER_EDGES : {};
+
+// Adjacency for the current tier, rebuilt on every render. Edges are stored as
+// [prerequisite, dependent] pairs, so _fwd walks toward future dependencies
+// (descendants) and _bwd walks toward the dependency tree (ancestors).
+let _fwd = {};
+let _bwd = {};
+let _highlightActive = false;
+
+function buildAdjacency(tier) {
+    _fwd = {}; _bwd = {};
+    (_EDGES[tier] || []).forEach(function(e) {
+        const s = e[0], t = e[1];
+        (_fwd[s] = _fwd[s] || []).push(t);
+        (_bwd[t] = _bwd[t] || []).push(s);
+    });
+}
+
+function _reachable(start, adj) {
+    const seen = {};
+    const stack = [start];
+    while (stack.length) {
+        const cur = stack.pop();
+        (adj[cur] || []).forEach(function(n) {
+            if (!seen[n]) { seen[n] = true; stack.push(n); }
+        });
+    }
+    return seen;
+}
+
+// Highlight a node's full dependency cone: itself + everything it (transitively)
+// depends on + everything that (transitively) depends on it. Dim the rest.
+function highlightCone(slug) {
+    const keep = {};
+    keep[slug] = true;
+    Object.keys(_reachable(slug, _bwd)).forEach(function(k) { keep[k] = true; });
+    Object.keys(_reachable(slug, _fwd)).forEach(function(k) { keep[k] = true; });
+
+    d3.selectAll('#graph .node').each(function() {
+        const t = d3.select(this).selectAll('title').text().trim();
+        d3.select(this).style('opacity', keep[t] ? 1 : 0.12);
+    });
+    d3.selectAll('#graph .edge').each(function() {
+        const t = d3.select(this).selectAll('title').text().trim();
+        const parts = t.split('->');
+        const s = (parts[0] || '').trim(), tg = (parts[1] || '').trim();
+        d3.select(this).style('opacity', (keep[s] && keep[tg]) ? 1 : 0.07);
+    });
+    _highlightActive = true;
+}
+
+function resetHighlight() {
+    if (!_highlightActive) return;
+    d3.selectAll('#graph .node, #graph .edge').style('opacity', 1);
+    _highlightActive = false;
+}
 
 // Finest tier present = the largest tier number we have a DOT for.
 const FINEST_TIER = _TIERS.length ? _TIERS[_TIERS.length - 1] : null;
@@ -215,10 +274,15 @@ function interactive() {
            $(this).siblings('dl').toggle();
         })
 
+    // Rebuild the dependency adjacency for the tier we just rendered.
+    buildAdjacency(currentTier);
+
     d3.selectAll('.node')
         .attr('pointer-events', 'fill')
         .on('click', function () {
            var title = d3.select(this).selectAll('title').text().trim();
+           // Highlight this node's full dependency cone (ancestors + descendants).
+           highlightCone(title);
            $('#statements > div').hide()
            $('.thm').hide();
            // Tier-1 cluster nodes (no per-statement modal): show a summary.
@@ -245,7 +309,24 @@ function interactive() {
             d3.select(this).node().parentNode.parentNode.parentNode ;
         d3.select(modal).style('display', 'none');
     });
+
+    // Clicking empty graph space clears the highlight. Node clicks land on a
+    // shape inside a .node group, so closest('.node') filters those out.
+    var svgEl = graphContainer.select('svg').node();
+    if (svgEl) {
+        svgEl.addEventListener('click', function(ev) {
+            if (!ev.target.closest('.node')) resetHighlight();
+        });
+    }
 }
+
+// Escape clears the highlight (and any open modal). Attached once.
+document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Escape') {
+        resetHighlight();
+        d3.selectAll('.dep-modal-container').style('display', 'none');
+    }
+});
 
 // Populate the tier selector and wire it up.
 (function setupTierControl() {

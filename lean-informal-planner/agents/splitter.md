@@ -6,7 +6,7 @@ description: >
   parent, within-tier dependencies, and Mathlib-status guess, and writing the
   universal-voice prose for each. Returns structural data for the orchestrator to
   merge; writes only its content files.
-tools: [Read, Write]
+tools: [Read, Write, Bash]
 mcpServers: [lean-informal-planner-mathlib]
 model: opus
 ---
@@ -42,7 +42,13 @@ For every node you create, decide:
   An edge means genuine use: the statement or proof of this node actually invokes the prerequisite. Do not add an edge merely because two results sit in the same chapter. Never write a cross-tier edge — dependence on a coarse cluster is recovered later by the quotient rule, not authored.
 - **`mathlib_status`** — your best guess of `in-mathlib`, `partial`, or `missing`, from your knowledge of Mathlib and a quick confirming search (below). This is a guess the main agent will have verified by a dedicated `mathlib-checker` pass; aim it well but don't agonize. When you do find a match, record the declaration name(s) and file so the checker and the content step can reuse them.
 
-Use the Mathlib tools (`mathlib_find_name`, `mathlib_grep`, `mathlib_read_file`) to confirm a status when it matters — chiefly to settle whether a node is `in-mathlib` (which decides whether you write a proof) and to capture the declaration a node points at. When in doubt between `partial` and `missing`, prefer `partial`: a false "missing" wrongly demands a proof you then write, while a false "partial" is cheap for the checker to correct.
+Use the Mathlib search CLI to confirm a status when it matters — chiefly to settle whether a node is `in-mathlib` (which decides whether you write a proof) and to capture the declaration a node points at:
+
+```
+python3 <plugin>/scripts/mathlib_search.py {name|grep|read|path} ...
+```
+
+`<plugin>` is the plugin root the orchestrator passes you. Prefer this CLI over the MCP `mathlib_*` tools: plugin MCP tools reach only the main orchestrator, not subagents like you, so the CLI is your reliable search path (it resolves the same checkout). Search the real source; don't decide `in-mathlib` from memory. When in doubt between `partial` and `missing`, prefer `partial`: a false "missing" wrongly demands a proof you then write, while a false "partial" is cheap for the checker to correct.
 
 ### 3. Write `informal_content/<id>.md` for each node
 

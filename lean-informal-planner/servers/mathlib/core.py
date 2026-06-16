@@ -7,6 +7,7 @@ machine without external dependencies.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -32,9 +33,25 @@ def _find_rg() -> str | None:
 def find_mathlib_path(repo_root: Path) -> Path | None:
     """Find the Mathlib installation path from a Lean project.
 
-    Checks lakefile.toml for a local path entry first,
-    then falls back to .lake/packages/mathlib.
+    Resolution order:
+      1. An explicit override env var (LEAN_PLANNER_MATHLIB or MATHLIB_PATH)
+         pointing straight at a checkout (a dir containing a Mathlib/ subdir).
+      2. repo_root itself being a Mathlib checkout (has a Mathlib/ subdir).
+      3. lakefile.toml with a local `require mathlib` path entry.
+      4. repo_root/.lake/packages/mathlib (the lake-resolved dependency).
     """
+    # 1. Explicit override — most robust, independent of any Lean project layout.
+    for env_var in ("LEAN_PLANNER_MATHLIB", "MATHLIB_PATH"):
+        override = os.environ.get(env_var)
+        if override:
+            p = Path(override).expanduser().resolve()
+            if (p / "Mathlib").exists():
+                return p
+
+    # 2. repo_root is itself a Mathlib checkout.
+    if (repo_root / "Mathlib").exists():
+        return repo_root
+
     lakefile_toml = repo_root / "lakefile.toml"
     if lakefile_toml.exists():
         try:
