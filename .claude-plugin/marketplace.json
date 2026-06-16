@@ -1,7 +1,17 @@
 {
-  "name": "lean-local",
-  "owner": { "name": "Charles Arnal" },
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "autoform",
+  "description": "Turn any AI coding assistant into a Lean 4 formalization agent. Mathlib conventions, proof strategies, structured review, and statement extraction.",
+  "owner": {
+    "name": "Vivien Cabannes",
+    "url": "https://github.com/facebookresearch/autoform-bot"
+  },
   "plugins": [
-    { "name": "lean-informal-planner", "source": "./lean-informal-planner" }
+    {
+      "name": "autoform",
+      "description": "Lean 4 + Mathlib formalization skills (conventions, proving, review, extraction) plus textbook-to-blueprint formalization planning.",
+      "source": "./",
+      "category": "productivity"
+    }
   ]
 }

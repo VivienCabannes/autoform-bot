@@ -1,0 +1,2 @@
+description = "Search the Lean/Mathlib Zulip for community discussions"
+prompt = "Search Zulip for discussions relevant to the current formalization task. Check naming conventions, proof strategies, and prior art before proceeding."

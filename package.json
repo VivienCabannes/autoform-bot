@@ -1,0 +1,11 @@
+{
+  "name": "autoform",
+  "version": "0.2.0",
+  "description": "Turn any AI coding assistant into a Lean 4 formalization agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/facebookresearch/autoform-bot"
+  },
+  "license": "MIT",
+  "bin": {}
+}

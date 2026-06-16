@@ -1,126 +1,81 @@
-# Fork of AutoformBot to make it an AI coding assistant Plugin
+# Autoform
 
-Multi-agent system for translating LaTeX mathematics into verified Lean 4 proofs using Mathlib.
+Turn any AI coding assistant into a Lean 4 formalization agent — and plan
+formalization efforts from textbooks.
 
-![Visualizer Dashboard](docs/assets/visualizer.png)
+Autoform gives your coding assistant the knowledge and tools to translate
+mathematics from LaTeX into verified Lean 4 proofs using Mathlib (statement
+extraction → proving → review), plus a **formalization planner** that builds a
+tiered dependency graph from a textbook, maps it to Mathlib, and renders it as
+an interactive leanblueprint (tier toggle, dependency-cone highlighting).
 
-## Setup
+## Install
 
-```bash
-make setup    # creates venv, installs deps, builds Lean + REPL (~20 min)
+```text
+/plugin marketplace add /home/niketp/rmt/autoform-bot
+/plugin install autoform@autoform
 ```
 
-Create `.env` with the API key for your chosen provider:
-```
-ANTHROPIC_API_KEY=your-key-here   # for Claude models
-OPENAI_API_KEY=your-key-here      # for GPT models
-GEMINI_API_KEY=your-key-here      # for Gemini models
-```
+(or point `/plugin marketplace add` at the git remote once pushed.)
 
-## Quick Start
+## Prerequisites
 
-**1. Prepare book data** — place `book.md` (and optionally `book.pdf`) in `autoform/data/<name>/`. See `autoform/data/example/` for a sample.
+- **Python ≥ 3.10**
+- **[uv](https://docs.astral.sh/uv/)** — runs the formalization MCP servers
+  (`uv run` resolves deps from `pyproject.toml` on first launch).
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+- For the **planner's interactive blueprint view**: graphviz + a small Python
+  toolchain — see [SETUP.md](SETUP.md).
 
-**2. Extract targets:**
-```bash
-python -m autoform.statement_extraction run \
-    --book-dir=autoform/data/my_book \
-    --output=autoform/data/my_book/targets.yaml
-```
+## Skills
 
-**3. Create a config** (see `autoform/bot/configs/` for examples):
-```yaml
-workspace:
-  path: ../my-workspace
-  mathlib_path: submodules/mathlib
-  lib_name: My_Book
+**Setup & workspace**
 
-book:
-  path: my_book
-  files: [book.md]
-  targets: targets.yaml
+| Skill | What it does |
+|-------|--------------|
+| `/install-lean` | Install Lean 4, elan, lake (auto-runs via hook) |
+| `/setup-project` | Create a new Lean 4 + Mathlib project |
+| `/setup-autoform` | Check uv, Python deps, Lean 4, and Zulip — install what's missing |
+| `/workspace` | Scan project structure, sorry/axiom counts, declarations |
+| `/zulip` | Search Lean Zulip for community discussions |
 
-llm:
-  model: Opus 4.6
+**Planning**
 
-workers:
-  agents_per_node: 5
-  num_repls_per_node: 5
-  min_agents_per_task: 3
-  max_agents_per_task: 5
-```
+| Skill | What it does |
+|-------|--------------|
+| `/plan` | Build a tiered dependency graph from a textbook, mapped to Mathlib |
+| `/plan-view` | Build & open the interactive blueprint (tier toggle, cone highlighting) |
 
-**4. Run:**
-```bash
-# Start fresh
-python -m autoform.bot.main run --config=path/to/config.yaml --name=my-run --fresh
+> The formalization skills (conventions, proving, review, extraction) ship as
+> reference implementations under [`examples/`](examples/) and are being wired in
+> incrementally — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-# Resume an interrupted run (omit --fresh)
-python -m autoform.bot.main run --config=path/to/config.yaml --name=my-run
+## MCP Servers
 
-# Multi-node with SLURM
-srun --nodes=N --ntasks-per-node=1 python -m autoform.bot.main run --config=... --name=my-run
-```
-
-**5. Monitor:**
-```bash
-python -m autoform.visualizer.app --runs-dir=../my-workspace --port=8003
-```
-
-**6. Evaluate:**
-```bash
-python -m autoform.eval run \
-    --repo-dir=../my-workspace/my-run/code \
-    --task-file=autoform/data/my_book/targets.yaml \
-    --book-dir=autoform/data/my_book
-```
-
-## Architecture
-
-```
-autoform-pipeline/
-├── autoform/
-│   ├── bot/                  Multi-agent pipeline (orchestrator, workers, reviewers)
-│   ├── eval/                 Evaluation (grading, lean checks, metrics, rubrics)
-│   ├── visualizer/           Web dashboard for inspecting runs and traces
-│   ├── statement_extraction/ Statement chunking and extraction from LaTeX
-│   └── data/                 Book datasets (book.md + targets.yaml)
-├── core/                     Framework (agent, inference, trace, coordination)
-├── tools/                    MCP tool servers (filesystem, git, bash, Lean REPL/LSP, mathlib)
-├── template/                 Lean 4 + Mathlib workspace template
-├── submodules/               Git submodules (mathlib, repl, lean-lsp-mcp)
-└── docs/                     Documentation
-```
-
-## Documentation
-
-**Pipeline:**
-- [Bot](docs/pipeline/bot.md) — multi-agent architecture, DAG workflow, multi-node SLURM, agent roles, config reference
-- [Evaluation](docs/pipeline/eval.md) — matching, axiom checking, LLM grading rubrics, dependency graphs
-- [Statement Extraction](docs/pipeline/statement_extraction.md) — chunking, multi-agent extraction, deduplication
-- [Visualizer](docs/pipeline/visualizer.md) — dashboard views, API endpoints, hub mode
-
-**Tools:**
-- [Tools Overview](docs/tools/overview.md) — MCP tool system, available servers, adding new tools
-- [REPL Reference](docs/tools/repl.md) — Lean REPL architecture, pooled server, Python API
+| Server | Status | What it does |
+|--------|--------|-------------|
+| `lean-informal-planner-mathlib` | ✅ | Mathlib source search for the planner |
+| `autoform-zulip` | ✅ | Search Lean Zulip for community discussions |
+| `autoform-repl` | ⬜ stub | Lean 4 REPL — run code, verify proofs |
+| `autoform-lsp` | ⬜ stub | Lean 4 LSP — diagnostics, type info |
+| `autoform-aristotle` | ⬜ stub | Aristotle (Harmonic) — delegate to an autonomous prover |
 
 ## License
 
-This project is licensed under the [MIT](LICENSE) license.
-
+[MIT](LICENSE)
 
 ## Citation
 
-If you find this work useful, please cite our paper:
-
 ```bibtex
 @misc{rammal2026formalizingmathematicsscale,
-      title={Formalizing Mathematics at Scale}, 
+      title={Formalizing Mathematics at Scale},
       author={Ahmad Rammal and Niket Patel and Fabian Gloeckle and Amaury Hayat and Julia Kempe and Remi Munos and Charles Arnal and Vivien Cabannes},
       year={2026},
       eprint={2605.29955},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2605.29955}, 
+      url={https://arxiv.org/abs/2605.29955},
 }
 ```
