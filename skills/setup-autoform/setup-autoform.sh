@@ -72,7 +72,32 @@ if [ "$all_ok" = true ]; then
 fi
 
 # =========================================================================
-# 3. Lean 4 (lean + lake)
+# 3. PDF tools (poppler-utils — pdftotext/pdftoppm, needed to read source PDFs)
+# =========================================================================
+log "Checking PDF tools (poppler-utils)"
+
+if command -v pdftotext &>/dev/null && command -v pdftoppm &>/dev/null; then
+  ok "poppler-utils ($(pdftotext -v 2>&1 | head -1))"
+else
+  log "Installing poppler-utils..."
+  if command -v brew &>/dev/null; then
+    brew install poppler || warn "brew install poppler failed"
+  elif command -v apt-get &>/dev/null; then
+    sudo apt-get install -y poppler-utils || warn "apt-get install poppler-utils failed"
+  elif command -v dnf &>/dev/null; then
+    sudo dnf install -y poppler-utils || warn "dnf install poppler-utils failed"
+  else
+    warn "No supported package manager found; install poppler-utils manually (provides pdftotext/pdftoppm)"
+  fi
+  if command -v pdftotext &>/dev/null && command -v pdftoppm &>/dev/null; then
+    ok "poppler-utils installed"
+  else
+    warn "poppler-utils still missing — reading source PDFs (pdftotext / Read of a PDF) will not work"
+  fi
+fi
+
+# =========================================================================
+# 4. Lean 4 (lean + lake)
 # =========================================================================
 log "Checking Lean 4"
 
@@ -96,7 +121,7 @@ else
 fi
 
 # =========================================================================
-# 4. Zulip credentials (optional)
+# 5. Zulip credentials (optional)
 # =========================================================================
 log "Checking Zulip (optional)"
 

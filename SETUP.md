@@ -28,10 +28,34 @@ make web
 make serve
 ```
 
-The `setup-venv` target creates a Python venv at `.venv/` and installs
-`leanblueprint`, `plastexdepgraph`, `plastexshowmore`, `plasTeX`, `pygraphviz`,
-and `fastmcp`. It attempts to detect graphviz headers for `pygraphviz` builds
-(via `brew` on macOS or `graphviz-dev` on Debian/Ubuntu).
+The `setup-venv` target creates a Python venv at `.venv/` and installs a **pinned**
+toolchain (`leanblueprint==0.0.20`, `plastexdepgraph==0.0.5`, `plastexshowmore==0.0.2`,
+`plasTeX==3.1`, `pygraphviz`, `fastmcp`). It attempts to detect graphviz headers for
+`pygraphviz` builds (via `brew` on macOS or `graphviz-dev` on Debian/Ubuntu). It also
+runs `setup-gvlibs` (graphviz **runtime** lib curation, below) and applies the
+`plastexdepgraph` hashability fix (below).
+
+## Platform notes (two fixes `setup-venv` applies for you)
+
+1. **Graphviz runtime libs (`setup-gvlibs`).** On "platform" Pythons (e.g. a vendored
+   interpreter whose `libc` differs from the system one), `pygraphviz` can build but
+   fail to load with `ImportError: libcdt.so.5: cannot open shared object file`, and
+   putting all of `/usr/lib64` on `LD_LIBRARY_PATH` is wrong (it pulls in a
+   conflicting system `libc`). `setup-gvlibs` copies **only** the graphviz shared
+   libraries — preserving their soname symlinks (`libcdt.so.5 -> libcdt.so.5.0.0`,
+   etc.) and including transitive deps like `libexpat`, `libltdl`, `libz` — into
+   `.lean-deps/gvlibs/`. `make web`/`make serve` prepend that dir to
+   `LD_LIBRARY_PATH`, so graphviz loads against the venv's own `libc`.
+
+2. **`plastexdepgraph` hashability fix.** With plasTeX 3.1 (the only version
+   `plastexdepgraph` accepts), the theorem environment classes created by
+   leanblueprint's `\newtheorem` (e.g. `definition`) define `__eq__` without
+   `__hash__`, so Python makes them unhashable and the dep-graph build dies at
+   `graph.nodes = set(nodes)` with `TypeError: unhashable type: 'definition'`. Because
+   no other plasTeX version is compatible, a version pin alone cannot avoid this;
+   `setup-venv` therefore applies a tiny, idempotent post-install patch that restores
+   `__hash__` on those classes. (Remove it once upstream `plastexdepgraph` fixes the
+   `set(nodes)` usage.)
 
 ## Manual install: a dedicated venv (fallback)
 
@@ -59,7 +83,7 @@ source ~/.venvs/lean-blueprint/bin/activate
 CFLAGS="-I$(brew --prefix graphviz)/include" \
 LDFLAGS="-L$(brew --prefix graphviz)/lib" \
   pip install pygraphviz
-pip install leanblueprint plastexdepgraph plastexshowmore plasTeX fastmcp
+pip install "leanblueprint==0.0.20" "plastexdepgraph==0.0.5" "plastexshowmore==0.0.2" "plasTeX==3.1" fastmcp
 ```
 
 Then point the plugin at this interpreter:
@@ -75,8 +99,14 @@ On Debian/Ubuntu, install the graphviz **dev headers** instead of using `CFLAGS`
 
 ```bash
 sudo apt-get install graphviz graphviz-dev
-pip install pygraphviz leanblueprint plastexdepgraph plastexshowmore plasTeX fastmcp
+pip install pygraphviz "leanblueprint==0.0.20" "plastexdepgraph==0.0.5" "plastexshowmore==0.0.2" "plasTeX==3.1" fastmcp
 ```
+
+> The manual path still needs the **`plastexdepgraph` hashability fix** described under
+> *Platform notes* above (otherwise the dep-graph build crashes with
+> `unhashable type: 'definition'`). The Makefile's `make setup-venv` applies it
+> automatically; if you install by hand, apply that one-line patch yourself, or just
+> use the Makefile.
 
 ## Verify the install
 

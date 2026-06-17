@@ -148,7 +148,17 @@ for spec in "${PKG_SPECS[@]}"; do
     pass "python import: ${import_name}"
   else
     if [ "$import_name" = "pygraphviz" ]; then
-      fail "python import: ${import_name}  (cannot 'import ${import_name}')" "$(pygraphviz_fix)"
+      # Distinguish "not installed" from "installed but its graphviz runtime
+      # libs aren't on the loader path" — the latter is expected on platform
+      # Pythons and is handled by the Makefile (setup-gvlibs + LD_LIBRARY_PATH),
+      # so the right fix is NOT 'pip install'.
+      pgv_err="$("$PYTHON" -c "import pygraphviz" 2>&1)"
+      if printf '%s' "$pgv_err" | grep -qiE "cannot open shared object|lib(cdt|gvc|cgraph|pathplan|xdot)\.so|\.so(\.[0-9]+)*: cannot"; then
+        fail "python import: pygraphviz  (installed, but its graphviz runtime libs are not on the loader path)" \
+             "expected on platform Pythons — 'make setup-venv' curates the libs into .lean-deps/gvlibs/ and 'make web' loads them via LD_LIBRARY_PATH. To verify now: LD_LIBRARY_PATH=.lean-deps/gvlibs $PYTHON -c 'import pygraphviz'"
+      else
+        fail "python import: pygraphviz  (cannot 'import pygraphviz')" "$(pygraphviz_fix)"
+      fi
     else
       fail "python import: ${import_name}  (cannot 'import ${import_name}')" \
            "$PIP install ${pip_name}"

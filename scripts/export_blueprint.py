@@ -1074,11 +1074,10 @@ setup-gvlibs:
 \t  echo "WARNING: dot not found on PATH; install graphviz first."; \\
 \telse \\
 \t  GV_LIB=$$(dirname "$$DOT")/../lib; \\
-\t  for lib in libcdt libcgraph libgvc libpathplan libxdot libexpat libltdl; do \\
-\t    src=$$(find "$$GV_LIB" /lib64 /usr/lib -name "$${lib}.so*" -type f 2>/dev/null | head -1); \\
-\t    if [ -n "$$src" ] && [ ! -e "$(DEPS)/gvlibs/$$(basename $$src)" ]; then \\
-\t      cp "$$src" $(DEPS)/gvlibs/; \\
-\t    fi; \\
+\t  for lib in libcdt libcgraph libgvc libpathplan libxdot libexpat libltdl libz; do \\
+\t    for src in $$(find "$$GV_LIB" /lib64 /usr/lib64 /usr/lib -name "$${lib}.so*" 2>/dev/null); do \\
+\t      cp -Pn "$$src" $(DEPS)/gvlibs/ 2>/dev/null || true; \\
+\t    done; \\
 \t  done; \\
 \t  echo "Graphviz libs curated in $(DEPS)/gvlibs/"; \\
 \tfi
@@ -1086,7 +1085,7 @@ setup-gvlibs:
 setup-venv: setup-gvlibs
 \tpython3 -m venv $(VENV)
 \t$(VENV)/bin/pip install --upgrade pip
-\t$(VENV)/bin/pip install leanblueprint plastexdepgraph plastexshowmore plasTeX fastmcp
+\t$(VENV)/bin/pip install "leanblueprint==0.0.20" "plastexdepgraph==0.0.5" "plastexshowmore==0.0.2" "plasTeX==3.1" fastmcp
 \t@echo ""
 \t@echo "Attempting to install pygraphviz (needs graphviz headers)..."
 \t@if command -v brew >/dev/null 2>&1; then \\
@@ -1099,6 +1098,9 @@ setup-venv: setup-gvlibs
 \t  echo "WARNING: graphviz headers not found. Install graphviz-dev (apt) or graphviz (brew) first."; \\
 \t  echo "  Then run: $(VENV)/bin/pip install pygraphviz"; \\
 \tfi
+\t@echo ""
+\t@echo "Applying plastexdepgraph hashability fix (plasTeX 3.1 theorem classes are unhashable, and 3.1 is the only plasTeX that plastexdepgraph accepts, so a version pin alone cannot avoid the dep-graph crash)..."
+\t@DG=$$(find $(VENV)/lib -path "*plastexdepgraph/Packages/depgraph.py" 2>/dev/null | head -1); if [ -n "$$DG" ]; then $(VENV)/bin/python -c 'import sys,pathlib; p=pathlib.Path(sys.argv[1]); s=p.read_text(); n="graph.nodes = set(nodes)"; rep="for _n in nodes:\\n            if type(_n).__hash__ is None:\\n                type(_n).__hash__ = lambda self: id(self)  # autoform-hashfix\\n        "+n; s2=(s.replace(n,rep) if ("autoform-hashfix" not in s and n in s) else s); p.write_text(s2); print("  hashfix applied" if s2!=s else "  hashfix already present or needle missing")' "$$DG"; else echo "  WARNING: plastexdepgraph depgraph.py not found; hashfix skipped"; fi
 \t@echo ""
 \t@echo "Venv ready at $(VENV)"
 \t@echo "Run 'source $(DEPS)/../.lean-deps/env.sh' or set LD_LIBRARY_PATH=$(DEPS)/gvlibs"

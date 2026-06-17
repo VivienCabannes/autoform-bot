@@ -30,9 +30,16 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/check_toolchain.sh
 
 The script prints a `PASS`/`FAIL` line per requirement (Python >= 3.10, the `dot`
 binary, and each Python import) and the exact fix command for anything missing. It
-exits `0` only when everything passes. If it fails, stop here and point the user at
-the Makefile's `make setup-venv` target (or `${CLAUDE_PLUGIN_ROOT}/SETUP.md` for
-manual install). Do not attempt later steps until the toolchain check passes.
+exits `0` only when everything passes. If it fails, stop here and run the Makefile's
+`make setup-venv` target (step 3) — that is the supported fix — or see
+`${CLAUDE_PLUGIN_ROOT}/SETUP.md` for the manual path. Do not attempt later steps
+until the toolchain is set up.
+
+Note: a pygraphviz FAIL of the form *"installed, but its graphviz runtime libs are
+not on the loader path"* is **expected on platform Pythons** and is **not** fixed by
+`pip install`. `make setup-venv` curates the graphviz libs into `.lean-deps/gvlibs/`
+and `make web`/`make serve` load them via `LD_LIBRARY_PATH`, so just proceed to
+step 3 — do not hand-install pygraphviz.
 
 ## 2. Export the blueprint project
 
@@ -61,17 +68,30 @@ The exporter produces a complete, ready-to-build project:
 <out>/blueprint/src/macros/           # shared math + theorem-environment macros
 ```
 
-## 3. Set up the toolchain (if needed)
+## 3. Set up the toolchain (required first time)
 
-If the toolchain check in step 1 failed, or this is the first build, run:
+On the first build (or whenever step 1 reports failures), run:
 
 ```bash
 cd <out>
 make setup-venv
 ```
 
-This creates a Python venv at `<out>/.venv/` and installs all required packages
-(leanblueprint, plastexdepgraph, plastexshowmore, plasTeX, pygraphviz, fastmcp).
+This one target does everything needed for a working build:
+- curates the graphviz **runtime** libraries (with their soname symlinks) into
+  `<out>/.lean-deps/gvlibs/`, so `pygraphviz` loads on platform Pythons without
+  dragging in the system `libc` (`make web`/`make serve` add this dir to
+  `LD_LIBRARY_PATH`);
+- creates a Python venv at `<out>/.venv/` and installs a **pinned** toolchain
+  (`leanblueprint`, `plastexdepgraph`, `plastexshowmore`, `plasTeX`, `pygraphviz`,
+  `fastmcp`);
+- applies a small hashability fix to `plastexdepgraph` (plasTeX 3.1's theorem
+  classes are unhashable and 3.1 is the only version `plastexdepgraph` accepts, so
+  the dep-graph build would otherwise crash with `unhashable type: 'definition'`).
+
+Always build and serve via the Makefile targets below (`make web` / `make serve`) —
+they export the `PATH` (venv) and `LD_LIBRARY_PATH` (gvlibs) the build needs. Do not
+call `plastex` directly.
 
 ## 4. Build the web with the Makefile
 
@@ -82,9 +102,10 @@ cd <out>
 make web
 ```
 
-This runs `leanblueprint web`, which invokes plasTeX to build the HTML blueprint.
-Output goes to `<out>/blueprint/web/`, where `dep_graph_document.html` is the
-dependency graph and `index.html` is the table of contents.
+This invokes plasTeX (with the venv on `PATH` and the curated graphviz libs on
+`LD_LIBRARY_PATH`) to build the HTML blueprint. Output goes to `<out>/blueprint/web/`,
+where `dep_graph_document.html` is the dependency graph and `index.html` is the table
+of contents.
 
 No LaTeX is required — the web build is pure-Python plasTeX.
 
