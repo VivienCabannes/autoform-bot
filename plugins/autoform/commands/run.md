@@ -47,11 +47,18 @@ If the target is ambiguous, say what you ruled out and pick the best reading —
 
 ## Prove mode (sorry / axiom / open declaration)
 
-**Phase 0 — Context.** Read the declaration and its file. Read the project's ground rules
-(`CLAUDE.md`, `AGENTS.md`, contributor docs) and any per-target plan the repo keeps (e.g.
-`docs/planning/`, audit ledgers like `AXIOM_AUDIT.md`). Confirm the build works before changing
-anything (`lake env lean` on the untouched file; fix toolchain/cache first if not — see
-formalization-workflow → build-timeout).
+**Phase 0 — Context (and a hard precondition).** First confirm you are *inside the Lean
+project*: a `lakefile.toml`/`lakefile.lean` must be reachable from the current working directory
+(in cwd or an ancestor). If it is not — e.g. the target is `lean4/src/Foo.lean` but the lakefile
+lives under `lean4/` — **STOP immediately** and tell the user the project root and the `cd` to
+run from. Do **not** proceed: with no reachable lakefile, `lake env lean`/`lake build` cannot
+run, the worker cannot compile or iterate a proof, and any "result" would be fiction. Then read
+the declaration and its file, the project's ground rules (`CLAUDE.md`, `AGENTS.md`, contributor
+docs) and any per-target plan the repo keeps (`docs/planning/`, audit ledgers like
+`AXIOM_AUDIT.md`). Finally, confirm the build actually works before changing anything (run
+`lake env lean` on the *untouched* file and see it exit cleanly; fix toolchain/cache first if not
+— see formalization-workflow → build-timeout). If this command itself fails, STOP and report it —
+it is the same precondition failure.
 
 **Phase 1 — Spec gate.** Before any proof work, write a short **spec note**: the statement in
 plain mathematics, its source (book/paper/ledger citation), and why the Lean statement is the
@@ -86,15 +93,30 @@ statement delta (`git diff -U0`: only `axiom` → `theorem`, type byte-identical
 project-wide sorry/axiom grep; and any repo soundness scripts CI runs (via
 `env -u ANTHROPIC_API_KEY`).
 
-**Phase 5 — Gate and packet.** Run the review gate (**code-reviewer** + **quality-inspector** in
-parallel; loop rejections back to a fresh worker up to `--review-cycles`, default 2). Then emit
-the **reviewer packet** (formalization-workflow → reviewer-packet) and commit following the
-repo's convention. Open a PR only if the repo's rules are satisfied and the user asked for one.
+**Phase 5 — Gate and packet (packet is gated, never the goal).** The reviewer packet is the
+*last* step and is **forbidden while the work is unfinished**. Before producing any packet, the
+Phase 4 evidence must be real and clean for *this run*: the target `sorry` is gone, `lake env
+lean` exits cleanly on the touched files, and `#print axioms` shows **no `sorryAx`** (only the
+expected/ledgered axioms). Only then run the review gate (**code-reviewer** + **quality-inspector**
+in parallel; loop rejections back to a fresh worker up to `--review-cycles`, default 2), emit the
+**reviewer packet** (formalization-workflow → reviewer-packet), and commit per the repo's
+convention. Open a PR only if the repo's rules are satisfied and the user asked for one.
+
+If the proof was **not** completed — the worker (or Aristotle) could not discharge it, the build
+won't run, or a `sorry`/`sorryAx` remains — **do not emit a success-shaped packet.** End the run
+with an explicit `FAILED — <one-line reason>` (e.g. "worker exhausted `--review-cycles` without a
+compiling proof"; "no reachable lakefile — see Phase 0"), the concrete blocker (the named lemma
+that didn't go through, the build error, the missing infrastructure), and the current honest
+state. A packet that sits on top of an unfilled `sorry` is itself a defect — never present one.
 
 ## Formalize mode (textbook / paper)
 
 **Phase 0 — Ingest.** Read the source (PDFs: read visually, ~20 pages per pass). Resolve scope
-(`--scope "ch. 1-2"`, a section list, or all). Locate or `lake init` the target Lean repo.
+(`--scope "ch. 1-2"`, a section list, or all). Locate or `lake init` the target Lean repo, then
+apply the **same hard precondition as prove-mode Phase 0**: a lakefile must be reachable from the
+working directory you will write and build from, and `lake env lean` must run there — confirm it
+(build a trivial `import Mathlib` scratch if the repo is fresh) before formalizing anything. If
+you cannot build, STOP and report it rather than emitting un-elaborated "statements".
 
 **Phase 1 — Plan.** Dispatch the **planner** subagent over the scoped source to produce
 `autoform-plan.yaml`: every definition/theorem/lemma with an id, source citation, LaTeX
@@ -130,3 +152,11 @@ kernel evidence (`lake env lean` + `#print axioms` output), and the reviewer pac
 `sorry`/raw `axiom` may remain in finished work — the only sanctioned gap is the project's
 placeholder convention (e.g. an `unproved` macro; bootstrap one if the project lacks it), and
 only where the source itself omits the proof.
+
+**The packet is earned, never assumed.** A reviewer packet asserts a result; emit one only when
+its kernel evidence is real for this run. If the run set out to *prove* (prove mode, or formalize
+Phase 3) and a target `sorry`/`sorryAx` survives, that is a **`FAILED`** outcome — report it as
+such with the concrete blocker, not as a packet. The single exception is the **`--spec-only`**
+packet, whose subject *is* the statements: its theorem bodies are disclosed, tracked spec-stage
+placeholders and the packet says so explicitly. Outside that, a packet over an unfilled `sorry`
+is a defect.
