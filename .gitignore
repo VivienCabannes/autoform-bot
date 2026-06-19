@@ -8,3 +8,7 @@ __pycache__/
 *.pyc
 .venv/
 traces/
+
+# Review surface runtime data (the verdict sidecar — single source of truth,
+# regenerated per project, never committed).
+review_status.json
