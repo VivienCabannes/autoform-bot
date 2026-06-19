@@ -19,7 +19,7 @@ the source (that is the autoform-reviewer, faithfulness) and you do **not** judg
 the content-reviewer). Load the **eval-rubrics** skill for the proof_integrity criteria, weight, and
 threshold; if the Skill tool is unavailable, Read
 `skills/eval-rubrics/references/proof_integrity.json`. The honesty discipline is in the
-**formalization-workflow** skill — load it too.
+**autoform-prove** skill — load it too.
 
 ## Inputs
 

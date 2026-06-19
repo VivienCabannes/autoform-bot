@@ -23,7 +23,7 @@ integer score 0–5 with a pass threshold; the criteria and prompt templates are
 |---|---|---|---|---|
 | **faithfulness** | 0.40 | 4/5 | `autoform-reviewer` | the Lean **statement** captures the source statement *at full strength* (no weakening, no vacuity) |
 | **proof_integrity** | 0.40 | 3/5 | `proof-integrity-reviewer` | the **proof** chain is genuine work on sound foundations (axioms clean, no disguised `sorry`/cheats) |
-| **code_quality** | 0.20 | 3/5 | `content-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = the **lean-conventions** skill) |
+| **code_quality** | 0.20 | 3/5 | `content-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = the **autoform** skill) |
 
 There are exactly three rubrics on the review path. The cheating-hunt splits along the two
 correctness axes: **statement-level** cheats (`: True`, weakened conclusion, smuggled hypotheses,
@@ -88,7 +88,7 @@ check on the project's main results against the source's actual main theorems. S
 
 ## Related
 
-Consumes **lean-conventions** (the `code_quality` yardstick) and **formalization-workflow** (the
+Consumes **autoform** (the `code_quality` yardstick) and **autoform-prove** (the
 axiom/`sorry` honesty gates). The three rubrics drive the `ai` slot read by the `review` skill /
 review surface. `graph-reviewer` and `holistic-reviewer` review DAG structure — orthogonal to this
 node-level jury, not part of it.
