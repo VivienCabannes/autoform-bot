@@ -1,7 +1,7 @@
 # Mathlib & Lean 4 conventions
 
-Key conventions for writing Mathlib-compatible Lean 4 code, distilled from 792 community
-conventions extracted from ~94k GitHub PR review comments and ~165k Zulip messages.
+Key conventions for writing Mathlib-compatible Lean 4 code, distilled from community Mathlib
+review practice (PR review comments and Zulip discussion).
 
 ## Proof style
 

@@ -3,7 +3,7 @@ name: lean-conventions
 description: >-
   Use when editing .lean files, writing or reviewing Lean 4 / Mathlib code, searching mathlib
   for lemmas, choosing tactics, naming declarations, or formalizing mathematics. Provides
-  idiomatic Mathlib conventions distilled from ~94k PR review comments and ~165k Zulip messages,
+  idiomatic Mathlib conventions distilled from community Mathlib review practice (PR review comments and Zulip discussion),
   plus topic reference guides (syntax, tactics, proof shapes, coercions). This is the yardstick
   the code-quality reviewer scores against and the style reference the worker writes to. Do NOT
   trigger for Coq/Rocq, Agda, Isabelle, HOL4, Mizar, Idris, or other non-Lean provers.
@@ -12,7 +12,7 @@ description: >-
 # Lean 4 / Mathlib conventions
 
 Authoritative conventions for writing Mathlib-compatible Lean 4 code. The full convention set
-lives in `references/mathlib-conventions.md` (distilled from 792 community conventions); read it
+lives in `references/mathlib-conventions.md`; read it
 before writing non-trivial Lean. The topic guides below are loaded on demand, so depth costs
 nothing while idle.
 
