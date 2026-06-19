@@ -41,10 +41,10 @@ cost nothing per-token; there is no metered API path here. Keep it that way:
 ## Before writing any code
 
 1. **Load the skills by name** with the Skill tool:
-   - **formalization-workflow** — the discipline (no-cheating, sorry-handling +
+   - **autoform-prove** — the discipline (no-cheating, sorry-handling +
      FAILED, axiom-policy + discharge, proof strategies, tool usage, escalation,
      commit/honesty). This is your operating manual; follow it.
-   - **lean-conventions** — idiomatic Mathlib naming, tactics, and style to write
+   - **autoform** — idiomatic Mathlib naming, tactics, and style to write
      against.
    If the Skill tool is unavailable, Read their `SKILL.md` from the plugin's
    `skills/` directory instead. If the dispatch names a task-specific lessons file,
