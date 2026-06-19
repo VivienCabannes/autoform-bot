@@ -23,5 +23,5 @@ Work incrementally. Prototype before editing. Search before proving.
 - Search Mathlib before writing a proof from scratch: `mathlib_grep` / `mathlib_find_name` (the
   mathlib MCP), or `exact?` / `apply?` / `rw?` inside a `run_lean_code` snippet.
 - Many standard results already exist — finding the right lemma name is faster, and far more
-  robust, than reproving a known fact. See **lean-conventions** for naming patterns that make
+  robust, than reproving a known fact. See **autoform** for naming patterns that make
   the search land.

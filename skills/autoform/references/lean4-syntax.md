@@ -7,7 +7,7 @@
 - `axiom foo` — creates a permanent unproved constant. Worse than `sorry`; reviewers reject it
   as a finished proof.
 - Converting `sorry → axiom` or `axiom → sorry` without proving anything has zero value (see the
-  **formalization-workflow** axiom policy).
+  **autoform-prove** axiom policy).
 
 ## Docstrings
 

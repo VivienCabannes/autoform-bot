@@ -22,7 +22,7 @@
 
 - If a hypothesis is always true (e.g. an emptiness condition that the types force), the
   statement can often be simplified — but check this is genuine, not a vacuity that makes the
-  whole statement trivial (a vacuous statement proves nothing; see the **formalization-workflow**
+  whole statement trivial (a vacuous statement proves nothing; see the **autoform-prove**
   false-statements reference).
 
 ## Uniform limits & smoothness (pointers)
