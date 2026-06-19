@@ -60,7 +60,7 @@ an interactive leanblueprint (tier toggle, dependency-cone highlighting).
 | `autoform-zulip` | ✅ | Search Lean Zulip for community discussions |
 | `autoform-repl` | ⬜ stub | Lean 4 REPL — run code, verify proofs |
 | `autoform-lsp` | ⬜ stub | Lean 4 LSP — diagnostics, type info |
-| `autoform-aristotle` | ⬜ stub | Aristotle (Harmonic) — delegate to an autonomous prover |
+| `autoform-aristotle` | ✅ | Aristotle (Harmonic) — delegate to an autonomous prover (FREE API, opt-in) |
 
 ## License
 

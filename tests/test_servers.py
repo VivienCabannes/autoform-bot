@@ -10,6 +10,7 @@ The zulip server wraps ``skills/zulip/zulip-search.py``.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -77,13 +78,42 @@ class TestAristotleServer:
         """The Aristotle server module should import without error."""
         from servers.aristotle import server  # noqa: F401
 
+    def test_import_core(self):
+        """The Aristotle core module should import without aristotlelib installed."""
+        from servers.aristotle import core  # noqa: F401
+
     def test_create_server(self):
-        """create_aristotle_server should return a FastMCP instance."""
+        """create_aristotle_server should return a FastMCP instance (zero-arg, no extra)."""
         from servers.aristotle.server import create_aristotle_server
 
         server = create_aristotle_server()
         assert server is not None
         assert server.name == "autoform-aristotle"
+
+    def test_exposes_delegation_tool(self):
+        """The server should expose the node-delegation backend entry tool."""
+        from servers.aristotle.server import create_aristotle_server
+
+        server = create_aristotle_server()
+        names = {getattr(t, "name", t) for t in asyncio.run(server.list_tools())}
+        assert "aristotle_delegate_node" in names
+        # The original six session tools survive.
+        for name in (
+            "aristotle_submit",
+            "aristotle_wait",
+            "aristotle_poll",
+            "aristotle_steer",
+            "aristotle_events",
+            "aristotle_sessions",
+        ):
+            assert name in names
+
+    def test_manager_constructs_without_aristotlelib(self):
+        """Constructing the manager must not import the optional dependency."""
+        from servers.aristotle.core import AristotleManager
+
+        mgr = AristotleManager(download_dir="./out")
+        assert mgr.list_sessions() == {"sessions": []}
 
 
 # ---------------------------------------------------------------------------
