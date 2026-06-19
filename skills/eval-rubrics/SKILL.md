@@ -23,7 +23,7 @@ integer score 0–5 with a pass threshold; the criteria and prompt templates are
 |---|---|---|---|---|
 | **faithfulness** | 0.40 | 4/5 | `autoform-reviewer` | the Lean **statement** captures the source statement *at full strength* (no weakening, no vacuity) |
 | **proof_integrity** | 0.40 | 3/5 | `proof-integrity-reviewer` | the **proof** chain is genuine work on sound foundations (axioms clean, no disguised `sorry`/cheats) |
-| **code_quality** | 0.20 | 3/5 | `content-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = the **autoform** skill) |
+| **code_quality** | 0.20 | 3/5 | `code-quality-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = the **autoform** skill) |
 
 There are exactly three rubrics on the review path. The cheating-hunt splits along the two
 correctness axes: **statement-level** cheats (`: True`, weakened conclusion, smuggled hypotheses,

@@ -23,8 +23,8 @@ These skills don't exist yet. Create them from scratch — see `examples/skills/
 |-------|--------------------|------------|---------------------|
 | **Mathlib conventions** | `skills/autoform/` | Medium | Lean 4 + Mathlib style, tactics, naming, pitfalls |
 | **Proof strategies** | `skills/autoform-prove/` | Medium | Incremental proving, REPL prototyping, sorry/axiom handling |
-| **Code review** | `skills/autoform-review/` | Medium | Faithfulness, cheating detection, structured checklist |
-| **Quality check** | `skills/autoform-quality/` | Easy | Naming, tactic usage, proof structure, code style |
+| **Review checklist** | *(absorbed)* `skills/eval-rubrics/references/{faithfulness,proof_integrity}.json` | — | Faithfulness, cheating detection, axiom audit — carried by the per-axis rubrics, not a standalone skill (single-axis reviewers load only their own rubric) |
+| **Quality check** | *(absorbed)* `skills/eval-rubrics/references/code_quality.json` | — | Naming, tactic usage, proof structure, code style — carried by the `code_quality` rubric + the `autoform` yardstick |
 | **Statement extraction** | `skills/autoform-extract/` | Easy | Extract formalizable statements from LaTeX/Markdown to YAML |
 | **Crew orchestration** | `skills/autoform-crew/` | Medium | When and how to spawn worker/reviewer/reader subagents |
 
