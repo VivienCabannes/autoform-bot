@@ -1,0 +1,65 @@
+name: plugin-lint
+
+# Static, dependency-free lint of the plugin's markdown/JSON/TOML surface.
+# Runs only when something on that surface changes.
+on:
+  push:
+    paths:
+      - "agents/**"
+      - "skills/**"
+      - "commands/**"
+      - ".claude-plugin/**"
+      - "scripts/lint_plugin.py"
+      - "scripts/check_invariants.py"
+      - ".github/workflows/plugin-lint.yml"
+  pull_request:
+    paths:
+      - "agents/**"
+      - "skills/**"
+      - "commands/**"
+      - ".claude-plugin/**"
+      - "scripts/lint_plugin.py"
+      - "scripts/check_invariants.py"
+      - ".github/workflows/plugin-lint.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Compile-check the deterministic scripts (stdlib only — no install step).
+      - name: Byte-compile scripts
+        run: |
+          python -m py_compile scripts/lint_plugin.py
+          if [ -f scripts/check_invariants.py ]; then
+            python -m py_compile scripts/check_invariants.py
+          fi
+
+      # The plugin linter: frontmatter, marketplace/plugin JSON, references,
+      # dangling-reference guard.
+      - name: Lint plugin
+        run: python scripts/lint_plugin.py
+
+      # Structural graph check, if the repo ships an example plan to validate.
+      - name: Check graph invariants (if an example graph exists)
+        run: |
+          if [ -f scripts/check_invariants.py ]; then
+            shopt -s nullglob
+            graphs=(examples/**/graph.json examples/*/graph.json examples/graph.json)
+            if [ ${#graphs[@]} -gt 0 ]; then
+              for g in "${graphs[@]}"; do
+                echo "::group::check_invariants $g"
+                python scripts/check_invariants.py "$g"
+                echo "::endgroup::"
+              done
+            else
+              echo "no example graph.json found — skipping invariant check"
+            fi
+          else
+            echo "scripts/check_invariants.py not present — skipping"
+          fi
