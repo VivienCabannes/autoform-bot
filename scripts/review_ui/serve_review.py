@@ -96,9 +96,8 @@ class Project:
         return rm.load_sidecar(self.sidecar_path)
 
     def write_sidecar(self, data: dict) -> None:
-        """The one and only write this server performs."""
-        self.sidecar_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        """The one and only write this server performs — atomic, via review_model."""
+        rm.save_sidecar(self.sidecar_path, data)
 
     def slug_map(self) -> Dict[str, str]:
         # Slugs are a deterministic function of the id set; recompute per request so

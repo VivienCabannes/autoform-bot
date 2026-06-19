@@ -36,6 +36,7 @@ only the color source changes (verdict instead of ``mathlib_status``).
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -98,21 +99,51 @@ def empty_sidecar() -> dict:
             "settings": {"dial": "on-demand"}, "reviews": {}}
 
 
-def load_sidecar(path: Path) -> dict:
-    """Load review_status.json, returning a fresh envelope if absent/corrupt.
+def _backup_corrupt_sidecar(p: Path, err: Exception) -> Optional[Path]:
+    """Move a corrupt sidecar aside so its (irreplaceable) human verdicts are never
+    silently overwritten by the next write. Returns the backup path, or None."""
+    backup = p.with_name(p.name + ".corrupt")
+    n = 1
+    while backup.exists():
+        backup = p.with_name(f"{p.name}.corrupt.{n}")
+        n += 1
+    try:
+        p.rename(backup)
+    except OSError:
+        return None
+    print(
+        f"WARNING: {p} is corrupt ({err}). It has been preserved as {backup} and a "
+        f"fresh sidecar will be created — any human verdicts are recoverable from the "
+        f"backup, NOT lost.",
+        file=sys.stderr,
+    )
+    return backup
 
-    Never raises on a missing file: the sidecar is runtime data and may not exist
-    yet on first review. A corrupt file is also treated as empty (the server will
-    overwrite on the next verdict write) rather than crashing the read path.
+
+def load_sidecar(path: Path) -> dict:
+    """Load review_status.json, returning a fresh envelope if absent.
+
+    Never raises on a missing file (the sidecar is runtime data, absent on first
+    review). A *corrupt* file is preserved (renamed to ``<name>.corrupt``) and a loud
+    warning is emitted before falling back to a fresh envelope — the sidecar holds the
+    irreplaceable human verdicts, so it is never silently discarded.
     """
     p = Path(path)
     if not p.is_file():
         return empty_sidecar()
     try:
-        data = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
+        text = p.read_text()
+    except OSError as err:
+        print(f"WARNING: could not read {p} ({err}); using a fresh sidecar for this "
+              f"read (the file is left untouched).", file=sys.stderr)
+        return empty_sidecar()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as err:
+        _backup_corrupt_sidecar(p, err)
         return empty_sidecar()
     if not isinstance(data, dict):
+        _backup_corrupt_sidecar(p, TypeError("sidecar root is not a JSON object"))
         return empty_sidecar()
     data.setdefault("version", 1)
     data.setdefault("settings", {})
@@ -121,6 +152,16 @@ def load_sidecar(path: Path) -> dict:
     if not isinstance(data["reviews"], dict):
         data["reviews"] = {}
     return data
+
+
+def save_sidecar(path: Path, data: dict) -> None:
+    """Atomically persist the sidecar (temp file + ``os.replace``) so an interrupted
+    or concurrent write can never leave a half-written ``review_status.json``."""
+    p = Path(path)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def dial_of(sidecar: dict) -> str:
