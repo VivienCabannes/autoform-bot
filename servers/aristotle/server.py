@@ -155,13 +155,20 @@ def create_aristotle_server(manager: AristotleManager | None = None) -> FastMCP:
     ) -> str:
         """Delegate ONE plan node to Aristotle: spec in, proof written back to the node.
 
-        This is the prover-backend entry. It reads the target node's spec from
-        the plan (its informal statement + source_refs + mathlib_declarations +
-        in-tier depends_on), hands the whole Lean project to Aristotle, blocks
-        until a terminal status, lands the returned Lean files into the project,
-        records the proof in the node's prose file, and returns a `merge_node.py`
-        payload that links the node's `content` (apply it through the single
-        locked graph writer).
+        Legacy one-shot entry, retained for backward compatibility. The UNIFIED
+        prover (``servers.prover``, the ``prove_node`` tool) is the preferred
+        path: it drives this same Aristotle backend through the SHARED driver +
+        steerer, so the live-steering judge that watches the run is identical to
+        the one that watches the Claude backend. Prefer ``prove_node(...,
+        backend="aristotle")``; this tool remains for callers that want the raw,
+        un-steered one-shot delegation plus the ``merge_node.py`` payload.
+
+        It reads the target node's spec from the plan (its informal statement +
+        source_refs + mathlib_declarations + in-tier depends_on), hands the whole
+        Lean project to Aristotle, blocks until a terminal status, lands the
+        returned Lean files into the project, records the proof in the node's
+        prose file, and returns a `merge_node.py` payload that links the node's
+        `content` (apply it through the single locked graph writer).
 
         Aristotle ONLY produces the proof into the node — it does not review,
         score, or touch review_status.json. The landed proof feeds the SAME
