@@ -192,6 +192,10 @@ def _page(title: str, body: str, bootstrap: str = "") -> bytes:
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{_E(title)}</title>"
         "<link rel='stylesheet' href='/assets/review.css'>"
+        "<script>window.MathJax={tex:{inlineMath:[['$','$'],['\\\\(','\\\\)']],"
+        "displayMath:[['$$','$$'],['\\\\[','\\\\]']]},"
+        "options:{skipHtmlTags:['script','noscript','style','textarea','pre','code']}};</script>"
+        "<script async src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'></script>"
         "</head><body>"
         "<header class='rv-header'><a class='rv-home' href='/'>review</a>"
         f"<span class='rv-title'>{_E(title)}</span></header>"
@@ -200,6 +204,33 @@ def _page(title: str, body: str, bootstrap: str = "") -> bytes:
         "<script src='/assets/review.js'></script>"
         "</body></html>"
     ).encode("utf-8")
+
+
+def _render_md(md: str) -> str:
+    """Minimal, safe Markdown -> HTML for the informal_content fallback: headings and
+    paragraphs only, HTML-escaped, with ``$...$`` / ``$$...$$`` kept intact for MathJax
+    (so it must NOT be wrapped in <pre>, which MathJax is configured to skip)."""
+    out = []
+    para = []
+
+    def _flush():
+        if para:
+            out.append("<p>" + "<br>".join(_E(x) for x in para) + "</p>")
+            para.clear()
+
+    for line in md.strip().split("\n"):
+        s = line.strip()
+        m = re.match(r"^(#{1,6})\s+(.*)$", s)
+        if not s:
+            _flush()
+        elif m:
+            _flush()
+            lvl = min(len(m.group(1)) + 2, 6)
+            out.append(f"<h{lvl}>{_E(m.group(2).strip())}</h{lvl}>")
+        else:
+            para.append(s)
+    _flush()
+    return "\n".join(out) or "<p><em>(empty)</em></p>"
 
 
 def render_home(proj: Project) -> bytes:
@@ -308,8 +339,8 @@ def render_node(proj: Project, node_id: str) -> bytes:
         md = proj.informal_md(node_id, node)
         if md:
             left = ("<div class='rv-thm-env rv-thm-raw'><p class='rv-note'>"
-                    "blueprint not built — showing raw informal_content.</p>"
-                    f"<pre>{_E(md)}</pre></div>")
+                    "blueprint not built — rendering informal_content.</p>"
+                    f"{_render_md(md)}</div>")
         else:
             left = ("<div class='rv-thm-env'><em>No blueprint fragment or "
                     "informal content for this node.</em></div>")
