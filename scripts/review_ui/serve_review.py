@@ -342,9 +342,16 @@ def _node_meta_html(proj: Project, node_id: str, node: dict, scorecard: dict) ->
     if refs:
         parts.append("<div class='rv-card'><h4>source_refs (verbatim)</h4><ul>")
         for r in refs:
-            f = _E(str(r.get("file", "")))
-            loc = _E(str(r.get("location", "")))
-            parts.append(f"<li><code>{f}</code> — {loc}</li>")
+            # source_refs entries are verbatim citations: usually a plain string,
+            # but tolerate a structured {file, location} dict too.
+            if isinstance(r, dict):
+                f = _E(str(r.get("file", "")))
+                loc = _E(str(r.get("location", "")))
+                parts.append(
+                    f"<li><code>{f}</code> — {loc}</li>" if loc
+                    else f"<li><code>{f}</code></li>")
+            else:
+                parts.append(f"<li>{_E(str(r))}</li>")
         parts.append("</ul></div>")
 
     decls = node.get("mathlib_declarations") or []
