@@ -39,13 +39,15 @@ from __future__ import annotations
 import argparse
 import html as htmllib
 import json
+import os
 import re
 import sys
 import urllib.parse
 import webbrowser
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent) not in sys.path:
@@ -62,6 +64,39 @@ _ASSETS_DIR = _REPO_ROOT / "assets" / "review"
 # tier-2 node as `<div class="thm" id="{{ slug }}" ...>` (MathJax already run), so
 # we inject that fragment verbatim — never regenerating the informalization.
 _THM_OPEN = '<div class="thm"'
+
+
+# ---------------------------------------------------------------------------
+# agent dispatch — the palette + bounded, write-only task queue
+# ---------------------------------------------------------------------------
+
+# The fixed registry of dispatchable agents, served to the client so the activity
+# panel can render a drag palette. Each entry is {id, label, icon, blurb, applies}.
+# This is the ONLY set of agents a /api/request may enqueue — an `agent` outside
+# these ids is a 400. The server merely WRITES a queue entry; it NEVER spawns the
+# agent or runs claude — an external orchestrator consumes task_queue.json.
+AGENT_PALETTE = [
+    {"id": "reviewer", "label": "Reviewer", "icon": "⚖",
+     "blurb": "re-review this node (jury)", "applies": "any"},
+    {"id": "worker", "label": "Worker", "icon": "⛏",
+     "blurb": "formalize / fill a sorry here", "applies": "any"},
+    {"id": "planner", "label": "Planner", "icon": "◷",
+     "blurb": "plan this node's sub-DAG", "applies": "any"},
+]
+
+# Set of valid agent ids (membership test for /api/request validation).
+_PALETTE_IDS = {a["id"] for a in AGENT_PALETTE}
+
+# Hard cap on the dispatch queue (bounded write — the orchestrator drains it).
+TASK_QUEUE_CAP = 200
+
+# Statuses an entry may carry; only a *queued* task may be cancelled, and a
+# queued/running task with the same agent+node blocks a duplicate enqueue.
+_ACTIVE_STATUSES = {"queued", "running"}
+
+# Sentinel returned by the body reader on un-parseable JSON (distinct from a valid
+# ``{}`` body) so a POST handler answers 400 rather than treating it as empty.
+_BAD_JSON = object()
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +119,11 @@ class Project:
         # Live activity feed, read-only, sitting next to graph.json. The orchestrator
         # may write it while a run is in flight; this server only ever reads it.
         self.agents_path = self.root / "agents_status.json"
+        # Dispatch queue, sitting next to graph.json. This is the SECOND deliberate
+        # write this server performs (beyond review_status.json): an append-only-ish
+        # list of task requests an external orchestrator consumes. The server writes
+        # it but NEVER spawns an agent / runs claude — it only dispatches.
+        self.task_queue_path = self.root / "task_queue.json"
         # Built blueprint dep-graph page (source of div.thm#<slug> fragments).
         self.blueprint_html = (
             self.root / "blueprint_export" / "blueprint" / "web"
@@ -115,6 +155,41 @@ class Project:
         """The current live activity feed, recomputed from disk each call (read-only;
         never raises — an absent feed degrades to an idle orchestrator)."""
         return rm.load_agents(self.agents_path)
+
+    # --- the dispatch queue (the second deliberate write) ---
+    def task_queue(self) -> List[dict]:
+        """The current dispatch queue, read from ``task_queue.json`` next to graph.json.
+
+        A list of task-request records the orchestrator consumes. Absent file,
+        unreadable file, corrupt JSON, or a non-list root all degrade to ``[]`` — the
+        dashboard must never error just because nothing has been dispatched yet. Never
+        raises. Non-dict entries are dropped so a malformed queue can't crash a render.
+        """
+        p = self.task_queue_path
+        if not p.is_file():
+            return []
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [t for t in data if isinstance(t, dict)]
+
+    def write_task_queue(self, queue: List[dict]) -> None:
+        """Atomically persist the dispatch queue (temp file + ``os.replace``), capped at
+        ``TASK_QUEUE_CAP`` entries — the orchestrator's inbox, bounded and crash-safe.
+
+        This is the SECOND deliberate write this server performs (beyond the sidecar).
+        It writes ONLY ``task_queue.json``; it never mutates the graph, the
+        informal_content, the agents feed, or the review sidecar, and it never spawns
+        an agent. Keeps the most recent ``TASK_QUEUE_CAP`` entries when over the cap.
+        """
+        bounded = list(queue)[-TASK_QUEUE_CAP:]
+        payload = json.dumps(bounded, ensure_ascii=False, indent=2)
+        tmp = self.task_queue_path.with_name(self.task_queue_path.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, self.task_queue_path)
 
     def slug_map(self) -> Dict[str, str]:
         # Slugs are a deterministic function of the id set; recompute per request so
@@ -870,6 +945,15 @@ def make_handler(proj: Project):
             if path == "/api/agents":
                 # Read-only live activity feed, recomputed from disk each call.
                 return self._json(200, proj.agents())
+            if path == "/api/dispatch":
+                # The activity-panel superset: the dispatch palette, the current
+                # queued tasks, and the existing live agents feed (unchanged). The
+                # panel polls this one endpoint; /api/agents stays available too.
+                return self._json(200, {
+                    "palette": AGENT_PALETTE,
+                    "queue": proj.task_queue(),
+                    "live": proj.agents(),
+                })
             if path.startswith("/assets/"):
                 return self._serve_asset(path[len("/assets/"):])
             if path.startswith("/cluster/"):
@@ -973,19 +1057,98 @@ def make_handler(proj: Project):
             }.get(f.suffix, "application/octet-stream")
             return self._send(200, f.read_bytes(), ctype)
 
+        def _read_json_body(self):
+            """Read + parse the request's JSON body, or (None) on bad JSON. Returns the
+            parsed object, or the sentinel ``_BAD_JSON`` when the body is not valid JSON
+            (so the caller can answer 400 rather than crash)."""
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                return json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                return _BAD_JSON
+
         # --- POST ---
         def do_POST(self):
             path = urllib.parse.urlparse(self.path).path
-            if not path.startswith("/api/verdict/"):
-                return self._json(404, {"ok": False, "error": "not found"})
+            if path == "/api/request":
+                return self._post_request()
+            if path == "/api/request/cancel":
+                return self._post_request_cancel()
+            if path.startswith("/api/verdict/"):
+                return self._post_verdict(path)
+            return self._json(404, {"ok": False, "error": "not found"})
+
+        def _post_request(self):
+            """POST /api/request {agent, node} → enqueue a dispatch request.
+
+            400 unless ``agent`` is in AGENT_PALETTE AND ``node`` is in the graph.
+            Otherwise append a queued task record (id = f"{agent}:{node}", stable) and
+            DEDUPE — an identical agent+node already queued/running returns the existing
+            queue unchanged, never a duplicate. Writes ONLY task_queue.json; never
+            spawns an agent. Returns {ok:true, queue:[...]}.
+            """
+            posted = self._read_json_body()
+            if posted is _BAD_JSON:
+                return self._json(400, {"ok": False, "error": "bad json"})
+            agent = posted.get("agent")
+            node = posted.get("node")
+            if agent not in _PALETTE_IDS:
+                return self._json(400, {"ok": False,
+                                        "error": f"unknown agent {agent!r}"})
+            nodes = proj.nodes()
+            if node not in nodes:
+                return self._json(400, {"ok": False,
+                                        "error": f"unknown node {node!r}"})
+
+            queue = proj.task_queue()
+            # Dedupe: an identical agent+node already queued or running blocks a
+            # duplicate — return the existing queue untouched (idempotent enqueue).
+            for t in queue:
+                if (t.get("agent") == agent and t.get("node") == node
+                        and t.get("status") in _ACTIVE_STATUSES):
+                    return self._json(200, {"ok": True, "queue": queue})
+
+            node_label = nodes[node].get("name") or node
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            queue.append({
+                "id": f"{agent}:{node}",
+                "agent": agent,
+                "node": node,
+                "node_label": node_label,
+                "status": "queued",
+                "at": now,
+                "requested_by": "dashboard",
+            })
+            proj.write_task_queue(queue)
+            return self._json(200, {"ok": True, "queue": proj.task_queue()})
+
+        def _post_request_cancel(self):
+            """POST /api/request/cancel {id} → remove a task, only if it is *queued*.
+
+            A running task is never cancellable from the dashboard (status reflects the
+            real orchestrator). Removes only an entry whose status == "queued". Writes
+            only task_queue.json. Returns {ok:true, queue:[...]} (unchanged if the id is
+            unknown or not queued).
+            """
+            posted = self._read_json_body()
+            if posted is _BAD_JSON:
+                return self._json(400, {"ok": False, "error": "bad json"})
+            task_id = posted.get("id")
+            queue = proj.task_queue()
+            kept = [t for t in queue
+                    if not (t.get("id") == task_id and t.get("status") == "queued")]
+            if len(kept) != len(queue):
+                proj.write_task_queue(kept)
+                kept = proj.task_queue()
+            return self._json(200, {"ok": True, "queue": kept})
+
+        def _post_verdict(self, path):
             node_id = urllib.parse.unquote(path[len("/api/verdict/"):])
             nodes = proj.nodes()
             if node_id not in nodes:
                 return self._json(404, {"ok": False, "error": "unknown node"})
-            length = int(self.headers.get("Content-Length", "0"))
-            try:
-                posted = json.loads(self.rfile.read(length) or b"{}")
-            except json.JSONDecodeError:
+            posted = self._read_json_body()
+            if posted is _BAD_JSON:
                 return self._json(400, {"ok": False, "error": "bad json"})
 
             verdict = posted.get("verdict")
@@ -999,7 +1162,6 @@ def make_handler(proj: Project):
             except (TypeError, ValueError):
                 return self._json(400, {"ok": False, "error": "score not an int"})
 
-            from datetime import datetime, timezone
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             sidecar = proj.sidecar()
             try:
