@@ -485,27 +485,24 @@
       g.style.cursor = "pointer";
 
       if (hasChildren(id) && !home.expanded.has(id)) {
-        // Collapsed parent → click unrolls it into its children.
+        // Collapsed parent → click unrolls it; SHIFT-click opens its detail packet.
         g.classList.add("rv-clusternode");
         g.addEventListener("click", function (ev) {
           ev.stopPropagation();
+          if (ev.shiftKey) { openDetails(id); return; }
           expandNode(id);
         });
       } else {
-        // Leaf (or a child now drawn inside an open box) → route to its packet.
+        // Leaf (or a child now drawn inside an open box) → click opens its packet
+        // (shift-click does the same — there is nothing to unroll).
         g.addEventListener("click", function (ev) {
           ev.stopPropagation();
-          window.location.href = "/node/" + encodeURIComponent(id);
+          openDetails(id);
         });
         if (tainted[id] && colors[id] !== "in_mathlib") {
           overlayHatch(g);
         }
       }
-
-      // Every node also gets a small circled-"i" details badge → its packet, whether
-      // a body-click unrolls it (parent) or routes to it (leaf). The badge stops
-      // propagation, so opening details never triggers an unroll.
-      addInfoBadge(g, id);
     });
 
     // 2) Expanded boxes: clicking the box (its label/background) collapses it. The
@@ -524,42 +521,20 @@
       g.addEventListener("click", function (ev) {
         // Only collapse when the box chrome itself is clicked — a click that
         // bubbled up from a child node already routed (and stopped) above.
+        // SHIFT-click opens the parent's own detail packet instead of collapsing.
         ev.stopPropagation();
+        if (ev.shiftKey) { openDetails(id); return; }
         collapseNode(id);
       });
     });
   }
 
-  // A small circled-"i" badge pinned to a node's top-right corner. Clicking it opens
-  // that node's detail packet (/node/<id>) — so you can inspect a node's specifics
-  // without unrolling it. Idempotent; positioned in the node's own SVG user space so
-  // the graph transform carries it along with the node.
-  function addInfoBadge(g, id) {
-    if (!id || g.querySelector(".rv-info-badge")) return;
-    var shape = g.querySelector("ellipse, polygon, path");
-    if (!shape) return;
-    var bb;
-    try { bb = shape.getBBox(); } catch (e) { return; }
-    if (!bb || !bb.width) return;
-    var ns = "http://www.w3.org/2000/svg";
-    var cx = bb.x + bb.width - 8, cy = bb.y + 9;
-    var badge = document.createElementNS(ns, "g");
-    badge.setAttribute("class", "rv-info-badge");
-    var circ = document.createElementNS(ns, "circle");
-    circ.setAttribute("cx", cx); circ.setAttribute("cy", cy); circ.setAttribute("r", "7.5");
-    var txt = document.createElementNS(ns, "text");
-    txt.setAttribute("x", cx); txt.setAttribute("y", cy);
-    txt.setAttribute("text-anchor", "middle");
-    txt.setAttribute("dominant-baseline", "central");
-    txt.textContent = "i";
-    var tip = document.createElementNS(ns, "title");
-    tip.textContent = "view details for " + id;
-    badge.appendChild(circ); badge.appendChild(txt); badge.appendChild(tip);
-    badge.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      window.location.href = "/node/" + encodeURIComponent(id);
-    });
-    g.appendChild(badge);
+  // Open a node's detail packet (/node/<id>). Reached by clicking a leaf, or by
+  // SHIFT-clicking any node (so you can inspect a parent's specifics without
+  // unrolling it — see decorate()).
+  function openDetails(id) {
+    if (!id) return;
+    window.location.href = "/node/" + encodeURIComponent(id);
   }
 
   function overlayHatch(g) {

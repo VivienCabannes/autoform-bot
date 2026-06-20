@@ -576,7 +576,10 @@ def _tiertoggle_html(present: list, tier: int) -> str:
             parts.append(f"<a class='rv-tt' href='/?tier={t}'>{_E(text)}</a>")
     # A hint to unroll appears whenever there is a deeper tier to drill into.
     if present and tier != present[-1]:
-        parts.append("<span class='rv-tt-hint'>click a node to unroll it</span>")
+        parts.append("<span class='rv-tt-hint'>click a node to unroll it · "
+                     "shift-click for details</span>")
+    else:
+        parts.append("<span class='rv-tt-hint'>click a node for its details</span>")
     parts.append("</div>")
     return "".join(parts)
 
