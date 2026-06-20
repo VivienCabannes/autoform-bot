@@ -246,13 +246,58 @@ def _render_md(md: str) -> str:
     return "\n".join(out) or "<p><em>(empty)</em></p>"
 
 
-def render_home(proj: Project, tier: int = 1) -> bytes:
+# Human-facing labels for the tier toggle (SHARED_SPEC): tier number -> label.
+TIER_LABELS = {1: "clusters", 2: "statements", 3: "declarations"}
+
+
+def _parse_tier(raw, nodes: Dict[str, dict]) -> int:
+    """Resolve a ``?tier=`` query value against the tiers actually present.
+
+    Returns the requested tier when it occurs in the graph, else the lowest tier
+    present (the default home view). A graph with no nodes degrades to tier 1.
+    """
+    present = rm.tiers_present(nodes)
+    default = present[0] if present else 1
+    if raw is None:
+        return default
+    try:
+        want = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return want if want in present else default
+
+
+def _focus_payload(parent_id: Optional[str], nodes: Dict[str, dict]) -> Optional[dict]:
+    """Build ``__RV_FOCUS__`` for ``?focus=<parentid>``: the parent, its display
+    label, and the child ids one tier down (the members to highlight in context).
+
+    Returns None when there is no focus or the parent is unknown, so the client
+    simply renders the flat graph with no focus ring.
+    """
+    if not parent_id or parent_id not in nodes:
+        return None
+    parent = nodes[parent_id]
+    return {
+        "parent": parent_id,
+        "label": parent.get("name") or parent_id,
+        "members": rm.child_ids(parent_id, nodes),
+    }
+
+
+def render_home(proj: Project, tier: Optional[int] = None,
+                focus: Optional[str] = None) -> bytes:
     nodes = proj.nodes()
     sidecar = proj.sidecar()
     state = rm.compute_state(nodes, sidecar)
-    # Tier-1 home starts fully collapsed (no clusters expanded); the client unrolls
-    # in place by re-fetching /api/dot with an `expand` set.
+    # Resolve the requested tier against the tiers actually present; the default
+    # home is the lowest tier present.
+    present = rm.tiers_present(nodes)
+    tier = _parse_tier(tier, nodes)
+    # The flat tier-N graph starts fully collapsed (no nodes expanded); the client
+    # unrolls in place by re-fetching /api/dot with an `expand` set. When focused on
+    # a parent one tier up, the client highlights that parent's members in context.
     dot = rm.recolor_dot(nodes, sidecar, tier=tier)
+    focus_payload = _focus_payload(focus, nodes)
     slug_map = proj.slug_map()
     # id<->slug both directions so the client can route node clicks to /node/<id>.
     id_by_slug = {slug: nid for nid, slug in slug_map.items()}
@@ -266,6 +311,11 @@ def render_home(proj: Project, tier: int = 1) -> bytes:
         f"window.__RV_KINDS__ = {json.dumps(kinds)};"
         f"window.__RV_PALETTE__ = {json.dumps(rm.PALETTE)};"
         f"window.__RV_TIER__ = {tier};"
+        # The tiers actually present (drives the tier toggle + valid jump targets).
+        f"window.__RV_TIERS__ = {json.dumps(present)};"
+        # Focus mode: {parent, label, members:[child ids one tier down]} or null.
+        # The client adds a steady focus ring to the members + a "back" banner.
+        f"window.__RV_FOCUS__ = {json.dumps(focus_payload)};"
         # The client owns the `expanded` set; it starts empty (home = collapsed).
         f"window.__RV_EXPANDED__ = [];"
         # Tells the client an /api/agents feed exists and where to poll it. The
@@ -296,16 +346,7 @@ def render_home(proj: Project, tier: int = 1) -> bytes:
         f"<div class='rv-dial'>dial: <strong>{_E(state['dial'])}</strong></div>"
         "</section>"
     )
-    tiertoggle = (
-        "<div class='rv-tiertoggle'><span class='rv-tt-label'>view</span>"
-        + ("<span class='rv-tt rv-tt-on'>Tier 1 · clusters</span>" if tier == 1
-           else "<a class='rv-tt' href='/?tier=1'>Tier 1 · clusters</a>")
-        + ("<span class='rv-tt rv-tt-on'>Tier 2 · statements</span>" if tier == 2
-           else "<a class='rv-tt' href='/?tier=2'>Tier 2 · statements</a>")
-        + ("<span class='rv-tt-hint'>click a cluster to unroll it</span>"
-           if tier == 1 else "")
-        + "</div>"
-    )
+    tiertoggle = _tiertoggle_html(present, tier)
     # Dashboard layout: header strip on top, then a two-column flex shell — the
     # Activity panel (sidebar) beside the tier-1 DAG centerpiece, with the legend
     # + tier toggle living in the graph column. The Activity panel HTML is built
@@ -344,6 +385,28 @@ def _legend_html() -> str:
         "<span class='rv-lanes'>lanes: in-mathlib (bottom) → missing (top)</span>"
         "</div>"
     )
+
+
+def _tiertoggle_html(present: list, tier: int) -> str:
+    """The tier toggle, listing **exactly** the tiers present in the graph, each
+    labelled ``N · <label>`` (1 · clusters / 2 · statements / 3 · declarations).
+
+    The current tier is a static span; the others are links to ``/?tier=N``. A hint
+    to unroll is shown on any tier that has a deeper tier to drill into.
+    """
+    parts = ["<div class='rv-tiertoggle'><span class='rv-tt-label'>view</span>"]
+    for t in present:
+        label = TIER_LABELS.get(t, f"tier {t}")
+        text = f"{t} · {label}"
+        if t == tier:
+            parts.append(f"<span class='rv-tt rv-tt-on'>{_E(text)}</span>")
+        else:
+            parts.append(f"<a class='rv-tt' href='/?tier={t}'>{_E(text)}</a>")
+    # A hint to unroll appears whenever there is a deeper tier to drill into.
+    if present and tier != present[-1]:
+        parts.append("<span class='rv-tt-hint'>click a node to unroll it</span>")
+    parts.append("</div>")
+    return "".join(parts)
 
 
 def render_cluster(proj: Project, cluster_id: str) -> bytes:
@@ -542,9 +605,12 @@ def make_handler(proj: Project):
             path = parsed.path
             if path == "/":
                 qs = urllib.parse.parse_qs(parsed.query)
-                # Home defaults to the tier-1 dashboard; ?tier=2 opens the full graph.
-                tier = 2 if qs.get("tier", ["1"])[0] == "2" else 1
-                return self._send(200, render_home(proj, tier))
+                # Home renders the flat tier-N graph (?tier=N, any tier present;
+                # default = lowest tier present) optionally focused on a parent one
+                # tier up (?focus=<parentid>) so its children are highlighted.
+                tier = qs.get("tier", [None])[0]
+                focus = qs.get("focus", [None])[0]
+                return self._send(200, render_home(proj, tier, focus))
             if path == "/api/state":
                 return self._json(200, rm.compute_state(proj.nodes(), proj.sidecar()))
             if path == "/api/dot":
@@ -563,20 +629,21 @@ def make_handler(proj: Project):
             return self._send(404, b"not found")
 
         def _api_dot(self, parsed):
-            """GET /api/dot?tier=<1|2>&expand=cX,cY -> {dot, id_by_slug, kinds}.
+            """GET /api/dot?tier=<N>&expand=id1,id2 -> {dot, id_by_slug, kinds}.
 
             Lets the client re-render the graph with a transition (no full reload)
-            after expanding/collapsing a tier-1 cluster. ``expand`` is a comma list of
-            cluster ids to unroll in place (tier-1 only); unknown ids are ignored by
-            the model. The payload mirrors the home bootstrap globals the client needs
-            to repaint and re-wire clicks.
+            after expanding/collapsing a node at the current tier. ``tier`` is any
+            tier present in the graph (1, 2, 3, …); ``expand`` is a comma list of
+            tier-N node ids to unroll in place into their tier-(N+1) children —
+            unknown ids and leaves are ignored by the model. The payload mirrors the
+            home bootstrap globals the client needs to repaint and re-wire clicks.
             """
-            qs = urllib.parse.parse_qs(parsed.query)
-            tier = 2 if qs.get("tier", ["1"])[0] == "2" else 1
-            expand_raw = qs.get("expand", [""])[0]
-            expanded = {c.strip() for c in expand_raw.split(",") if c.strip()}
             nodes = proj.nodes()
             sidecar = proj.sidecar()
+            qs = urllib.parse.parse_qs(parsed.query)
+            tier = _parse_tier(qs.get("tier", [None])[0], nodes)
+            expand_raw = qs.get("expand", [""])[0]
+            expanded = {c.strip() for c in expand_raw.split(",") if c.strip()}
             dot = rm.recolor_dot(nodes, sidecar, tier=tier, expanded=expanded)
             slug_map = proj.slug_map()
             id_by_slug = {slug: nid for nid, slug in slug_map.items()}
@@ -586,6 +653,7 @@ def make_handler(proj: Project):
                 "dot": dot,
                 "id_by_slug": id_by_slug,
                 "kinds": kinds,
+                "tier": tier,
             })
 
         def _serve_asset(self, name):
