@@ -145,3 +145,21 @@ def test_parent_cycle_terminates(tmp_path):
     ss = proj.sorry_set(proj.nodes())
     # Both members of the cycle are reached once; the walk terminates.
     assert ss == {"A.B.C", "A.B"}
+
+
+def test_lean_has_sorry_ignores_comments_and_hyphen_form():
+    """Regression: the detector must not trip on prose. A `sorry`/`admit` inside a
+    `--` or `/- … -/` comment, or the hyphenated word form `sorry-free`, is NOT a
+    real gap; only a bare `sorry`/`admit`/`sorryAx` token in code counts."""
+    has = sv._lean_has_sorry
+    # prose / comments / identifiers → not flagged
+    assert has("-- TODO sorry later") is False
+    assert has("/- a sorry in a block -/") is False
+    assert has("/-! inspection-verified sorry-free at port -/\ndef f := 1") is False
+    assert has("inspection-verified sorry-free") is False
+    assert has("def sorryHandler := 1") is False
+    assert has("structure my_admit where x : Nat") is False
+    # real incompleteness → flagged
+    assert has("  exact sorry") is True
+    assert has("theorem t : p := by admit") is True
+    assert has("  := sorryAx _") is True
