@@ -432,6 +432,24 @@ def cluster_rollup(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> di
     }
 
 
+def cluster_color(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> str:
+    """Trust color for a tier-1 cluster, rolled up from its tier-2 children's
+    color_state (so in-Mathlib reuse rolls up to blue). Any flagged/rejected child =>
+    flagged; all children in Mathlib => blue; all trusted => clean; else unreviewed."""
+    children = _tier2_children(cluster_id, nodes)
+    states = [color_state(nodes[c], verdict_of(c, sidecar))
+              for c in children if c in nodes]
+    if not states:
+        return "unreviewed"
+    if any(s in ("rejected", "flagged") for s in states):
+        return "flagged"
+    if all(s == "in_mathlib" for s in states):
+        return "in_mathlib"
+    if all(s in ("clean", "in_mathlib") for s in states):
+        return "clean"
+    return "unreviewed"
+
+
 # ---------------------------------------------------------------------------
 # coverage + trust frontier
 # ---------------------------------------------------------------------------
@@ -504,6 +522,7 @@ def _verdict_node_dot(
     verdict: str,
     source: Optional[str],
     tainted: bool,
+    state_override: Optional[str] = None,
 ) -> str:
     """Emit one DOT node line colored by the **trust state** (color_state), not the
     raw verdict.
@@ -524,7 +543,7 @@ def _verdict_node_dot(
     kind = (node.get("kind") or "theorem").lower()
     shape = "box" if kind in eb.DEFINITION_KINDS else "ellipse"
 
-    state = color_state(node, verdict)
+    state = state_override if state_override is not None else color_state(node, verdict)
     blue = state == "in_mathlib"
 
     colors = VERDICT_DOT.get(state, VERDICT_DOT["unreviewed"])
@@ -575,12 +594,37 @@ def recolor_dot(
     """
     name_to_slug = eb.build_slug_map(nodes)
     sub = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == tier}
-    tainted = tainted_set(nodes, sidecar)
 
     lines: List[str] = ['strict digraph "" {']
     lines.extend(eb._graph_attr_lines())
-
     ids = set(sub)
+
+    if tier == 1:
+        # Tier-1 overview: each cluster colored by its roll-up (in-Mathlib children
+        # roll up to blue), with edges lifted from cross-cluster tier-2 dependencies.
+        for cid in sorted(sub):
+            lines.append(_verdict_node_dot(
+                cid, sub[cid], name_to_slug[cid],
+                "unreviewed", "human", False,
+                state_override=cluster_color(cid, nodes, sidecar),
+            ))
+        parent = {nid: node.get("parent") for nid, node in nodes.items()}
+        cedges: List[Tuple[str, str]] = []
+        for nid, node in nodes.items():
+            if eb.node_tier(node) != 2:
+                continue
+            pn = parent.get(nid)
+            for dep in node.get("depends_on", []) or []:
+                pd = parent.get(dep)
+                if pn in ids and pd in ids and pn != pd:
+                    cedges.append((name_to_slug[pd], name_to_slug[pn]))
+        for s, t in sorted(set(cedges)):
+            lines.append(f'  "{s}" -> "{t}" [style=dashed];')
+        lines.append("}")
+        return "\n".join(lines)
+
+    # Tier 2 (default): each node colored by its own trust state; within-tier edges.
+    tainted = tainted_set(nodes, sidecar)
     for nid in sorted(sub):
         lines.append(_verdict_node_dot(
             nid, sub[nid], name_to_slug[nid],
@@ -588,7 +632,6 @@ def recolor_dot(
             review_source(nid, sidecar),
             nid in tainted,
         ))
-
     edges: List[Tuple[str, str]] = []
     for nid, node in sub.items():
         for dep in node.get("depends_on", []) or []:
@@ -596,7 +639,6 @@ def recolor_dot(
                 edges.append((name_to_slug[dep], name_to_slug[nid]))
     for s, t in sorted(set(edges)):
         lines.append(f'  "{s}" -> "{t}" [style=dashed];')
-
     lines.append("}")
     return "\n".join(lines)
 

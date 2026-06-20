@@ -19,6 +19,12 @@
     rejected: "#C0392B", grey: "#C9C2B4"
   };
 
+  // Tier-1 home shows clusters (click -> /cluster/<id>); tier-2 shows nodes (-> /node/<id>).
+  var TIER = window.__RV_TIER__ || 2;
+  function nodeHref(id) {
+    return (TIER === 1 ? "/cluster/" : "/node/") + encodeURIComponent(id);
+  }
+
   // ---- home screen ----
   function initHome() {
     var dot = window.__RV_DOT__;
@@ -66,7 +72,7 @@
       if (!id) return;
       g.style.cursor = "pointer";
       g.addEventListener("click", function () {
-        window.location.href = "/node/" + encodeURIComponent(id);
+        window.location.href = nodeHref(id);
       });
       // A blue (in-Mathlib) node is trusted by construction — never hatch it.
       if (tainted[id] && colors[id] !== "in_mathlib") {
@@ -127,7 +133,7 @@
       html += "<li class='rv-fb rv-" + cs + (isTainted ? " rv-tainted" : "")
         + (blue ? " rv-solid"
                 : (sources[id] === "human" ? " rv-human" : " rv-aionly")) + "'>"
-        + "<a href='/node/" + encodeURIComponent(id) + "'>" + escapeHtml(id)
+        + "<a href='" + nodeHref(id) + "'>" + escapeHtml(id)
         + "</a> <span class='rv-fb-v'>" + label + "</span>"
         + (!blue && sources[id] ? " <span class='rv-fb-src'>" + src + "</span>" : "")
         + (isTainted ? " <span class='rv-fb-taint'>tainted</span>" : "")

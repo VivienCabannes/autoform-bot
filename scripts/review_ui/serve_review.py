@@ -233,11 +233,11 @@ def _render_md(md: str) -> str:
     return "\n".join(out) or "<p><em>(empty)</em></p>"
 
 
-def render_home(proj: Project) -> bytes:
+def render_home(proj: Project, tier: int = 2) -> bytes:
     nodes = proj.nodes()
     sidecar = proj.sidecar()
     state = rm.compute_state(nodes, sidecar)
-    dot = rm.recolor_dot(nodes, sidecar, tier=2)
+    dot = rm.recolor_dot(nodes, sidecar, tier=tier)
     slug_map = proj.slug_map()
     # id<->slug both directions so the client can route node clicks to /node/<id>.
     id_by_slug = {slug: nid for nid, slug in slug_map.items()}
@@ -247,6 +247,7 @@ def render_home(proj: Project) -> bytes:
         f"window.__RV_STATE__ = {json.dumps(state)};"
         f"window.__RV_IDBYSLUG__ = {json.dumps(id_by_slug)};"
         f"window.__RV_PALETTE__ = {json.dumps(rm.PALETTE)};"
+        f"window.__RV_TIER__ = {tier};"
     )
     cov = state["coverage"]
     frontier = state["trust_frontier"]
@@ -266,6 +267,13 @@ def render_home(proj: Project) -> bytes:
         + "</div>"
         f"<div class='rv-dial'>dial: <strong>{_E(state['dial'])}</strong></div>"
         "</section>"
+        + ("<div class='rv-tiertoggle'>view: "
+           + ("<strong>Tier 1 · clusters</strong>" if tier == 1
+              else "<a href='/?tier=1'>Tier 1 · clusters</a>")
+           + " &nbsp;⇄&nbsp; "
+           + ("<strong>Tier 2 · statements</strong>" if tier == 2
+              else "<a href='/'>Tier 2 · statements</a>")
+           + "</div>")
         + _legend_html()
         + "<div id='rv-graph' class='rv-graph'></div>"
     )
@@ -480,9 +488,12 @@ def make_handler(proj: Project):
 
         # --- GET ---
         def do_GET(self):
-            path = urllib.parse.urlparse(self.path).path
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
             if path == "/":
-                return self._send(200, render_home(proj))
+                qs = urllib.parse.parse_qs(parsed.query)
+                tier = 1 if qs.get("tier", ["2"])[0] == "1" else 2
+                return self._send(200, render_home(proj, tier))
             if path == "/api/state":
                 return self._json(200, rm.compute_state(proj.nodes(), proj.sidecar()))
             if path.startswith("/assets/"):
