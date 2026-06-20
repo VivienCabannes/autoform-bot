@@ -12,8 +12,12 @@ Two encodings live side by side on the graph and must never be conflated:
 
   * **position** = ``mathlib_status`` — vertical lanes, ``in-mathlib`` at the
     *bottom* rising to ``missing`` at the *top*; dependencies flow upward.
-  * **color** = the **effective review verdict** (``human`` if present, else
-    ``ai``, else unreviewed).
+  * **color** = the **trust state**: blue = already in Mathlib (reused, trusted
+    by construction — not ours to review) / green = ours, reviewed clean / amber
+    = ours, flagged / red = ours, rejected / grey = ours, unreviewed. A real
+    defect (flagged/rejected verdict) overrides to amber/red even on a Mathlib
+    node. The two encodings *reinforce* each other: a blue (in-Mathlib) node
+    also sits in the in-Mathlib lane.
 
 The sidecar (``review_status.json``) is the single source of truth for verdicts.
 Schema (see SHARED_SPEC.md)::
@@ -59,19 +63,26 @@ PALETTE = {
     "paper": "#F7F4EE",
     "ink": "#1F1D1A",
     "accent": "#1A4B8C",
+    "in_mathlib": "#2563B0",  # blue — already in Mathlib (reused, trusted)
     "clean": "#2F7D4F",
     "flagged": "#C08A1E",
     "rejected": "#C0392B",
     "grey": "#C9C2B4",  # unreviewed
 }
 
-# Effective-verdict -> DOT colors. Fills are light tints; borders are the palette.
+# Color-state -> DOT colors. Fills are light tints; borders are the palette.
+# "in_mathlib" (blue) is a trust state, not a verdict: a node already in Mathlib.
 VERDICT_DOT = {
+    "in_mathlib": {"color": PALETTE["in_mathlib"], "fill": "#DCE8F7"},
     "clean":      {"color": PALETTE["clean"],    "fill": "#D6EAD9"},
     "flagged":    {"color": PALETTE["flagged"],  "fill": "#F2E4C4"},
     "rejected":   {"color": PALETTE["rejected"], "fill": "#F1D2CE"},
     "unreviewed": {"color": PALETTE["grey"],     "fill": "#ECE7DC"},
 }
+
+# mathlib_status values that mean a node is *fully* in Mathlib (=> blue, trusted).
+# Canonical value is "exists"; tolerate the other spellings seen in the wild.
+IN_MATHLIB_STATUSES = {"exists", "in-mathlib", "in_mathlib", "mathlib"}
 
 # The three jury rubrics: (name, weight, pass_threshold). Mirrors eval-rubrics.
 RUBRICS: List[Tuple[str, float, int]] = [
@@ -256,6 +267,49 @@ def review_source(node_id: str, sidecar: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# trust state — blue (in Mathlib) as a first-class color, distinct from verdict
+# ---------------------------------------------------------------------------
+
+def is_in_mathlib(node: dict) -> bool:
+    """True when a node is *fully* in Mathlib (trusted by construction).
+
+    Keyed on ``mathlib_status`` — canonical ``"exists"``, with the other common
+    spellings tolerated. Such a node is reused, not ours to review, so it is
+    neither "unreviewed" (grey) nor "we proved it" (green) — it is **blue**.
+    """
+    return (node or {}).get("mathlib_status") in IN_MATHLIB_STATUSES
+
+
+def color_state(node: dict, effective_verdict: str) -> str:
+    """The **trust-state color** for a node: one of ``in_mathlib`` (blue) /
+    ``clean`` (green) / ``flagged`` (amber) / ``rejected`` (red) / ``unreviewed``
+    (grey).
+
+    A real defect (flagged/rejected) shows even on a reuse — e.g. a wrong Mathlib
+    lemma cited — so it overrides the blue. Otherwise an in-Mathlib node is blue;
+    everything else keeps its effective verdict (clean -> green, else grey).
+    """
+    if effective_verdict in ("rejected", "flagged"):
+        return effective_verdict
+    if is_in_mathlib(node):
+        return "in_mathlib"
+    return effective_verdict
+
+
+def is_trusted(node_id: str, node: dict, sidecar: dict) -> bool:
+    """Whether a node is *trusted* for taint/frontier/coverage.
+
+    Trusted = effective verdict ``clean`` (ours, reviewed clean) **OR** the node
+    is in Mathlib (trusted by construction) and carries no defect verdict. A
+    flagged/rejected node is never trusted, even if it is in Mathlib.
+    """
+    v = verdict_of(node_id, sidecar)
+    if v == "clean":
+        return True
+    return is_in_mathlib(node) and v not in ("flagged", "rejected")
+
+
 def node_scorecard(node_id: str, sidecar: dict) -> dict:
     """A flat scorecard for the packet/UI: per-rubric scores, weighted total,
     ai/human verdicts, the effective verdict, and its source."""
@@ -309,6 +363,9 @@ def tainted_set(nodes: Dict[str, dict], sidecar: dict) -> Set[str]:
     effective verdict of flagged or rejected. Computed live, never stored. The bad
     nodes themselves are NOT in the tainted set (they are the source, not victims) —
     they carry their own verdict color; taint marks the *downstream* trust damage.
+
+    Only flagged/rejected nodes taint: an ``in_mathlib`` (blue) node is trusted by
+    construction and never seeds taint (it has no flagged/rejected verdict).
     """
     rev = _dependents_index(nodes)
     bad = [nid for nid in nodes
@@ -388,22 +445,28 @@ def coverage(nodes: Dict[str, dict], sidecar: dict) -> dict:
     tier2 = [nid for nid, node in nodes.items() if eb.node_tier(node) == 2]
     reviewed = [nid for nid in tier2 if verdict_of(nid, sidecar) != "unreviewed"]
     human = [nid for nid in tier2 if review_source(nid, sidecar) == "human"]
+    in_mathlib = [nid for nid in tier2 if is_in_mathlib(nodes[nid])]
+    trusted = [nid for nid in tier2 if is_trusted(nid, nodes[nid], sidecar)]
     total = len(tier2)
     return {
         "total": total,
         "reviewed": len(reviewed),
         "human_confirmed": len(human),
+        "in_mathlib": len(in_mathlib),
+        "trusted": len(trusted),
         "fraction": (len(reviewed) / total) if total else 0.0,
     }
 
 
 def trust_frontier(nodes: Dict[str, dict], sidecar: dict) -> List[str]:
-    """The sink nodes (top-level results) resting on a fully-clean closure.
+    """The sink nodes (top-level results) resting on a fully-**trusted** closure.
 
     A sink is a tier-2 node that nothing else (in tier 2) depends on. A sink is on
-    the trust frontier when it AND its entire ``depends_on`` closure are all clean
-    (effective verdict == clean). These are the results a human can currently trust
-    end-to-end. Sorted for determinism.
+    the trust frontier when it AND its entire ``depends_on`` closure are all
+    *trusted* — each node is either reviewed clean or already in Mathlib (with no
+    flagged/rejected defect). A blue (in-Mathlib) node therefore counts toward the
+    frontier exactly like a clean one. These are the results a human can currently
+    trust end-to-end. Sorted for determinism.
     """
     tier2 = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == 2}
     rev = _dependents_index(tier2)
@@ -412,7 +475,7 @@ def trust_frontier(nodes: Dict[str, dict], sidecar: dict) -> List[str]:
     frontier: List[str] = []
     for sink in sinks:
         closure = _closure(sink, tier2)
-        if all(verdict_of(nid, sidecar) == "clean" for nid in closure):
+        if all(is_trusted(nid, tier2[nid], sidecar) for nid in closure):
             frontier.append(sink)
     return sorted(frontier)
 
@@ -442,10 +505,14 @@ def _verdict_node_dot(
     source: Optional[str],
     tainted: bool,
 ) -> str:
-    """Emit one DOT node line colored by *verdict* (not mathlib_status).
+    """Emit one DOT node line colored by the **trust state** (color_state), not the
+    raw verdict.
 
-    Encodings (SHARED_SPEC):
-      * fill/border color = effective verdict (clean/flagged/rejected/unreviewed);
+    Encodings:
+      * fill/border color = color_state (in_mathlib=blue / clean=green /
+        flagged=amber / rejected=red / unreviewed=grey);
+      * in_mathlib node    => **solid** (trusted by construction — no AI-only ring,
+        never hatched), even when no human has reviewed it;
       * AI-only node       => dashed border ring (style=dashed);
       * human-confirmed    => solid filled;
       * tainted node       => 45-degree hatch overlay (style includes "diagonals"
@@ -457,7 +524,10 @@ def _verdict_node_dot(
     kind = (node.get("kind") or "theorem").lower()
     shape = "box" if kind in eb.DEFINITION_KINDS else "ellipse"
 
-    colors = VERDICT_DOT.get(verdict, VERDICT_DOT["unreviewed"])
+    state = color_state(node, verdict)
+    blue = state == "in_mathlib"
+
+    colors = VERDICT_DOT.get(state, VERDICT_DOT["unreviewed"])
     attrs: List[str] = [
         f'label="{eb._dot_escape(nid)}"',
         f'color="{colors["color"]}"',
@@ -465,20 +535,26 @@ def _verdict_node_dot(
         f"shape={shape}",
     ]
 
-    # style: filled always; dashed adds the AI-only ring; "diagonals" hints taint.
+    # style: filled always. A blue (in-Mathlib) node is trusted by construction:
+    # solid, no AI-only ring and never hatched. Otherwise: dashed = AI-only ring,
+    # "diagonals" hints taint.
     styles = ["filled"]
-    if source != "human":
+    if not blue and source != "human":
         # AI-only (or unreviewed) -> dashed ring marks "provisional / unvouched".
         styles.append("dashed")
-    if tainted:
+    if tainted and not blue:
         # graphviz "diagonals" decorates the node; the client overlays a true 45deg
         # hatch via the class we tag below, so this is a graceful fallback.
         styles.append("diagonals")
     attrs.append(f'style="{",".join(styles)}"')
 
     # A class the client SVG post-processor keys on for the exact hatch + ring.
-    klass = f"rv-{verdict}" + (" rv-tainted" if tainted else "") + (
-        " rv-aionly" if source != "human" else " rv-human")
+    # Blue nodes are solid + never tainted/AI-only-styled (trusted by construction).
+    if blue:
+        klass = "rv-in_mathlib rv-solid"
+    else:
+        klass = f"rv-{state}" + (" rv-tainted" if tainted else "") + (
+            " rv-aionly" if source != "human" else " rv-human")
     attrs.append(f'class="{klass}"')
 
     return f'  "{slug}" [{", ".join(attrs)}];'
@@ -535,9 +611,14 @@ def compute_state(nodes: Dict[str, dict], sidecar: dict) -> dict:
     tainted = sorted(tainted_set(nodes, sidecar))
     clusters = sorted(
         nid for nid, node in nodes.items() if eb.node_tier(node) == 1)
+    verdicts = {nid: verdict_of(nid, sidecar) for nid in nodes}
     return {
         "dial": dial_of(sidecar),
-        "verdicts": {nid: verdict_of(nid, sidecar) for nid in nodes},
+        "verdicts": verdicts,
+        # color_state per node: the trust-state color the UI paints (blue for an
+        # in-Mathlib reuse, else the effective verdict). Alongside `verdicts` so the
+        # client/tests can distinguish blue from green/grey.
+        "colors": {nid: color_state(nodes[nid], verdicts[nid]) for nid in nodes},
         "sources": {nid: review_source(nid, sidecar) for nid in nodes},
         "tainted": tainted,
         "coverage": coverage(nodes, sidecar),

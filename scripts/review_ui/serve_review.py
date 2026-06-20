@@ -275,7 +275,8 @@ def render_home(proj: Project) -> bytes:
 def _legend_html() -> str:
     return (
         "<div class='rv-legend'>"
-        "<span class='rv-key rv-clean'>clean</span>"
+        "<span class='rv-key rv-in_mathlib'>in Mathlib</span>"
+        "<span class='rv-key rv-clean'>ours · clean</span>"
         "<span class='rv-key rv-flagged'>flagged</span>"
         "<span class='rv-key rv-rejected'>rejected</span>"
         "<span class='rv-key rv-grey'>unreviewed</span>"

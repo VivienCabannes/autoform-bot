@@ -1,13 +1,18 @@
 /* Review surface — three screens (home / cluster / node packet).
  * Palette (SHARED_SPEC): paper #F7F4EE / ink #1F1D1A / accent #1A4B8C;
- * clean #2F7D4F / flagged #C08A1E / rejected #C0392B / grey (unreviewed) #C9C2B4.
+ * in_mathlib (blue) #2563B0 / clean #2F7D4F / flagged #C08A1E /
+ * rejected #C0392B / grey (unreviewed) #C9C2B4.
+ * Color = trust state: blue = in Mathlib (reused, trusted) · green = ours, clean.
  * Encodings: AI-only = dashed ring; human-confirmed = solid; tainted = 45° hatch.
+ * A blue (in-Mathlib) node is always solid and never hatched (trusted by construction).
  */
 
 :root {
   --paper: #F7F4EE;
   --ink: #1F1D1A;
   --accent: #1A4B8C;
+  --in-mathlib: #2563B0;
+  --in-mathlib-fill: #DCE8F7;
   --clean: #2F7D4F;
   --flagged: #C08A1E;
   --rejected: #C0392B;
@@ -73,6 +78,8 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
   padding: 2px 9px; border-radius: 10px; border: 1.5px solid var(--grey);
   background: #fff;
 }
+.rv-key.rv-in_mathlib { border-color: var(--in-mathlib); color: var(--in-mathlib);
+  background: var(--in-mathlib-fill); }
 .rv-key.rv-clean { border-color: var(--clean); color: var(--clean); }
 .rv-key.rv-flagged { border-color: var(--flagged); color: var(--flagged); }
 .rv-key.rv-rejected { border-color: var(--rejected); color: var(--rejected); }
@@ -98,6 +105,35 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 .rv-graph .node.rv-aionly polygon { stroke-dasharray: 5 4; }
 .rv-graph .node.rv-human ellipse,
 .rv-graph .node.rv-human polygon { stroke-width: 2.4px; }
+/* In-Mathlib (blue) nodes are trusted by construction: solid blue, never dashed
+ * (the DOT already omits the AI-only ring); reaffirm here so they never inherit
+ * a dashed/hatched look. */
+.rv-graph .node.rv-in_mathlib ellipse,
+.rv-graph .node.rv-in_mathlib polygon {
+  stroke: var(--in-mathlib); stroke-dasharray: none; stroke-width: 2px;
+}
+
+/* --- offline fallback list: one chip per node, colored by trust state --- */
+.rv-fallback { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 8px; }
+.rv-fb {
+  padding: 3px 10px; border-radius: 12px; border: 1.5px solid var(--grey);
+  background: #fff; font-size: 13px;
+}
+.rv-fb.rv-aionly { border-style: dashed; }
+.rv-fb.rv-in_mathlib { border-color: var(--in-mathlib); background: var(--in-mathlib-fill); }
+.rv-fb.rv-in_mathlib a { color: var(--in-mathlib); }
+.rv-fb.rv-clean { border-color: var(--clean); }
+.rv-fb.rv-flagged { border-color: var(--flagged); }
+.rv-fb.rv-rejected { border-color: var(--rejected); }
+.rv-fb.rv-tainted {
+  background: repeating-linear-gradient(45deg, #fff, #fff 4px, #ded8c9 4px, #ded8c9 6px);
+}
+/* Blue is trusted by construction — never show it as tainted/hatched. */
+.rv-fb.rv-in_mathlib.rv-tainted { background: var(--in-mathlib-fill); }
+.rv-fb-v { color: #8a8575; }
+.rv-fb-src, .rv-fb-taint { font-size: 11px; color: #8a8575; }
+.rv-fb-taint { color: var(--rejected); }
 
 /* --- cluster deck --- */
 .rv-cluster-rollup {
@@ -115,6 +151,7 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 }
 .rv-table th { font-size: 12px; text-transform: uppercase; color: #8a8575; }
 .rv-verdict-cell { font-weight: 600; }
+.rv-row.rv-in_mathlib .rv-verdict-cell { color: var(--in-mathlib); }
 .rv-row.rv-clean .rv-verdict-cell { color: var(--clean); }
 .rv-row.rv-flagged .rv-verdict-cell { color: var(--flagged); }
 .rv-row.rv-rejected .rv-verdict-cell { color: var(--rejected); }
@@ -160,6 +197,7 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
   font-size: 12px; padding: 2px 8px; border-radius: 10px; margin-left: 8px;
   border: 1.5px solid var(--grey);
 }
+.rv-eff.rv-in_mathlib { border-color: var(--in-mathlib); color: var(--in-mathlib); }
 .rv-eff.rv-clean { border-color: var(--clean); color: var(--clean); }
 .rv-eff.rv-flagged { border-color: var(--flagged); color: var(--flagged); }
 .rv-eff.rv-rejected { border-color: var(--rejected); color: var(--rejected); }

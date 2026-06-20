@@ -15,7 +15,8 @@
   "use strict";
 
   var PALETTE = window.__RV_PALETTE__ || {
-    clean: "#2F7D4F", flagged: "#C08A1E", rejected: "#C0392B", grey: "#C9C2B4"
+    in_mathlib: "#2563B0", clean: "#2F7D4F", flagged: "#C08A1E",
+    rejected: "#C0392B", grey: "#C9C2B4"
   };
 
   // ---- home screen ----
@@ -55,6 +56,7 @@
     ensureHatchPattern(svg);
     var tainted = {};
     (state.tainted || []).forEach(function (id) { tainted[id] = true; });
+    var colors = state.colors || {};
 
     var nodes = svg.querySelectorAll("g.node");
     nodes.forEach(function (g) {
@@ -66,7 +68,8 @@
       g.addEventListener("click", function () {
         window.location.href = "/node/" + encodeURIComponent(id);
       });
-      if (tainted[id]) {
+      // A blue (in-Mathlib) node is trusted by construction — never hatch it.
+      if (tainted[id] && colors[id] !== "in_mathlib") {
         var shape = g.querySelector("ellipse, polygon, path");
         if (shape) {
           // Layer the hatch over the existing verdict fill.
@@ -100,26 +103,34 @@
     defs.appendChild(pat);
   }
 
-  // Static, dependency-free fallback: list every node colored by its verdict,
-  // each linking to its packet. Tainted nodes get a hatch chip.
+  // Static, dependency-free fallback: list every node colored by its **trust
+  // state** (blue = in Mathlib, else the effective verdict), each linking to its
+  // packet. Tainted nodes get a hatch chip — except blue nodes, which are trusted
+  // by construction and never hatched or shown as AI-only.
   function renderFallback(mount, idBySlug, state) {
     var verdicts = state.verdicts || {};
+    var colors = state.colors || {};
     var sources = state.sources || {};
     var tainted = {};
     (state.tainted || []).forEach(function (id) { tainted[id] = true; });
 
     var ids = Object.keys(verdicts).sort();
     var html = "<p class='rv-note'>Interactive graph unavailable (offline) — "
-      + "static node list, colored by verdict.</p><ul class='rv-fallback'>";
+      + "static node list, colored by trust state.</p><ul class='rv-fallback'>";
     ids.forEach(function (id) {
       var v = verdicts[id] || "unreviewed";
+      var cs = colors[id] || v;
+      var blue = cs === "in_mathlib";
+      var isTainted = tainted[id] && !blue;
       var src = sources[id] === "human" ? "human" : "ai";
-      html += "<li class='rv-fb rv-" + v + (tainted[id] ? " rv-tainted" : "")
-        + (sources[id] === "human" ? " rv-human" : " rv-aionly") + "'>"
+      var label = blue ? "in Mathlib" : v;
+      html += "<li class='rv-fb rv-" + cs + (isTainted ? " rv-tainted" : "")
+        + (blue ? " rv-solid"
+                : (sources[id] === "human" ? " rv-human" : " rv-aionly")) + "'>"
         + "<a href='/node/" + encodeURIComponent(id) + "'>" + escapeHtml(id)
-        + "</a> <span class='rv-fb-v'>" + v + "</span>"
-        + (sources[id] ? " <span class='rv-fb-src'>" + src + "</span>" : "")
-        + (tainted[id] ? " <span class='rv-fb-taint'>tainted</span>" : "")
+        + "</a> <span class='rv-fb-v'>" + label + "</span>"
+        + (!blue && sources[id] ? " <span class='rv-fb-src'>" + src + "</span>" : "")
+        + (isTainted ? " <span class='rv-fb-taint'>tainted</span>" : "")
         + "</li>";
     });
     html += "</ul>";
