@@ -891,12 +891,22 @@ def _recolor_tier_dot(
         if nid in expanded:
             continue
         if has_children(nid, nodes):
-            # collapsed parent → single node colored by the roll-up over its children
-            lines.append(_verdict_node_dot(
-                nid, sub[nid], name_to_slug[nid],
-                "unreviewed", rollup_source(nid, nodes, sidecar), False,
-                state_override=rollup_color(nid, nodes, sidecar),
-            ))
+            own = verdict_of(nid, sidecar)
+            if own != "unreviewed":
+                # The node was itself reviewed → its OWN verdict wins over the roll-up.
+                # A unit judged clean shows green even while its child modules are still
+                # unreviewed; taint still hatches it if a defect sits in its closure.
+                lines.append(_verdict_node_dot(
+                    nid, sub[nid], name_to_slug[nid],
+                    own, review_source(nid, sidecar), nid in tainted,
+                ))
+            else:
+                # No own verdict (e.g. a cluster) → colored by the roll-up over children.
+                lines.append(_verdict_node_dot(
+                    nid, sub[nid], name_to_slug[nid],
+                    "unreviewed", rollup_source(nid, nodes, sidecar), False,
+                    state_override=rollup_color(nid, nodes, sidecar),
+                ))
         else:
             # leaf → colored by its own trust state (taint / AI-only ring honoured)
             lines.append(_verdict_node_dot(
