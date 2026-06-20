@@ -88,11 +88,16 @@ def test_expanded_cross_edges_use_repr_trick():
     dot = rm.recolor_dot(g, _sc(), tier=1, expanded={"cA"})
     # cB stays collapsed -> still a node
     assert f'"{slug["cB"]}" [' in dot
-    # edges flow dep -> dependent. b1 dep a1 (a1's cluster cA expanded) =>
-    # repr(a1)=a1 (child) -> repr(b1)=cB  ==>  a1 -> cB
-    assert f'"{slug["a1"]}" -> "{slug["cB"]}"' in dot
-    # b2 dep a2 => repr(a2)=a2 -> repr(b2)=cB  ==>  a2 -> cB
+    # edges flow dep -> dependent. The lifted repr-trick cross edges are
+    #   b1 dep a1 => repr(a1)=a1 (child) -> repr(b1)=cB  ==>  a1 -> cB
+    #   b2 dep a2 => repr(a2)=a2 (child) -> repr(b2)=cB  ==>  a2 -> cB
+    # plus the lifted intra-cluster edge a1 -> a2. With transitive reduction of the
+    # DISPLAYED edge set, a1 -> cB is REDUNDANT (a1 -> a2 -> cB already reaches cB)
+    # and is dropped; a2 -> cB survives (it is the only route a2 -> cB).
     assert f'"{slug["a2"]}" -> "{slug["cB"]}"' in dot
+    assert f'"{slug["a1"]}" -> "{slug["cB"]}"' not in dot   # reduced away (redundant)
+    # the lifted a1 -> a2 cross edge is still present (non-redundant skeleton arc)
+    assert f'"{slug["a1"]}" -> "{slug["a2"]}"' in dot
     # no lifted cA -> cB edge anymore (cA's endpoints are now their own children)
     assert f'"{slug["cA"]}" -> "{slug["cB"]}"' not in dot
     assert f'"{slug["cB"]}" -> "{slug["cA"]}"' not in dot

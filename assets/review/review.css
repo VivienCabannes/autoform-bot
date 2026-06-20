@@ -191,7 +191,7 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 
 /* --- home: graph --- */
 .rv-graph {
-  width: 100%; height: 74vh; border: 1px solid var(--line);
+  width: 100%; height: 88vh; border: 1px solid var(--line);
   border-radius: 8px; background: #fff; overflow: hidden;
   box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
   position: relative;

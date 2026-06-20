@@ -782,6 +782,70 @@ def _verdict_node_dot(
     return f'  "{slug}" [{", ".join(attrs)}];'
 
 
+def transitive_reduction(succ: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+    """Transitive reduction of a DAG given as an adjacency map ``succ`` (u -> direct
+    successors of u). Returns a NEW adjacency map keeping only the non-redundant
+    edges: drop ``u -> v`` exactly when some *other* direct successor ``w`` of ``u``
+    (``w != v``) already reaches ``v`` (``v`` is in the reachability closure of
+    ``w``). The reachable closure is computed by memoised DFS.
+
+    DISPLAY-ONLY helper for the review render: it reduces the *drawn* edge set so a
+    redundant ``u -> v`` (already implied by ``u -> w -> ... -> v``) is not painted.
+    It is NEVER applied to the dependency semantics — ``compute_state`` / taint /
+    ``trust_frontier`` / coverage keep using the full ``depends_on`` graph, so a
+    reduced-away edge is still a real dependency for trust propagation.
+
+    Acyclicity: the within-tier dependency graph is acyclic. If a cycle is present
+    we must *never* drop an edge ``u -> v`` when ``u`` is itself reachable from ``v``
+    (that would silently delete a real arc of the cycle), so such edges are always
+    kept. Concretely, when testing whether ``w`` reaches ``v`` we ignore any ``w``
+    that is reachable back from ``v`` (it sits on a cycle with ``v``), and we never
+    drop ``u -> v`` while computing ``u``'s own reachability — the closure used to
+    justify a drop excludes the edge under test.
+    """
+    nodes = set(succ)
+    for vs in succ.values():
+        nodes |= set(vs)
+
+    # Memoised reachability closure: reach(x) = all nodes reachable from x following
+    # one or more edges (x itself NOT included). DFS with a recursion guard so a cycle
+    # cannot loop forever; on a cycle every member ends up reachable from every other.
+    _reach: Dict[str, Set[str]] = {}
+
+    def reach(x: str) -> Set[str]:
+        cached = _reach.get(x)
+        if cached is not None:
+            return cached
+        acc: Set[str] = set()
+        _reach[x] = acc  # publish early so a back-edge on a cycle sees a (growing) set
+        for y in succ.get(x, ()):  # direct successors
+            acc.add(y)
+            acc |= reach(y)
+        return acc
+
+    reduced: Dict[str, Set[str]] = {}
+    for u in succ:
+        outs = succ.get(u, set())
+        kept: Set[str] = set()
+        for v in outs:
+            redundant = False
+            for w in outs:
+                if w == v or w == u:
+                    continue
+                # Cycle guard: if v reaches w, then w is on a cycle with v; a path
+                # u -> w -> ... -> v would ride that cycle, so it does not justify
+                # dropping the direct u -> v. Skip such w.
+                if w in reach(v):
+                    continue
+                if v in reach(w):
+                    redundant = True
+                    break
+            if not redundant:
+                kept.add(v)
+        reduced[u] = kept
+    return reduced
+
+
 def _recolor_tier_dot(
     nodes: Dict[str, dict],
     sidecar: dict,
@@ -916,7 +980,19 @@ def _recolor_tier_dot(
                 continue
             cedges.add((rd, rn))
 
-    for s, t in sorted(cedges):
+    # Transitive reduction of the DEDUPED emitted edge set (display-only): a pair
+    # (s, t) means the drawn arc ``s -> t``. Build the successor map over exactly the
+    # pairs we are about to draw — flat tier-N deps, only=-filtered deps, and the
+    # expanded/lifted repr-trick deps all live in `cedges` together — reduce it, and
+    # emit only the surviving non-redundant arcs. This changes only what is *drawn*;
+    # taint / frontier / coverage still run over the full `depends_on` graph.
+    succ: Dict[str, Set[str]] = {}
+    for s, t in cedges:
+        succ.setdefault(s, set()).add(t)
+    reduced = transitive_reduction(succ)
+    drawn: Set[Tuple[str, str]] = {
+        (s, t) for s, ts in reduced.items() for t in ts}
+    for s, t in sorted(drawn):
         lines.append(f'  "{s}" -> "{t}" [style=dashed];')
 
     lines.append("}")
@@ -971,21 +1047,35 @@ def recolor_dot(
         # here is sufficient to render exactly those nodes + their internal edges.
         sub = {nid: node for nid, node in sub.items() if nid in only}
 
+    ids = set(sub)
+    exp = {pid for pid in (expanded or set()) if pid in ids and has_children(pid, nodes)}
+
     lines: List[str] = ['strict digraph "" {']
     lines.extend(eb._graph_attr_lines())
-    # Curved splines + concentrate are O(slow) in graphviz-wasm and hang the browser on
-    # the larger review graphs (100s–1000s of edges). Drop them, and tighten ranksep/
-    # nodesep so the graph stays compact — a spread-out layout fits the canvas at a tiny
-    # scale, making nodes unreadable. (Keep the default curved look for the tiny views.)
-    n_render = len(sub)
-    if n_render > 120:
-        # very large (e.g. tier-3): fastest straight-line layout, very compact
-        lines.append("  graph [splines=line, concentrate=false, ranksep=0.4, nodesep=0.22];")
-    elif n_render > 15:
-        # medium (e.g. tier-2): polyline routes *around* nodes (readable) and is far
-        # cheaper than curved; compact spacing keeps nodes legible when fit to canvas
-        lines.append("  graph [splines=polyline, concentrate=false, ranksep=0.5, nodesep=0.32];")
-    ids = set(sub)
+    # Massot-style layout override (a later `graph [...]` wins over the shared default
+    # appended by eb._graph_attr_lines): top→bottom, compact ranks, concentrate off,
+    # and splines sized to the rendered-node count so the leanblueprint look (curved)
+    # stays affordable now that transitive reduction has cut the drawn edge set.
+    #
+    #   * curved   for ≤60 rendered nodes  (the Massot look — readable, fit-legible)
+    #   * polyline for 61–120              (routes around nodes; cheaper than curved)
+    #   * line     for >120                (safety net — >120 flat tiers hit the picker,
+    #                                       so a full graph this size never renders)
+    #
+    # Rendered-node count = leaves/collapsed parents drawn as single nodes (sub minus
+    # expanded) + the tier-(N+1) children drawn inside every expanded box.
+    n_render = len(sub) - len(exp)
+    for pid in exp:
+        n_render += len(child_ids(pid, nodes))
+    if n_render <= 60:
+        splines = "curved"
+    elif n_render <= 120:
+        splines = "polyline"
+    else:
+        splines = "line"
+    lines.append(
+        f"  graph [rankdir=TB, ranksep=0.5, nodesep=0.3, concentrate=false, "
+        f"splines={splines}];")
 
     return _recolor_tier_dot(
         nodes, sidecar, sub, ids, name_to_slug, lines, tier, expanded or set())
