@@ -443,6 +443,21 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
   background: #1f1d1a; color: #e8e3d6; padding: 10px; border-radius: 5px;
   overflow-x: auto; font-size: 12px;
 }
+
+/* Lean source panel on a module packet (real source read from lean_root). */
+.rv-lean { margin: 20px 0 4px; }
+.rv-lean-h { font-size: 14px; color: #6c665a; margin: 0 0 7px; font-weight: 600; }
+.rv-lean-h code {
+  color: var(--accent); background: #f0ece2; padding: 1px 6px; border-radius: 3px;
+  font-size: 12px;
+}
+.rv-lean-trunc { font-style: italic; color: #8a8575; margin-left: 8px; font-size: 12px; font-weight: 400; }
+.rv-lean-pre {
+  background: #1f1d1a; color: #e8e3d8; border: 1px solid var(--line);
+  border-radius: 8px; padding: 14px 16px; overflow: auto; max-height: 62vh;
+  font: 12px/1.55 "SF Mono", Menlo, Consolas, monospace; margin: 0;
+}
+.rv-lean-pre code { font: inherit; background: none; padding: 0; }
 .rv-note { color: #8a8575; font-size: 12px; }
 .rv-score-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .rv-score-table th, .rv-score-table td {

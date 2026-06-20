@@ -162,7 +162,8 @@
       + "<p class='rv-tl-guide'>Rendering " + count + " nodes at once hangs the "
       + "browser. Open a cluster → unit to drill in, or pick a node below to view its "
       + "<strong>neighborhood</strong> (the node plus what it depends on / what "
-      + "depends on it, bounded).</p>"
+      + "depends on it, bounded). <em class='rv-tl-shift'>Shift-click an item to open "
+      + "its details instead.</em></p>"
       + "<div class='rv-tl-search'>"
       + "<input type='search' id='rv-tl-input' class='rv-tl-input' "
       + "placeholder='search " + count + " " + escapeHtml(label)
@@ -217,8 +218,11 @@
       });
       list.innerHTML = html;
       list.querySelectorAll(".rv-tl-pick").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          jumpTo(btn.getAttribute("data-id"));
+        btn.addEventListener("click", function (ev) {
+          var id = btn.getAttribute("data-id");
+          // SHIFT-click → that node's detail packet; plain click → its neighborhood.
+          if (ev.shiftKey) { openDetails(id); return; }
+          jumpTo(id);
         });
       });
     }

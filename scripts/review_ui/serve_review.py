@@ -90,6 +90,10 @@ class Project:
             / "dep_graph_document.html"
         )
         self._slug_cache: Optional[Dict[str, str]] = None
+        # Root of the Lean sources a module node maps into (module A.B.C ->
+        # <lean_root>/A/B/C.lean). Set from --lean-root or graph metadata.lean_root;
+        # None disables the Lean-source panel. Read-only, path-traversal-guarded.
+        self.lean_root: Optional[Path] = None
 
     # --- graph + sidecar ---
     def nodes(self):
@@ -155,6 +159,47 @@ class Project:
             if c.is_file():
                 return c.read_text(errors="replace")
         return None
+
+    def lean_source(self, node_id: str, node: dict,
+                    max_lines: int = 600) -> Optional[dict]:
+        """The real Lean source for a *module* node, read from ``lean_root``.
+
+        A module ``A.B.C`` maps to ``<lean_root>/A/B/C.lean`` (Lean's file layout);
+        a node may instead carry an explicit relative ``lean_file``. Returns
+        ``{text, rel, truncated, total}`` (display capped at ``max_lines``) or None
+        when there is no source. Read-only and path-traversal-guarded: the resolved
+        file must live under ``lean_root``, and only ``kind == "module"`` nodes (or
+        nodes with an explicit ``lean_file``) are eligible — so a crafted node id can
+        never read outside the Lean tree.
+        """
+        rel = node.get("lean_file")
+        if not rel:
+            if (node.get("kind") or "").lower() != "module":
+                return None
+            rel = node_id.replace(".", "/") + ".lean"
+        root = self.lean_root
+        if root is None:
+            mr = (self.metadata() or {}).get("lean_root")
+            root = Path(mr) if mr else None
+        if root is None:
+            return None
+        root = root.resolve()
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(root)            # reject any ../ escape
+        except ValueError:
+            return None
+        if not target.is_file():
+            return None
+        text = target.read_text(errors="replace")
+        lines = text.splitlines()
+        truncated = len(lines) > max_lines
+        return {
+            "text": "\n".join(lines[:max_lines]),
+            "rel": rel,
+            "truncated": truncated,
+            "total": len(lines),
+        }
 
     def kernel_evidence(self, node_id: str) -> Optional[str]:
         """The ``#print axioms`` dump for a node, if a ``kernel/<id>.txt`` exists."""
@@ -660,11 +705,27 @@ def render_node(proj: Project, node_id: str) -> bytes:
         f"window.__RV_NODE_TIER__ = {json.dumps(node_tier)};"
         f"window.__RV_TIERS__ = {json.dumps(present)};"
     )
+    # Real Lean source for a module node (tier-3), read live from lean_root.
+    lean = proj.lean_source(node_id, node)
+    lean_html = ""
+    if lean:
+        note = (f"<span class='rv-lean-trunc'>showing first "
+                f"{len(lean['text'].splitlines())} of {lean['total']} lines</span>"
+                if lean["truncated"] else "")
+        lean_html = (
+            "<section class='rv-lean'>"
+            f"<h3 class='rv-lean-h'>Lean source <code>{_E(lean['rel'])}</code>"
+            f"{note}</h3>"
+            f"<pre class='rv-lean-pre'><code>{_E(lean['text'])}</code></pre>"
+            "</section>"
+        )
+
     body = (
         "<div class='rv-packet'>"
         f"<section class='rv-packet-left'>{left}</section>"
         f"<section class='rv-packet-right'>{right}</section>"
         "</div>"
+        + lean_html
         + _verdict_panel_html(node_id, scorecard)
     )
     return _page(f"node · {node_id}", body, boot)
@@ -970,12 +1031,18 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--open", action="store_true",
                     help="open the home screen in a browser")
+    ap.add_argument("--lean-root", type=Path, default=None,
+                    help="root of the Lean sources (module A.B.C -> "
+                         "<lean-root>/A/B/C.lean); enables the Lean-source panel on "
+                         "module packets. Overrides graph metadata.lean_root.")
     args = ap.parse_args(argv)
 
     graph_path = args.graph.resolve()
     if not graph_path.is_file():
         ap.error(f"graph.json not found: {graph_path}")
     proj = Project(graph_path)
+    if args.lean_root is not None:
+        proj.lean_root = args.lean_root.resolve()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(proj))
     url = f"http://127.0.0.1:{args.port}/"
