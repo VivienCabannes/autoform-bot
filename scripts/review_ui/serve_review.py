@@ -17,6 +17,11 @@ Three screens (SHARED_SPEC):
 
 API:
   * ``GET  /api/state``         — computed verdicts + taint + coverage + frontier.
+  * ``GET  /api/dot``           — ``?tier=<1|2>&expand=cX,cY`` -> ``{dot, id_by_slug,
+                                  kinds}`` so the client re-renders (tier toggle /
+                                  in-place cluster expansion) with a transition.
+  * ``GET  /api/agents``        — the current read-only ``agents_status.json`` live
+                                  activity feed, recomputed per call.
   * ``POST /api/verdict/<id>``  — write the human slot, recompute taint, return the
                                   delta (new effective verdicts + tainted set).
   * ``GET  /assets/*``          — review.css / review.js (+ any static asset).
@@ -76,6 +81,9 @@ class Project:
         self.content_dir = self.root / "informal_content"
         self.kernel_dir = self.root / "kernel"
         self.sidecar_path = self.root / "review_status.json"
+        # Live activity feed, read-only, sitting next to graph.json. The orchestrator
+        # may write it while a run is in flight; this server only ever reads it.
+        self.agents_path = self.root / "agents_status.json"
         # Built blueprint dep-graph page (source of div.thm#<slug> fragments).
         self.blueprint_html = (
             self.root / "blueprint_export" / "blueprint" / "web"
@@ -98,6 +106,11 @@ class Project:
     def write_sidecar(self, data: dict) -> None:
         """The one and only write this server performs — atomic, via review_model."""
         rm.save_sidecar(self.sidecar_path, data)
+
+    def agents(self) -> dict:
+        """The current live activity feed, recomputed from disk each call (read-only;
+        never raises — an absent feed degrades to an idle orchestrator)."""
+        return rm.load_agents(self.agents_path)
 
     def slug_map(self) -> Dict[str, str]:
         # Slugs are a deterministic function of the id set; recompute per request so
@@ -233,21 +246,33 @@ def _render_md(md: str) -> str:
     return "\n".join(out) or "<p><em>(empty)</em></p>"
 
 
-def render_home(proj: Project, tier: int = 2) -> bytes:
+def render_home(proj: Project, tier: int = 1) -> bytes:
     nodes = proj.nodes()
     sidecar = proj.sidecar()
     state = rm.compute_state(nodes, sidecar)
+    # Tier-1 home starts fully collapsed (no clusters expanded); the client unrolls
+    # in place by re-fetching /api/dot with an `expand` set.
     dot = rm.recolor_dot(nodes, sidecar, tier=tier)
     slug_map = proj.slug_map()
     # id<->slug both directions so the client can route node clicks to /node/<id>.
     id_by_slug = {slug: nid for nid, slug in slug_map.items()}
+    # kinds drive the client's shape/icon choices on re-render (box vs ellipse).
+    kinds = {nid: (node.get("kind") or "theorem") for nid, node in nodes.items()}
 
     boot = (
         f"window.__RV_DOT__ = {json.dumps(dot)};"
         f"window.__RV_STATE__ = {json.dumps(state)};"
         f"window.__RV_IDBYSLUG__ = {json.dumps(id_by_slug)};"
+        f"window.__RV_KINDS__ = {json.dumps(kinds)};"
         f"window.__RV_PALETTE__ = {json.dumps(rm.PALETTE)};"
         f"window.__RV_TIER__ = {tier};"
+        # The client owns the `expanded` set; it starts empty (home = collapsed).
+        f"window.__RV_EXPANDED__ = [];"
+        # Tells the client an /api/agents feed exists and where to poll it. The
+        # Activity-panel HTML/JS is built client-side (Frontend phase), not here —
+        # we only expose the data hooks + the container div below.
+        f"window.__RV_AGENTS_URL__ = {json.dumps('/api/agents')};"
+        f"window.__RV_DOT_URL__ = {json.dumps('/api/dot')};"
     )
     cov = state["coverage"]
     frontier = state["trust_frontier"]
@@ -275,6 +300,9 @@ def render_home(proj: Project, tier: int = 2) -> bytes:
               else "<a href='/'>Tier 2 · statements</a>")
            + "</div>")
         + _legend_html()
+        # Activity-panel mount point: the Frontend phase fills this from /api/agents.
+        # The server only provides the empty container + the data hooks in `boot`.
+        + "<div id='rv-activity' class='rv-activity' data-agents-url='/api/agents'></div>"
         + "<div id='rv-graph' class='rv-graph'></div>"
     )
     return _page("dependency graph", body, boot)
@@ -492,10 +520,16 @@ def make_handler(proj: Project):
             path = parsed.path
             if path == "/":
                 qs = urllib.parse.parse_qs(parsed.query)
-                tier = 1 if qs.get("tier", ["2"])[0] == "1" else 2
+                # Home defaults to the tier-1 dashboard; ?tier=2 opens the full graph.
+                tier = 2 if qs.get("tier", ["1"])[0] == "2" else 1
                 return self._send(200, render_home(proj, tier))
             if path == "/api/state":
                 return self._json(200, rm.compute_state(proj.nodes(), proj.sidecar()))
+            if path == "/api/dot":
+                return self._api_dot(parsed)
+            if path == "/api/agents":
+                # Read-only live activity feed, recomputed from disk each call.
+                return self._json(200, proj.agents())
             if path.startswith("/assets/"):
                 return self._serve_asset(path[len("/assets/"):])
             if path.startswith("/cluster/"):
@@ -505,6 +539,32 @@ def make_handler(proj: Project):
                 nid = urllib.parse.unquote(path[len("/node/"):])
                 return self._send(200, render_node(proj, nid))
             return self._send(404, b"not found")
+
+        def _api_dot(self, parsed):
+            """GET /api/dot?tier=<1|2>&expand=cX,cY -> {dot, id_by_slug, kinds}.
+
+            Lets the client re-render the graph with a transition (no full reload)
+            after expanding/collapsing a tier-1 cluster. ``expand`` is a comma list of
+            cluster ids to unroll in place (tier-1 only); unknown ids are ignored by
+            the model. The payload mirrors the home bootstrap globals the client needs
+            to repaint and re-wire clicks.
+            """
+            qs = urllib.parse.parse_qs(parsed.query)
+            tier = 2 if qs.get("tier", ["1"])[0] == "2" else 1
+            expand_raw = qs.get("expand", [""])[0]
+            expanded = {c.strip() for c in expand_raw.split(",") if c.strip()}
+            nodes = proj.nodes()
+            sidecar = proj.sidecar()
+            dot = rm.recolor_dot(nodes, sidecar, tier=tier, expanded=expanded)
+            slug_map = proj.slug_map()
+            id_by_slug = {slug: nid for nid, slug in slug_map.items()}
+            kinds = {nid: (node.get("kind") or "theorem")
+                     for nid, node in nodes.items()}
+            return self._json(200, {
+                "dot": dot,
+                "id_by_slug": id_by_slug,
+                "kinds": kinds,
+            })
 
         def _serve_asset(self, name):
             # Only serve files under assets/review/ (no traversal).

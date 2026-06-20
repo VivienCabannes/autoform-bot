@@ -182,6 +182,55 @@ def dial_of(sidecar: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# live agent activity feed (read-only input, written by the orchestrator)
+# ---------------------------------------------------------------------------
+
+def _empty_agents() -> dict:
+    """The default activity feed: an idle orchestrator and no running agents."""
+    return {"orchestrator": {"state": "idle"}, "agents": []}
+
+
+def load_agents(path: Path) -> dict:
+    """Load ``agents_status.json`` (the live activity feed), never raising.
+
+    The feed is a purely read-only input the orchestrator may write while a run is
+    in flight; the review server only ever reads it. Absent file, unreadable file,
+    corrupt JSON, or a non-object/oddly-shaped root all degrade gracefully to
+    ``{"orchestrator": {"state": "idle"}, "agents": []}`` — the dashboard must never
+    error just because no run is active. A well-formed feed is normalized so the
+    caller can rely on an ``orchestrator`` dict (with a ``state``) and an ``agents``
+    list always being present.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return _empty_agents()
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return _empty_agents()
+    if not isinstance(data, dict):
+        return _empty_agents()
+
+    orch = data.get("orchestrator")
+    if not isinstance(orch, dict):
+        orch = {"state": "idle"}
+    else:
+        orch = dict(orch)
+        orch.setdefault("state", "idle")
+
+    agents = data.get("agents")
+    if not isinstance(agents, list):
+        agents = []
+    else:
+        agents = [a for a in agents if isinstance(a, dict)]
+
+    out = dict(data)
+    out["orchestrator"] = orch
+    out["agents"] = agents
+    return out
+
+
+# ---------------------------------------------------------------------------
 # jury scoring -> verdict (Feature 6, threshold-gated, NOT the average)
 # ---------------------------------------------------------------------------
 
@@ -579,10 +628,106 @@ def _verdict_node_dot(
     return f'  "{slug}" [{", ".join(attrs)}];'
 
 
+def _recolor_tier1_dot(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    sub: Dict[str, dict],
+    ids: Set[str],
+    name_to_slug: Dict[str, str],
+    lines: List[str],
+    expanded: Set[str],
+) -> str:
+    """Emit the tier-1 overview DOT with in-place cluster expansion.
+
+    * **Collapsed** cluster (id ∉ ``expanded``) → a single node colored by
+      ``cluster_color`` (clickable). Cross-cluster edges that touch it are lifted
+      onto this node.
+    * **Expanded** cluster (id ∈ ``expanded``) → a ``subgraph cluster_<slug>`` box
+      whose children are tier-2 nodes colored by their own ``color_state`` (taint /
+      AI-only ring honoured), with the intra-cluster ``depends_on`` edges drawn
+      dashed *inside* the box.
+    * **Cross edges** (the repr trick): for every tier-2 dependency ``d -> n``,
+      ``repr(x) = slug(x)`` if ``parent(x) ∈ expanded`` else ``slug(parent(x))``;
+      emit ``repr(d) -> repr(n)`` when the two slugs differ, deduped. Edges fully
+      inside one expanded cluster are emitted by that cluster's subgraph, not here.
+    """
+    parent = {nid: node.get("parent") for nid, node in nodes.items()}
+    # Only expand clusters that are actually tier-1 ids in this view.
+    expanded = {cid for cid in expanded if cid in ids}
+    tainted = tainted_set(nodes, sidecar)
+
+    # --- collapsed clusters: one node each, colored by roll-up ---
+    for cid in sorted(sub):
+        if cid in expanded:
+            continue
+        lines.append(_verdict_node_dot(
+            cid, sub[cid], name_to_slug[cid],
+            "unreviewed", "human", False,
+            state_override=cluster_color(cid, nodes, sidecar),
+        ))
+
+    # --- expanded clusters: a subgraph box per cluster with its tier-2 children ---
+    for cid in sorted(expanded):
+        children = _tier2_children(cid, nodes)
+        label = sub[cid].get("name") or cid
+        lines.append(f'  subgraph cluster_{name_to_slug[cid]} {{')
+        lines.append(f'    label="{eb._dot_escape(label)}";')
+        lines.append('    style="filled,rounded";')
+        lines.append('    color="#C9C2B4";')
+        lines.append('    fillcolor="#FBF9F4";')  # light roll-up tint background
+        lines.append(f'    fontname="{eb.GRAPH_STYLE["font_name"]}";')
+        for nid in children:
+            line = _verdict_node_dot(
+                nid, nodes[nid], name_to_slug[nid],
+                verdict_of(nid, sidecar),
+                review_source(nid, sidecar),
+                nid in tainted,
+            )
+            lines.append("  " + line)  # indent into the subgraph
+        # intra-cluster dashed edges (both endpoints in this cluster)
+        intra: List[Tuple[str, str]] = []
+        cset = set(children)
+        for nid in children:
+            for dep in nodes[nid].get("depends_on", []) or []:
+                if dep in cset and dep != nid:
+                    intra.append((name_to_slug[dep], name_to_slug[nid]))
+        for s, t in sorted(set(intra)):
+            lines.append(f'    "{s}" -> "{t}" [style=dashed];')
+        lines.append("  }")
+
+    # --- cross edges via the repr trick (deduped) ---
+    def _repr(x: str) -> Optional[str]:
+        px = parent.get(x)
+        if px in expanded:
+            return name_to_slug[x]          # child node (its cluster is open)
+        if px in ids:
+            return name_to_slug[px]         # the collapsed cluster node
+        return None                          # parentless / out-of-view: skip
+
+    cedges: List[Tuple[str, str]] = []
+    for nid, node in nodes.items():
+        if eb.node_tier(node) != 2:
+            continue
+        rn = _repr(nid)
+        if rn is None:
+            continue
+        for dep in node.get("depends_on", []) or []:
+            rd = _repr(dep)
+            if rd is None or rd == rn:
+                continue
+            cedges.append((rd, rn))
+    for s, t in sorted(set(cedges)):
+        lines.append(f'  "{s}" -> "{t}" [style=dashed];')
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def recolor_dot(
     nodes: Dict[str, dict],
     sidecar: dict,
     tier: int = 2,
+    expanded: Optional[Set[str]] = None,
 ) -> str:
     """Build a DOT digraph for the given tier, recolored by effective verdict.
 
@@ -591,6 +736,17 @@ def recolor_dot(
     only the node colors/styles change (verdict instead of mathlib_status) plus the
     dashed-ring / hatch encodings. Within-tier ``depends_on`` edges are emitted
     dashed, matching ``export_blueprint.build_tier2_dot``.
+
+    ``expanded`` is meaningful only for ``tier == 1`` and is the set of cluster ids
+    to **unroll in place**. A collapsed cluster (not in ``expanded``) is drawn as a
+    single node colored by ``cluster_color`` (clickable, with the cross-cluster edges
+    lifted onto it). An expanded cluster is drawn as a graphviz
+    ``subgraph cluster_<slug> { label=...; <tier-2 children colored by color_state>;
+    intra-cluster dashed edges }`` so its members show inside a labelled box. Edges
+    are emitted by the *repr* trick: each tier-2 dependency ``d -> n`` maps each
+    endpoint to itself when its parent is expanded, else to the parent cluster node;
+    the mapped edge is emitted (deduped) when its endpoints differ. Collapsed
+    clusters are plain nodes, so no ``lhead/ltail`` is needed.
     """
     name_to_slug = eb.build_slug_map(nodes)
     sub = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == tier}
@@ -600,28 +756,8 @@ def recolor_dot(
     ids = set(sub)
 
     if tier == 1:
-        # Tier-1 overview: each cluster colored by its roll-up (in-Mathlib children
-        # roll up to blue), with edges lifted from cross-cluster tier-2 dependencies.
-        for cid in sorted(sub):
-            lines.append(_verdict_node_dot(
-                cid, sub[cid], name_to_slug[cid],
-                "unreviewed", "human", False,
-                state_override=cluster_color(cid, nodes, sidecar),
-            ))
-        parent = {nid: node.get("parent") for nid, node in nodes.items()}
-        cedges: List[Tuple[str, str]] = []
-        for nid, node in nodes.items():
-            if eb.node_tier(node) != 2:
-                continue
-            pn = parent.get(nid)
-            for dep in node.get("depends_on", []) or []:
-                pd = parent.get(dep)
-                if pn in ids and pd in ids and pn != pd:
-                    cedges.append((name_to_slug[pd], name_to_slug[pn]))
-        for s, t in sorted(set(cedges)):
-            lines.append(f'  "{s}" -> "{t}" [style=dashed];')
-        lines.append("}")
-        return "\n".join(lines)
+        return _recolor_tier1_dot(
+            nodes, sidecar, sub, ids, name_to_slug, lines, expanded or set())
 
     # Tier 2 (default): each node colored by its own trust state; within-tier edges.
     tainted = tainted_set(nodes, sidecar)
