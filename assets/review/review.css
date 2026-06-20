@@ -51,9 +51,17 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 .rv-headerbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 22px;
+  gap: 18px 22px;
   align-items: center;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
+  padding: 12px 16px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+}
+.rv-headerbar-main {
+  display: flex; flex-wrap: wrap; gap: 14px 28px; align-items: center;
 }
 .rv-coverage { display: flex; align-items: center; gap: 8px; }
 .rv-cov-label, .rv-fr-label { font-size: 12px; text-transform: uppercase;
@@ -62,12 +70,48 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
   width: 180px; height: 10px; border-radius: 5px;
   background: #e7e1d4; overflow: hidden;
 }
-.rv-cov-fill { height: 100%; background: var(--clean); transition: width .2s; }
+.rv-cov-fill {
+  height: 100%; transition: width .3s ease;
+  background: linear-gradient(90deg, var(--clean), #3a9a62);
+}
 .rv-cov-num { font-size: 12px; color: #6c665a; }
 .rv-frontier { font-size: 13px; }
 .rv-frontier a { margin-right: 6px; }
 .rv-dial { margin-left: auto; font-size: 13px; color: #6c665a; }
 .rv-dial strong { color: var(--accent); }
+
+/* --- dashboard shell: activity sidebar + graph column (responsive flexbox) --- */
+.rv-dash {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+}
+.rv-graphcol { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 880px) {
+  .rv-dash { flex-direction: column; }
+  .rv-activity { width: 100% !important; position: static !important; }
+}
+
+/* --- tier toggle (segmented control) --- */
+.rv-tiertoggle {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+.rv-tt-label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+  color: #8a8575;
+}
+.rv-tt {
+  font-size: 13px; padding: 5px 12px; border-radius: 14px;
+  border: 1.5px solid var(--line); background: #fff; color: var(--accent);
+  transition: background .15s, border-color .15s, color .15s;
+}
+a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--grey); }
+.rv-tt-on {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+  font-weight: 600; cursor: default;
+}
+.rv-tt-hint { font-size: 12px; color: #8a8575; font-style: italic; margin-left: 4px; }
 
 /* --- legend --- */
 .rv-legend {
@@ -94,11 +138,53 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 /* --- home: graph --- */
 .rv-graph {
   width: 100%; min-height: 70vh; border: 1px solid var(--line);
-  border-radius: 6px; background: #fff; overflow: auto;
+  border-radius: 8px; background: #fff; overflow: auto;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+  position: relative;
 }
 .rv-graph svg { width: 100%; height: auto; }
 .rv-graph .node { cursor: pointer; transition: opacity .15s ease; }
 .rv-graph .node:hover { opacity: .85; }
+
+.rv-graph-loading, .rv-act-loading {
+  padding: 26px 18px; color: #8a8575; font-size: 13px; font-style: italic;
+}
+
+/* collapsed-cluster nodes feel pressable; expanded boxes invite a collapse */
+.rv-graph .node.rv-clusternode ellipse,
+.rv-graph .node.rv-clusternode polygon { stroke-width: 2.4px; }
+.rv-graph .node.rv-clusternode:hover ellipse,
+.rv-graph .node.rv-clusternode:hover polygon {
+  stroke: var(--accent); filter: brightness(.97);
+}
+.rv-graph .cluster.rv-clusterbox { transition: opacity .15s ease; }
+.rv-graph .cluster.rv-clusterbox:hover { opacity: .9; }
+.rv-graph .cluster.rv-clusterbox:hover > polygon,
+.rv-graph .cluster.rv-clusterbox:hover > path {
+  stroke: var(--accent); stroke-width: 1.6px;
+}
+
+/* --- target pulse: agents highlight the node(s) they're working on --- */
+.rv-graph .rv-pulse ellipse,
+.rv-graph .rv-pulse polygon,
+.rv-graph .rv-pulse > polygon,
+.rv-graph .rv-pulse > path {
+  stroke: var(--accent);
+  filter: url(#rv-glow);
+  animation: rv-pulse-ring 1.4s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+@keyframes rv-pulse-ring {
+  0%, 100% { stroke-width: 2px; stroke-opacity: .65; }
+  50% { stroke-width: 4.5px; stroke-opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rv-graph .rv-pulse ellipse, .rv-graph .rv-pulse polygon,
+  .rv-graph .rv-pulse > polygon, .rv-graph .rv-pulse > path {
+    animation: none; stroke-width: 3.5px; stroke-opacity: 1;
+  }
+}
 
 /* SVG verdict-node decorations applied by review.js after graphviz render. */
 .rv-graph .node.rv-aionly ellipse,
@@ -134,6 +220,98 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 .rv-fb-v { color: #8a8575; }
 .rv-fb-src, .rv-fb-taint { font-size: 11px; color: #8a8575; }
 .rv-fb-taint { color: var(--rejected); }
+
+/* offline fallback — tier-1 cluster list (expand reveals children) */
+.rv-fallback-clusters { flex-direction: column; align-items: stretch; gap: 6px; }
+.rv-fb-cluster { display: block; }
+.rv-fb-toggle {
+  font: inherit; text-align: left; cursor: pointer;
+  padding: 6px 12px; border-radius: 8px; border: 1.5px solid var(--grey);
+  background: #fff; color: var(--ink); width: 100%;
+}
+.rv-fb-toggle:hover { background: #f1ede4; }
+.rv-fb-toggle.rv-clean { border-color: var(--clean); }
+.rv-fb-toggle.rv-flagged { border-color: var(--flagged); }
+.rv-fb-toggle.rv-rejected { border-color: var(--rejected); }
+.rv-fb-children { flex-direction: column; align-items: stretch;
+  gap: 5px; margin: 6px 0 4px 18px; }
+
+/* --- activity panel (mission-control sidebar) --- */
+.rv-activity {
+  flex: 0 0 270px; width: 270px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+  position: sticky; top: 14px;
+  align-self: flex-start;
+}
+.rv-act-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px;
+}
+.rv-act-title {
+  margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+  color: #8a8575;
+}
+/* orchestrator status pill (color by state) */
+.rv-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 12px;
+  border: 1.5px solid var(--grey); background: #fff; color: #6c665a;
+  text-transform: capitalize;
+}
+.rv-pill-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+}
+.rv-pill-running {
+  color: var(--clean); border-color: var(--clean); background: #eaf4ee;
+}
+.rv-pill-running .rv-pill-dot { animation: rv-blink 1.3s ease-in-out infinite; }
+.rv-pill-done { color: var(--in-mathlib); border-color: var(--in-mathlib);
+  background: var(--in-mathlib-fill); }
+.rv-pill-idle { color: #8a8575; border-color: var(--grey); }
+@keyframes rv-blink { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+.rv-act-orch { margin-bottom: 10px; }
+.rv-orch-phase { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rv-orch-detail { font-size: 12px; color: #8a8575; margin-top: 2px; }
+.rv-act-offline { margin-top: 6px; color: var(--flagged); }
+
+.rv-act-empty {
+  font-size: 13px; color: #8a8575; font-style: italic;
+  padding: 10px; border: 1px dashed var(--line); border-radius: 6px;
+  text-align: center;
+}
+
+/* agent cards */
+.rv-agents { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 8px; }
+.rv-agent {
+  border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px;
+  background: #fbfaf6; transition: border-color .15s, box-shadow .15s;
+}
+.rv-agent:hover {
+  border-color: var(--grey); box-shadow: 0 1px 3px rgba(31, 29, 26, .06);
+}
+.rv-agent-top { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+.rv-agent-name { font-size: 13px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-agent-body { font-size: 12px; color: #6c665a; }
+.rv-agent-state { font-style: italic; }
+.rv-agent-arrow { color: #b3ac9d; }
+.rv-agent-target { font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; }
+
+/* role badges — distinct colors per role */
+.rv-rolebadge {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; padding: 2px 7px; border-radius: 9px;
+  color: #fff; flex: 0 0 auto;
+}
+.rv-role-worker { background: var(--in-mathlib); }   /* blue */
+.rv-role-reviewer { background: var(--flagged); }    /* amber */
+.rv-role-planner { background: #6b4fb0; }            /* violet */
+.rv-role-agent { background: var(--grey); color: var(--ink); }
 
 /* --- cluster deck --- */
 .rv-cluster-rollup {

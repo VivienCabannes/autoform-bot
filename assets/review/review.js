@@ -1,92 +1,218 @@
-/* Review surface client.
+/* Review surface client — mission-control dashboard.
  *
- * Home screen: render the verdict-recolored DOT with d3-graphviz if available,
- * else fall back to a static node list, then decorate the SVG (45° hatch overlay
- * for tainted nodes; the dashed-ring / solid encodings already arrive baked into
- * the DOT's node styles) and route node clicks to /node/<id>.
+ * Home screen:
+ *   - renders the verdict-recolored DOT with d3-graphviz (CDN, lazy) — tier-1 by
+ *     default, clusters collapsed;
+ *   - CLICK-TO-UNROLL: clicking a collapsed cluster fetches /api/dot with the new
+ *     `expand` set and re-renders WITH A TRANSITION (no full reload); clicking an
+ *     expanded cluster's label collapses it; clicking a tier-2 child routes to
+ *     /node/<id>;
+ *   - decorates the SVG (45° hatch overlay for tainted nodes; dashed-ring / solid
+ *     encodings arrive baked into the DOT);
+ *   - ACTIVITY PANEL: polls /api/agents every ~2.5s, renders the orchestrator pill
+ *     + a card per active agent, and pulses the target node(s) in the graph
+ *     (pulsing the collapsed cluster when the target is hidden inside it);
+ *   - keeps an offline fallback (cluster list; expanding reveals children).
  *
  * Node screen: POST the human verdict to /api/verdict/<id> and reflect the delta.
  *
  * No build step, no framework — plain DOM. d3/d3-graphviz are loaded lazily from a
- * CDN only on the home screen; if offline, the static fallback keeps the page
- * usable (it still lists every node, colored by verdict, linking to its packet).
+ * CDN only on the home screen; offline, the static fallback keeps the page usable.
  */
 (function () {
   "use strict";
 
   var PALETTE = window.__RV_PALETTE__ || {
     in_mathlib: "#2563B0", clean: "#2F7D4F", flagged: "#C08A1E",
-    rejected: "#C0392B", grey: "#C9C2B4"
+    rejected: "#C0392B", grey: "#C9C2B4", accent: "#1A4B8C", ink: "#1F1D1A"
   };
 
-  // Tier-1 home shows clusters (click -> /cluster/<id>); tier-2 shows nodes (-> /node/<id>).
+  var POLL_MS = 2500;          // /api/agents poll cadence (~2.5s, per spec)
+  var TRANSITION_MS = 450;     // d3-graphviz expand/collapse transition
+
+  // ---- shared home state (the client owns `expanded`) ----
   var TIER = window.__RV_TIER__ || 2;
-  function nodeHref(id) {
-    return (TIER === 1 ? "/cluster/" : "/node/") + encodeURIComponent(id);
+  var DOT_URL = window.__RV_DOT_URL__ || "/api/dot";
+  var AGENTS_URL = window.__RV_AGENTS_URL__ || "/api/agents";
+
+  var home = {
+    dot: window.__RV_DOT__ || null,
+    state: window.__RV_STATE__ || {},
+    idBySlug: window.__RV_IDBYSLUG__ || {},
+    kinds: window.__RV_KINDS__ || {},
+    expanded: new Set(window.__RV_EXPANDED__ || []),
+    mount: null,
+    graphvizReady: false,
+    rendering: false,
+    targets: [],          // current agent target node ids (from /api/agents)
+    online: true          // graphviz available (vs offline fallback)
+  };
+
+  // The set of tier-1 cluster ids (from /api/state.clusters): lets us tell a
+  // collapsed-cluster node apart from a tier-2 statement node in the SVG.
+  function clusterIds() {
+    var c = (home.state && home.state.clusters) || {};
+    return c;
+  }
+  function isCluster(id) { return Object.prototype.hasOwnProperty.call(clusterIds(), id); }
+
+  // parent(child id) -> cluster id, from state.clusters[*].children.
+  var _parentOf = null;
+  function parentOf(id) {
+    if (!_parentOf) {
+      _parentOf = {};
+      var cl = clusterIds();
+      Object.keys(cl).forEach(function (cid) {
+        (cl[cid].children || []).forEach(function (ch) { _parentOf[ch] = cid; });
+      });
+    }
+    return _parentOf[id];
   }
 
-  // ---- home screen ----
+  // ---- home screen bootstrap ----
   function initHome() {
-    var dot = window.__RV_DOT__;
-    var state = window.__RV_STATE__ || {};
-    var idBySlug = window.__RV_IDBYSLUG__ || {};
     var mount = document.getElementById("rv-graph");
-    if (!mount || !dot) return;
+    if (!mount || !home.dot) return;
+    home.mount = mount;
+
+    // Start the activity panel immediately (independent of graphviz availability).
+    initActivity();
 
     loadGraphviz(function (ok) {
       if (ok && window.d3 && window.d3.select(mount).graphviz) {
-        renderWithGraphviz(mount, dot, idBySlug, state);
+        home.online = true;
+        renderGraph(home.dot, false);
       } else {
-        renderFallback(mount, idBySlug, state);
+        home.online = false;
+        renderFallback(mount);
       }
     });
   }
 
-  function renderWithGraphviz(mount, dot, idBySlug, state) {
+  // Render `dot` into the mount via d3-graphviz. `transition` => animate from the
+  // current layout to the new one (used on expand/collapse). On first paint we skip
+  // the transition (nothing to morph from) but still fit.
+  function renderGraph(dot, transition) {
+    var mount = home.mount;
+    if (!mount) return;
+    home.rendering = true;
+    var loading = mount.querySelector(".rv-graph-loading");
+    if (loading) loading.remove();
     try {
-      window.d3.select(mount).graphviz({ useWorker: false })
-        .fit(true)
-        .renderDot(dot)
-        .on("end", function () { decorate(mount, idBySlug, state); });
+      var gv = window.d3.select(mount).graphviz({ useWorker: false }).fit(true);
+      if (transition) {
+        gv = gv.transition(function () {
+          return window.d3.transition("rv").duration(TRANSITION_MS);
+        });
+      }
+      gv.renderDot(dot).on("end", function () {
+        home.rendering = false;
+        decorate(mount);
+        applyPulse();           // re-apply pulse after every (re)render
+      });
     } catch (e) {
-      renderFallback(mount, idBySlug, state);
+      home.rendering = false;
+      home.online = false;
+      renderFallback(mount);
     }
   }
 
-  // Post-render SVG decoration: route clicks + overlay a true 45° hatch on
-  // tainted nodes (the DOT already carries the dashed ring + verdict colors via
-  // node style/class, so we only add what graphviz cannot: the hatch pattern).
-  function decorate(mount, idBySlug, state) {
+  // Fetch a fresh DOT for the current `expanded` set and re-render with a transition.
+  function refetchAndRender() {
+    if (!home.online) { renderFallback(home.mount); return; }
+    var expand = Array.from(home.expanded).join(",");
+    var url = DOT_URL + "?tier=1&expand=" + encodeURIComponent(expand);
+    fetch(url).then(function (r) { return r.json(); }).then(function (res) {
+      home.dot = res.dot;
+      if (res.id_by_slug) home.idBySlug = res.id_by_slug;
+      if (res.kinds) home.kinds = res.kinds;
+      renderGraph(res.dot, true);
+    }).catch(function () {
+      // Network hiccup: leave the current graph; the panel still polls.
+    });
+  }
+
+  function expandCluster(id) {
+    if (home.rendering || home.expanded.has(id)) return;
+    home.expanded.add(id);
+    refetchAndRender();
+  }
+  function collapseCluster(id) {
+    if (home.rendering || !home.expanded.has(id)) return;
+    home.expanded.delete(id);
+    refetchAndRender();
+  }
+
+  // ---- SVG decoration: wire clicks (unroll / collapse / route) + hatch taint ----
+  function decorate(mount) {
     var svg = mount.querySelector("svg");
     if (!svg) return;
     ensureHatchPattern(svg);
-    var tainted = {};
-    (state.tainted || []).forEach(function (id) { tainted[id] = true; });
-    var colors = state.colors || {};
+    ensurePulseFilter(svg);
 
-    var nodes = svg.querySelectorAll("g.node");
-    nodes.forEach(function (g) {
+    var tainted = {};
+    (home.state.tainted || []).forEach(function (id) { tainted[id] = true; });
+    var colors = home.state.colors || {};
+
+    // 1) Plain nodes: tier-1 collapsed clusters (id is a cluster) OR tier-2 children
+    //    (inside an expanded subgraph, or the whole graph in tier-2 mode).
+    svg.querySelectorAll("g.node").forEach(function (g) {
       var titleEl = g.querySelector("title");
       var slug = titleEl ? titleEl.textContent.trim() : "";
-      var id = idBySlug[slug];
+      var id = home.idBySlug[slug] || slug;
       if (!id) return;
+      g.setAttribute("data-rv-id", id);
       g.style.cursor = "pointer";
-      g.addEventListener("click", function () {
-        window.location.href = nodeHref(id);
-      });
-      // A blue (in-Mathlib) node is trusted by construction — never hatch it.
-      if (tainted[id] && colors[id] !== "in_mathlib") {
-        var shape = g.querySelector("ellipse, polygon, path");
-        if (shape) {
-          // Layer the hatch over the existing verdict fill.
-          var clone = shape.cloneNode(true);
-          clone.setAttribute("fill", "url(#rv-hatch)");
-          clone.setAttribute("fill-opacity", "0.45");
-          clone.setAttribute("stroke", "none");
-          shape.parentNode.appendChild(clone);
+
+      if (TIER === 1 && isCluster(id)) {
+        // Collapsed cluster node -> unroll in place.
+        g.classList.add("rv-clusternode");
+        g.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          expandCluster(id);
+        });
+      } else {
+        // Tier-2 statement -> route to its packet.
+        g.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          window.location.href = "/node/" + encodeURIComponent(id);
+        });
+        if (tainted[id] && colors[id] !== "in_mathlib") {
+          overlayHatch(g);
         }
       }
     });
+
+    // 2) Expanded cluster boxes: clicking the label/box collapses the cluster.
+    svg.querySelectorAll("g.cluster").forEach(function (g) {
+      var titleEl = g.querySelector("title");
+      var t = titleEl ? titleEl.textContent.trim() : "";
+      // graphviz titles a subgraph "cluster_<slug>"; map the slug back to the id.
+      var slug = t.indexOf("cluster_") === 0 ? t.slice("cluster_".length) : t;
+      var id = home.idBySlug[slug] || slug;
+      if (!id || !isCluster(id)) return;
+      g.setAttribute("data-rv-cluster", id);
+      g.classList.add("rv-clusterbox");
+      // Make the label feel clickable; clicking anywhere on the box collapses.
+      var label = g.querySelector("text");
+      if (label) label.style.cursor = "pointer";
+      g.style.cursor = "pointer";
+      g.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        collapseCluster(id);
+      });
+    });
+  }
+
+  function overlayHatch(g) {
+    var shape = g.querySelector("ellipse, polygon, path");
+    if (!shape) return;
+    var clone = shape.cloneNode(true);
+    clone.setAttribute("fill", "url(#rv-hatch)");
+    clone.setAttribute("fill-opacity", "0.45");
+    clone.setAttribute("stroke", "none");
+    clone.classList.add("rv-hatch-overlay");
+    shape.parentNode.appendChild(clone);
   }
 
   function ensureHatchPattern(svg) {
@@ -109,11 +235,117 @@
     defs.appendChild(pat);
   }
 
-  // Static, dependency-free fallback: list every node colored by its **trust
-  // state** (blue = in Mathlib, else the effective verdict), each linking to its
-  // packet. Tainted nodes get a hatch chip — except blue nodes, which are trusted
-  // by construction and never hatched or shown as AI-only.
-  function renderFallback(mount, idBySlug, state) {
+  // A soft accent glow used by the pulsing target ring.
+  function ensurePulseFilter(svg) {
+    if (svg.querySelector("#rv-glow")) return;
+    var ns = "http://www.w3.org/2000/svg";
+    var defs = svg.querySelector("defs") || svg.insertBefore(
+      document.createElementNS(ns, "defs"), svg.firstChild);
+    var f = document.createElementNS(ns, "filter");
+    f.setAttribute("id", "rv-glow");
+    f.setAttribute("x", "-40%"); f.setAttribute("y", "-40%");
+    f.setAttribute("width", "180%"); f.setAttribute("height", "180%");
+    var blur = document.createElementNS(ns, "feGaussianBlur");
+    blur.setAttribute("stdDeviation", "3");
+    blur.setAttribute("result", "b");
+    var merge = document.createElementNS(ns, "feMerge");
+    ["b", "SourceGraphic"].forEach(function (n) {
+      var m = document.createElementNS(ns, "feMergeNode");
+      m.setAttribute("in", n);
+      merge.appendChild(m);
+    });
+    f.appendChild(blur); f.appendChild(merge);
+    defs.appendChild(f);
+  }
+
+  // ---- target pulse: highlight the node(s) agents are working on ----
+  // For each target id, pulse its node if visible; if it sits inside a collapsed
+  // cluster, pulse that cluster node instead. Re-applied after each (re)render and
+  // whenever the poll changes the target set.
+  function applyPulse() {
+    var mount = home.mount;
+    if (!mount) return;
+    var svg = mount.querySelector("svg");
+    if (!svg) return;
+
+    // Clear any prior pulse marks.
+    svg.querySelectorAll(".rv-pulse").forEach(function (g) {
+      g.classList.remove("rv-pulse");
+    });
+
+    var visible = {};   // data-rv-id -> g.node element
+    svg.querySelectorAll("g.node[data-rv-id]").forEach(function (g) {
+      visible[g.getAttribute("data-rv-id")] = g;
+    });
+    var expandedBoxes = {}; // cluster id -> g.cluster element
+    svg.querySelectorAll("g.cluster[data-rv-cluster]").forEach(function (g) {
+      expandedBoxes[g.getAttribute("data-rv-cluster")] = g;
+    });
+
+    home.targets.forEach(function (tid) {
+      if (visible[tid]) {                 // target node itself is on screen
+        visible[tid].classList.add("rv-pulse");
+        return;
+      }
+      var p = parentOf(tid);
+      if (p && visible[p]) {              // hidden inside a COLLAPSED cluster node
+        visible[p].classList.add("rv-pulse");
+      } else if (p && expandedBoxes[p]) {
+        // Expanded but child not yet matched (rare timing) — pulse the box.
+        expandedBoxes[p].classList.add("rv-pulse");
+      }
+    });
+  }
+
+  // ---- offline fallback: cluster list; expanding reveals children ----
+  function renderFallback(mount) {
+    if (!mount) return;
+    var state = home.state || {};
+    if (TIER === 1) return renderFallbackTier1(mount, state);
+    return renderFallbackTier2(mount, state);
+  }
+
+  function renderFallbackTier1(mount, state) {
+    var clusters = state.clusters || {};
+    var cids = Object.keys(clusters).sort();
+    var html = "<p class='rv-note'>Interactive graph unavailable (offline) — "
+      + "static cluster list; expand a cluster to reveal its statements.</p>"
+      + "<ul class='rv-fallback rv-fallback-clusters'>";
+    cids.forEach(function (cid) {
+      var roll = clusters[cid] || {};
+      var v = roll.verdict || "unreviewed";
+      var open = home.expanded.has(cid);
+      html += "<li class='rv-fb-cluster'>"
+        + "<button type='button' class='rv-fb-toggle rv-" + v + "' "
+        + "data-cid='" + escapeHtml(cid) + "'>"
+        + (open ? "▾ " : "▸ ") + escapeHtml(cid)
+        + " <span class='rv-fb-v'>" + escapeHtml(v) + "</span></button>";
+      if (open) {
+        html += "<ul class='rv-fallback rv-fb-children'>";
+        (roll.children || []).forEach(function (ch) {
+          var cv = (roll.child_verdicts || {})[ch] || "unreviewed";
+          var cs = (state.colors || {})[ch] || cv;
+          html += "<li class='rv-fb rv-" + cs + "'>"
+            + "<a href='/node/" + encodeURIComponent(ch) + "'>" + escapeHtml(ch)
+            + "</a> <span class='rv-fb-v'>" + escapeHtml(cv) + "</span></li>";
+        });
+        html += "</ul>";
+      }
+      html += "</li>";
+    });
+    html += "</ul>";
+    mount.innerHTML = html;
+    mount.querySelectorAll(".rv-fb-toggle").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var cid = btn.getAttribute("data-cid");
+        if (home.expanded.has(cid)) home.expanded.delete(cid);
+        else home.expanded.add(cid);
+        renderFallbackTier1(mount, state);
+      });
+    });
+  }
+
+  function renderFallbackTier2(mount, state) {
     var verdicts = state.verdicts || {};
     var colors = state.colors || {};
     var sources = state.sources || {};
@@ -133,7 +365,7 @@
       html += "<li class='rv-fb rv-" + cs + (isTainted ? " rv-tainted" : "")
         + (blue ? " rv-solid"
                 : (sources[id] === "human" ? " rv-human" : " rv-aionly")) + "'>"
-        + "<a href='" + nodeHref(id) + "'>" + escapeHtml(id)
+        + "<a href='/node/" + encodeURIComponent(id) + "'>" + escapeHtml(id)
         + "</a> <span class='rv-fb-v'>" + label + "</span>"
         + (!blue && sources[id] ? " <span class='rv-fb-src'>" + src + "</span>" : "")
         + (isTainted ? " <span class='rv-fb-taint'>tainted</span>" : "")
@@ -162,6 +394,101 @@
       document.head.appendChild(s);
     }
     next();
+  }
+
+  // ---- activity panel: poll /api/agents, render orchestrator + agent cards ----
+  var ROLE_LABEL = { worker: "worker", reviewer: "reviewer", planner: "planner" };
+
+  function initActivity() {
+    var panel = document.getElementById("rv-activity");
+    if (!panel) return;
+    pollAgents(panel);
+    setInterval(function () { pollAgents(panel); }, POLL_MS);
+  }
+
+  function pollAgents(panel) {
+    fetch(AGENTS_URL, { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (feed) {
+        renderActivity(panel, feed || {});
+        var agents = (feed && feed.agents) || [];
+        var next = agents.map(function (a) { return a && a.target; })
+          .filter(Boolean);
+        // Only re-apply pulse if the target set actually changed.
+        if (next.join("|") !== home.targets.join("|")) {
+          home.targets = next;
+          applyPulse();
+        }
+      })
+      .catch(function () {
+        // Keep the last good panel; show a soft offline note once.
+        if (!panel.querySelector(".rv-act-offline")) {
+          var hdr = panel.querySelector(".rv-act-orch");
+          if (hdr) {
+            var n = document.createElement("div");
+            n.className = "rv-act-offline rv-note";
+            n.textContent = "feed unreachable — retrying…";
+            hdr.appendChild(n);
+          }
+        }
+      });
+  }
+
+  function renderActivity(panel, feed) {
+    var orch = feed.orchestrator || { state: "idle" };
+    var agents = (feed.agents || []).filter(function (a) {
+      return a && (a.role || a.name || a.target);
+    });
+    var ostate = String(orch.state || "idle");
+
+    var html = "<div class='rv-act-head'>"
+      + "<h3 class='rv-act-title'>activity</h3>"
+      + "<span class='rv-pill rv-pill-" + escapeHtml(ostate) + "'>"
+      + "<span class='rv-pill-dot'></span>" + escapeHtml(ostate) + "</span>"
+      + "</div>";
+
+    html += "<div class='rv-act-orch'>";
+    if (orch.phase) {
+      html += "<div class='rv-orch-phase'>" + escapeHtml(orch.phase) + "</div>";
+    }
+    if (orch.detail) {
+      html += "<div class='rv-orch-detail'>" + escapeHtml(orch.detail) + "</div>";
+    }
+    if (!orch.phase && !orch.detail) {
+      html += "<div class='rv-orch-detail'>orchestrator " + escapeHtml(ostate)
+        + "</div>";
+    }
+    html += "</div>";
+
+    if (!agents.length) {
+      html += "<div class='rv-act-empty'>idle — no agents running</div>";
+    } else {
+      html += "<ul class='rv-agents'>";
+      agents.forEach(function (a) {
+        var role = String(a.role || "agent").toLowerCase();
+        var roleClass = ROLE_LABEL[role] ? role : "agent";
+        var target = a.target || "";
+        html += "<li class='rv-agent'>"
+          + "<div class='rv-agent-top'>"
+          + "<span class='rv-rolebadge rv-role-" + escapeHtml(roleClass) + "'>"
+          + escapeHtml(role) + "</span>"
+          + "<span class='rv-agent-name'>" + escapeHtml(a.name || "agent")
+          + "</span>"
+          + "</div>"
+          + "<div class='rv-agent-body'>"
+          + "<span class='rv-agent-state'>" + escapeHtml(a.state || "active")
+          + "</span>";
+        if (target) {
+          html += " <span class='rv-agent-arrow'>→</span> "
+            + "<a class='rv-agent-target' href='/node/"
+            + encodeURIComponent(target) + "'>" + escapeHtml(target) + "</a>";
+        }
+        html += "</div></li>";
+      });
+      html += "</ul>";
+    }
+
+    panel.innerHTML = html;
   }
 
   // ---- node screen: verdict panel POST ----

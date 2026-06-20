@@ -276,8 +276,10 @@ def render_home(proj: Project, tier: int = 1) -> bytes:
     )
     cov = state["coverage"]
     frontier = state["trust_frontier"]
-    body = (
+    # --- compact mission-control header: project title · coverage · frontier · dial ---
+    headerbar = (
         "<section class='rv-headerbar'>"
+        "<div class='rv-headerbar-main'>"
         "<div class='rv-coverage'>"
         f"<span class='rv-cov-label'>coverage</span>"
         f"<div class='rv-cov-bar'><div class='rv-cov-fill' "
@@ -290,20 +292,40 @@ def render_home(proj: Project, tier: int = 1) -> bytes:
                      for f in frontier) if frontier
            else "<em>none yet — no sink rests on a fully-clean closure</em>")
         + "</div>"
+        "</div>"
         f"<div class='rv-dial'>dial: <strong>{_E(state['dial'])}</strong></div>"
         "</section>"
-        + ("<div class='rv-tiertoggle'>view: "
-           + ("<strong>Tier 1 · clusters</strong>" if tier == 1
-              else "<a href='/?tier=1'>Tier 1 · clusters</a>")
-           + " &nbsp;⇄&nbsp; "
-           + ("<strong>Tier 2 · statements</strong>" if tier == 2
-              else "<a href='/'>Tier 2 · statements</a>")
-           + "</div>")
+    )
+    tiertoggle = (
+        "<div class='rv-tiertoggle'><span class='rv-tt-label'>view</span>"
+        + ("<span class='rv-tt rv-tt-on'>Tier 1 · clusters</span>" if tier == 1
+           else "<a class='rv-tt' href='/?tier=1'>Tier 1 · clusters</a>")
+        + ("<span class='rv-tt rv-tt-on'>Tier 2 · statements</span>" if tier == 2
+           else "<a class='rv-tt' href='/'>Tier 2 · statements</a>")
+        + ("<span class='rv-tt-hint'>click a cluster to unroll it</span>"
+           if tier == 1 else "")
+        + "</div>"
+    )
+    # Dashboard layout: header strip on top, then a two-column flex shell — the
+    # Activity panel (sidebar) beside the tier-1 DAG centerpiece, with the legend
+    # + tier toggle living in the graph column. The Activity panel HTML is built
+    # client-side from /api/agents (review.js); the server provides the empty
+    # mount + data hooks (in `boot`).
+    body = (
+        headerbar
+        + "<div class='rv-dash'>"
+        + "<aside id='rv-activity' class='rv-activity' "
+          "data-agents-url='/api/agents'>"
+          "<div class='rv-act-loading'>connecting to activity feed…</div>"
+          "</aside>"
+        + "<div class='rv-graphcol'>"
+        + tiertoggle
         + _legend_html()
-        # Activity-panel mount point: the Frontend phase fills this from /api/agents.
-        # The server only provides the empty container + the data hooks in `boot`.
-        + "<div id='rv-activity' class='rv-activity' data-agents-url='/api/agents'></div>"
-        + "<div id='rv-graph' class='rv-graph'></div>"
+        + "<div id='rv-graph' class='rv-graph'>"
+          "<div class='rv-graph-loading'>rendering dependency graph…</div>"
+          "</div>"
+        + "</div>"
+        + "</div>"
     )
     return _page("dependency graph", body, boot)
 
