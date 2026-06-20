@@ -16,10 +16,15 @@
  *     banner is shown;
  *   - decorates the SVG (45° hatch overlay for tainted nodes; dashed-ring / solid
  *     encodings arrive baked into the DOT);
- *   - ACTIVITY PANEL: polls /api/agents every ~2.5s, renders the orchestrator pill
- *     + a card per active agent, and pulses the target node(s) in the graph
- *     (pulsing the collapsed parent when the target is hidden inside it) — at any
- *     tier, via the tier-agnostic topology;
+ *   - ACTIVITY PANEL (action surface): polls /api/dispatch every ~2.5s (the superset
+ *     {palette, queue, live}; live == the old /api/agents payload). Renders a top
+ *     "Agents · ready" palette of DRAGGABLE agent cards, the existing live feed
+ *     (orchestrator pill + a card per active agent), and a "Tasks" list = queued +
+ *     running, each "agent → node" with a status chip + a × cancel on queued ones.
+ *     Dragging a palette card onto a g.node POSTs /api/request to enqueue a real
+ *     dispatch; the target node gets a pending marker. Pulses the live target
+ *     node(s) (pulsing the collapsed parent when the target is hidden inside it) —
+ *     at any tier, via the tier-agnostic topology;
  *   - keeps an offline fallback (node/parent list; expanding reveals children).
  *
  * Local views for large graphs (PART 5-7):
@@ -46,7 +51,7 @@
     rejected: "#C0392B", grey: "#C9C2B4", accent: "#1A4B8C", ink: "#1F1D1A"
   };
 
-  var POLL_MS = 2500;          // /api/agents poll cadence (~2.5s, per spec)
+  var POLL_MS = 2500;          // dispatch poll cadence (~2.5s, per spec)
 
   // Human-facing tier labels (mirrors the server's TIER_LABELS) for the bar/banner.
   var TIER_LABELS = { 1: "clusters", 2: "statements", 3: "declarations" };
@@ -57,6 +62,10 @@
   var TIERS = window.__RV_TIERS__ || [TIER];
   var DOT_URL = window.__RV_DOT_URL__ || "/api/dot";
   var AGENTS_URL = window.__RV_AGENTS_URL__ || "/api/agents";
+  // The activity panel polls /api/dispatch — the superset {palette, queue, live}
+  // (live is exactly the old /api/agents payload). /api/agents stays available;
+  // we just poll the richer endpoint so the palette + task queue stay live too.
+  var DISPATCH_URL = window.__RV_DISPATCH_URL__ || "/api/dispatch";
   var FOCUS = window.__RV_FOCUS__ || null;   // {parent,label,members:[ids]} or null
 
   // ---- local-view globals (PART 5-7) ----
@@ -80,8 +89,20 @@
     bar: null,            // the expanded-nodes bar element (HTML, above the graph)
     graphvizReady: false,
     rendering: false,
-    targets: [],          // current agent target node ids (from /api/agents)
+    targets: [],          // live-agent target node ids (from /api/dispatch.live)
+    pending: [],          // node ids with a queued/running dispatch task (marker)
     online: true          // graphviz available (vs offline fallback)
+  };
+
+  // ---- dispatch state: palette (drag source) + queue (queued/running tasks) ----
+  // Populated by the /api/dispatch poll; the activity panel renders from it and the
+  // graph gets a pending marker on every node carrying a queued/running task. The
+  // server only WRITES the queue (an orchestrator consumes it) — we never fake a
+  // "running" status; it comes from the real queue + the live feed.
+  var dispatch = {
+    palette: window.__RV_DISPATCH_PALETTE__ || [],   // [{id,label,icon,blurb,applies}]
+    queue: [],                                       // [{id,agent,node,node_label,status,…}]
+    live: { orchestrator: { state: "idle" }, agents: [] }
   };
 
   // ---- tier-agnostic topology (replaces the tier-1-only state.clusters logic) ----
@@ -274,6 +295,7 @@
       decorate(mount);
       applyFocusRing();
       applyPulse();
+      applyPending();
     }
     try {
       var gv = window.d3.select(stage).graphviz({ useWorker: false }).fit(true);
@@ -488,6 +510,13 @@
       g.setAttribute("data-rv-id", id);
       g.style.cursor = "pointer";
 
+      // Drop target: every g.node accepts a dragged palette agent. dragover allows
+      // the drop (+ a hover ring); dragleave clears it; drop reads the agent id and
+      // THIS node's data-rv-id → POST /api/request. A drop with no agent id is
+      // ignored (e.g. text dragged from elsewhere). This is purely additive — it
+      // doesn't touch the click-to-unroll / shift-click handlers wired below.
+      wireDropTarget(g, id);
+
       if (hasChildren(id) && !home.expanded.has(id)) {
         // Collapsed parent → click unrolls it; SHIFT-click opens its detail packet.
         g.classList.add("rv-clusternode");
@@ -530,6 +559,34 @@
         if (ev.shiftKey) { openDetails(id); return; }
         collapseNode(id);
       });
+    });
+  }
+
+  // Make a single g.node a drop target for the agent palette. `nodeId` is the node's
+  // resolved data-rv-id (the SAME id the panel/queue uses). dragover preventDefault +
+  // a hover ring; dragleave clears it; drop maps (dragged agent id + nodeId) → POST
+  // /api/request. We guard against re-wiring (decorate runs after every render).
+  function wireDropTarget(g, nodeId) {
+    if (g.__rvDrop) return;          // idempotent across re-decorates
+    g.__rvDrop = true;
+    g.addEventListener("dragover", function (ev) {
+      ev.preventDefault();           // mark this node as a valid drop target
+      try { ev.dataTransfer.dropEffect = "copy"; } catch (e) {}
+      g.classList.add("rv-drop-hover");
+    });
+    g.addEventListener("dragleave", function () {
+      g.classList.remove("rv-drop-hover");
+    });
+    g.addEventListener("drop", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      g.classList.remove("rv-drop-hover");
+      var agent = dropAgentId(ev);
+      if (!agent) return;            // no agent id on the drop → ignore it
+      // Resolve the node id off the element at drop time (data-rv-id is set by
+      // decorate); fall back to the id captured at wire time.
+      var node = g.getAttribute("data-rv-id") || nodeId;
+      dispatchRequest(agent, node);
     });
   }
 
@@ -774,29 +831,31 @@
     next();
   }
 
-  // ---- activity panel: poll /api/agents, render orchestrator + agent cards ----
+  // ---- activity panel: poll /api/dispatch, render palette + live feed + tasks ----
+  // The panel is an ACTION surface: a top palette of draggable agents, the existing
+  // live orchestrator/agent feed, and a Tasks list (queued from the dispatch queue +
+  // running from the live feed). Drag a palette card onto a node to POST /api/request.
   var ROLE_LABEL = { worker: "worker", reviewer: "reviewer", planner: "planner" };
+
+  // Known palette icons (fallback if the server entry omits one). The real icons
+  // come from /api/dispatch.palette[*].icon; this is only a defensive default.
+  var ROLE_ICON = { reviewer: "⚖", worker: "⛏", planner: "◷" };
 
   function initActivity() {
     var panel = document.getElementById("rv-activity");
     if (!panel) return;
-    pollAgents(panel);
-    setInterval(function () { pollAgents(panel); }, POLL_MS);
+    pollDispatch(panel);
+    setInterval(function () { pollDispatch(panel); }, POLL_MS);
   }
 
-  function pollAgents(panel) {
-    fetch(AGENTS_URL, { cache: "no-store" })
+  // Poll the dispatch superset {palette, queue, live}. Refreshes the panel + the
+  // graph markers (live pulse + queued/running pending marker). On a network hiccup
+  // we keep the last good panel and surface a soft offline note (once).
+  function pollDispatch(panel) {
+    fetch(DISPATCH_URL, { cache: "no-store" })
       .then(function (r) { return r.json(); })
-      .then(function (feed) {
-        renderActivity(panel, feed || {});
-        var agents = (feed && feed.agents) || [];
-        var next = agents.map(function (a) { return a && a.target; })
-          .filter(Boolean);
-        // Only re-apply pulse if the target set actually changed.
-        if (next.join("|") !== home.targets.join("|")) {
-          home.targets = next;
-          applyPulse();
-        }
+      .then(function (data) {
+        applyDispatch(panel, data || {});
       })
       .catch(function () {
         // Keep the last good panel; show a soft offline note once.
@@ -812,19 +871,84 @@
       });
   }
 
-  function renderActivity(panel, feed) {
-    var orch = feed.orchestrator || { state: "idle" };
-    var agents = (feed.agents || []).filter(function (a) {
+  // Take a fresh /api/dispatch payload: cache it, re-render the panel, and refresh
+  // the two graph overlays. Used by the poll AND right after an enqueue/cancel so the
+  // panel + markers update immediately without waiting for the next poll tick.
+  function applyDispatch(panel, data) {
+    if (Array.isArray(data.palette)) dispatch.palette = data.palette;
+    dispatch.queue = Array.isArray(data.queue) ? data.queue : [];
+    dispatch.live = data.live || { orchestrator: { state: "idle" }, agents: [] };
+    renderActivity(panel);
+
+    // Live pulse: the node(s) agents are actively working on (the live feed's
+    // targets) — unchanged behavior, just sourced from dispatch.live now.
+    var agents = (dispatch.live && dispatch.live.agents) || [];
+    var nextTargets = agents.map(function (a) { return a && a.target; }).filter(Boolean);
+    if (nextTargets.join("|") !== home.targets.join("|")) {
+      home.targets = nextTargets;
+      applyPulse();
+    }
+
+    // Pending marker: every node carrying a queued/running task (from the queue).
+    var nextPending = dispatch.queue
+      .filter(function (t) {
+        var s = String(t && t.status || "");
+        return s === "queued" || s === "running";
+      })
+      .map(function (t) { return t && t.node; })
+      .filter(Boolean);
+    if (nextPending.slice().sort().join("|") !== home.pending.slice().sort().join("|")) {
+      home.pending = nextPending;
+      applyPending();
+    }
+  }
+
+  // Convenience: refetch the dispatch state and re-render (after enqueue/cancel).
+  function refreshDispatch() {
+    var panel = document.getElementById("rv-activity");
+    if (!panel) return;
+    pollDispatch(panel);
+  }
+
+  function renderActivity(panel) {
+    var palette = dispatch.palette || [];
+    var queue = dispatch.queue || [];
+    var live = dispatch.live || {};
+    var orch = live.orchestrator || { state: "idle" };
+    var agents = (live.agents || []).filter(function (a) {
       return a && (a.role || a.name || a.target);
     });
     var ostate = String(orch.state || "idle");
 
+    // --- header: title + orchestrator status pill ---
     var html = "<div class='rv-act-head'>"
       + "<h3 class='rv-act-title'>activity</h3>"
       + "<span class='rv-pill rv-pill-" + escapeHtml(ostate) + "'>"
       + "<span class='rv-pill-dot'></span>" + escapeHtml(ostate) + "</span>"
       + "</div>";
 
+    // --- "Agents · ready": the draggable dispatch palette ---
+    html += "<div class='rv-palette-sec'>"
+      + "<div class='rv-sec-head'>Agents <span class='rv-sec-dot'>·</span> "
+      + "<span class='rv-sec-ready'>ready</span></div>"
+      + "<div class='rv-palette' role='list'>";
+    palette.forEach(function (a) {
+      var id = String(a.id || "");
+      var role = ROLE_LABEL[id] ? id : "agent";
+      var icon = a.icon || ROLE_ICON[id] || "▸";
+      html += "<div class='rv-palette-card rv-role-" + escapeHtml(role) + "' "
+        + "role='listitem' draggable='true' data-agent='" + escapeHtml(id) + "' "
+        + "title='drag onto a node to dispatch a " + escapeHtml(a.label || id)
+        + "'>"
+        + "<span class='rv-pc-icon' aria-hidden='true'>" + escapeHtml(icon) + "</span>"
+        + "<div class='rv-pc-text'>"
+        + "<span class='rv-pc-label'>" + escapeHtml(a.label || id) + "</span>"
+        + "<span class='rv-pc-blurb'>" + escapeHtml(a.blurb || "") + "</span>"
+        + "</div></div>";
+    });
+    html += "</div></div>";
+
+    // --- orchestrator phase/detail (the existing live feed chrome) ---
     html += "<div class='rv-act-orch'>";
     if (orch.phase) {
       html += "<div class='rv-orch-phase'>" + escapeHtml(orch.phase) + "</div>";
@@ -838,9 +962,8 @@
     }
     html += "</div>";
 
-    if (!agents.length) {
-      html += "<div class='rv-act-empty'>idle — no agents running</div>";
-    } else {
+    // --- the live agent cards (running agents from the live feed) ---
+    if (agents.length) {
       html += "<ul class='rv-agents'>";
       agents.forEach(function (a) {
         var role = String(a.role || "agent").toLowerCase();
@@ -866,7 +989,216 @@
       html += "</ul>";
     }
 
+    // --- "Tasks": queued (from the queue) + running (from the live feed) ---
+    // Each row: agent → node, a status chip, and a × cancel on queued ones. Running
+    // tasks are drawn from BOTH the queue (status:"running") and any live agent that
+    // isn't already represented by a queue row, so "running" never gets faked — it
+    // reflects the real queue + live feed. When both are empty, the drag-prompt.
+    var tasks = buildTasks(queue, agents);
+    html += "<div class='rv-tasks-sec'>"
+      + "<div class='rv-sec-head'>Tasks"
+      + (tasks.length ? " <span class='rv-sec-count'>" + tasks.length + "</span>" : "")
+      + "</div>";
+    if (!tasks.length) {
+      html += "<div class='rv-act-empty'>no tasks — drag an agent onto a node "
+        + "to dispatch one</div>";
+    } else {
+      html += "<ul class='rv-tasks'>";
+      tasks.forEach(function (t) {
+        var status = String(t.status || "queued");
+        var statusClass = (status === "running") ? "running"
+          : (status === "queued") ? "queued" : "other";
+        var nodeLbl = t.node_label || t.node || "";
+        html += "<li class='rv-task rv-task-" + escapeHtml(statusClass) + "'>"
+          + "<div class='rv-task-main'>"
+          + "<span class='rv-task-agent rv-role-" + escapeHtml(
+              ROLE_LABEL[t.agent] ? t.agent : "agent")
+          + "'>" + escapeHtml(t.agent || "agent") + "</span>"
+          + "<span class='rv-task-arrow'>→</span>"
+          + "<a class='rv-task-node' href='/node/"
+          + encodeURIComponent(t.node || "") + "' title='" + escapeHtml(nodeLbl)
+          + "'>" + escapeHtml(nodeLbl) + "</a>"
+          + "</div>"
+          + "<div class='rv-task-right'>"
+          + "<span class='rv-chip rv-chip-" + escapeHtml(statusClass) + "'>"
+          + escapeHtml(status) + "</span>";
+        // A × cancel is offered ONLY for queued tasks (a running one is never
+        // cancellable from the dashboard — matches the server's guard).
+        if (status === "queued" && t.id) {
+          html += "<button type='button' class='rv-task-cancel' "
+            + "data-task-id='" + escapeHtml(t.id) + "' "
+            + "title='cancel this queued task'>×</button>";
+        }
+        html += "</div></li>";
+      });
+      html += "</ul>";
+    }
+    html += "</div>";
+
     panel.innerHTML = html;
+    wirePalette(panel);
+    wireTaskCancels(panel);
+  }
+
+  // Merge the dispatch queue with live agents into a single task list. Queue rows are
+  // authoritative for queued + running tasks the orchestrator owns; we ADD a live
+  // agent only if it has a target not already represented by a queue row (so a node
+  // an agent is working on shows as "running" even before/without a queue entry).
+  // Never invents a status — queued rows stay queued, running rows/agents stay running.
+  function buildTasks(queue, agents) {
+    var tasks = [];
+    var seenNodeAgent = {};
+    (queue || []).forEach(function (t) {
+      var status = String(t && t.status || "");
+      if (status !== "queued" && status !== "running") return;
+      tasks.push(t);
+      if (t.agent && t.node) seenNodeAgent[t.agent + " " + t.node] = true;
+      if (t.node) seenNodeAgent[" " + t.node] = true;
+    });
+    (agents || []).forEach(function (a) {
+      var target = a && a.target;
+      if (!target) return;
+      var role = String(a.role || "agent").toLowerCase();
+      // Skip if a queue row already covers this agent+node (or this node generally).
+      if (seenNodeAgent[role + " " + target]
+          || seenNodeAgent[" " + target]) return;
+      tasks.push({
+        id: null,                       // live-only row: no cancel (not in the queue)
+        agent: ROLE_LABEL[role] ? role : "agent",
+        node: target,
+        node_label: a.target_label || target,
+        status: "running"
+      });
+    });
+    return tasks;
+  }
+
+  // Wire the palette cards as drag sources: dragstart stows the agent id on the
+  // dataTransfer + flags the card (.rv-dragging); dragend clears the flag.
+  function wirePalette(panel) {
+    panel.querySelectorAll(".rv-palette-card").forEach(function (card) {
+      card.addEventListener("dragstart", function (ev) {
+        var agent = card.getAttribute("data-agent") || "";
+        try {
+          ev.dataTransfer.setData("text/rv-agent", agent);
+          ev.dataTransfer.setData("text/plain", agent);   // fallback channel
+          ev.dataTransfer.effectAllowed = "copy";
+        } catch (e) { /* older browsers: text/plain only */ }
+        card.classList.add("rv-dragging");
+        document.body.classList.add("rv-drag-active");
+      });
+      card.addEventListener("dragend", function () {
+        card.classList.remove("rv-dragging");
+        document.body.classList.remove("rv-drag-active");
+        // Clear any lingering hover ring on nodes (e.g. a drop outside any node).
+        var mount = home.mount;
+        if (mount) {
+          mount.querySelectorAll(".rv-drop-hover").forEach(function (g) {
+            g.classList.remove("rv-drop-hover");
+          });
+        }
+      });
+    });
+  }
+
+  // Wire the × cancel buttons on queued task rows → POST /api/request/cancel.
+  function wireTaskCancels(panel) {
+    panel.querySelectorAll(".rv-task-cancel").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var id = btn.getAttribute("data-task-id");
+        if (!id) return;
+        btn.disabled = true;
+        fetch("/api/request/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: id })
+        }).then(function (r) { return r.json(); }).then(function () {
+          refreshDispatch();    // re-render panel + refresh markers from the truth
+        }).catch(function () {
+          btn.disabled = false;
+        });
+      });
+    });
+  }
+
+  // Read the dragged agent id off a drop event (our private channel first, then the
+  // plain-text fallback). Empty string when there is no agent id (ignore the drop).
+  function dropAgentId(ev) {
+    var dt = ev.dataTransfer;
+    if (!dt) return "";
+    var id = "";
+    try { id = dt.getData("text/rv-agent"); } catch (e) { id = ""; }
+    if (!id) { try { id = dt.getData("text/plain"); } catch (e2) { id = ""; } }
+    return (id || "").trim();
+  }
+
+  // Dispatch a task: POST /api/request {agent, node}. On ok, refetch /api/dispatch
+  // (re-render the panel + refresh markers) and pulse the target node immediately so
+  // the drop reads as "accepted". Ignores a 400 silently (the panel stays truthful).
+  function dispatchRequest(agent, node) {
+    if (!agent || !node) return;
+    fetch("/api/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent: agent, node: node })
+    }).then(function (r) { return r.json(); }).then(function (res) {
+      if (res && res.ok) {
+        pulseNodeNow(node);     // instant feedback while the poll catches up
+        refreshDispatch();      // authoritative re-render from /api/dispatch
+      }
+    }).catch(function () { /* network hiccup: the next poll will reconcile */ });
+  }
+
+  // ---- pending marker: nodes carrying a queued/running dispatch task ----
+  // A distinct, STEADY marker (vs the animated live pulse): a dashed accent ring so
+  // dispatched-but-not-yet-running work is visible on the graph. Tier-agnostic — a
+  // pending node hidden inside a collapsed parent marks that visible ancestor, the
+  // same way applyPulse() surfaces a hidden live target.
+  function applyPending() {
+    var mount = home.mount;
+    if (!mount) return;
+    var svg = mount.querySelector("svg");
+    if (!svg) return;
+
+    svg.querySelectorAll(".rv-pending").forEach(function (g) {
+      g.classList.remove("rv-pending");
+    });
+
+    var visible = {};   // data-rv-id -> g.node element
+    svg.querySelectorAll("g.node[data-rv-id]").forEach(function (g) {
+      visible[g.getAttribute("data-rv-id")] = g;
+    });
+    var boxes = {};     // node id -> g.cluster element (open box)
+    svg.querySelectorAll("g.cluster[data-rv-cluster]").forEach(function (g) {
+      boxes[g.getAttribute("data-rv-cluster")] = g;
+    });
+
+    // A node that is also LIVE-pulsing keeps the pulse (the more urgent signal);
+    // we only mark pending on nodes that aren't currently pulsing, so the two
+    // markers never fight on the same element.
+    function mark(g) {
+      if (!g.classList.contains("rv-pulse")) g.classList.add("rv-pending");
+    }
+    home.pending.forEach(function (pid) {
+      if (visible[pid]) { mark(visible[pid]); return; }
+      var p = parentOf(pid);
+      while (p) {
+        if (visible[p]) { mark(visible[p]); return; }
+        if (boxes[p]) { mark(boxes[p]); return; }
+        p = parentOf(p);
+      }
+    });
+  }
+
+  // Briefly pulse a single node right after a successful drop (instant feedback). The
+  // node is added to home.targets so the steady poll keeps it lit while it's live;
+  // applyPulse() handles the hidden-inside-a-collapsed-parent case.
+  function pulseNodeNow(node) {
+    if (!node) return;
+    if (home.targets.indexOf(node) === -1) {
+      home.targets = home.targets.concat([node]);
+    }
+    applyPulse();
   }
 
   // ---- node screen: verdict panel POST ----

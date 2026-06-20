@@ -263,6 +263,29 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 /* A focus member that an agent is also targeting still pulses (pulse wins visually);
  * the steady ring underneath marks it as a focus member too. */
 
+/* --- drag-and-drop dispatch: drop-hover ring + pending (queued/running) marker --- */
+/* While a palette agent is dragged over a node, ring it in solid accent so the drop
+ * target is obvious (distinct from both the focus ring and the live pulse). */
+.rv-graph .node.rv-drop-hover > ellipse,
+.rv-graph .node.rv-drop-hover > polygon,
+.rv-graph .node.rv-drop-hover ellipse,
+.rv-graph .node.rv-drop-hover polygon {
+  stroke: var(--accent); stroke-width: 4px; stroke-opacity: 1;
+  filter: url(#rv-glow);
+}
+/* Pending marker: a node carries a queued/running dispatched task. A STEADY dashed
+ * accent ring — distinct from the focus ring (solid amber) and the live pulse
+ * (animated glow): "work is dispatched here" reads apart from "an agent is live
+ * here right now". If a node is BOTH pending and live-pulsing, the pulse wins
+ * (declared later / animated), which is the truthful priority. */
+.rv-graph .node.rv-pending ellipse,
+.rv-graph .node.rv-pending polygon,
+.rv-graph .cluster.rv-pending > polygon,
+.rv-graph .cluster.rv-pending > path {
+  stroke: var(--accent); stroke-width: 2.4px; stroke-dasharray: 3 3;
+  stroke-opacity: .9;
+}
+
 /* expanded box highlight when its bar chip is hovered (HTML ⇄ SVG cross-link) */
 .rv-graph .cluster.rv-box-hover > polygon,
 .rv-graph .cluster.rv-box-hover > path {
@@ -398,6 +421,98 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-role-reviewer { background: var(--flagged); }    /* amber */
 .rv-role-planner { background: #6b4fb0; }            /* violet */
 .rv-role-agent { background: var(--grey); color: var(--ink); }
+
+/* --- "Agents · ready" palette: draggable agent cards (drag → node = dispatch) --- */
+.rv-sec-head {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; color: #8a8575; margin: 4px 0 6px;
+}
+.rv-sec-ready { color: var(--clean); }
+.rv-sec-dot { color: var(--grey); }
+.rv-sec-count {
+  font-size: 11px; font-weight: 700; color: #6c665a;
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: 9px; padding: 0 6px; margin-left: 2px;
+}
+.rv-palette-sec { margin-bottom: 12px; }
+.rv-palette { display: flex; flex-direction: column; gap: 6px; }
+.rv-palette-card {
+  display: flex; align-items: center; gap: 9px;
+  border: 1px solid var(--line); border-left-width: 3px; border-radius: 7px;
+  padding: 7px 9px; background: #fff; cursor: grab;
+  transition: border-color .12s, box-shadow .12s, transform .06s;
+  user-select: none;
+}
+.rv-palette-card:hover {
+  border-color: var(--grey);
+  box-shadow: 0 1px 4px rgba(31, 29, 26, .08);
+}
+.rv-palette-card:active { cursor: grabbing; }
+/* the dragged card lifts + fades while in flight */
+.rv-palette-card.rv-dragging { opacity: .5; transform: scale(.98); }
+/* left accent edge = the agent's role color (mirrors the role badges) */
+.rv-palette-card.rv-role-reviewer { border-left-color: var(--flagged); }
+.rv-palette-card.rv-role-worker { border-left-color: var(--in-mathlib); }
+.rv-palette-card.rv-role-planner { border-left-color: #6b4fb0; }
+.rv-palette-card.rv-role-agent { border-left-color: var(--grey); }
+.rv-pc-icon {
+  font-size: 17px; line-height: 1; flex: 0 0 auto; width: 20px;
+  text-align: center; color: var(--ink);
+}
+.rv-pc-text { display: flex; flex-direction: column; min-width: 0; }
+.rv-pc-label { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rv-pc-blurb {
+  font-size: 11px; color: #8a8575;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* while a drag is active, hint that nodes are live drop targets */
+body.rv-drag-active .rv-graph .node { cursor: copy; }
+
+/* --- "Tasks": queued + running dispatch tasks --- */
+.rv-tasks-sec { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.rv-tasks { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+.rv-task {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px;
+  background: #fbfaf6;
+}
+.rv-task-running { background: #eaf4ee; border-color: var(--clean); }
+.rv-task-main {
+  display: flex; align-items: center; gap: 5px; min-width: 0; flex: 1 1 auto;
+}
+.rv-task-agent {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .03em; padding: 1px 6px; border-radius: 8px; color: #fff;
+  flex: 0 0 auto;
+}
+.rv-task-arrow { color: #b3ac9d; flex: 0 0 auto; }
+.rv-task-node {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rv-task-right { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.rv-chip {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .03em; padding: 2px 7px; border-radius: 9px;
+  border: 1px solid var(--grey); color: #6c665a; background: #fff;
+}
+.rv-chip-queued { color: var(--flagged); border-color: var(--flagged);
+  background: #faf3e3; }
+.rv-chip-running { color: var(--clean); border-color: var(--clean);
+  background: #eaf4ee; }
+.rv-chip-running { animation: rv-blink 1.6s ease-in-out infinite; }
+.rv-task-cancel {
+  border: 1px solid var(--line); background: #fff; color: #8a8575;
+  width: 20px; height: 20px; border-radius: 50%; line-height: 1;
+  font-size: 14px; cursor: pointer; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.rv-task-cancel:hover {
+  color: var(--rejected); border-color: var(--rejected); background: #fbeceb;
+}
+.rv-task-cancel:disabled { opacity: .4; cursor: default; }
 
 /* --- cluster deck --- */
 .rv-cluster-rollup {
