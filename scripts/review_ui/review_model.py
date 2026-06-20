@@ -435,15 +435,53 @@ def tainted_set(nodes: Dict[str, dict], sidecar: dict) -> Set[str]:
 
 
 # ---------------------------------------------------------------------------
-# tier-1 cluster roll-up
+# tier topology — direct children one tier down, tiers present, has-children
+# ---------------------------------------------------------------------------
+
+def child_ids(parent_id: str, nodes: Dict[str, dict]) -> List[str]:
+    """The direct children of ``parent_id`` one tier *down*, sorted.
+
+    A child of a node at tier *N* is a node at tier *N+1* whose ``parent`` is
+    ``parent_id``. Generalizes ``_tier2_children`` (a tier-1 cluster's tier-2
+    children) to any tier, so a tier-2 statement's tier-3 declarations are found
+    the same way. Returns ``[]`` for an unknown parent or a leaf.
+    """
+    parent = nodes.get(parent_id)
+    if parent is None:
+        return []
+    want = eb.node_tier(parent) + 1
+    return sorted(
+        nid for nid, node in nodes.items()
+        if eb.node_tier(node) == want and node.get("parent") == parent_id
+    )
+
+
+def has_children(node_id: str, nodes: Dict[str, dict]) -> bool:
+    """Whether ``node_id`` has any direct children one tier down (vs a leaf)."""
+    return bool(child_ids(node_id, nodes))
+
+
+def tiers_present(nodes: Dict[str, dict]) -> List[int]:
+    """The sorted, distinct tiers that actually occur in the graph.
+
+    Drives the tier toggle (it lists exactly the tiers present) and the default
+    home tier (the lowest present). E.g. a graph with clusters + statements +
+    declarations returns ``[1, 2, 3]``.
+    """
+    return sorted({eb.node_tier(node) for node in nodes.values()})
+
+
+# ---------------------------------------------------------------------------
+# tier roll-up (any tier — a node's roll-up over its direct children)
 # ---------------------------------------------------------------------------
 
 def _tier2_children(cluster_id: str, nodes: Dict[str, dict]) -> List[str]:
-    """The tier-2 node ids whose parent is this tier-1 cluster, sorted."""
-    return sorted(
-        nid for nid, node in nodes.items()
-        if eb.node_tier(node) == 2 and node.get("parent") == cluster_id
-    )
+    """The tier-2 node ids whose parent is this tier-1 cluster, sorted.
+
+    Back-compat alias kept for tier-1 callers/tests; identical to
+    ``child_ids`` for a tier-1 parent.
+    """
+    return child_ids(cluster_id, nodes)
 
 
 def cluster_rollup(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> dict:
@@ -481,11 +519,17 @@ def cluster_rollup(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> di
     }
 
 
-def cluster_color(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> str:
-    """Trust color for a tier-1 cluster, rolled up from its tier-2 children's
-    color_state (so in-Mathlib reuse rolls up to blue). Any flagged/rejected child =>
-    flagged; all children in Mathlib => blue; all trusted => clean; else unreviewed."""
-    children = _tier2_children(cluster_id, nodes)
+def rollup_color(parent_id: str, nodes: Dict[str, dict], sidecar: dict) -> str:
+    """Trust color for *any* parent, rolled up from its direct children's
+    ``color_state`` (so in-Mathlib reuse rolls up to blue). Works at every tier: a
+    tier-1 cluster rolls up its tier-2 children, a tier-2 statement rolls up its
+    tier-3 declarations, etc. Any flagged/rejected child => flagged; all children in
+    Mathlib => blue; all trusted (clean or in-Mathlib) => clean; else unreviewed.
+
+    A leaf (no children) returns ``unreviewed`` — a parentless roll-up is undefined,
+    so callers should color a true leaf by its own ``color_state`` instead.
+    """
+    children = child_ids(parent_id, nodes)
     states = [color_state(nodes[c], verdict_of(c, sidecar))
               for c in children if c in nodes]
     if not states:
@@ -497,6 +541,14 @@ def cluster_color(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> str
     if all(s in ("clean", "in_mathlib") for s in states):
         return "clean"
     return "unreviewed"
+
+
+# Back-compat alias: a tier-1 cluster's roll-up color is just ``rollup_color`` of the
+# cluster id. Existing callers/tests use ``cluster_color``; keep it pointing here.
+def cluster_color(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> str:
+    """Alias for ``rollup_color`` — a tier-1 cluster's roll-up color over its
+    tier-2 children. Retained so existing tier-1 callers/tests keep working."""
+    return rollup_color(cluster_id, nodes, sidecar)
 
 
 # ---------------------------------------------------------------------------
@@ -628,49 +680,71 @@ def _verdict_node_dot(
     return f'  "{slug}" [{", ".join(attrs)}];'
 
 
-def _recolor_tier1_dot(
+def _recolor_tier_dot(
     nodes: Dict[str, dict],
     sidecar: dict,
     sub: Dict[str, dict],
     ids: Set[str],
     name_to_slug: Dict[str, str],
     lines: List[str],
+    tier: int,
     expanded: Set[str],
 ) -> str:
-    """Emit the tier-1 overview DOT with in-place cluster expansion.
+    """Emit the tier-*N* overview DOT with in-place expansion of any tier-*N* node
+    into its tier-*(N+1)* children. Generalizes the old tier-1-only routine.
 
-    * **Collapsed** cluster (id ∉ ``expanded``) → a single node colored by
-      ``cluster_color`` (clickable). Cross-cluster edges that touch it are lifted
-      onto this node.
-    * **Expanded** cluster (id ∈ ``expanded``) → a ``subgraph cluster_<slug>`` box
-      whose children are tier-2 nodes colored by their own ``color_state`` (taint /
-      AI-only ring honoured), with the intra-cluster ``depends_on`` edges drawn
-      dashed *inside* the box.
-    * **Cross edges** (the repr trick): for every tier-2 dependency ``d -> n``,
-      ``repr(x) = slug(x)`` if ``parent(x) ∈ expanded`` else ``slug(parent(x))``;
-      emit ``repr(d) -> repr(n)`` when the two slugs differ, deduped. Edges fully
-      inside one expanded cluster are emitted by that cluster's subgraph, not here.
+    For each node at ``tier``:
+
+    * **Leaf** (no children at tier+1) → a single node colored by its own
+      ``color_state`` (taint / AI-only ring honoured), exactly as a flat tier graph.
+    * **Collapsed** parent (has children, id ∉ ``expanded``) → a single node colored
+      by ``rollup_color`` over its direct children (clickable). Cross edges that
+      touch it are lifted onto this node.
+    * **Expanded** parent (id ∈ ``expanded``) → a ``subgraph cluster_<slug>`` box
+      whose members are its tier-(N+1) children colored by their own ``color_state``,
+      with the intra-parent ``depends_on`` edges drawn dashed *inside* the box.
+
+    **Cross edges** (the repr trick) at the *current* tier: edges come from two
+    sources, deduped together —
+
+      * the tier-N nodes' own direct ``depends_on`` (tier-N → tier-N), mapped to
+        node slugs; and
+      * the tier-(N+1) children's ``depends_on`` lifted via ``repr``: for a child
+        ``x``, ``repr(x) = slug(x)`` when its parent ∈ ``expanded`` (the box is open
+        so the child is a real node) else ``slug(parent(x))`` (the collapsed parent
+        node). Emit ``repr(d) -> repr(n)`` when the two slugs differ.
+
+    An edge fully inside one expanded box (both children share an expanded parent)
+    is emitted by that subgraph, never here.
     """
-    parent = {nid: node.get("parent") for nid, node in nodes.items()}
-    # Only expand clusters that are actually tier-1 ids in this view.
-    expanded = {cid for cid in expanded if cid in ids}
+    expanded = {pid for pid in expanded if pid in ids and has_children(pid, nodes)}
     tainted = tainted_set(nodes, sidecar)
 
-    # --- collapsed clusters: one node each, colored by roll-up ---
-    for cid in sorted(sub):
-        if cid in expanded:
+    # --- leaves + collapsed parents: one node each ---
+    for nid in sorted(sub):
+        if nid in expanded:
             continue
-        lines.append(_verdict_node_dot(
-            cid, sub[cid], name_to_slug[cid],
-            "unreviewed", "human", False,
-            state_override=cluster_color(cid, nodes, sidecar),
-        ))
+        if has_children(nid, nodes):
+            # collapsed parent → single node colored by the roll-up over its children
+            lines.append(_verdict_node_dot(
+                nid, sub[nid], name_to_slug[nid],
+                "unreviewed", "human", False,
+                state_override=rollup_color(nid, nodes, sidecar),
+            ))
+        else:
+            # leaf → colored by its own trust state (taint / AI-only ring honoured)
+            lines.append(_verdict_node_dot(
+                nid, sub[nid], name_to_slug[nid],
+                verdict_of(nid, sidecar),
+                review_source(nid, sidecar),
+                nid in tainted,
+            ))
 
-    # --- expanded clusters: a subgraph box per cluster with its tier-2 children ---
-    for cid in sorted(expanded):
-        children = _tier2_children(cid, nodes)
-        label = sub[cid].get("name") or cid
-        lines.append(f'  subgraph cluster_{name_to_slug[cid]} {{')
+    # --- expanded parents: a subgraph box per parent with its tier-(N+1) children ---
+    for pid in sorted(expanded):
+        children = child_ids(pid, nodes)
+        label = sub[pid].get("name") or pid
+        lines.append(f'  subgraph cluster_{name_to_slug[pid]} {{')
         lines.append(f'    label="{eb._dot_escape(label)}";')
         lines.append('    style="filled,rounded";')
         lines.append('    color="#C9C2B4";')
@@ -684,7 +758,7 @@ def _recolor_tier1_dot(
                 nid in tainted,
             )
             lines.append("  " + line)  # indent into the subgraph
-        # intra-cluster dashed edges (both endpoints in this cluster)
+        # intra-parent dashed edges (both endpoints among this parent's children)
         intra: List[Tuple[str, str]] = []
         cset = set(children)
         for nid in children:
@@ -695,18 +769,41 @@ def _recolor_tier1_dot(
             lines.append(f'    "{s}" -> "{t}" [style=dashed];')
         lines.append("  }")
 
-    # --- cross edges via the repr trick (deduped) ---
+    # --- cross edges at the current tier (deduped) ---
+    cedges: Set[Tuple[str, str]] = set()
+
+    # (a) tier-N nodes' own direct depends_on (e.g. a tier-2 statement depending on
+    #     another tier-2 statement). Both endpoints must be tier-N nodes in view AND
+    #     still drawn as bare nodes — an *expanded* endpoint is a subgraph box, not a
+    #     node, so its bare slug must never appear in an edge (that would spawn a
+    #     phantom node). When a node is expanded its real connectivity is shown by
+    #     its children's own deps (b), so we simply skip a direct edge touching it.
+    for nid in sub:
+        if nid in expanded:
+            continue
+        for dep in sub[nid].get("depends_on", []) or []:
+            if dep in ids and dep != nid and dep not in expanded:
+                s, t = name_to_slug[dep], name_to_slug[nid]
+                if s != t:
+                    cedges.add((s, t))
+
+    # (b) tier-(N+1) children's depends_on, lifted via the repr trick. A child maps
+    #     to itself when its parent box is open, else to its (collapsed) tier-N
+    #     parent node. This is what surfaces cross-parent structure when the parents
+    #     themselves carry no direct depends_on.
+    parent = {nid: node.get("parent") for nid, node in nodes.items()}
+    want_child = tier + 1
+
     def _repr(x: str) -> Optional[str]:
         px = parent.get(x)
         if px in expanded:
-            return name_to_slug[x]          # child node (its cluster is open)
+            return name_to_slug[x]          # child node (its parent box is open)
         if px in ids:
-            return name_to_slug[px]         # the collapsed cluster node
+            return name_to_slug[px]         # the collapsed tier-N parent node
         return None                          # parentless / out-of-view: skip
 
-    cedges: List[Tuple[str, str]] = []
     for nid, node in nodes.items():
-        if eb.node_tier(node) != 2:
+        if eb.node_tier(node) != want_child:
             continue
         rn = _repr(nid)
         if rn is None:
@@ -715,8 +812,9 @@ def _recolor_tier1_dot(
             rd = _repr(dep)
             if rd is None or rd == rn:
                 continue
-            cedges.append((rd, rn))
-    for s, t in sorted(set(cedges)):
+            cedges.add((rd, rn))
+
+    for s, t in sorted(cedges):
         lines.append(f'  "{s}" -> "{t}" [style=dashed];')
 
     lines.append("}")
@@ -729,24 +827,30 @@ def recolor_dot(
     tier: int = 2,
     expanded: Optional[Set[str]] = None,
 ) -> str:
-    """Build a DOT digraph for the given tier, recolored by effective verdict.
+    """Build a DOT digraph for the given tier, recolored by effective verdict, with
+    in-place expansion of any tier-*N* node into its tier-*(N+1)* children.
 
     Reuses the exporter's ``_graph_attr_lines`` (shared graph/node/edge attrs) and
     slug map, so the recolored graph is laid out identically to the exported one —
     only the node colors/styles change (verdict instead of mathlib_status) plus the
     dashed-ring / hatch encodings. Within-tier ``depends_on`` edges are emitted
-    dashed, matching ``export_blueprint.build_tier2_dot``.
+    dashed.
 
-    ``expanded`` is meaningful only for ``tier == 1`` and is the set of cluster ids
-    to **unroll in place**. A collapsed cluster (not in ``expanded``) is drawn as a
-    single node colored by ``cluster_color`` (clickable, with the cross-cluster edges
-    lifted onto it). An expanded cluster is drawn as a graphviz
-    ``subgraph cluster_<slug> { label=...; <tier-2 children colored by color_state>;
-    intra-cluster dashed edges }`` so its members show inside a labelled box. Edges
-    are emitted by the *repr* trick: each tier-2 dependency ``d -> n`` maps each
-    endpoint to itself when its parent is expanded, else to the parent cluster node;
-    the mapped edge is emitted (deduped) when its endpoints differ. Collapsed
-    clusters are plain nodes, so no ``lhead/ltail`` is needed.
+    ``expanded`` is the set of tier-*N* node ids to **unroll in place** and now works
+    at **any tier** (tier-1 clusters → tier-2 statements; tier-2 statements → tier-3
+    declarations; …). For each node at ``tier``:
+
+    * a **leaf** (no tier-(N+1) children) is a single node colored by its own
+      ``color_state``;
+    * a **collapsed** parent (has children, not in ``expanded``) is a single node
+      colored by ``rollup_color`` over its direct children, with cross edges lifted
+      onto it;
+    * an **expanded** parent is a graphviz ``subgraph cluster_<slug> { label=...;
+      <tier-(N+1) children colored by color_state>; intra-parent dashed edges }``.
+
+    Cross edges use the *repr* trick at the current tier (each tier-N dependency
+    ``d -> n`` mapped to its node slugs, deduped). Edges inside an expanded box are
+    tier-(N+1) deps and are emitted by that subgraph, not here.
     """
     name_to_slug = eb.build_slug_map(nodes)
     sub = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == tier}
@@ -755,28 +859,8 @@ def recolor_dot(
     lines.extend(eb._graph_attr_lines())
     ids = set(sub)
 
-    if tier == 1:
-        return _recolor_tier1_dot(
-            nodes, sidecar, sub, ids, name_to_slug, lines, expanded or set())
-
-    # Tier 2 (default): each node colored by its own trust state; within-tier edges.
-    tainted = tainted_set(nodes, sidecar)
-    for nid in sorted(sub):
-        lines.append(_verdict_node_dot(
-            nid, sub[nid], name_to_slug[nid],
-            verdict_of(nid, sidecar),
-            review_source(nid, sidecar),
-            nid in tainted,
-        ))
-    edges: List[Tuple[str, str]] = []
-    for nid, node in sub.items():
-        for dep in node.get("depends_on", []) or []:
-            if dep in ids and dep != nid:
-                edges.append((name_to_slug[dep], name_to_slug[nid]))
-    for s, t in sorted(set(edges)):
-        lines.append(f'  "{s}" -> "{t}" [style=dashed];')
-    lines.append("}")
-    return "\n".join(lines)
+    return _recolor_tier_dot(
+        nodes, sidecar, sub, ids, name_to_slug, lines, tier, expanded or set())
 
 
 # ---------------------------------------------------------------------------
