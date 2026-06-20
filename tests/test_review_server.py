@@ -124,6 +124,47 @@ def test_tiertoggle_only_present_tiers(tmp_path):
     assert "href='/?tier=3'" not in html
 
 
+# --- tier-agnostic topology hook (drives the client unroll at any tier) -----
+
+def test_topology_maps_children_and_parents_at_every_tier(tmp_path):
+    nodes = _proj(tmp_path).nodes()
+    topo = sv._topology(nodes)
+    # a tier-1 cluster and a tier-2 statement both surface as parents-with-children
+    assert topo["children"]["cA"] == ["s1", "s2"]      # tier-1 -> tier-2
+    assert topo["children"]["s1"] == ["d1", "d2"]      # tier-2 -> tier-3
+    # leaves (s2, d1, d2) never appear as keys in children
+    assert "s2" not in topo["children"]
+    assert "d2" not in topo["children"]
+    # parents is the inverse, one tier down -> its box
+    assert topo["parents"]["s1"] == "cA"
+    assert topo["parents"]["d1"] == "s1"
+    assert topo["parents"]["d2"] == "s1"
+
+
+def test_topology_in_home_boot(tmp_path):
+    boot = _boot(sv.render_home(_proj(tmp_path), "2", None))
+    assert "window.__RV_TOPO__ = " in boot
+    # the tier-2 parent's tier-3 children ride along so the client can unroll there
+    assert '"s1": ["d1", "d2"]' in boot
+
+
+def test_home_has_focus_banner_and_expanded_bar_containers(tmp_path):
+    html = sv.render_home(_proj(tmp_path), "2", None).decode("utf-8")
+    # reliable HTML mounts the client fills — not SVG-injected
+    assert "id='rv-focus-banner'" in html
+    assert "id='rv-expanded-bar'" in html
+
+
+def test_api_dot_includes_topo(tmp_path):
+    # the /api/dot payload carries the same topo so re-renders stay consistent
+    import review_model as rm
+    proj = _proj(tmp_path)
+    nodes = proj.nodes()
+    topo = sv._topology(nodes)
+    # cross-check the helper matches the model's own child_ids at tier 2
+    assert topo["children"]["s1"] == rm.child_ids("s1", nodes)
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

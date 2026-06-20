@@ -267,6 +267,35 @@ def _parse_tier(raw, nodes: Dict[str, dict]) -> int:
     return want if want in present else default
 
 
+def _topology(nodes: Dict[str, dict]) -> dict:
+    """Tier-agnostic parent/children topology the client needs to drive the unroll.
+
+    The DOT alone can't tell the client whether a *collapsed* node is a parent (so a
+    click should unroll it) or a leaf (so a click should open its packet), nor which
+    parent a tier-(N+1) child belongs to once a box is open (so a hidden target can
+    pulse its collapsed parent). ``state.clusters`` answers this only for tier 1.
+
+    So expose, for the whole graph (every tier):
+
+      * ``children`` — ``{parent id: [direct child ids one tier down]}`` for every
+        node that has at least one child (an entry's presence === "has children");
+      * ``parents``  — ``{child id: parent id}`` (the inverse), so the client can map
+        any node to the box it lives in.
+
+    Both are derived from ``rm.child_ids`` (same rule the model expands by), so the
+    client's "has children?" test is exactly the server's, at any tier.
+    """
+    children: Dict[str, list] = {}
+    parents: Dict[str, str] = {}
+    for nid in nodes:
+        kids = rm.child_ids(nid, nodes)
+        if kids:
+            children[nid] = kids
+            for k in kids:
+                parents[k] = nid
+    return {"children": children, "parents": parents}
+
+
 def _focus_payload(parent_id: Optional[str], nodes: Dict[str, dict]) -> Optional[dict]:
     """Build ``__RV_FOCUS__`` for ``?focus=<parentid>``: the parent, its display
     label, and the child ids one tier down (the members to highlight in context).
@@ -318,6 +347,10 @@ def render_home(proj: Project, tier: Optional[int] = None,
         f"window.__RV_FOCUS__ = {json.dumps(focus_payload)};"
         # The client owns the `expanded` set; it starts empty (home = collapsed).
         f"window.__RV_EXPANDED__ = [];"
+        # Tier-agnostic parent/children topology so the client can tell a parent
+        # (click → unroll) from a leaf (click → packet) at ANY tier, and map a
+        # tier-(N+1) child to its (collapsed) parent box for the pulse.
+        f"window.__RV_TOPO__ = {json.dumps(_topology(nodes))};"
         # Tells the client an /api/agents feed exists and where to poll it. The
         # Activity-panel HTML/JS is built client-side (Frontend phase), not here —
         # we only expose the data hooks + the container div below.
@@ -362,6 +395,16 @@ def render_home(proj: Project, tier: Optional[int] = None,
         + "<div class='rv-graphcol'>"
         + tiertoggle
         + _legend_html()
+        # Focus banner ("Showing … in context · ‹ back"): hidden by default, the
+        # client fills + reveals it when __RV_FOCUS__ is present. Reliable HTML, so
+        # the context cue never depends on SVG injection.
+        + "<div id='rv-focus-banner' class='rv-focus-banner' "
+          "style='display:none'></div>"
+        # Expanded-nodes bar: one chip per expanded node (collapse + open-in-tier-N+1).
+        # The client builds it from its `expanded` set; empty/hidden until a node is
+        # unrolled. Plain HTML above the graph — never injected into the SVG.
+        + "<div id='rv-expanded-bar' class='rv-expanded-bar' "
+          "style='display:none'></div>"
         + "<div id='rv-graph' class='rv-graph'>"
           "<div class='rv-graph-loading'>rendering dependency graph…</div>"
           "</div>"
@@ -654,6 +697,9 @@ def make_handler(proj: Project):
                 "id_by_slug": id_by_slug,
                 "kinds": kinds,
                 "tier": tier,
+                # Same tier-agnostic topology as the home boot, so a re-render after
+                # an unroll keeps the client's parent/leaf + child→parent maps fresh.
+                "topo": _topology(nodes),
             })
 
         def _serve_asset(self, name):
