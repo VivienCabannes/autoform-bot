@@ -478,3 +478,83 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-verdict-panel button:hover { background: #15407a; }
 .rv-vp-status { font-size: 13px; color: var(--clean); }
 .rv-err { color: var(--rejected); }
+
+/* --- PART 6: anchor-view banner (reuses the focus-banner slot) --------------- */
+.rv-fb-nb { color: #6c665a; font-size: 12px; }
+.rv-anchor-banner .rv-fb-ico { color: var(--accent); }
+.rv-anchor-banner .rv-fb-text strong { color: var(--accent); }
+.rv-nb-controls { display: inline-flex; gap: 8px; align-items: center; }
+.rv-nb-expand {
+  font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 12px;
+  border: 1.5px solid var(--accent); background: var(--accent); color: #fff;
+}
+.rv-nb-expand:hover { background: #15407a; text-decoration: none; }
+.rv-nb-expand.rv-nb-maxed {
+  background: #fff; color: #8a8575; border-color: var(--grey);
+  font-weight: 500; cursor: default;
+}
+
+/* --- PART 5: too-large placeholder + entry-point picker ---------------------- */
+.rv-toolarge {
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  padding: 20px 22px; max-width: 640px; margin: 6px auto;
+  box-shadow: 0 1px 3px rgba(31, 29, 26, .05);
+}
+.rv-tl-head { display: flex; align-items: flex-start; gap: 12px; }
+.rv-tl-ico {
+  font-size: 22px; color: var(--accent); line-height: 1.2; flex: 0 0 auto;
+}
+.rv-tl-title { margin: 0; font-size: 17px; line-height: 1.35; }
+.rv-tl-guide { color: #6c665a; font-size: 13.5px; margin: 12px 0 16px; }
+.rv-tl-guide strong { color: var(--ink); }
+.rv-tl-search { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.rv-tl-input {
+  flex: 1 1 320px; font: inherit; font-size: 14px;
+  padding: 9px 13px; border: 1.5px solid var(--grey); border-radius: 8px;
+  background: var(--paper);
+}
+.rv-tl-input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(26, 75, 140, .12); background: #fff;
+}
+.rv-tl-hint { font-size: 12px; color: #8a8575; white-space: nowrap; }
+.rv-tl-list {
+  list-style: none; margin: 14px 0 0; padding: 0;
+  max-height: 360px; overflow-y: auto;
+}
+.rv-tl-item { margin: 0 0 6px; }
+.rv-tl-pick {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; width: 100%;
+  text-align: left; font: inherit; cursor: pointer;
+  padding: 8px 12px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--paper);
+  transition: border-color .12s, background .12s;
+}
+.rv-tl-pick:hover {
+  border-color: var(--accent); background: var(--in-mathlib-fill);
+}
+.rv-tl-id {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+  font-weight: 600; color: var(--ink);
+}
+.rv-tl-sub { font-size: 12.5px; color: #6c665a;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.rv-tl-parent { font-size: 11.5px; color: #8a8575; }
+.rv-tl-go {
+  margin-left: auto; font-size: 12px; font-weight: 600; color: var(--accent);
+  white-space: nowrap;
+}
+.rv-tl-pick:hover .rv-tl-go { text-decoration: underline; }
+.rv-tl-none { padding: 10px 4px; color: #8a8575; font-size: 13px; font-style: italic; }
+
+/* --- PART 7: node packet "view neighborhood ▸" link ------------------------- */
+.rv-nb-link-row {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+.rv-nb-link {
+  font-weight: 600; font-size: 13px; padding: 5px 12px; border-radius: 14px;
+  border: 1.5px solid var(--accent); background: var(--accent); color: #fff;
+}
+.rv-nb-link:hover { background: #15407a; text-decoration: none; }
+.rv-nb-link-sub { font-size: 11.5px; color: #8a8575; }

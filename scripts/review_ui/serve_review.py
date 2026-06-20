@@ -642,9 +642,20 @@ def render_node(proj: Project, node_id: str) -> bytes:
     # right column: source_refs (verbatim) + mathlib decls + kernel evidence.
     right = _node_meta_html(proj, node_id, node, scorecard)
 
+    # The node's own tier (and the tiers present) so the packet can offer a
+    # "view neighborhood ▸" link back to the local view at the RIGHT tier:
+    #   /?tier=<this node's tier>&anchor=<id>
+    # — re-centering the bounded neighborhood on this node. node_tier is the same
+    # rule the model/exporter use everywhere (node["tier"], default 2).
+    import export_blueprint as eb
+    node_tier = eb.node_tier(node)
+    present = rm.tiers_present(nodes)
     boot = (
         f"window.__RV_NODE__ = {json.dumps(node_id)};"
         f"window.__RV_SCORECARD__ = {json.dumps(scorecard)};"
+        # Drives the packet's "view neighborhood ▸" link (→ /?tier=<tier>&anchor=<id>).
+        f"window.__RV_NODE_TIER__ = {json.dumps(node_tier)};"
+        f"window.__RV_TIERS__ = {json.dumps(present)};"
     )
     body = (
         "<div class='rv-packet'>"

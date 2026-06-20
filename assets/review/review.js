@@ -22,6 +22,17 @@
  *     tier, via the tier-agnostic topology;
  *   - keeps an offline fallback (node/parent list; expanding reveals children).
  *
+ * Local views for large graphs (PART 5-7):
+ *   - TOO-LARGE PLACEHOLDER: when __RV_TOO_LARGE__ is set (a flat tier with more
+ *     nodes than the render cap), the d3 render is skipped entirely; the graph area
+ *     shows a friendly card + a SEARCH box filtering __RV_NODES__ by id into a short
+ *     clickable list (pick → /?tier=N&anchor=<id>, that node's bounded neighborhood);
+ *   - NEIGHBORHOOD / ANCHOR view: a focus/anchor subgraph (bounded) renders normally;
+ *     an anchor view shows a banner with "expand ±1 hop" (radius+1, clamped 3) and
+ *     "‹ back" — child-click → /node/<id> and parent unroll still work;
+ *   - the node packet gains a "view neighborhood ▸" link → /?tier=<node tier>&anchor
+ *     =<id> (the tier comes from window.__RV_NODE_TIER__).
+ *
  * Node screen: POST the human verdict to /api/verdict/<id> and reflect the delta.
  *
  * No build step, no framework — plain DOM. d3/d3-graphviz are loaded lazily from a
@@ -47,6 +58,16 @@
   var DOT_URL = window.__RV_DOT_URL__ || "/api/dot";
   var AGENTS_URL = window.__RV_AGENTS_URL__ || "/api/agents";
   var FOCUS = window.__RV_FOCUS__ || null;   // {parent,label,members:[ids]} or null
+
+  // ---- local-view globals (PART 5-7) ----
+  // A focus/anchor view is a bounded subgraph that renders normally; an anchor view
+  // also carries {id,radius} (drives the "±K hops · ‹ back" banner + "expand ±1 hop").
+  // A flat too-large tier renders a placeholder + entry-point picker instead of d3.
+  var NEIGHBORHOOD = !!window.__RV_NEIGHBORHOOD__;     // focus OR anchor local view
+  var ANCHOR = window.__RV_ANCHOR__ || null;           // {id, radius} or null
+  var TOO_LARGE = window.__RV_TOO_LARGE__ || null;      // {tier,count,threshold} | null
+  var TOO_LARGE_NODES = window.__RV_NODES__ || null;    // [{id,label,parent}] picker
+  var NB_MAX_RADIUS = 3;   // mirrors serve_review.NB_MAX_RADIUS (anchor clamp)
 
   var home = {
     dot: window.__RV_DOT__ || null,
@@ -89,11 +110,23 @@
     home.mount = mount;
     home.bar = document.getElementById("rv-expanded-bar");
 
-    // Focus banner is static context (server told us we're focused); render once.
+    // Local-view banners are static context (server told us which view this is):
+    //   focus → "Showing the <tier> of <unit> in context · ‹ back"
+    //   anchor → "Neighborhood of <anchor> (±K hops) · ‹ back" + "expand ±1 hop"
     renderFocusBanner();
+    renderNeighborhoodBanner();
 
     // Start the activity panel immediately (independent of graphviz availability).
     initActivity();
+
+    // PART 5 — too-large flat tier: do NOT run d3. Render a placeholder card + an
+    // entry-point picker (search → /?tier=N&anchor=<id>) in the graph area. The
+    // server already handed us an empty placeholder DOT, so a stray render couldn't
+    // draw the N-node graph, but we short-circuit before even loading graphviz.
+    if (TOO_LARGE) {
+      renderTooLarge(mount);
+      return;
+    }
 
     loadGraphviz(function (ok) {
       if (ok && window.d3 && window.d3.select(mount).graphviz) {
@@ -105,6 +138,105 @@
       }
       renderExpandedBar();
     });
+  }
+
+  // ---- PART 5: too-large placeholder + entry-point picker ----------------------
+  // When the flat tier is too big to render, show a friendly card with guidance and
+  // a SEARCH box that filters __RV_NODES__ by id into a short clickable list; picking
+  // a node navigates to /?tier=N&anchor=<id> (its bounded neighborhood). We never run
+  // the d3 render in this state.
+  function renderTooLarge(mount) {
+    var tier = TOO_LARGE.tier;
+    var count = TOO_LARGE.count;
+    var nodes = TOO_LARGE_NODES || [];
+    var label = tierLabel(tier);
+
+    var card = document.createElement("div");
+    card.className = "rv-toolarge";
+    card.innerHTML =
+      "<div class='rv-tl-head'>"
+      + "<span class='rv-tl-ico'>▦</span>"
+      + "<h3 class='rv-tl-title'>This graph has " + count + " " + escapeHtml(label)
+      + " — too many to show at once.</h3>"
+      + "</div>"
+      + "<p class='rv-tl-guide'>Rendering " + count + " nodes at once hangs the "
+      + "browser. Open a cluster → unit to drill in, or pick a node below to view its "
+      + "<strong>neighborhood</strong> (the node plus what it depends on / what "
+      + "depends on it, bounded).</p>"
+      + "<div class='rv-tl-search'>"
+      + "<input type='search' id='rv-tl-input' class='rv-tl-input' "
+      + "placeholder='search " + count + " " + escapeHtml(label)
+      + " by id…' autocomplete='off' spellcheck='false'>"
+      + "<span class='rv-tl-hint' id='rv-tl-hint'></span>"
+      + "</div>"
+      + "<ul class='rv-tl-list' id='rv-tl-list'></ul>";
+    mount.innerHTML = "";
+    mount.appendChild(card);
+
+    var input = card.querySelector("#rv-tl-input");
+    var list = card.querySelector("#rv-tl-list");
+    var hint = card.querySelector("#rv-tl-hint");
+    var MAX_SHOWN = 25;   // a SHORT list; the search narrows it
+
+    function jumpTo(id) {
+      window.location.href = "/?tier=" + encodeURIComponent(tier)
+        + "&anchor=" + encodeURIComponent(id);
+    }
+
+    function renderList(q) {
+      var needle = (q || "").trim().toLowerCase();
+      var matches = nodes.filter(function (n) {
+        if (!needle) return true;
+        var id = String(n.id || "").toLowerCase();
+        var lbl = String(n.label || "").toLowerCase();
+        return id.indexOf(needle) !== -1 || lbl.indexOf(needle) !== -1;
+      });
+      var shown = matches.slice(0, MAX_SHOWN);
+      if (!matches.length) {
+        list.innerHTML = "<li class='rv-tl-none'>no " + escapeHtml(label)
+          + " match “" + escapeHtml(needle) + "”</li>";
+        hint.textContent = "0 of " + count;
+        return;
+      }
+      hint.textContent = (matches.length > shown.length
+        ? "showing " + shown.length + " of " + matches.length + " matches"
+        : matches.length + (needle ? " match" + (matches.length === 1 ? "" : "es")
+                                   : " " + label));
+      var html = "";
+      shown.forEach(function (n) {
+        var id = n.id;
+        var sub = (n.label && n.label !== id)
+          ? "<span class='rv-tl-sub'>" + escapeHtml(n.label) + "</span>" : "";
+        var par = n.parent
+          ? "<span class='rv-tl-parent'>in " + escapeHtml(n.parent) + "</span>" : "";
+        html += "<li class='rv-tl-item' data-id='" + escapeHtml(id) + "'>"
+          + "<button type='button' class='rv-tl-pick' data-id='" + escapeHtml(id)
+          + "'><span class='rv-tl-id'>" + escapeHtml(id) + "</span>"
+          + sub + par + "<span class='rv-tl-go'>view neighborhood ▸</span>"
+          + "</button></li>";
+      });
+      list.innerHTML = html;
+      list.querySelectorAll(".rv-tl-pick").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          jumpTo(btn.getAttribute("data-id"));
+        });
+      });
+    }
+
+    renderList("");
+    input.addEventListener("input", function () { renderList(input.value); });
+    // Enter on a sole match jumps straight in.
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter") return;
+      var needle = input.value.trim().toLowerCase();
+      var matches = nodes.filter(function (n) {
+        var id = String(n.id || "").toLowerCase();
+        var lbl = String(n.label || "").toLowerCase();
+        return id.indexOf(needle) !== -1 || lbl.indexOf(needle) !== -1;
+      });
+      if (matches.length === 1) jumpTo(matches[0].id);
+    });
+    input.focus();
   }
 
   // Render `dot` into the mount via d3-graphviz. `transition` => animate from the
@@ -261,8 +393,52 @@
       + "<span class='rv-fb-text'>Showing the " + escapeHtml(tierLabel(TIER))
       + " of <strong>" + escapeHtml(label) + "</strong> in context"
       + (n ? " <span class='rv-fb-count'>(" + n + ")</span>" : "")
+      + " <span class='rv-fb-nb'>+ immediate neighbors</span>"
       + "</span>"
       + "<a class='rv-fb-back' href='" + back + "'>‹ back</a>";
+  }
+
+  // ---- PART 6: anchor-view banner ("Neighborhood of ‹anchor› (±K hops)") --------
+  // For an anchor view (?anchor=<id>&radius=K) we render a banner — into the same
+  // slot the focus banner uses (focus/anchor are mutually exclusive on the server) —
+  // carrying the anchor label and two controls:
+  //   "expand ±1 hop" → re-navigate with radius+1 (clamped to NB_MAX_RADIUS=3);
+  //   "‹ back"        → leave the local view (back to the flat tier this came from).
+  // Child clicks → /node/<id> and parent unroll still work (the subgraph renders
+  // normally), so this banner is the only anchor-specific chrome.
+  function renderNeighborhoodBanner() {
+    if (!ANCHOR || FOCUS) return;   // focus uses renderFocusBanner; flat: nothing
+    var slot = document.getElementById("rv-focus-banner");
+    if (!slot) return;
+    slot.style.display = "";
+    slot.classList.add("rv-anchor-banner");
+    var id = ANCHOR.id;
+    var k = Number(ANCHOR.radius) || 1;
+    // "‹ back" drops the anchor → the flat tier-N view (no anchor/radius).
+    var back = "/?tier=" + encodeURIComponent(TIER);
+    var canExpand = k < NB_MAX_RADIUS;
+    var nextK = Math.min(k + 1, NB_MAX_RADIUS);
+    var expandHref = "/?tier=" + encodeURIComponent(TIER)
+      + "&anchor=" + encodeURIComponent(id) + "&radius=" + nextK;
+
+    var html =
+      "<span class='rv-fb-ico'>⊚</span>"
+      + "<span class='rv-fb-text'>Neighborhood of <strong>" + escapeHtml(id)
+      + "</strong> <span class='rv-fb-count'>(±" + k + " hop"
+      + (k === 1 ? "" : "s") + ")</span></span>"
+      + "<span class='rv-nb-controls'>";
+    if (canExpand) {
+      html += "<a class='rv-nb-expand' href='" + expandHref + "' "
+        + "title='widen to ±" + nextK + " hops (more neighbors, still bounded)'>"
+        + "expand ±1 hop ▸</a>";
+    } else {
+      html += "<span class='rv-nb-expand rv-nb-maxed' "
+        + "title='already at the maximum radius (±" + NB_MAX_RADIUS + ")'>"
+        + "max radius (±" + NB_MAX_RADIUS + ")</span>";
+    }
+    html += "</span>"
+      + "<a class='rv-fb-back' href='" + back + "'>‹ back</a>";
+    slot.innerHTML = html;
   }
 
   // After each render: ring the focus members + de-emphasize non-members. Distinct
@@ -722,6 +898,35 @@
     });
   }
 
+  // ---- PART 7: node packet "view neighborhood ▸" link --------------------------
+  // Re-center the bounded local view from any node: /?tier=<this node's tier>&anchor
+  // =<id>. The node's tier comes from the server (window.__RV_NODE_TIER__, the same
+  // node_tier rule used everywhere); we only offer it when that tier can actually be
+  // anchored (it's a real tier present in the graph). Inserted at the top of the
+  // packet's right column, next to the node id.
+  function initNeighborhoodLink() {
+    var nodeId = window.__RV_NODE__;
+    if (!nodeId) return;                       // not the node screen
+    var right = document.querySelector(".rv-packet-right");
+    if (!right) return;
+    var tier = window.__RV_NODE_TIER__;
+    var tiers = window.__RV_TIERS__ || [];
+    if (tier == null || tiers.indexOf(tier) === -1) return;   // nowhere to anchor
+
+    var href = "/?tier=" + encodeURIComponent(tier)
+      + "&anchor=" + encodeURIComponent(nodeId);
+    var wrap = document.createElement("div");
+    wrap.className = "rv-nb-link-row";
+    wrap.innerHTML =
+      "<a class='rv-nb-link' href='" + href + "' "
+      + "title='view this node’s bounded neighborhood in the "
+      + escapeHtml(tierLabel(tier)) + " graph'>"
+      + "view neighborhood ▸</a>"
+      + "<span class='rv-nb-link-sub'>this " + escapeHtml(tierLabel(tier))
+      + " node + its deps / dependents (bounded)</span>";
+    right.insertBefore(wrap, right.firstChild);
+  }
+
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
@@ -737,5 +942,6 @@
   document.addEventListener("DOMContentLoaded", function () {
     initHome();
     initVerdictForm();
+    initNeighborhoodLink();
   });
 })();
