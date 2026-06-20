@@ -65,6 +65,31 @@ _ASSETS_DIR = _REPO_ROOT / "assets" / "review"
 # we inject that fragment verbatim — never regenerating the informalization.
 _THM_OPEN = '<div class="thm"'
 
+# Whole-word match for an incompleteness marker in Lean: `sorry`, `admit`, or the
+# raw `sorryAx`. `\b` anchors keep it from firing inside an identifier (e.g.
+# `sorryHandler`, `my_admit`); the line scanner below first strips `--` comments so a
+# `-- sorry` note never counts. This is the live "not implemented yet" detector.
+_SORRY_RE = re.compile(r"\b(?:sorry|admit|sorryAx)\b")
+
+
+def _lean_has_sorry(text: str) -> bool:
+    """Best-effort: does this Lean source contain a real ``sorry``/``admit``/
+    ``sorryAx``?
+
+    Scans line by line, dropping each line's ``--`` trailing comment before matching
+    (a deliberately simple, *conservative* strip — a ``--`` inside a string literal is
+    rare in practice and a false negative here only means a node is *not* flagged
+    violet, never that a real gap is hidden somewhere it matters for trust). Block
+    comments (``/- … -/``) are not parsed; the whole-word regex makes a stray
+    ``sorry`` in prose unlikely, and the detector is intentionally permissive — its
+    job is to light up incomplete modules, not to be a Lean parser.
+    """
+    for line in text.splitlines():
+        code = line.split("--", 1)[0]
+        if _SORRY_RE.search(code):
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # agent dispatch — the palette + bounded, write-only task queue
@@ -275,6 +300,113 @@ class Project:
             "truncated": truncated,
             "total": len(lines),
         }
+
+    def _lean_root(self) -> Optional[Path]:
+        """Resolve the root of the Lean sources, or None when the feature is inert.
+
+        Same resolution the Lean-source panel uses: the explicit ``--lean-root``
+        (``self.lean_root``) wins, else graph ``metadata.lean_root``. ``None`` /
+        missing / unreadable metadata → ``None`` (the sorry feature simply does
+        nothing). Never raises.
+        """
+        root = self.lean_root
+        if root is None:
+            try:
+                mr = (self.metadata() or {}).get("lean_root")
+            except Exception:
+                mr = None
+            root = Path(mr) if mr else None
+        if root is None:
+            return None
+        try:
+            root = root.resolve()
+        except OSError:
+            return None
+        return root if root.is_dir() else None
+
+    def sorry_set(self, nodes: Dict[str, dict]) -> set:
+        """The set of node ids whose Lean is **incomplete** (a live ``sorry`` scan).
+
+        When ``lean_root`` is configured (``--lean-root`` or graph
+        ``metadata.lean_root``), scan every ``*.lean`` file under it for a whole-word
+        ``sorry`` / ``admit`` / ``sorryAx`` outside a ``--`` line comment, then map each
+        flagged file to its **module id** and propagate to that module's ancestors:
+
+          1. **file → module id.** A file ``<lean_root>/A/B/C.lean`` is module
+             ``A.B.C`` (Lean's package layout). A node may instead pin an explicit
+             relative ``lean_file``; such a node's id is used directly for that file
+             (an explicit ``lean_file`` overrides the path-derived id), so a module
+             whose graph id is not its dotted path is still matched.
+          2. **keep only real nodes.** A derived/declared module id is added to the
+             result only if it is actually a node in the graph — a ``.lean`` file with
+             no corresponding node contributes nothing (no phantom ids).
+          3. **ancestor propagation.** For every flagged module, walk ``node['parent']``
+             up the graph topology and add each ancestor (its unit, then its cluster,
+             …). An incomplete module therefore turns its parent unit and cluster violet
+             too, matching ``color_state``'s "a parent is sorry iff any descendant is".
+
+        Recomputed per request (cheap), and **degrades gracefully**: ``lean_root``
+        ``None`` / missing → ``set()``; an unreadable file is skipped; a malformed
+        node ``parent`` chain (or a cycle) is bounded so the walk always terminates.
+        ``lean_root`` absent ⇒ the feature is inert and the whole surface reproduces
+        its pre-sorry behavior exactly.
+        """
+        root = self._lean_root()
+        if root is None:
+            return set()
+
+        # Explicit pins: lean_file (relative, as resolved against root) -> node id.
+        # An explicit lean_file wins over the path-derived module id for that file.
+        explicit: Dict[Path, str] = {}
+        for nid, node in nodes.items():
+            rel = (node or {}).get("lean_file")
+            if not rel:
+                continue
+            try:
+                tgt = (root / rel).resolve()
+                tgt.relative_to(root)            # ignore any ../ escape
+            except (OSError, ValueError):
+                continue
+            explicit[tgt] = nid
+
+        flagged: set = set()
+        try:
+            lean_files = sorted(root.rglob("*.lean"))
+        except OSError:
+            lean_files = []
+        for f in lean_files:
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            if not _lean_has_sorry(text):
+                continue
+            fr = f.resolve()
+            # Map this file to a module id: an explicit lean_file pin wins, else the
+            # dotted path relative to lean_root (A/B/C.lean -> A.B.C).
+            nid = explicit.get(fr)
+            if nid is None:
+                try:
+                    relpath = fr.relative_to(root)
+                except ValueError:
+                    continue
+                nid = ".".join(relpath.with_suffix("").parts)
+            # Only a real graph node counts (no phantom ids from stray .lean files).
+            if nid in nodes:
+                flagged.add(nid)
+
+        # Propagate each flagged module to its ancestors (parent unit, cluster, …) by
+        # walking node['parent'] up the topology, bounded against a malformed cycle.
+        result: set = set()
+        for nid in flagged:
+            cur: Optional[str] = nid
+            seen: set = set()
+            while cur and cur in nodes and cur not in seen:
+                seen.add(cur)
+                result.add(cur)
+                parent = nodes[cur].get("parent")
+                cur = parent if isinstance(parent, str) else None
+        return result
 
     def kernel_evidence(self, node_id: str) -> Optional[str]:
         """The ``#print axioms`` dump for a node, if a ``kernel/<id>.txt`` exists."""
@@ -516,7 +648,11 @@ def render_home(proj: Project, tier: Optional[int] = None,
                 radius: Optional[int] = None) -> bytes:
     nodes = proj.nodes()
     sidecar = proj.sidecar()
-    state = rm.compute_state(nodes, sidecar)
+    # Live "not implemented" set: node ids whose Lean has a sorry/admit/sorryAx (plus
+    # each one's ancestor unit/cluster). Empty when no lean_root is configured, so the
+    # whole surface is unchanged in that case. Recomputed per request.
+    sorry_set = proj.sorry_set(nodes)
+    state = rm.compute_state(nodes, sidecar, sorry_set)
     # Resolve the requested tier against the tiers actually present; the default
     # home is the lowest tier present.
     present = rm.tiers_present(nodes)
@@ -561,7 +697,8 @@ def render_home(proj: Project, tier: Optional[int] = None,
     if too_large is not None:
         dot = _placeholder_dot()
     else:
-        dot = rm.recolor_dot(nodes, sidecar, tier=tier, only=only)
+        dot = rm.recolor_dot(nodes, sidecar, tier=tier, only=only,
+                             sorry_set=sorry_set)
     slug_map = proj.slug_map()
     # id<->slug both directions so the client can route node clicks to /node/<id>.
     id_by_slug = {slug: nid for nid, slug in slug_map.items()}
@@ -670,6 +807,7 @@ def _legend_html() -> str:
         "<span class='rv-key rv-clean'>ours · clean</span>"
         "<span class='rv-key rv-flagged'>flagged</span>"
         "<span class='rv-key rv-rejected'>rejected</span>"
+        "<span class='rv-key rv-sorry'>sorry / not implemented</span>"
         "<span class='rv-key rv-grey'>unreviewed</span>"
         "<span class='rv-key rv-dash'>AI-only (dashed)</span>"
         "<span class='rv-key rv-solid'>human-confirmed</span>"
@@ -787,10 +925,18 @@ def render_node(proj: Project, node_id: str) -> bytes:
         note = (f"<span class='rv-lean-trunc'>showing first "
                 f"{len(lean['text'].splitlines())} of {lean['total']} lines</span>"
                 if lean["truncated"] else "")
+        # "contains sorry" badge: this module's Lean has a live sorry/admit/sorryAx
+        # (its id is in the sorry set as a flagged *module*, not merely an ancestor),
+        # so the packet flags the incomplete code beside the source. Empty/absent
+        # lean_root ⇒ sorry_set is empty ⇒ no badge (unchanged behavior).
+        sorry_note = ""
+        if node_id in proj.sorry_set(nodes):
+            sorry_note = ("<span class='rv-lean-sorry'>contains "
+                          "<code>sorry</code> — not implemented yet</span>")
         lean_html = (
             "<section class='rv-lean'>"
             f"<h3 class='rv-lean-h'>Lean source <code>{_E(lean['rel'])}</code>"
-            f"{note}</h3>"
+            f"{note}{sorry_note}</h3>"
             f"<pre class='rv-lean-pre'><code>{_E(lean['text'])}</code></pre>"
             "</section>"
         )
@@ -939,7 +1085,9 @@ def make_handler(proj: Project):
                 return self._send(
                     200, render_home(proj, tier, focus, anchor, radius))
             if path == "/api/state":
-                return self._json(200, rm.compute_state(proj.nodes(), proj.sidecar()))
+                nodes = proj.nodes()
+                return self._json(200, rm.compute_state(
+                    nodes, proj.sidecar(), proj.sorry_set(nodes)))
             if path == "/api/dot":
                 return self._api_dot(parsed)
             if path == "/api/agents":
@@ -1022,8 +1170,12 @@ def make_handler(proj: Project):
             if too_large is not None:
                 dot = _placeholder_dot()
             else:
+                # Live sorry set (ids + ancestors); empty without a lean_root, so a
+                # re-render matches the home paint and is unchanged when inert.
+                sorry_set = proj.sorry_set(nodes)
                 dot = rm.recolor_dot(nodes, sidecar, tier=tier,
-                                     expanded=expanded, only=only)
+                                     expanded=expanded, only=only,
+                                     sorry_set=sorry_set)
             slug_map = proj.slug_map()
             id_by_slug = {slug: nid for nid, slug in slug_map.items()}
             kinds = {nid: (node.get("kind") or "theorem")
@@ -1172,8 +1324,10 @@ def make_handler(proj: Project):
                 return self._json(400, {"ok": False, "error": str(exc)})
             proj.write_sidecar(updated)
 
-            # Recompute and return the delta the client needs to repaint.
-            state = rm.compute_state(nodes, updated)
+            # Recompute and return the delta the client needs to repaint. Thread the
+            # live sorry set so the returned taint/frontier/coverage reflect incomplete
+            # Lean too (empty without a lean_root ⇒ unchanged behavior).
+            state = rm.compute_state(nodes, updated, proj.sorry_set(nodes))
             return self._json(200, {
                 "ok": True,
                 "node": node_id,

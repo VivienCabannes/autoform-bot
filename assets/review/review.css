@@ -16,6 +16,8 @@
   --clean: #2F7D4F;
   --flagged: #C08A1E;
   --rejected: #C0392B;
+  --sorry: #7C3AED;          /* violet — Lean contains a sorry/admit/sorryAx (incomplete) */
+  --sorry-fill: #ECE7FB;
   --grey: #C9C2B4;
   --line: #DAD4C7;
 }
@@ -181,6 +183,8 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-key.rv-clean { border-color: var(--clean); color: var(--clean); }
 .rv-key.rv-flagged { border-color: var(--flagged); color: var(--flagged); }
 .rv-key.rv-rejected { border-color: var(--rejected); color: var(--rejected); }
+.rv-key.rv-sorry { border-color: var(--sorry); color: var(--sorry);
+  background: var(--sorry-fill); }
 .rv-key.rv-grey { border-color: var(--grey); color: #8a8575; }
 .rv-key.rv-dash { border-style: dashed; }
 .rv-key.rv-solid { background: #eef0ea; }
@@ -567,6 +571,12 @@ body.rv-drag-active .rv-graph .node { cursor: copy; }
   font-size: 12px;
 }
 .rv-lean-trunc { font-style: italic; color: #8a8575; margin-left: 8px; font-size: 12px; font-weight: 400; }
+.rv-lean-sorry {
+  margin-left: 8px; font-size: 12px; font-weight: 600; color: var(--sorry);
+  border: 1.5px solid var(--sorry); background: var(--sorry-fill);
+  padding: 1px 8px; border-radius: 10px;
+}
+.rv-lean-sorry code { background: none; color: inherit; padding: 0; font-size: inherit; }
 .rv-lean-pre {
   background: #1f1d1a; color: #e8e3d8; border: 1px solid var(--line);
   border-radius: 8px; padding: 14px 16px; overflow: auto; max-height: 62vh;
