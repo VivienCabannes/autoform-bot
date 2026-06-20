@@ -102,7 +102,8 @@
   var dispatch = {
     palette: window.__RV_DISPATCH_PALETTE__ || [],   // [{id,label,icon,blurb,applies}]
     queue: [],                                       // [{id,agent,node,node_label,status,…}]
-    live: { orchestrator: { state: "idle" }, agents: [] }
+    live: { orchestrator: { state: "idle" }, agents: [] },
+    backend: null                                    // {current, options:[{id,label,available,billing}]}
   };
 
   // ---- tier-agnostic topology (replaces the tier-1-only state.clusters logic) ----
@@ -878,6 +879,7 @@
     if (Array.isArray(data.palette)) dispatch.palette = data.palette;
     dispatch.queue = Array.isArray(data.queue) ? data.queue : [];
     dispatch.live = data.live || { orchestrator: { state: "idle" }, agents: [] };
+    if (data.backend) dispatch.backend = data.backend;
     renderActivity(panel);
 
     // Live pulse: the node(s) agents are actively working on (the live feed's
@@ -926,6 +928,25 @@
       + "<span class='rv-pill rv-pill-" + escapeHtml(ostate) + "'>"
       + "<span class='rv-pill-dot'></span>" + escapeHtml(ostate) + "</span>"
       + "</div>";
+
+    // --- backend selector: which prover backend the agents run on (shared with
+    //     /autoform:set-backend via ~/.autoform/config.json; also the billing path) ---
+    var be = dispatch.backend;
+    if (be && Array.isArray(be.options)) {
+      var cur = be.current || "max";
+      var curOpt = be.options.filter(function (o) { return o.id === cur; })[0] || {};
+      html += "<div class='rv-backend'>"
+        + "<label class='rv-be-label' for='rv-be-select'>backend</label>"
+        + "<select id='rv-be-select' class='rv-be-select'>";
+      be.options.forEach(function (o) {
+        var lbl = (o.label || o.id) + (o.available ? "" : " (planned)");
+        html += "<option value='" + escapeHtml(o.id) + "'"
+          + (o.id === cur ? " selected" : "") + ">" + escapeHtml(lbl) + "</option>";
+      });
+      html += "</select>"
+        + "<span class='rv-be-billing'>" + escapeHtml(curOpt.billing || "") + "</span>"
+        + "</div>";
+    }
 
     // --- "Agents · ready": the draggable dispatch palette ---
     html += "<div class='rv-palette-sec'>"
@@ -1038,6 +1059,30 @@
     panel.innerHTML = html;
     wirePalette(panel);
     wireTaskCancels(panel);
+    wireBackend(panel);
+  }
+
+  // Wire the backend dropdown: on change, POST /api/backend {backend} → persist the
+  // choice (shared with /autoform:set-backend) and refetch so the billing hint + the
+  // selected option reflect the server's truth. Disables the select while in flight.
+  function wireBackend(panel) {
+    var sel = panel.querySelector(".rv-be-select");
+    if (!sel) return;
+    sel.addEventListener("change", function () {
+      var backend = sel.value;
+      sel.disabled = true;
+      fetch("/api/backend", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backend: backend })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          if (res && res.backend) dispatch.backend = res.backend;
+        })
+        .catch(function () { /* leave the prior selection; poll will reconcile */ })
+        .then(function () { sel.disabled = false; refreshDispatch(); });
+    });
   }
 
   // Merge the dispatch queue with live agents into a single task list. Queue rows are

@@ -438,6 +438,23 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
   background: var(--paper); border: 1px solid var(--line);
   border-radius: 9px; padding: 0 6px; margin-left: 2px;
 }
+/* --- backend selector (which prover backend the agents run on) --- */
+.rv-backend {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 12px; padding: 8px 10px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+}
+.rv-be-label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #8a8575;
+}
+.rv-be-select {
+  font: inherit; font-size: 13px; padding: 3px 8px; border-radius: 8px;
+  border: 1.5px solid var(--accent); background: #fff; color: var(--accent);
+  font-weight: 600; cursor: pointer;
+}
+.rv-be-select:disabled { opacity: .6; cursor: progress; }
+.rv-be-billing { flex-basis: 100%; font-size: 11px; color: #8a8575; font-style: italic; }
+
 .rv-palette-sec { margin-bottom: 12px; }
 .rv-palette { display: flex; flex-direction: column; gap: 6px; }
 .rv-palette-card {

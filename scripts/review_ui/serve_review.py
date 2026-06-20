@@ -118,6 +118,67 @@ AGENT_PALETTE = [
 # Set of valid agent ids (membership test for /api/request validation).
 _PALETTE_IDS = {a["id"] for a in AGENT_PALETTE}
 
+# ---------------------------------------------------------------------------
+# prover backend selection — shared with the /autoform:set-backend command via the
+# SAME config file (~/.autoform/config.json, override with $AUTOFORM_CONFIG). The
+# dashboard reads it for the backend dropdown and writes it when the user flips it,
+# so the UI and the CLI stay in sync. Backend is also the billing path: max = the Max
+# subscription (no API tokens), aristotle = Harmonic, codex = its own (planned).
+# Mirrors plugins/autoform/scripts/backend_config.py's registry.
+# ---------------------------------------------------------------------------
+BACKENDS = {
+    "max": {"label": "Claude Max", "available": True,
+            "billing": "Max subscription · no API tokens"},
+    "aristotle": {"label": "Aristotle", "available": True,
+                  "billing": "Harmonic · ARISTOTLE_API_KEY"},
+    "codex": {"label": "Codex", "available": False,
+              "billing": "Codex · its own auth (planned)"},
+}
+_DEFAULT_BACKEND = "max"
+
+
+def _backend_config_path() -> Path:
+    return Path(os.environ.get(
+        "AUTOFORM_CONFIG", str(Path.home() / ".autoform" / "config.json")))
+
+
+def get_backend() -> str:
+    """The persisted prover backend, or ``max`` if unset/unreadable/unknown."""
+    try:
+        data = json.loads(_backend_config_path().read_text())
+        if data.get("backend") in BACKENDS:
+            return data["backend"]
+    except Exception:
+        pass
+    return _DEFAULT_BACKEND
+
+
+def set_backend(backend: str) -> None:
+    """Persist ``backend`` to the shared config (atomic). Raises ValueError if unknown."""
+    if backend not in BACKENDS:
+        raise ValueError(f"unknown backend {backend!r}")
+    p = _backend_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data["backend"] = backend
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _backend_payload() -> dict:
+    """The {current, options} the dashboard's backend dropdown renders from."""
+    return {
+        "current": get_backend(),
+        "options": [{"id": k, "label": v["label"], "available": v["available"],
+                     "billing": v["billing"]} for k, v in BACKENDS.items()],
+    }
+
 # Hard cap on the dispatch queue (bounded write — the orchestrator drains it).
 TASK_QUEUE_CAP = 200
 
@@ -1107,6 +1168,7 @@ def make_handler(proj: Project):
                     "palette": AGENT_PALETTE,
                     "queue": proj.task_queue(),
                     "live": proj.agents(),
+                    "backend": _backend_payload(),
                 })
             if path.startswith("/assets/"):
                 return self._serve_asset(path[len("/assets/"):])
@@ -1232,9 +1294,29 @@ def make_handler(proj: Project):
                 return self._post_request()
             if path == "/api/request/cancel":
                 return self._post_request_cancel()
+            if path == "/api/backend":
+                return self._post_backend()
             if path.startswith("/api/verdict/"):
                 return self._post_verdict(path)
             return self._json(404, {"ok": False, "error": "not found"})
+
+        def _post_backend(self):
+            """POST /api/backend {backend} → persist the prover backend to the shared
+            config (~/.autoform/config.json — the same file /autoform:set-backend uses),
+            so the UI dropdown and the CLI stay in sync. 400 unless the backend is known.
+            Returns {ok:true, backend:{current, options}}."""
+            posted = self._read_json_body()
+            if posted is _BAD_JSON:
+                return self._json(400, {"ok": False, "error": "bad json"})
+            backend = posted.get("backend")
+            if backend not in BACKENDS:
+                return self._json(400, {"ok": False,
+                                        "error": f"unknown backend {backend!r}"})
+            try:
+                set_backend(backend)
+            except Exception as err:  # pragma: no cover - disk/permission edge
+                return self._json(500, {"ok": False, "error": str(err)})
+            return self._json(200, {"ok": True, "backend": _backend_payload()})
 
         def _post_request(self):
             """POST /api/request {agent, node} → enqueue a dispatch request.
