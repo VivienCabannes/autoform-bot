@@ -301,7 +301,7 @@ def render_home(proj: Project, tier: int = 1) -> bytes:
         + ("<span class='rv-tt rv-tt-on'>Tier 1 · clusters</span>" if tier == 1
            else "<a class='rv-tt' href='/?tier=1'>Tier 1 · clusters</a>")
         + ("<span class='rv-tt rv-tt-on'>Tier 2 · statements</span>" if tier == 2
-           else "<a class='rv-tt' href='/'>Tier 2 · statements</a>")
+           else "<a class='rv-tt' href='/?tier=2'>Tier 2 · statements</a>")
         + ("<span class='rv-tt-hint'>click a cluster to unroll it</span>"
            if tier == 1 else "")
         + "</div>"

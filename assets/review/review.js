@@ -98,20 +98,28 @@
     home.rendering = true;
     var loading = mount.querySelector(".rv-graph-loading");
     if (loading) loading.remove();
-    try {
-      var gv = window.d3.select(mount).graphviz({ useWorker: false }).fit(true);
-      if (transition) {
-        gv = gv.transition(function () {
-          return window.d3.transition("rv").duration(TRANSITION_MS);
-        });
-      }
-      gv.renderDot(dot).on("end", function () {
-        home.rendering = false;
-        decorate(mount);
-        applyPulse();           // re-apply pulse after every (re)render
-      });
-    } catch (e) {
+    // Settle exactly once — wire clicks + pulse, and release the render lock. We
+    // do NOT depend solely on d3-graphviz's "end" event (if it doesn't fire,
+    // home.rendering would stay true and every later click would be dropped); a
+    // safety timeout guarantees the lock is released.
+    var settled = false;
+    function settle() {
+      if (settled) return;
+      settled = true;
       home.rendering = false;
+      decorate(mount);
+      applyPulse();
+    }
+    try {
+      // Reuse the per-element graphviz instance and re-render. We re-render rather
+      // than morph: structural d3-graphviz transitions (adding a subgraph cluster on
+      // unroll) can silently drop the new nodes, so a clean re-render is reliable.
+      var gv = window.d3.select(mount).graphviz({ useWorker: false }).fit(true);
+      gv.renderDot(dot);
+      gv.on("end", settle);
+      setTimeout(settle, 500);
+    } catch (e) {
+      settle();
       home.online = false;
       renderFallback(mount);
     }
