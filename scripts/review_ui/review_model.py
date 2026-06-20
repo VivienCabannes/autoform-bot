@@ -551,6 +551,24 @@ def cluster_color(cluster_id: str, nodes: Dict[str, dict], sidecar: dict) -> str
     return rollup_color(cluster_id, nodes, sidecar)
 
 
+def rollup_source(parent_id: str, nodes: Dict[str, dict], sidecar: dict) -> str:
+    """Solid-vs-dashed for a *collapsed parent* node. A parent is drawn **solid**
+    ("human") only if every child's trust is vouched — each child is either in-Mathlib
+    (blue, trusted by construction) or human-confirmed. If any child's status rests on
+    an AI-only review (or is unreviewed), the parent is **dashed** ("ai" / provisional),
+    so a cluster of only AI-reviewed nodes never looks human-vouched."""
+    kids = child_ids(parent_id, nodes)
+    if not kids:
+        return "ai"
+    for c in kids:
+        if is_in_mathlib(nodes.get(c, {})):
+            continue
+        if review_source(c, sidecar) == "human":
+            continue
+        return "ai"
+    return "human"
+
+
 # ---------------------------------------------------------------------------
 # coverage + trust frontier
 # ---------------------------------------------------------------------------
@@ -728,7 +746,7 @@ def _recolor_tier_dot(
             # collapsed parent → single node colored by the roll-up over its children
             lines.append(_verdict_node_dot(
                 nid, sub[nid], name_to_slug[nid],
-                "unreviewed", "human", False,
+                "unreviewed", rollup_source(nid, nodes, sidecar), False,
                 state_override=rollup_color(nid, nodes, sidecar),
             ))
         else:
