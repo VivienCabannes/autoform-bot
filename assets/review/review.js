@@ -501,6 +501,11 @@
           overlayHatch(g);
         }
       }
+
+      // Every node also gets a small circled-"i" details badge → its packet, whether
+      // a body-click unrolls it (parent) or routes to it (leaf). The badge stops
+      // propagation, so opening details never triggers an unroll.
+      addInfoBadge(g, id);
     });
 
     // 2) Expanded boxes: clicking the box (its label/background) collapses it. The
@@ -523,6 +528,38 @@
         collapseNode(id);
       });
     });
+  }
+
+  // A small circled-"i" badge pinned to a node's top-right corner. Clicking it opens
+  // that node's detail packet (/node/<id>) — so you can inspect a node's specifics
+  // without unrolling it. Idempotent; positioned in the node's own SVG user space so
+  // the graph transform carries it along with the node.
+  function addInfoBadge(g, id) {
+    if (!id || g.querySelector(".rv-info-badge")) return;
+    var shape = g.querySelector("ellipse, polygon, path");
+    if (!shape) return;
+    var bb;
+    try { bb = shape.getBBox(); } catch (e) { return; }
+    if (!bb || !bb.width) return;
+    var ns = "http://www.w3.org/2000/svg";
+    var cx = bb.x + bb.width - 8, cy = bb.y + 9;
+    var badge = document.createElementNS(ns, "g");
+    badge.setAttribute("class", "rv-info-badge");
+    var circ = document.createElementNS(ns, "circle");
+    circ.setAttribute("cx", cx); circ.setAttribute("cy", cy); circ.setAttribute("r", "7.5");
+    var txt = document.createElementNS(ns, "text");
+    txt.setAttribute("x", cx); txt.setAttribute("y", cy);
+    txt.setAttribute("text-anchor", "middle");
+    txt.setAttribute("dominant-baseline", "central");
+    txt.textContent = "i";
+    var tip = document.createElementNS(ns, "title");
+    tip.textContent = "view details for " + id;
+    badge.appendChild(circ); badge.appendChild(txt); badge.appendChild(tip);
+    badge.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      window.location.href = "/node/" + encodeURIComponent(id);
+    });
+    g.appendChild(badge);
   }
 
   function overlayHatch(g) {

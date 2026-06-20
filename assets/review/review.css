@@ -204,6 +204,15 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-graph .node { cursor: pointer; transition: opacity .15s ease; }
 .rv-graph .node:hover { opacity: .85; }
 
+/* per-node circled-"i" details badge: open a node's packet without unrolling it.
+   Subtle by default, brightens on node/badge hover. */
+.rv-info-badge { cursor: pointer; opacity: .5; transition: opacity .12s ease; }
+.rv-graph .node:hover .rv-info-badge { opacity: 1; }
+.rv-info-badge circle { fill: #fff; stroke: var(--accent); stroke-width: 1.3; }
+.rv-info-badge text { fill: var(--accent); font: italic 700 10px Georgia, "Times New Roman", serif; }
+.rv-info-badge:hover circle { fill: var(--accent); }
+.rv-info-badge:hover text { fill: #fff; }
+
 .rv-graph-loading, .rv-act-loading {
   padding: 26px 18px; color: #8a8575; font-size: 13px; font-style: italic;
 }
