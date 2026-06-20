@@ -875,6 +875,12 @@ def recolor_dot(
 
     lines: List[str] = ['strict digraph "" {']
     lines.extend(eb._graph_attr_lines())
+    # Curved splines + concentrate are O(slow) in graphviz-wasm and hang the browser
+    # on the larger review graphs (the tier-2/tier-3 graphs carry 100s–1000s of edges).
+    # Fall back to straight-line edges beyond a small graph: the layout stays fast and a
+    # dependency DAG reads fine without curved routing. (Keep curved for the tiny views.)
+    if len(sub) > 15:
+        lines.append("  graph [splines=line, concentrate=false];")
     ids = set(sub)
 
     return _recolor_tier_dot(
