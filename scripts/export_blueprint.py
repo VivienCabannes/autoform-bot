@@ -920,7 +920,7 @@ split-level=0
 [html5]
 localtoc-level=0
 mathjax-dollars=False
-extra-js=tier_dots.js
+extra-js=tier_dots.js,dep_graph_core.js
 extra-css=extra_styles.css
 """
 
@@ -1201,6 +1201,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     js_text, tiers_present = emit_tier_dots_js(nodes, name_to_slug)
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir / "tier_dots.js").write_text(js_text)
+    # Shared dependency-graph renderer (the SAME module the live review surface uses) —
+    # written into src/ so plasTeX's extra-js copies it to web/js/, where the template
+    # loads it as js/dep_graph_core.js. Best-effort: if the asset isn't present (an older
+    # checkout without the review surface), the template's render() falls back to its
+    # bundled reused-instance renderer — never a regression.
+    _core_js = repo_root / "assets" / "review" / "dep_graph_core.js"
+    if _core_js.is_file():
+        (src_dir / "dep_graph_core.js").write_text(_core_js.read_text())
 
     # web.tex + print.tex + plastex.cfg + macros + scaffolding.
     web_tex, options_line = build_web_tex(template_path, title, metadata)

@@ -274,43 +274,33 @@
     home.rendering = true;
     var loading = mount.querySelector(".rv-graph-loading");
     if (loading) loading.remove();
-    // Render into a FRESH child element each time. d3-graphviz throws when it
-    // re-renders a structurally different graph on a *reused* instance — an unroll
-    // introduces a `subgraph cluster_…`, which is exactly that case. A brand-new
-    // element carries no stale renderer state, so every (re)render is a clean
-    // first-render. Keep the old graph visible until the new one settles, then swap.
-    var stage = document.createElement("div");
-    stage.className = "rv-graph-stage";
-    stage.style.cssText = "width:100%;height:100%;";
-    mount.appendChild(stage);
-    var settled = false;
-    function settle() {
-      if (settled) return;
-      settled = true;
+    // The d3-graphviz rendering (fresh-stage-per-render + settle/timeout backstop) is
+    // the shared DepGraphCore.renderDot — the SAME renderer the leanblueprint dep-graph
+    // page uses, so the two viewers don't duplicate it. We pass our own stage class
+    // ("rv-graph-stage", which carries the canvas-sizing CSS), do the review-specific
+    // decoration on settle, and drop to the offline fallback on a render throw.
+    if (!(window.DepGraphCore && window.d3 && window.d3.select(mount).graphviz)) {
       home.rendering = false;
-      // Drop every prior stage, keeping only the one we just rendered.
-      var stages = mount.querySelectorAll(".rv-graph-stage");
-      for (var i = 0; i < stages.length; i++) {
-        if (stages[i] !== stage) stages[i].remove();
-      }
-      decorate(mount);
-      applyFocusRing();
-      applyPulse();
-      applyPending();
-    }
-    try {
-      var gv = window.d3.select(stage).graphviz({ useWorker: false }).fit(true);
-      gv.renderDot(dot);
-      gv.on("end", settle);
-      // Safety: settle even if d3-graphviz's "end" event doesn't fire in this build.
-      setTimeout(settle, 700);
-    } catch (e) {
-      settled = true;
-      home.rendering = false;
-      stage.remove();
       home.online = false;
       renderFallback(mount);
+      return;
     }
+    window.DepGraphCore.renderDot(mount, dot, {
+      useWorker: false,
+      stageClass: "rv-graph-stage",
+      onSettle: function () {
+        home.rendering = false;
+        decorate(mount);
+        applyFocusRing();
+        applyPulse();
+        applyPending();
+      },
+      onError: function () {
+        home.rendering = false;
+        home.online = false;
+        renderFallback(mount);
+      }
+    });
   }
 
   // Fetch a fresh DOT for the current tier + `expanded` set and re-render with a

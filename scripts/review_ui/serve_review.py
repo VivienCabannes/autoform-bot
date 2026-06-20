@@ -533,6 +533,7 @@ def _page(title: str, body: str, bootstrap: str = "") -> bytes:
         f"<span class='rv-title'>{_E(title)}</span></header>"
         f"<main class='rv-main'>{body}</main>"
         f"{boot}"
+        "<script src='/assets/dep_graph_core.js'></script>"
         "<script src='/assets/review.js'></script>"
         "</body></html>"
     ).encode("utf-8")
