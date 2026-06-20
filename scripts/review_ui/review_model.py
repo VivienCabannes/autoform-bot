@@ -875,12 +875,18 @@ def recolor_dot(
 
     lines: List[str] = ['strict digraph "" {']
     lines.extend(eb._graph_attr_lines())
-    # Curved splines + concentrate are O(slow) in graphviz-wasm and hang the browser
-    # on the larger review graphs (the tier-2/tier-3 graphs carry 100s–1000s of edges).
-    # Fall back to straight-line edges beyond a small graph: the layout stays fast and a
-    # dependency DAG reads fine without curved routing. (Keep curved for the tiny views.)
-    if len(sub) > 15:
-        lines.append("  graph [splines=line, concentrate=false];")
+    # Curved splines + concentrate are O(slow) in graphviz-wasm and hang the browser on
+    # the larger review graphs (100s–1000s of edges). Drop them, and tighten ranksep/
+    # nodesep so the graph stays compact — a spread-out layout fits the canvas at a tiny
+    # scale, making nodes unreadable. (Keep the default curved look for the tiny views.)
+    n_render = len(sub)
+    if n_render > 120:
+        # very large (e.g. tier-3): fastest straight-line layout, very compact
+        lines.append("  graph [splines=line, concentrate=false, ranksep=0.4, nodesep=0.22];")
+    elif n_render > 15:
+        # medium (e.g. tier-2): polyline routes *around* nodes (readable) and is far
+        # cheaper than curved; compact spacing keeps nodes legible when fit to canvas
+        lines.append("  graph [splines=polyline, concentrate=false, ranksep=0.5, nodesep=0.32];")
     ids = set(sub)
 
     return _recolor_tier_dot(
