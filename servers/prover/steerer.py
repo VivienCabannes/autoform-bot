@@ -41,10 +41,10 @@ from .base import Event
 
 logger = logging.getLogger(__name__)
 
-# The rubric is the Hermes/Marathon steering rubric, verbatim in spirit: judge
-# whether the prover is going OFF-COURSE relative to the GOAL, with a high bar.
+# A live-steering rubric: judge whether the prover is going OFF-COURSE relative to
+# the GOAL, with a high bar to intervene.
 STEER_JUDGE_RUBRIC = (
-    "You are the live-steering judge ('Hermes') for an autonomous Lean prover. You see a "
+    "You are the live-steering judge for an autonomous Lean prover. You see a "
     "window of its recent events (thinking, file edits, errors, build output). Decide whether "
     "it is going OFF-COURSE relative to the GOAL — e.g. abandoning the goal, axiomatizing / "
     "`sorry`-ing / `admit`-ing what it was asked to prove, weakening or pinning a parameter it "
