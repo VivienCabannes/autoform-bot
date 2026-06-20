@@ -249,6 +249,32 @@ def _render_md(md: str) -> str:
 # Human-facing labels for the tier toggle (SHARED_SPEC): tier number -> label.
 TIER_LABELS = {1: "clusters", 2: "statements", 3: "declarations"}
 
+# A flat tier with more than LARGE nodes is too big to render whole (the browser
+# hangs). Instead of the full graph we serve a friendly placeholder + an entry-point
+# picker (the client builds the picker from __RV_NODES__). Local views (focus/anchor)
+# render a bounded neighborhood and so are never subject to this guard.
+LARGE = 120
+
+# How far a neighborhood reaches, and how many nodes it may contain. The local view is
+# always bounded by NB_CAP so it loads fast; the anchor radius is clamped to NB_MAX_RADIUS.
+NB_CAP = 60
+NB_MIN_RADIUS = 1
+NB_MAX_RADIUS = 3
+
+
+def _clamp_radius(raw) -> int:
+    """Resolve a ``?radius=`` query value, clamped to ``[NB_MIN_RADIUS, NB_MAX_RADIUS]``.
+
+    Defaults to ``NB_MIN_RADIUS`` (1) when absent or non-integer; an out-of-range
+    value is clamped, never rejected, so a bad/oversized radius still renders a
+    bounded view rather than erroring.
+    """
+    try:
+        k = int(raw)
+    except (TypeError, ValueError):
+        return NB_MIN_RADIUS
+    return max(NB_MIN_RADIUS, min(NB_MAX_RADIUS, k))
+
 
 def _parse_tier(raw, nodes: Dict[str, dict]) -> int:
     """Resolve a ``?tier=`` query value against the tiers actually present.
@@ -296,6 +322,26 @@ def _topology(nodes: Dict[str, dict]) -> dict:
     return {"children": children, "parents": parents}
 
 
+def _tier_count(tier: int, nodes: Dict[str, dict]) -> int:
+    """How many nodes sit at ``tier`` (drives the flat too-large guard)."""
+    import export_blueprint as eb
+    return sum(1 for n in nodes.values() if eb.node_tier(n) == tier)
+
+
+def _placeholder_dot() -> str:
+    """An empty placeholder DOT for the too-large flat guard.
+
+    A valid-but-empty digraph: the client never renders it (it shows the picker card
+    when ``__RV_TOO_LARGE__`` is set), and ``/api/dot`` returns it so a stray re-render
+    request for a too-large flat tier can never trigger the 226-node graph. Carries a
+    single invisible placeholder node so any d3/graphviz consumer parses cleanly.
+    """
+    return ('strict digraph "" {\n'
+            '  graph [splines=line];\n'
+            '  "__rv_placeholder__" [style=invis, label=""];\n'
+            '}')
+
+
 def _focus_payload(parent_id: Optional[str], nodes: Dict[str, dict]) -> Optional[dict]:
     """Build ``__RV_FOCUS__`` for ``?focus=<parentid>``: the parent, its display
     label, and the child ids one tier down (the members to highlight in context).
@@ -313,8 +359,41 @@ def _focus_payload(parent_id: Optional[str], nodes: Dict[str, dict]) -> Optional
     }
 
 
+def _anchor_payload(anchor_id: Optional[str], radius: int,
+                    nodes: Dict[str, dict]) -> Optional[dict]:
+    """Build ``__RV_ANCHOR__`` for ``?anchor=<nodeid>&radius=K``: the centered node id
+    and the (already clamped) radius. Returns None when there is no anchor or the
+    anchor is unknown, so the client renders the flat graph with no anchor banner.
+    """
+    if not anchor_id or anchor_id not in nodes:
+        return None
+    return {"id": anchor_id, "radius": radius}
+
+
+def _tier_nodes_payload(tier: int, nodes: Dict[str, dict]) -> list:
+    """The tier-`tier` nodes as ``[{id,label,parent}]`` (sorted by id) for the
+    too-large entry-point picker. Faithful to the data — real ids/labels/parents —
+    so the client can filter and jump to ``/?tier=N&anchor=<id>`` without rendering
+    the (too-large) graph.
+    """
+    import export_blueprint as eb
+    out = []
+    for nid in sorted(nodes):
+        node = nodes[nid]
+        if eb.node_tier(node) != tier:
+            continue
+        out.append({
+            "id": nid,
+            "label": node.get("name") or nid,
+            "parent": node.get("parent"),
+        })
+    return out
+
+
 def render_home(proj: Project, tier: Optional[int] = None,
-                focus: Optional[str] = None) -> bytes:
+                focus: Optional[str] = None,
+                anchor: Optional[str] = None,
+                radius: Optional[int] = None) -> bytes:
     nodes = proj.nodes()
     sidecar = proj.sidecar()
     state = rm.compute_state(nodes, sidecar)
@@ -322,11 +401,47 @@ def render_home(proj: Project, tier: Optional[int] = None,
     # home is the lowest tier present.
     present = rm.tiers_present(nodes)
     tier = _parse_tier(tier, nodes)
-    # The flat tier-N graph starts fully collapsed (no nodes expanded); the client
-    # unrolls in place by re-fetching /api/dot with an `expand` set. When focused on
-    # a parent one tier up, the client highlights that parent's members in context.
-    dot = rm.recolor_dot(nodes, sidecar, tier=tier)
+
+    # --- decide which graph to render ---
+    # Three mutually-distinct cases at this tier:
+    #   focus=<parent>  → a BOUNDED neighborhood of the parent's children (local view)
+    #   anchor=<node>   → a BOUNDED neighborhood centered on one node (local view)
+    #   flat (neither)  → the whole tier, UNLESS it is too large (> LARGE) — then a
+    #                     placeholder + picker, never the full graph.
     focus_payload = _focus_payload(focus, nodes)
+    radius = _clamp_radius(radius)
+    anchor_payload = _anchor_payload(anchor, radius, nodes)
+
+    only = None                  # the bounded subgraph (set of ids) or None for flat
+    neighborhood_view = False    # True for a focus/anchor local view
+    too_large = None             # __RV_TOO_LARGE__ payload for the flat guard
+    tier_nodes = None            # __RV_NODES__ picker list for the flat guard
+
+    if focus_payload is not None:
+        # Modules of <unit> + immediate neighbors: seed on the unit's children, ±1 hop.
+        members = focus_payload["members"]
+        only = rm.neighborhood(set(members), nodes, tier, radius=1, cap=NB_CAP)
+        neighborhood_view = True
+    elif anchor_payload is not None:
+        # Neighborhood of <anchor> within the clamped radius.
+        only = rm.neighborhood({anchor_payload["id"]}, nodes, tier, radius, cap=NB_CAP)
+        neighborhood_view = True
+    else:
+        # Flat tier view: guard a too-large tier — do NOT render the full graph.
+        tier_count = _tier_count(tier, nodes)
+        if tier_count > LARGE:
+            too_large = {"tier": tier, "count": tier_count, "threshold": LARGE}
+            tier_nodes = _tier_nodes_payload(tier, nodes)
+
+    # The flat tier-N graph starts fully collapsed (no nodes expanded); the client
+    # unrolls in place by re-fetching /api/dot with an `expand` set. A local view
+    # (focus/anchor) renders the bounded `only` subgraph instead of the whole tier;
+    # a too-large flat tier renders an empty placeholder DOT (the client shows the
+    # picker card, never the 226-node graph).
+    if too_large is not None:
+        dot = _placeholder_dot()
+    else:
+        dot = rm.recolor_dot(nodes, sidecar, tier=tier, only=only)
     slug_map = proj.slug_map()
     # id<->slug both directions so the client can route node clicks to /node/<id>.
     id_by_slug = {slug: nid for nid, slug in slug_map.items()}
@@ -343,8 +458,22 @@ def render_home(proj: Project, tier: Optional[int] = None,
         # The tiers actually present (drives the tier toggle + valid jump targets).
         f"window.__RV_TIERS__ = {json.dumps(present)};"
         # Focus mode: {parent, label, members:[child ids one tier down]} or null.
+        # In a too-large flat tier `focus` is still null; focus implies a local view.
         # The client adds a steady focus ring to the members + a "back" banner.
         f"window.__RV_FOCUS__ = {json.dumps(focus_payload)};"
+        # Local-view flags. __RV_NEIGHBORHOOD__ is true for a focus/anchor view (the
+        # `only` subgraph is bounded, so it renders normally). __RV_ANCHOR__ is
+        # {id, radius} for an anchor view (drives the "±K hops · ‹ back" banner and
+        # the "expand ±1 hop" control), else null.
+        f"window.__RV_NEIGHBORHOOD__ = {json.dumps(neighborhood_view)};"
+        f"window.__RV_ANCHOR__ = {json.dumps(anchor_payload)};"
+        # Too-large flat guard: when set, the client renders a placeholder card +
+        # entry-point picker (from __RV_NODES__) INSTEAD of the d3 graph — the DOT
+        # is an empty placeholder, never the full N-node graph.
+        #   __RV_TOO_LARGE__ = {tier, count, threshold} | null
+        #   __RV_NODES__     = [{id,label,parent}] (the tier's nodes, for the picker)
+        f"window.__RV_TOO_LARGE__ = {json.dumps(too_large)};"
+        f"window.__RV_NODES__ = {json.dumps(tier_nodes)};"
         # The client owns the `expanded` set; it starts empty (home = collapsed).
         f"window.__RV_EXPANDED__ = [];"
         # Tier-agnostic parent/children topology so the client can tell a parent
@@ -649,11 +778,16 @@ def make_handler(proj: Project):
             if path == "/":
                 qs = urllib.parse.parse_qs(parsed.query)
                 # Home renders the flat tier-N graph (?tier=N, any tier present;
-                # default = lowest tier present) optionally focused on a parent one
-                # tier up (?focus=<parentid>) so its children are highlighted.
+                # default = lowest tier present), OR a bounded local view:
+                #   ?focus=<parentid>          → unit's children + immediate neighbors
+                #   ?anchor=<nodeid>&radius=K  → neighborhood of one node (±K hops)
+                # A flat too-large tier renders a placeholder + picker instead.
                 tier = qs.get("tier", [None])[0]
                 focus = qs.get("focus", [None])[0]
-                return self._send(200, render_home(proj, tier, focus))
+                anchor = qs.get("anchor", [None])[0]
+                radius = qs.get("radius", [None])[0]
+                return self._send(
+                    200, render_home(proj, tier, focus, anchor, radius))
             if path == "/api/state":
                 return self._json(200, rm.compute_state(proj.nodes(), proj.sidecar()))
             if path == "/api/dot":
@@ -672,14 +806,28 @@ def make_handler(proj: Project):
             return self._send(404, b"not found")
 
         def _api_dot(self, parsed):
-            """GET /api/dot?tier=<N>&expand=id1,id2 -> {dot, id_by_slug, kinds}.
+            """GET /api/dot?tier=<N>&expand=id1,id2&focus=<p>&anchor=<n>&radius=K
+            -> {dot, id_by_slug, kinds, tier, topo, neighborhood, anchor, too_large,
+            nodes}.
 
             Lets the client re-render the graph with a transition (no full reload)
             after expanding/collapsing a node at the current tier. ``tier`` is any
             tier present in the graph (1, 2, 3, …); ``expand`` is a comma list of
             tier-N node ids to unroll in place into their tier-(N+1) children —
-            unknown ids and leaves are ignored by the model. The payload mirrors the
-            home bootstrap globals the client needs to repaint and re-wire clicks.
+            unknown ids and leaves are ignored by the model.
+
+            Mirrors the same **local-view** selection as ``render_home`` so a client
+            re-render matches the server's first paint:
+
+              * ``focus=<parentid>``         → ``only = neighborhood(children, ±1)``;
+              * ``anchor=<nodeid>&radius=K``  → ``only = neighborhood({anchor}, ±K)``
+                (K clamped 1..3);
+              * flat **too-large** tier (> LARGE, no focus/anchor) → an empty
+                placeholder DOT (never the full N-node graph) + ``too_large``/``nodes``
+                so the client shows the picker, exactly as the home guard does.
+
+            The payload mirrors the home bootstrap globals the client needs to repaint
+            and re-wire clicks.
             """
             nodes = proj.nodes()
             sidecar = proj.sidecar()
@@ -687,7 +835,36 @@ def make_handler(proj: Project):
             tier = _parse_tier(qs.get("tier", [None])[0], nodes)
             expand_raw = qs.get("expand", [""])[0]
             expanded = {c.strip() for c in expand_raw.split(",") if c.strip()}
-            dot = rm.recolor_dot(nodes, sidecar, tier=tier, expanded=expanded)
+
+            focus = qs.get("focus", [None])[0]
+            anchor = qs.get("anchor", [None])[0]
+            radius = _clamp_radius(qs.get("radius", [None])[0])
+            focus_payload = _focus_payload(focus, nodes)
+            anchor_payload = _anchor_payload(anchor, radius, nodes)
+
+            only = None
+            neighborhood_view = False
+            too_large = None
+            tier_nodes = None
+            if focus_payload is not None:
+                only = rm.neighborhood(set(focus_payload["members"]), nodes, tier,
+                                       radius=1, cap=NB_CAP)
+                neighborhood_view = True
+            elif anchor_payload is not None:
+                only = rm.neighborhood({anchor_payload["id"]}, nodes, tier, radius,
+                                       cap=NB_CAP)
+                neighborhood_view = True
+            elif _tier_count(tier, nodes) > LARGE:
+                # Flat too-large tier: never emit the full graph — placeholder + picker.
+                too_large = {"tier": tier, "count": _tier_count(tier, nodes),
+                             "threshold": LARGE}
+                tier_nodes = _tier_nodes_payload(tier, nodes)
+
+            if too_large is not None:
+                dot = _placeholder_dot()
+            else:
+                dot = rm.recolor_dot(nodes, sidecar, tier=tier,
+                                     expanded=expanded, only=only)
             slug_map = proj.slug_map()
             id_by_slug = {slug: nid for nid, slug in slug_map.items()}
             kinds = {nid: (node.get("kind") or "theorem")
@@ -700,6 +877,12 @@ def make_handler(proj: Project):
                 # Same tier-agnostic topology as the home boot, so a re-render after
                 # an unroll keeps the client's parent/leaf + child→parent maps fresh.
                 "topo": _topology(nodes),
+                # Local-view / guard mirrors so a re-render matches the home paint.
+                "focus": focus_payload,
+                "neighborhood": neighborhood_view,
+                "anchor": anchor_payload,
+                "too_large": too_large,
+                "nodes": tier_nodes,
             })
 
         def _serve_asset(self, name):

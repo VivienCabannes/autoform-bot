@@ -472,6 +472,90 @@ def tiers_present(nodes: Dict[str, dict]) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# bounded local neighborhood — BFS by hop over depends_on, BOTH directions
+# ---------------------------------------------------------------------------
+
+def neighborhood(
+    anchors,
+    nodes: Dict[str, dict],
+    tier: int,
+    radius: int = 1,
+    cap: int = 60,
+) -> Set[str]:
+    """The bounded set of **tier-`tier`** node ids within ``radius`` hops of
+    ``anchors``, following ``depends_on`` in **both directions** (a node's own deps
+    ∪ the nodes that depend on it), with the anchors themselves always included.
+
+    This is what powers the *local view*: instead of rendering a whole too-large
+    tier (e.g. 226 tier-3 modules), we render only a small subgraph around a node or
+    a unit's children. The walk is restricted to a single tier — only tier-`tier`
+    nodes are ever traversed or returned — and is a true breadth-first expansion by
+    hop, so "closest first" is well defined.
+
+    Bounding (faithful + fast):
+
+      * BFS by hop from the anchor frontier; each hop adds the tier-`tier` neighbors
+        (deps ∪ dependents) of the current frontier not yet seen.
+      * **Anchors are always in the result**, even past ``cap`` — the thing you asked
+        to center on is never dropped (anchors are added first, before any cap trim).
+      * If a hop would push the total past ``cap``, only as many of that hop's new
+        nodes as fit are kept (in stable sorted order) and the walk **stops** — the
+        result never exceeds ``cap``. Closer nodes are therefore always preferred
+        over farther ones (a full nearer hop is admitted before any farther hop).
+
+    Returns a ``set`` (membership is what callers need); the *stable order* governs
+    only which nodes survive the cap, not the return type. Unknown anchors and
+    anchors of the wrong tier contribute nothing (an off-tier or missing anchor
+    simply seeds no frontier), so an all-unknown anchor set yields ``set()``.
+    """
+    if radius < 0:
+        radius = 0
+    if cap < 0:
+        cap = 0
+
+    # Restrict the universe to this tier; the walk never leaves it.
+    tier_ids = {nid for nid, node in nodes.items() if eb.node_tier(node) == tier}
+
+    # Forward (deps) + reverse (dependents) adjacency, both confined to this tier.
+    deps: Dict[str, Set[str]] = {nid: set() for nid in tier_ids}
+    rdeps: Dict[str, Set[str]] = {nid: set() for nid in tier_ids}
+    for nid in tier_ids:
+        for dep in nodes[nid].get("depends_on", []) or []:
+            if dep in tier_ids and dep != nid:
+                deps[nid].add(dep)      # nid -> dep (nid depends on dep)
+                rdeps[dep].add(nid)     # dep <- nid (nid is a dependent of dep)
+
+    # Seed: only anchors that are real tier-`tier` nodes. Anchors are always kept,
+    # even if there are more than `cap` of them (caller asked to center on them).
+    seed = sorted(a for a in anchors if a in tier_ids)
+    result: Set[str] = set(seed)
+    if not seed or radius == 0:
+        return result
+
+    frontier = list(seed)
+    for _hop in range(radius):
+        # Gather this hop's new tier-`tier` neighbors (deps ∪ dependents), stable.
+        nxt: Set[str] = set()
+        for cur in frontier:
+            nxt |= deps.get(cur, set())
+            nxt |= rdeps.get(cur, set())
+        new = sorted(n for n in nxt if n not in result)
+        if not new:
+            break
+        room = cap - len(result)
+        if room <= 0:
+            break
+        if len(new) > room:
+            # This hop overflows the cap: keep the closest `room` (stable order)
+            # and stop — farther hops are never admitted before a nearer one.
+            result.update(new[:room])
+            break
+        result.update(new)
+        frontier = new
+    return result
+
+
+# ---------------------------------------------------------------------------
 # tier roll-up (any tier — a node's roll-up over its direct children)
 # ---------------------------------------------------------------------------
 
@@ -844,6 +928,7 @@ def recolor_dot(
     sidecar: dict,
     tier: int = 2,
     expanded: Optional[Set[str]] = None,
+    only: Optional[Set[str]] = None,
 ) -> str:
     """Build a DOT digraph for the given tier, recolored by effective verdict, with
     in-place expansion of any tier-*N* node into its tier-*(N+1)* children.
@@ -869,9 +954,22 @@ def recolor_dot(
     Cross edges use the *repr* trick at the current tier (each tier-N dependency
     ``d -> n`` mapped to its node slugs, deduped). Edges inside an expanded box are
     tier-(N+1) deps and are emitted by that subgraph, not here.
+
+    ``only`` (a *local view*): when given, render **only** the tier-`tier` nodes in
+    that set and the ``depends_on`` edges **between** them (a bounded subgraph, e.g.
+    a ``neighborhood``). Same coloring, encodings, expansion and compact-layout rules
+    apply — the only change is that ``sub``/``ids`` (the universe of drawn tier-N
+    nodes) is filtered to ``only``, so every emitted edge already has both endpoints
+    in ``only`` and no out-of-view node or edge can leak in. ``only=None`` keeps the
+    full-tier behavior unchanged.
     """
     name_to_slug = eb.build_slug_map(nodes)
     sub = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == tier}
+    if only is not None:
+        # Local view: restrict the drawn tier-N universe to `only`. Every node line
+        # and every edge in _recolor_tier_dot is gated on `sub`/`ids`, so filtering
+        # here is sufficient to render exactly those nodes + their internal edges.
+        sub = {nid: node for nid, node in sub.items() if nid in only}
 
     lines: List[str] = ['strict digraph "" {']
     lines.extend(eb._graph_attr_lines())
