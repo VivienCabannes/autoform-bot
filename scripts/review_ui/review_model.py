@@ -67,6 +67,7 @@ PALETTE = {
     "clean": "#2F7D4F",
     "flagged": "#C08A1E",
     "rejected": "#C0392B",
+    "sorry": "#7C3AED",  # violet — incomplete (Lean contains a sorry/admit/sorryAx)
     "grey": "#C9C2B4",  # unreviewed
 }
 
@@ -77,6 +78,7 @@ VERDICT_DOT = {
     "clean":      {"color": PALETTE["clean"],    "fill": "#D6EAD9"},
     "flagged":    {"color": PALETTE["flagged"],  "fill": "#F2E4C4"},
     "rejected":   {"color": PALETTE["rejected"], "fill": "#F1D2CE"},
+    "sorry":      {"color": "#7C3AED",           "fill": "#ECE7FB"},
     "unreviewed": {"color": PALETTE["grey"],     "fill": "#ECE7DC"},
 }
 
@@ -330,15 +332,25 @@ def is_in_mathlib(node: dict) -> bool:
     return (node or {}).get("mathlib_status") in IN_MATHLIB_STATUSES
 
 
-def color_state(node: dict, effective_verdict: str) -> str:
-    """The **trust-state color** for a node: one of ``in_mathlib`` (blue) /
-    ``clean`` (green) / ``flagged`` (amber) / ``rejected`` (red) / ``unreviewed``
-    (grey).
+def color_state(node: dict, effective_verdict: str, is_sorry: bool = False) -> str:
+    """The **trust-state color** for a node: one of ``sorry`` (violet) /
+    ``in_mathlib`` (blue) / ``clean`` (green) / ``flagged`` (amber) /
+    ``rejected`` (red) / ``unreviewed`` (grey).
 
-    A real defect (flagged/rejected) shows even on a reuse — e.g. a wrong Mathlib
-    lemma cited — so it overrides the blue. Otherwise an in-Mathlib node is blue;
-    everything else keeps its effective verdict (clean -> green, else grey).
+    Precedence (top wins):
+      1. **sorry** (violet) — the Lean contains a ``sorry``/``admit``/``sorryAx``
+         (or a descendant module does): the code is *incomplete*, which is the
+         dominant fact and overrides any verdict (even rejected/flagged) and the
+         blue in-Mathlib state. An honest gap, distinct from an overclaim.
+      2. a real defect (flagged/rejected) shows even on a reuse — e.g. a wrong
+         Mathlib lemma cited — so it overrides the blue.
+      3. an in-Mathlib node is blue.
+      4. otherwise keep the effective verdict (clean -> green, else grey).
+
+    ``is_sorry=False`` (the default) reproduces the original behavior exactly.
     """
+    if is_sorry:
+        return "sorry"
     if effective_verdict in ("rejected", "flagged"):
         return effective_verdict
     if is_in_mathlib(node):
@@ -346,13 +358,25 @@ def color_state(node: dict, effective_verdict: str) -> str:
     return effective_verdict
 
 
-def is_trusted(node_id: str, node: dict, sidecar: dict) -> bool:
+def is_trusted(
+    node_id: str,
+    node: dict,
+    sidecar: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> bool:
     """Whether a node is *trusted* for taint/frontier/coverage.
 
     Trusted = effective verdict ``clean`` (ours, reviewed clean) **OR** the node
     is in Mathlib (trusted by construction) and carries no defect verdict. A
     flagged/rejected node is never trusted, even if it is in Mathlib.
+
+    A node in ``sorry_set`` (its Lean is incomplete) is **never trusted**,
+    regardless of verdict or Mathlib status — incomplete code is an honest gap,
+    not something a human can rely on end-to-end. ``sorry_set=None`` (the default)
+    reproduces the original behavior exactly (empty set ⇒ no node is sorry).
     """
+    if node_id in (sorry_set or set()):
+        return False
     v = verdict_of(node_id, sidecar)
     if v == "clean":
         return True
@@ -405,20 +429,30 @@ def _dependents_index(nodes: Dict[str, dict]) -> Dict[str, List[str]]:
     return rev
 
 
-def tainted_set(nodes: Dict[str, dict], sidecar: dict) -> Set[str]:
-    """The set of node ids tainted by some flagged/rejected ancestor.
+def tainted_set(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> Set[str]:
+    """The set of node ids tainted by some flagged/rejected/sorry ancestor.
 
-    A node is *tainted* if any node in its ``depends_on`` transitive closure has an
-    effective verdict of flagged or rejected. Computed live, never stored. The bad
-    nodes themselves are NOT in the tainted set (they are the source, not victims) —
-    they carry their own verdict color; taint marks the *downstream* trust damage.
+    A node is *tainted* if any node in its ``depends_on`` transitive closure is a
+    taint source. Taint sources are ``flagged`` ∪ ``rejected`` (defect verdicts)
+    ∪ ``sorry_set`` (incomplete Lean): a node resting on incomplete code is itself
+    not trustworthy end-to-end, exactly like one resting on a rejected overclaim.
+    Computed live, never stored. The source nodes themselves are NOT in the tainted
+    set (they are the source, not victims) — they carry their own color; taint marks
+    the *downstream* trust damage.
 
-    Only flagged/rejected nodes taint: an ``in_mathlib`` (blue) node is trusted by
-    construction and never seeds taint (it has no flagged/rejected verdict).
+    Only flagged/rejected/sorry nodes taint: an ``in_mathlib`` (blue) node is trusted
+    by construction and never seeds taint. ``sorry_set=None`` (the default) reproduces
+    the original behavior exactly (no sorry sources, only flagged/rejected taint).
     """
+    sorry_set = sorry_set or set()
     rev = _dependents_index(nodes)
     bad = [nid for nid in nodes
-           if verdict_of(nid, sidecar) in ("flagged", "rejected")]
+           if verdict_of(nid, sidecar) in ("flagged", "rejected")
+           or nid in sorry_set]
 
     tainted: Set[str] = set()
     stack = list(bad)
@@ -657,17 +691,27 @@ def rollup_source(parent_id: str, nodes: Dict[str, dict], sidecar: dict) -> str:
 # coverage + trust frontier
 # ---------------------------------------------------------------------------
 
-def coverage(nodes: Dict[str, dict], sidecar: dict) -> dict:
+def coverage(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> dict:
     """Review coverage over tier-2 nodes: how many have any effective verdict.
 
     Coverage is the header progress bar: reviewed / total tier-2. "Reviewed" means
     a node has an effective verdict (ai or human), i.e. it is not ``unreviewed``.
+
+    ``sorry_set`` (default empty) is threaded into ``is_trusted`` so a node with
+    incomplete Lean is not counted as trusted. ``sorry_set=None`` reproduces the
+    original behavior exactly.
     """
+    sorry_set = sorry_set or set()
     tier2 = [nid for nid, node in nodes.items() if eb.node_tier(node) == 2]
     reviewed = [nid for nid in tier2 if verdict_of(nid, sidecar) != "unreviewed"]
     human = [nid for nid in tier2 if review_source(nid, sidecar) == "human"]
     in_mathlib = [nid for nid in tier2 if is_in_mathlib(nodes[nid])]
-    trusted = [nid for nid in tier2 if is_trusted(nid, nodes[nid], sidecar)]
+    trusted = [nid for nid in tier2
+               if is_trusted(nid, nodes[nid], sidecar, sorry_set)]
     total = len(tier2)
     return {
         "total": total,
@@ -679,7 +723,11 @@ def coverage(nodes: Dict[str, dict], sidecar: dict) -> dict:
     }
 
 
-def trust_frontier(nodes: Dict[str, dict], sidecar: dict) -> List[str]:
+def trust_frontier(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> List[str]:
     """The sink nodes (top-level results) resting on a fully-**trusted** closure.
 
     A sink is a tier-2 node that nothing else (in tier 2) depends on. A sink is on
@@ -688,7 +736,12 @@ def trust_frontier(nodes: Dict[str, dict], sidecar: dict) -> List[str]:
     flagged/rejected defect). A blue (in-Mathlib) node therefore counts toward the
     frontier exactly like a clean one. These are the results a human can currently
     trust end-to-end. Sorted for determinism.
+
+    ``sorry_set`` (default empty) is threaded into ``is_trusted`` so a sink whose
+    closure touches incomplete Lean is *off* the frontier. ``sorry_set=None``
+    reproduces the original behavior exactly.
     """
+    sorry_set = sorry_set or set()
     tier2 = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == 2}
     rev = _dependents_index(tier2)
     sinks = [nid for nid in tier2 if not rev.get(nid)]
@@ -696,7 +749,7 @@ def trust_frontier(nodes: Dict[str, dict], sidecar: dict) -> List[str]:
     frontier: List[str] = []
     for sink in sinks:
         closure = _closure(sink, tier2)
-        if all(is_trusted(nid, tier2[nid], sidecar) for nid in closure):
+        if all(is_trusted(nid, tier2[nid], sidecar, sorry_set) for nid in closure):
             frontier.append(sink)
     return sorted(frontier)
 
@@ -726,13 +779,17 @@ def _verdict_node_dot(
     source: Optional[str],
     tainted: bool,
     state_override: Optional[str] = None,
+    is_sorry: bool = False,
 ) -> str:
     """Emit one DOT node line colored by the **trust state** (color_state), not the
     raw verdict.
 
     Encodings:
-      * fill/border color = color_state (in_mathlib=blue / clean=green /
+      * fill/border color = color_state (sorry=violet / in_mathlib=blue / clean=green /
         flagged=amber / rejected=red / unreviewed=grey);
+      * sorry node         => **violet, SOLID** (a code fact — the Lean is incomplete —
+        not an AI-only opinion, so no dashed ring and never the blue path), class
+        ``rv-sorry``. Takes precedence over every verdict and over in_mathlib;
       * in_mathlib node    => **solid** (trusted by construction — no AI-only ring,
         never hatched), even when no human has reviewed it;
       * AI-only node       => dashed border ring (style=dashed);
@@ -742,11 +799,20 @@ def _verdict_node_dot(
         client CSS uses for an exact 45deg hatch on the SVG).
     Shape still follows ``kind`` (box for definitions) exactly as the exporter does,
     so layout is identical to the exported graph.
+
+    ``is_sorry=False`` (the default) reproduces the original behavior exactly.
     """
     kind = (node.get("kind") or "theorem").lower()
     shape = "box" if kind in eb.DEFINITION_KINDS else "ellipse"
 
-    state = state_override if state_override is not None else color_state(node, verdict)
+    # sorry is the dominant fact: violet, solid, never the blue path — it overrides
+    # any state_override (roll-up / verdict) coming from the caller.
+    if is_sorry:
+        state = "sorry"
+    elif state_override is not None:
+        state = state_override
+    else:
+        state = color_state(node, verdict)
     blue = state == "in_mathlib"
 
     colors = VERDICT_DOT.get(state, VERDICT_DOT["unreviewed"])
@@ -757,22 +823,27 @@ def _verdict_node_dot(
         f"shape={shape}",
     ]
 
-    # style: filled always. A blue (in-Mathlib) node is trusted by construction:
+    # style: filled always. A sorry node is a code fact (the Lean is incomplete):
+    # solid, no AI-only ring (its incompleteness does not depend on any review) and
+    # never the blue path. A blue (in-Mathlib) node is trusted by construction:
     # solid, no AI-only ring and never hatched. Otherwise: dashed = AI-only ring,
     # "diagonals" hints taint.
     styles = ["filled"]
-    if not blue and source != "human":
+    if not is_sorry and not blue and source != "human":
         # AI-only (or unreviewed) -> dashed ring marks "provisional / unvouched".
         styles.append("dashed")
-    if tainted and not blue:
+    if tainted and not is_sorry and not blue:
         # graphviz "diagonals" decorates the node; the client overlays a true 45deg
         # hatch via the class we tag below, so this is a graceful fallback.
         styles.append("diagonals")
     attrs.append(f'style="{",".join(styles)}"')
 
     # A class the client SVG post-processor keys on for the exact hatch + ring.
-    # Blue nodes are solid + never tainted/AI-only-styled (trusted by construction).
-    if blue:
+    # Sorry nodes are violet + solid (class rv-sorry); blue nodes are solid + never
+    # tainted/AI-only-styled (trusted by construction).
+    if is_sorry:
+        klass = "rv-sorry rv-solid"
+    elif blue:
         klass = "rv-in_mathlib rv-solid"
     else:
         klass = f"rv-{state}" + (" rv-tainted" if tainted else "") + (
@@ -855,6 +926,7 @@ def _recolor_tier_dot(
     lines: List[str],
     tier: int,
     expanded: Set[str],
+    sorry_set: Optional[Set[str]] = None,
 ) -> str:
     """Emit the tier-*N* overview DOT with in-place expansion of any tier-*N* node
     into its tier-*(N+1)* children. Generalizes the old tier-1-only routine.
@@ -882,9 +954,16 @@ def _recolor_tier_dot(
 
     An edge fully inside one expanded box (both children share an expanded parent)
     is emitted by that subgraph, never here.
+
+    ``sorry_set`` (default empty) is the set of node ids whose Lean is incomplete: a
+    node in it is drawn violet/solid (class ``rv-sorry``) and seeds taint, overriding
+    its verdict/roll-up color. A parent unit/cluster is already in ``sorry_set`` (the
+    server propagates a sorry to its ancestors), so its collapsed node goes violet
+    over the roll-up. ``sorry_set=None`` reproduces the original behavior exactly.
     """
+    sorry_set = sorry_set or set()
     expanded = {pid for pid in expanded if pid in ids and has_children(pid, nodes)}
-    tainted = tainted_set(nodes, sidecar)
+    tainted = tainted_set(nodes, sidecar, sorry_set)
 
     # --- leaves + collapsed parents: one node each ---
     for nid in sorted(sub):
@@ -899,6 +978,7 @@ def _recolor_tier_dot(
                 lines.append(_verdict_node_dot(
                     nid, sub[nid], name_to_slug[nid],
                     own, review_source(nid, sidecar), nid in tainted,
+                    is_sorry=nid in sorry_set,
                 ))
             else:
                 # No own verdict (e.g. a cluster) → colored by the roll-up over children.
@@ -906,6 +986,7 @@ def _recolor_tier_dot(
                     nid, sub[nid], name_to_slug[nid],
                     "unreviewed", rollup_source(nid, nodes, sidecar), False,
                     state_override=rollup_color(nid, nodes, sidecar),
+                    is_sorry=nid in sorry_set,
                 ))
         else:
             # leaf → colored by its own trust state (taint / AI-only ring honoured)
@@ -914,6 +995,7 @@ def _recolor_tier_dot(
                 verdict_of(nid, sidecar),
                 review_source(nid, sidecar),
                 nid in tainted,
+                is_sorry=nid in sorry_set,
             ))
 
     # --- expanded parents: a subgraph box per parent with its tier-(N+1) children ---
@@ -932,6 +1014,7 @@ def _recolor_tier_dot(
                 verdict_of(nid, sidecar),
                 review_source(nid, sidecar),
                 nid in tainted,
+                is_sorry=nid in sorry_set,
             )
             lines.append("  " + line)  # indent into the subgraph
         # intra-parent dashed edges (both endpoints among this parent's children)
@@ -1015,6 +1098,7 @@ def recolor_dot(
     tier: int = 2,
     expanded: Optional[Set[str]] = None,
     only: Optional[Set[str]] = None,
+    sorry_set: Optional[Set[str]] = None,
 ) -> str:
     """Build a DOT digraph for the given tier, recolored by effective verdict, with
     in-place expansion of any tier-*N* node into its tier-*(N+1)* children.
@@ -1048,6 +1132,12 @@ def recolor_dot(
     nodes) is filtered to ``only``, so every emitted edge already has both endpoints
     in ``only`` and no out-of-view node or edge can leak in. ``only=None`` keeps the
     full-tier behavior unchanged.
+
+    ``sorry_set`` (a set of node ids whose Lean is incomplete) is threaded through to
+    ``_recolor_tier_dot``: each drawn tier-N node ``nid`` is emitted with
+    ``is_sorry=nid in sorry_set`` so a sorry node renders violet/solid (class
+    ``rv-sorry``) and seeds taint. ``sorry_set=None`` (the default) reproduces the
+    original behavior exactly.
     """
     name_to_slug = eb.build_slug_map(nodes)
     sub = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == tier}
@@ -1088,31 +1178,54 @@ def recolor_dot(
         f"splines={splines}];")
 
     return _recolor_tier_dot(
-        nodes, sidecar, sub, ids, name_to_slug, lines, tier, expanded or set())
+        nodes, sidecar, sub, ids, name_to_slug, lines, tier, expanded or set(),
+        sorry_set=sorry_set or set())
 
 
 # ---------------------------------------------------------------------------
 # whole-graph state (the /api/state payload)
 # ---------------------------------------------------------------------------
 
-def compute_state(nodes: Dict[str, dict], sidecar: dict) -> dict:
+def compute_state(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> dict:
     """The full computed review state: verdicts, taint, coverage, frontier, dial,
-    and per-cluster roll-ups. Pure; this is exactly what ``/api/state`` returns."""
-    tainted = sorted(tainted_set(nodes, sidecar))
+    and per-cluster roll-ups. Pure; this is exactly what ``/api/state`` returns.
+
+    ``sorry_set`` (a set of node ids whose Lean is incomplete, default empty) is
+    woven through the whole computation:
+
+      * ``colors`` paint a sorry node violet (``"sorry"``) — top precedence over
+        every verdict and over in_mathlib;
+      * ``tainted`` adds the sorry nodes as taint sources (sources = flagged ∪
+        rejected ∪ sorry), so a sorry's forward ``depends_on`` closure is hatched;
+      * ``coverage`` / ``trust_frontier`` no longer count a sorry node (or a sink
+        resting on one) as trusted;
+      * the payload gains a ``"sorry"`` key listing the sorted node ids.
+
+    ``sorry_set=None`` (the default) reproduces the original behavior byte-for-byte:
+    an empty set means no sorry sources, no violet colors, and ``"sorry": []``.
+    """
+    sorry_set = sorry_set or set()
+    tainted = sorted(tainted_set(nodes, sidecar, sorry_set))
     clusters = sorted(
         nid for nid, node in nodes.items() if eb.node_tier(node) == 1)
     verdicts = {nid: verdict_of(nid, sidecar) for nid in nodes}
     return {
         "dial": dial_of(sidecar),
         "verdicts": verdicts,
-        # color_state per node: the trust-state color the UI paints (blue for an
-        # in-Mathlib reuse, else the effective verdict). Alongside `verdicts` so the
-        # client/tests can distinguish blue from green/grey.
-        "colors": {nid: color_state(nodes[nid], verdicts[nid]) for nid in nodes},
+        # color_state per node: the trust-state color the UI paints (violet for a
+        # sorry/incomplete node, blue for an in-Mathlib reuse, else the effective
+        # verdict). Alongside `verdicts` so the client/tests can distinguish each.
+        "colors": {nid: color_state(nodes[nid], verdicts[nid], nid in sorry_set)
+                   for nid in nodes},
         "sources": {nid: review_source(nid, sidecar) for nid in nodes},
         "tainted": tainted,
-        "coverage": coverage(nodes, sidecar),
-        "trust_frontier": trust_frontier(nodes, sidecar),
+        "sorry": sorted(nid for nid in sorry_set if nid in nodes),
+        "coverage": coverage(nodes, sidecar, sorry_set),
+        "trust_frontier": trust_frontier(nodes, sidecar, sorry_set),
         "clusters": {cid: cluster_rollup(cid, nodes, sidecar) for cid in clusters},
     }
 
