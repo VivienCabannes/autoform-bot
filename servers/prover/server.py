@@ -4,7 +4,7 @@
 with the chosen backend and writes the proof into the node. ``backend`` selects
 the adapter — ``"claude"`` (default, Claude-on-Max, free) or ``"aristotle"``
 (opt-in, free, needs the ``aristotle`` extra + ``ARISTOTLE_API_KEY`` + network) —
-but the **driver and steerer are the SAME for both**: only the adapter differs.
+but the **driver and steerer are the SAME for every backend**: only the adapter differs.
 
 This is the unified replacement for PR C's one-shot ``aristotle_delegate_node``
 and PR D's in-session worker: both are now adapters behind one driver.
@@ -91,7 +91,7 @@ def create_prover_server() -> FastMCP:
         The backend is a PARAMETER — ``"claude"`` (default, runs on the Claude Max
         subscription, free) or ``"aristotle"`` (opt-in, free, needs the aristotle
         extra + ARISTOTLE_API_KEY + network). The driver and the live-steering
-        judge are IDENTICAL for both; only the thin adapter differs. The shared
+        judge are IDENTICAL across backends; only the thin adapter differs. The shared
         steerer watches the run and injects a corrective instruction (in-flight
         for Aristotle via project.ask, turn-granular for Claude via --resume) only
         when the prover goes off-course, up to ``max_steers`` times.
@@ -105,7 +105,7 @@ def create_prover_server() -> FastMCP:
             node_id: The target node id (verbatim, e.g. "Chernoff bound").
             project_dir: The Lean project directory (where the proof is written
                 and informal_content/ lives).
-            backend: "claude" (default) or "aristotle".
+            backend: "claude" (default), "aristotle", or "codex".
             max_steers: Cap on in-flight steers for this run (default 3).
             max_wait_seconds: Ceiling on how long to wait (Aristotle backend).
 

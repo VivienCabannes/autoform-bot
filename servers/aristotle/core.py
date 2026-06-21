@@ -23,7 +23,7 @@ onto two surfaces:
   terminal status, lands the returned Lean files into the project, and writes the
   proof back to the node (Lean files in the project + the node's prose file).
 
-HARD CONSTRAINT (see SHARED_SPEC / design doc): Aristotle ONLY produces a proof
+HARD CONSTRAINT (design doc): Aristotle ONLY produces a proof
 *into a node*. It does **not** review, score, taint, or touch the sidecar — the
 proof it lands feeds the SAME incremental jury -> ``review_status.json`` -> review
 surface that the in-session worker feeds (built by PRs A/E). Nothing here reads or

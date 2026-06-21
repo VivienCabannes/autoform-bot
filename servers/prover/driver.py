@@ -1,4 +1,4 @@
-"""The UNIFIED DRIVER — one loop that drives EITHER backend identically.
+"""The UNIFIED DRIVER — one loop that drives ANY backend identically.
 
 This module is the whole point of the unified prover: the loop below is written
 against the :class:`~servers.prover.base.ProverAdapter` interface and the shared

@@ -122,6 +122,7 @@ class ProverAdapter(abc.ABC):
 
     * :class:`servers.prover.claude_adapter.ClaudeAdapter`
     * :class:`servers.prover.aristotle_adapter.AristotleAdapter`
+    * :class:`servers.prover.codex_adapter.CodexAdapter`
 
     The four methods are the *entire* per-backend surface. Adapters may be sync
     or async at the edges, but expose these synchronous signatures (the Aristotle
@@ -129,7 +130,7 @@ class ProverAdapter(abc.ABC):
     a plain loop with no event-loop assumptions.
     """
 
-    #: ``"claude"`` or ``"aristotle"`` — the value the MCP tool's ``backend`` arg
+    #: ``"claude"`` / ``"aristotle"`` / ``"codex"`` — the value the MCP tool's ``backend`` arg
     #: selects on.
     name: str = "abstract"
 

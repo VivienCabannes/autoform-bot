@@ -142,7 +142,7 @@ class Steerer:
     def _decide(self, goal: str, window: Sequence[Event]) -> dict[str, Any] | None:
         """Run (or reuse) the judge for this window; returns the parsed verdict.
 
-        The decision is cached on ``id(window)`` length so that the driver's
+        The decision is cached on ``(id(window), len(window))`` so that the driver's
         paired ``off_course`` / ``correction`` calls over one window invoke the
         judge once.
         """
