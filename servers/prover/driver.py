@@ -17,18 +17,24 @@ The contract::
 3. While under the ``max_steers`` cap, we ask the shared steerer whether the run
    is off-course; if so we inject ``adapter.steer(run, correction)``, count it,
    and clear the window (so the next judgement is made on post-steer behaviour).
-4. When the event stream ends we return ``adapter.result(run)``.
+4. When the event stream ends we take ``adapter.result(run)``.
+5. **Honesty gate** — a backend's ``proved`` is the worker's *claim*. Before it
+   stands, :mod:`servers.prover.verify` independently checks the landed Lean
+   (build-clean + no ``sorry``/``admit``); a failed gate downgrades the verdict to
+   ``failed``. This runs once, in the shared driver, so it protects every backend.
 
-That is the equivalence the spec demands: identical driver + identical steerer,
-only the adapter differs.
+That is the equivalence the spec demands: identical driver + identical steerer +
+identical honesty gate, only the adapter differs.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from .base import ProofResult, ProverAdapter
 from .steerer import Steerer
+from .verify import VerifyResult, verify_proof
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,7 @@ def prove(
     *,
     max_steers: int = 3,
     steerer: Steerer | None = None,
+    verifier: Callable[[str, str], VerifyResult] | None = verify_proof,
 ) -> ProofResult:
     """Drive ``adapter`` to prove ``node`` against ``spec``, steering as needed.
 
@@ -56,9 +63,14 @@ def prove(
         max_steers: Cap on in-flight steers for this run (the high-bar judge
             rarely reaches it).
         steerer: The shared steering judge; injected in tests.
+        verifier: The honesty gate run on a *claimed* ``proved`` — it independently
+            checks the landed Lean compiles with no ``sorry``/``admit`` and, on
+            failure, the verdict is downgraded to ``failed``. ``None`` disables it
+            (and tests inject a fake). Defaults to :func:`servers.prover.verify.verify_proof`.
 
     Returns:
-        The adapter's terminal :class:`ProofResult` (``proved`` or ``failed``).
+        The adapter's terminal :class:`ProofResult` (``proved`` or ``failed``) —
+        with a claimed ``proved`` only allowed to stand once the gate confirms it.
     """
     judge = steerer if steerer is not None else Steerer()
     run = adapter.start(node, spec, project_dir)
@@ -79,4 +91,17 @@ def prove(
     result = adapter.result(run)
     if not result.backend:
         result.backend = adapter.name
+
+    # Honesty gate: a backend's "proved" is the worker's CLAIM. Independently verify
+    # the landed Lean before letting it stand — overriding the claim if it fails, so
+    # no backend can report a sorry'd or non-compiling file as proved.
+    if result.proved and verifier is not None:
+        gate = verifier(node, project_dir)
+        result.meta = {**(result.meta or {}), "verify": gate.checks}
+        if not gate.ok:
+            logger.warning("driver: verification gate REJECTED %s's proof claim for %s: %s",
+                           adapter.name, node, gate.reason)
+            result.meta["claimed_proved"] = True
+            result.status = "failed"
+            result.reason = f"verification gate: {gate.reason}"
     return result
