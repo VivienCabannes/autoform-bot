@@ -3,8 +3,9 @@
   "description": "Evaluates whether the Lean statement faithfully and completely captures the source statement at full strength.",
   "weight": 0.4,
   "pass_threshold": 4,
+  "reject_at_or_below": 2,
   "max_score": 5,
-  "reviewer": "autoform-reviewer",
+  "reviewer": "faithfulness-reviewer",
   "criteria": {
     "5": "Captures the same quantifiers, hypotheses, and conclusion structure as the source; preserves local vs global scope; domain conditions and set-theoretic structure match the source; all parts of multi-part statements are covered; supporting definitions genuinely encode the mathematical objects from the source",
     "4": "Very close to the source: correct locality, correct hypotheses, correct domain conditions; any extra assumptions do not change the mathematical setting (e.g., adding decidability is fine; changing the function space is not); supporting definitions are real, not stubs",

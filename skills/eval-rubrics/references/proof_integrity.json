@@ -3,6 +3,7 @@
   "description": "Evaluates whether the proof chain is genuine work built on sound foundations.",
   "weight": 0.4,
   "pass_threshold": 3,
+  "reject_at_or_below": 2,
   "max_score": 5,
   "reviewer": "proof-integrity-reviewer",
   "criteria": {

@@ -1,5 +1,5 @@
 ---
-name: autoform-reviewer
+name: faithfulness-reviewer
 description: >
   Faithfulness reviewer for a single Lean 4 formalization node. Given ONE rubric (faithfulness),
   it judges whether the Lean *statement* captures the source statement at full strength — hunting

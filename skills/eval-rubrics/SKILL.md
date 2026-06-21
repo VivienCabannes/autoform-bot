@@ -17,19 +17,36 @@ single-axis reviewers**, each given ONLY its own rubric — never the others'. E
 integer score 0–5 with a pass threshold; the criteria and prompt templates are the JSON files in
 `references/`.
 
-## The three jury rubrics
+## The jury rubrics
 
 | Rubric | Weight | Pass ≥ | Reviewer agent | Judges whether… |
 |---|---|---|---|---|
-| **faithfulness** | 0.40 | 4/5 | `autoform-reviewer` | the Lean **statement** captures the source statement *at full strength* (no weakening, no vacuity) |
+| **faithfulness** | 0.40 | 4/5 | `faithfulness-reviewer` | the Lean **statement** captures the source statement *at full strength* (no weakening, no vacuity) |
 | **proof_integrity** | 0.40 | 3/5 | `proof-integrity-reviewer` | the **proof** chain is genuine work on sound foundations (axioms clean, no disguised `sorry`/cheats) |
 | **code_quality** | 0.20 | 3/5 | `code-quality-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = the **autoform** skill) |
 
-There are exactly three rubrics on the review path. The cheating-hunt splits along the two
-correctness axes: **statement-level** cheats (`: True`, weakened conclusion, smuggled hypotheses,
-proxy objects, theorem-as-`def…:Prop`, vacuity) belong to **faithfulness**; **proof-level** cheats
-(`sorry`/`axiom` in helpers, `decide`/`native_decide` hiding, `False.elim` on a false goal,
-fake/circular proofs) belong to **proof_integrity**.
+The jury is **whatever rubric files live in `references/`** — currently these three. The
+cheating-hunt splits along the two correctness axes: **statement-level** cheats (`: True`, weakened
+conclusion, smuggled hypotheses, proxy objects, theorem-as-`def…:Prop`, vacuity) belong to
+**faithfulness**; **proof-level** cheats (`sorry`/`axiom` in helpers, `decide`/`native_decide`
+hiding, `False.elim` on a false goal, fake/circular proofs) belong to **proof_integrity**.
+
+## Modular by design — the files ARE the jury
+
+The rubric files in `references/` are the **single source of truth**: the dashboard, the
+deterministic dispatcher, and the verdict gate all read the axis set, weights, thresholds and
+gating roles from them at load time (`review_model.rubric_specs()`), so the reviewer system is
+changed by editing JSON, never code:
+
+- **Add an axis** — drop a new `<axis>.json` (`name`, `weight`, `pass_threshold`, `reviewer`,
+  `criteria`, `prompt_template`) plus its judge agent; the jury, the parallel fan-out, and the
+  weighted score pick it up automatically.
+- **Shrink to a single reviewer** — leave one rubric file; the verdict gate works with one axis.
+- **Tune the gate per axis, in data** — `reject_at_or_below` sets the score that forces *rejected*
+  (correctness axes); `verdict_ceiling: "flagged"` marks a *style* axis that can never reject.
+
+Because everything derives from the files, **dropping a `reviewer` on a node always runs the current
+rubric set** — changing the jury never breaks the dispatch.
 
 ## Displayed score and verdict (threshold-gated, NOT the average)
 
@@ -84,7 +101,7 @@ a `human` slot (human verdicts are immutable). Effective verdict = `human` if pr
 
 The **faithfulness** rubric, run on the DAG's target/sink nodes, *is* the spec-gate — a faithfulness
 check on the project's main results against the source's actual main theorems. Same rubric, same
-`autoform-reviewer`, filtered to the roots. No separate machinery.
+`faithfulness-reviewer`, filtered to the roots. No separate machinery.
 
 ## Related
 
