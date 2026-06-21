@@ -1,6 +1,6 @@
 ---
 description: Stand up an autoform formalization project end-to-end — ensure a Lean 4 + Mathlib project, build the multi-tiered dependency DAG + blueprint from your sources, and launch the local review dashboard ready for /autoform:orchestrate.
-argument-hint: "[<project-dir>] [--rebuild] [--port 8765]"
+argument-hint: "[<project-dir>] [--rebuild] [--port N]   # omit --port → auto-find a free port"
 allowed-tools: Read, Write, Edit, Bash, Grep, Glob, Task, Skill
 ---
 
@@ -18,12 +18,14 @@ One command from sources to a live, reviewable tiered DAG. Arguments: `$ARGUMENT
 
 3. **Blueprint.** Run the **`plan-view`** skill to build the leanblueprint (toolchain check → `export_blueprint.py` → `make web`) so the dashboard can render the typeset statements.
 
-4. **Dashboard.** Launch the review UI on `127.0.0.1`, detached (idempotent — if one already serves this graph, reuse it):
+4. **Dashboard.** Pick the port — use `--port` if given, else **auto-find a free one** (don't hard-code 8765; it may be taken). Then launch the review UI on `127.0.0.1`, detached (idempotent — reuse if one already serves this graph):
    ```
+   PORT="${port:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); p=s.getsockname()[1]; s.close(); print(p)')}"
    pgrep -f "serve_review.py.*<project>/graph.json" >/dev/null \
      && echo "dashboard already serving this graph" \
-     || { nohup python3 ${CLAUDE_PLUGIN_ROOT}/scripts/review_ui/serve_review.py --graph <project>/graph.json --port ${port:-8765} >> <project>/serve_review.log 2>&1 & echo "started dashboard PID $!"; }
+     || { nohup python3 ${CLAUDE_PLUGIN_ROOT}/scripts/review_ui/serve_review.py --graph <project>/graph.json --port "$PORT" >> <project>/serve_review.log 2>&1 & echo "started dashboard PID $! on http://127.0.0.1:$PORT/"; }
    ```
+   Report the actual `http://127.0.0.1:$PORT/` URL.
 
 5. **Report**: the dashboard URL (`http://127.0.0.1:<port>/`), the tier-1/2 node counts, and the next step — **`/autoform:orchestrate`** to start reviewing/proving (autonomously, or by dropping agents on nodes in the dashboard, or both).
 
