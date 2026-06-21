@@ -19,8 +19,8 @@ This is the rule that matters, and the #1 failure mode: **do NOT make a TODO lis
 
 - **reviewer** → **launch the deterministic watcher in the BACKGROUND**, then return. It drains every queued reviewer node in parallel (each node's 3-judge jury as concurrent `claude -p` processes), writes the verdicts itself, and keeps polling for new dashboard drops — you never score anything. Launch detached (idempotent: skip if one's already watching this project), and report the PID:
   ```
-  pgrep -f "dispatch_runner.py.*<project>" >/dev/null \
-    && echo "watcher already running for this project (pkill -f dispatch_runner.py to stop)" \
+  pgrep -f "dispatch_runner.py.*--watch" >/dev/null \
+    && echo "a --watch watcher is already running (pkill -f dispatch_runner.py to stop)" \
     || { nohup env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9 --watch >> <project>/dispatch.log 2>&1 & echo "started watcher PID $! — drops now auto-fire"; }
   ```
   **NEVER run `--watch` in the foreground** — it loops forever and would hang this command. Tell the user: drops auto-fire; `tail -f <project>/dispatch.log` to watch; `pkill -f dispatch_runner.py` to stop. (For a one-shot drain instead, run it foreground **without** `--watch`, or with `--once`.)
