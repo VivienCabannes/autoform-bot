@@ -17,11 +17,13 @@ in sync. Arguments: `$ARGUMENTS`.
 
 This is the rule that matters, and the #1 failure mode: **do NOT make a TODO list and work the queue yourself.** You have no authority to score or prove a node — every task is delegated. For EACH task you MUST spawn subagents with the **Task tool** (or call the `prove_node` MCP). The orchestrator's own job is only claim → route → record; it never reads a `.lean` file to judge or edits one to prove.
 
-- **reviewer** → **run the deterministic runner** — it drains ALL queued reviewer tasks at once (each node's 3-judge jury as concurrent `claude -p` processes), computes the threshold-gated verdict, and writes it itself. You do NOT spawn judges or score anything:
+- **reviewer** → **launch the deterministic watcher in the BACKGROUND**, then return. It drains every queued reviewer node in parallel (each node's 3-judge jury as concurrent `claude -p` processes), writes the verdicts itself, and keeps polling for new dashboard drops — you never score anything. Launch detached (idempotent: skip if one's already watching this project), and report the PID:
   ```
-  env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9 --watch
+  pgrep -f "dispatch_runner.py.*<project>" >/dev/null \
+    && echo "watcher already running for this project (pkill -f dispatch_runner.py to stop)" \
+    || { nohup env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9 --watch >> <project>/dispatch.log 2>&1 & echo "started watcher PID $! — drops now auto-fire"; }
   ```
-  `--watch` (the dispatch default) keeps it draining **new** drops ~every 10s until interrupted — so the user drops reviewers on the dashboard and they auto-fire. Drop `--watch` (or pass `--once`) for a single drain.
+  **NEVER run `--watch` in the foreground** — it loops forever and would hang this command. Tell the user: drops auto-fire; `tail -f <project>/dispatch.log` to watch; `pkill -f dispatch_runner.py` to stop. (For a one-shot drain instead, run it foreground **without** `--watch`, or with `--once`.)
 - **worker** → call the **`prove_node`** MCP tool (or `Task subagent_type:"autoform:autoform-worker"`).
 - **planner** → `Task subagent_type:"autoform:splitter"` (or the `plan` skill) over the node's scope.
 
@@ -74,12 +76,12 @@ Drain every `queued` task; in `--watch`, re-poll for new drops (until interrupte
      backend: "<prover id>"}`. The prover's driver + steerer + adapter prove the node on the selected
      backend; its claude adapter already carries the no-cheating / honest-`FAILED` worker discipline
      and the **Phase-0 lakefile precondition**. Read the returned `{status, reason}`.
-   - **reviewer** → **not handled per-task.** All queued reviewer tasks are drained together by the
-     deterministic runner (`scripts/dispatch_runner.py`, above): one call reviews every queued node in
-     parallel (3 judges each), applies the threshold gate (**rejected** if faithfulness ≤ 2 or
-     proof_integrity ≤ 2; **clean** if faithfulness ≥ 4 ∧ proof_integrity ≥ 3 ∧ code_quality ≥ 3; else
-     **flagged**), writes each `ai` slot (`source:"dispatch:runner"`, preserving any `human` slot,
-     atomic), and flips the queue + feed. The per-task steps here apply to **worker / planner** tasks.
+   - **reviewer** → **not handled per-task.** The **background watcher** launched at the start
+     (`dispatch_runner.py --watch`) drains every queued reviewer node in parallel (3 judges each),
+     applies the threshold gate (**rejected** if faithfulness ≤ 2 or proof_integrity ≤ 2; **clean** if
+     faithfulness ≥ 4 ∧ proof_integrity ≥ 3 ∧ code_quality ≥ 3; else **flagged**), writes each `ai` slot
+     (`source:"dispatch:runner"`, preserving any `human` slot, atomic), and keeps doing so for new
+     drops. The per-task steps here apply only to **worker / planner** tasks.
    - **planner** → `Task subagent_type:"autoform:splitter"` (or the `plan` skill) over the node's scope → produce/refresh the sub-DAG.
 4. **Finish:** only on a real, verified result — `dispatch_queue.py <project> done <id> --result "…"`.
    On an honest failure (prove_node `status: failed`, an unbuildable project, a split/negative jury that
