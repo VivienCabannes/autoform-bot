@@ -338,14 +338,16 @@ def color_state(node: dict, effective_verdict: str, is_sorry: bool = False) -> s
     ``rejected`` (red) / ``unreviewed`` (grey).
 
     Precedence (top wins):
-      1. **sorry** (violet) — the Lean contains a ``sorry``/``admit``/``sorryAx``
-         (or a descendant module does): the code is *incomplete*, which is the
-         dominant fact and overrides any verdict (even rejected/flagged) and the
-         blue in-Mathlib state. An honest gap, distinct from an overclaim.
+      1. **sorry / not-implemented** (violet) — the Lean contains a
+         ``sorry``/``admit``/``sorryAx``: the code is *incomplete*, the dominant
+         fact, overriding any verdict and the blue in-Mathlib state.
       2. a real defect (flagged/rejected) shows even on a reuse — e.g. a wrong
          Mathlib lemma cited — so it overrides the blue.
       3. an in-Mathlib node is blue.
-      4. otherwise keep the effective verdict (clean -> green, else grey).
+      4. a node still **missing** from Mathlib with no verdict yet has no real
+         proof — in the plan model ``missing`` means "needs a statement *and*
+         proof", so it is **not implemented**: violet, not grey "unreviewed".
+      5. otherwise keep the effective verdict (clean -> green, else grey).
 
     ``is_sorry=False`` (the default) reproduces the original behavior exactly.
     """
@@ -355,6 +357,8 @@ def color_state(node: dict, effective_verdict: str, is_sorry: bool = False) -> s
         return effective_verdict
     if is_in_mathlib(node):
         return "in_mathlib"
+    if (node or {}).get("mathlib_status") == "missing" and effective_verdict == "unreviewed":
+        return "sorry"  # planned / missing, no proof yet → "not implemented" (violet)
     return effective_verdict
 
 

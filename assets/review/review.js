@@ -786,7 +786,7 @@
       var blue = cs === "in_mathlib";
       var isTainted = tainted[id] && !blue;
       var src = sources[id] === "human" ? "human" : "ai";
-      var label = blue ? "in Mathlib" : v;
+      var label = blue ? "in Mathlib" : (cs === "sorry" ? "not implemented" : v);
       var foc = FOCUS && FOCUS.members ? (members[id] ? " rv-focus-member" : " rv-focus-dim") : "";
       html += "<li class='rv-fb rv-" + cs + (isTainted ? " rv-tainted" : "") + foc
         + (blue ? " rv-solid"
