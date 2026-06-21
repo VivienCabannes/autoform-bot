@@ -107,12 +107,22 @@ def _lean_has_sorry(text: str) -> bool:
 # these ids is a 400. The server merely WRITES a queue entry; it NEVER spawns the
 # agent or runs claude — an external orchestrator consumes task_queue.json.
 AGENT_PALETTE = [
+    # Deterministic-engine kinds (dispatch_runner drains these):
     {"id": "reviewer", "label": "Reviewer", "icon": "⚖",
-     "blurb": "re-review this node (jury)", "applies": "any"},
+     "blurb": "re-review this node (3-judge jury)", "applies": "any"},
     {"id": "worker", "label": "Worker", "icon": "⛏",
      "blurb": "formalize / fill a sorry here", "applies": "any"},
+    # Model-driven kinds (the /autoform:orchestrate agent runs these as Task subagents):
     {"id": "planner", "label": "Planner", "icon": "◷",
-     "blurb": "plan this node's sub-DAG", "applies": "any"},
+     "blurb": "split + check + review this cluster's sub-DAG", "applies": "tier1"},
+    {"id": "graphreview", "label": "Graph reviewer", "icon": "🔗",
+     "blurb": "audit & fix dependency edges here", "applies": "tier1"},
+    {"id": "contentreview", "label": "Content reviewer", "icon": "📝",
+     "blurb": "check prose faithfulness vs sources", "applies": "tier1"},
+    {"id": "holistic", "label": "Holistic review", "icon": "🔭",
+     "blurb": "big-picture pass over the whole graph", "applies": "any"},
+    {"id": "mathcheck", "label": "Mathlib check", "icon": "🔎",
+     "blurb": "is this concept already in Mathlib?", "applies": "any"},
 ]
 
 # Set of valid agent ids (membership test for /api/request validation).
