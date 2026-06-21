@@ -13,11 +13,27 @@ session, ARE the orchestrator**: you drain the queue, run each task through the 
 mechanism, and keep the dashboard's live feed (`agents_status.json`) + verdicts (`review_status.json`)
 in sync. Arguments: `$ARGUMENTS`.
 
+## ⛔ You are a DISPATCHER — delegate every task; never do the work yourself
+
+This is the rule that matters, and the #1 failure mode: **do NOT make a TODO list and work the queue yourself.** You have no authority to score or prove a node — every task is delegated. For EACH task you MUST spawn subagents with the **Task tool** (or call the `prove_node` MCP). The orchestrator's own job is only claim → route → record; it never reads a `.lean` file to judge or edits one to prove.
+
+- **reviewer** → **run the deterministic runner** — it drains ALL queued reviewer tasks at once (each node's 3-judge jury as concurrent `claude -p` processes), computes the threshold-gated verdict, and writes it itself. You do NOT spawn judges or score anything:
+  ```
+  env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9
+  ```
+- **worker** → call the **`prove_node`** MCP tool (or `Task subagent_type:"autoform:autoform-worker"`).
+- **planner** → `Task subagent_type:"autoform:splitter"` (or the `plan` skill) over the node's scope.
+
+If you catch yourself opening a `.lean` file to judge it, **STOP** — that's a subagent's job.
+
+**Run tasks in parallel, not one at a time.** The jury judges are READ-ONLY, so dispatch **several reviewer tasks at once** — spawn multiple nodes' juries together (keep ~3–4 nodes × 3 judges in flight, one Task batch per message). Only **workers** serialize, and only when their target files overlap.
+
 Two native mechanisms (no legacy Python engine):
 - **Proving** → the unified **prover MCP** `prove_node(node, backend)` (the `autoform-prover` server) —
   its driver + steerer + adapter prove the node on the selected backend.
-- **Reviewing** → the **faithfulness jury** as `Task` subagents (the autoform reviewer / single-axis
-  judges).
+- **Reviewing** → the **deterministic runner** `scripts/dispatch_runner.py` — it fans every queued
+  reviewer node's 3-judge jury out as parallel `claude -p` processes (Max) and writes the verdicts
+  atomically. No model-driven delegation, no one-at-a-time.
 
 Load the **formalization-workflow**, **eval-rubrics**, and **lean-conventions** skills first.
 
@@ -57,14 +73,13 @@ Drain every `queued` task; in `--watch`, re-poll for new drops (until interrupte
      backend: "<prover id>"}`. The prover's driver + steerer + adapter prove the node on the selected
      backend; its claude adapter already carries the no-cheating / honest-`FAILED` worker discipline
      and the **Phase-0 lakefile precondition**. Read the returned `{status, reason}`.
-   - **reviewer** → run the **faithfulness jury as THREE blind `Task` subagents IN PARALLEL** (one per
-     axis: faithfulness / proof_integrity / code_quality), each given ONLY its rubric + the Lean
-     statement + the source (send all three in one message). Gate: **rejected** if faithfulness ≤ 2 or
+   - **reviewer** → **not handled per-task.** All queued reviewer tasks are drained together by the
+     deterministic runner (`scripts/dispatch_runner.py`, above): one call reviews every queued node in
+     parallel (3 judges each), applies the threshold gate (**rejected** if faithfulness ≤ 2 or
      proof_integrity ≤ 2; **clean** if faithfulness ≥ 4 ∧ proof_integrity ≥ 3 ∧ code_quality ≥ 3; else
-     **flagged**. Write the verdict into `review_status.json`'s `ai` slot for the node
-     (`{faithfulness, proof_integrity, code_quality, verdict, at, source:"dispatch:reviewer"}`),
-     **preserving any existing `human` slot**. Atomic write.
-   - **planner** → the planner subagent / `skills/plan` over the node's scope → produce/refresh the plan.
+     **flagged**), writes each `ai` slot (`source:"dispatch:runner"`, preserving any `human` slot,
+     atomic), and flips the queue + feed. The per-task steps here apply to **worker / planner** tasks.
+   - **planner** → `Task subagent_type:"autoform:splitter"` (or the `plan` skill) over the node's scope → produce/refresh the sub-DAG.
 4. **Finish:** only on a real, verified result — `dispatch_queue.py <project> done <id> --result "…"`.
    On an honest failure (prove_node `status: failed`, an unbuildable project, a split/negative jury that
    isn't a clean pass), `… fail <id> --reason "<blocker>"`. The helper idles the feed when nothing is
@@ -74,8 +89,9 @@ Drain every `queued` task; in `--watch`, re-poll for new drops (until interrupte
 - A **reviewer** task records the jury's *actual* verdict — never `clean` without the evidence.
 - A **worker** task is `done` ONLY if `prove_node` returns `proved` (the `sorry` is gone, build clean,
   no `sorryAx`); otherwise `failed` with the concrete blocker. Never fake a proof.
-- The feed mirrors exactly what's running — never fabricate a `running`/`done`. Process worker tasks
-  one at a time unless their files are disjoint; the jury's three judges are read-only and run parallel.
+- The feed mirrors exactly what's running — never fabricate a `running`/`done`. Process **worker** tasks
+  one at a time unless their files are disjoint; **reviewer** tasks run concurrently — keep several
+  nodes' juries (each 3 read-only judges) in flight at once.
 
 ## Close-out
 On exit (`--once` done, `--max` hit, or interrupt), idle the feed (`dispatch_queue.py <project> idle`)
