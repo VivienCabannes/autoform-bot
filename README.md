@@ -36,8 +36,8 @@ an interactive leanblueprint (tier toggle, dependency-cone highlighting).
 | Skill | What it does |
 |-------|--------------|
 | `/install-lean` | Install Lean 4, elan, lake (auto-runs via hook) |
-| `/setup-project` | Create a new Lean 4 + Mathlib project |
-| `/setup-autoform` | Check uv, Python deps, Lean 4, and Zulip — install what's missing |
+| `/make-project` | Create a new Lean 4 + Mathlib project |
+| `/install-autoform` | Check uv, Python deps, Lean 4, and Zulip — install what's missing |
 | `/workspace` | Scan project structure, sorry/axiom counts, declarations |
 | `/zulip` | Search Lean Zulip for community discussions |
 

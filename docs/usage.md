@@ -185,7 +185,7 @@ aristotle_wait("thm-5-5")     # block until done
 | Command | What it does | Status |
 |---------|-------------|--------|
 | `/install-lean` | Install Lean 4, elan, lake | ✅ |
-| `/setup-project` | Create new Lean 4 + Mathlib project | ✅ |
+| `/make-project` | Create new Lean 4 + Mathlib project | ✅ |
 | `/workspace` | Inspect project structure and health | ✅ |
 | `/zulip` | Search Lean Zulip for community discussions | ✅ |
 | `/autoform` | Load Mathlib & Lean 4 conventions | ⬜ Not yet |
