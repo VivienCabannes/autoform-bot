@@ -86,12 +86,84 @@ VERDICT_DOT = {
 # Canonical value is "exists"; tolerate the other spellings seen in the wild.
 IN_MATHLIB_STATUSES = {"exists", "in-mathlib", "in_mathlib", "mathlib"}
 
-# The three jury rubrics: (name, weight, pass_threshold). Mirrors eval-rubrics.
-RUBRICS: List[Tuple[str, float, int]] = [
-    ("faithfulness", 0.40, 4),
-    ("proof_integrity", 0.40, 3),
-    ("code_quality", 0.20, 3),
+# ---------------------------------------------------------------------------
+# Jury rubrics — SINGLE SOURCE OF TRUTH: skills/eval-rubrics/references/*.json.
+# The axis set, weights, pass thresholds and gating roles are READ FROM THOSE FILES,
+# so the jury is modular: add a rubric file to add an axis, remove one to shrink the
+# jury (down to a single reviewer), and everything downstream — the weighted score,
+# the verdict gate, the parallel dispatcher — adapts with NO code change. A built-in
+# fallback keeps this module usable (tests / missing files) without the rubric dir.
+# ---------------------------------------------------------------------------
+_RUBRIC_DIR = Path(__file__).resolve().parents[2] / "skills" / "eval-rubrics" / "references"
+
+# The built-in three — used only if no rubric files are found.
+_FALLBACK_RUBRICS: List[dict] = [
+    {"name": "faithfulness",    "weight": 0.40, "pass_threshold": 4, "max_score": 5, "reject_at_or_below": 2},
+    {"name": "proof_integrity", "weight": 0.40, "pass_threshold": 3, "max_score": 5, "reject_at_or_below": 2},
+    {"name": "code_quality",    "weight": 0.20, "pass_threshold": 3, "max_score": 5, "verdict_ceiling": "flagged"},
 ]
+
+
+def _spec(d: dict) -> dict:
+    """Normalize one rubric dict into a jury spec. A ``verdict_ceiling`` (e.g.
+    ``"flagged"``) marks a *style* axis that can NEVER reject; its absence makes the
+    axis a *correctness* gate that rejects at/below ``reject_at_or_below`` (default 2)."""
+    can_reject = d.get("verdict_ceiling") is None
+    return {
+        "name": d["name"],
+        "weight": float(d.get("weight", 0.0)),
+        "pass_threshold": int(d.get("pass_threshold", 3)),
+        "max_score": int(d.get("max_score", 5)),
+        "can_reject": can_reject,
+        "reject_at_or_below": (int(d.get("reject_at_or_below", 2)) if can_reject else None),
+        "reviewer": d.get("reviewer"),
+    }
+
+
+def _load_specs() -> List[dict]:
+    """Read every rubric file once → ordered specs (heaviest axis first, ties by name).
+    Falls back to the built-in three if the dir is absent/empty/unreadable."""
+    raw: List[dict] = []
+    try:
+        for f in sorted(_RUBRIC_DIR.glob("*.json")):
+            try:
+                raw.append(json.loads(f.read_text()))
+            except Exception:
+                continue
+    except Exception:
+        raw = []
+    specs = [_spec(d) for d in raw] or [_spec(d) for d in _FALLBACK_RUBRICS]
+    specs.sort(key=lambda s: (-s["weight"], s["name"]))
+    return specs
+
+
+_SPECS: List[dict] = _load_specs()
+
+
+def rubric_specs() -> List[dict]:
+    """The ordered jury axis specs (loaded once at import from the rubric files)."""
+    return _SPECS
+
+
+def load_rubrics() -> dict:
+    """Full rubric dicts (criteria, prompt_template, …) keyed by axis name — for the
+    dispatcher to build judge prompts. Same files as the specs; empty if absent."""
+    out: dict = {}
+    try:
+        for f in sorted(_RUBRIC_DIR.glob("*.json")):
+            try:
+                d = json.loads(f.read_text())
+                out[d["name"]] = d
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+# Derived, in spec order — what the rest of the module + the dispatcher consume.
+AXES: List[str] = [s["name"] for s in _SPECS]
+RUBRICS: List[Tuple[str, float, int]] = [(s["name"], s["weight"], s["pass_threshold"]) for s in _SPECS]
 
 VERDICTS = ("clean", "flagged", "rejected")
 DIALS = ("on-demand", "targets", "full")
@@ -251,29 +323,26 @@ def weighted_score(scores: dict) -> Optional[float]:
 
 
 def jury_verdict(scores: dict) -> str:
-    """Map three rubric scores to a verdict, threshold-gated (Feature 6).
+    """Map rubric scores to a verdict, threshold-gated — GENERIC over whatever rubric
+    set eval-rubrics defines (Feature 6). For the default three axes this reproduces
+    the original behavior exactly (faith/integ <=2 reject; faith>=4 & integ>=3 &
+    qual>=3 clean).
 
-      * rejected — faithfulness <=2 OR proof_integrity <=2 (a correctness rubric
-        materially wrong / cheating). Style can never reach here.
-      * clean    — all pass (faith >=4, integ >=3, qual >=3).
-      * flagged  — otherwise (e.g. faith ==3, or code_quality <=2).
+      * rejected — any *correctness* axis (no ``verdict_ceiling``) scored at or below
+        its ``reject_at_or_below`` line. A *style* axis (verdict ceiling) never rejects.
+      * clean    — every axis meets its ``pass_threshold``.
+      * flagged  — anything else.
 
-    Missing scores are treated conservatively as a fail (cannot be clean).
+    Missing scores are treated conservatively as a fail (cannot be clean), and a
+    missing correctness score does not trigger a rejection.
     """
-    faith = scores.get("faithfulness")
-    integ = scores.get("proof_integrity")
-    qual = scores.get("code_quality")
-
-    # rejected: a correctness axis materially wrong. Style never rejects.
-    if (faith is not None and faith <= 2) or (integ is not None and integ <= 2):
-        return "rejected"
-
-    passes = (
-        faith is not None and faith >= 4
-        and integ is not None and integ >= 3
-        and qual is not None and qual >= 3
-    )
-    if passes:
+    for s in _SPECS:
+        if s["can_reject"]:
+            v = scores.get(s["name"])
+            if v is not None and v <= s["reject_at_or_below"]:
+                return "rejected"
+    if all(scores.get(s["name"]) is not None and scores[s["name"]] >= s["pass_threshold"]
+           for s in _SPECS):
         return "clean"
     return "flagged"
 
@@ -396,9 +465,7 @@ def node_scorecard(node_id: str, sidecar: dict) -> dict:
     return {
         "id": node_id,
         "ai": {
-            "faithfulness": ai.get("faithfulness"),
-            "proof_integrity": ai.get("proof_integrity"),
-            "code_quality": ai.get("code_quality"),
+            **{ax: ai.get(ax) for ax in AXES},
             "weighted": weighted_score(ai),
             "verdict": ai.get("verdict"),
             "at": ai.get("at"),

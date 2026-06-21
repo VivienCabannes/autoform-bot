@@ -50,16 +50,15 @@ try:
 except Exception as _e:                 # prover deps absent → --workers reports it cleanly
     _PROVER_OK, _PROVER_ERR, _build_node_spec = False, str(_e), None
 
-RUBRIC_DIR = HERE.parent / "skills" / "eval-rubrics" / "references"
-AXES = ["faithfulness", "proof_integrity", "code_quality"]
+# The jury axes + rubrics come from review_model — the SINGLE SOURCE OF TRUTH
+# (skills/eval-rubrics/references/*.json). Add/remove a rubric file and the jury here
+# follows with no edit: AXES, the per-node judge fan-out, and the verdict all adapt.
+AXES = rm.AXES
+load_rubrics = rm.load_rubrics
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def load_rubrics() -> dict:
-    return {ax: json.loads((RUBRIC_DIR / f"{ax}.json").read_text()) for ax in AXES}
 
 
 def build_prompt(rubric: dict, node_id: str, node: dict, content_text: str) -> str:
@@ -238,7 +237,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic parallel review dispatcher.")
     ap.add_argument("project", type=Path, help="dir holding graph.json + task_queue.json")
     ap.add_argument("--repo", type=Path, default=None, help="Lean repo = judge cwd (default: graph metadata.lean_root, else <project>/../..)")
-    ap.add_argument("--jobs", type=int, default=9, help="max concurrent claude judges (default 9 = 3 nodes x 3)")
+    ap.add_argument("--jobs", type=int, default=max(3, 3 * len(AXES)), help=f"max concurrent claude judges (default = 3 nodes x {len(AXES)} axes)")
     ap.add_argument("--model", default="opus")
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--limit", type=int, default=0, help="process only the first N reviewer tasks (0 = all)")
@@ -268,7 +267,7 @@ def main(argv=None) -> int:
           + (f" · WATCH every {a.poll}s" if a.watch else ""))
     if a.dry_run:
         for t in (initial[:a.limit] if a.limit else initial):
-            print(f"  reviewer → {t['node']:28} → 3-judge jury (faithfulness | proof_integrity | code_quality)")
+            print(f"  reviewer → {t['node']:28} → {len(AXES)}-judge jury ({' | '.join(AXES)})")
         return 0
 
     def drain_once() -> int:
@@ -292,7 +291,7 @@ def main(argv=None) -> int:
         def finalize(tid: str, node_id: str) -> None:
             scores = {ax: results[tid].get(ax, {}).get("score") for ax in AXES}
             usable = {k: v for k, v in scores.items() if isinstance(v, int)}
-            verdict = rm.jury_verdict(usable) if len(usable) == 3 else "flagged"
+            verdict = rm.jury_verdict(usable) if len(usable) == len(AXES) else "flagged"
             sc = rm.load_sidecar(sidecar_path)                  # single writer, under lock
             sc["reviews"].setdefault(node_id, {})["ai"] = {
                 **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
@@ -301,7 +300,7 @@ def main(argv=None) -> int:
             for t in cur:
                 if t["id"] == tid:
                     t["status"], t["finished_at"] = "done", dq._now()
-                    t["result"] = f"{verdict} (f{scores['faithfulness']}/i{scores['proof_integrity']}/q{scores['code_quality']})"
+                    t["result"] = f"{verdict} (" + " ".join(f"{ax[0]}{scores[ax]}" for ax in AXES) + ")"
             dq._save(queue_path, cur)
             dq._save(feed_path, dq._feed_for(cur))
             print(f"  ✓ {node_id:28} → {verdict.upper():9} {scores}", flush=True)
