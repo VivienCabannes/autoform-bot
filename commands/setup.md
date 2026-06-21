@@ -9,7 +9,7 @@ allowed-tools: Read, Write, Edit, Bash, Grep, Glob, Task, Skill
 One command from sources to a live, reviewable tiered DAG. Arguments: `$ARGUMENTS`.
 
 ## Steps
-1. **Lean project.** Target dir = `$ARGUMENTS` path or CWD. If no `lakefile.*`, run the **`setup-project`** skill (and **`install-lean`** first if `lake`/`elan` are missing) to create a Lean 4 + Mathlib project. Export `LEAN_PROJECT_DIR` to it. Echo the path.
+1. **Lean project.** Target dir = `$ARGUMENTS` path or CWD. If no `lakefile.*`, run the **`make-project`** skill (and **`install-lean`** first if `lake`/`elan` are missing) to create a Lean 4 + Mathlib project. Export `LEAN_PROJECT_DIR` to it. Echo the path.
 
 2. **Plan → the multi-tier DAG.** If `graph.json` is absent (or `--rebuild` is passed), run the **`plan`** skill:
    - **Confirm sources + scope with the user** (which textbook/paper, in what format — LaTeX/Markdown/PDF — and which chapters/sections). Don't invent prerequisites; ask if the sources don't cover something.

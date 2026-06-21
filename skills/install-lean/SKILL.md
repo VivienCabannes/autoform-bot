@@ -23,4 +23,4 @@ The script is idempotent — safe to re-run. It:
 3. Installs the default Lean toolchain if `lean` is not on PATH
 4. Verifies `lean --version` and `lake --version` both work
 
-After install, suggest `/setup-project` to create a new formalization project.
+After install, suggest `/make-project` to create a new formalization project.

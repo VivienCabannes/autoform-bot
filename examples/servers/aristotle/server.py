@@ -74,7 +74,7 @@ class AristotleManager:
                 import aristotlelib
             except ImportError:
                 raise RuntimeError(
-                    "aristotlelib is not installed. Run: /setup-autoform\n"
+                    "aristotlelib is not installed. Run: /install-autoform\n"
                     "Get an API key at: https://aristotle.harmonic.fun/dashboard/keys"
                 )
             self._lib = aristotlelib

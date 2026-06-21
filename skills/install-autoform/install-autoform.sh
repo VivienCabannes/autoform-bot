@@ -2,7 +2,7 @@
 # Set up the full autoform environment.
 # Checks uv, Python deps, Lean 4, and optional Zulip access.
 #
-# Usage: bash setup-autoform.sh
+# Usage: bash install-autoform.sh
 # Safe to re-run — skips steps that are already done.
 
 set -euo pipefail

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Set up a new Lean 4 + Mathlib project from the LeanProject template.
 #
-# Usage: bash scripts/setup-project.sh <ProjectName> [target-dir]
+# Usage: bash scripts/make-project.sh <ProjectName> [target-dir]
 #
 # - Clones the LeanProject template
 # - Renames everything to <ProjectName>
@@ -18,7 +18,7 @@ fail() { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; exit 1; }
 
 # --- Args ---
 if [ $# -lt 1 ]; then
-  echo "Usage: setup-project.sh <ProjectName> [target-dir]"
+  echo "Usage: make-project.sh <ProjectName> [target-dir]"
   echo ""
   echo "  ProjectName   UpperCamelCase name (e.g. ConvexBodies, PrimeGaps)"
   echo "  target-dir    Where to create the project (default: ./<ProjectName>)"
