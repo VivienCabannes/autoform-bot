@@ -151,9 +151,12 @@ def run_judge(axis: str, prompt: str, repo: str, model: str, timeout: int) -> di
 
 def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str, max_steers: int) -> tuple:
     """Prove/repair one node via the prover core (#14). Serial — workers write files.
-    Returns (status, reason); status is 'proved' or 'failed' (honest, never faked)."""
+    Returns (status, reason, detail): status 'proved'|'failed' (honest, never faked),
+    reason = the one-line outcome, detail = the worker's fuller report — on a FAILED
+    this carries its escalation prose (the named missing lemma, why it's stuck), which
+    the engine hands to the orchestrator to triage rather than acting on itself."""
     if not _PROVER_OK:
-        return "failed", f"prover core unavailable: {_PROVER_ERR}"
+        return "failed", f"prover core unavailable: {_PROVER_ERR}", ""
     spec = None
     if _build_node_spec:
         try:
@@ -171,9 +174,64 @@ def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str,
     try:                                       # skip-permissions: the worker edits + builds autonomously
         res = _prove(_ClaudeAdapter(extra_args=["--dangerously-skip-permissions"]),
                      node_id, spec, repo, max_steers=max_steers)
-        return res.status, (res.reason or "")
+        return res.status, (res.reason or ""), (res.proof_text or "")
     except Exception as e:
-        return "failed", f"prover error: {e}"
+        return "failed", f"prover error: {e}", ""
+
+
+_ESC_NOTE_CAP = 2400
+
+
+def _escalation_note(reason: str, detail: str, cap: int = _ESC_NOTE_CAP) -> str:
+    """Build the escalation ``note`` from the worker's one-line FAILED ``reason`` and
+    its fuller ``detail`` (its final report). The FAILED line is the most actionable
+    part, so it always leads and is never truncated; the report follows, kept
+    head-AND-tail (with an explicit ``…[N chars omitted]…`` marker) when long — the
+    named missing lemma is often in the report's *tail*, which a plain head-truncation
+    would silently drop (the very signal the escalation exists to carry)."""
+    reason = (reason or "").strip()
+    detail = (detail or "").strip()
+    extra = detail if detail and detail != reason else ""
+    if not extra:
+        return reason[:cap]
+    budget = max(400, cap - len(reason) - 40)
+    if len(extra) <= budget:
+        clip = extra
+    else:
+        head, tail = budget * 3 // 5, budget * 2 // 5
+        clip = f"{extra[:head]}\n…[{len(extra) - head - tail} chars omitted]…\n{extra[-tail:]}"
+    return f"{reason}\n\n{clip}".strip() if reason else clip
+
+
+def _raise_escalation(queue: list, node_id: str, label: str, note: str,
+                      max_escalations: int = 3) -> bool:
+    """Append an ``escalation`` task for the orchestrator to triage, with two
+    engine-side circuit breakers so safety never rests on LLM prose alone:
+      * **dedup** — at most one *open* (queued/running) escalation per node;
+      * **cap** — at most ``max_escalations`` escalations per node *ever* (``done``
+        ones count too). Past the cap the engine stops raising: a node still failing
+        after N grow-the-DAG rounds is a human's call, not an infinite Max-billed
+        retry loop. Returns True iff a new task was added.
+
+    The engine NEVER mutates ``graph.json`` from a worker result — whether a wall is a
+    real new prerequisite, a duplicate, a cluster-level gap, or a non-DAG failure
+    (toolchain / false statement / honest give-up) is a judgment call. It only raises
+    the flag + the worker's own words (``note``); ``/autoform:orchestrate`` decides."""
+    escs = [x for x in queue if x.get("agent") == "escalation" and x.get("node") == node_id]
+    if any(e.get("status") in ("queued", "running") for e in escs):
+        return False                      # an open escalation is already pending
+    if len(escs) >= max_escalations:
+        return False                      # cap hit — stop the retry/escalate cycle
+    queue.append({
+        "id": f"escalation-{node_id}-{dq._now().replace(':', '').replace('-', '')}",
+        "agent": "escalation", "node": node_id, "node_label": (label or node_id),
+        "status": "queued", "at": dq._now(), "source": "engine", "note": note})
+    return True
+
+
+def _node_escalations(queue: list, node_id: str) -> list:
+    """All escalation tasks for a node (any status) — for the worker guard + cap."""
+    return [x for x in queue if x.get("agent") == "escalation" and x.get("node") == node_id]
 
 
 def main(argv=None) -> int:
@@ -188,6 +246,7 @@ def main(argv=None) -> int:
     ap.add_argument("--poll", type=int, default=10, help="seconds between polls in --watch (default 10)")
     ap.add_argument("--workers", action="store_true", help="ALSO drain worker tasks (serial) via the prover core — proves/repairs nodes")
     ap.add_argument("--max-steers", type=int, default=2, help="worker: max live steers per node (default 2)")
+    ap.add_argument("--max-escalations", type=int, default=3, help="worker: engine-side bound — stop re-proving/re-escalating a node after this many escalations (default 3), so a hard node can't loop forever")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
@@ -279,21 +338,40 @@ def main(argv=None) -> int:
         wk = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "worker"]
         n = 0
         for t in wk:
-            c = json.loads(queue_path.read_text())                      # claim
-            for x in c:
+            c = json.loads(queue_path.read_text())                      # re-read (new drops/escalations)
+            escs = _node_escalations(c, t["node"])
+            # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
+            if any(e.get("status") in ("queued", "running") for e in escs):
+                continue                  # an open escalation on this node — leave it queued, skip
+            if len(escs) >= a.max_escalations:        # cap hit — stop re-proving a hard node
+                for x in c:
+                    if x["id"] == t["id"]:
+                        x["status"], x["finished_at"] = "failed", dq._now()
+                        x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
+                dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+                print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
+                n += 1
+                continue
+            for x in c:                                                 # claim
                 if x["id"] == t["id"]:
                     x["status"], x["started_at"] = "running", dq._now()
             dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
             print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
-            status, reason = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                        str(proj / "graph.json"), repo, a.max_steers)
+            status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
+                                                str(proj / "graph.json"), repo, a.max_steers)
             c = json.loads(queue_path.read_text())                      # finish (re-read for new drops)
             for x in c:
                 if x["id"] == t["id"]:
                     x["status"] = "done" if status == "proved" else "failed"
                     x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
+            escalated = False
+            if status != "proved":      # hand the worker's wall to the orchestrator — it decides, not us
+                lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
+                escalated = _raise_escalation(c, t["node"], lbl,
+                                              _escalation_note(reason, detail), a.max_escalations)
             dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
-            print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}", flush=True)
+            print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
+                  + ("  ⚑ escalation raised" if escalated else ""), flush=True)
             n += 1
         return n
 

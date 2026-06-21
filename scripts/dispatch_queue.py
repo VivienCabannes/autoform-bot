@@ -9,14 +9,17 @@ the agent *working* while the session does the real work. The privileged agent w
 (prove / review) is the command's job — this only moves the paperwork, atomically.
 
 The dashboard contract (both files sit next to ``graph.json`` in the review project):
-  * ``task_queue.json`` = ``[{id, agent, node, node_label, status, at, ...}]``
+  * ``task_queue.json`` = ``[{id, agent, node, node_label, status, at, source, note?, ...}]``
+    — ``source`` (``orchestrator``|``engine``|``human``, default ``orchestrator``) is who
+    raised the task; ``note`` is an optional free-text payload (e.g. a worker's escalation
+    prose). ``status`` shows a one-line ``note`` preview; the full text stays in the file.
   * ``agents_status.json`` = ``{orchestrator:{state,phase,detail}, agents:[{role,name,
     target,target_label,status,detail}]}`` — exactly what serve_review reads.
 
 Usage::
 
   dispatch_queue.py <project> next                 # next queued task as JSON ('' if none)
-  dispatch_queue.py <project> enqueue --agent A --node N [--node-label L]   # self-queue a task
+  dispatch_queue.py <project> enqueue --agent A --node N [--node-label L] [--note T] [--source S]
   dispatch_queue.py <project> claim <id> [--detail D]
   dispatch_queue.py <project> done  <id> [--result R]
   dispatch_queue.py <project> fail  <id> [--reason R]
@@ -83,9 +86,11 @@ def main(argv=None) -> int:
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
     ap.add_argument("--reason", default="")
-    ap.add_argument("--agent", default="", help="enqueue: agent id (reviewer|worker|planner)")
+    ap.add_argument("--agent", default="", help="enqueue: agent id (reviewer|worker|planner|escalation)")
     ap.add_argument("--node", default="", help="enqueue: target node id")
     ap.add_argument("--node-label", default="", help="enqueue: display label (defaults to --node)")
+    ap.add_argument("--note", default="", help="enqueue: free-text payload (e.g. a worker's escalation reason)")
+    ap.add_argument("--source", default="orchestrator", help="enqueue: who raised it (orchestrator|engine|human)")
     a = ap.parse_args(argv)
 
     qp = a.project / "task_queue.json"
@@ -103,6 +108,9 @@ def main(argv=None) -> int:
             print("  (queue empty)")
         for t in tasks:
             print(f'  {t.get("status","?"):8} {t.get("agent","?"):9} {t.get("node","?")}')
+            if t.get("note"):                       # preview (full text lives in task_queue.json)
+                note = " ".join(str(t["note"]).split())
+                print(f'           ↳ note: {note[:160]}{"…" if len(note) > 160 else ""}')
         return 0
     if a.cmd == "idle":
         _save(fp, {"orchestrator": {"state": "idle"}, "agents": []})
@@ -116,9 +124,12 @@ def main(argv=None) -> int:
             print(f"already queued/running: {a.agent} -> {a.node} (skipped)")
             return 0
         tid = f"{a.agent}-{a.node}-{_now().replace(':', '').replace('-', '')}"
-        tasks.append({"id": tid, "agent": a.agent, "node": a.node,
-                      "node_label": a.node_label or a.node, "status": "queued",
-                      "at": _now(), "source": "orchestrator"})
+        entry = {"id": tid, "agent": a.agent, "node": a.node,
+                 "node_label": a.node_label or a.node, "status": "queued",
+                 "at": _now(), "source": a.source or "orchestrator"}
+        if a.note:
+            entry["note"] = a.note
+        tasks.append(entry)
         _save(qp, tasks)
         _save(fp, _feed_for(tasks))
         print(f"enqueued {tid}")

@@ -123,6 +123,10 @@ AGENT_PALETTE = [
      "blurb": "big-picture pass over the whole graph", "applies": "any"},
     {"id": "mathcheck", "label": "Mathlib check", "icon": "🔎",
      "blurb": "is this concept already in Mathlib?", "applies": "any"},
+    # Raised by the engine when a worker hits a wall; the orchestrate agent triages it
+    # (a human may also drop it to ask the orchestrator to look at a node).
+    {"id": "escalation", "label": "Escalation", "icon": "⚑",
+     "blurb": "a worker hit a wall here — the orchestrator triages (grow the DAG / fix / surface)", "applies": "any"},
 ]
 
 # Set of valid agent ids (membership test for /api/request validation).

@@ -14,7 +14,7 @@ Two things run, sharing **one task queue** (`task_queue.json`, the file the dash
 So it runs **autonomously**, the **human drives** it via the dashboard, or **both**. Arguments: `$ARGUMENTS`.
 
 ## ⛔ You never review or prove a node yourself
-Reviewing and proving are the engine's job (deterministic, parallel). You only: launch the engine, decide what to queue, `enqueue` it, run the planning/review agents, and report. If you catch yourself scoring a node or editing a `.lean` proof, STOP — that's the engine.
+Reviewing and proving are the engine's job (deterministic, parallel). You only: launch the engine, decide what to queue, `enqueue` it, **triage escalations**, run the planning/review agents, and report. If you catch yourself scoring a node or editing a `.lean` proof, STOP — that's the engine.
 
 ## Setup
 1. **Project dir** (holds `graph.json` + `task_queue.json`): explicit `$ARGUMENTS` > `$AUTOFORM_DISPATCH_PROJECT` > the running dashboard (`ps -axww -o command | grep '[s]erve_review.py'` → its `--graph` parent) > ask. **Echo it.** Note `metadata.lean_root` → **PROJECT_DIR** (where proofs land).
@@ -29,13 +29,14 @@ pgrep -f "dispatch_runner.py.*--watch" >/dev/null \
 ```
 `--workers` proves nodes autonomously (the prover worker runs with skip-permissions). **NEVER run a `--watch` in the foreground** — it loops forever and hangs this command. Tell the user: drops auto-fire; `tail -f <project>/dispatch.log` to watch; `pkill -f dispatch_runner.py` to stop.
 
-## 2. The seven agent kinds (the dashboard palette + queue)
-Two kinds are drained by the **deterministic engine** — only ever `enqueue` them, never `Task` them (that double-runs and breaks the engine's honesty guarantee). The other five **you** run as `Task` subagents, routing every graph change through `scripts/merge_node.py` — the **sole graph writer**; subagents return data, they never write `graph.json` themselves.
+## 2. The dispatch kinds (the dashboard palette + queue)
+Two kinds are drained by the **deterministic engine** — only ever `enqueue` them, never `Task` them (that double-runs and breaks the engine's honesty guarantee). Five **you** run as `Task` subagents, routing every graph change through `scripts/merge_node.py` — the **sole graph writer**; subagents return data, they never write `graph.json` themselves. The last, **`escalation`**, the engine *raises* when a worker hits a wall and **you triage** — the worker's "I'm stuck, here's what's missing" signal, not a subagent.
 
 | kind | who | action |
 |---|---|---|
 | **reviewer** | engine | `dispatch_queue.py <project> enqueue --agent reviewer --node <id>` → the parallel 3-judge jury writes the `ai` verdict. |
-| **worker** | engine | `… enqueue --agent worker --node <id>` → the prover fills the node; `done` only on a real `proved`. |
+| **worker** | engine | `… enqueue --agent worker --node <id>` → the prover fills the node; `done` only on a real `proved`. On a FAILED it auto-raises an `escalation` (below) carrying the worker's words. |
+| **escalation** | engine → you | auto-raised when a worker FAILs; the queue entry carries the worker's own words in `note`. `claim` it, then **triage with judgment**: dedup the named gap against existing nodes; a genuine new prerequisite → `merge_node.py` (add a `missing` node + an edge into the blocked node) then `enqueue reviewer`/`worker` for it; a **cluster-level** gap → run the `planner` pipeline; a non-DAG failure (toolchain / false statement / honest give-up) → **don't grow the DAG**, surface to the user; then `done` it (or `fail` with a one-line reason if dismissed). A human may also drop it to ask you to look at a node. |
 | **mathcheck** | you | `Task autoform:mathlib-checker` with `{name, kind, description}` → merge the returned `{mathlib_status, mathlib_declarations, mathlib_file, mathlib_notes}` into the node via `merge_node.py`. |
 | **graphreview** | you | `Task autoform:graph-reviewer` (opus) with the node-id partition + `graph.json` path + `merge_node.py` path + tier/phase → apply high-confidence edge payloads via `merge_node.py`; surface uncertain ones. |
 | **contentreview** | you | `Task autoform:content-reviewer` with the cluster's tier-2 ids, their `informal_content/<id>.md` paths + structural fields, and source paths → it edits the `.md` files directly; route any structural flag to a `graphreview`. |
@@ -54,13 +55,13 @@ On a `planner` task for tier-1 cluster **C** — replaces the old bare-splitter 
 
 ## 3. The autonomy loop — default FULL-AUTO (`--manual` = drop-only)
 Unless `--manual`, loop until every target's closure is clean or `--max-tasks` (default 40) is hit:
-1. **Read** `graph.json` + `review_status.json`. Foundations-first (topological by `depends_on`): **unreviewed** node → `enqueue reviewer`; **defective/unproven** (`rejected`/`flagged`/`sorry`/`missing`, prerequisites clean) → `enqueue worker`; a **coarse cluster with no fine children** → run the `planner` pipeline; a node with a **guessed/stale `mathlib_status`** → `mathcheck`.
+1. **Read** `graph.json` + `review_status.json` + the queue. **Drain escalations first** — any `escalation` task is a worker's wall: `claim` it, read its `note` (preview via `dispatch_queue.py <project> status`; full text in `task_queue.json`), triage per the table (dedup → `merge_node.py` / `planner` / surface to the user), then `done` it. Then, foundations-first (topological by `depends_on`): **unreviewed** node → `enqueue reviewer`; **defective/unproven** (`rejected`/`flagged`/`sorry`/`missing`, prerequisites clean **and no open `escalation` on the node**) → `enqueue worker`; a **coarse cluster with no fine children** → run the `planner` pipeline; a node with a **guessed/stale `mathlib_status`** → `mathcheck`. The engine enforces these bounds too — it skips a worker whose node has an open escalation, and after `--max-escalations` (default 3) rounds it marks the worker `blocked: … needs human` and stops re-proving, so a hard node can't loop. If a node keeps re-escalating, **stop growing the DAG and surface it to the user** rather than re-queueing.
 2. **Enqueue a bounded wave** (≈ `--jobs`×2 reviewers + a few workers) via `dispatch_queue.py <project> enqueue --agent <kind> --node <id>`; it dedups — skip nodes already `running`; don't queue a worker whose prerequisites are still `rejected`.
 3. **Run your kinds** (planner/graphreview/contentreview/holistic/mathcheck) per the table; the engine drains reviewer/worker.
 4. **Wait**: poll `dispatch_queue.py <project> status` (+ `dispatch.log`) until the wave reaches `done`/`failed`, then **re-read and queue the next** — each clean proof unblocks dependents, each clean review exposes the next frontier.
 5. **Stop** at a clean frontier or `--max-tasks`; summarize verdicts + the remaining frontier. Optionally run one `holistic` triplet over the whole graph before declaring done.
 
-The human can drop any of the seven kinds in the dashboard at any time — they land in the same queue; the engine drains its two, you drain the other five. Autonomous and manual coexist.
+The human can drop any of the eight kinds in the dashboard at any time — they land in the same queue; the engine drains its two (and auto-raises `escalation`), you drain the rest. Autonomous and manual coexist.
 
 ## Honesty (non-negotiable)
 - The engine records the jury's **actual** verdict and marks a worker `done` ONLY on a real `proved` (sorry gone, build clean, no `sorryAx`) — never a faked proof. Don't override it.
