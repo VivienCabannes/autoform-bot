@@ -20,7 +20,7 @@ Two encodings live side by side on the graph and must never be conflated:
     also sits in the in-Mathlib lane.
 
 The sidecar (``review_status.json``) is the single source of truth for verdicts.
-Schema (see SHARED_SPEC.md)::
+Schema::
 
     { "version": 1, "updated_at": "<iso>", "settings": {"dial": "on-demand"},
       "reviews": {
@@ -56,7 +56,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import export_blueprint as eb  # noqa: E402  (sys.path adjusted above)
 
 # ---------------------------------------------------------------------------
-# Palette (SHARED_SPEC) — verdict -> (DOT border color, fill color). These are the
+# Palette — verdict -> (DOT border color, fill color). These are the
 # *review* colors and deliberately differ from the exporter's mathlib_status colors.
 # ---------------------------------------------------------------------------
 PALETTE = {
@@ -309,7 +309,7 @@ def load_agents(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def weighted_score(scores: dict) -> Optional[float]:
-    """Displayed score = 0.40*faith + 0.40*integ + 0.20*qual (0-5), or None.
+    """Weighted mean over the loaded rubric axes — default 0.40*faith + 0.40*integ + 0.20*qual (0-5), or None.
 
     Returns None if any rubric score is missing (so the caller can show "—").
     """

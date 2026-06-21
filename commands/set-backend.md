@@ -14,7 +14,7 @@ the same config**, so UI and CLI stay in sync. **Backend is also the billing pat
 
 - `max` → the **Max subscription** (the prover's `claude` adapter, `ANTHROPIC_API_KEY` scrubbed) — no API tokens.
 - `aristotle` → Harmonic's Aristotle (`ARISTOTLE_API_KEY`).
-- `codex` → its own auth *(planned — adapter not yet implemented; selecting it warns)*.
+- `codex` → its own auth (OpenAI — a ChatGPT subscription or an API key).
 
 Use the helper `scripts/backend_config.py`, always via `env -u ANTHROPIC_API_KEY python3
 scripts/backend_config.py`:

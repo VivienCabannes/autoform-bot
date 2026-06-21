@@ -6,7 +6,7 @@ Serves the three review screens over a stdlib ThreadingHTTPServer bound to
 fragments are read-only; the **only** file this server ever writes is the sidecar
 ``review_status.json`` (the single source of truth for verdicts).
 
-Three screens (SHARED_SPEC):
+Three screens:
   * ``GET /``               — home: the dep-graph recolored by effective verdict
                               (AI-only dashed, human solid, tainted hatched, mathlib
                               lanes), with the coverage bar + trust-frontier header.
@@ -109,7 +109,7 @@ def _lean_has_sorry(text: str) -> bool:
 AGENT_PALETTE = [
     # Deterministic-engine kinds (dispatch_runner drains these):
     {"id": "reviewer", "label": "Reviewer", "icon": "⚖",
-     "blurb": "re-review this node (3-judge jury)", "applies": "any"},
+     "blurb": "re-review this node (the review jury)", "applies": "any"},
     {"id": "worker", "label": "Worker", "icon": "⛏",
      "blurb": "formalize / fill a sorry here", "applies": "any"},
     # Model-driven kinds (the /autoform:orchestrate agent runs these as Task subagents):
@@ -580,7 +580,7 @@ def _render_md(md: str) -> str:
     return "\n".join(out) or "<p><em>(empty)</em></p>"
 
 
-# Human-facing labels for the tier toggle (SHARED_SPEC): tier number -> label.
+# Human-facing labels for the tier toggle: tier number -> label.
 TIER_LABELS = {1: "clusters", 2: "statements", 3: "declarations"}
 
 # A flat tier with more than LARGE nodes is too big to render whole (the browser

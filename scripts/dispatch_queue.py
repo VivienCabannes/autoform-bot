@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Queue/feed mechanics for ``/autoform:dispatch`` — the bridge between the DAG
+"""Queue/feed mechanics for ``/autoform:orchestrate`` — the bridge between the DAG
 review dashboard's ``task_queue.json`` and the autoform run/review pipelines.
 
 Pure, deterministic file mechanics with **zero model tokens**: read the next queued
@@ -86,7 +86,7 @@ def main(argv=None) -> int:
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
     ap.add_argument("--reason", default="")
-    ap.add_argument("--agent", default="", help="enqueue: agent id (reviewer|worker|planner|escalation)")
+    ap.add_argument("--agent", default="", help="enqueue: agent id — any palette kind (reviewer|worker|planner|graphreview|contentreview|holistic|mathcheck|escalation)")
     ap.add_argument("--node", default="", help="enqueue: target node id")
     ap.add_argument("--node-label", default="", help="enqueue: display label (defaults to --node)")
     ap.add_argument("--note", default="", help="enqueue: free-text payload (e.g. a worker's escalation reason)")
