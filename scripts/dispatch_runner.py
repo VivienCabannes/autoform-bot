@@ -29,6 +29,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -145,6 +146,8 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default="opus")
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--limit", type=int, default=0, help="process only the first N reviewer tasks (0 = all)")
+    ap.add_argument("--watch", action="store_true", help="keep running: drain, then re-poll for new drops every --poll s (Ctrl-C to stop)")
+    ap.add_argument("--poll", type=int, default=10, help="seconds between polls in --watch (default 10)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
@@ -157,78 +160,98 @@ def main(argv=None) -> int:
     repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
     rubrics = load_rubrics()
 
-    queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
-    rev = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "reviewer"]
-    if a.limit:
-        rev = rev[:a.limit]
-    others = [t for t in queue if t.get("status") == "queued" and t.get("agent") != "reviewer"]
-
+    initial = [t for t in (json.loads(queue_path.read_text()) if queue_path.exists() else [])
+               if t.get("status") == "queued" and t.get("agent") == "reviewer"]
     print(f"project          : {proj}")
     print(f"repo (judge cwd) : {repo}")
-    print(f"queued reviewers : {len(rev)}   (other agents queued: {len(others)} — run via the prover/planner)")
-    print(f"parallelism      : up to {a.jobs} concurrent judges · model {a.model} · backend max (key scrubbed)")
+    print(f"queued reviewers : {len(initial)}")
+    print(f"parallelism      : up to {a.jobs} concurrent judges · model {a.model} · backend max (key scrubbed)"
+          + (f" · WATCH every {a.poll}s" if a.watch else ""))
     if a.dry_run:
-        for t in rev:
+        for t in (initial[:a.limit] if a.limit else initial):
             print(f"  reviewer → {t['node']:28} → 3-judge jury (faithfulness | proof_integrity | code_quality)")
         return 0
-    if not rev:
-        print("nothing to do (no queued reviewer tasks).")
-        return 0
 
-    # Claim every reviewer task up front so the dashboard feed shows them ALL running at once.
-    rev_ids = {t["id"] for t in rev}
-    for t in queue:
-        if t["id"] in rev_ids:
-            t["status"], t["started_at"] = "running", dq._now()
-    dq._save(queue_path, queue)
-    dq._save(feed_path, dq._feed_for(queue))
-
-    results: dict[str, dict] = {t["id"]: {} for t in rev}
-    by_id = {t["id"]: t for t in rev}
-    lock = threading.Lock()
-
-    def finalize(tid: str, node_id: str) -> None:
-        scores = {ax: results[tid].get(ax, {}).get("score") for ax in AXES}
-        usable = {k: v for k, v in scores.items() if isinstance(v, int)}
-        verdict = rm.jury_verdict(usable) if len(usable) == 3 else "flagged"
-        sc = rm.load_sidecar(sidecar_path)                      # single writer, under lock
-        entry = sc["reviews"].setdefault(node_id, {})
-        entry["ai"] = {**scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
-        rm.save_sidecar(sidecar_path, sc)                       # preserves any human slot
-        for t in queue:
-            if t["id"] == tid:
-                t["status"], t["finished_at"] = "done", dq._now()
-                t["result"] = f"{verdict} (f{scores['faithfulness']}/i{scores['proof_integrity']}/q{scores['code_quality']})"
+    def drain_once() -> int:
+        """Review every currently-queued reviewer node in parallel; returns the count."""
+        queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+        rev = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "reviewer"]
+        if a.limit:
+            rev = rev[:a.limit]
+        if not rev:
+            return 0
+        rev_ids = {t["id"] for t in rev}
+        for t in queue:                          # claim up front → the feed shows them all running
+            if t["id"] in rev_ids:
+                t["status"], t["started_at"] = "running", dq._now()
         dq._save(queue_path, queue)
         dq._save(feed_path, dq._feed_for(queue))
-        print(f"  ✓ {node_id:28} → {verdict.upper():9} {scores}", flush=True)
 
-    with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        fut_map = {}
-        for t in rev:
-            node = nodes.get(t["node"], {})
-            content_text = ""
-            if node.get("content") and (proj / node["content"]).exists():
-                content_text = (proj / node["content"]).read_text()
-            for axis in AXES:
-                prompt = build_prompt(rubrics[axis], t["node"], node, content_text)
-                fut = ex.submit(run_judge, axis, prompt, repo, a.model, a.timeout)
-                fut_map[fut] = (t["id"], t["node"], axis)
-        for fut in cf.as_completed(fut_map):
-            tid, node_id, axis = fut_map[fut]
-            try:
-                res = fut.result()
-            except Exception as e:                              # never let one judge sink the run
-                res = {"score": None, "reasoning": f"{axis}: {e}", "error": "exc"}
-            print(f"    [{node_id}] {axis:16} score={res.get('score')}", flush=True)
-            with lock:
-                results[tid][axis] = res
-                if len(results[tid]) == len(AXES):
-                    finalize(tid, node_id)
+        results: dict[str, dict] = {t["id"]: {} for t in rev}
+        lock = threading.Lock()
 
-    dq._save(feed_path, {"orchestrator": {"state": "idle"}, "agents": []})
-    done = [by_id[i] for i in rev_ids if by_id[i].get("status") == "done"]
-    print(f"\nDONE — {len(done)}/{len(rev)} reviewer nodes scored. Sidecar: {sidecar_path}")
+        def finalize(tid: str, node_id: str) -> None:
+            scores = {ax: results[tid].get(ax, {}).get("score") for ax in AXES}
+            usable = {k: v for k, v in scores.items() if isinstance(v, int)}
+            verdict = rm.jury_verdict(usable) if len(usable) == 3 else "flagged"
+            sc = rm.load_sidecar(sidecar_path)                  # single writer, under lock
+            sc["reviews"].setdefault(node_id, {})["ai"] = {
+                **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
+            rm.save_sidecar(sidecar_path, sc)                   # preserves any human slot
+            cur = json.loads(queue_path.read_text())            # re-read: new drops may have arrived
+            for t in cur:
+                if t["id"] == tid:
+                    t["status"], t["finished_at"] = "done", dq._now()
+                    t["result"] = f"{verdict} (f{scores['faithfulness']}/i{scores['proof_integrity']}/q{scores['code_quality']})"
+            dq._save(queue_path, cur)
+            dq._save(feed_path, dq._feed_for(cur))
+            print(f"  ✓ {node_id:28} → {verdict.upper():9} {scores}", flush=True)
+
+        with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+            fut_map = {}
+            for t in rev:
+                node = nodes.get(t["node"], {})
+                content_text = ""
+                if node.get("content") and (proj / node["content"]).exists():
+                    content_text = (proj / node["content"]).read_text()
+                for axis in AXES:
+                    prompt = build_prompt(rubrics[axis], t["node"], node, content_text)
+                    fut = ex.submit(run_judge, axis, prompt, repo, a.model, a.timeout)
+                    fut_map[fut] = (t["id"], t["node"], axis)
+            for fut in cf.as_completed(fut_map):
+                tid, node_id, axis = fut_map[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:                          # never let one judge sink the run
+                    res = {"score": None, "reasoning": f"{axis}: {e}", "error": "exc"}
+                print(f"    [{node_id}] {axis:16} score={res.get('score')}", flush=True)
+                with lock:
+                    results[tid][axis] = res
+                    if len(results[tid]) == len(AXES):
+                        finalize(tid, node_id)
+        return len(rev)
+
+    idle = {"orchestrator": {"state": "idle"}, "agents": []}
+    if a.watch:
+        print("WATCHING — drop reviewers on the dashboard and they auto-fire. Ctrl-C to stop.", flush=True)
+        total = 0
+        try:
+            while True:
+                n = drain_once()
+                if n:
+                    total += n
+                    print(f"  …drained {n} (session total {total}); re-checking for new drops.", flush=True)
+                else:
+                    dq._save(feed_path, idle)
+                    time.sleep(a.poll)
+        except KeyboardInterrupt:
+            dq._save(feed_path, idle)
+            print(f"\nstopped — {total} reviewer node(s) scored this session.", flush=True)
+        return 0
+
+    n = drain_once()
+    dq._save(feed_path, idle)
+    print(f"\nDONE — {n} reviewer node(s) scored. Sidecar: {sidecar_path}", flush=True)
     return 0
 
 

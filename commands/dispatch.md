@@ -19,8 +19,9 @@ This is the rule that matters, and the #1 failure mode: **do NOT make a TODO lis
 
 - **reviewer** → **run the deterministic runner** — it drains ALL queued reviewer tasks at once (each node's 3-judge jury as concurrent `claude -p` processes), computes the threshold-gated verdict, and writes it itself. You do NOT spawn judges or score anything:
   ```
-  env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9
+  env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9 --watch
   ```
+  `--watch` (the dispatch default) keeps it draining **new** drops ~every 10s until interrupted — so the user drops reviewers on the dashboard and they auto-fire. Drop `--watch` (or pass `--once`) for a single drain.
 - **worker** → call the **`prove_node`** MCP tool (or `Task subagent_type:"autoform:autoform-worker"`).
 - **planner** → `Task subagent_type:"autoform:splitter"` (or the `plan` skill) over the node's scope.
 
