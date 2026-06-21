@@ -95,7 +95,7 @@ def test_driver_steers_when_steerer_says_off_course():
     adapter = FakeAdapter(script, ProofResult(status="proved", proof_text="done"))
     steerer = FakeSteerer(steer_at={2})  # off-course after the 2nd event
 
-    result = prove(adapter, "N", "spec", "/proj", max_steers=3, steerer=steerer)
+    result = prove(adapter, "N", "spec", "/proj", max_steers=3, steerer=steerer, verifier=None)
 
     assert result.proved
     assert adapter.steers == ["get back on course (saw 2 events)"]  # exactly one steer
@@ -107,7 +107,7 @@ def test_driver_never_steers_when_on_course():
     adapter = FakeAdapter(script, ProofResult(status="proved"))
     steerer = FakeSteerer(steer_at=set())  # never off-course
 
-    result = prove(adapter, "N", "spec", "/proj", steerer=steerer)
+    result = prove(adapter, "N", "spec", "/proj", steerer=steerer, verifier=None)
 
     assert adapter.steers == []
     assert result.proved
@@ -120,7 +120,7 @@ def test_driver_respects_max_steers_cap():
     # After each steer the window resets to [], so off-course fires at len==1.
     steerer = FakeSteerer(steer_at={1, 2, 3, 4, 5, 6})
 
-    result = prove(adapter, "N", "spec", "/proj", max_steers=2, steerer=steerer)
+    result = prove(adapter, "N", "spec", "/proj", max_steers=2, steerer=steerer, verifier=None)
 
     assert len(adapter.steers) == 2  # cap honoured
     assert result.status == "failed"
@@ -133,7 +133,7 @@ def test_driver_clears_window_after_steer():
     adapter = FakeAdapter(script, ProofResult(status="proved"))
     steerer = FakeSteerer(steer_at={2})
 
-    prove(adapter, "N", "spec", "/proj", max_steers=5, steerer=steerer)
+    prove(adapter, "N", "spec", "/proj", max_steers=5, steerer=steerer, verifier=None)
 
     # events: 1,(2→steer,reset),1,(2→steer,reset)  -> exactly 2 steers
     assert len(adapter.steers) == 2
@@ -144,7 +144,7 @@ def test_driver_returns_adapter_result_verbatim():
     adapter = FakeAdapter([_ev(EventKind.MESSAGE)], final)
     steerer = FakeSteerer(steer_at=set())
 
-    result = prove(adapter, "N", "spec", "/proj", steerer=steerer)
+    result = prove(adapter, "N", "spec", "/proj", steerer=steerer, verifier=None)
 
     assert result is final
     assert result.reason == "blocked"
@@ -159,8 +159,8 @@ def test_driver_is_backend_agnostic_same_loop_two_adapters():
     a2 = FakeAdapter(list(script), ProofResult(status="proved"))
     a2.name = "backendB"
 
-    prove(a1, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}))
-    prove(a2, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}))
+    prove(a1, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}), verifier=None)
+    prove(a2, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}), verifier=None)
 
     # Identical steering behaviour for both backends.
     assert a1.steers == a2.steers == ["get back on course (saw 2 events)"]
@@ -279,7 +279,7 @@ def test_claude_adapter_single_turn_proves():
     runner = FakeClaudeRunner(turns)
     adapter = ClaudeAdapter(runner=runner)
 
-    result = prove(adapter, "T", "prove True", "/proj", steerer=FakeSteerer(steer_at=set()))
+    result = prove(adapter, "T", "prove True", "/proj", steerer=FakeSteerer(steer_at=set()), verifier=None)
 
     assert result.proved
     assert "theorem t" in result.proof_text
@@ -306,7 +306,7 @@ def test_claude_adapter_steer_resumes_session():
     # it as a resumed follow-up turn.
     steerer = FakeSteerer(steer_at={2})
 
-    result = prove(adapter, "T", "prove True", "/proj", max_steers=1, steerer=steerer)
+    result = prove(adapter, "T", "prove True", "/proj", max_steers=1, steerer=steerer, verifier=None)
 
     assert result.proved
     assert "theorem t" in result.proof_text
@@ -325,7 +325,7 @@ def test_claude_adapter_reports_honest_failed():
     )]
     adapter = ClaudeAdapter(runner=FakeClaudeRunner(turns))
 
-    result = prove(adapter, "T", "spec", "/proj", steerer=FakeSteerer(steer_at=set()))
+    result = prove(adapter, "T", "spec", "/proj", steerer=FakeSteerer(steer_at=set()), verifier=None)
 
     assert result.status == "failed"
     assert "missing lemma foo" in result.reason
@@ -457,7 +457,7 @@ def test_aristotle_adapter_drives_via_shared_driver(tmp_path):
     spec = "prove Thm"
 
     # Drive through the unified driver with a no-op steerer (terminal immediately).
-    result = prove(adapter, "Thm", spec, str(tmp_path), steerer=FakeSteerer(steer_at=set()))
+    result = prove(adapter, "Thm", spec, str(tmp_path), steerer=FakeSteerer(steer_at=set()), verifier=None)
 
     assert result.proved
     assert result.backend == "aristotle"

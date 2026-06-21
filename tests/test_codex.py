@@ -76,7 +76,7 @@ def test_codex_adapter_single_turn_proves():
     )]
     runner = FakeCodexRunner(turns)
     adapter = CodexAdapter(runner=runner)
-    result = prove(adapter, "Foo", "prove 1=1", "/tmp/proj", max_steers=0)
+    result = prove(adapter, "Foo", "prove 1=1", "/tmp/proj", max_steers=0, verifier=None)
     assert result.status == "proved"
     assert result.backend == "codex"
     assert result.meta["session_id"] == "sess-1"
@@ -91,14 +91,14 @@ def test_codex_adapter_reports_honest_failed():
          "text": "Tried nlinarith and ring.\nFAILED — could not discharge the inductive step"}},
     )]
     adapter = CodexAdapter(runner=FakeCodexRunner(turns))
-    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0)
+    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0, verifier=None)
     assert result.status == "failed"
     assert "inductive step" in result.reason
 
 
 def test_codex_adapter_empty_output_fails():
     adapter = CodexAdapter(runner=FakeCodexRunner([[]]))
-    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0)
+    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0, verifier=None)
     assert result.status == "failed"
 
 
@@ -112,7 +112,7 @@ def test_codex_steer_resumes_session():
     )
     runner = FakeCodexRunner([turn1, turn2])
     adapter = CodexAdapter(runner=runner)
-    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer())
+    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer(), verifier=None)
     assert len(runner.calls) == 2
     # second turn must resume the captured session
     assert "resume" in runner.calls[1]["args"] and "sess-9" in runner.calls[1]["args"]
@@ -124,7 +124,7 @@ def test_codex_steer_without_session_is_dropped():
     turn1 = _lines({"type": "item.completed", "item": {"type": "agent_message", "text": "no session here"}})
     runner = FakeCodexRunner([turn1])
     adapter = CodexAdapter(runner=runner)
-    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer())
+    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer(), verifier=None)
     assert len(runner.calls) == 1  # no second (resume) turn
     assert result.status == "proved"
 
@@ -134,7 +134,7 @@ def test_codex_env_scrubs_anthropic_key(monkeypatch):
     runner = FakeCodexRunner([_lines(
         {"type": "item.completed", "item": {"type": "agent_message", "text": "ok proved"}})])
     adapter = CodexAdapter(runner=runner)
-    prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0)
+    prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0, verifier=None)
     assert "ANTHROPIC_API_KEY" not in runner.calls[0]["env"]
 
 

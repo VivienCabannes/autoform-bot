@@ -2,30 +2,35 @@
 
 An adapter reports ``status="proved"`` from its worker's self-report. That is a
 CLAIM, not a proof. Before the driver lets the claim stand, this gate INDEPENDENTLY
-verifies the work the worker actually landed:
+verifies the work the worker actually landed — using the Lean **kernel**, because
+the cheap checks are unsound:
 
-  1. **Something landed** — the worker touched at least one ``.lean`` file.
-  2. **No gap** — none of the touched files contains a real ``sorry`` / ``admit`` /
-     ``sorryAx`` (outside comments).
-  3. **Build clean** — each touched file elaborates under ``lake env lean`` (exit 0).
+  * ``lake build`` / ``lake env lean`` **exit 0 on a ``sorry``** (it is only a
+    *warning*), so an exit-code build check never catches incompleteness; and
+  * a text scan for ``sorry`` can be fooled by string literals / comments and is
+    blind to a ``sorry`` reached through an imported file.
 
-Any failure makes the gate return ``ok=False``; the driver then downgrades the
-verdict to ``failed`` with the gate's reason, OVERRIDING the worker's prose — so a
-confident message over a sorry'd or non-compiling file can never be reported proved.
+So the authoritative check is ``#print axioms`` on the touched declarations: a proof
+that rests on a ``sorry`` anywhere in its transitive dependencies reports
+``sorryAx`` in its axiom set (verified: a clean ``Main`` importing a ``sorry``'d
+``Lemma`` still prints ``'main' depends on axioms: [sorryAx]``). The gate:
 
-This is the *producer-side* gate. The kernel-level ``#print axioms`` audit (sorryAx
-introduced via non-literal paths, unexpected/unledgered axioms) stays the
-proof-integrity reviewer's job — defense in depth, not duplicated here.
+  1. **lakefile present** — else (fail-CLOSED for real runs) the proof cannot be
+     verified, so a claimed ``proved`` is rejected. (A planner Phase-0 precondition
+     guarantees a lakefile in production; tests pass ``require_lakefile=False``.)
+  2. **something landed** — ≥1 ``.lean`` changed (uncommitted *and* committed), with
+     a node→module fallback.
+  3. **build clean** — ``lake build`` exits 0 (catches genuine compile errors; a
+     ``sorry`` is only a warning so it is step 4's job, not the build's) and produces
+     the ``.olean`` the probe imports.
+  4. **no ``sorryAx``** — ``#print axioms`` over the touched modules' declarations
+     contains no ``sorryAx`` (catches literal AND transitive/imported gaps).
 
-Every ``lake`` invocation scrubs ``ANTHROPIC_API_KEY`` (Max billing hygiene). All
-external effects (git, file reads, ``lake``) sit behind injectable seams so the gate
-is unit-testable with no Lean toolchain.
-
-It **auto-skips** (passes, logged + flagged in ``checks``) when no lakefile is
-reachable — there is nothing to build. In production a lakefile is guaranteed by the
-planner's Phase-0 precondition before any worker runs, so the skip only affects
-non-Lean test/scratch contexts; it is recorded as ``checks={"verified": False}`` so a
-caller can tell a real pass from a skip.
+Any failure → ``ok=False`` and the driver downgrades the verdict to ``failed``. The
+deeper non-``sorry`` axiom audit (custom ``axiom``/orphan classes) stays the
+proof-integrity reviewer's job. Every ``lake`` call scrubs ``ANTHROPIC_API_KEY``.
+All external effects (git, file read, ``lake build``, the ``#print axioms`` probe)
+sit behind injectable seams so the gate's logic is unit-testable with no toolchain.
 """
 
 from __future__ import annotations
@@ -34,33 +39,39 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Incompleteness markers (mirrors the dashboard's sorry scanner). Whole-word so it
-# never fires inside an identifier (`sorryHandler`); the ``(?!-)`` tail rejects the
-# hyphenated prose form (``sorry-free``).
 _SORRY_RE = re.compile(r"\b(?:sorry|admit|sorryAx)\b(?!-)")
 _BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
-
-_BUILD_TIMEOUT = 600
+_MODULE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*$")
+_NS_RE = re.compile(r"^namespace\s+([A-Za-z_][A-Za-z0-9_'.]*)")
+_DECL_RE = re.compile(
+    r"^(?:@\[[^\]]*\]\s*)*"
+    r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
+    r"(?:theorem|lemma|def|abbrev|instance)\s+([A-Za-z_][A-Za-z0-9_'.]*)"
+)
+_BUILD_TIMEOUT = 900
+_PROBE_TIMEOUT = 300
 
 
 @dataclass
 class VerifyResult:
-    """Outcome of the verification gate. ``checks`` is informational (goes to the
-    ProofResult ``meta`` so a pass-vs-skip and the failing check are auditable)."""
+    """Outcome of the gate. ``checks`` is informational (→ the ProofResult ``meta``
+    so a real pass, a skip, and the failing check are all auditable)."""
 
     ok: bool
     reason: str = ""
     checks: dict = field(default_factory=dict)
 
 
+# --------------------------------------------------------------------------- utils
+
 def _strip_comments(src: str) -> str:
-    """Drop ``/- … -/`` block comments and ``-- …`` line comments before scanning."""
     src = _BLOCK_COMMENT_RE.sub(" ", src)
     out = []
     for line in src.splitlines():
@@ -70,7 +81,8 @@ def _strip_comments(src: str) -> str:
 
 
 def has_sorry(src: str) -> bool:
-    """Does this Lean source contain a real ``sorry`` / ``admit`` / ``sorryAx``?"""
+    """Fast pre-filter: a literal ``sorry``/``admit``/``sorryAx`` in source (outside
+    comments). Not authoritative — the kernel check below is — but a cheap early out."""
     return bool(_SORRY_RE.search(_strip_comments(src)))
 
 
@@ -81,7 +93,6 @@ def _scrubbed_env() -> dict:
 
 
 def find_lakefile(project_dir: str) -> bool:
-    """Is a ``lakefile.toml`` / ``lakefile.lean`` reachable from ``project_dir`` up?"""
     try:
         p = Path(project_dir).resolve()
     except Exception:
@@ -92,33 +103,55 @@ def find_lakefile(project_dir: str) -> bool:
     return False
 
 
-def git_touched_lean(project_dir: str) -> list[str]:
-    """The ``.lean`` files the worker just changed, from ``git status --porcelain``.
+# ----------------------------------------------------------------- touched files
 
-    Backend- and graph-agnostic — it reads the actual edits in the repo. Returns
-    repo-relative paths; empty if not a git repo or nothing changed."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", project_dir, "status", "--porcelain"],
-            capture_output=True, text=True, timeout=30,
-        ).stdout
-    except Exception:
-        return []
+def parse_porcelain_z(data: bytes) -> list[str]:
+    """Parse ``git status --porcelain -z`` (NUL-separated, no quoting) → changed
+    ``.lean`` paths, skipping deletions and consuming the rename/copy origin field."""
+    fields = data.split(b"\x00")
     files: list[str] = []
-    for line in out.splitlines():
-        path = line[3:].strip()                 # porcelain: "XY <path>"
-        if " -> " in path:                       # rename: "<old> -> <new>"
-            path = path.split(" -> ", 1)[1]
-        path = path.strip().strip('"')
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        i += 1
+        if len(rec) < 3:
+            continue
+        xy = rec[:2].decode("ascii", "ignore")
+        path = rec[3:].decode("utf-8", "surrogateescape")
+        if xy and (xy[0] in "RC" or xy[1:2] in ("R", "C")):
+            i += 1  # rename/copy: the next field is the origin path — consume it
+        if "D" in xy:          # deletion (staged or worktree) — nothing to verify
+            continue
         if path.endswith(".lean"):
             files.append(path)
     return files
 
 
+def _git_lean_changes(project_dir: str) -> list[str]:
+    """Touched ``.lean`` files: uncommitted (``status``) first, else the worker's last
+    commit (``diff HEAD~1 HEAD``) — so a worker that committed its proof is covered."""
+    try:
+        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z"],
+                             capture_output=True, timeout=30).stdout
+        files = parse_porcelain_z(out)
+        if files:
+            return files
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["git", "-C", project_dir, "diff", "--name-only", "-z", "--diff-filter=d", "HEAD~1", "HEAD"],
+            capture_output=True, timeout=30).stdout
+        return [p for p in out.decode("utf-8", "surrogateescape").split("\x00") if p.endswith(".lean")]
+    except Exception:
+        return []
+
+
 def _node_file_fallback(node: str, project_dir: str) -> list[str]:
-    """If git shows nothing (e.g. the worker committed its edits), fall back to the
-    node's module path: ``A.B.C`` → ``A/B/C.lean`` under the project root or ``src/``.
-    Best-effort and only for module-style node ids; empty otherwise."""
+    """Module-id node (``A.B``) → ``A/B.lean`` under the project root or ``src/``.
+    Rejects non-module ids (prose/kebab) so a stray ``node`` cannot escape the dir."""
+    if not _MODULE_ID_RE.match(node or ""):
+        return []
     rel = node.replace(".", "/") + ".lean"
     for sub in ("", "src"):
         p = Path(project_dir) / sub / rel
@@ -127,20 +160,107 @@ def _node_file_fallback(node: str, project_dir: str) -> list[str]:
     return []
 
 
-def _lake_build_file(file: str, project_dir: str) -> tuple[int, str]:
-    """Elaborate one file under the project toolchain: ``lake env lean <file>``."""
+def _touched_lean(project_dir: str, node: str) -> list[str]:
+    return _git_lean_changes(project_dir) or _node_file_fallback(node, project_dir)
+
+
+# ------------------------------------------------------------ module + decl parse
+
+def _module_of(file: str, project_dir: str) -> str | None:
+    """``A/B/C.lean`` (relative to the project root) → module name ``A.B.C``."""
     try:
-        p = subprocess.run(
-            ["lake", "env", "lean", file],
-            cwd=project_dir, env=_scrubbed_env(),
-            capture_output=True, text=True, timeout=_BUILD_TIMEOUT,
-        )
+        rel = Path(file)
+        if rel.is_absolute():
+            rel = rel.relative_to(Path(project_dir).resolve())
+    except Exception:
+        rel = Path(file)
+    s = str(rel)
+    if not s.endswith(".lean"):
+        return None
+    mod = s[:-5].replace(os.sep, ".").replace("/", ".")
+    return mod if _MODULE_ID_RE.match(mod) else None
+
+
+def _decls_of(src: str) -> list[str]:
+    """Top-level declaration names (namespace-qualified) the gate will kernel-check."""
+    decls: list[str] = []
+    stack: list[tuple[str, str]] = []   # (kind, name) for namespace/section, to match `end`
+    for raw in _strip_comments(src).splitlines():
+        s = raw.strip()
+        m = _NS_RE.match(s)
+        if m:
+            stack.append(("ns", m.group(1)))
+            continue
+        if re.match(r"^section\b", s):
+            stack.append(("sec", ""))
+            continue
+        if re.match(r"^end\b", s):
+            if stack:
+                stack.pop()
+            continue
+        m = _DECL_RE.match(s)
+        if m:
+            ns = ".".join(e[1] for e in stack if e[0] == "ns" and e[1])
+            decls.append(f"{ns}.{m.group(1)}" if ns else m.group(1))
+    # de-dup, preserve order
+    return list(dict.fromkeys(decls))
+
+
+def _build_probe(files: list[str], project_dir: str, reader: Callable[[Path], str]) -> tuple[str, list[str], list[str]]:
+    """Assemble the ``#print axioms`` probe: ``import <modules>`` + one ``#print
+    axioms <decl>`` per touched declaration."""
+    modules, decls = [], []
+    for f in files:
+        mod = _module_of(f, project_dir)
+        if mod and mod not in modules:
+            modules.append(mod)
+        fp = Path(f) if Path(f).is_absolute() else Path(project_dir) / f
+        try:
+            decls.extend(_decls_of(reader(fp)))
+        except Exception:
+            continue
+    decls = list(dict.fromkeys(decls))
+    body = "\n".join(f"import {m}" for m in modules)
+    body += "\n" + "\n".join(f"#print axioms {d}" for d in decls)
+    return body, modules, decls
+
+
+# ----------------------------------------------------------------- real runners
+
+def _lake_build(project_dir: str) -> tuple[int, str]:
+    try:
+        p = subprocess.run(["lake", "build"], cwd=project_dir, env=_scrubbed_env(),
+                           capture_output=True, text=True, timeout=_BUILD_TIMEOUT)
         return p.returncode, (p.stdout + p.stderr)
     except subprocess.TimeoutExpired:
-        return 124, f"lake env lean {file}: timed out after {_BUILD_TIMEOUT}s"
-    except Exception as e:                        # toolchain missing / not runnable
-        return 1, f"lake env lean {file}: {e}"
+        return 124, f"lake build timed out after {_BUILD_TIMEOUT}s"
+    except Exception as e:
+        return 1, f"lake build: {e}"
 
+
+def _run_probe(probe_src: str, project_dir: str) -> tuple[int, str]:
+    """Run the ``#print axioms`` probe under the project's lake env."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".lean", delete=False) as fh:
+            fh.write(probe_src)
+            tmp = fh.name
+        p = subprocess.run(["lake", "env", "lean", tmp], cwd=project_dir, env=_scrubbed_env(),
+                           capture_output=True, text=True, timeout=_PROBE_TIMEOUT)
+        return p.returncode, (p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        return 124, f"#print axioms probe timed out after {_PROBE_TIMEOUT}s"
+    except Exception as e:
+        return 1, f"#print axioms probe: {e}"
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+# ----------------------------------------------------------------- the gate
 
 def verify_proof(
     node: str,
@@ -148,46 +268,64 @@ def verify_proof(
     *,
     touched: list[str] | None = None,
     reader: Callable[[Path], str] | None = None,
-    builder: Callable[[str, str], tuple[int, str]] | None = None,
+    builder: Callable[[str], tuple[int, str]] | None = None,
+    prober: Callable[[str, str], tuple[int, str]] | None = None,
     has_lakefile: bool | None = None,
+    require_lakefile: bool = True,
 ) -> VerifyResult:
     """Independently verify a *claimed* proof for ``node`` in ``project_dir``.
 
-    Seams — ``touched`` (file list), ``reader`` (file → text), ``builder``
-    (file, dir → (rc, output)), ``has_lakefile`` — are injectable for tests; the
-    real defaults use git + the filesystem + ``lake env lean``.
-    """
+    Seams — ``touched`` / ``reader`` / ``builder`` (``lake build`` → (rc, out)) /
+    ``prober`` (the ``#print axioms`` runner → (rc, out)) / ``has_lakefile`` — are
+    injectable for tests; the real defaults use git + the filesystem + ``lake``."""
     has_lake = find_lakefile(project_dir) if has_lakefile is None else has_lakefile
     if not has_lake:
-        logger.warning("verify: no lakefile under %s — skipping build gate (claim unverified)", project_dir)
+        if require_lakefile:
+            logger.warning("verify: no lakefile under %s — cannot verify; rejecting claim", project_dir)
+            return VerifyResult(False, "no lakefile reachable — the proof cannot be verified",
+                                {"verified": False})
         return VerifyResult(True, "", {"verified": False, "skipped": "no lakefile"})
 
-    files = (touched if touched is not None
-             else git_touched_lean(project_dir) or _node_file_fallback(node, project_dir))
+    files = touched if touched is not None else _touched_lean(project_dir, node)
     if not files:
         return VerifyResult(False, "no Lean file was written — nothing to verify",
                             {"verified": True, "files": []})
 
     read = reader or (lambda pth: Path(pth).read_text(encoding="utf-8", errors="ignore"))
 
-    # 1. no-gap scan on each touched file
+    # 1. fast pre-filter — a literal sorry/admit in the touched source.
     for f in files:
         fp = Path(f) if Path(f).is_absolute() else Path(project_dir) / f
         try:
-            src = read(fp)
+            if has_sorry(read(fp)):
+                return VerifyResult(False, f"`{f}` contains a literal sorry/admit",
+                                    {"verified": True, "files": files, "sorry_in": f})
         except Exception:
-            src = ""
-        if has_sorry(src):
-            return VerifyResult(False, f"`{f}` still contains a sorry/admit/sorryAx",
-                                {"verified": True, "files": files, "sorry_in": f})
+            continue
 
-    # 2. build-clean: each touched file must elaborate
-    build = builder or _lake_build_file
-    for f in files:
-        rc, out = build(f, project_dir)
-        if rc != 0:
-            tail = " ".join(out.split())[-300:]
-            return VerifyResult(False, f"`{f}` does not compile (lake env lean exit {rc}): {tail}",
-                                {"verified": True, "files": files, "build_fail": f})
+    # 2. build clean — genuine compile errors only (rc). A `sorry` is just a warning
+    #    (rc 0) and is the kernel check's job below; we do NOT scan build output for
+    #    sorry warnings because `lake build` is whole-project and would flag OTHER
+    #    in-progress files. This step also produces the .olean the probe imports.
+    build = builder or _lake_build
+    rc, bout = build(project_dir)
+    if rc != 0:
+        return VerifyResult(False, f"`lake build` failed (exit {rc}): {' '.join(bout.split())[-300:]}",
+                            {"verified": True, "files": files, "build": "error"})
 
-    return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean", "sorry": "none"})
+    # 3. AUTHORITATIVE kernel check — #print axioms must show no sorryAx (catches a
+    #    sorry reached through an imported/untouched file too).
+    probe, modules, decls = _build_probe(files, project_dir, read)
+    if not decls:
+        # no declarations to kernel-check; the build + pre-filter passed.
+        return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean", "kernel": "no-decls"})
+    prove_probe = prober or _run_probe
+    prc, pout = prove_probe(probe, project_dir)
+    if "sorryAx" in pout:
+        return VerifyResult(False, "proof depends on `sorryAx` — a sorry/admit, possibly via an imported file",
+                            {"verified": True, "files": files, "kernel": "sorryAx"})
+    if "axioms" not in pout:   # no #print-axioms report ran (import failed / module not built)
+        return VerifyResult(False, f"could not kernel-verify (no axiom report; lean exit {prc}): {' '.join(pout.split())[-200:]}",
+                            {"verified": True, "files": files, "kernel": "unverified"})
+    return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean",
+                                   "modules": modules, "decls": len(decls), "kernel": "clean"})
