@@ -32,15 +32,14 @@ import os
 from pathlib import Path
 
 # Known backends. ``available`` = an adapter exists in servers/prover today; ``prover``
-# = the id passed to the prove_node MCP tool. ``codex`` is listed for forward-compat
-# (selecting it warns until its adapter lands).
+# = the id passed to the prove_node MCP tool.
 BACKENDS: dict[str, dict] = {
     "max": {"label": "Claude Max", "available": True, "prover": "claude",
             "billing": "Max subscription · no API tokens"},
     "aristotle": {"label": "Aristotle", "available": True, "prover": "aristotle",
                   "billing": "Harmonic · ARISTOTLE_API_KEY"},
-    "codex": {"label": "Codex", "available": False, "prover": "codex",
-              "billing": "Codex · its own auth (planned)"},
+    "codex": {"label": "Codex", "available": True, "prover": "codex",
+              "billing": "Codex · its own auth (ChatGPT/OpenAI login)"},
 }
 DEFAULT_BACKEND = "max"
 
