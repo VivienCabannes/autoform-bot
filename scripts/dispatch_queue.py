@@ -16,11 +16,17 @@ The dashboard contract (both files sit next to ``graph.json`` in the review proj
 Usage::
 
   dispatch_queue.py <project> next                 # next queued task as JSON ('' if none)
+  dispatch_queue.py <project> enqueue --agent A --node N [--node-label L]   # self-queue a task
   dispatch_queue.py <project> claim <id> [--detail D]
   dispatch_queue.py <project> done  <id> [--result R]
   dispatch_queue.py <project> fail  <id> [--reason R]
   dispatch_queue.py <project> idle                 # reset the feed to idle
   dispatch_queue.py <project> status               # one line per task
+
+``enqueue`` lets the orchestrator (Claude, or any caller) add its OWN tasks to the
+same queue the dashboard writes — so autonomous and human-dropped work share one
+pipeline. It is idempotent: a duplicate (same agent+node already queued/running)
+is skipped, never double-queued.
 """
 from __future__ import annotations
 
@@ -72,11 +78,14 @@ def _feed_for(tasks: list) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Drain/sync the review dashboard queue.")
     ap.add_argument("project", type=Path, help="review project dir (holds task_queue.json)")
-    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status"])
+    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue"])
     ap.add_argument("id", nargs="?", help="task id (for claim/done/fail)")
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
     ap.add_argument("--reason", default="")
+    ap.add_argument("--agent", default="", help="enqueue: agent id (reviewer|worker|planner)")
+    ap.add_argument("--node", default="", help="enqueue: target node id")
+    ap.add_argument("--node-label", default="", help="enqueue: display label (defaults to --node)")
     a = ap.parse_args(argv)
 
     qp = a.project / "task_queue.json"
@@ -98,6 +107,21 @@ def main(argv=None) -> int:
     if a.cmd == "idle":
         _save(fp, {"orchestrator": {"state": "idle"}, "agents": []})
         print("feed idle")
+        return 0
+    if a.cmd == "enqueue":
+        if not (a.agent and a.node):
+            ap.error("enqueue needs --agent and --node")
+        if any(t.get("status") in ("queued", "running") and t.get("agent") == a.agent
+               and t.get("node") == a.node for t in tasks):
+            print(f"already queued/running: {a.agent} -> {a.node} (skipped)")
+            return 0
+        tid = f"{a.agent}-{a.node}-{_now().replace(':', '').replace('-', '')}"
+        tasks.append({"id": tid, "agent": a.agent, "node": a.node,
+                      "node_label": a.node_label or a.node, "status": "queued",
+                      "at": _now(), "source": "orchestrator"})
+        _save(qp, tasks)
+        _save(fp, _feed_for(tasks))
+        print(f"enqueued {tid}")
         return 0
 
     if not a.id:

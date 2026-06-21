@@ -38,6 +38,17 @@ sys.path.insert(0, str(HERE / "review_ui"))
 sys.path.insert(0, str(HERE))
 import review_model as rm          # load_sidecar / save_sidecar / jury_verdict
 import dispatch_queue as dq        # _save / _feed_for / _now (queue + live feed)
+sys.path.insert(0, str(HERE.parent))   # plugin root, for the prover core (--workers)
+try:
+    from servers.prover.driver import prove as _prove
+    from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
+    try:
+        from servers.aristotle.core import build_node_spec as _build_node_spec
+    except Exception:
+        _build_node_spec = None
+    _PROVER_OK, _PROVER_ERR = True, ""
+except Exception as _e:                 # prover deps absent → --workers reports it cleanly
+    _PROVER_OK, _PROVER_ERR, _build_node_spec = False, str(_e), None
 
 RUBRIC_DIR = HERE.parent / "skills" / "eval-rubrics" / "references"
 AXES = ["faithfulness", "proof_integrity", "code_quality"]
@@ -138,6 +149,33 @@ def run_judge(axis: str, prompt: str, repo: str, model: str, timeout: int) -> di
     return parse_score(p.stdout, axis)
 
 
+def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str, max_steers: int) -> tuple:
+    """Prove/repair one node via the prover core (#14). Serial — workers write files.
+    Returns (status, reason); status is 'proved' or 'failed' (honest, never faked)."""
+    if not _PROVER_OK:
+        return "failed", f"prover core unavailable: {_PROVER_ERR}"
+    spec = None
+    if _build_node_spec:
+        try:
+            spec = _build_node_spec(Path(graph_path), node_id, project_dir=Path(repo))
+        except Exception:
+            spec = None
+    if not spec:                              # fallback spec from the node's prose
+        body = ""
+        if node.get("content") and (proj / node["content"]).exists():
+            body = (proj / node["content"]).read_text()[:4000]
+        spec = (f"Target node `{node_id}` ({node.get('kind', 'statement')}). "
+                f"{node.get('description', '')}\n\n{body}\n\n"
+                f"Find the declaration(s) in the repo and complete/repair the proof so the file "
+                f"compiles cleanly with NO sorry/admit/axiom — or report an honest FAILED.")
+    try:                                       # skip-permissions: the worker edits + builds autonomously
+        res = _prove(_ClaudeAdapter(extra_args=["--dangerously-skip-permissions"]),
+                     node_id, spec, repo, max_steers=max_steers)
+        return res.status, (res.reason or "")
+    except Exception as e:
+        return "failed", f"prover error: {e}"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic parallel review dispatcher.")
     ap.add_argument("project", type=Path, help="dir holding graph.json + task_queue.json")
@@ -148,6 +186,8 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=0, help="process only the first N reviewer tasks (0 = all)")
     ap.add_argument("--watch", action="store_true", help="keep running: drain, then re-poll for new drops every --poll s (Ctrl-C to stop)")
     ap.add_argument("--poll", type=int, default=10, help="seconds between polls in --watch (default 10)")
+    ap.add_argument("--workers", action="store_true", help="ALSO drain worker tasks (serial) via the prover core — proves/repairs nodes")
+    ap.add_argument("--max-steers", type=int, default=2, help="worker: max live steers per node (default 2)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
@@ -231,13 +271,39 @@ def main(argv=None) -> int:
                         finalize(tid, node_id)
         return len(rev)
 
+    def drain_workers() -> int:
+        """Prove every queued worker node, one at a time (workers write files → serial)."""
+        if not a.workers:
+            return 0
+        queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+        wk = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "worker"]
+        n = 0
+        for t in wk:
+            c = json.loads(queue_path.read_text())                      # claim
+            for x in c:
+                if x["id"] == t["id"]:
+                    x["status"], x["started_at"] = "running", dq._now()
+            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+            print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
+            status, reason = run_worker(t["node"], nodes.get(t["node"], {}), proj,
+                                        str(proj / "graph.json"), repo, a.max_steers)
+            c = json.loads(queue_path.read_text())                      # finish (re-read for new drops)
+            for x in c:
+                if x["id"] == t["id"]:
+                    x["status"] = "done" if status == "proved" else "failed"
+                    x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
+            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+            print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}", flush=True)
+            n += 1
+        return n
+
     idle = {"orchestrator": {"state": "idle"}, "agents": []}
     if a.watch:
         print("WATCHING — drop reviewers on the dashboard and they auto-fire. Ctrl-C to stop.", flush=True)
         total = 0
         try:
             while True:
-                n = drain_once()
+                n = drain_once() + drain_workers()
                 if n:
                     total += n
                     print(f"  …drained {n} (session total {total}); re-checking for new drops.", flush=True)
@@ -249,9 +315,9 @@ def main(argv=None) -> int:
             print(f"\nstopped — {total} reviewer node(s) scored this session.", flush=True)
         return 0
 
-    n = drain_once()
+    n = drain_once() + drain_workers()
     dq._save(feed_path, idle)
-    print(f"\nDONE — {n} reviewer node(s) scored. Sidecar: {sidecar_path}", flush=True)
+    print(f"\nDONE — {n} task(s) processed. Sidecar: {sidecar_path}", flush=True)
     return 0
 
 
