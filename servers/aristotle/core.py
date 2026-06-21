@@ -117,6 +117,26 @@ class AristotleManager:
                     "and set ARISTOTLE_API_KEY (free key at "
                     "https://aristotle.harmonic.fun/dashboard/keys)."
                 ) from err
+            # API guard: this client targets the aristotlelib >=2.0 API
+            # (``Project.create_from_directory`` / ``ask`` / ``get_tasks``). An older
+            # lib (e.g. 0.5.x) has an incompatible API and would fail with a cryptic
+            # AttributeError deep in submit() — surface it clearly instead. This fires
+            # only when running outside the plugin's locked env (pyproject pins >=2.0).
+            proj = getattr(aristotlelib, "Project", None)
+            if proj is None or not hasattr(proj, "create_from_directory"):
+                try:
+                    import importlib.metadata as _md
+                    ver = _md.version("aristotlelib")
+                except Exception:
+                    ver = "unknown"
+                raise RuntimeError(
+                    f"aristotlelib {ver} has an incompatible API — this client needs the "
+                    ">=2.0 API (Project.create_from_directory / ask / get_tasks). You are "
+                    "likely running outside the plugin's locked env. Run the Aristotle "
+                    "backend via the prover MCP server (`uv run --extra aristotle python -m "
+                    "servers.prover.server`) or `uv sync --extra aristotle` (the pyproject "
+                    "pins aristotlelib>=2.0), not a stray global install."
+                )
             self._lib = aristotlelib
         return self._lib
 
