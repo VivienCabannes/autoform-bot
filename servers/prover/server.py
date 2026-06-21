@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 def _make_adapter(backend: str, graph_path: str, max_wait_seconds: float) -> ProverAdapter:
-    """Construct the adapter for ``backend``. Aristotle is imported lazily here."""
+    """Construct the adapter for ``backend``. Aristotle/Codex are imported lazily here."""
     if backend == "claude":
         return ClaudeAdapter()
     if backend == "aristotle":
@@ -45,7 +45,12 @@ def _make_adapter(backend: str, graph_path: str, max_wait_seconds: float) -> Pro
         from .aristotle_adapter import AristotleAdapter
 
         return AristotleAdapter(graph_path=graph_path, max_wait_seconds=max_wait_seconds)
-    raise ValueError(f"unknown backend {backend!r}; expected 'claude' or 'aristotle'")
+    if backend == "codex":
+        # Lazy import: the OpenAI ``codex`` CLI backend (its own auth, not Max).
+        from .codex_adapter import CodexAdapter
+
+        return CodexAdapter()
+    raise ValueError(f"unknown backend {backend!r}; expected 'claude', 'aristotle', or 'codex'")
 
 
 def run_prove_node(
