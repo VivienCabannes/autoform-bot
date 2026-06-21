@@ -38,6 +38,7 @@ sys.path.insert(0, str(HERE / "review_ui"))
 sys.path.insert(0, str(HERE))
 import review_model as rm          # load_sidecar / save_sidecar / jury_verdict
 import dispatch_queue as dq        # _save / _feed_for / _now (queue + live feed)
+import backend_config              # backend selection (max -> claude adapter, aristotle, codex)
 sys.path.insert(0, str(HERE.parent))   # plugin root, for the prover core (--workers)
 try:
     from servers.prover.driver import prove as _prove
@@ -148,12 +149,27 @@ def run_judge(axis: str, prompt: str, repo: str, model: str, timeout: int) -> di
     return parse_score(p.stdout, axis)
 
 
-def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str, max_steers: int) -> tuple:
-    """Prove/repair one node via the prover core (#14). Serial — workers write files.
-    Returns (status, reason, detail): status 'proved'|'failed' (honest, never faked),
-    reason = the one-line outcome, detail = the worker's fuller report — on a FAILED
-    this carries its escalation prose (the named missing lemma, why it's stuck), which
-    the engine hands to the orchestrator to triage rather than acting on itself."""
+def _worker_adapter(backend: str, repo: str, graph_path: str):
+    """The prover adapter for the configured backend (the engine's worker path).
+    ``claude`` = headless Max worker (skip-permissions); ``aristotle``/``codex`` via
+    their adapters (imported lazily so the engine starts without those extras)."""
+    if backend == "aristotle":
+        from servers.prover.aristotle_adapter import AristotleAdapter
+        return AristotleAdapter(graph_path=graph_path)
+    if backend == "codex":
+        from servers.prover.codex_adapter import CodexAdapter
+        return CodexAdapter()
+    return _ClaudeAdapter(extra_args=["--dangerously-skip-permissions"])
+
+
+def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str,
+               max_steers: int, backend: str = "claude") -> tuple:
+    """Prove/repair one node via the prover core (#14) on the chosen ``backend``.
+    Serial — workers write files. Returns (status, reason, detail): status
+    'proved'|'failed' (honest — gated by the driver's verification gate), reason =
+    the one-line outcome, detail = the worker's fuller report — on a FAILED this
+    carries its escalation prose (the named missing lemma, why it's stuck), which the
+    engine hands to the orchestrator to triage rather than acting on itself."""
     if not _PROVER_OK:
         return "failed", f"prover core unavailable: {_PROVER_ERR}", ""
     spec = None
@@ -170,8 +186,8 @@ def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str,
                 f"{node.get('description', '')}\n\n{body}\n\n"
                 f"Find the declaration(s) in the repo and complete/repair the proof so the file "
                 f"compiles cleanly with NO sorry/admit/axiom — or report an honest FAILED.")
-    try:                                       # skip-permissions: the worker edits + builds autonomously
-        res = _prove(_ClaudeAdapter(extra_args=["--dangerously-skip-permissions"]),
+    try:                                       # the worker edits + builds autonomously
+        res = _prove(_worker_adapter(backend, repo, graph_path),
                      node_id, spec, repo, max_steers=max_steers)
         return res.status, (res.reason or ""), (res.proof_text or "")
     except Exception as e:
@@ -245,6 +261,7 @@ def main(argv=None) -> int:
     ap.add_argument("--poll", type=int, default=10, help="seconds between polls in --watch (default 10)")
     ap.add_argument("--workers", action="store_true", help="ALSO drain worker tasks (serial) via the prover core — proves/repairs nodes")
     ap.add_argument("--max-steers", type=int, default=2, help="worker: max live steers per node (default 2)")
+    ap.add_argument("--backend", default=backend_config.get_backend(), help="prover backend for --workers (max|aristotle|codex; default: the persisted backend_config)")
     ap.add_argument("--max-escalations", type=int, default=3, help="worker: engine-side bound — stop re-proving/re-escalating a node after this many escalations (default 3), so a hard node can't loop forever")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
@@ -263,7 +280,8 @@ def main(argv=None) -> int:
     print(f"project          : {proj}")
     print(f"repo (judge cwd) : {repo}")
     print(f"queued reviewers : {len(initial)}")
-    print(f"parallelism      : up to {a.jobs} concurrent judges · model {a.model} · backend max (key scrubbed)"
+    print(f"parallelism      : up to {a.jobs} concurrent judges · model {a.model} · judges→Max (key scrubbed)"
+          + (f" · workers→{a.backend} ({backend_config.prover_of(a.backend)} adapter)" if a.workers else "")
           + (f" · WATCH every {a.poll}s" if a.watch else ""))
     if a.dry_run:
         for t in (initial[:a.limit] if a.limit else initial):
@@ -357,7 +375,8 @@ def main(argv=None) -> int:
             dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
             print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
             status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                                str(proj / "graph.json"), repo, a.max_steers)
+                                                str(proj / "graph.json"), repo, a.max_steers,
+                                                backend=backend_config.prover_of(a.backend))
             c = json.loads(queue_path.read_text())                      # finish (re-read for new drops)
             for x in c:
                 if x["id"] == t["id"]:

@@ -21,13 +21,23 @@ Reviewing and proving are the engine's job (deterministic, parallel). You only: 
 2. **Backend**: `--backend` > `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/backend_config.py get` > `max`. **Echo it.**
 
 ## 1. Launch the engine (always)
-Detached + idempotent — skip if a `--watch` engine is already up:
+Detached + idempotent — skip if a `--watch` engine is already up. Launched via `uv run
+--extra aristotle` so the chosen backend's deps (aristotlelib) are present; harmless for
+`max`/`codex`. Pass the resolved `$BACKEND` through with `--backend`:
 ```
 pgrep -f "dispatch_runner.py.*--watch" >/dev/null \
   && echo "engine already running (pkill -f dispatch_runner.py to stop)" \
-  || { nohup env -u ANTHROPIC_API_KEY python3 -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> --jobs 9 --watch --workers >> <project>/dispatch.log 2>&1 & echo "started engine PID $!"; }
+  || { nohup env -u ANTHROPIC_API_KEY uv run --directory ${CLAUDE_PLUGIN_ROOT} --extra aristotle \
+        python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> \
+        --backend $BACKEND --jobs 9 --watch --workers >> <project>/dispatch.log 2>&1 & echo "started engine PID $!"; }
 ```
-`--workers` proves nodes autonomously (the prover worker runs with skip-permissions). **NEVER run a `--watch` in the foreground** — it loops forever and hangs this command. Tell the user: drops auto-fire; `tail -f <project>/dispatch.log` to watch; `pkill -f dispatch_runner.py` to stop.
+`--workers` proves nodes autonomously on `$BACKEND` (claude = headless Max worker with
+skip-permissions; aristotle = Harmonic; codex = its own auth) — and every claimed proof
+passes the shared **verification gate** (`servers/prover/verify.py`: builds clean + `#print
+axioms` shows no `sorryAx`) before it can land. The 3-judge jury always bills Max (key
+scrubbed). **NEVER run a `--watch` in the foreground** — it loops forever and hangs this
+command. Tell the user: drops auto-fire; `tail -f <project>/dispatch.log` to watch; `pkill
+-f dispatch_runner.py` to stop.
 
 ## 2. The dispatch kinds (the dashboard palette + queue)
 Two kinds are drained by the **deterministic engine** — only ever `enqueue` them, never `Task` them (that double-runs and breaks the engine's honesty guarantee). Five **you** run as `Task` subagents, routing every graph change through `scripts/merge_node.py` — the **sole graph writer**; subagents return data, they never write `graph.json` themselves. The last, **`escalation`**, the engine *raises* when a worker hits a wall and **you triage** — the worker's "I'm stuck, here's what's missing" signal, not a subagent.
