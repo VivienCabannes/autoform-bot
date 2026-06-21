@@ -6,7 +6,8 @@ its event stream onto the shared :class:`~servers.prover.base.Event` vocabulary,
 steer turn-granularly by resuming the session, and parse the final report into a
 :class:`~servers.prover.base.ProofResult` — held to the SAME no-cheating /
 honest-``FAILED`` discipline. Only the CLI and its output schema differ, so the
-shared driver + steerer are unchanged.
+shared driver + steerer are unchanged, and the honest-FAILED parse / spec prompt /
+env scrub / JSONL parse / discipline skeleton are shared via ``_cli_common``.
 
 **Billing / auth.** Codex runs on its OWN auth — the ``codex`` CLI's logged-in
 account (a ChatGPT subscription, or an OpenAI API key), **not** the Claude Max
@@ -26,18 +27,22 @@ model, or flags via the ctor / ``AUTOFORM_CODEX_BIN`` if your codex differs.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._cli_common import (
+    _build_spec_prompt,
+    _failure_reason,
+    _iter_json_lines,
+    _looks_failed,
+    _scrubbed_env,
+    _subprocess_line_runner,
+    build_worker_prompt,
+)
 from .base import Event, EventKind, ProofResult, ProverAdapter, Run
-
-# Reuse the SHARED honesty parsing + the generic subprocess runner so "what counts
-# as an honest FAILED" has ONE definition across every CLI-agent backend.
-from .claude_adapter import _failure_reason, _looks_failed, _subprocess_stream_runner
 
 logger = logging.getLogger(__name__)
 
@@ -49,38 +54,13 @@ DEFAULT_CODEX_BIN = os.environ.get("AUTOFORM_CODEX_BIN", "codex")
 DEFAULT_AUTONOMY_ARGS = ["--dangerously-bypass-approvals-and-sandbox"]
 
 # The SAME no-cheating / honest-FAILED contract the Claude backend states, framed
-# for codex (no separate system-prompt flag, so it is inlined into the first turn).
-CODEX_SYSTEM_PROMPT = (
-    "You are a Lean 4 / Mathlib formalization worker — a prover backend. Given a target "
-    "node and its spec, search Mathlib, write a GENUINE Lean 4 proof, and compile-to-iterate "
-    "(run `lake env lean` / the project's REPL) until it compiles cleanly with no gaps.\n\n"
-    "Hard rule — no cheating: `sorry`, `admit`, raw `axiom`, and `native_decide` are NEVER an "
-    "acceptable finished proof; do not hide a gap behind an `opaque`/`macro`/structure field or "
-    "a vacuous `False.elim`. The statement must be proved faithfully — no weakening, no smuggled "
-    "hypotheses. Grep the whole project for `sorry`/`admit`/`axiom` before calling anything done.\n\n"
-    "Output: on success, write the proof into the node's file and report the final Lean content "
-    "plus a one-line compilation status. If you could NOT discharge the target (does not compile, "
-    "a `sorry` remains, the build will not run, or you ran out of road), do NOT deliver a "
-    "success-shaped result — end with a line `FAILED — <one-line reason>` naming the concrete "
-    "blocker. Reporting FAILED honestly is correct; delivering a sorry'd file as done is the one "
-    "thing you must never do."
+# for codex (no separate system-prompt flag, so it is inlined into the first turn) —
+# assembled from the shared skeleton in ``_cli_common`` so the two cannot drift.
+CODEX_SYSTEM_PROMPT = build_worker_prompt(
+    tools_clause="(run `lake env lean` / the project's REPL)",
+    build_phrase="the build will not run",
+    blocker_phrase="naming the concrete blocker.",
 )
-
-
-def _codex_env() -> dict[str, str]:
-    """Codex runs on its own auth (``codex login``); inherit the environment. We
-    still drop ``ANTHROPIC_API_KEY`` (irrelevant to codex) as project hygiene."""
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
-    return env
-
-
-def _build_spec_prompt(node: str, spec: str) -> str:
-    return (
-        f"# Formalization target: {node}\n\n{spec}\n\n"
-        "Prove this node now. Write the proof into the project and report the result "
-        "(or an honest `FAILED — <reason>` if you cannot)."
-    )
 
 
 # codex ``exec --json`` item types → normalized EventKind (defensive sets; matching
@@ -171,7 +151,7 @@ class CodexAdapter(ProverAdapter):
         self._codex_bin = codex_bin
         self._autonomy_args = list(autonomy_args if autonomy_args is not None else DEFAULT_AUTONOMY_ARGS)
         self._extra_args = list(extra_args or [])
-        self._runner = runner or _subprocess_stream_runner
+        self._runner = runner or _subprocess_line_runner
 
     # ------------------------------------------------------------------ surface
 
@@ -228,14 +208,7 @@ class CodexAdapter(ProverAdapter):
             args += ["-m", state.model]
         args += self._autonomy_args + state.extra_args + [prompt]
 
-        for line in self._runner(args, _codex_env(), state.project_dir):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir)):
             event, final, sid = _classify_codex_event(obj)
             if sid:
                 state.session_id = sid

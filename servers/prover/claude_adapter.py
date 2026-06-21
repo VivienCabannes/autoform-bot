@@ -35,18 +35,28 @@ adapter's surface identical to Aristotle's (whose ``project.ask`` is likewise a
 new task on the live session), so the SHARED driver loop is unchanged. ``events``
 transparently chains the resumed turn's stream after the current one, so to the
 driver it is one continuous event iterator.
+
+Shared CLI-agent internals (the honest-FAILED parse, the spec prompt, the env
+scrub, the JSONL parse, the worker-discipline skeleton) live in ``_cli_common`` —
+one definition across the Claude and Codex backends.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._cli_common import (
+    _build_spec_prompt,
+    _failure_reason,
+    _iter_json_lines,
+    _looks_failed,
+    _scrubbed_env,
+    _subprocess_line_runner,
+    build_worker_prompt,
+)
 from .base import Event, EventKind, ProofResult, ProverAdapter, Run
 
 logger = logging.getLogger(__name__)
@@ -54,45 +64,21 @@ logger = logging.getLogger(__name__)
 # Default model for the headless worker (overridable via ctor / env).
 DEFAULT_MODEL = "opus"
 
-# The prover discipline the headless worker is held to. This is the SAME
-# no-cheating / honest-FAILED contract the in-session ``autoform-worker`` agent
-# carries (agents/autoform-worker.md); kept here so the Claude *backend* states
-# its contract even when launched outside an agent harness.
-WORKER_SYSTEM_PROMPT = (
-    "You are a Lean 4 / Mathlib formalization worker — a prover backend. Given a target "
-    "node and its spec, search Mathlib, write a GENUINE Lean 4 proof, and compile-to-iterate "
-    "via the autoform-repl / autoform-lsp MCP tools until it compiles cleanly with no gaps.\n\n"
-    "Hard rule — no cheating: `sorry`, `admit`, raw `axiom`, and `native_decide` are NEVER an "
-    "acceptable finished proof; do not hide a gap behind an `opaque`/`macro`/structure field or "
-    "a vacuous `False.elim`. The statement must be proved faithfully — no weakening, no smuggled "
-    "hypotheses, no pinned-general parameter. Grep the whole project for `sorry`/`admit`/`axiom` "
-    "before calling anything done.\n\n"
-    "Billing: scrub `ANTHROPIC_API_KEY` from every subprocess you spawn (`env -u "
-    "ANTHROPIC_API_KEY …`) so no `lake`/`git`/script child can bill the Anthropic API.\n\n"
-    "Output: on success, write the proof into the node's file and report the final Lean content "
-    "plus a one-line REPL compilation status. If you could NOT discharge the target (does not "
-    "compile, a `sorry` remains, build will not run, or you ran out of road), do NOT deliver a "
-    "success-shaped result — end with a line `FAILED — <one-line reason>` and the concrete blocker. "
-    "Reporting FAILED honestly is correct; delivering a sorry'd file as done is the one thing you "
-    "must never do."
+# The prover discipline the headless worker is held to — the SAME no-cheating /
+# honest-FAILED contract the in-session ``autoform-worker`` agent carries
+# (agents/autoform-worker.md), assembled from the shared skeleton in ``_cli_common``
+# so it cannot drift from the Codex backend's copy.
+WORKER_SYSTEM_PROMPT = build_worker_prompt(
+    tools_clause="via the autoform-repl / autoform-lsp MCP tools",
+    extra_hyp_clause=", no pinned-general parameter",
+    billing_paragraph=(
+        "Billing: scrub `ANTHROPIC_API_KEY` from every subprocess you spawn (`env -u "
+        "ANTHROPIC_API_KEY …`) so no `lake`/`git`/script child can bill the Anthropic API.\n\n"
+    ),
+    repl_word="REPL ",
+    build_phrase="build will not run",
+    blocker_phrase="and the concrete blocker.",
 )
-
-
-def _scrubbed_env() -> dict[str, str]:
-    """A copy of the environment with ``ANTHROPIC_API_KEY`` removed → Max OAuth."""
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
-    return env
-
-
-def _build_spec_prompt(node: str, spec: str) -> str:
-    """The first-turn user prompt: the node target + its spec."""
-    return (
-        f"# Formalization target: {node}\n\n"
-        f"{spec}\n\n"
-        "Prove this node now. Write the proof into the project and report the result "
-        "(or an honest `FAILED — <reason>` if you cannot)."
-    )
 
 
 def _classify_stream_event(obj: dict[str, Any]) -> Event | None:
@@ -183,7 +169,7 @@ class ClaudeAdapter(ProverAdapter):
         self._model = model
         self._system_prompt = system_prompt
         self._extra_args = list(extra_args or [])
-        self._runner = runner or _subprocess_stream_runner
+        self._runner = runner or _subprocess_line_runner
 
     # ------------------------------------------------------------------
     # Adapter surface
@@ -256,14 +242,7 @@ class ClaudeAdapter(ProverAdapter):
             args += ["--append-system-prompt", self._system_prompt]
         args += state.extra_args
 
-        for line in self._runner(args, _scrubbed_env(), state.project_dir):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir)):
             # Capture the session id (emitted on the ``system: init`` line and the
             # ``result`` line) so a steer can resume this exact conversation.
             sid = obj.get("session_id")
@@ -275,51 +254,3 @@ class ClaudeAdapter(ProverAdapter):
             if event.kind is EventKind.RESULT and event.content:
                 state.final_text = event.content
             yield event
-
-
-def _subprocess_stream_runner(args: list[str], env: dict[str, str], cwd: str):
-    """Real launcher: run ``claude`` and yield its stdout lines (stream-json).
-
-    Lives behind the injectable ``runner`` seam so the adapter is unit-testable
-    without spawning ``claude``.
-    """
-    proc = subprocess.Popen(
-        args,
-        cwd=cwd or None,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            yield line
-    finally:
-        proc.stdout and proc.stdout.close()
-        proc.wait()
-
-
-def _looks_failed(text: str) -> bool:
-    """Heuristic: did the worker report an honest FAILED rather than a proof?
-
-    The worker contract ends a failure with a ``FAILED — <reason>`` line; an empty
-    result is also treated as a failure (no proof produced).
-    """
-    if not text.strip():
-        return True
-    return "FAILED" in text.upper().split("\n")[0] or "\nFAILED" in ("\n" + text).upper()
-
-
-def _failure_reason(text: str) -> str:
-    """Extract the one-line reason from a ``FAILED — <reason>`` report."""
-    if not text.strip():
-        return "claude worker produced no output"
-    for line in text.splitlines():
-        up = line.strip()
-        if up.upper().startswith("FAILED"):
-            # Strip the "FAILED —/-/:" lead-in.
-            rest = up[6:].lstrip(" —-:")
-            return rest or "worker reported FAILED"
-    return "worker reported FAILED"
