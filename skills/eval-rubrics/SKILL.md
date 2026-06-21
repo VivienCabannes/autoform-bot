@@ -12,7 +12,7 @@ description: >-
 
 # Evaluation rubrics for formalized mathematics
 
-The grading criteria the AI jury applies to a formalized node. The jury is **three blind
+The grading criteria the AI jury applies to a formalized node. The jury is **blind
 single-axis reviewers**, each given ONLY its own rubric — never the others'. Each rubric is an
 integer score 0–5 with a pass threshold; the criteria and prompt templates are the JSON files in
 `references/`.
@@ -79,7 +79,7 @@ all three pass, the verdict is clean; otherwise flagged.
 3. Score the one rubric you were given, 0–5, with a one-paragraph justification grounded in concrete
    evidence (cite the line / lemma), not vibes. Emit strict JSON `{"score", "reasoning"}` (the
    proof_integrity rubric additionally emits `axiom_only` + `axiom_verdicts`).
-4. The orchestrator combines the three scores into the displayed score and the verdict above.
+4. The orchestrator combines the per-axis scores into the displayed score and the verdict above.
 
 ## Writing to the sidecar (`review_status.json`)
 
