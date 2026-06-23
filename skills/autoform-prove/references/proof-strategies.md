@@ -22,6 +22,10 @@ Work incrementally. Prototype before editing. Search before proving.
 
 - Search Mathlib before writing a proof from scratch: `mathlib_grep` / `mathlib_find_name` (the
   mathlib MCP), or `exact?` / `apply?` / `rw?` inside a `run_lean_code` snippet.
+- **Don't know the name?** Search by *meaning* with the **lean-explore** skill — semantic search
+  over Mathlib + 8 libraries (Batteries, Std, FLT, …): `lean-explore-search.py "<what the lemma
+  says>"` returns the fully-qualified name + module, which you then confirm with `mathlib_find_name`.
+  (Needs `LEANEXPLORE_API_KEY`; skip if unset.)
 - Many standard results already exist — finding the right lemma name is faster, and far more
   robust, than reproving a known fact. See **autoform** for naming patterns that make
   the search land.
