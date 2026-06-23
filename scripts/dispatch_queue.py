@@ -24,7 +24,8 @@ Usage::
   dispatch_queue.py <project> done  <id> [--result R]
   dispatch_queue.py <project> fail  <id> [--reason R]
   dispatch_queue.py <project> idle                 # reset the feed to idle
-  dispatch_queue.py <project> status               # one line per task
+  dispatch_queue.py <project> status               # one line per task (banners open escalations)
+  dispatch_queue.py <project> escalations          # ONLY open escalations + full notes (your triage list)
 
 ``enqueue`` lets the orchestrator (Claude, or any caller) add its OWN tasks to the
 same queue the dashboard writes — so autonomous and human-dropped work share one
@@ -78,10 +79,21 @@ def _feed_for(tasks: list) -> dict:
             "agents": agents}
 
 
+def _open_escalations(tasks: list) -> list:
+    """Queued/running ``escalation`` tasks — the orchestrator's triage worklist.
+
+    These look like any other ``queued`` task but the deterministic engine NEVER
+    drains them (it only drains ``reviewer``/``worker``); only ``/autoform:orchestrate``
+    resolves them. Surfacing them distinctly is what stops the orchestrator from
+    waiting on a queued escalation as if the engine would clear it (it never will)."""
+    return [t for t in tasks
+            if t.get("agent") == "escalation" and t.get("status") in ("queued", "running")]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Drain/sync the review dashboard queue.")
     ap.add_argument("project", type=Path, help="review project dir (holds task_queue.json)")
-    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue"])
+    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue", "escalations"])
     ap.add_argument("id", nargs="?", help="task id (for claim/done/fail)")
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
@@ -106,11 +118,31 @@ def main(argv=None) -> int:
     if a.cmd == "status":
         if not tasks:
             print("  (queue empty)")
+            return 0
+        open_esc = _open_escalations(tasks)
+        if open_esc:                                # impossible to miss in a poll
+            print(f'  ⚑⚑ {len(open_esc)} OPEN ESCALATION(S) — the orchestrator MUST triage these; the')
+            print(f'      engine never drains them: {", ".join(t.get("node","?") for t in open_esc)}')
+            print(f'      → full notes:  dispatch_queue.py <project> escalations\n')
         for t in tasks:
             print(f'  {t.get("status","?"):8} {t.get("agent","?"):9} {t.get("node","?")}')
             if t.get("note"):                       # preview (full text lives in task_queue.json)
                 note = " ".join(str(t["note"]).split())
                 print(f'           ↳ note: {note[:160]}{"…" if len(note) > 160 else ""}')
+        return 0
+    if a.cmd == "escalations":
+        open_esc = _open_escalations(tasks)
+        if not open_esc:
+            print("  (no open escalations)")
+            return 0
+        print(f"  {len(open_esc)} open escalation(s) awaiting triage — these are YOURS, not the engine's:\n")
+        for t in open_esc:
+            print(f'  • {t.get("node","?")}   [{t.get("status","?")}]   id={t.get("id","?")}')
+            for line in str(t.get("note", "")).strip().splitlines():
+                print(f'      {line}')
+            print()
+        print("  Triage each (claim → grow the DAG via merge_node.py / run planner / surface to the")
+        print("  user → done), then the blocked node can be re-queued. Never leave one queued.")
         return 0
     if a.cmd == "idle":
         _save(fp, {"orchestrator": {"state": "idle"}, "agents": []})
