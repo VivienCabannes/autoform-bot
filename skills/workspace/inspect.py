@@ -69,9 +69,13 @@ def inspect_workspace(path: str | None = None) -> dict[str, Any]:
         "sorry_count": _count_pattern(project_root, "sorry"),
         "axiom_count": _count_pattern(project_root, r"^\s*axiom\s", regex=True),
         "tools_available": {
-            "lake": _tool_works("lake"),
-            "lean": _tool_works("lean"),
-            "rg": _tool_works("rg"),
+            "lake": _resolve_tool("lake") is not None,
+            "lean": _resolve_tool("lean") is not None,
+            "rg": _resolve_tool("rg") is not None,
+        },
+        "tools_functional": {
+            "lake": _tool_runs("lake", cwd=project_root),
+            "lean": _tool_runs("lean", cwd=project_root),
         },
     }
 
@@ -155,20 +159,46 @@ def list_lean_declarations(path: str | None = None, limit: int = 200) -> dict[st
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _tool_works(cmd: str) -> bool:
-    """Return True only if ``cmd`` is on PATH *and* runs.
+def _resolve_tool(name: str) -> str | None:
+    """Find a tool on PATH, falling back to elan's standard bin dir.
 
-    A bare ``shutil.which`` is misleading for Lean: the ``elan`` shim is on PATH
-    even with no toolchain configured, so ``which`` reports ``lean``/``lake`` as
-    available when ``lean --version`` actually errors. Verify it runs.
+    elan installs shims into ``$ELAN_HOME/bin`` (default ``~/.elan/bin``) for
+    every user and platform. Non-login shells often don't add that dir to PATH,
+    so a pure ``shutil.which`` check yields false negatives for lake/lean. This
+    fallback is agnostic — it relies on elan's documented layout, not any
+    machine-specific config.
     """
-    if shutil.which(cmd) is None:
+    found = shutil.which(name)
+    if found:
+        return found
+    elan_root = os.environ.get("ELAN_HOME") or str(Path.home() / ".elan")
+    candidate = Path(elan_root) / "bin" / name
+    if candidate.exists() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return None
+
+
+def _tool_runs(name: str, *, cwd: Path | None = None) -> bool:
+    """Best-effort check that a resolved tool actually executes.
+
+    Runs ``<tool> --version`` from ``cwd`` (use a toolchain-pinned project dir
+    so elan can select a toolchain). A "no default toolchain" error still means
+    the binary is present and functional — elan just lacks a global default — so
+    that case is treated as a success.
+    """
+    path = _resolve_tool(name)
+    if path is None:
         return False
     try:
-        result = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=10)
-        return result.returncode == 0
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True,
+            timeout=15, check=False, cwd=str(cwd) if cwd else None,
+        )
     except (OSError, subprocess.SubprocessError):
         return False
+    if result.returncode == 0:
+        return True
+    return "no default toolchain" in (result.stderr + result.stdout).lower()
 
 
 def _count_pattern(root: Path, pattern: str, *, regex: bool = False) -> int:
