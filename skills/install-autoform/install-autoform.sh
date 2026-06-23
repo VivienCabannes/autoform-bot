@@ -190,6 +190,22 @@ else:
 fi
 
 # =========================================================================
+# 6. Lean Explore API key (optional)
+# =========================================================================
+log "Checking Lean Explore (optional)"
+
+if [ -n "${LEANEXPLORE_API_KEY:-}" ]; then
+  ok "LEANEXPLORE_API_KEY set — semantic Mathlib search via the lean-explore skill is available"
+else
+  skip "LEANEXPLORE_API_KEY not set — the lean-explore skill is optional"
+  echo ""
+  echo "  To enable semantic Mathlib search (the lean-explore skill):"
+  echo "    1. Get a key at https://www.leanexplore.com"
+  echo "    2. export LEANEXPLORE_API_KEY=<your-key>"
+  echo ""
+fi
+
+# =========================================================================
 # Summary
 # =========================================================================
 echo ""
