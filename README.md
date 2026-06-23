@@ -34,6 +34,24 @@ Assistant: *searches Mathlib for existing lemmas, uses correct typeclasses,
            writes idiomatic proofs, flags what the book leaves unproved*
 ```
 
+## Quickstart
+
+Play with the working pieces in one command — no install required:
+
+```bash
+make demo      # scan the bundled sample Lean project (pure stdlib)
+```
+
+Set up the full environment (installs `uv`, syncs deps) and run the tests:
+
+```bash
+make setup     # install uv if missing, then `uv sync --all-extras`
+make test      # smoke tests
+make help      # list every target
+```
+
+See [QUICKSTART.md](QUICKSTART.md) for the full walkthrough.
+
 ## Prerequisites
 
 - **Python ≥ 3.10**

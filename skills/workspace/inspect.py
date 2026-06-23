@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -70,9 +69,9 @@ def inspect_workspace(path: str | None = None) -> dict[str, Any]:
         "sorry_count": _count_pattern(project_root, "sorry"),
         "axiom_count": _count_pattern(project_root, r"^\s*axiom\s", regex=True),
         "tools_available": {
-            "lake": shutil.which("lake") is not None,
-            "lean": shutil.which("lean") is not None,
-            "rg": shutil.which("rg") is not None,
+            "lake": _tool_works("lake"),
+            "lean": _tool_works("lean"),
+            "rg": _tool_works("rg"),
         },
     }
 
@@ -155,6 +154,22 @@ def list_lean_declarations(path: str | None = None, limit: int = 200) -> dict[st
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _tool_works(cmd: str) -> bool:
+    """Return True only if ``cmd`` is on PATH *and* runs.
+
+    A bare ``shutil.which`` is misleading for Lean: the ``elan`` shim is on PATH
+    even with no toolchain configured, so ``which`` reports ``lean``/``lake`` as
+    available when ``lean --version`` actually errors. Verify it runs.
+    """
+    if shutil.which(cmd) is None:
+        return False
+    try:
+        result = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
 
 def _count_pattern(root: Path, pattern: str, *, regex: bool = False) -> int:
     if shutil.which("rg"):
@@ -253,9 +268,32 @@ def _assign_yaml_field(target: dict[str, Any], text: str) -> None:
     key, value = key.strip(), value.strip()
     if not key:
         return
+    target[key] = _coerce_scalar(value)
+
+
+def _coerce_scalar(value: str) -> Any:
+    """Coerce a YAML scalar from the fallback parser to a Python value.
+
+    Handles the cases the targets schema actually uses without PyYAML:
+    inline flow lists (``[a, b]``), booleans, null, and quoted/plain strings.
+    """
+    # Quoted string — strip quotes, keep verbatim.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        value = value[1:-1]
-    target[key] = value
+        return value[1:-1]
+    # Inline flow list: [], [a], [a, b]
+    if len(value) >= 2 and value[0] == "[" and value[-1] == "]":
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_coerce_scalar(item.strip()) for item in inner.split(",") if item.strip()]
+    lowered = value.lower()
+    if lowered in {"true", "yes"}:
+        return True
+    if lowered in {"false", "no"}:
+        return False
+    if lowered in {"null", "~", ""}:
+        return None
+    return value
 
 
 def _parse_rg_line(line: str, root: Path) -> dict[str, Any]:
