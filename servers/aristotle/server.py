@@ -15,7 +15,6 @@ API key: ARISTOTLE_API_KEY env var (mint at https://aristotle.harmonic.fun/dashb
 
 from __future__ import annotations
 
-import os
 
 from fastmcp.server import FastMCP
 

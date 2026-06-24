@@ -36,10 +36,16 @@ class TestReplServer:
         from servers.repl import pool  # noqa: F401
 
     def test_create_server(self):
-        """create_repl_server should return a FastMCP instance."""
+        """create_repl_server should return a FastMCP instance.
+
+        Uses a mock pool so no real ``lake exe repl`` subprocess is spawned —
+        the factory only wraps the pool; it doesn't call it at construction.
+        """
+        from unittest.mock import MagicMock
+
         from servers.repl.server import create_repl_server
 
-        server = create_repl_server()
+        server = create_repl_server(MagicMock())
         assert server is not None
         assert server.name == "autoform-repl"
 
