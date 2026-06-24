@@ -24,8 +24,9 @@ Usage::
   dispatch_queue.py <project> done  <id> [--result R]
   dispatch_queue.py <project> fail  <id> [--reason R]
   dispatch_queue.py <project> idle                 # reset the feed to idle
-  dispatch_queue.py <project> status               # one line per task (banners open escalations)
-  dispatch_queue.py <project> escalations          # ONLY open escalations + full notes (your triage list)
+  dispatch_queue.py <project> status               # one line per task (banners all orchestrator-owned work)
+  dispatch_queue.py <project> escalations          # open escalations + full notes (engine-raised walls)
+  dispatch_queue.py <project> mine                 # ALL open orchestrator-owned tasks — your full worklist
 
 ``enqueue`` lets the orchestrator (Claude, or any caller) add its OWN tasks to the
 same queue the dashboard writes — so autonomous and human-dropped work share one
@@ -90,10 +91,27 @@ def _open_escalations(tasks: list) -> list:
             if t.get("agent") == "escalation" and t.get("status") in ("queued", "running")]
 
 
+# The queue has two consumers. The deterministic engine drains exactly these:
+_ENGINE_KINDS = ("reviewer", "worker")
+# ...and the orchestrator (/autoform:orchestrate) owns ALL the rest — each via the same
+# lifecycle: claim -> run its Task subagent(s)/pipeline -> done (or fail). The engine
+# NEVER closes an orchestrator-owned task, so one left queued sits forever until the
+# orchestrator clears it. (Escalation was just the first symptom of this whole class.)
+_ORCH_KINDS = ("escalation", "planner", "graphreview", "contentreview", "holistic", "mathcheck")
+
+
+def _open_orchestrator_tasks(tasks: list) -> list:
+    """Open (queued/running) tasks the orchestrator owns — its FULL worklist, not just
+    escalations. None are engine-drained; each needs claim -> run -> done. Escalations
+    are the subset the engine auto-raises (and that carry the worker's words in ``note``)."""
+    return [t for t in tasks
+            if t.get("agent") in _ORCH_KINDS and t.get("status") in ("queued", "running")]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Drain/sync the review dashboard queue.")
     ap.add_argument("project", type=Path, help="review project dir (holds task_queue.json)")
-    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue", "escalations"])
+    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue", "escalations", "mine"])
     ap.add_argument("id", nargs="?", help="task id (for claim/done/fail)")
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
@@ -119,11 +137,17 @@ def main(argv=None) -> int:
         if not tasks:
             print("  (queue empty)")
             return 0
-        open_esc = _open_escalations(tasks)
-        if open_esc:                                # impossible to miss in a poll
-            print(f'  ⚑⚑ {len(open_esc)} OPEN ESCALATION(S) — the orchestrator MUST triage these; the')
-            print(f'      engine never drains them: {", ".join(t.get("node","?") for t in open_esc)}')
-            print(f'      → full notes:  dispatch_queue.py <project> escalations\n')
+        open_orch = _open_orchestrator_tasks(tasks)
+        if open_orch:                               # impossible to miss in a poll
+            tally: dict = {}
+            for t in open_orch:
+                tally[t.get("agent", "?")] = tally.get(t.get("agent", "?"), 0) + 1
+            breakdown = ", ".join(f"{n}×{k}" for k, n in sorted(tally.items()))
+            print(f'  ⚑⚑ {len(open_orch)} TASK(S) AWAIT THE ORCHESTRATOR — the engine drains NONE of these;')
+            print(f'      each needs claim → run → done:  {breakdown}')
+            print(f'      → worklist:  dispatch_queue.py <project> mine'
+                  + ('   ·  escalations carry a worker’s words' if tally.get("escalation") else ''))
+            print()
         for t in tasks:
             print(f'  {t.get("status","?"):8} {t.get("agent","?"):9} {t.get("node","?")}')
             if t.get("note"):                       # preview (full text lives in task_queue.json)
@@ -143,6 +167,21 @@ def main(argv=None) -> int:
             print()
         print("  Triage each (claim → grow the DAG via merge_node.py / run planner / surface to the")
         print("  user → done), then the blocked node can be re-queued. Never leave one queued.")
+        return 0
+    if a.cmd == "mine":
+        open_orch = _open_orchestrator_tasks(tasks)
+        if not open_orch:
+            print("  (nothing awaiting the orchestrator — reviewer/worker tasks drain themselves)")
+            return 0
+        order = {k: i for i, k in enumerate(_ORCH_KINDS)}        # escalations first
+        print(f"  {len(open_orch)} task(s) awaiting the orchestrator — the engine drains NONE of these.")
+        print("  Each: claim → run its Task subagent(s)/pipeline (graph edits via merge_node.py) → done.\n")
+        for t in sorted(open_orch, key=lambda x: (order.get(x.get("agent"), 99), str(x.get("node", "")))):
+            print(f'  • {t.get("agent","?"):13} {t.get("node","?")}   [{t.get("status","?")}]   id={t.get("id","?")}')
+            if t.get("agent") == "escalation" and t.get("note"):  # the worker's own words
+                for line in str(t["note"]).strip().splitlines():
+                    print(f'        {line}')
+        print("\n  Never leave one queued/running when a run ends (orchestrate.md step 5).")
         return 0
     if a.cmd == "idle":
         _save(fp, {"orchestrator": {"state": "idle"}, "agents": []})
