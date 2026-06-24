@@ -5,8 +5,8 @@ Covers the write-only dispatch queue + the dispatch API:
   * ``Project.task_queue`` — read ``task_queue.json`` next to graph.json; absent /
     corrupt / mis-shaped → ``[]``; never raises.
   * ``Project.write_task_queue`` — atomic (temp + ``os.replace``), capped at 200.
-  * ``GET  /api/dispatch``        — ``{palette, queue, live}`` (palette of 3, the
-    existing agents feed under ``live``).
+  * ``GET  /api/dispatch``        — ``{palette, queue, live, backend}`` (palette of 8,
+    the existing agents feed under ``live``).
   * ``POST /api/request``         — enqueue + validate (unknown agent/node → 400) +
     DEDUPE (identical agent+node queued/running never duplicates) + the exact task
     record shape.
@@ -120,11 +120,28 @@ def test_write_task_queue_does_not_touch_graph_or_sidecar(tmp_path):
 # palette constant
 # ---------------------------------------------------------------------------
 
-def test_palette_has_three_agents_with_required_fields():
+_ALL_KINDS = {"reviewer", "worker", "planner", "graphreview",
+              "contentreview", "holistic", "mathcheck", "escalation"}
+
+
+def test_palette_covers_every_dispatch_kind():
     ids = [a["id"] for a in sv.AGENT_PALETTE]
-    assert ids == ["reviewer", "worker", "planner"]
+    assert set(ids) == _ALL_KINDS
+    assert len(ids) == len(set(ids))                      # no duplicates
     for a in sv.AGENT_PALETTE:
         assert set(a) >= {"id", "label", "icon", "blurb", "applies"}
+
+
+def test_palette_partitions_into_engine_and_orchestrator_kinds():
+    # The dispatch_queue lifecycle constants must EXACTLY partition the palette: the
+    # engine drains the engine kinds; the orchestrator must claim→run→done all the
+    # rest. A palette kind in NEITHER set would silently dangle (never resolved) — the
+    # exact bug this guards against, so the partition can't drift as kinds are added.
+    import dispatch_queue as dq
+    palette = {a["id"] for a in sv.AGENT_PALETTE}
+    assert dq._ENGINE_KINDS == ("reviewer", "worker")
+    assert not (set(dq._ENGINE_KINDS) & set(dq._ORCH_KINDS))        # disjoint
+    assert set(dq._ENGINE_KINDS) | set(dq._ORCH_KINDS) == palette   # exhaustive
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +190,8 @@ def test_api_dispatch_shape(tmp_path):
     try:
         code, body = srv.get("/api/dispatch")
         assert code == 200
-        assert set(body) == {"palette", "queue", "live"}
-        assert [a["id"] for a in body["palette"]] == ["reviewer", "worker", "planner"]
+        assert set(body) == {"palette", "queue", "live", "backend"}
+        assert {a["id"] for a in body["palette"]} == _ALL_KINDS
         assert body["queue"] == []
         # live is the existing agents feed payload (idle when nothing runs)
         assert body["live"]["orchestrator"]["state"] == "idle"
