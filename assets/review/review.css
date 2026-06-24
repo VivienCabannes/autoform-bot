@@ -424,6 +424,11 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-role-worker { background: var(--in-mathlib); }   /* blue */
 .rv-role-reviewer { background: var(--flagged); }    /* amber */
 .rv-role-planner { background: #6b4fb0; }            /* violet */
+.rv-role-graphreview { background: #138d90; }        /* teal  — edges */
+.rv-role-contentreview { background: #b0467e; }      /* rose  — prose */
+.rv-role-holistic { background: #3f51b5; }           /* indigo — whole graph */
+.rv-role-mathcheck { background: #2f8a4e; }          /* green — in Mathlib? */
+.rv-role-escalation { background: #c0392b; }         /* red   — a worker hit a wall */
 .rv-role-agent { background: var(--grey); color: var(--ink); }
 
 /* --- "Agents · ready" palette: draggable agent cards (drag → node = dispatch) --- */
@@ -475,6 +480,11 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-palette-card.rv-role-reviewer { border-left-color: var(--flagged); }
 .rv-palette-card.rv-role-worker { border-left-color: var(--in-mathlib); }
 .rv-palette-card.rv-role-planner { border-left-color: #6b4fb0; }
+.rv-palette-card.rv-role-graphreview { border-left-color: #138d90; }
+.rv-palette-card.rv-role-contentreview { border-left-color: #b0467e; }
+.rv-palette-card.rv-role-holistic { border-left-color: #3f51b5; }
+.rv-palette-card.rv-role-mathcheck { border-left-color: #2f8a4e; }
+.rv-palette-card.rv-role-escalation { border-left-color: #c0392b; }
 .rv-palette-card.rv-role-agent { border-left-color: var(--grey); }
 .rv-pc-icon {
   font-size: 17px; line-height: 1; flex: 0 0 auto; width: 20px;

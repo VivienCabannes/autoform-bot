@@ -826,11 +826,22 @@
   // The panel is an ACTION surface: a top palette of draggable agents, the existing
   // live orchestrator/agent feed, and a Tasks list (queued from the dispatch queue +
   // running from the live feed). Drag a palette card onto a node to POST /api/request.
-  var ROLE_LABEL = { worker: "worker", reviewer: "reviewer", planner: "planner" };
+  // Every dispatch kind gets its own role class (→ a distinct accent colour); an
+  // unknown id falls back to the neutral "agent". Keep these keys in lock-step with
+  // serve_review.py AGENT_PALETTE — the two engine kinds + the six the orchestrator owns.
+  var ROLE_LABEL = {
+    reviewer: "reviewer", worker: "worker",
+    planner: "planner", graphreview: "graphreview", contentreview: "contentreview",
+    holistic: "holistic", mathcheck: "mathcheck", escalation: "escalation"
+  };
 
   // Known palette icons (fallback if the server entry omits one). The real icons
   // come from /api/dispatch.palette[*].icon; this is only a defensive default.
-  var ROLE_ICON = { reviewer: "⚖", worker: "⛏", planner: "◷" };
+  var ROLE_ICON = {
+    reviewer: "⚖", worker: "⛏",
+    planner: "◷", graphreview: "🔗", contentreview: "📝",
+    holistic: "🔭", mathcheck: "🔎", escalation: "⚑"
+  };
 
   function initActivity() {
     var panel = document.getElementById("rv-activity");
