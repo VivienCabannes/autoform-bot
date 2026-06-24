@@ -34,6 +34,21 @@ Assistant: *searches Mathlib for existing lemmas, uses correct typeclasses,
            writes idiomatic proofs, flags what the book leaves unproved*
 ```
 
+## Quickstart
+
+Install the plugin into Claude Code in two commands:
+
+```bash
+make setup           # install Python deps (uv + MCP-server deps)
+make install-claude  # install the plugin into Claude Code
+```
+
+Then launch `claude` and use `/workspace`, `/zulip`, `/setup-autoform`.
+(Codex instead? `make install-codex`.)
+
+Just want to poke at a skill without an assistant? `make demo` scans a bundled
+sample Lean project (no deps). See [QUICKSTART.md](QUICKSTART.md) for the full walkthrough.
+
 ## Prerequisites
 
 - **Python ≥ 3.10**

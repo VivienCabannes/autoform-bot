@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -70,9 +69,13 @@ def inspect_workspace(path: str | None = None) -> dict[str, Any]:
         "sorry_count": _count_pattern(project_root, "sorry"),
         "axiom_count": _count_pattern(project_root, r"^\s*axiom\s", regex=True),
         "tools_available": {
-            "lake": shutil.which("lake") is not None,
-            "lean": shutil.which("lean") is not None,
-            "rg": shutil.which("rg") is not None,
+            "lake": _resolve_tool("lake") is not None,
+            "lean": _resolve_tool("lean") is not None,
+            "rg": _resolve_tool("rg") is not None,
+        },
+        "tools_functional": {
+            "lake": _tool_runs("lake", cwd=project_root),
+            "lean": _tool_runs("lean", cwd=project_root),
         },
     }
 
@@ -155,6 +158,48 @@ def list_lean_declarations(path: str | None = None, limit: int = 200) -> dict[st
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _resolve_tool(name: str) -> str | None:
+    """Find a tool on PATH, falling back to elan's standard bin dir.
+
+    elan installs shims into ``$ELAN_HOME/bin`` (default ``~/.elan/bin``) for
+    every user and platform. Non-login shells often don't add that dir to PATH,
+    so a pure ``shutil.which`` check yields false negatives for lake/lean. This
+    fallback is agnostic — it relies on elan's documented layout, not any
+    machine-specific config.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    elan_root = os.environ.get("ELAN_HOME") or str(Path.home() / ".elan")
+    candidate = Path(elan_root) / "bin" / name
+    if candidate.exists() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return None
+
+
+def _tool_runs(name: str, *, cwd: Path | None = None) -> bool:
+    """Best-effort check that a resolved tool actually executes.
+
+    Runs ``<tool> --version`` from ``cwd`` (use a toolchain-pinned project dir
+    so elan can select a toolchain). A "no default toolchain" error still means
+    the binary is present and functional — elan just lacks a global default — so
+    that case is treated as a success.
+    """
+    path = _resolve_tool(name)
+    if path is None:
+        return False
+    try:
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True,
+            timeout=15, check=False, cwd=str(cwd) if cwd else None,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode == 0:
+        return True
+    return "no default toolchain" in (result.stderr + result.stdout).lower()
+
 
 def _count_pattern(root: Path, pattern: str, *, regex: bool = False) -> int:
     if shutil.which("rg"):
@@ -253,9 +298,32 @@ def _assign_yaml_field(target: dict[str, Any], text: str) -> None:
     key, value = key.strip(), value.strip()
     if not key:
         return
+    target[key] = _coerce_scalar(value)
+
+
+def _coerce_scalar(value: str) -> Any:
+    """Coerce a YAML scalar from the fallback parser to a Python value.
+
+    Handles the cases the targets schema actually uses without PyYAML:
+    inline flow lists (``[a, b]``), booleans, null, and quoted/plain strings.
+    """
+    # Quoted string — strip quotes, keep verbatim.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        value = value[1:-1]
-    target[key] = value
+        return value[1:-1]
+    # Inline flow list: [], [a], [a, b]
+    if len(value) >= 2 and value[0] == "[" and value[-1] == "]":
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [_coerce_scalar(item.strip()) for item in inner.split(",") if item.strip()]
+    lowered = value.lower()
+    if lowered in {"true", "yes"}:
+        return True
+    if lowered in {"false", "no"}:
+        return False
+    if lowered in {"null", "~", ""}:
+        return None
+    return value
 
 
 def _parse_rg_line(line: str, root: Path) -> dict[str, Any]:
