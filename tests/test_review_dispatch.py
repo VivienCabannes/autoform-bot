@@ -197,10 +197,17 @@ class _Server:
         with urllib.request.urlopen(self._url(path)) as r:
             return r.status, json.loads(r.read())
 
-    def post(self, path, body):
+    def post(self, path, body, token=True, host=None):
+        """POST with the CSRF token by default; ``token=False`` / ``host=…``
+        simulate a cross-origin forgery for the 403 tests."""
         data = json.dumps(body).encode()
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["X-Review-Token"] = sv._API_TOKEN
+        if host is not None:
+            headers["Host"] = host
         req = urllib.request.Request(self._url(path), data=data, method="POST",
-                                     headers={"Content-Type": "application/json"})
+                                     headers=headers)
         try:
             with urllib.request.urlopen(req) as r:
                 return r.status, json.loads(r.read())
@@ -396,6 +403,100 @@ def test_cancel_unknown_id_is_noop(tmp_path):
         code, body = srv.post("/api/request/cancel", {"id": "nope:nope"})
         assert code == 200
         assert len(body["queue"]) == 1
+    finally:
+        srv.close()
+
+
+# ---------------------------------------------------------------------------
+# CSRF gate — every POST needs the per-process token + a loopback Host
+# ---------------------------------------------------------------------------
+
+def test_post_without_token_is_403_and_writes_nothing(tmp_path):
+    # A cross-origin "simple" POST carries no X-Review-Token → rejected, and the
+    # forged task never lands in the queue.
+    srv = _serve(tmp_path)
+    try:
+        code, body = srv.post("/api/request",
+                              {"agent": "reviewer", "node": "s1"}, token=False)
+        assert code == 403
+        assert body["ok"] is False
+        assert srv.get("/api/dispatch")[1]["queue"] == []
+    finally:
+        srv.close()
+
+
+def test_post_with_wrong_token_is_403(tmp_path):
+    srv = _serve(tmp_path)
+    try:
+        data = json.dumps({"agent": "reviewer", "node": "s1"}).encode()
+        req = urllib.request.Request(
+            srv._url("/api/request"), data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-Review-Token": "not-the-token"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        assert code == 403
+    finally:
+        srv.close()
+
+
+def test_post_verdict_without_token_is_403(tmp_path):
+    # Human verdicts are the crown jewels — a forged POST must never write one.
+    srv = _serve(tmp_path)
+    try:
+        code, body = srv.post("/api/verdict/s1", {"verdict": "clean"}, token=False)
+        assert code == 403
+        assert body["ok"] is False
+    finally:
+        srv.close()
+
+
+def test_post_with_non_loopback_host_is_403(tmp_path):
+    # DNS rebinding: attacker.example resolves to 127.0.0.1, making their page
+    # "same-origin" — the Host allowlist still rejects it, token or not.
+    srv = _serve(tmp_path)
+    try:
+        code, body = srv.post("/api/request", {"agent": "reviewer", "node": "s1"},
+                              host="attacker.example")
+        assert code == 403
+        assert srv.get("/api/dispatch")[1]["queue"] == []
+    finally:
+        srv.close()
+
+
+def test_post_with_wrong_port_host_is_403(tmp_path):
+    srv = _serve(tmp_path)
+    try:
+        code, _ = srv.post("/api/request", {"agent": "reviewer", "node": "s1"},
+                           host=f"127.0.0.1:{srv.port + 1}")
+        assert code == 403
+    finally:
+        srv.close()
+
+
+def test_localhost_host_with_bound_port_is_accepted(tmp_path):
+    srv = _serve(tmp_path)
+    try:
+        code, body = srv.post("/api/request", {"agent": "reviewer", "node": "s1"},
+                              host=f"localhost:{srv.port}")
+        assert code == 200
+        assert body["ok"] is True
+    finally:
+        srv.close()
+
+
+def test_get_stays_unauthenticated_and_page_carries_token(tmp_path):
+    # GETs need no token, and the served page embeds window.__RV_TOKEN__ so the
+    # client JS can send it back on POSTs.
+    srv = _serve(tmp_path)
+    try:
+        assert srv.get("/api/dispatch")[0] == 200      # no token header sent
+        with urllib.request.urlopen(srv._url("/")) as r:
+            page = r.read().decode()
+        assert f'window.__RV_TOKEN__ = "{sv._API_TOKEN}"' in page
     finally:
         srv.close()
 

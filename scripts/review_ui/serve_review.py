@@ -42,6 +42,7 @@ import html as htmllib
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 import urllib.parse
@@ -206,6 +207,47 @@ _ACTIVE_STATUSES = {"queued", "running"}
 # Sentinel returned by the body reader on un-parseable JSON (distinct from a valid
 # ``{}`` body) so a POST handler answers 400 rather than treating it as empty.
 _BAD_JSON = object()
+
+# ---------------------------------------------------------------------------
+# CSRF protection. The server binds 127.0.0.1, but any webpage the user visits
+# can still fire cross-origin "simple" POSTs at localhost (no CORS preflight),
+# forging HUMAN VERDICTS or enqueueing Max-billed tasks. Two independent checks
+# gate every POST (GETs stay unauthenticated, they expose nothing sensitive):
+#
+#   * a per-process random token, generated at startup, embedded in every served
+#     page as ``window.__RV_TOKEN__`` and required back in the ``X-Review-Token``
+#     header — a foreign origin can *send* a request but can never *read* the
+#     page, so it can never learn the token;
+#   * a Host-header allowlist (127.0.0.1 / localhost / [::1], with the bound
+#     port) — blocks DNS-rebinding, where an attacker points their own hostname
+#     at 127.0.0.1 to make the dashboard "same-origin" with their page.
+# ---------------------------------------------------------------------------
+_API_TOKEN = secrets.token_hex(16)
+
+# Hostnames a request may address this server by (loopback spellings only).
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_denied(host: Optional[str], bound_port: int) -> Optional[str]:
+    """Why the Host header is unacceptable, or None if it is fine.
+
+    Accepts exactly the loopback names, with either no port or the bound port
+    (``[::1]:port`` bracket form included). Anything else — a public hostname, a
+    rebinding domain, a wrong port — is rejected.
+    """
+    host = (host or "").strip()
+    if not host:
+        return "missing Host header"
+    if host.startswith("["):                      # [::1] / [::1]:port
+        name, _, rest = host.partition("]")
+        name, port = name[1:], rest.lstrip(":")
+    else:
+        name, _, port = host.partition(":")
+    if name.lower() not in _ALLOWED_HOSTS:
+        return f"Host {host!r} is not loopback"
+    if port and port != str(bound_port):
+        return f"Host {host!r} does not match the bound port {bound_port}"
+    return None
 
 
 def _bounded_queue(queue: List[dict]) -> List[dict]:
@@ -571,8 +613,12 @@ _E = htmllib.escape
 
 
 def _page(title: str, body: str, bootstrap: str = "") -> bytes:
-    """Wrap a screen body in the shared shell (links review.css/js)."""
-    boot = f"<script>{bootstrap}</script>" if bootstrap else ""
+    """Wrap a screen body in the shared shell (links review.css/js).
+
+    Every page carries the per-process CSRF token (``window.__RV_TOKEN__``) so
+    the client JS can send it back as ``X-Review-Token`` on its POSTs."""
+    boot = (f"<script>window.__RV_TOKEN__ = {json.dumps(_API_TOKEN)};"
+            f"{bootstrap}</script>")
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -1342,8 +1388,24 @@ def make_handler(proj: Project):
             except json.JSONDecodeError:
                 return _BAD_JSON
 
+        def _csrf_denied(self) -> Optional[str]:
+            """Why this POST fails the CSRF gate (Host allowlist + token), or None."""
+            deny = _host_denied(self.headers.get("Host"),
+                                self.server.server_address[1])
+            if deny:
+                return deny
+            if self.headers.get("X-Review-Token") != _API_TOKEN:
+                return "missing or invalid X-Review-Token"
+            return None
+
         # --- POST ---
         def do_POST(self):
+            # CSRF gate on EVERY POST (GETs stay unauthenticated): loopback Host
+            # + the per-process token the served page carries. A cross-origin
+            # page can fire the request but can never read the token.
+            deny = self._csrf_denied()
+            if deny:
+                return self._json(403, {"ok": False, "error": deny})
             path = urllib.parse.urlparse(self.path).path
             if path == "/api/request":
                 return self._post_request()

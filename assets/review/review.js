@@ -66,6 +66,13 @@
   // (live is exactly the old /api/agents payload). /api/agents stays available;
   // we just poll the richer endpoint so the palette + task queue stay live too.
   var DISPATCH_URL = window.__RV_DISPATCH_URL__ || "/api/dispatch";
+  // CSRF token the server embeds in every page (window.__RV_TOKEN__): sent back
+  // as X-Review-Token on every POST — the server 403s a POST without it, so a
+  // foreign origin (which cannot read this page) can never forge one.
+  var API_TOKEN = window.__RV_TOKEN__ || "";
+  function postHeaders() {
+    return { "Content-Type": "application/json", "X-Review-Token": API_TOKEN };
+  }
   var FOCUS = window.__RV_FOCUS__ || null;   // {parent,label,members:[ids]} or null
 
   // ---- local-view globals (PART 5-7) ----
@@ -1074,7 +1081,7 @@
       sel.disabled = true;
       fetch("/api/backend", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: postHeaders(),
         body: JSON.stringify({ backend: backend })
       })
         .then(function (r) { return r.json(); })
@@ -1156,7 +1163,7 @@
         btn.disabled = true;
         fetch("/api/request/cancel", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: postHeaders(),
           body: JSON.stringify({ id: id })
         }).then(function (r) { return r.json(); }).then(function () {
           refreshDispatch();    // re-render panel + refresh markers from the truth
@@ -1185,7 +1192,7 @@
     if (!agent || !node) return;
     fetch("/api/request", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: postHeaders(),
       body: JSON.stringify({ agent: agent, node: node })
     }).then(function (r) { return r.json(); }).then(function (res) {
       if (res && res.ok) {
@@ -1270,7 +1277,7 @@
       if (status) { status.textContent = "saving…"; }
       fetch("/api/verdict/" + encodeURIComponent(node), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: postHeaders(),
         body: JSON.stringify(payload)
       }).then(function (r) { return r.json(); }).then(function (res) {
         if (res.ok) {
