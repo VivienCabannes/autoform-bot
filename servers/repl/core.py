@@ -79,6 +79,14 @@ def _inherit_clean_env() -> dict[str, str]:
     return env
 
 
+def _append_capped(buffer: str, chunk: str, max_len: int) -> str:
+    """Append ``chunk`` to ``buffer``, keeping only the last ``max_len`` chars."""
+    buffer += chunk
+    if len(buffer) > max_len:
+        return buffer[-max_len:]
+    return buffer
+
+
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
     """Split Lean code into import statements and body.
 
@@ -384,7 +392,10 @@ class LeanRepl:
                     self.restart()
                     if run_from_env:
                         raise ReplProcessRestarted(str(e)) from e
-                except (TimeoutError, RuntimeError, json.JSONDecodeError) as e:
+                except (TimeoutError, RuntimeError, json.JSONDecodeError, OSError) as e:
+                    # OSError covers BrokenPipeError when the process dies
+                    # between poll() and stdin.write(); without it the dead
+                    # REPL would escape run() un-restarted.
                     last_exception = e
                     logger.error("Error running command: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
                     if not run_from_env and i < max_retries:
@@ -460,7 +471,9 @@ class LeanRepl:
                 err_chunk_bytes = os.read(stderr_fd, self.chunk_size)
                 if err_chunk_bytes:
                     err_chunk = err_chunk_bytes.decode("utf-8", errors="replace")
-                    stderr_buffer += err_chunk
+                    # Cap stderr like max_buffer_bytes caps stdout; keep the
+                    # tail since it is only used for error reporting.
+                    stderr_buffer = _append_capped(stderr_buffer, err_chunk, max_buffer)
                     logger.debug("Lean REPL stderr: %s", err_chunk.rstrip())
 
         return json.loads(response_str)
