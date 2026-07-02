@@ -29,8 +29,8 @@ class FakeCodexRunner:
         self.turns = list(turns)
         self.calls: list[dict] = []
 
-    def __call__(self, args, env, cwd):
-        self.calls.append({"args": args, "env": env, "cwd": cwd})
+    def __call__(self, args, env, cwd, deadline=None):
+        self.calls.append({"args": args, "env": env, "cwd": cwd, "deadline": deadline})
         idx = len(self.calls) - 1
         yield from (self.turns[idx] if idx < len(self.turns) else [])
 
@@ -141,3 +141,30 @@ def test_codex_env_scrubs_anthropic_key(monkeypatch):
 def test_codex_system_prompt_forbids_cheating():
     p = CODEX_SYSTEM_PROMPT.lower()
     assert "sorry" in p and "admit" in p and "failed" in p
+
+
+def test_codex_adapter_timeout_is_terminal_failed_with_sub_status():
+    from servers.prover._cli_common import ProverTimeout
+    from servers.prover.base import EventKind
+
+    def hung_runner(args, env, cwd, deadline=None):
+        yield json.dumps({"type": "thread.started", "thread_id": "sess-t"})
+        raise ProverTimeout("CLI worker exceeded its deadline: codex")
+
+    adapter = CodexAdapter(runner=hung_runner, max_wait_seconds=1)
+    run = adapter.start("Foo", "spec", "/tmp/proj")
+    events = list(adapter.events(run))
+    assert events and events[-1].kind is EventKind.ERROR and "timeout" in events[-1].content
+
+    result = adapter.result(run)
+    assert result.status == "failed"
+    assert "timeout" in result.reason
+    assert result.meta["sub_status"] == "timeout"
+
+
+def test_codex_adapter_threads_deadline_to_runner():
+    runner = FakeCodexRunner([_lines(
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "ok proved"}})])
+    adapter = CodexAdapter(runner=runner, max_wait_seconds=120)
+    prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=0, verifier=None)
+    assert runner.calls[0]["deadline"] is not None

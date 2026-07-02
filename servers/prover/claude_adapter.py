@@ -45,12 +45,14 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ._cli_common import (
+    ProverTimeout,
     _build_spec_prompt,
     _failure_reason,
     _iter_json_lines,
@@ -169,6 +171,8 @@ class _ClaudeRun:
     final_text: str = ""
     started: bool = False
     extra_args: list[str] = field(default_factory=list)
+    deadline: float | None = None       # absolute time.monotonic() wall-clock cap
+    timed_out: bool = False
 
 
 class ClaudeAdapter(ProverAdapter):
@@ -187,6 +191,10 @@ class ClaudeAdapter(ProverAdapter):
             (``AUTOFORM_MCP_CONFIG`` env, else the plugin's own ``.mcp.json``);
             ``""`` disables the flag entirely.
         extra_args: Extra ``claude`` CLI args the caller wants threaded through.
+        max_wait_seconds: Wall-clock ceiling for the WHOLE run (all turns). On
+            expiry the child process group is killed, a terminal error event is
+            yielded, and the run reports ``failed`` with meta sub-status
+            ``"timeout"``. ``None`` disables the cap.
         runner: Injectable launcher ``(args, env, cwd, deadline=None) ->
             Iterator[str]`` yielding stream-json lines. Defaults to a real
             ``subprocess`` launcher; tests inject a fake so no live ``claude``
@@ -203,6 +211,7 @@ class ClaudeAdapter(ProverAdapter):
         autonomy_args: list[str] | None = None,
         mcp_config: str | None = None,
         extra_args: list[str] | None = None,
+        max_wait_seconds: float | None = None,
         runner: Any | None = None,
     ) -> None:
         self._model = model
@@ -210,6 +219,7 @@ class ClaudeAdapter(ProverAdapter):
         self._autonomy_args = list(autonomy_args if autonomy_args is not None else DEFAULT_AUTONOMY_ARGS)
         self._mcp_config = _default_mcp_config() if mcp_config is None else (mcp_config or None)
         self._extra_args = list(extra_args or [])
+        self._max_wait_seconds = max_wait_seconds
         self._runner = runner or _subprocess_line_runner
 
     # ------------------------------------------------------------------
@@ -223,6 +233,8 @@ class ClaudeAdapter(ProverAdapter):
             project_dir=str(project_dir),
             model=self._model,
             extra_args=self._extra_args,
+            deadline=(time.monotonic() + self._max_wait_seconds
+                      if self._max_wait_seconds is not None else None),
         )
         return Run(backend=self.name, goal=spec, project_dir=str(project_dir), handle=state)
 
@@ -236,16 +248,22 @@ class ClaudeAdapter(ProverAdapter):
         """
         state: _ClaudeRun = run.handle
 
-        # First turn: system prompt + spec.
-        first_prompt = _build_spec_prompt(state.node, state.spec)
-        yield from self._run_turn(state, first_prompt, resume=False)
+        try:
+            # First turn: system prompt + spec.
+            first_prompt = _build_spec_prompt(state.node, state.spec)
+            yield from self._run_turn(state, first_prompt, resume=False)
 
-        # Drain any steers the driver queued during the turn (turn-granular
-        # steering — see the module docstring on the mechanism).
-        while state.pending_steer:
-            correction = state.pending_steer
-            state.pending_steer = None
-            yield from self._run_turn(state, correction, resume=True)
+            # Drain any steers the driver queued during the turn (turn-granular
+            # steering — see the module docstring on the mechanism).
+            while state.pending_steer:
+                correction = state.pending_steer
+                state.pending_steer = None
+                yield from self._run_turn(state, correction, resume=True)
+        except ProverTimeout:
+            state.timed_out = True
+            logger.warning("claude adapter: %s hit max_wait_seconds; worker killed", state.node)
+            yield Event(EventKind.ERROR,
+                        f"timeout: run exceeded max_wait_seconds ({self._max_wait_seconds}s); worker killed")
 
     def steer(self, run: Run, message: str) -> None:
         """Queue ``message`` as the next follow-up turn (delivered between turns).
@@ -261,6 +279,15 @@ class ClaudeAdapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         state: _ClaudeRun = run.handle
         text = (state.final_text or "").strip()
+        if state.timed_out:
+            return ProofResult(
+                status="failed",
+                proof_text=text,
+                reason=f"timeout: run exceeded max_wait_seconds ({self._max_wait_seconds}s); worker killed",
+                backend=self.name,
+                landed_files=0,
+                meta={"session_id": state.session_id, "model": state.model, "sub_status": "timeout"},
+            )
         proved = not _looks_failed(text)
         return ProofResult(
             status="proved" if proved else "failed",
@@ -286,7 +313,7 @@ class ClaudeAdapter(ProverAdapter):
             args += ["--mcp-config", self._mcp_config]
         args += state.extra_args
 
-        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir)):
+        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)):
             # Capture the session id (emitted on the ``system: init`` line and the
             # ``result`` line) so a steer can resume this exact conversation.
             sid = obj.get("session_id")

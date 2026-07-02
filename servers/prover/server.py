@@ -44,7 +44,8 @@ def _make_adapter(
 ) -> ProverAdapter:
     """Construct the adapter for ``backend``. Aristotle/Codex are imported lazily here."""
     if backend == "claude":
-        return ClaudeAdapter(extra_args=extra_args, mcp_config=mcp_config)
+        return ClaudeAdapter(extra_args=extra_args, mcp_config=mcp_config,
+                             max_wait_seconds=max_wait_seconds)
     if backend == "aristotle":
         # Lazy import: only pulled in when the Aristotle backend is actually
         # selected, so the server imports without the ``aristotle`` extra.
@@ -55,7 +56,7 @@ def _make_adapter(
         # Lazy import: the OpenAI ``codex`` CLI backend (its own auth, not Max).
         from .codex_adapter import CodexAdapter
 
-        return CodexAdapter(extra_args=extra_args)
+        return CodexAdapter(extra_args=extra_args, max_wait_seconds=max_wait_seconds)
     raise ValueError(f"unknown backend {backend!r}; expected 'claude', 'aristotle', or 'codex'")
 
 
@@ -117,7 +118,9 @@ def create_prover_server() -> FastMCP:
                 and informal_content/ lives).
             backend: "claude" (default), "aristotle", or "codex".
             max_steers: Cap on in-flight steers for this run (default 3).
-            max_wait_seconds: Ceiling on how long to wait (Aristotle backend).
+            max_wait_seconds: Wall-clock ceiling for the run — honored by every
+                backend (Aristotle stops polling; claude/codex kill the worker
+                process group and fail with sub-status "timeout").
             extra_args: Extra CLI args threaded through to the claude/codex
                 worker invocation.
             mcp_config: MCP config path for the claude worker's --mcp-config.

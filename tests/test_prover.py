@@ -251,8 +251,10 @@ class FakeClaudeRunner:
         self._i = 0
         self.calls: list[list[str]] = []
 
-    def __call__(self, args, env, cwd):
+    def __call__(self, args, env, cwd, deadline=None):
         self.calls.append(args)
+        self.deadlines = getattr(self, "deadlines", [])
+        self.deadlines.append(deadline)
         # The key must NOT be visible to the launched claude (Max billing).
         assert "ANTHROPIC_API_KEY" not in env
         lines = self._turns[self._i] if self._i < len(self._turns) else []
@@ -375,6 +377,33 @@ def test_claude_adapter_autonomy_and_mcp_are_optional(monkeypatch):
     args = runner.calls[0]
     assert "--dangerously-skip-permissions" not in args
     assert "--mcp-config" not in args
+
+
+def test_claude_adapter_threads_deadline_to_runner():
+    runner = FakeClaudeRunner([_stream({"type": "result", "session_id": "s", "result": "ok proved"})])
+    adapter = ClaudeAdapter(runner=runner, max_wait_seconds=120)
+    prove(adapter, "T", "spec", "/proj", steerer=FakeSteerer(steer_at=set()), verifier=None)
+    assert runner.deadlines[0] is not None  # wall-clock cap reaches the launcher
+
+
+def test_claude_adapter_timeout_is_terminal_failed_with_sub_status():
+    """A hung worker (runner raises ProverTimeout) ends the run: terminal error
+    event, status=failed, reason mentions the timeout, meta sub_status=timeout."""
+    from servers.prover._cli_common import ProverTimeout
+
+    def hung_runner(args, env, cwd, deadline=None):
+        yield json.dumps({"type": "system", "subtype": "init", "session_id": "sess-t"})
+        raise ProverTimeout("CLI worker exceeded its deadline: claude")
+
+    adapter = ClaudeAdapter(runner=hung_runner, max_wait_seconds=1)
+    run = adapter.start("T", "spec", "/proj")
+    events = list(adapter.events(run))
+    assert events and events[-1].kind is EventKind.ERROR and "timeout" in events[-1].content
+
+    result = adapter.result(run)
+    assert result.status == "failed"
+    assert "timeout" in result.reason
+    assert result.meta["sub_status"] == "timeout"
 
 
 def test_make_adapter_threads_extra_args_and_mcp_config():

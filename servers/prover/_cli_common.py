@@ -12,10 +12,21 @@ worker-discipline text never drift between backends. The parts that genuinely di
 from __future__ import annotations
 
 import json
+import logging
 import os
+import queue
+import signal
 import subprocess
+import threading
+import time
 from collections.abc import Iterator
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class ProverTimeout(Exception):
+    """The CLI worker exceeded its wall-clock deadline (the child was killed)."""
 
 
 def _scrubbed_env() -> dict[str, str]:
@@ -87,11 +98,57 @@ def _iter_json_lines(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
             continue
 
 
-def _subprocess_line_runner(args: list[str], env: dict[str, str], cwd: str) -> Iterator[str]:
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """terminate() then kill() the child **and its process group** (the child is
+    started in its own group so grandchildren — ``lake`` builds, git — die too)."""
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
+
+    def _signal_group(sig: int) -> None:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except Exception:
+                pass
+        try:
+            proc.send_signal(sig)
+        except Exception:
+            pass
+
+    _signal_group(signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        _signal_group(signal.SIGKILL)
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # pragma: no cover - unkillable child
+            logger.warning("could not reap CLI worker pid %s", proc.pid)
+
+
+def _subprocess_line_runner(
+    args: list[str],
+    env: dict[str, str],
+    cwd: str,
+    deadline: float | None = None,
+) -> Iterator[str]:
     """Real launcher: run a CLI and yield its stdout lines (JSONL).
 
     Lives behind the injectable ``runner`` seam so the adapters are unit-testable
     without spawning a live ``claude``/``codex`` process.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant: when it passes, the
+    child (and its whole process group — it is started with
+    ``start_new_session=True``) is terminated then killed and
+    :class:`ProverTimeout` is raised. The same kill path runs when the generator
+    is closed early (``GeneratorExit``), so an abandoned run never leaks a
+    fully-autonomous child process. Lines are pumped through a queue by a reader
+    thread so the deadline is enforced even while the child is silent.
     """
     proc = subprocess.Popen(
         args,
@@ -101,13 +158,42 @@ def _subprocess_line_runner(args: list[str], env: dict[str, str], cwd: str) -> I
         stderr=subprocess.DEVNULL,
         text=True,
         bufsize=1,
+        start_new_session=True,  # own process group → the kill path reaps grandchildren
     )
+    assert proc.stdout is not None
+    lines: queue.Queue[Any] = queue.Queue()
+    _EOF = object()
+
+    def _pump() -> None:
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                lines.put(line)
+        except Exception:  # pragma: no cover - pipe torn down mid-read
+            pass
+        finally:
+            lines.put(_EOF)
+
+    threading.Thread(target=_pump, daemon=True).start()
     try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            yield line
+        while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise ProverTimeout(f"CLI worker exceeded its deadline: {args[0]}")
+            try:
+                item = lines.get(timeout=1.0 if remaining is None else min(remaining, 1.0))
+            except queue.Empty:
+                continue  # re-check the deadline, keep waiting for output
+            if item is _EOF:
+                break
+            yield item
     finally:
-        proc.stdout and proc.stdout.close()
+        # Runs on normal exhaustion, on ProverTimeout, AND on generator close
+        # (GeneratorExit) — the child never outlives its consumer.
+        _kill_process_tree(proc)
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
         proc.wait()
 
 

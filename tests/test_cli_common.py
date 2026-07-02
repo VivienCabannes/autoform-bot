@@ -4,12 +4,21 @@ backends cannot drift on "what counts as an honest FAILED" or the discipline tex
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
+
+import pytest
+
 from servers.prover._cli_common import (
+    ProverTimeout,
     _build_spec_prompt,
     _failure_reason,
     _iter_json_lines,
     _looks_failed,
     _scrubbed_env,
+    _subprocess_line_runner,
     build_worker_prompt,
 )
 from servers.prover.claude_adapter import WORKER_SYSTEM_PROMPT
@@ -73,3 +82,63 @@ def test_builder_reproduces_the_claude_prompt_exactly():
     # Locks the skeleton + the claude deltas to the live prompt — a silent edit to
     # either side fails here.
     assert build_worker_prompt(**_CLAUDE_PARAMS) == WORKER_SYSTEM_PROMPT
+
+
+# --- subprocess lifecycle: deadline enforcement + kill path ----------------------
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_runner_kills_hung_process_on_deadline():
+    """A silent, long-running child is killed when the wall-clock deadline passes."""
+    args = [sys.executable, "-u", "-c", "import time; time.sleep(60)"]
+    started = time.monotonic()
+    gen = _subprocess_line_runner(args, os.environ.copy(), "", time.monotonic() + 0.5)
+    with pytest.raises(ProverTimeout):
+        list(gen)
+    assert time.monotonic() - started < 20  # killed promptly, not after 60s
+
+
+def test_runner_kill_path_on_generator_close():
+    """Abandoning the generator (GeneratorExit) reaps the child process."""
+    code = "import os, sys, time; print(os.getpid(), flush=True); time.sleep(60)"
+    gen = _subprocess_line_runner([sys.executable, "-u", "-c", code], os.environ.copy(), "", None)
+    pid = int(next(gen).strip())
+    assert _alive(pid)
+    gen.close()  # GeneratorExit → terminate()/kill() of the process group
+    deadline = time.monotonic() + 10
+    while _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(pid)
+
+
+def test_runner_normal_exhaustion_yields_all_lines():
+    code = "print('a'); print('b')"
+    out = list(_subprocess_line_runner([sys.executable, "-c", code], os.environ.copy(), "",
+                                       time.monotonic() + 30))
+    assert [ln.strip() for ln in out] == ["a", "b"]
+
+
+def test_runner_kills_grandchildren_via_process_group():
+    """The child is started in its own process group so grandchildren die too."""
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print(p.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    gen = _subprocess_line_runner([sys.executable, "-u", "-c", code], os.environ.copy(), "",
+                                  time.monotonic() + 30)
+    grandchild = int(next(gen).strip())
+    assert _alive(grandchild)
+    gen.close()
+    deadline = time.monotonic() + 10
+    while _alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(grandchild)

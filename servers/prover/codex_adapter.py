@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from ._cli_common import (
+    ProverTimeout,
     _build_spec_prompt,
     _failure_reason,
     _iter_json_lines,
@@ -123,6 +125,8 @@ class _CodexRun:
     pending_steer: str | None = None
     final_text: str = ""
     extra_args: list[str] = field(default_factory=list)
+    deadline: float | None = None       # absolute time.monotonic() wall-clock cap
+    timed_out: bool = False
 
 
 class CodexAdapter(ProverAdapter):
@@ -144,6 +148,7 @@ class CodexAdapter(ProverAdapter):
         codex_bin: str = DEFAULT_CODEX_BIN,
         autonomy_args: list[str] | None = None,
         extra_args: list[str] | None = None,
+        max_wait_seconds: float | None = None,
         runner: Any | None = None,
     ) -> None:
         self._model = model
@@ -151,32 +156,41 @@ class CodexAdapter(ProverAdapter):
         self._codex_bin = codex_bin
         self._autonomy_args = list(autonomy_args if autonomy_args is not None else DEFAULT_AUTONOMY_ARGS)
         self._extra_args = list(extra_args or [])
+        self._max_wait_seconds = max_wait_seconds
         self._runner = runner or _subprocess_line_runner
 
     # ------------------------------------------------------------------ surface
 
     def start(self, node: str, spec: str, project_dir: str) -> Run:
         state = _CodexRun(node=node, spec=spec, project_dir=str(project_dir),
-                          model=self._model, extra_args=self._extra_args)
+                          model=self._model, extra_args=self._extra_args,
+                          deadline=(time.monotonic() + self._max_wait_seconds
+                                    if self._max_wait_seconds is not None else None))
         return Run(backend=self.name, goal=spec, project_dir=str(project_dir), handle=state)
 
     def events(self, run: Run) -> Iterator[Event]:
         """First turn (discipline + spec), then any steered resume turns."""
         state: _CodexRun = run.handle
-        # codex exec has no separate system-prompt flag, so the worker discipline is
-        # prepended to the first user prompt.
-        first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
-        yield from self._run_turn(state, first, resume=False)
+        try:
+            # codex exec has no separate system-prompt flag, so the worker discipline is
+            # prepended to the first user prompt.
+            first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
+            yield from self._run_turn(state, first, resume=False)
 
-        while state.pending_steer:
-            correction = state.pending_steer
-            state.pending_steer = None
-            if not state.session_id:
-                # No session captured → cannot resume with context; drop the steer
-                # rather than run a context-less turn (best-effort, never raises).
-                logger.info("codex adapter: no session id; dropping steer (no resume context)")
-                break
-            yield from self._run_turn(state, correction, resume=True)
+            while state.pending_steer:
+                correction = state.pending_steer
+                state.pending_steer = None
+                if not state.session_id:
+                    # No session captured → cannot resume with context; drop the steer
+                    # rather than run a context-less turn (best-effort, never raises).
+                    logger.info("codex adapter: no session id; dropping steer (no resume context)")
+                    break
+                yield from self._run_turn(state, correction, resume=True)
+        except ProverTimeout:
+            state.timed_out = True
+            logger.warning("codex adapter: %s hit max_wait_seconds; worker killed", state.node)
+            yield Event(EventKind.ERROR,
+                        f"timeout: run exceeded max_wait_seconds ({self._max_wait_seconds}s); worker killed")
 
     def steer(self, run: Run, message: str) -> None:
         """Queue ``message`` as the next resume turn (delivered between turns)."""
@@ -187,6 +201,16 @@ class CodexAdapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         state: _CodexRun = run.handle
         text = (state.final_text or "").strip()
+        if state.timed_out:
+            return ProofResult(
+                status="failed",
+                proof_text=text,
+                reason=f"timeout: run exceeded max_wait_seconds ({self._max_wait_seconds}s); worker killed",
+                backend=self.name,
+                landed_files=0,
+                meta={"session_id": state.session_id, "model": state.model or "codex-default",
+                      "sub_status": "timeout"},
+            )
         proved = not _looks_failed(text)
         return ProofResult(
             status="proved" if proved else "failed",
@@ -208,7 +232,7 @@ class CodexAdapter(ProverAdapter):
             args += ["-m", state.model]
         args += self._autonomy_args + state.extra_args + [prompt]
 
-        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir)):
+        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)):
             event, final, sid = _classify_codex_event(obj)
             if sid:
                 state.session_id = sid
