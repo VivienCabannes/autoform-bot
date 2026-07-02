@@ -15,7 +15,9 @@ description: >-
 The grading criteria the AI jury applies to a formalized node. The jury is **blind
 single-axis reviewers**, each given ONLY its own rubric — never the others'. Each rubric is an
 integer score 0–5 with a pass threshold; the criteria and prompt templates are the JSON files in
-`references/`.
+`references/` (from a subagent, read them at
+`${CLAUDE_PLUGIN_ROOT}/skills/eval-rubrics/references/<axis>.json` — subagents run with cwd set to
+the user's project, so plugin-relative paths do not resolve).
 
 ## The jury rubrics
 
@@ -79,12 +81,21 @@ all three pass, the verdict is clean; otherwise flagged.
 3. Score the one rubric you were given, 0–5, with a one-paragraph justification grounded in concrete
    evidence (cite the line / lemma), not vibes. Emit strict JSON `{"score", "reasoning"}` (the
    proof_integrity rubric additionally emits `axiom_only` + `axiom_verdicts`).
-4. The orchestrator combines the per-axis scores into the displayed score and the verdict above.
+4. The deterministic dispatcher parses each reviewer's JSON, persists the scores, and combines the
+   per-axis scores into the displayed score and the verdict above.
+
+**Abstaining.** When a dispatch is missing a required input (e.g. no ground-truth source named for
+a correctness axis), the reviewer does not score against its own reconstruction — it returns
+`{"score": null, "error": "<what was missing>"}`. A `null` score is an explicit abstain: the
+dispatcher records no score for that axis and derives no verdict from it, so a dispatch bug is
+distinguishable from a genuine 0.
 
 ## Writing to the sidecar (`review_status.json`)
 
-Each reviewer's score lands in the node's **`ai`** slot, keyed by node `id`. After all three run,
-the `ai` slot holds the three integers, the computed `verdict`, and a timestamp:
+The reviewers never write the sidecar themselves — the deterministic dispatcher parses each
+reviewer's JSON output and persists it. Each reviewer's score lands in the node's **`ai`** slot,
+keyed by node `id`. After all three run, the `ai` slot holds the three integers, the computed
+`verdict`, and a timestamp:
 
 ```jsonc
 "reviews": {
@@ -94,8 +105,9 @@ the `ai` slot holds the three integers, the computed `verdict`, and a timestamp:
 } }
 ```
 
-The **`ai` slot is the jury's only write.** Re-running the jury rewrites `ai` only; it never touches
-a `human` slot (human verdicts are immutable). Effective verdict = `human` if present, else `ai`.
+The **`ai` slot is the only slot jury scores ever touch.** Re-running the jury rewrites `ai` only;
+it never touches a `human` slot (human verdicts are immutable). Effective verdict = `human` if
+present, else `ai`.
 
 ## The spec-gate
 
