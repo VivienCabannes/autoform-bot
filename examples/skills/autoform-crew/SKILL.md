@@ -2,7 +2,8 @@
 name: autoform-crew
 description: >
   Orchestration guide for parallel formalization with subagent teams.
-  Tells the main thread WHEN and HOW to spawn autoform-worker, autoform-reviewer,
+  Tells the main thread WHEN and HOW to spawn autoform-worker, the three-judge
+  review jury (faithfulness-reviewer, proof-integrity-reviewer, code-quality-reviewer),
   and autoform-reader subagents for parallel proving, batch review, and
   context-efficient file reading.
   Trigger: "parallelize", "formalize chapter", "batch", "use crew",
@@ -18,8 +19,14 @@ Autoform-crew orchestrates multiple subagents for parallel formalization. The ma
 | Agent | Model | Role | MCP servers |
 |-------|-------|------|-------------|
 | `autoform-worker` | opus | Formalize: read source, search Mathlib, write proofs | repl, mathlib, trace |
-| `autoform-reviewer` | opus | Review: check faithfulness, cheating, conventions | lsp, mathlib, trace |
+| `faithfulness-reviewer` | opus | Judge: statement captures the source at full strength | lsp, zulip |
+| `proof-integrity-reviewer` | opus | Judge: proof chain is genuine work on sound foundations | lsp, zulip |
+| `code-quality-reviewer` | opus | Judge: Mathlib conventions and idiomatic Lean 4 style | lsp, mathlib |
 | `autoform-reader` | haiku | Read: summarize large files cheaply | none |
+
+The three reviewer judges are blind single-axis jurors sharing the **eval-rubrics** skill; each
+returns a 0–5 score for its own rubric, and the verdict (clean / flagged / rejected) is gated
+downstream.
 
 ## Aristotle delegation
 
@@ -67,7 +74,7 @@ Plan:
 4. While Aristotle works, review local workers' output
 5. aristotle_wait("thm-5-5") — collect results
 6. aristotle_wait("thm-5-6") — collect results
-7. Review Aristotle's output with autoform-reviewer
+7. Review Aristotle's output with the review jury (faithfulness-reviewer + proof-integrity-reviewer + code-quality-reviewer)
 ```
 
 ### Steering Aristotle
@@ -86,7 +93,7 @@ This injects the instruction into Aristotle's running session without restarting
 |------|-----|
 | Formalize 3+ independent targets from a chapter | Parallel `autoform-worker` per target |
 | Formalize 1 theorem with tricky dependencies | Main thread (needs cross-file context) |
-| Review all files in a directory | Parallel `autoform-reviewer` per file |
+| Review all files in a directory | Parallel review jury (the three single-axis reviewers) per file |
 | Read a 500-line book chapter for context | `autoform-reader` (saves main context) |
 | Quick Mathlib search or REPL test | Main thread, no subagent |
 
@@ -131,14 +138,15 @@ Review these 4 files against Chapter 3 of book.md:
 - MyBook/Hausdorff.lean
 - MyBook/Completeness.lean
 
-Spawn autoform-reviewer for each file in parallel.
+Spawn the review jury — faithfulness-reviewer, proof-integrity-reviewer, and
+code-quality-reviewer — for each file in parallel.
 ```
 
 ### Pipeline: prove → review → fix
 
 For each target:
 1. `autoform-worker` formalizes and writes the file
-2. `autoform-reviewer` reviews against the source
+2. the review jury scores it against the source — `faithfulness-reviewer` (statement) and `proof-integrity-reviewer` (proof), plus `code-quality-reviewer` (style)
 3. If rejected: main thread reads the feedback, spawns another `autoform-worker` with the feedback as context
 
 ### Wave-based chapter formalization
@@ -168,16 +176,12 @@ Status: proved | sorry (<count>) | unproved (<count>)
 Summary: <1-2 sentences on approach>
 ```
 
-**`autoform-reviewer` returns:**
+**Each reviewer judge (`faithfulness-reviewer` / `proof-integrity-reviewer` / `code-quality-reviewer`) returns strict JSON:**
 ```
-APPROVED: <brief reason>
+{"score": <0-5>, "reasoning": "<evidence-grounded justification with file:line>"}
 ```
-or:
-```
-REJECTED: <reason>
-Issues: <numbered list with file:line>
-Fixes: <numbered list>
-```
+The per-axis scores are combined downstream into the threshold-gated verdict
+(clean / flagged / rejected) per the **eval-rubrics** skill.
 
 **`autoform-reader` returns:**
 Structured summary with section headings, theorem names, and line numbers. Concise — its whole point is saving main-thread context.
@@ -186,7 +190,7 @@ Structured summary with section headings, theorem names, and line numbers. Conci
 
 - Don't spawn a worker for a target whose dependencies aren't formalized yet — it will waste turns trying to import nonexistent definitions.
 - Don't spawn parallel workers that write to the same file — they'll conflict.
-- Don't use `autoform-reviewer` for style-only checks — use `/autoform-quality` in the main thread or spawn a dedicated quality review.
+- Don't use the correctness judges (`faithfulness-reviewer`, `proof-integrity-reviewer`) for style-only checks — spawn `code-quality-reviewer`, or apply the **eval-rubrics** skill's code_quality rubric in the main thread.
 - Don't spawn `autoform-reader` for small files (< 100 lines) — just read them directly.
 - Don't expect workers to coordinate with each other — they're independent. Cross-cutting concerns (shared namespaces, import organization) are the main thread's job.
 

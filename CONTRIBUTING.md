@@ -31,7 +31,7 @@ These skills don't exist yet. Create them from scratch — see `examples/skills/
 | Component | Location | Status | Difficulty | Notes |
 |-----------|----------|--------|------------|-------|
 | **Worker agent** | `agents/autoform-worker.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
-| **Reviewer agent** | `agents/faithfulness-reviewer.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
+| **Reviewer jury** | `agents/faithfulness-reviewer.md`, `agents/proof-integrity-reviewer.md`, `agents/code-quality-reviewer.md` | ✅ Implemented | — | Full single-axis judge prompts; shared rubrics live in `skills/eval-rubrics/references/` |
 | **Reader agent** | `agents/autoform-reader.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
 
 ## How to contribute a server

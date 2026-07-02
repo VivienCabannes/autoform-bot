@@ -18,8 +18,9 @@ This directory contains full reference implementations for stubbed components in
 | `skills/autoform-extract/SKILL.md` | Complete extraction workflow | *(new skill — create `skills/autoform-extract/`)* |
 | `skills/autoform-crew/SKILL.md` | Full crew orchestration protocol | *(new skill — create `skills/autoform-crew/`)* |
 | `agents/autoform-worker.md` | Rich worker prompt with 5-step workflow, rules, integrity checks | `agents/autoform-worker.md` |
-| `agents/autoform-reviewer.md` | Full reviewer prompt with 6-point checklist | `agents/autoform-reviewer.md` |
 | `agents/autoform-reader.md` | Complete reader prompt with reading strategies | `agents/autoform-reader.md` |
+
+Reviewing is now done by the three single-axis jury agents (`agents/faithfulness-reviewer.md`, `agents/proof-integrity-reviewer.md`, `agents/code-quality-reviewer.md`), which ship as full production prompts — there is no reviewer stub or example to copy.
 
 ## How to use
 
