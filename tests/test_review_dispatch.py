@@ -95,15 +95,50 @@ def test_write_task_queue_roundtrips(tmp_path):
         proj.task_queue_path.name + ".tmp").exists()
 
 
-def test_write_task_queue_caps_at_200(tmp_path):
+def test_write_task_queue_caps_finished_at_200(tmp_path):
     proj = _proj(tmp_path)
-    big = [{"id": f"t{i}", "status": "queued"} for i in range(250)]
+    big = [{"id": f"t{i}", "status": "done"} for i in range(250)]
     proj.write_task_queue(big)
     saved = proj.task_queue()
     assert len(saved) == sv.TASK_QUEUE_CAP == 200
-    # the cap keeps the MOST RECENT entries (the tail)
+    # the cap trims the OLDEST finished entries (keeps the tail)
     assert saved[0]["id"] == "t50"
     assert saved[-1]["id"] == "t249"
+
+
+def test_write_task_queue_cap_never_drops_live_entries(tmp_path):
+    # 40 live (queued/running) entries scattered through 250: the cap must trim
+    # only the oldest done/failed history — dropping a live entry would cancel
+    # real pending work and defeat the escalation circuit-breaker's count.
+    proj = _proj(tmp_path)
+    big = []
+    for i in range(250):
+        if i % 25 == 0:
+            big.append({"id": f"q{i}", "status": "queued"})
+        elif i % 25 == 1:
+            big.append({"id": f"r{i}", "status": "running"})
+        else:
+            big.append({"id": f"d{i}", "status": "failed" if i % 2 else "done"})
+    proj.write_task_queue(big)
+    saved = proj.task_queue()
+    assert len(saved) == sv.TASK_QUEUE_CAP
+    live = [t for t in saved if t["status"] in ("queued", "running")]
+    assert len(live) == 20                       # every live entry survived
+    # the 50 dropped entries are the OLDEST finished ones
+    finished_ids = [t["id"] for t in saved if t["id"][0] == "d"]
+    assert finished_ids == [t["id"] for t in big
+                            if t["id"][0] == "d"][50:]
+
+
+def test_write_task_queue_cap_keeps_all_live_even_over_cap(tmp_path):
+    # Pathological: more live entries than the cap. The cap bounds *history*,
+    # never live work — everything queued/running is kept (file exceeds the cap).
+    proj = _proj(tmp_path)
+    big = [{"id": f"q{i}", "status": "queued"} for i in range(210)] \
+        + [{"id": f"d{i}", "status": "done"} for i in range(20)]
+    proj.write_task_queue(big)
+    saved = proj.task_queue()
+    assert [t["id"] for t in saved] == [f"q{i}" for i in range(210)]
 
 
 def test_write_task_queue_does_not_touch_graph_or_sidecar(tmp_path):

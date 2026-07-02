@@ -207,6 +207,24 @@ _ACTIVE_STATUSES = {"queued", "running"}
 _BAD_JSON = object()
 
 
+def _bounded_queue(queue: List[dict]) -> List[dict]:
+    """Apply ``TASK_QUEUE_CAP``: drop the OLDEST finished (non-queued/running)
+    entries until the total fits — never a live entry. Order is preserved. If the
+    live entries alone exceed the cap, everything live is still kept (the cap
+    bounds *history*, not real pending work)."""
+    overflow = len(queue) - TASK_QUEUE_CAP
+    if overflow <= 0:
+        return queue
+    kept: List[dict] = []
+    for t in queue:
+        if (overflow > 0 and isinstance(t, dict)
+                and t.get("status") not in _ACTIVE_STATUSES):
+            overflow -= 1
+            continue
+        kept.append(t)
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # project context — resolves all the read-only inputs around graph.json
 # ---------------------------------------------------------------------------
@@ -291,9 +309,15 @@ class Project:
         This is the SECOND deliberate write this server performs (beyond the sidecar).
         It writes ONLY ``task_queue.json``; it never mutates the graph, the
         informal_content, the agents feed, or the review sidecar, and it never spawns
-        an agent. Keeps the most recent ``TASK_QUEUE_CAP`` entries when over the cap.
+        an agent.
+
+        The cap only ever trims **finished** history (``done``/``failed``, oldest
+        first) — a live ``queued``/``running`` entry is NEVER dropped: silently
+        losing one would cancel real pending work and shrink the per-node escalation
+        history the engine's circuit-breaker counts. So the file may exceed the cap
+        when more than ``TASK_QUEUE_CAP`` entries are live (the engine drains them).
         """
-        bounded = list(queue)[-TASK_QUEUE_CAP:]
+        bounded = _bounded_queue(list(queue))
         payload = json.dumps(bounded, ensure_ascii=False, indent=2)
         # Unique temp name (mkstemp) — a fixed <name>.tmp is a write race with the
         # engine, which swaps the same file. Callers doing load-mutate-save hold
