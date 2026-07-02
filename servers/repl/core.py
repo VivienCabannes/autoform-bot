@@ -90,14 +90,29 @@ def _append_capped(buffer: str, chunk: str, max_len: int) -> str:
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
     """Split Lean code into import statements and body.
 
+    Leading ``/- ... -/`` block comments (e.g. copyright headers) are
+    skipped so imports after them are still recognized. Doc comments
+    (``/--``) are left in the body — they attach to declarations.
+
     Returns (import_names, body, header_line_count).
     """
     lines = code.split("\n")
     imports: list[str] = []
     body_start = 0
+    block_depth = 0
 
     for i, line in enumerate(lines):
         stripped = line.strip()
+        if block_depth > 0:
+            block_depth = max(block_depth + stripped.count("/-") - stripped.count("-/"), 0)
+            if imports and block_depth == 0:
+                body_start = i + 1
+            continue
+        if stripped.startswith("/-") and not stripped.startswith("/--"):
+            block_depth = max(stripped.count("/-") - stripped.count("-/"), 0)
+            if imports and block_depth == 0:
+                body_start = i + 1
+            continue
         if stripped.startswith("import "):
             imports.append(stripped[7:].strip())
             body_start = i + 1
