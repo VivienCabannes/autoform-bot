@@ -109,14 +109,48 @@ Search Mathlib first, write to MyBook/Chapter1/.
 
 ## Delegating to Aristotle
 
-For hard, self-contained proofs, delegate to [Aristotle](https://aristotle.harmonic.fun) (Harmonic's autonomous prover):
+For hard, self-contained proofs, delegate to [Aristotle](https://aristotle.harmonic.fun)
+(Harmonic's autonomous prover). Aristotle is a prover **backend**: it produces a
+proof *into a plan node*, and that proof then feeds the same review pipeline
+(jury → `review_status.json` → review surface) as the in-session worker. It is one
+of two swappable backends behind a single interface — `(target node + spec) →
+proof written back to the node` — alongside the in-session Claude worker.
+
+> **Aristotle is a FREE external API, and it is OPT-IN / default-off.** There is
+> no metered cost to you. The only requirements are the opt-in `aristotle` extra
+> (`aristotlelib`), an `ARISTOTLE_API_KEY`, and network access. With no Python
+> backend and a free Aristotle, the architecture is all-free (in-session work
+> bills the Claude subscription, not the API). Nothing here runs unless you ask
+> for it.
 
 ```bash
-# One-time setup (handled automatically by uv if using the plugin)
-export ARISTOTLE_API_KEY=arstl_...
+# Opt in: install the extra and set a (free) API key.
+uv sync --extra aristotle
+export ARISTOTLE_API_KEY=arstl_...   # free key: https://aristotle.harmonic.fun/dashboard/keys
 ```
 
-Then in a Claude Code session:
+### Delegate a plan node (recommended)
+
+The highest-level entry hands Aristotle a target node from your plan and writes
+the proof back into that node — landing the Lean files into the project and
+recording the proof in the node's prose file. The returned `merge_payload` links
+the node's `content` through the single locked graph writer (`merge_node.py`).
+
+```
+aristotle_delegate_node(
+    graph_path="graph.json",
+    node_id="Chernoff bound",
+    project_dir=".")
+```
+
+Aristotle reads the node's spec itself (its informal statement, `source_refs`,
+`mathlib_declarations`, and in-tier `depends_on`), so you don't restate it. The
+landed proof is reviewed by the normal jury/review surface — Aristotle never
+self-certifies, reviews, or touches `review_status.json`.
+
+### Lower-level session tools
+
+For ad-hoc tasks (not tied to a plan node), drive a raw session:
 
 ```
 Submit Theorem 5.5 to Aristotle:
@@ -151,7 +185,7 @@ aristotle_wait("thm-5-5")     # block until done
 | Command | What it does | Status |
 |---------|-------------|--------|
 | `/install-lean` | Install Lean 4, elan, lake | ✅ |
-| `/setup-project` | Create new Lean 4 + Mathlib project | ✅ |
+| `/make-project` | Create new Lean 4 + Mathlib project | ✅ |
 | `/workspace` | Inspect project structure and health | ✅ |
 | `/zulip` | Search Lean Zulip for community discussions | ✅ |
 | `/autoform` | Load Mathlib & Lean 4 conventions | ⬜ Not yet |
@@ -174,12 +208,13 @@ aristotle_wait("thm-5-5")     # block until done
 | `get_repl_status` | repl | Check REPL pool health | ⬜ Stub |
 | `lean_diagnostic_messages` | lsp | Get file compilation diagnostics | ⬜ Stub |
 | `lean_hover` | lsp | Get type info at a position | ⬜ Stub |
-| `aristotle_submit` | aristotle | Submit a formalization task to Aristotle | ⬜ Stub |
-| `aristotle_wait` | aristotle | Block until an Aristotle task completes | ⬜ Stub |
-| `aristotle_poll` | aristotle | Non-blocking status check | ⬜ Stub |
-| `aristotle_steer` | aristotle | Redirect a running task with new instructions | ⬜ Stub |
-| `aristotle_events` | aristotle | Inspect what Aristotle is doing | ⬜ Stub |
-| `aristotle_sessions` | aristotle | List all active Aristotle sessions | ⬜ Stub |
+| `aristotle_delegate_node` | aristotle | Delegate a plan node: spec in, proof written back to the node | ✅ |
+| `aristotle_submit` | aristotle | Submit a formalization task to Aristotle | ✅ |
+| `aristotle_wait` | aristotle | Block until an Aristotle task completes | ✅ |
+| `aristotle_poll` | aristotle | Non-blocking status check | ✅ |
+| `aristotle_steer` | aristotle | Redirect a running task with new instructions | ✅ |
+| `aristotle_events` | aristotle | Inspect what Aristotle is doing | ✅ |
+| `aristotle_sessions` | aristotle | List all active Aristotle sessions | ✅ |
 
 ## Environment variables
 

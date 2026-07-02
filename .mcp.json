@@ -24,6 +24,11 @@
         "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
       }
     },
+    "autoform-prover": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "servers.prover.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}"
+    },
     "autoform-zulip": {
       "command": "uv",
       "args": ["run", "--extra", "zulip", "python", "-m", "servers.zulip.server"],
