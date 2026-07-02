@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
@@ -199,15 +200,30 @@ def _subprocess_line_runner(
         proc.wait()
 
 
+# A status-like FAILED line: the contract's `FAILED — <reason>` at line start
+# (allowing markdown emphasis/heading lead-ins) or a `status: FAILED` field.
+# UPPERCASE only for the bare form — the token is a status marker, not prose.
+_FAILED_LINE_RE = re.compile(r"^[\s>*_#`-]*FAILED\b")
+_STATUS_FAILED_RE = re.compile(r"^[\s>*_`-]*status\s*[:=]\s*FAILED\b", re.IGNORECASE)
+
+
 def _looks_failed(text: str) -> bool:
     """Heuristic: did the worker report an honest FAILED rather than a proof?
 
     The worker contract ends a failure with a ``FAILED — <reason>`` line; an empty
-    result is also treated as a failure (no proof produced).
+    result is also treated as a failure (no proof produced). The match is
+    deliberately STRICT — ``FAILED`` counts only as a status-like token (at line
+    start, or a ``status: FAILED`` field), never anywhere in prose ("the previous
+    attempt FAILED, so I …" is not a failure report). A false *proved* here is
+    caught by the verify gate downstream, but a false *failed* has NO backstop —
+    it silently discards a genuine proof — which is why this must not loosen.
     """
     if not text.strip():
         return True
-    return "FAILED" in text.upper().split("\n")[0] or "\nFAILED" in ("\n" + text).upper()
+    return any(
+        _FAILED_LINE_RE.match(line) or _STATUS_FAILED_RE.match(line)
+        for line in text.splitlines()
+    )
 
 
 def _failure_reason(text: str) -> str:
@@ -215,9 +231,9 @@ def _failure_reason(text: str) -> str:
     if not text.strip():
         return "worker produced no output"
     for line in text.splitlines():
-        up = line.strip()
-        if up.upper().startswith("FAILED"):
-            # Strip the "FAILED —/-/:" lead-in.
-            rest = up[6:].lstrip(" —-:")
+        m = _FAILED_LINE_RE.match(line) or _STATUS_FAILED_RE.match(line)
+        if m:
+            # Strip the "FAILED —/-/:" lead-in (and any markdown emphasis).
+            rest = line[m.end():].lstrip(" *_`—-:").strip()
             return rest or "worker reported FAILED"
     return "worker reported FAILED"

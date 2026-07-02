@@ -67,6 +67,30 @@ def test_looks_failed_and_failure_reason():
     assert _failure_reason("") == "worker produced no output"   # backend-neutral (was claude-specific)
 
 
+def test_looks_failed_only_on_status_like_token():
+    """`FAILED` in PROSE must not fail the run — a false failed silently discards
+    a genuine proof and (unlike a false proved) has no verify-gate backstop."""
+    # prose mentions — NOT failures
+    assert not _looks_failed("The first attempt FAILED, so I used nlinarith instead.\n"
+                             "theorem t : 1 = 1 := rfl")
+    assert not _looks_failed("Note: earlier `simp` FAILED on this goal but omega closed it.")
+    assert not _looks_failed("- the tactic FAILED once; retried and it compiled cleanly")
+    # status-like tokens — failures
+    assert _looks_failed("FAILED — missing lemma")
+    assert _looks_failed("worked for a while\nFAILED — could not close the goal")
+    assert _looks_failed("**FAILED** — the induction does not go through")
+    assert _looks_failed("status: FAILED")
+    assert _looks_failed("Status = FAILED (budget exhausted)")
+    # lowercase prose 'failed' is never a status token
+    assert not _looks_failed("failed attempts taught me the right invariant; proof landed")
+
+
+def test_failure_reason_handles_markdown_and_status_forms():
+    assert _failure_reason("**FAILED** — induction mismatch") == "induction mismatch"
+    assert _failure_reason("status: FAILED — out of budget") == "out of budget"
+    assert _failure_reason("FAILED") == "worker reported FAILED"
+
+
 def test_build_spec_prompt():
     p = _build_spec_prompt("Foo.Bar", "prove X")
     assert "# Formalization target: Foo.Bar" in p and "prove X" in p and "FAILED" in p
