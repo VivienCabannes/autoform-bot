@@ -35,10 +35,16 @@ from .driver import prove
 logger = logging.getLogger(__name__)
 
 
-def _make_adapter(backend: str, graph_path: str, max_wait_seconds: float) -> ProverAdapter:
+def _make_adapter(
+    backend: str,
+    graph_path: str,
+    max_wait_seconds: float,
+    extra_args: list[str] | None = None,
+    mcp_config: str | None = None,
+) -> ProverAdapter:
     """Construct the adapter for ``backend``. Aristotle/Codex are imported lazily here."""
     if backend == "claude":
-        return ClaudeAdapter()
+        return ClaudeAdapter(extra_args=extra_args, mcp_config=mcp_config)
     if backend == "aristotle":
         # Lazy import: only pulled in when the Aristotle backend is actually
         # selected, so the server imports without the ``aristotle`` extra.
@@ -49,7 +55,7 @@ def _make_adapter(backend: str, graph_path: str, max_wait_seconds: float) -> Pro
         # Lazy import: the OpenAI ``codex`` CLI backend (its own auth, not Max).
         from .codex_adapter import CodexAdapter
 
-        return CodexAdapter()
+        return CodexAdapter(extra_args=extra_args)
     raise ValueError(f"unknown backend {backend!r}; expected 'claude', 'aristotle', or 'codex'")
 
 
@@ -61,6 +67,8 @@ def run_prove_node(
     backend: str = "claude",
     max_steers: int = 3,
     max_wait_seconds: float = 5400,
+    extra_args: list[str] | None = None,
+    mcp_config: str | None = None,
 ) -> ProofResult:
     """Build the node spec, run the unified driver with the chosen adapter.
 
@@ -69,7 +77,7 @@ def run_prove_node(
     it to ``{status, reason, backend, ...}``.
     """
     spec = build_node_spec(Path(graph_path), node_id, project_dir=Path(project_dir))
-    adapter = _make_adapter(backend, graph_path, max_wait_seconds)
+    adapter = _make_adapter(backend, graph_path, max_wait_seconds, extra_args, mcp_config)
     return prove(adapter, node_id, spec, project_dir, max_steers=max_steers)
 
 
@@ -85,6 +93,8 @@ def create_prover_server() -> FastMCP:
         backend: str = "claude",
         max_steers: int = 3,
         max_wait_seconds: float = 5400,
+        extra_args: list[str] | None = None,
+        mcp_config: str | None = None,
     ) -> str:
         """Prove ONE plan node with a swappable backend; write the proof into the node.
 
@@ -108,6 +118,13 @@ def create_prover_server() -> FastMCP:
             backend: "claude" (default), "aristotle", or "codex".
             max_steers: Cap on in-flight steers for this run (default 3).
             max_wait_seconds: Ceiling on how long to wait (Aristotle backend).
+            extra_args: Extra CLI args threaded through to the claude/codex
+                worker invocation.
+            mcp_config: MCP config path for the claude worker's --mcp-config.
+                Default (None) auto-discovers: the AUTOFORM_MCP_CONFIG env var if
+                set, else the plugin's own .mcp.json next to this package; the
+                headless worker also runs with --dangerously-skip-permissions by
+                default so it can actually Edit/Write/Bash.
 
         Returns:
             JSON ``{node_id, backend, status, reason, landed_files, proof_text}``
@@ -121,6 +138,8 @@ def create_prover_server() -> FastMCP:
                 backend=backend,
                 max_steers=max_steers,
                 max_wait_seconds=max_wait_seconds,
+                extra_args=extra_args,
+                mcp_config=mcp_config,
             )
         except Exception as err:
             return json.dumps(

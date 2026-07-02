@@ -343,6 +343,48 @@ def test_claude_system_prompt_forbids_cheating():
         assert token in WORKER_SYSTEM_PROMPT
 
 
+def test_claude_adapter_default_argv_is_runnable(tmp_path, monkeypatch):
+    """The headless worker must be able to Edit/Write/Bash and reach the MCP tools:
+    the default argv carries the permission flag and --mcp-config."""
+    cfg = tmp_path / "my-mcp.json"
+    cfg.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("AUTOFORM_MCP_CONFIG", str(cfg))
+
+    runner = FakeClaudeRunner([_stream({"type": "result", "session_id": "s", "result": "ok proved"})])
+    adapter = ClaudeAdapter(runner=runner)
+    prove(adapter, "T", "spec", "/proj", steerer=FakeSteerer(steer_at=set()), verifier=None)
+
+    args = runner.calls[0]
+    assert "--dangerously-skip-permissions" in args
+    assert "--mcp-config" in args
+    assert args[args.index("--mcp-config") + 1] == str(cfg)
+
+
+def test_claude_adapter_mcp_config_falls_back_to_plugin_mcp_json(monkeypatch):
+    # No env override → the plugin's own repo-root .mcp.json is discovered.
+    monkeypatch.delenv("AUTOFORM_MCP_CONFIG", raising=False)
+    adapter = ClaudeAdapter(runner=FakeClaudeRunner([[]]))
+    assert adapter._mcp_config and adapter._mcp_config.endswith(".mcp.json")
+
+
+def test_claude_adapter_autonomy_and_mcp_are_optional(monkeypatch):
+    monkeypatch.delenv("AUTOFORM_MCP_CONFIG", raising=False)
+    runner = FakeClaudeRunner([_stream({"type": "result", "session_id": "s", "result": "ok proved"})])
+    adapter = ClaudeAdapter(runner=runner, autonomy_args=[], mcp_config="")
+    prove(adapter, "T", "spec", "/proj", steerer=FakeSteerer(steer_at=set()), verifier=None)
+    args = runner.calls[0]
+    assert "--dangerously-skip-permissions" not in args
+    assert "--mcp-config" not in args
+
+
+def test_make_adapter_threads_extra_args_and_mcp_config():
+    from servers.prover.server import _make_adapter
+
+    a = _make_adapter("claude", "g.json", 60, extra_args=["--foo"], mcp_config="/x/mcp.json")
+    assert a._extra_args == ["--foo"]
+    assert a._mcp_config == "/x/mcp.json"
+
+
 # ===========================================================================
 # Aristotle adapter — in-memory fake lib (NO network, NO aristotlelib)
 # ===========================================================================

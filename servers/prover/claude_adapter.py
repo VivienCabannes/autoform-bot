@@ -44,8 +44,10 @@ one definition across the Claude and Codex backends.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ._cli_common import (
@@ -63,6 +65,33 @@ logger = logging.getLogger(__name__)
 
 # Default model for the headless worker (overridable via ctor / env).
 DEFAULT_MODEL = "opus"
+
+#: Full autonomy for the headless worker (edit files + run ``lake``/git) — without
+#: this a bare ``claude -p`` child can approve nothing and cannot Edit/Write/Bash,
+#: so the WORKER_SYSTEM_PROMPT's compile-to-iterate loop is impossible. The same
+#: flag the dispatch runner (PR #13) and codex's ``DEFAULT_AUTONOMY_ARGS`` analogue
+#: use. Pass ``autonomy_args=[]`` to run under the default permission prompts.
+DEFAULT_AUTONOMY_ARGS = ["--dangerously-skip-permissions"]
+
+
+def _default_mcp_config() -> str | None:
+    """Auto-discover the MCP config for the headless worker.
+
+    The worker discipline promises the ``autoform-repl`` / ``autoform-lsp`` MCP
+    tools, so the child needs a ``--mcp-config``. Resolution order:
+
+    1. ``AUTOFORM_MCP_CONFIG`` env var (explicit override), else
+    2. the plugin's own ``.mcp.json`` at the repo root relative to this package,
+       if present, else
+    3. ``None`` (no flag — the worker falls back to plain ``lake`` builds).
+    """
+    env = os.environ.get("AUTOFORM_MCP_CONFIG", "").strip()
+    if env:
+        return env
+    candidate = Path(__file__).resolve().parents[2] / ".mcp.json"
+    if candidate.exists():
+        return str(candidate)
+    return None
 
 # The prover discipline the headless worker is held to — the SAME no-cheating /
 # honest-FAILED contract the in-session ``autoform-worker`` agent carries
@@ -149,11 +178,19 @@ class ClaudeAdapter(ProverAdapter):
         model: Model id passed to ``claude --model`` (default ``"opus"``).
         system_prompt: The worker discipline (defaults to
             :data:`WORKER_SYSTEM_PROMPT`).
-        extra_args: Extra ``claude`` CLI args (e.g. ``--mcp-config`` /
-            ``--permission-mode``) the caller wants threaded through.
-        runner: Injectable launcher ``(args, env, cwd) -> Iterator[str]`` yielding
-            stream-json lines. Defaults to a real ``subprocess`` launcher; tests
-            inject a fake so no live ``claude`` process is spawned.
+        autonomy_args: Permission flags for the headless worker (defaults to
+            :data:`DEFAULT_AUTONOMY_ARGS`, i.e. ``--dangerously-skip-permissions``
+            — without it the child cannot Edit/Write/Bash). ``[]`` disables.
+        mcp_config: Path passed to ``--mcp-config`` so the worker gets the
+            ``autoform-repl``/``autoform-lsp`` tools its discipline promises.
+            ``None`` (default) auto-discovers via :func:`_default_mcp_config`
+            (``AUTOFORM_MCP_CONFIG`` env, else the plugin's own ``.mcp.json``);
+            ``""`` disables the flag entirely.
+        extra_args: Extra ``claude`` CLI args the caller wants threaded through.
+        runner: Injectable launcher ``(args, env, cwd, deadline=None) ->
+            Iterator[str]`` yielding stream-json lines. Defaults to a real
+            ``subprocess`` launcher; tests inject a fake so no live ``claude``
+            process is spawned.
     """
 
     name = "claude"
@@ -163,11 +200,15 @@ class ClaudeAdapter(ProverAdapter):
         *,
         model: str = DEFAULT_MODEL,
         system_prompt: str = WORKER_SYSTEM_PROMPT,
+        autonomy_args: list[str] | None = None,
+        mcp_config: str | None = None,
         extra_args: list[str] | None = None,
         runner: Any | None = None,
     ) -> None:
         self._model = model
         self._system_prompt = system_prompt
+        self._autonomy_args = list(autonomy_args if autonomy_args is not None else DEFAULT_AUTONOMY_ARGS)
+        self._mcp_config = _default_mcp_config() if mcp_config is None else (mcp_config or None)
         self._extra_args = list(extra_args or [])
         self._runner = runner or _subprocess_line_runner
 
@@ -240,6 +281,9 @@ class ClaudeAdapter(ProverAdapter):
             args += ["--resume", state.session_id]
         elif not resume:
             args += ["--append-system-prompt", self._system_prompt]
+        args += self._autonomy_args
+        if self._mcp_config:
+            args += ["--mcp-config", self._mcp_config]
         args += state.extra_args
 
         for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir)):
