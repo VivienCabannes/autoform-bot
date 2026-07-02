@@ -112,6 +112,58 @@ def test_no_decls_passes_after_build():
     assert r.ok and r.checks["kernel"] == "no-decls"
 
 
+# --- axiom whitelist -------------------------------------------------------------
+
+def test_standard_axioms_pass_and_are_recorded():
+    r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
+                     reader=lambda p: "theorem t : 1=1 := rfl", builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir:
+                         (0, "'t' depends on axioms: [propext, Classical.choice, Quot.sound]"))
+    assert r.ok
+    assert r.checks["axioms"] == ["Classical.choice", "Quot.sound", "propext"]
+
+
+def test_rogue_axiom_fails_naming_it():
+    """An axiom-stubbed 'proof' (custom axiom, no sorryAx) must NOT pass the gate."""
+    r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
+                     reader=lambda p: "theorem t : P := stub", builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir:
+                         (0, "'t' depends on axioms: [propext, myEvilStub]"))
+    assert not r.ok
+    assert "myEvilStub" in r.reason
+    assert r.checks["kernel"] == "axiom" and r.checks["rogue_axioms"] == ["myEvilStub"]
+
+
+def test_ledger_whitelists_project_axioms(tmp_path):
+    (tmp_path / "AXIOM_AUDIT.md").write_text(
+        "# Audited axioms\n\n"
+        "We accept `axiom Physics.continuum_hypothesis` pending Tier-3 work.\n\n"
+        "- Analysis.bigAssumption\n",
+        encoding="utf-8")
+    r = verify_proof("N", str(tmp_path), has_lakefile=True, touched=["A.lean"],
+                     reader=lambda p: "theorem t : P := ledgered", builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir:
+                         (0, "'t' depends on axioms: [Physics.continuum_hypothesis, "
+                             "Analysis.bigAssumption, propext]"))
+    assert r.ok
+
+
+def test_ledger_parser_is_forgiving_but_not_greedy():
+    from servers.prover.verify import parse_axiom_ledger
+
+    text = (
+        "# Ledger\n"
+        "Prose about the project. Overview words must not become allowances.\n"
+        "```lean\naxiom Foo.bar : Nat\n```\n"
+        "inline mention of axiom Baz.qux here\n"
+        "- `List.item'`\n"
+        "* Another.one\n"
+        "- not a single name\n"
+    )
+    names = parse_axiom_ledger(text)
+    assert names == {"Foo.bar", "Baz.qux", "List.item'", "Another.one"}
+
+
 # --- baseline change-attribution (real git repo in tmp_path) --------------------
 
 def _git(repo, *args):

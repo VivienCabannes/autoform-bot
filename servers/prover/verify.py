@@ -26,9 +26,14 @@ that rests on a ``sorry`` anywhere in its transitive dependencies reports
   4. **no ``sorryAx``** — ``#print axioms`` over the touched modules' declarations
      contains no ``sorryAx`` (catches literal AND transitive/imported gaps).
 
+  5. **axiom whitelist** — every axiom the kernel reports must be one of Lean's
+     standard axioms (``propext`` / ``Classical.choice`` / ``Quot.sound`` /
+     ``funext``) or listed in the project's axiom ledger (``AXIOM_AUDIT.md`` at the
+     project root), so an axiom-stubbed "proof" cannot pass the gate.
+
 Any failure → ``ok=False`` and the driver downgrades the verdict to ``failed``. The
-deeper non-``sorry`` axiom audit (custom ``axiom``/orphan classes) stays the
-proof-integrity reviewer's job. Every ``lake`` call scrubs ``ANTHROPIC_API_KEY``.
+deeper axiom audit (orphan classes, whether a ledgered axiom is justified) stays
+the proof-integrity reviewer's job. Every ``lake`` call scrubs ``ANTHROPIC_API_KEY``.
 All external effects (git, file read, ``lake build``, the ``#print axioms`` probe)
 sit behind injectable seams so the gate's logic is unit-testable with no toolchain.
 """
@@ -58,6 +63,18 @@ _DECL_RE = re.compile(
 )
 _BUILD_TIMEOUT = 900
 _PROBE_TIMEOUT = 300
+
+# The standard axioms a genuine Mathlib-style proof may rest on. Modern Lean 4
+# reports the core trio (funext is a theorem, derived from Quot.sound, but is kept
+# for older/alternative toolchains that surface it as an axiom). Anything else must
+# be whitelisted in the project's axiom ledger or the gate fails.
+_STANDARD_AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound", "funext"})
+
+#: Ledger filenames probed (first hit wins) at the project root.
+_AXIOM_LEDGER_NAMES = ("AXIOM_AUDIT.md", "AXIOM_AUDIT.txt", "axiom_audit.md", "AXIOMS.md")
+
+_AXIOM_REPORT_RE = re.compile(r"depends on axioms:\s*\[([^\]]*)\]")
+_LEDGER_AXIOM_RE = re.compile(r"\baxiom\s+`?([A-Za-z_][A-Za-z0-9_.']*)`?")
 
 
 @dataclass
@@ -253,6 +270,46 @@ def _attributable_lean(project_dir: str, baseline: Baseline) -> list[str]:
     return files
 
 
+# ------------------------------------------------------------------ axiom audit
+
+def parse_axiom_ledger(text: str) -> set[str]:
+    """Axiom names a project ledger (AXIOM_AUDIT.md) explicitly allows.
+
+    Deliberately FORGIVING about format: it accepts inline/fenced ``axiom <name>``
+    declarations anywhere in the text, and bullet-list items that are a single
+    axiom name (``- Foo.bar`` / ``* Foo.bar``, optionally backticked). Arbitrary
+    prose words are NOT picked up — only ``axiom``-prefixed names and list items."""
+    names = set(_LEDGER_AXIOM_RE.findall(text))
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s[0] not in "-*+":
+            continue
+        s = s.lstrip("-*+ \t").strip().strip("`")
+        if s and _MODULE_ID_RE.match(s):
+            names.add(s)
+    return names
+
+
+def _ledger_axioms(project_dir: str) -> set[str]:
+    """Read the project's axiom ledger, if one exists at the project root."""
+    for name in _AXIOM_LEDGER_NAMES:
+        p = Path(project_dir) / name
+        try:
+            if p.exists():
+                return parse_axiom_ledger(p.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:  # pragma: no cover - unreadable ledger = no allowances
+            continue
+    return set()
+
+
+def _axioms_in_report(pout: str) -> set[str]:
+    """Every axiom named in ``#print axioms`` output (`'d' depends on axioms: [...]`)."""
+    names: set[str] = set()
+    for m in _AXIOM_REPORT_RE.finditer(pout):
+        names.update(a.strip() for a in m.group(1).split(",") if a.strip())
+    return names
+
+
 # ------------------------------------------------------------ module + decl parse
 
 def _module_of(file: str, project_dir: str) -> str | None:
@@ -437,5 +494,19 @@ def verify_proof(
     if "axioms" not in pout:   # no #print-axioms report ran (import failed / module not built)
         return VerifyResult(False, f"could not kernel-verify (no axiom report; lean exit {prc}): {' '.join(pout.split())[-200:]}",
                             {"verified": True, "files": files, "kernel": "unverified"})
+
+    # 4. axiom WHITELIST — sorryAx is not the only way to fake a proof: an
+    #    axiom-stubbed lemma passes the check above. Only Lean's standard axioms
+    #    (plus any the project's axiom ledger explicitly audits) may appear.
+    axioms = _axioms_in_report(pout)
+    allowed = _STANDARD_AXIOMS | _ledger_axioms(project_dir)
+    rogue = sorted(axioms - allowed)
+    if rogue:
+        return VerifyResult(
+            False,
+            f"proof depends on non-standard axiom(s) not in the project ledger: {', '.join(rogue)}",
+            {"verified": True, "files": files, "kernel": "axiom",
+             "axioms": sorted(axioms), "rogue_axioms": rogue})
     return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean",
-                                   "modules": modules, "decls": len(decls), "kernel": "clean"})
+                                   "modules": modules, "decls": len(decls), "kernel": "clean",
+                                   "axioms": sorted(axioms)})
