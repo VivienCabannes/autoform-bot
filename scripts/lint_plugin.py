@@ -25,6 +25,8 @@ Checks (all stdlib):
   - No surviving mention of an agent/skill in REMOVED_AGENTS / REMOVED_SKILLS
     (the rename-regression guard; HTML/`<!-- -->` comments are stripped first so
     planned-but-unbuilt TODO notes never trip it).
+  - At least one agent and one skill were actually checked (so wholesale
+    deletion/renaming of `agents/` or `skills/` cannot produce a vacuous pass).
 
 Exit code 0 = clean, 1 = at least one error. Run: python scripts/lint_plugin.py
 """
@@ -152,10 +154,14 @@ def check_plugin_json() -> None:
         err(f"plugin.json version is not semver-shaped: {version!r}")
 
 
-def check_agents() -> None:
-    """Every agents/*.md needs `name` (== filename stem) and `description`."""
+def check_agents() -> int:
+    """Every agents/*.md needs `name` (== filename stem) and `description`.
+
+    Returns the number of agents checked (0 would mean a vacuous pass)."""
     global checks
+    count = 0
     for path in sorted((REPO_ROOT / "agents").glob("*.md")):
+        count += 1
         checks += 1
         fm = frontmatter(path)
         if fm is None:
@@ -166,12 +172,17 @@ def check_agents() -> None:
                 err(f"{rel(path)}: agent frontmatter missing `{key}`")
         if fm.get("name") and fm["name"] != path.stem:
             err(f"{rel(path)}: agent `name: {fm['name']}` != filename `{path.stem}`")
+    return count
 
 
-def check_skills() -> None:
-    """Every skills/*/SKILL.md needs `name` and `description`."""
+def check_skills() -> int:
+    """Every skills/*/SKILL.md needs `name` and `description`.
+
+    Returns the number of skills checked (0 would mean a vacuous pass)."""
     global checks
+    count = 0
     for skill_md in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
+        count += 1
         checks += 1
         fm = frontmatter(skill_md)
         if fm is None:
@@ -180,6 +191,7 @@ def check_skills() -> None:
         for key in ("name", "description"):
             if key not in fm:
                 err(f"{rel(skill_md)}: skill frontmatter missing `{key}`")
+    return count
 
 
 def check_commands() -> None:
@@ -208,14 +220,19 @@ def check_skill_references() -> None:
     niket/dev cites a skill's own reference files by their `references/`-rooted
     path (e.g. `references/plan-json-schema.md`). We match exactly that shape so
     data-file mentions (`informal_content/<id>.md`, `graph.json`) are ignored.
+    Nested paths (`references/sub/x.md`) and any extension (`.py`, `.sh`, ...)
+    are covered; trailing punctuation that markdown prose attaches (a sentence
+    period, `...`) is stripped before checking existence.
     Backtick-quoted and bare path forms are both accepted; HTML comments stripped.
     """
     global checks
-    ref_cite = re.compile(r"references/([A-Za-z0-9_.-]+\.(?:md|txt|json))")
+    ref_cite = re.compile(r"references/([A-Za-z0-9_./-]+)")
     for skill_md in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
         refs_dir = skill_md.parent / "references"
         body = strip_comments(skill_md.read_text(encoding="utf-8"))
-        for base in sorted(set(ref_cite.findall(body))):
+        for base in sorted({m.rstrip("./") for m in ref_cite.findall(body)}):
+            if not base:
+                continue
             checks += 1
             if not (refs_dir / base).exists():
                 err(f"{rel(skill_md)}: cites `references/{base}` but "
@@ -252,17 +269,27 @@ def check_no_dangling_references() -> None:
 
 
 def main() -> int:
+    global checks
     if not (REPO_ROOT / ".claude-plugin").is_dir():
         print(f"error: .claude-plugin/ not found at {REPO_ROOT} "
               f"(run from the plugin repo root)", file=sys.stderr)
         return 1
     check_marketplace()
     check_plugin_json()
-    check_agents()
-    check_skills()
+    n_agents = check_agents()
+    n_skills = check_skills()
     check_commands()
     check_skill_references()
     check_no_dangling_references()
+
+    # Minimum-count sanity: this plugin ships agents and skills, so checking
+    # zero of either means agents/ or skills/ was deleted/renamed — a vacuous
+    # pass, not a clean tree.
+    checks += 2
+    if n_agents == 0:
+        err("no agents/*.md found — agents/ deleted or renamed?")
+    if n_skills == 0:
+        err("no skills/*/SKILL.md found — skills/ deleted or renamed?")
 
     if errors:
         print(f"plugin-lint: FAILED ({len(errors)} error(s), {checks} checks)")
