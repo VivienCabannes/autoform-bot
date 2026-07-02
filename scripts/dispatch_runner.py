@@ -129,8 +129,16 @@ def parse_score(stdout: str, axis: str) -> dict:
             continue
         if isinstance(j, dict) and "score" in j:
             s = j.get("score")
-            return {"score": int(s) if isinstance(s, (int, float)) else None,
-                    "reasoning": str(j.get("reasoning", ""))[:500]}
+            reasoning = str(j.get("reasoning", ""))[:500]
+            if isinstance(s, (int, float)):
+                return {"score": int(s), "reasoning": reasoning}
+            # Explicit abstain: {"score": null, "error": "…"} (e.g. missing source
+            # refs). Keep the judge's error text in the reasoning; a None score then
+            # flows through the same "usable" filtering as a timeout upstream.
+            err = str(j.get("error", "") or "").strip()
+            txt = " — ".join(x for x in (reasoning, err) if x) \
+                or f"{axis}: abstained (score null)"
+            return {"score": None, "reasoning": txt[:500], "error": "abstain"}
     return {"score": None, "reasoning": f"{axis}: unparseable output: {text[:160]}", "error": "parse"}
 
 
@@ -393,7 +401,15 @@ def main(argv=None) -> int:
         def finalize(tid: str, node_id: str) -> None:
             scores = {ax: results[tid].get(ax, {}).get("score") for ax in AXES}
             usable = {k: v for k, v in scores.items() if isinstance(v, int)}
-            verdict = rm.jury_verdict(usable) if len(usable) == len(AXES) else "flagged"
+            if not usable:                  # every judge failed/timed out/abstained
+                reasons = "; ".join(
+                    str(results[tid].get(ax, {}).get("reasoning", ""))[:80] for ax in AXES)
+                fail_task(tid, f"no usable scores — {reasons}")   # no ai verdict at all
+                return
+            # jury_verdict on whatever scores ARE usable: it is already conservative
+            # about gaps (a missing axis blocks 'clean', a present failing correctness
+            # axis rejects) — a judge timeout must never DOWNGRADE rejected→flagged.
+            verdict = rm.jury_verdict(usable)
             with fslock.locked(sidecar_path):       # vs the dashboard's human verdicts
                 sc = rm.load_sidecar(sidecar_path)
                 sc["reviews"].setdefault(node_id, {})["ai"] = {

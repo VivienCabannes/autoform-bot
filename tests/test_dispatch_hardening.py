@@ -11,6 +11,11 @@ Covers the crash-safety fixes:
   * startup sweep — reviewer/worker tasks stranded in ``running`` (a previous
     engine died) are reset to ``queued`` with a "requeued after engine restart"
     note; orchestrator-owned kinds are left alone.
+  * jury verdict honesty — a partial jury still REJECTS on a failing correctness
+    score (never downgraded to flagged by a judge timeout), and an all-abstain
+    jury writes NO ai verdict at all: the task fails with "no usable scores".
+  * parse_score — an explicit ``{"score": null, "error": …}`` is an abstain
+    (score None, error text kept in the reasoning).
 
 All jury runs are simulated by monkeypatching ``run_judge`` / ``load_rubrics``;
 no ``claude`` subprocess is ever spawned.
@@ -169,6 +174,79 @@ def test_main_runs_the_sweep_then_drains_the_requeued_task(tmp_path, monkeypatch
     t = _by_id(proj, "reviewer:s1")
     assert t["status"] == "done"
     assert "requeued after engine restart" in t["note"]
+
+
+# ---------------------------------------------------------------------------
+# jury verdict honesty — no downgrade on a partial jury; no verdict on abstain
+# ---------------------------------------------------------------------------
+
+def _run_with_scores(tmp_path, monkeypatch, scores):
+    """Drive one reviewer task through main() with canned per-axis judge results."""
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+
+    def judge(axis, prompt, repo, model, timeout):
+        s = scores.get(axis)
+        if s is None:
+            return {"score": None, "reasoning": f"{axis}: judge timed out after {timeout}s",
+                    "error": "timeout"}
+        return {"score": s, "reasoning": "canned"}
+
+    monkeypatch.setattr(dr, "run_judge", judge)
+    proj = _proj(tmp_path, [
+        {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "queued"}])
+    assert dr.main([str(proj)]) == 0
+    return proj
+
+
+def test_partial_jury_still_rejects_never_downgrades(tmp_path, monkeypatch):
+    # faithfulness=1 (rejectable) + proof_integrity=5, third judge timed out:
+    # the verdict must be REJECTED — not silently downgraded to flagged.
+    proj = _run_with_scores(tmp_path, monkeypatch,
+                            {"faithfulness": 1, "proof_integrity": 5,
+                             "code_quality": None})
+    ai = _sidecar(proj)["reviews"]["s1"]["ai"]
+    assert ai["verdict"] == "rejected"
+    assert ai["code_quality"] is None            # the missing score stays visible
+    assert _by_id(proj, "reviewer:s1")["status"] == "done"
+
+
+def test_all_judges_failed_writes_no_ai_verdict_and_fails_task(tmp_path, monkeypatch):
+    # Every judge timed out/abstained: no usable score exists, so no ai verdict is
+    # written at all and the task fails (re-queueable) rather than pretending.
+    proj = _run_with_scores(tmp_path, monkeypatch,
+                            {ax: None for ax in dr.AXES})
+    assert "s1" not in _sidecar(proj)["reviews"]
+    t = _by_id(proj, "reviewer:s1")
+    assert t["status"] == "failed"
+    assert "no usable scores" in t["result"]
+
+
+# ---------------------------------------------------------------------------
+# parse_score — explicit {"score": null, "error": …} is an abstain
+# ---------------------------------------------------------------------------
+
+def test_parse_score_null_is_abstain_and_keeps_error_text():
+    out = dr.parse_score(json.dumps(
+        {"score": None, "error": "missing source refs — cannot judge faithfulness"}),
+        "faithfulness")
+    assert out["score"] is None
+    assert out["error"] == "abstain"
+    assert "missing source refs" in out["reasoning"]
+
+
+def test_parse_score_null_with_reasoning_keeps_both():
+    out = dr.parse_score(json.dumps(
+        {"score": None, "reasoning": "no source to compare against",
+         "error": "no-source"}), "faithfulness")
+    assert out["score"] is None
+    assert out["error"] == "abstain"
+    assert "no source to compare against" in out["reasoning"]
+    assert "no-source" in out["reasoning"]
+
+
+def test_parse_score_integer_still_parses():
+    out = dr.parse_score(json.dumps({"score": 4, "reasoning": "solid"}), "code_quality")
+    assert out == {"score": 4, "reasoning": "solid"}
 
 
 if __name__ == "__main__":
