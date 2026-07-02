@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -274,7 +275,6 @@ def main(argv=None) -> int:
     queue_path = proj / "task_queue.json"
     feed_path = proj / "agents_status.json"
     repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
-    rubrics = load_rubrics()
 
     initial = [t for t in (json.loads(queue_path.read_text()) if queue_path.exists() else [])
                if t.get("status") == "queued" and t.get("agent") == "reviewer"]
@@ -289,8 +289,48 @@ def main(argv=None) -> int:
             print(f"  reviewer → {t['node']:28} → {len(AXES)}-judge jury ({' | '.join(AXES)})")
         return 0
 
+    _rubric_warned = [False]                # one diagnostic per bad state, not per poll
+
+    def usable_rubrics():
+        """Reload + validate the rubrics BEFORE any task is claimed.
+
+        Every jury axis must have a rubric file carrying a ``prompt_template``
+        (skills/eval-rubrics/references/*.json — sibling PR #12). Returns the rubric
+        dict when complete; otherwise prints one clear diagnostic and returns None,
+        so the caller leaves every task queued instead of claiming work it would
+        then crash on (KeyError at rubrics[axis])."""
+        rubrics = load_rubrics()
+        missing = [ax for ax in AXES
+                   if not isinstance((rubrics.get(ax) or {}).get("prompt_template"), str)]
+        if not missing:
+            _rubric_warned[0] = False
+            return rubrics
+        if not _rubric_warned[0]:
+            _rubric_warned[0] = True
+            print(f"eval-rubrics skill not found — no rubric with a prompt_template for "
+                  f"axis(es): {', '.join(missing)} (looked in skills/eval-rubrics/references/). "
+                  f"Merge PR #12 / install the rubrics; reviewer tasks stay QUEUED until then.",
+                  flush=True)
+        return None
+
+    def fail_task(tid: str, err: str) -> None:
+        """Mark ONE task failed with the error in ``result`` — an unexpected
+        exception sinks that task, never the loop/engine."""
+        with fslock.locked(queue_path):
+            cur = json.loads(queue_path.read_text()) if queue_path.exists() else []
+            for t in cur:
+                if t["id"] == tid:
+                    t["status"], t["finished_at"] = "failed", dq._now()
+                    t["result"] = f"error: {err}"[:300]
+            dq._save(queue_path, cur)
+            dq._save(feed_path, dq._feed_for(cur))
+        print(f"  ✗ task {tid} → FAILED ({err})", flush=True)
+
     def drain_once() -> int:
         """Review every currently-queued reviewer node in parallel; returns the count."""
+        rubrics = usable_rubrics()          # validate BEFORE claiming anything
+        if rubrics is None:
+            return 0                        # tasks stay queued — nothing was claimed
         # Load-mutate-save cycles on the queue run under the cross-process lock —
         # the dashboard enqueues/cancels in the same file concurrently.
         with fslock.locked(queue_path):
@@ -332,12 +372,17 @@ def main(argv=None) -> int:
         with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
             fut_map = {}
             for t in rev:
-                node = nodes.get(t["node"], {})
-                content_text = ""
-                if node.get("content") and (proj / node["content"]).exists():
-                    content_text = (proj / node["content"]).read_text()
-                for axis in AXES:
-                    prompt = build_prompt(rubrics[axis], t["node"], node, content_text)
+                try:                        # per-task: a bad node/prompt fails THAT task
+                    node = nodes.get(t["node"], {})
+                    content_text = ""
+                    if node.get("content") and (proj / node["content"]).exists():
+                        content_text = (proj / node["content"]).read_text()
+                    prompts = [(axis, build_prompt(rubrics[axis], t["node"], node, content_text))
+                               for axis in AXES]
+                except Exception as e:
+                    fail_task(t["id"], str(e))
+                    continue
+                for axis, prompt in prompts:
                     fut = ex.submit(run_judge, axis, prompt, repo, a.model, a.timeout)
                     fut_map[fut] = (t["id"], t["node"], axis)
             for fut in cf.as_completed(fut_map):
@@ -350,7 +395,10 @@ def main(argv=None) -> int:
                 with lock:
                     results[tid][axis] = res
                     if len(results[tid]) == len(AXES):
-                        finalize(tid, node_id)
+                        try:                # per-task: a finalize blow-up fails THAT task
+                            finalize(tid, node_id)
+                        except Exception as e:
+                            fail_task(tid, str(e))
         return len(rev)
 
     def drain_workers() -> int:
@@ -361,45 +409,53 @@ def main(argv=None) -> int:
         wk = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "worker"]
         n = 0
         for t in wk:
-            with fslock.locked(queue_path):         # re-read (new drops/escalations) + claim
-                c = json.loads(queue_path.read_text())
-                escs = _node_escalations(c, t["node"])
-                # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
-                if any(e.get("status") in ("queued", "running") for e in escs):
-                    continue              # an open escalation on this node — leave it queued, skip
-                if len(escs) >= a.max_escalations:    # cap hit — stop re-proving a hard node
-                    for x in c:
-                        if x["id"] == t["id"]:
-                            x["status"], x["finished_at"] = "failed", dq._now()
-                            x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
-                    dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
-                    print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
-                    n += 1
-                    continue
-                for x in c:                                             # claim
-                    if x["id"] == t["id"]:
-                        x["status"], x["started_at"] = "running", dq._now()
-                dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
-            print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
-            status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                                str(proj / "graph.json"), repo, a.max_steers,
-                                                backend=backend_config.prover_of(a.backend))
-            with fslock.locked(queue_path):         # finish (re-read for new drops)
-                c = json.loads(queue_path.read_text())
+            try:
+                n += _drain_one_worker(t)
+            except Exception as e:          # per-task: an unexpected blow-up fails THAT task
+                fail_task(t["id"], str(e))
+                n += 1
+        return n
+
+    def _drain_one_worker(t: dict) -> int:
+        """Claim + prove one queued worker task; returns 1 when it was handled
+        (proved / failed / blocked), 0 when skipped (open escalation)."""
+        with fslock.locked(queue_path):     # re-read (new drops/escalations) + claim
+            c = json.loads(queue_path.read_text())
+            escs = _node_escalations(c, t["node"])
+            # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
+            if any(e.get("status") in ("queued", "running") for e in escs):
+                return 0                  # an open escalation on this node — leave it queued, skip
+            if len(escs) >= a.max_escalations:        # cap hit — stop re-proving a hard node
                 for x in c:
                     if x["id"] == t["id"]:
-                        x["status"] = "done" if status == "proved" else "failed"
-                        x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
-                escalated = False
-                if status != "proved":  # hand the worker's wall to the orchestrator — it decides, not us
-                    lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
-                    escalated = _raise_escalation(c, t["node"], lbl,
-                                                  _escalation_note(reason, detail), a.max_escalations)
+                        x["status"], x["finished_at"] = "failed", dq._now()
+                        x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
                 dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
-            print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
-                  + ("  ⚑ escalation raised" if escalated else ""), flush=True)
-            n += 1
-        return n
+                print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
+                return 1
+            for x in c:                                                 # claim
+                if x["id"] == t["id"]:
+                    x["status"], x["started_at"] = "running", dq._now()
+            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+        print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
+        status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
+                                            str(proj / "graph.json"), repo, a.max_steers,
+                                            backend=backend_config.prover_of(a.backend))
+        with fslock.locked(queue_path):     # finish (re-read for new drops)
+            c = json.loads(queue_path.read_text())
+            for x in c:
+                if x["id"] == t["id"]:
+                    x["status"] = "done" if status == "proved" else "failed"
+                    x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
+            escalated = False
+            if status != "proved":      # hand the worker's wall to the orchestrator — it decides, not us
+                lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
+                escalated = _raise_escalation(c, t["node"], lbl,
+                                              _escalation_note(reason, detail), a.max_escalations)
+            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+        print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
+              + ("  ⚑ escalation raised" if escalated else ""), flush=True)
+        return 1
 
     idle = {"orchestrator": {"state": "idle"}, "agents": []}
     if a.watch:
@@ -407,7 +463,12 @@ def main(argv=None) -> int:
         total = 0
         try:
             while True:
-                n = drain_once() + drain_workers()
+                try:
+                    n = drain_once() + drain_workers()
+                except Exception:           # the watch loop survives anything but Ctrl-C
+                    traceback.print_exc()
+                    print("  engine error — surviving it; will keep draining.", flush=True)
+                    n = 0
                 if n:
                     total += n
                     print(f"  …drained {n} (session total {total}); re-checking for new drops.", flush=True)
