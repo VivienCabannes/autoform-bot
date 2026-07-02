@@ -119,12 +119,21 @@ class AristotleAdapter(ProverAdapter):
     # ------------------------------------------------------------------
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
-        if self._loop is None:
+        if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
+            self._owns_loop = True
         return self._loop
 
     def _run(self, coro: Any) -> Any:
         return self._get_loop().run_until_complete(coro)
+
+    def close(self) -> None:
+        """Close the adapter's private event loop (if it created one).
+
+        Called automatically at the end of :meth:`result`; idempotent. A loop
+        injected via the ctor is the caller's to close."""
+        if getattr(self, "_owns_loop", False) and self._loop is not None and not self._loop.is_closed():
+            self._loop.close()
 
     def _mgr(self, project_dir: str) -> AristotleManager:
         if self._manager is None:
@@ -204,30 +213,39 @@ class AristotleAdapter(ProverAdapter):
         mgr = self._mgr(state.project_dir)
         project_dir = Path(state.project_dir)
 
-        node = load_node(Path(state.graph_path), state.node)
-        summary = state.final_summary
-        landed = 0
-        with _temp_dir() as td:
-            root = self._run(mgr.download_result(state.session_id, td))
-            if root is not None:
-                landed = _overlay_project(root, project_dir)
-        if landed:
-            _record_proof_in_prose(Path(state.graph_path), state.node, node, project_dir, summary)
+        try:
+            node = load_node(Path(state.graph_path), state.node)
+            summary = state.final_summary
+            landed = 0
+            with _temp_dir() as td:
+                root = self._run(mgr.download_result(state.session_id, td))
+                if root is not None:
+                    landed = _overlay_project(root, project_dir)
+            if landed:
+                _record_proof_in_prose(Path(state.graph_path), state.node, node, project_dir, summary)
+        finally:
+            # The run is terminal — release the adapter's private event loop.
+            self.close()
 
-        # Aristotle "proved" = a non-error terminal status that landed files. The
-        # downstream jury (PR E) does the real verification; this is only the
-        # producer's coarse proved/failed signal.
-        proved = state.final_status in ("COMPLETE", "COMPLETE_WITH_ERRORS") and landed > 0
+        # Aristotle "proved" = the fully-clean terminal status (COMPLETE) that
+        # landed files. COMPLETE_WITH_ERRORS is NOT a proved-claim — the task hit
+        # errors it could not fully resolve — but the server-side session is
+        # resumable, so it is reported failed with sub-status "continuable". The
+        # downstream verify gate / jury do the real verification either way.
+        proved = state.final_status == "COMPLETE" and landed > 0
         reason = "" if proved else (
             f"Aristotle terminal status {state.final_status} landed {landed} file(s)"
         )
+        meta: dict[str, Any] = {"aristotle_status": state.final_status}
+        if state.final_status == "COMPLETE_WITH_ERRORS":
+            meta["sub_status"] = "continuable"
         return ProofResult(
             status="proved" if proved else "failed",
             proof_text=summary,
             reason=reason,
             backend=self.name,
             landed_files=landed,
-            meta={"aristotle_status": state.final_status},
+            meta=meta,
         )
 
     # ------------------------------------------------------------------

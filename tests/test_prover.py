@@ -455,9 +455,9 @@ class _FakeEvent:
 
 
 class _FakeTask:
-    def __init__(self) -> None:
+    def __init__(self, status: str = "COMPLETE") -> None:
         self.agent_task_id = "task-1"
-        self.status = _Status("COMPLETE")
+        self.status = _Status(status)
         self.output_summary = "Proved the target; lake build is green."
         self._events = [
             _FakeEvent("e1", "THINKING", "planning the proof"),
@@ -473,10 +473,10 @@ class _FakeTask:
 
 
 class _FakeProject:
-    def __init__(self, returned_files: dict[str, str]) -> None:
+    def __init__(self, returned_files: dict[str, str], status: str = "COMPLETE") -> None:
         self.project_id = "proj-aristotle"
         self._returned_files = returned_files
-        self._task = _FakeTask()
+        self._task = _FakeTask(status)
 
     async def get_tasks(self, limit: int = 1, newest_first: bool = True):
         return [self._task], None
@@ -499,18 +499,19 @@ class _FakeProject:
 
 
 class _FakeLib:
-    def __init__(self, returned_files: dict[str, str]) -> None:
+    def __init__(self, returned_files: dict[str, str], status: str = "COMPLETE") -> None:
         self._returned_files = returned_files
+        self._status = status
         lib = self
 
         class Project:
             @staticmethod
             async def create(prompt: str):
-                return _FakeProject(lib._returned_files)
+                return _FakeProject(lib._returned_files, lib._status)
 
             @staticmethod
             async def create_from_directory(prompt: str, project_dir: str):
-                return _FakeProject(lib._returned_files)
+                return _FakeProject(lib._returned_files, lib._status)
 
         self.Project = Project
 
@@ -554,6 +555,40 @@ def test_aristotle_adapter_drives_via_shared_driver(tmp_path):
     assert (tmp_path / "Book" / "Thm.lean").exists()
     prose = (tmp_path / "informal_content" / "thm.md").read_text()
     assert "Proof (delegated to Aristotle)" in prose
+
+
+def test_aristotle_complete_with_errors_is_failed_continuable(tmp_path):
+    """COMPLETE_WITH_ERRORS is not a proved-claim: failed + sub-status continuable."""
+    from servers.aristotle.core import AristotleManager
+    from servers.prover.aristotle_adapter import AristotleAdapter
+
+    gp = _write_plan(tmp_path)
+    mgr = AristotleManager(download_dir=str(tmp_path / ".cache"),
+                           lib=_FakeLib({"Book/Thm.lean": "theorem bar : True := sorry\n"},
+                                        status="COMPLETE_WITH_ERRORS"))
+    adapter = AristotleAdapter(graph_path=str(gp), manager=mgr, poll_interval=0, max_wait_seconds=5)
+
+    result = prove(adapter, "Thm", "prove Thm", str(tmp_path),
+                   steerer=FakeSteerer(steer_at=set()), verifier=None)
+
+    assert result.status == "failed"
+    assert result.meta["sub_status"] == "continuable"
+    assert "COMPLETE_WITH_ERRORS" in result.reason  # the reason is preserved
+    assert result.landed_files >= 1                 # partial files still land for a resume
+
+
+def test_aristotle_adapter_closes_private_loop_after_result(tmp_path):
+    from servers.aristotle.core import AristotleManager
+    from servers.prover.aristotle_adapter import AristotleAdapter
+
+    gp = _write_plan(tmp_path)
+    mgr = AristotleManager(download_dir=str(tmp_path / ".cache"),
+                           lib=_FakeLib({"Book/Thm.lean": "theorem bar : True := trivial\n"}))
+    adapter = AristotleAdapter(graph_path=str(gp), manager=mgr, poll_interval=0, max_wait_seconds=5)
+
+    prove(adapter, "Thm", "prove Thm", str(tmp_path), steerer=FakeSteerer(steer_at=set()), verifier=None)
+
+    assert adapter._loop is not None and adapter._loop.is_closed()
 
 
 def test_aristotle_adapter_events_normalized(tmp_path):

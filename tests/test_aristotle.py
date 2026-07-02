@@ -218,3 +218,31 @@ def test_delegate_does_not_write_graph_or_sidecar(tmp_path):
 def test_default_system_prompt_forbids_cheating():
     assert "sorry" in DEFAULT_DELEGATE_SYSTEM
     assert "axiom" in DEFAULT_DELEGATE_SYSTEM
+
+
+def test_overlay_lands_only_lean_files_and_protects_build_config(tmp_path):
+    """Aristotle's returned lakefile/toolchain (and any non-.lean file) must never
+    overwrite the user's project — only .lean files are overlaid."""
+    from servers.aristotle.core import _overlay_project
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text("name = 'mine'\n", encoding="utf-8")
+    (project / "lean-toolchain").write_text("leanprover/lean4:v4.10.0\n", encoding="utf-8")
+
+    returned = tmp_path / "returned"
+    (returned / "MyBook").mkdir(parents=True)
+    (returned / "MyBook" / "Thm.lean").write_text("theorem t : True := trivial\n", encoding="utf-8")
+    (returned / "lakefile.toml").write_text("name = 'aristotle-repin'\n", encoding="utf-8")
+    (returned / "lakefile.lean").write_text("-- evil\n", encoding="utf-8")
+    (returned / "lean-toolchain").write_text("other-toolchain\n", encoding="utf-8")
+    (returned / "README.md").write_text("junk\n", encoding="utf-8")
+
+    copied = _overlay_project(returned, project)
+
+    assert copied == 1
+    assert (project / "MyBook" / "Thm.lean").exists()
+    assert (project / "lakefile.toml").read_text() == "name = 'mine'\n"      # untouched
+    assert (project / "lean-toolchain").read_text() == "leanprover/lean4:v4.10.0\n"
+    assert not (project / "lakefile.lean").exists()
+    assert not (project / "README.md").exists()

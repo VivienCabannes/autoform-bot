@@ -482,16 +482,28 @@ def build_node_spec(
     return "\n".join(lines)
 
 
+# Build-configuration files Aristotle must never overwrite in the user's project:
+# a returned lakefile/toolchain could silently repin Mathlib or the Lean version.
+_PROTECTED_FILES = {"lakefile.toml", "lakefile.lean", "lean-toolchain"}
+
+
 def _overlay_project(root: Path, project_dir: Path) -> int:
-    """Copy Aristotle's returned files (under ``root``) over ``project_dir`` at the
-    same relative paths. Skips ``.git``/``.lake``, dirs, and symlinks. Returns the
-    number of files copied."""
+    """Copy Aristotle's returned ``.lean`` files (under ``root``) over
+    ``project_dir`` at the same relative paths. ONLY ``.lean`` files are landed:
+    ``lakefile.lean`` / ``lakefile.toml`` / ``lean-toolchain`` are refused with a
+    warning, other non-Lean files are silently skipped, and ``.git``/``.lake``,
+    dirs, and symlinks are never copied. Returns the number of files copied."""
     copied = 0
     for src in root.rglob("*"):
         if src.is_dir() or src.is_symlink():
             continue
         rel = src.relative_to(root)
         if rel.parts and rel.parts[0] in _SKIP_TOP:
+            continue
+        if rel.name in _PROTECTED_FILES:
+            logger.warning("overlay: refusing to overwrite build config %s from Aristotle's result", rel)
+            continue
+        if rel.suffix != ".lean":
             continue
         dest = project_dir / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
