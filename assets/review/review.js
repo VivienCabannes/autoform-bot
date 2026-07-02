@@ -1098,16 +1098,16 @@
       var status = String(t && t.status || "");
       if (status !== "queued" && status !== "running") return;
       tasks.push(t);
-      if (t.agent && t.node) seenNodeAgent[t.agent + " " + t.node] = true;
-      if (t.node) seenNodeAgent[" " + t.node] = true;
+      if (t.agent && t.node) seenNodeAgent[t.agent + "\u0000" + t.node] = true;
+      if (t.node) seenNodeAgent["\u0000" + t.node] = true;
     });
     (agents || []).forEach(function (a) {
       var target = a && a.target;
       if (!target) return;
       var role = String(a.role || "agent").toLowerCase();
       // Skip if a queue row already covers this agent+node (or this node generally).
-      if (seenNodeAgent[role + " " + target]
-          || seenNodeAgent[" " + target]) return;
+      if (seenNodeAgent[role + "\u0000" + target]
+          || seenNodeAgent["\u0000" + target]) return;
       tasks.push({
         id: null,                       // live-only row: no cancel (not in the queue)
         agent: ROLE_LABEL[role] ? role : "agent",

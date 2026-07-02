@@ -3,8 +3,9 @@
 
 Serves the three review screens over a stdlib ThreadingHTTPServer bound to
 ``127.0.0.1`` (local only — never exposed). The graph and the *built* blueprint
-fragments are read-only; the **only** file this server ever writes is the sidecar
-``review_status.json`` (the single source of truth for verdicts).
+fragments are read-only; the only files this server ever writes are the sidecar
+``review_status.json`` (the single source of truth for verdicts) and the dispatch
+queue ``task_queue.json`` (the orchestrate engine's inbox, via ``/api/request``).
 
 Three screens:
   * ``GET /``               — home: the dep-graph recolored by effective verdict

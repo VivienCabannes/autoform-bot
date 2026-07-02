@@ -8,13 +8,14 @@ concurrently; ALL queued nodes' judges run in one bounded process pool, so nodes
 are reviewed **in parallel, not one-by-one**. The single parent process is the
 only writer of ``review_status.json`` (atomic, under a lock) — no write race.
 
-Billing: every judge runs ``claude -p`` with ``ANTHROPIC_API_KEY`` scrubbed → the
-Max subscription. Judges get only Read/Grep/Glob/Bash (read the Lean, run
-``#print axioms``) — never write the verdict file themselves; the parent does.
+Billing: every judge runs ``claude -p`` with ``ANTHROPIC_API_KEY`` AND
+``ANTHROPIC_AUTH_TOKEN`` scrubbed → the Max subscription. Judges get only
+Read/Grep/Glob/Bash (read the Lean, run ``#print axioms``) — never write the
+verdict file themselves; the parent does.
 
 Usage::
 
-  env -u ANTHROPIC_API_KEY python3 scripts/dispatch_runner.py <project-dir> \\
+  env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN python3 scripts/dispatch_runner.py <project-dir> \\
       [--repo <lean-repo>] [--jobs 9] [--model opus] [--limit N] [--dry-run]
 
 ``<project-dir>`` holds graph.json + task_queue.json + review_status.json.
@@ -26,6 +27,7 @@ import concurrent.futures as cf
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -142,21 +144,45 @@ def parse_score(stdout: str, axis: str) -> dict:
     return {"score": None, "reasoning": f"{axis}: unparseable output: {text[:160]}", "error": "parse"}
 
 
+# Env vars scrubbed before every `claude -p` so judges bill the Max subscription,
+# never the API — the key AND the OAuth/bearer token are both auth paths.
+_SCRUBBED_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill a timed-out judge AND its whole process group. `claude` spawns its own
+    children (Bash tool, etc.); killing only the direct child would leave them
+    running — and still billing. Falls back to a plain kill if the group is gone."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
+    try:
+        proc.communicate(timeout=5)          # reap; never hang the pool on a zombie
+    except Exception:
+        pass
+
+
 def run_judge(axis: str, prompt: str, repo: str, model: str, timeout: int) -> dict:
     sysp = (f"You are the autoform {axis} judge. Score ONLY this one axis, strictly per the rubric in "
             f"the prompt. Investigate the real Lean in your working directory (read the declarations; "
             f"for proof_integrity run `#print axioms`). Do NOT write review_status.json — only output "
             f"your JSON verdict as the final message.")
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}   # -> Max, never the API
+    env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_ENV_VARS}  # -> Max, never the API
     args = ["claude", "-p", prompt, "--append-system-prompt", sysp,
             "--allowedTools", "Read,Grep,Glob,Bash", "--output-format", "json", "--model", model]
+    # start_new_session=True puts the judge in its OWN process group, so a timeout
+    # kills the whole tree (claude + whatever it spawned), not just the direct child.
+    proc = subprocess.Popen(args, env=env, cwd=repo, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        p = subprocess.run(args, env=env, cwd=repo, capture_output=True, text=True, timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_group(proc)
         return {"score": None, "reasoning": f"{axis}: judge timed out after {timeout}s", "error": "timeout"}
-    if p.returncode != 0 and not p.stdout.strip():
-        return {"score": None, "reasoning": f"{axis}: claude exited {p.returncode}: {p.stderr[:160]}", "error": "exit"}
-    return parse_score(p.stdout, axis)
+    if proc.returncode != 0 and not stdout.strip():
+        return {"score": None, "reasoning": f"{axis}: claude exited {proc.returncode}: {stderr[:160]}", "error": "exit"}
+    return parse_score(stdout, axis)
 
 
 def _worker_adapter(backend: str, repo: str, graph_path: str):

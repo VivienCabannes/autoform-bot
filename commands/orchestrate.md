@@ -21,13 +21,15 @@ Reviewing and proving are the engine's job (deterministic, parallel). You only: 
 2. **Backend**: `--backend` > `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/backend_config.py get` > `max`. **Echo it.**
 
 ## 1. Launch the engine (always)
-Detached + idempotent — skip if a `--watch` engine is already up. Launched via `uv run
---extra aristotle` so the chosen backend's deps (aristotlelib) are present; harmless for
-`max`/`codex`. Pass the resolved `$BACKEND` through with `--backend`:
+Detached + idempotent — skip if a `--watch` engine is already up **for THIS project**
+(the pgrep pattern includes `<project>`, so another project's engine never trips the
+guard). Launched via `uv run --extra aristotle` so the chosen backend's deps
+(aristotlelib) are present; harmless for `max`/`codex`. Pass the resolved `$BACKEND`
+through with `--backend`:
 ```
-pgrep -f "dispatch_runner.py.*--watch" >/dev/null \
-  && echo "engine already running (pkill -f dispatch_runner.py to stop)" \
-  || { nohup env -u ANTHROPIC_API_KEY uv run --directory ${CLAUDE_PLUGIN_ROOT} --extra aristotle \
+pgrep -f "dispatch_runner.py <project>.*--watch" >/dev/null \
+  && echo "engine already running for <project> (pkill -f 'dispatch_runner.py <project>' to stop)" \
+  || { nohup env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN uv run --directory ${CLAUDE_PLUGIN_ROOT} --extra aristotle \
         python -u ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_runner.py <project> --repo <PROJECT_DIR> \
         --backend $BACKEND --jobs 9 --watch --workers >> <project>/dispatch.log 2>&1 & echo "started engine PID $!"; }
 ```

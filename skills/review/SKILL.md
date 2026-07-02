@@ -25,8 +25,10 @@ Two outputs from one skill:
   review UI** on `127.0.0.1` and open the recolored dependency graph.
 
 Both read the same sidecar, `review_status.json` — the single source of truth for
-verdicts, and **the only file this surface ever writes**. `graph.json` and
-`informal_content/` stay pristine.
+verdicts. The headless packet writes nothing; the review server writes exactly
+**two** files — the sidecar and `task_queue.json` (the dispatch queue that
+drag-and-drop / `POST /api/request` enqueues into for the orchestrate engine).
+`graph.json` and `informal_content/` stay pristine.
 
 The packet's structure, trust-class taxonomy, and the rules that make it honest live
 in `references/reviewer-packet.md` — read it before producing any packet.
@@ -53,9 +55,12 @@ in `references/reviewer-packet.md` — read it before producing any packet.
   render with a **dashed ring**; human-confirmed render **solid** (so an
   AI-greened-but-unvouched node reads as provisional).
 
-The jury is **always on** and **incremental**: a node is judged when created or when
-its statement/proof changes; a recorded human verdict freezes it. The jury does not
-re-sweep the whole DAG on every run.
+The jury is **queue-driven**: a node is judged when a `reviewer` task for it lands
+in `task_queue.json` (a dashboard drop, or the orchestrator's `enqueue`) and the
+dispatch engine drains it — there is **no change-detection** and no automatic
+re-sweep of the DAG, so re-judging an edited node means enqueueing it again. A
+recorded human verdict freezes the node: re-running the jury rewrites only the
+`ai` slot, never the human one.
 
 ## Roll-up, taint, trust frontier (computed live, never stored)
 
@@ -139,7 +144,7 @@ This default is text-only and writes nothing. It is the CI/agent path.
 
    The server reads `graph.json`, `informal_content/`, the built blueprint, an
    optional `kernel/<id>.txt`, and `review_status.json`; it **writes only**
-   `review_status.json`.
+   `review_status.json` (verdicts) and `task_queue.json` (dispatch requests).
 
 ## Spec-gate (targets) — faithfulness on the DAG roots
 
@@ -161,6 +166,7 @@ status, no new infrastructure — it reuses the same jury + sidecar + packet.
 
 - Never claim "compiles" / "axiom-clean" without the command output in the packet.
 - A packet with an unexplained `AXIOM`/`SORRY` row is a **failed** packet — say so.
-- The surface writes **only** `review_status.json`. Never edit `graph.json`,
-  `informal_content/`, or the built blueprint from the review path.
+- The surface writes **only** `review_status.json` and `task_queue.json`. Never
+  edit `graph.json`, `informal_content/`, or the built blueprint from the review
+  path.
 - Human verdicts are immutable — re-running the jury never overrides a human slot.
