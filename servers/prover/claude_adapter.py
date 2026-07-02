@@ -173,6 +173,7 @@ class _ClaudeRun:
     extra_args: list[str] = field(default_factory=list)
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
+    dropped_steers: int = 0             # steers skipped for lack of a session id
 
 
 class ClaudeAdapter(ProverAdapter):
@@ -258,6 +259,15 @@ class ClaudeAdapter(ProverAdapter):
             while state.pending_steer:
                 correction = state.pending_steer
                 state.pending_steer = None
+                if not state.session_id:
+                    # No session id captured → resuming is impossible. A bare
+                    # `claude -p "<correction>"` would be a fresh CONTEXT-FREE
+                    # session whose output would overwrite final_text and decide
+                    # the verdict — skip the steer instead (mirrors the codex
+                    # adapter's guard); annotated in the result meta.
+                    state.dropped_steers += 1
+                    logger.info("claude adapter: no session id; dropping steer (no resume context)")
+                    break
                 yield from self._run_turn(state, correction, resume=True)
         except ProverTimeout:
             state.timed_out = True
@@ -289,13 +299,16 @@ class ClaudeAdapter(ProverAdapter):
                 meta={"session_id": state.session_id, "model": state.model, "sub_status": "timeout"},
             )
         proved = not _looks_failed(text)
+        meta = {"session_id": state.session_id, "model": state.model}
+        if state.dropped_steers:
+            meta["dropped_steers"] = state.dropped_steers
         return ProofResult(
             status="proved" if proved else "failed",
             proof_text=text,
             reason="" if proved else _failure_reason(text),
             backend=self.name,
             landed_files=0,  # files are written in-place by the worker's own tools
-            meta={"session_id": state.session_id, "model": state.model},
+            meta=meta,
         )
 
     # ------------------------------------------------------------------

@@ -379,6 +379,24 @@ def test_claude_adapter_autonomy_and_mcp_are_optional(monkeypatch):
     assert "--mcp-config" not in args
 
 
+def test_claude_steer_without_session_is_dropped():
+    """No session id captured → a queued steer is SKIPPED, not launched as a bare
+    context-free `claude -p` whose output would decide the verdict."""
+    turn1 = _stream(  # note: NO session_id anywhere in the stream
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}},
+        {"type": "result", "result": "theorem t : True := trivial"},
+    )
+    runner = FakeClaudeRunner([turn1, _stream({"type": "result", "result": "FAILED — context-free turn"})])
+    adapter = ClaudeAdapter(runner=runner)
+    steerer = FakeSteerer(steer_at={1})  # driver queues a steer during the turn
+
+    result = prove(adapter, "T", "spec", "/proj", max_steers=1, steerer=steerer, verifier=None)
+
+    assert len(runner.calls) == 1              # no second (context-free) turn launched
+    assert result.proved                       # verdict comes from the REAL turn
+    assert result.meta["dropped_steers"] == 1  # the skip is annotated
+
+
 def test_claude_adapter_threads_deadline_to_runner():
     runner = FakeClaudeRunner([_stream({"type": "result", "session_id": "s", "result": "ok proved"})])
     adapter = ClaudeAdapter(runner=runner, max_wait_seconds=120)
