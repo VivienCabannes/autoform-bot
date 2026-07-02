@@ -8,6 +8,7 @@ on:
       - "agents/**"
       - "skills/**"
       - "commands/**"
+      - "examples/**"
       - ".claude-plugin/**"
       - "scripts/lint_plugin.py"
       - "scripts/check_invariants.py"
@@ -17,6 +18,7 @@ on:
       - "agents/**"
       - "skills/**"
       - "commands/**"
+      - "examples/**"
       - ".claude-plugin/**"
       - "scripts/lint_plugin.py"
       - "scripts/check_invariants.py"
@@ -49,8 +51,11 @@ jobs:
       - name: Check graph invariants (if an example graph exists)
         run: |
           if [ -f scripts/check_invariants.py ]; then
-            shopt -s nullglob
-            graphs=(examples/**/graph.json examples/*/graph.json examples/graph.json)
+            # globstar so ** recurses; nullglob so an empty match yields an
+            # empty array instead of the literal pattern. `examples/**/...`
+            # also matches examples/graph.json itself (** matches zero dirs).
+            shopt -s globstar nullglob
+            graphs=(examples/**/graph.json)
             if [ ${#graphs[@]} -gt 0 ]; then
               for g in "${graphs[@]}"; do
                 echo "::group::check_invariants $g"
