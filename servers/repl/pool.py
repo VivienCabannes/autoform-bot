@@ -62,12 +62,24 @@ class LeanReplPool:
             self._idle.put(repl)
 
     def run(self, code: str, **kwargs: Any) -> dict[str, Any]:
-        """Run code on an idle REPL, retrying once on restart."""
+        """Run code on an idle REPL.
+
+        Retries once if the REPL restarted mid-command — but only when no
+        ``env_id`` was passed: a restart renumbers environments, so
+        retrying with a stale env_id would run against the wrong (or a
+        missing) environment. In that case ReplProcessRestarted is
+        surfaced to the caller instead. (run_lean_code never passes
+        env_id, so the common path keeps its retry.)
+        """
+        if self._shutdown:
+            return {"repl_error": "REPL pool is shut down."}
         repl = self._idle.get()
         try:
             try:
                 return repl.run(code, **kwargs)
             except ReplProcessRestarted:
+                if kwargs.get("env_id") is not None:
+                    raise
                 logger.info("REPL was restarted, retrying command...")
                 return repl.run(code, **kwargs)
         finally:
@@ -78,8 +90,8 @@ class LeanReplPool:
         return sum(w.get_memory_usage() for w in self._workers)
 
     def shutdown(self) -> None:
-        """Shut down all REPL instances."""
+        """Shut down all REPL instances; in-flight runs won't restart them."""
         self._shutdown = True
         for worker in self._workers:
-            worker.close()
+            worker.shutdown()
         self._workers.clear()

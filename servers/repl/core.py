@@ -319,6 +319,7 @@ class LeanRepl:
         self.mem_limit_gb: int = config.instance_mem_limit_gb
 
         self._process_lock = threading.Lock()
+        self._shutdown = False
 
         self._allowed_import_roots: frozenset[str] | None = None
         if config.validate_imports and config.allowed_imports:
@@ -378,9 +379,23 @@ class LeanRepl:
             self.process = None
             self._base_env_id = None
 
+    def shutdown(self) -> None:
+        """Permanently close the REPL: block new runs and restarts, then kill.
+
+        Sets the shutdown flag first so an in-flight run does not restart
+        the process, then takes the process lock so the kill does not race
+        a concurrent write.
+        """
+        self._shutdown = True
+        with self._process_lock:
+            self.close()
+
     def restart(self) -> None:
-        """Restart the Lean REPL process."""
+        """Restart the Lean REPL process (no-op after shutdown)."""
         self.close()
+        if self._shutdown:
+            logger.info("REPL is shut down; not restarting")
+            return
         self.start()
 
     def is_alive(self) -> bool:
@@ -440,6 +455,8 @@ class LeanRepl:
 
         last_exception: Exception | None = None
         with self._process_lock:
+            if self._shutdown:
+                return {"repl_error": "REPL is shut down."}
             self._check_memory_and_maybe_restart()
             for i in range(max_retries + 1):
                 try:
@@ -449,6 +466,8 @@ class LeanRepl:
                 except ReplProcessExited as e:
                     last_exception = e
                     logger.error("REPL process exited: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
+                    if self._shutdown:
+                        break
                     if not run_from_env and i < max_retries:
                         backoff = min(2**i, 30) + random.uniform(0, 1)
                         time.sleep(backoff)
@@ -461,6 +480,8 @@ class LeanRepl:
                     # REPL would escape run() un-restarted.
                     last_exception = e
                     logger.error("Error running command: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
+                    if self._shutdown:
+                        break
                     if not run_from_env and i < max_retries:
                         backoff = min(2**i, 30) + random.uniform(0, 1)
                         time.sleep(backoff)
