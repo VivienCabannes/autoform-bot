@@ -3,8 +3,10 @@
 Each test class verifies that the server module imports cleanly and that
 the ``create_*_server()`` factory produces a valid FastMCP instance.
 
-Stub servers (repl, lsp, aristotle) have zero-argument factories that
-return servers whose tools return "not implemented" strings.
+The repl server is a real implementation (pooled Lean REPL; behavioral
+tests live in ``tests/test_repl.py``). Stub servers (lsp, aristotle) have
+zero-argument factories that return servers whose tools return
+"not implemented" strings.
 The zulip server wraps ``skills/zulip/zulip-search.py``.
 """
 
@@ -16,7 +18,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# REPL server — stub
+# REPL server — real implementation (see tests/test_repl.py for behavior)
 # ---------------------------------------------------------------------------
 
 

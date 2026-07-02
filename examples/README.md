@@ -6,9 +6,7 @@ This directory contains full reference implementations for stubbed components in
 
 | Example | What it implements | Replaces stub at |
 |---------|--------------------|------------------|
-| `servers/repl/core.py` | Lean REPL subprocess with non-blocking I/O, import caching, memory monitoring, auto-restart | `servers/repl/core.py` |
-| `servers/repl/pool.py` | Thread pool with queue-based dispatch, staggered startup, memory monitoring | `servers/repl/pool.py` |
-| `servers/repl/server.py` | FastMCP server wiring for the REPL pool | `servers/repl/server.py` |
+| `servers/repl/` | *(promoted — the real pooled Lean REPL now lives at `servers/repl/`; this directory keeps only a README pointer)* | *(already implemented)* |
 | `servers/lsp/server.py` | Lean LSP session (JSON-RPC), diagnostics, hover | `servers/lsp/server.py` |
 | `servers/aristotle/server.py` | AristotleManager with multi-session support, polling, steering | `servers/aristotle/server.py` |
 | `servers/mathlib/` | Ripgrep-based Mathlib search, name finder, file reader | *(no stub — standalone reference)* |
@@ -28,7 +26,7 @@ This directory contains full reference implementations for stubbed components in
 1. Find the stub you want to implement in the table above.
 2. Copy the example file to the stub location:
    ```bash
-   cp examples/servers/repl/core.py servers/repl/core.py
+   cp examples/servers/lsp/server.py servers/lsp/server.py
    ```
 3. Read through the example and adapt it to your needs. The examples are designed to work as-is, but you may want to adjust configuration defaults, error messages, or timeouts.
 4. Run the smoke tests to verify everything still imports and creates correctly:
