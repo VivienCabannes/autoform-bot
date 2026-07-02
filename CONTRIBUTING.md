@@ -17,12 +17,10 @@ Autoform is a **template plugin** — the wiring (manifests, hooks, discovery fi
 
 ### Skills (new)
 
-These skills don't exist yet. Create them from scratch — see `examples/skills/` for reference content.
+**Mathlib conventions** (`skills/autoform/`) and **proof strategies** (`skills/autoform-prove/`) are now active skills — their `examples/skills/` reference content was folded in, so contribute to them directly. The skills below don't exist yet. Create them from scratch — see `examples/skills/` for reference content.
 
 | Skill | Suggested location | Difficulty | What it should cover |
 |-------|--------------------|------------|---------------------|
-| **Mathlib conventions** | `skills/autoform/` | Medium | Lean 4 + Mathlib style, tactics, naming, pitfalls |
-| **Proof strategies** | `skills/autoform-prove/` | Medium | Incremental proving, REPL prototyping, sorry/axiom handling |
 | **Statement extraction** | `skills/autoform-extract/` | Easy | Extract formalizable statements from LaTeX/Markdown to YAML |
 | **Crew orchestration** | `skills/autoform-crew/` | Medium | When and how to spawn worker/reviewer/reader subagents |
 

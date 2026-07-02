@@ -13,8 +13,6 @@ This directory contains full reference implementations for stubbed components in
 | `servers/aristotle/server.py` | AristotleManager with multi-session support, polling, steering | `servers/aristotle/server.py` |
 | `servers/mathlib/` | Ripgrep-based Mathlib search, name finder, file reader | *(no stub — standalone reference)* |
 | `servers/trace/` | Append-only JSONL trace store with filtering and summaries | *(no stub — standalone reference)* |
-| `skills/autoform/SKILL.md` | Complete Mathlib conventions (full tactic tables, pitfall lists, simp rules) | *(new skill — create `skills/autoform/`)* |
-| `skills/autoform-prove/SKILL.md` | Full proof strategies and workflow | *(new skill — create `skills/autoform-prove/`)* |
 | `skills/autoform-extract/SKILL.md` | Complete extraction workflow | *(new skill — create `skills/autoform-extract/`)* |
 | `skills/autoform-crew/SKILL.md` | Full crew orchestration protocol | *(new skill — create `skills/autoform-crew/`)* |
 | `agents/autoform-worker.md` | Rich worker prompt with 5-step workflow, rules, integrity checks | `agents/autoform-worker.md` |
