@@ -16,7 +16,7 @@ def create_repl_server(pool: LeanReplPool) -> FastMCP:
 
     Exposes two tools:
     - run_lean_code: Send Lean code to the REPL pool
-    - get_repl_status: Check pool health and memory usage
+    - get_repl_status: Check pool health, warm-up progress, and memory usage
     """
     server = FastMCP(name="autoform-repl")
 
@@ -30,7 +30,9 @@ def create_repl_server(pool: LeanReplPool) -> FastMCP:
         but only imports the preloaded environment transitively provides
         (Mathlib and its dependencies, e.g. Aesop, Batteries) are
         available. Any other import returns an error instead of being
-        silently ignored.
+        silently ignored. While the pool is still warming up, calls wait
+        briefly and then return a "still warming up — retry shortly"
+        message.
 
         Args:
             code: Lean code to execute (optional imports + body).
@@ -48,18 +50,16 @@ def create_repl_server(pool: LeanReplPool) -> FastMCP:
 
     @server.tool
     def get_repl_status() -> str:
-        """Check the REPL pool's health and memory usage.
+        """Check the REPL pool's health, warm-up progress, and memory usage.
 
         Returns:
-            JSON string with capacity, memory_usage_gb, and shutdown status.
+            JSON string with capacity, ready/starting/failed worker counts,
+            warming flag, idle_workers, pending_requests, memory_usage_gb,
+            and shutdown status.
         """
-        return json.dumps(
-            {
-                "capacity": pool.capacity,
-                "memory_usage_gb": round(pool.get_memory_usage(), 2),
-                "shutdown": pool._shutdown,
-            }
-        )
+        status = pool.status()
+        status["memory_usage_gb"] = round(pool.get_memory_usage(), 2)
+        return json.dumps(status)
 
     return server
 
@@ -71,6 +71,10 @@ if __name__ == "__main__":
 
     config = LeanReplPoolConfig(cwd=cwd, repl_command=repl_cmd, num_repls=num_repls)
     pool = LeanReplPool(config)
+    # Warm the pool in the background: each REPL imports Mathlib (30-120s),
+    # and the MCP stdio handshake must answer immediately or the client
+    # times out. Workers become available as they finish starting.
+    pool.start_background()
 
     try:
         server = create_repl_server(pool)
