@@ -154,10 +154,10 @@ aristotle_wait("thm-5-5")     # block until done
 | `/setup-project` | Create new Lean 4 + Mathlib project | ✅ |
 | `/workspace` | Inspect project structure and health | ✅ |
 | `/zulip` | Search Lean Zulip for community discussions | ✅ |
-| `/autoform` | Load Mathlib & Lean 4 conventions | ⬜ Not yet |
-| `/autoform-prove` | Load proof strategies and workflow guidance | ⬜ Not yet |
+| `/autoform` | Load Mathlib & Lean 4 conventions | ✅ |
+| `/autoform-prove` | Load proof strategies and workflow guidance | ✅ |
 | `/autoform-review` | Review formalization for correctness and integrity | ⬜ Not yet |
-| `/autoform-quality` | Check code quality against Mathlib conventions | ⬜ Not yet |
+| `/eval-rubrics` | Grade a formalization against the jury rubrics (faithfulness, proof integrity, code quality) | ✅ |
 | `/autoform-extract` | Extract statements from source material | ⬜ Not yet |
 | `/autoform-crew` | Orchestrate parallel formalization with subagent teams | ⬜ Not yet |
 
