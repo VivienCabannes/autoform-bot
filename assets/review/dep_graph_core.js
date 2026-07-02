@@ -22,8 +22,13 @@
    * `subgraph cluster_…`), so a brand-new element — carrying no stale renderer state —
    * makes every (re)render a clean first-render. The prior graph stays visible until
    * the new one settles, then the old stages are dropped and onSettle(mount) runs.
-   * Settles exactly once, with a timeout backstop in case d3-graphviz's "end" event
-   * doesn't fire in a given build. A render throw removes the stage and calls onError.
+   * Settles exactly once. d3-graphviz's "end" event is AUTHORITATIVE; the timeout
+   * is only a fallback for builds where "end" never fires — and before settling it
+   * checks that an <svg> actually landed in the stage. A big graph still laying
+   * out past the timeout re-arms the check with backoff (up to ~30s) instead of
+   * permanently settling early, which would wire interactivity onto nothing and
+   * turn the real "end" into a no-op. A render throw removes the stage and calls
+   * onError.
    *
    * opts:
    *   useWorker  — pass to .graphviz({useWorker}) (default false; the safe path)
@@ -31,7 +36,7 @@
    *   stageClass — class on the fresh stage div (default "dg-stage"); callers with
    *                their own stage CSS (e.g. the review surface's "rv-graph-stage")
    *                pass it so their styling + drop-prior-stages logic still apply
-   *   timeout    — settle backstop in ms (default 700)
+   *   timeout    — initial fallback-check delay in ms (default 700)
    *   onSettle(mount) — run after the new graph settles (decorate / wire modals …)
    *   onError(mount, err) — run if the render throws (offline fallback …)
    */
@@ -59,8 +64,28 @@
       var gv = global.d3.select(stage).graphviz({ useWorker: !!opts.useWorker })
         .fit(opts.fit !== false);
       gv.renderDot(dot);
-      gv.on("end", settle);
-      setTimeout(settle, opts.timeout || 700);  // backstop if "end" never fires
+      gv.on("end", settle);                     // authoritative: the render finished
+
+      // Fallback for builds where "end" never fires: after `timeout`, settle ONLY
+      // if the SVG actually rendered. Otherwise the render is still in flight (big
+      // graphs routinely lay out slower than 700ms) — re-arm with backoff up to a
+      // generous ceiling rather than settling early (that would run onSettle on an
+      // empty stage and make the real "end" a no-op). At the ceiling, settle
+      // regardless, as the last-resort backstop the old timeout was.
+      var delay = opts.timeout || 700;
+      var CEILING = 30000;
+      var waited = 0;
+      function fallbackCheck() {
+        if (settled) return;                    // "end" already settled — done
+        if (stage.querySelector("svg") || waited >= CEILING) {
+          settle();
+          return;
+        }
+        waited += delay;
+        delay = Math.min(delay * 2, 5000);      // backoff: 0.7s, 1.4s, 2.8s, 5s, 5s…
+        setTimeout(fallbackCheck, delay);
+      }
+      setTimeout(fallbackCheck, delay);
     } catch (e) {
       settled = true;
       stage.remove();
