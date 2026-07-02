@@ -62,8 +62,11 @@ def test_color_state_missing_clean_is_green():
     assert rm.color_state({"mathlib_status": "missing"}, "clean") == "clean"
 
 
-def test_color_state_missing_unreviewed_is_grey():
-    assert rm.color_state({"mathlib_status": "missing"}, "unreviewed") == "unreviewed"
+def test_color_state_missing_unreviewed_is_violet_not_implemented():
+    # A node still missing from Mathlib with no verdict has no real proof yet: in
+    # the plan model "missing" means "needs a statement AND proof", so it renders
+    # as not-implemented (violet "sorry"), NOT grey unreviewed (color_state rule 4).
+    assert rm.color_state({"mathlib_status": "missing"}, "unreviewed") == "sorry"
 
 
 def test_color_state_no_status_falls_through_to_verdict():
