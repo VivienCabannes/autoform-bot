@@ -25,6 +25,18 @@ DEFAULT_SMOKE_TEST_TIMEOUT = 10
 ALLOWED_IMPORTS = frozenset({"Mathlib", "Aesop", "Batteries", "LeanSearchClient"})
 WARMUP_IMPORTS = frozenset({"Mathlib"})
 
+# Import roots available in every Lean environment, regardless of warmup.
+CORE_IMPORT_ROOTS = frozenset({"Init", "Lean", "Std"})
+
+# Conservative map of known transitive dependencies: preloading the key
+# root also makes these roots available. Only Mathlib's direct lake
+# dependencies are listed; anything not provably provided is rejected.
+KNOWN_TRANSITIVE_IMPORT_ROOTS: dict[str, frozenset[str]] = {
+    "Mathlib": frozenset(
+        {"Aesop", "Batteries", "Cli", "ImportGraph", "LeanSearchClient", "Plausible", "ProofWidgets", "Qq"}
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,6 +97,16 @@ def _append_capped(buffer: str, chunk: str, max_len: int) -> str:
     if len(buffer) > max_len:
         return buffer[-max_len:]
     return buffer
+
+
+def _preloaded_import_roots(warmup_imports: frozenset[str]) -> frozenset[str]:
+    """Return the import roots transitively provided by the warmup environment."""
+    roots = set(CORE_IMPORT_ROOTS)
+    for imp in warmup_imports:
+        root = imp.split(".")[0]
+        roots.add(root)
+        roots |= KNOWN_TRANSITIVE_IMPORT_ROOTS.get(root, frozenset())
+    return frozenset(roots)
 
 
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
@@ -302,6 +324,8 @@ class LeanRepl:
         if config.validate_imports and config.allowed_imports:
             self._allowed_import_roots = config.allowed_imports
 
+        self._preloaded_roots = _preloaded_import_roots(config.warmup_imports)
+
     def start(self) -> None:
         """Start the Lean REPL process."""
         env = _inherit_clean_env()
@@ -368,7 +392,13 @@ class LeanRepl:
         return _get_process_memory_gb(self.process)
 
     def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
-        """Send code to the REPL and get the response."""
+        """Send code to the REPL and get the response.
+
+        Without ``env_id``, import lines are stripped from ``code`` and the
+        body runs against the single warmup environment preloaded in
+        ``start()``; imports that environment does not provide are rejected.
+        With ``env_id``, code runs against that environment unchanged.
+        """
         timeout = timeout or self.request_timeout
         run_from_env = env_id is not None
         max_retries = 0 if run_from_env else self.max_retries
@@ -387,6 +417,24 @@ class LeanRepl:
                             f"Allowed roots: {', '.join(sorted(self._allowed_import_roots))}."
                         )
                     }
+
+            # Imports are NOT loaded per request: the import lines were
+            # stripped above and the body runs against the single warmup
+            # environment preloaded in start(). Reject imports that
+            # environment does not transitively provide, instead of
+            # stripping them silently and leaving the caller with bare
+            # unknown-identifier errors downstream.
+            # TODO: cache per-import-set environments so any allowed
+            # import combination gets a real environment of its own.
+            unavailable = sorted({s for s in imports if s.split(".")[0] not in self._preloaded_roots})
+            if unavailable:
+                return {
+                    "repl_error": (
+                        f"Imports not available in the preloaded environment: {', '.join(unavailable)}. "
+                        f"Code runs against a preloaded environment ({', '.join(sorted(self.config.warmup_imports))} "
+                        "and its dependencies); other imports are not loaded per request."
+                    )
+                }
 
             env_id = self._base_env_id
 

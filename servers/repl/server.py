@@ -22,13 +22,18 @@ def create_repl_server(pool: LeanReplPool) -> FastMCP:
 
     @server.tool
     def run_lean_code(code: str, timeout: float | None = None) -> str:
-        """Send Lean code to the REPL and return formatted diagnostics.
+        """Compile Lean code against a preloaded Mathlib environment.
 
-        Imports are cached automatically — repeated calls with the same
-        imports reuse the cached environment for speed.
+        Each pooled REPL has already run ``import Mathlib``. Submitted
+        ``import`` lines are stripped and the remaining code is compiled
+        against that preloaded environment, so imports cost nothing —
+        but only imports the preloaded environment transitively provides
+        (Mathlib and its dependencies, e.g. Aesop, Batteries) are
+        available. Any other import returns an error instead of being
+        silently ignored.
 
         Args:
-            code: Lean code to execute (imports + body).
+            code: Lean code to execute (optional imports + body).
             timeout: Optional timeout in seconds (overrides the default).
 
         Returns:
