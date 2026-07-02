@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -137,7 +138,11 @@ class AristotleAdapter(ProverAdapter):
 
     def _mgr(self, project_dir: str) -> AristotleManager:
         if self._manager is None:
-            self._manager = AristotleManager(download_dir=str(Path(project_dir) / ".aristotle-cache"))
+            # ARISTOTLE_DOWNLOAD_DIR (the same env the standalone aristotle server
+            # honors) overrides the default per-project cache.
+            download_dir = os.environ.get("ARISTOTLE_DOWNLOAD_DIR", "").strip() or str(
+                Path(project_dir) / ".aristotle-cache")
+            self._manager = AristotleManager(download_dir=download_dir)
         return self._manager
 
     # ------------------------------------------------------------------

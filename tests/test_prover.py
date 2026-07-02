@@ -637,6 +637,29 @@ def test_prover_server_exposes_single_prove_node_tool():
     assert names == {"prove_node"}
 
 
+def test_prover_mcp_entry_has_no_aristotle_extra(repo_root):
+    """The claude-only default path must not pay a launch-time aristotlelib
+    dependency: the lazy import handles absence, erroring at selection time."""
+    cfg = json.loads((repo_root / ".mcp.json").read_text(encoding="utf-8"))
+    entry = cfg["mcpServers"]["autoform-prover"]
+    assert "--extra" not in entry["args"]
+    assert "ARISTOTLE_DOWNLOAD_DIR" not in entry.get("env", {})  # dead env removed
+
+
+def test_aristotle_adapter_honors_download_dir_env(tmp_path, monkeypatch):
+    from servers.prover.aristotle_adapter import AristotleAdapter
+
+    monkeypatch.setenv("ARISTOTLE_DOWNLOAD_DIR", str(tmp_path / "dl"))
+    adapter = AristotleAdapter(graph_path="g.json")
+    mgr = adapter._mgr(str(tmp_path))            # does not import aristotlelib
+    assert str(mgr._download_dir) == str(tmp_path / "dl")
+
+    monkeypatch.delenv("ARISTOTLE_DOWNLOAD_DIR")
+    adapter2 = AristotleAdapter(graph_path="g.json")
+    mgr2 = adapter2._mgr(str(tmp_path))
+    assert str(mgr2._download_dir) == str(tmp_path / ".aristotle-cache")
+
+
 def test_prove_node_unknown_backend_fails_gracefully(tmp_path):
     from servers.prover.server import run_prove_node
 

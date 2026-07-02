@@ -26,11 +26,8 @@
     },
     "autoform-prover": {
       "command": "uv",
-      "args": ["run", "--extra", "aristotle", "python", "-m", "servers.prover.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
-      }
+      "args": ["run", "python", "-m", "servers.prover.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}"
     },
     "autoform-zulip": {
       "command": "uv",
