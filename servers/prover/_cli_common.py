@@ -30,13 +30,15 @@ class ProverTimeout(Exception):
 
 
 def _scrubbed_env() -> dict[str, str]:
-    """A copy of the environment with ``ANTHROPIC_API_KEY`` removed.
+    """A copy of the environment with ``ANTHROPIC_API_KEY`` /
+    ``ANTHROPIC_AUTH_TOKEN`` removed.
 
     For the Claude backend this routes billing to the Max subscription (never the
     API); for Codex (its own auth) it is project hygiene. Same operation either way.
     """
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
     return env
 
 

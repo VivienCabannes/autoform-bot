@@ -107,6 +107,7 @@ def has_sorry(src: str) -> bool:
 def _scrubbed_env() -> dict:
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
     return env
 
 

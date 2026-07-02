@@ -39,9 +39,20 @@ _CLAUDE_PARAMS = dict(
 
 def test_scrubbed_env_drops_anthropic_key(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-secret")
     monkeypatch.setenv("KEEP_ME", "yes")
     env = _scrubbed_env()
     assert "ANTHROPIC_API_KEY" not in env and env.get("KEEP_ME") == "yes"
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+def test_verify_scrubbed_env_drops_auth_token(monkeypatch):
+    from servers.prover.verify import _scrubbed_env as verify_scrub
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-secret")
+    env = verify_scrub()
+    assert "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" not in env
 
 
 def test_iter_json_lines_skips_blank_and_unparseable():
