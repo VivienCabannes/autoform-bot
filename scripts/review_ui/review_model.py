@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -240,13 +241,28 @@ def load_sidecar(path: Path) -> dict:
 
 
 def save_sidecar(path: Path, data: dict) -> None:
-    """Atomically persist the sidecar (temp file + ``os.replace``) so an interrupted
-    or concurrent write can never leave a half-written ``review_status.json``."""
+    """Atomically persist the sidecar (unique temp file + ``os.replace``) so an
+    interrupted or concurrent write can never leave a half-written or torn
+    ``review_status.json``. The temp name comes from ``tempfile.mkstemp`` — never a
+    fixed ``<name>.tmp`` that two processes could scribble into simultaneously.
+
+    Atomicity protects the *file*; it does not serialize load-mutate-save cycles.
+    Callers that read-modify-write a shared sidecar must hold
+    ``fslock.locked(path)`` around the whole cycle (see ``fslock.py``).
+    """
     p = Path(path)
     payload = json.dumps(data, ensure_ascii=False, indent=2)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    os.replace(tmp, p)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def dial_of(sidecar: dict) -> str:

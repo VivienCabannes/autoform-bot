@@ -36,6 +36,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "review_ui"))
 sys.path.insert(0, str(HERE))
+import fslock                      # cross-process lock shared with serve_review
 import review_model as rm          # load_sidecar / save_sidecar / jury_verdict
 import dispatch_queue as dq        # _save / _feed_for / _now (queue + live feed)
 import backend_config              # backend selection (max -> claude adapter, aristotle, codex)
@@ -290,18 +291,21 @@ def main(argv=None) -> int:
 
     def drain_once() -> int:
         """Review every currently-queued reviewer node in parallel; returns the count."""
-        queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
-        rev = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "reviewer"]
-        if a.limit:
-            rev = rev[:a.limit]
-        if not rev:
-            return 0
-        rev_ids = {t["id"] for t in rev}
-        for t in queue:                          # claim up front → the feed shows them all running
-            if t["id"] in rev_ids:
-                t["status"], t["started_at"] = "running", dq._now()
-        dq._save(queue_path, queue)
-        dq._save(feed_path, dq._feed_for(queue))
+        # Load-mutate-save cycles on the queue run under the cross-process lock —
+        # the dashboard enqueues/cancels in the same file concurrently.
+        with fslock.locked(queue_path):
+            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+            rev = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "reviewer"]
+            if a.limit:
+                rev = rev[:a.limit]
+            if not rev:
+                return 0
+            rev_ids = {t["id"] for t in rev}
+            for t in queue:                      # claim up front → the feed shows them all running
+                if t["id"] in rev_ids:
+                    t["status"], t["started_at"] = "running", dq._now()
+            dq._save(queue_path, queue)
+            dq._save(feed_path, dq._feed_for(queue))
 
         results: dict[str, dict] = {t["id"]: {} for t in rev}
         lock = threading.Lock()
@@ -310,17 +314,19 @@ def main(argv=None) -> int:
             scores = {ax: results[tid].get(ax, {}).get("score") for ax in AXES}
             usable = {k: v for k, v in scores.items() if isinstance(v, int)}
             verdict = rm.jury_verdict(usable) if len(usable) == len(AXES) else "flagged"
-            sc = rm.load_sidecar(sidecar_path)                  # single writer, under lock
-            sc["reviews"].setdefault(node_id, {})["ai"] = {
-                **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
-            rm.save_sidecar(sidecar_path, sc)                   # preserves any human slot
-            cur = json.loads(queue_path.read_text())            # re-read: new drops may have arrived
-            for t in cur:
-                if t["id"] == tid:
-                    t["status"], t["finished_at"] = "done", dq._now()
-                    t["result"] = f"{verdict} (" + " ".join(f"{ax[0]}{scores[ax]}" for ax in AXES) + ")"
-            dq._save(queue_path, cur)
-            dq._save(feed_path, dq._feed_for(cur))
+            with fslock.locked(sidecar_path):       # vs the dashboard's human verdicts
+                sc = rm.load_sidecar(sidecar_path)
+                sc["reviews"].setdefault(node_id, {})["ai"] = {
+                    **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
+                rm.save_sidecar(sidecar_path, sc)   # preserves any human slot
+            with fslock.locked(queue_path):         # re-read: new drops may have arrived
+                cur = json.loads(queue_path.read_text())
+                for t in cur:
+                    if t["id"] == tid:
+                        t["status"], t["finished_at"] = "done", dq._now()
+                        t["result"] = f"{verdict} (" + " ".join(f"{ax[0]}{scores[ax]}" for ax in AXES) + ")"
+                dq._save(queue_path, cur)
+                dq._save(feed_path, dq._feed_for(cur))
             print(f"  ✓ {node_id:28} → {verdict.upper():9} {scores}", flush=True)
 
         with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
@@ -355,39 +361,41 @@ def main(argv=None) -> int:
         wk = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "worker"]
         n = 0
         for t in wk:
-            c = json.loads(queue_path.read_text())                      # re-read (new drops/escalations)
-            escs = _node_escalations(c, t["node"])
-            # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
-            if any(e.get("status") in ("queued", "running") for e in escs):
-                continue                  # an open escalation on this node — leave it queued, skip
-            if len(escs) >= a.max_escalations:        # cap hit — stop re-proving a hard node
-                for x in c:
+            with fslock.locked(queue_path):         # re-read (new drops/escalations) + claim
+                c = json.loads(queue_path.read_text())
+                escs = _node_escalations(c, t["node"])
+                # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
+                if any(e.get("status") in ("queued", "running") for e in escs):
+                    continue              # an open escalation on this node — leave it queued, skip
+                if len(escs) >= a.max_escalations:    # cap hit — stop re-proving a hard node
+                    for x in c:
+                        if x["id"] == t["id"]:
+                            x["status"], x["finished_at"] = "failed", dq._now()
+                            x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
+                    dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+                    print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
+                    n += 1
+                    continue
+                for x in c:                                             # claim
                     if x["id"] == t["id"]:
-                        x["status"], x["finished_at"] = "failed", dq._now()
-                        x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
+                        x["status"], x["started_at"] = "running", dq._now()
                 dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
-                print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
-                n += 1
-                continue
-            for x in c:                                                 # claim
-                if x["id"] == t["id"]:
-                    x["status"], x["started_at"] = "running", dq._now()
-            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
             print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
             status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
                                                 str(proj / "graph.json"), repo, a.max_steers,
                                                 backend=backend_config.prover_of(a.backend))
-            c = json.loads(queue_path.read_text())                      # finish (re-read for new drops)
-            for x in c:
-                if x["id"] == t["id"]:
-                    x["status"] = "done" if status == "proved" else "failed"
-                    x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
-            escalated = False
-            if status != "proved":      # hand the worker's wall to the orchestrator — it decides, not us
-                lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
-                escalated = _raise_escalation(c, t["node"], lbl,
-                                              _escalation_note(reason, detail), a.max_escalations)
-            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+            with fslock.locked(queue_path):         # finish (re-read for new drops)
+                c = json.loads(queue_path.read_text())
+                for x in c:
+                    if x["id"] == t["id"]:
+                        x["status"] = "done" if status == "proved" else "failed"
+                        x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
+                escalated = False
+                if status != "proved":  # hand the worker's wall to the orchestrator — it decides, not us
+                    lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
+                    escalated = _raise_escalation(c, t["node"], lbl,
+                                                  _escalation_note(reason, detail), a.max_escalations)
+                dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
             print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
                   + ("  ⚑ escalation raised" if escalated else ""), flush=True)
             n += 1

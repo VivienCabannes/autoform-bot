@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import urllib.parse
 import webbrowser
 from datetime import datetime, timezone
@@ -53,6 +54,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))  # scripts/ on path for export_blueprint
 
+import fslock  # noqa: E402 — cross-process lock shared with dispatch_runner/_queue
 import review_model as rm  # noqa: E402
 
 # Repo root = .../scripts/review_ui -> up two. Assets live at <root>/assets/review/.
@@ -293,9 +295,22 @@ class Project:
         """
         bounded = list(queue)[-TASK_QUEUE_CAP:]
         payload = json.dumps(bounded, ensure_ascii=False, indent=2)
-        tmp = self.task_queue_path.with_name(self.task_queue_path.name + ".tmp")
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, self.task_queue_path)
+        # Unique temp name (mkstemp) — a fixed <name>.tmp is a write race with the
+        # engine, which swaps the same file. Callers doing load-mutate-save hold
+        # fslock.locked(task_queue_path) around the whole cycle.
+        fd, tmp = tempfile.mkstemp(dir=str(self.task_queue_path.parent),
+                                   prefix=self.task_queue_path.name + ".",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, self.task_queue_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def slug_map(self) -> Dict[str, str]:
         # Slugs are a deterministic function of the id set; recompute per request so
@@ -1355,26 +1370,30 @@ def make_handler(proj: Project):
                 return self._json(400, {"ok": False,
                                         "error": f"unknown node {node!r}"})
 
-            queue = proj.task_queue()
-            # Dedupe: an identical agent+node already queued or running blocks a
-            # duplicate — return the existing queue untouched (idempotent enqueue).
-            for t in queue:
-                if (t.get("agent") == agent and t.get("node") == node
-                        and t.get("status") in _ACTIVE_STATUSES):
-                    return self._json(200, {"ok": True, "queue": queue})
+            # Load-mutate-save under the cross-process lock: the engine (runner /
+            # dispatch_queue) mutates the same file, so an unlocked cycle here could
+            # erase its just-landed claim/finish (or vice versa).
+            with fslock.locked(proj.task_queue_path):
+                queue = proj.task_queue()
+                # Dedupe: an identical agent+node already queued or running blocks a
+                # duplicate — return the existing queue untouched (idempotent enqueue).
+                for t in queue:
+                    if (t.get("agent") == agent and t.get("node") == node
+                            and t.get("status") in _ACTIVE_STATUSES):
+                        return self._json(200, {"ok": True, "queue": queue})
 
-            node_label = nodes[node].get("name") or node
-            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            queue.append({
-                "id": f"{agent}:{node}",
-                "agent": agent,
-                "node": node,
-                "node_label": node_label,
-                "status": "queued",
-                "at": now,
-                "requested_by": "dashboard",
-            })
-            proj.write_task_queue(queue)
+                node_label = nodes[node].get("name") or node
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                queue.append({
+                    "id": f"{agent}:{node}",
+                    "agent": agent,
+                    "node": node,
+                    "node_label": node_label,
+                    "status": "queued",
+                    "at": now,
+                    "requested_by": "dashboard",
+                })
+                proj.write_task_queue(queue)
             return self._json(200, {"ok": True, "queue": proj.task_queue()})
 
         def _post_request_cancel(self):
@@ -1389,12 +1408,13 @@ def make_handler(proj: Project):
             if posted is _BAD_JSON:
                 return self._json(400, {"ok": False, "error": "bad json"})
             task_id = posted.get("id")
-            queue = proj.task_queue()
-            kept = [t for t in queue
-                    if not (t.get("id") == task_id and t.get("status") == "queued")]
-            if len(kept) != len(queue):
-                proj.write_task_queue(kept)
-                kept = proj.task_queue()
+            with fslock.locked(proj.task_queue_path):   # see _post_request
+                queue = proj.task_queue()
+                kept = [t for t in queue
+                        if not (t.get("id") == task_id and t.get("status") == "queued")]
+                if len(kept) != len(queue):
+                    proj.write_task_queue(kept)
+                    kept = proj.task_queue()
             return self._json(200, {"ok": True, "queue": kept})
 
         def _post_verdict(self, path):
@@ -1418,14 +1438,18 @@ def make_handler(proj: Project):
                 return self._json(400, {"ok": False, "error": "score not an int"})
 
             now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            sidecar = proj.sidecar()
-            try:
-                updated = rm.apply_human_verdict(
-                    sidecar, node_id, verdict, score,
-                    posted.get("note", ""), posted.get("by", "reviewer"), now)
-            except ValueError as exc:
-                return self._json(400, {"ok": False, "error": str(exc)})
-            proj.write_sidecar(updated)
+            # Load-mutate-save under the cross-process lock: the runner's finalize()
+            # rewrites the same sidecar, and an unlocked cycle here could lose either
+            # its fresh ai slot or (far worse) this human verdict.
+            with fslock.locked(proj.sidecar_path):
+                sidecar = proj.sidecar()
+                try:
+                    updated = rm.apply_human_verdict(
+                        sidecar, node_id, verdict, score,
+                        posted.get("note", ""), posted.get("by", "reviewer"), now)
+                except ValueError as exc:
+                    return self._json(400, {"ok": False, "error": str(exc)})
+                proj.write_sidecar(updated)
 
             # Recompute and return the delta the client needs to repaint. Thread the
             # live sorry set so the returned taint/frontier/coverage reflect incomplete

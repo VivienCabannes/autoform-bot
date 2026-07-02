@@ -39,8 +39,14 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE / "review_ui") not in sys.path:
+    sys.path.insert(0, str(_HERE / "review_ui"))
+import fslock  # noqa: E402  — the SHARED cross-process lock (dashboard + engine)
 
 
 def _now() -> str:
@@ -55,10 +61,21 @@ def _load(path: Path, default):
 
 
 def _save(path: Path, data) -> None:
-    """Atomic write (temp + os.replace) — never leave a half-written queue/feed."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    """Atomic write (unique mkstemp temp + os.replace) — never leave a half-written
+    queue/feed, and never share a fixed temp name two writers could tear. Callers
+    doing load-mutate-save on a shared file hold ``fslock.locked(path)`` around the
+    whole cycle; this alone only makes the single write atomic."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _feed_for(tasks: list) -> dict:
@@ -190,45 +207,53 @@ def main(argv=None) -> int:
     if a.cmd == "enqueue":
         if not (a.agent and a.node):
             ap.error("enqueue needs --agent and --node")
-        if any(t.get("status") in ("queued", "running") and t.get("agent") == a.agent
-               and t.get("node") == a.node for t in tasks):
-            print(f"already queued/running: {a.agent} -> {a.node} (skipped)")
-            return 0
-        tid = f"{a.agent}-{a.node}-{_now().replace(':', '').replace('-', '')}"
-        entry = {"id": tid, "agent": a.agent, "node": a.node,
-                 "node_label": a.node_label or a.node, "status": "queued",
-                 "at": _now(), "source": a.source or "orchestrator"}
-        if a.note:
-            entry["note"] = a.note
-        tasks.append(entry)
-        _save(qp, tasks)
-        _save(fp, _feed_for(tasks))
+        with fslock.locked(qp):                      # cross-process: dashboard writes too
+            tasks = _load(qp, [])
+            if not isinstance(tasks, list):
+                tasks = []
+            if any(t.get("status") in ("queued", "running") and t.get("agent") == a.agent
+                   and t.get("node") == a.node for t in tasks):
+                print(f"already queued/running: {a.agent} -> {a.node} (skipped)")
+                return 0
+            tid = f"{a.agent}-{a.node}-{_now().replace(':', '').replace('-', '')}"
+            entry = {"id": tid, "agent": a.agent, "node": a.node,
+                     "node_label": a.node_label or a.node, "status": "queued",
+                     "at": _now(), "source": a.source or "orchestrator"}
+            if a.note:
+                entry["note"] = a.note
+            tasks.append(entry)
+            _save(qp, tasks)
+            _save(fp, _feed_for(tasks))
         print(f"enqueued {tid}")
         return 0
 
     if not a.id:
         ap.error(f"{a.cmd} needs a task id")
-    t = next((t for t in tasks if t.get("id") == a.id), None)
-    if t is None:
-        print(f"no task {a.id!r} in {qp}", file=sys.stderr)
-        return 1
-    if a.cmd == "claim":
-        t["status"] = "running"
-        t["started_at"] = _now()
-        if a.detail:
-            t["detail"] = a.detail
-    elif a.cmd == "done":
-        t["status"] = "done"
-        t["finished_at"] = _now()
-        if a.result:
-            t["result"] = a.result
-    elif a.cmd == "fail":
-        t["status"] = "failed"
-        t["finished_at"] = _now()
-        if a.reason:
-            t["result"] = a.reason
-    _save(qp, tasks)
-    _save(fp, _feed_for(tasks))
+    with fslock.locked(qp):                          # cross-process: dashboard writes too
+        tasks = _load(qp, [])
+        if not isinstance(tasks, list):
+            tasks = []
+        t = next((t for t in tasks if t.get("id") == a.id), None)
+        if t is None:
+            print(f"no task {a.id!r} in {qp}", file=sys.stderr)
+            return 1
+        if a.cmd == "claim":
+            t["status"] = "running"
+            t["started_at"] = _now()
+            if a.detail:
+                t["detail"] = a.detail
+        elif a.cmd == "done":
+            t["status"] = "done"
+            t["finished_at"] = _now()
+            if a.result:
+                t["result"] = a.result
+        elif a.cmd == "fail":
+            t["status"] = "failed"
+            t["finished_at"] = _now()
+            if a.reason:
+                t["result"] = a.reason
+        _save(qp, tasks)
+        _save(fp, _feed_for(tasks))
     print(f'{a.cmd} {a.id} -> {t["status"]}')
     return 0
 
