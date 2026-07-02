@@ -1,7 +1,10 @@
 # Sorry handling and the FAILED rule
 
 The minimum bar for acceptance is **net `sorry` reduction**. Count before and after:
-`grep -c "sorry" file.lean`.
+`grep -c "sorry" file.lean`. Note that commit acceptability and task status are separate
+questions: reducing 5 `sorry`s to 2 is a commit-worthy improvement *and* still status `FAILED`
+for the task — the task only succeeds when the target is fully proved (see the FAILED rule
+below).
 
 ## Rules
 

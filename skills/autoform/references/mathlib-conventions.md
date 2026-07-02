@@ -106,15 +106,14 @@ review practice (PR review comments and Zulip discussion).
 
 ## `unproved` vs `axiom` vs `sorry`
 
-- **`unproved`** — "the book doesn't prove this." Use the `unproved` macro
-  (`unproved theoremName (args) : Conclusion`) when the source explicitly omits the proof,
-  references another source, or states without proof. Compiles to `@[unproved] axiom` so the
-  infrastructure tracks it as a justified gap. **Best option** for statements without proofs in
-  the source material.
-- **`axiom`** — for infrastructure the worker fails to construct (definitions, structures,
-  instances, helper lemmas). Compiles cleanly without poisoning the kernel. Prefer over `sorry`
-  when you must move on — but it is still a gap a reviewer will weigh (see the
+- **`sorry`** — the honest placeholder, and the **preferred** one. It introduces `sorryAx`,
+  which `#print axioms` reports loudly for everything downstream — the gap stays visible until
+  it is genuinely closed. When a proof won't finish, leave a `sorry`.
+- **`axiom`** — **worse than `sorry`.** It appears in every downstream `#print axioms`
+  silently, posing as a legitimate foundation, and reviewers reject it as a stand-in for a
+  proof. The only sanctioned use is under an audited-ledger discharge protocol (see the
   **autoform-prove** axiom policy).
-- **`sorry`** — **avoid.** Introduces `sorryAx`, which breaks soundness for everything
-  downstream. Use only as a temporary placeholder during active proof development, never as a
-  final state.
+- **Sanctioned placeholder macros** — a project-defined placeholder (e.g. an `unproved`
+  attribute-macro marking "the source doesn't prove this") is the best option for tracked,
+  justified gaps — but only **if the project defines one**. Check first; do not assume it
+  exists. Without one, use `sorry`.

@@ -5,6 +5,9 @@
 - When axiomatizing `∃ x, P x`, axiomatize `P c` for the specific witness `c` from the source.
 - Then prove the existential by `⟨c, axiom⟩`. This carries mathematical content (the witness),
   rather than asserting bare existence.
+- **Scope:** this pattern applies only within the sanctioned-placeholder / audited-ledger
+  regime, where the axiom is tracked and satisfiability-vetted (see the **autoform-prove**
+  axiom policy) — never as a way to dodge a proof.
 
 ## `choose` pitfalls
 
