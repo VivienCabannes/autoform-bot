@@ -5,12 +5,15 @@ The real kernel path is smoke-tested separately against a minimal Lean project.
 """
 from __future__ import annotations
 
+import subprocess
+
 from servers.prover.base import ProofResult, ProverAdapter, Run
 from servers.prover.driver import prove
 from servers.prover.verify import (
     VerifyResult,
     _decls_of,
     _module_of,
+    capture_baseline,
     has_sorry,
     parse_porcelain_z,
     verify_proof,
@@ -109,6 +112,81 @@ def test_no_decls_passes_after_build():
     assert r.ok and r.checks["kernel"] == "no-decls"
 
 
+# --- baseline change-attribution (real git repo in tmp_path) --------------------
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
+def _make_repo(tmp_path):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@t")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "Existing.lean").write_text("theorem old : True := trivial\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "init")
+    return tmp_path
+
+
+def test_baseline_pre_existing_dirty_file_is_not_attributed(tmp_path):
+    """A pre-existing dirty file must NOT let a run that landed nothing pass."""
+    repo = _make_repo(tmp_path)
+    (repo / "Existing.lean").write_text("theorem old : True := trivial -- user WIP\n", encoding="utf-8")
+
+    baseline = capture_baseline(str(repo))
+    assert baseline.captured and "Existing.lean" in baseline.dirty_hashes
+
+    # ... the run happens, lands NOTHING ...
+    r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
+                     builder=_CLEAN_BUILD, prober=_CLEAN_PROBE)
+    assert not r.ok and "nothing landed" in r.reason
+
+
+def test_baseline_new_file_is_attributed_and_verified(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "Existing.lean").write_text("-- pre-existing user edit\n", encoding="utf-8")
+    baseline = capture_baseline(str(repo))
+
+    # The run lands a NEW file.
+    (repo / "Fresh.lean").write_text("theorem fresh : True := trivial\n", encoding="utf-8")
+    r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
+                     builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir: (0, "'fresh' depends on axioms: [propext]"))
+    assert r.ok
+    # Only the run's file is verified — the pre-existing dirty file is excluded.
+    assert r.checks["files"] == ["Fresh.lean"]
+
+
+def test_baseline_rewritten_dirty_file_is_attributed(tmp_path):
+    """A file dirty at baseline whose CONTENT the run changed counts as touched."""
+    repo = _make_repo(tmp_path)
+    (repo / "Existing.lean").write_text("-- user WIP\n", encoding="utf-8")
+    baseline = capture_baseline(str(repo))
+
+    (repo / "Existing.lean").write_text("theorem proved : True := trivial\n", encoding="utf-8")
+    r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
+                     builder=_CLEAN_BUILD, prober=_CLEAN_PROBE)
+    assert r.ok and r.checks["files"] == ["Existing.lean"]
+
+
+def test_baseline_committed_proof_is_attributed(tmp_path):
+    """A worker that COMMITTED its proof is covered via the baseline head diff."""
+    repo = _make_repo(tmp_path)
+    baseline = capture_baseline(str(repo))
+
+    (repo / "Fresh.lean").write_text("theorem fresh : True := trivial\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "worker proof")
+    r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
+                     builder=_CLEAN_BUILD, prober=_CLEAN_PROBE)
+    assert r.ok and r.checks["files"] == ["Fresh.lean"]
+
+
+def test_baseline_capture_never_raises_outside_git(tmp_path):
+    b = capture_baseline(str(tmp_path / "not-a-repo"))
+    assert b.captured is False  # gate falls back to no-baseline behaviour
+
+
 # --- driver integration --------------------------------------------------------
 
 class _FakeAdapter(ProverAdapter):
@@ -132,20 +210,20 @@ class _FakeAdapter(ProverAdapter):
 
 def test_driver_downgrades_false_proved():
     res = prove(_FakeAdapter("proved"), "N", "spec", "/p", max_steers=0,
-                verifier=lambda node, pdir: VerifyResult(False, "sorryAx", {"verified": True}))
+                verifier=lambda node, pdir, baseline=None: VerifyResult(False, "sorryAx", {"verified": True}))
     assert res.status == "failed" and "verification gate" in res.reason and res.meta["claimed_proved"] is True
 
 
 def test_driver_passes_real_proved():
     res = prove(_FakeAdapter("proved"), "N", "spec", "/p", max_steers=0,
-                verifier=lambda node, pdir: VerifyResult(True, "", {"verified": True, "kernel": "clean"}))
+                verifier=lambda node, pdir, baseline=None: VerifyResult(True, "", {"verified": True, "kernel": "clean"}))
     assert res.status == "proved" and res.meta["verify"]["kernel"] == "clean"
 
 
 def test_driver_gate_only_runs_on_proved():
     n = {"c": 0}
     prove(_FakeAdapter("failed"), "N", "spec", "/p", max_steers=0,
-          verifier=lambda node, pdir: (n.__setitem__("c", n["c"] + 1), VerifyResult(True))[1])
+          verifier=lambda node, pdir, baseline=None: (n.__setitem__("c", n["c"] + 1), VerifyResult(True))[1])
     assert n["c"] == 0
 
 

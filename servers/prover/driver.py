@@ -34,7 +34,7 @@ from collections.abc import Callable
 
 from .base import ProofResult, ProverAdapter
 from .steerer import Steerer
-from .verify import VerifyResult, verify_proof
+from .verify import VerifyResult, capture_baseline, verify_proof
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def prove(
     *,
     max_steers: int = 3,
     steerer: Steerer | None = None,
-    verifier: Callable[[str, str], VerifyResult] | None = verify_proof,
+    verifier: Callable[..., VerifyResult] | None = verify_proof,
 ) -> ProofResult:
     """Drive ``adapter`` to prove ``node`` against ``spec``, steering as needed.
 
@@ -67,12 +67,19 @@ def prove(
             checks the landed Lean compiles with no ``sorry``/``admit`` and, on
             failure, the verdict is downgraded to ``failed``. ``None`` disables it
             (and tests inject a fake). Defaults to :func:`servers.prover.verify.verify_proof`.
+            Called as ``verifier(node, project_dir, baseline=baseline)`` where
+            ``baseline`` is the git snapshot captured below.
 
     Returns:
         The adapter's terminal :class:`ProofResult` (``proved`` or ``failed``) —
         with a claimed ``proved`` only allowed to stand once the gate confirms it.
     """
     judge = steerer if steerer is not None else Steerer()
+    # Snapshot the project's git state BEFORE the backend starts, so the gate can
+    # attribute changes to THIS run (pre-existing dirty files must neither pass a
+    # run that landed nothing nor fail one on a sibling's in-progress sorry).
+    # Threaded explicitly into the verifier — no global state.
+    baseline = capture_baseline(project_dir) if verifier is not None else None
     run = adapter.start(node, spec, project_dir)
     goal = run.goal or spec
 
@@ -96,7 +103,7 @@ def prove(
     # the landed Lean before letting it stand — overriding the claim if it fails, so
     # no backend can report a sorry'd or non-compiling file as proved.
     if result.proved and verifier is not None:
-        gate = verifier(node, project_dir)
+        gate = verifier(node, project_dir, baseline=baseline)
         result.meta = {**(result.meta or {}), "verify": gate.checks}
         if not gate.ok:
             logger.warning("driver: verification gate REJECTED %s's proof claim for %s: %s",

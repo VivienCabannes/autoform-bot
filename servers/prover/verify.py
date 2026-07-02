@@ -35,6 +35,7 @@ sit behind injectable seams so the gate's logic is unit-testable with no toolcha
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -105,6 +106,64 @@ def find_lakefile(project_dir: str) -> bool:
 
 # ----------------------------------------------------------------- touched files
 
+@dataclass
+class Baseline:
+    """Git state of ``project_dir`` at RUN START, for change attribution.
+
+    ``git status`` alone cannot attribute changes to *this* run: a pre-existing
+    dirty file would let a run that landed nothing pass the gate on the user's old
+    edits (false proved), and a sibling worker's in-progress ``sorry`` would fail
+    an unrelated run (false failed). The driver captures a :class:`Baseline`
+    before ``adapter.start`` and passes it to :func:`verify_proof` explicitly (no
+    global state); "touched by the run" is then *newly* dirty files, files whose
+    content hash changed since the baseline, and files committed since the
+    baseline ``head``.
+
+    Args:
+        dirty_hashes: dirty ``.lean`` path → content hash at capture time.
+        head: the ``HEAD`` commit sha at capture time (``""`` if unknown).
+        captured: whether git state was successfully read — when ``False``
+            (non-git dir, git missing) attribution is impossible and the gate
+            falls back to the no-baseline behaviour.
+    """
+
+    dirty_hashes: dict[str, str] = field(default_factory=dict)
+    head: str = ""
+    captured: bool = False
+
+
+def _hash_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return "unreadable"
+
+
+def capture_baseline(project_dir: str) -> Baseline:
+    """Snapshot the dirty ``.lean`` files (path → content hash) + ``HEAD`` sha.
+
+    Never raises: on any git failure it returns an un-``captured`` baseline and
+    the gate behaves exactly as it did without one.
+    """
+    try:
+        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z"],
+                             capture_output=True, timeout=30)
+        if out.returncode != 0:
+            return Baseline()
+        dirty = parse_porcelain_z(out.stdout)
+        head_p = subprocess.run(["git", "-C", project_dir, "rev-parse", "HEAD"],
+                                capture_output=True, timeout=30)
+        head = head_p.stdout.decode("ascii", "ignore").strip() if head_p.returncode == 0 else ""
+        root = Path(project_dir)
+        return Baseline(
+            dirty_hashes={f: _hash_file(root / f) for f in dirty},
+            head=head,
+            captured=True,
+        )
+    except Exception:
+        return Baseline()
+
+
 def parse_porcelain_z(data: bytes) -> list[str]:
     """Parse ``git status --porcelain -z`` (NUL-separated, no quoting) → changed
     ``.lean`` paths, skipping deletions and consuming the rename/copy origin field."""
@@ -162,6 +221,36 @@ def _node_file_fallback(node: str, project_dir: str) -> list[str]:
 
 def _touched_lean(project_dir: str, node: str) -> list[str]:
     return _git_lean_changes(project_dir) or _node_file_fallback(node, project_dir)
+
+
+def _attributable_lean(project_dir: str, baseline: Baseline) -> list[str]:
+    """``.lean`` files attributable to THIS run, judged against ``baseline``:
+    newly dirty, dirty with a changed content hash, or committed since the
+    baseline ``head``. Pre-existing dirty files whose content is unchanged are
+    NOT attributed (they are the user's / a sibling worker's, not this run's)."""
+    files: list[str] = []
+    try:
+        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z"],
+                             capture_output=True, timeout=30).stdout
+        root = Path(project_dir)
+        for f in parse_porcelain_z(out):
+            prior = baseline.dirty_hashes.get(f)
+            if prior is None or _hash_file(root / f) != prior:
+                files.append(f)
+    except Exception:
+        pass
+    if baseline.head:
+        # The worker may have COMMITTED its proof: diff the baseline head to HEAD.
+        try:
+            out = subprocess.run(
+                ["git", "-C", project_dir, "diff", "--name-only", "-z", "--diff-filter=d",
+                 baseline.head, "HEAD"],
+                capture_output=True, timeout=30).stdout
+            files += [p for p in out.decode("utf-8", "surrogateescape").split("\x00")
+                      if p.endswith(".lean") and p not in files]
+        except Exception:
+            pass
+    return files
 
 
 # ------------------------------------------------------------ module + decl parse
@@ -266,6 +355,7 @@ def verify_proof(
     node: str,
     project_dir: str,
     *,
+    baseline: Baseline | None = None,
     touched: list[str] | None = None,
     reader: Callable[[Path], str] | None = None,
     builder: Callable[[str], tuple[int, str]] | None = None,
@@ -274,6 +364,11 @@ def verify_proof(
     require_lakefile: bool = True,
 ) -> VerifyResult:
     """Independently verify a *claimed* proof for ``node`` in ``project_dir``.
+
+    ``baseline`` (captured by the driver at run start via :func:`capture_baseline`
+    and threaded through explicitly) scopes "touched" to changes attributable to
+    THIS run — without it, a pre-existing dirty file could yield a false "proved"
+    and a sibling worker's in-progress ``sorry`` a false "failed".
 
     Seams — ``touched`` / ``reader`` / ``builder`` (``lake build`` → (rc, out)) /
     ``prober`` (the ``#print axioms`` runner → (rc, out)) / ``has_lakefile`` — are
@@ -286,7 +381,22 @@ def verify_proof(
                                 {"verified": False})
         return VerifyResult(True, "", {"verified": False, "skipped": "no lakefile"})
 
-    files = touched if touched is not None else _touched_lean(project_dir, node)
+    if touched is not None:
+        files = touched
+    elif baseline is not None and baseline.captured:
+        # Attribute changes to THIS run against the baseline. When git attribution
+        # is authoritative (baseline captured) and nothing is attributable, the
+        # claim fails outright — the node→module fallback would re-admit exactly
+        # the pre-existing edits the baseline exists to exclude.
+        files = _attributable_lean(project_dir, baseline)
+        if not files:
+            return VerifyResult(
+                False,
+                "nothing landed — no .lean change is attributable to this run "
+                "(pre-existing dirty files are not counted)",
+                {"verified": True, "files": [], "attribution": "baseline"})
+    else:
+        files = _touched_lean(project_dir, node)
     if not files:
         return VerifyResult(False, "no Lean file was written — nothing to verify",
                             {"verified": True, "files": []})
