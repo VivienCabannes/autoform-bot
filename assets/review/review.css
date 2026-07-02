@@ -1,0 +1,727 @@
+/* Review surface — three screens (home / cluster / node packet).
+ * Palette (SHARED_SPEC): paper #F7F4EE / ink #1F1D1A / accent #1A4B8C;
+ * in_mathlib (blue) #2563B0 / clean #2F7D4F / flagged #C08A1E /
+ * rejected #C0392B / grey (unreviewed) #C9C2B4.
+ * Color = trust state: blue = in Mathlib (reused, trusted) · green = ours, clean.
+ * Encodings: AI-only = dashed ring; human-confirmed = solid; tainted = 45° hatch.
+ * A blue (in-Mathlib) node is always solid and never hatched (trusted by construction).
+ */
+
+:root {
+  --paper: #F7F4EE;
+  --ink: #1F1D1A;
+  --accent: #1A4B8C;
+  --in-mathlib: #2563B0;
+  --in-mathlib-fill: #DCE8F7;
+  --clean: #2F7D4F;
+  --flagged: #C08A1E;
+  --rejected: #C0392B;
+  --sorry: #7C3AED;          /* violet — Lean contains a sorry/admit/sorryAx (incomplete) */
+  --sorry-fill: #ECE7FB;
+  --grey: #C9C2B4;
+  --line: #DAD4C7;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+  margin: 0;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
+
+/* --- header --- */
+.rv-header {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 10px 22px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+.rv-home { font-weight: 700; color: var(--accent); }
+.rv-title { color: #6c665a; font-size: 13px; }
+.rv-main { padding: 18px 22px; max-width: 1180px; margin: 0 auto; }
+
+/* --- home: header bar (coverage + frontier + dial) --- */
+.rv-headerbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px 22px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 12px 16px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+}
+.rv-headerbar-main {
+  display: flex; flex-wrap: wrap; gap: 14px 28px; align-items: center;
+}
+.rv-coverage { display: flex; align-items: center; gap: 8px; }
+.rv-cov-label, .rv-fr-label { font-size: 12px; text-transform: uppercase;
+  letter-spacing: .04em; color: #8a8575; }
+.rv-cov-bar {
+  width: 180px; height: 10px; border-radius: 5px;
+  background: #e7e1d4; overflow: hidden;
+}
+.rv-cov-fill {
+  height: 100%; transition: width .3s ease;
+  background: linear-gradient(90deg, var(--clean), #3a9a62);
+}
+.rv-cov-num { font-size: 12px; color: #6c665a; }
+.rv-frontier { font-size: 13px; }
+.rv-frontier a { margin-right: 6px; }
+.rv-dial { margin-left: auto; font-size: 13px; color: #6c665a; }
+.rv-dial strong { color: var(--accent); }
+
+/* --- dashboard shell: activity sidebar + graph column (responsive flexbox) --- */
+.rv-dash {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+}
+.rv-graphcol { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 880px) {
+  .rv-dash { flex-direction: column; }
+  .rv-activity { width: 100% !important; position: static !important; }
+}
+
+/* --- tier toggle (segmented control) --- */
+.rv-tiertoggle {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+.rv-tt-label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+  color: #8a8575;
+}
+.rv-tt {
+  font-size: 13px; padding: 5px 12px; border-radius: 14px;
+  border: 1.5px solid var(--line); background: #fff; color: var(--accent);
+  transition: background .15s, border-color .15s, color .15s;
+}
+a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--grey); }
+.rv-tt-on {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+  font-weight: 600; cursor: default;
+}
+.rv-tt-hint { font-size: 12px; color: #8a8575; font-style: italic; margin-left: 4px; }
+
+/* --- focus banner ("Showing ‹label› in context · ‹ back") --- */
+.rv-focus-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 10px; padding: 8px 14px;
+  background: linear-gradient(90deg, var(--in-mathlib-fill), #fff);
+  border: 1.5px solid var(--in-mathlib); border-radius: 8px;
+  font-size: 13px; color: var(--ink);
+}
+.rv-fb-ico { color: var(--in-mathlib); font-size: 15px; }
+.rv-fb-text strong { color: var(--in-mathlib); }
+.rv-fb-count { color: #6c665a; font-size: 12px; }
+.rv-fb-back {
+  margin-left: auto; font-weight: 600; padding: 3px 10px; border-radius: 12px;
+  border: 1.5px solid var(--in-mathlib); background: #fff;
+}
+.rv-fb-back:hover { background: var(--in-mathlib-fill); text-decoration: none; }
+
+/* --- expanded-nodes bar (one chip per expanded node) --- */
+.rv-expanded-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 10px; padding: 7px 12px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+}
+.rv-xb-label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+  color: #8a8575;
+}
+.rv-xb-chips { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 8px; }
+.rv-xb-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 3px 6px 3px 11px; border-radius: 14px;
+  border: 1.5px solid var(--grey); background: #fbfaf6;
+  transition: border-color .15s, box-shadow .15s;
+}
+.rv-xb-chip:hover { border-color: var(--accent);
+  box-shadow: 0 1px 3px rgba(31, 29, 26, .07); }
+.rv-xb-name {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rv-xb-collapse {
+  font: inherit; font-size: 11px; cursor: pointer;
+  padding: 2px 9px; border-radius: 10px;
+  border: 1px solid var(--grey); background: #fff; color: #6c665a;
+}
+.rv-xb-collapse:hover { background: #f1ede4; border-color: #b3ac9d; }
+.rv-xb-open {
+  font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 10px;
+  border: 1.5px solid var(--accent); background: var(--accent); color: #fff;
+}
+.rv-xb-open:hover { background: #15407a; text-decoration: none; }
+
+/* --- legend --- */
+.rv-legend {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  margin: 8px 0 12px; font-size: 12px;
+}
+.rv-key {
+  padding: 2px 9px; border-radius: 10px; border: 1.5px solid var(--grey);
+  background: #fff;
+}
+.rv-key.rv-in_mathlib { border-color: var(--in-mathlib); color: var(--in-mathlib);
+  background: var(--in-mathlib-fill); }
+.rv-key.rv-clean { border-color: var(--clean); color: var(--clean); }
+.rv-key.rv-flagged { border-color: var(--flagged); color: var(--flagged); }
+.rv-key.rv-rejected { border-color: var(--rejected); color: var(--rejected); }
+.rv-key.rv-sorry { border-color: var(--sorry); color: var(--sorry);
+  background: var(--sorry-fill); }
+.rv-key.rv-grey { border-color: var(--grey); color: #8a8575; }
+.rv-key.rv-dash { border-style: dashed; }
+.rv-key.rv-solid { background: #eef0ea; }
+.rv-key.rv-hatch {
+  background: repeating-linear-gradient(45deg, #fff, #fff 4px, #ded8c9 4px, #ded8c9 6px);
+}
+.rv-lanes { color: #8a8575; margin-left: auto; }
+
+/* --- home: graph --- */
+.rv-graph {
+  width: 100%; height: 88vh; border: 1px solid var(--line);
+  border-radius: 8px; background: #fff; overflow: hidden;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+  position: relative;
+}
+/* Each (re)render lives in its own absolutely-positioned stage that fills the
+   container, so the graph uses the whole canvas and a swapped-out stage can never
+   leave a white box behind. */
+.rv-graph-stage { position: absolute; inset: 0; }
+.rv-graph svg { display: block; width: 100%; height: 100%; }
+.rv-graph .node { cursor: pointer; transition: opacity .15s ease; }
+.rv-graph .node:hover { opacity: .85; }
+
+.rv-graph-loading, .rv-act-loading {
+  padding: 26px 18px; color: #8a8575; font-size: 13px; font-style: italic;
+}
+
+/* collapsed-cluster nodes feel pressable; expanded boxes invite a collapse */
+.rv-graph .node.rv-clusternode ellipse,
+.rv-graph .node.rv-clusternode polygon { stroke-width: 2.4px; }
+.rv-graph .node.rv-clusternode:hover ellipse,
+.rv-graph .node.rv-clusternode:hover polygon {
+  stroke: var(--accent); filter: brightness(.97);
+}
+.rv-graph .cluster.rv-clusterbox { transition: opacity .15s ease; }
+.rv-graph .cluster.rv-clusterbox:hover { opacity: .9; }
+.rv-graph .cluster.rv-clusterbox:hover > polygon,
+.rv-graph .cluster.rv-clusterbox:hover > path {
+  stroke: var(--accent); stroke-width: 1.6px;
+}
+
+/* --- target pulse: agents highlight the node(s) they're working on --- */
+.rv-graph .rv-pulse ellipse,
+.rv-graph .rv-pulse polygon,
+.rv-graph .rv-pulse > polygon,
+.rv-graph .rv-pulse > path {
+  stroke: var(--accent);
+  filter: url(#rv-glow);
+  animation: rv-pulse-ring 1.4s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+@keyframes rv-pulse-ring {
+  0%, 100% { stroke-width: 2px; stroke-opacity: .65; }
+  50% { stroke-width: 4.5px; stroke-opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rv-graph .rv-pulse ellipse, .rv-graph .rv-pulse polygon,
+  .rv-graph .rv-pulse > polygon, .rv-graph .rv-pulse > path {
+    animation: none; stroke-width: 3.5px; stroke-opacity: 1;
+  }
+}
+
+/* --- focus mode: steady ring on member nodes; de-emphasize the rest --- */
+/* Distinct from the agent pulse: a STEADY amber-accent double-ring (no animation),
+ * vs the pulse's animated accent glow. So "this is what you drilled into" reads
+ * differently from "an agent is working here right now". */
+.rv-graph .rv-focus-member ellipse,
+.rv-graph .rv-focus-member polygon {
+  stroke: var(--flagged);
+  stroke-width: 3px;
+  paint-order: stroke;
+}
+.rv-graph .rv-focus-member:hover ellipse,
+.rv-graph .rv-focus-member:hover polygon { filter: brightness(.97); }
+/* Non-members fade back so the focused set pops (kept legible, not hidden). */
+.rv-graph svg.rv-has-focus .rv-focus-dim { opacity: .38;
+  transition: opacity .15s ease; }
+.rv-graph svg.rv-has-focus .rv-focus-dim:hover { opacity: .75; }
+/* A focus member that an agent is also targeting still pulses (pulse wins visually);
+ * the steady ring underneath marks it as a focus member too. */
+
+/* --- drag-and-drop dispatch: drop-hover ring + pending (queued/running) marker --- */
+/* While a palette agent is dragged over a node, ring it in solid accent so the drop
+ * target is obvious (distinct from both the focus ring and the live pulse). */
+.rv-graph .node.rv-drop-hover > ellipse,
+.rv-graph .node.rv-drop-hover > polygon,
+.rv-graph .node.rv-drop-hover ellipse,
+.rv-graph .node.rv-drop-hover polygon {
+  stroke: var(--accent); stroke-width: 4px; stroke-opacity: 1;
+  filter: url(#rv-glow);
+}
+/* Pending marker: a node carries a queued/running dispatched task. A STEADY dashed
+ * accent ring — distinct from the focus ring (solid amber) and the live pulse
+ * (animated glow): "work is dispatched here" reads apart from "an agent is live
+ * here right now". If a node is BOTH pending and live-pulsing, the pulse wins
+ * (declared later / animated), which is the truthful priority. */
+.rv-graph .node.rv-pending ellipse,
+.rv-graph .node.rv-pending polygon,
+.rv-graph .cluster.rv-pending > polygon,
+.rv-graph .cluster.rv-pending > path {
+  stroke: var(--accent); stroke-width: 2.4px; stroke-dasharray: 3 3;
+  stroke-opacity: .9;
+}
+
+/* expanded box highlight when its bar chip is hovered (HTML ⇄ SVG cross-link) */
+.rv-graph .cluster.rv-box-hover > polygon,
+.rv-graph .cluster.rv-box-hover > path {
+  stroke: var(--accent); stroke-width: 2px;
+}
+
+/* SVG verdict-node decorations applied by review.js after graphviz render. */
+.rv-graph .node.rv-aionly ellipse,
+.rv-graph .node.rv-aionly polygon { stroke-dasharray: 5 4; }
+.rv-graph .node.rv-human ellipse,
+.rv-graph .node.rv-human polygon { stroke-width: 2.4px; }
+/* In-Mathlib (blue) nodes are trusted by construction: solid blue, never dashed
+ * (the DOT already omits the AI-only ring); reaffirm here so they never inherit
+ * a dashed/hatched look. */
+.rv-graph .node.rv-in_mathlib ellipse,
+.rv-graph .node.rv-in_mathlib polygon {
+  stroke: var(--in-mathlib); stroke-dasharray: none; stroke-width: 2px;
+}
+
+/* --- offline fallback list: one chip per node, colored by trust state --- */
+.rv-fallback { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 8px; }
+.rv-fb {
+  padding: 3px 10px; border-radius: 12px; border: 1.5px solid var(--grey);
+  background: #fff; font-size: 13px;
+}
+.rv-fb.rv-aionly { border-style: dashed; }
+.rv-fb.rv-in_mathlib { border-color: var(--in-mathlib); background: var(--in-mathlib-fill); }
+.rv-fb.rv-in_mathlib a { color: var(--in-mathlib); }
+.rv-fb.rv-clean { border-color: var(--clean); }
+.rv-fb.rv-flagged { border-color: var(--flagged); }
+.rv-fb.rv-rejected { border-color: var(--rejected); }
+.rv-fb.rv-tainted {
+  background: repeating-linear-gradient(45deg, #fff, #fff 4px, #ded8c9 4px, #ded8c9 6px);
+}
+/* Blue is trusted by construction — never show it as tainted/hatched. */
+.rv-fb.rv-in_mathlib.rv-tainted { background: var(--in-mathlib-fill); }
+.rv-fb-v { color: #8a8575; }
+.rv-fb-haschild { color: var(--accent); font-weight: 600; }
+.rv-fb.rv-focus-member { box-shadow: 0 0 0 2px var(--flagged) inset; }
+.rv-fb.rv-focus-dim { opacity: .45; }
+.rv-fb-src, .rv-fb-taint { font-size: 11px; color: #8a8575; }
+.rv-fb-taint { color: var(--rejected); }
+
+/* offline fallback — tier-1 cluster list (expand reveals children) */
+.rv-fallback-clusters { flex-direction: column; align-items: stretch; gap: 6px; }
+.rv-fb-cluster { display: block; }
+.rv-fb-toggle {
+  font: inherit; text-align: left; cursor: pointer;
+  padding: 6px 12px; border-radius: 8px; border: 1.5px solid var(--grey);
+  background: #fff; color: var(--ink); width: 100%;
+}
+.rv-fb-toggle:hover { background: #f1ede4; }
+.rv-fb-toggle.rv-clean { border-color: var(--clean); }
+.rv-fb-toggle.rv-flagged { border-color: var(--flagged); }
+.rv-fb-toggle.rv-rejected { border-color: var(--rejected); }
+.rv-fb-children { flex-direction: column; align-items: stretch;
+  gap: 5px; margin: 6px 0 4px 18px; }
+
+/* --- activity panel (mission-control sidebar) --- */
+.rv-activity {
+  flex: 0 0 270px; width: 270px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 14px;
+  box-shadow: 0 1px 2px rgba(31, 29, 26, .04);
+  position: sticky; top: 14px;
+  align-self: flex-start;
+}
+.rv-act-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px;
+}
+.rv-act-title {
+  margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+  color: #8a8575;
+}
+/* orchestrator status pill (color by state) */
+.rv-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 12px;
+  border: 1.5px solid var(--grey); background: #fff; color: #6c665a;
+  text-transform: capitalize;
+}
+.rv-pill-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+}
+.rv-pill-running {
+  color: var(--clean); border-color: var(--clean); background: #eaf4ee;
+}
+.rv-pill-running .rv-pill-dot { animation: rv-blink 1.3s ease-in-out infinite; }
+.rv-pill-done { color: var(--in-mathlib); border-color: var(--in-mathlib);
+  background: var(--in-mathlib-fill); }
+.rv-pill-idle { color: #8a8575; border-color: var(--grey); }
+@keyframes rv-blink { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+.rv-act-orch { margin-bottom: 10px; }
+.rv-orch-phase { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rv-orch-detail { font-size: 12px; color: #8a8575; margin-top: 2px; }
+.rv-act-offline { margin-top: 6px; color: var(--flagged); }
+
+.rv-act-empty {
+  font-size: 13px; color: #8a8575; font-style: italic;
+  padding: 10px; border: 1px dashed var(--line); border-radius: 6px;
+  text-align: center;
+}
+
+/* agent cards */
+.rv-agents { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 8px; }
+.rv-agent {
+  border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px;
+  background: #fbfaf6; transition: border-color .15s, box-shadow .15s;
+}
+.rv-agent:hover {
+  border-color: var(--grey); box-shadow: 0 1px 3px rgba(31, 29, 26, .06);
+}
+.rv-agent-top { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+.rv-agent-name { font-size: 13px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-agent-body { font-size: 12px; color: #6c665a; }
+.rv-agent-state { font-style: italic; }
+.rv-agent-arrow { color: #b3ac9d; }
+.rv-agent-target { font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; }
+
+/* role badges — distinct colors per role */
+.rv-rolebadge {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; padding: 2px 7px; border-radius: 9px;
+  color: #fff; flex: 0 0 auto;
+}
+.rv-role-worker { background: var(--in-mathlib); }   /* blue */
+.rv-role-reviewer { background: var(--flagged); }    /* amber */
+.rv-role-planner { background: #6b4fb0; }            /* violet */
+.rv-role-graphreview { background: #138d90; }        /* teal  — edges */
+.rv-role-contentreview { background: #b0467e; }      /* rose  — prose */
+.rv-role-holistic { background: #3f51b5; }           /* indigo — whole graph */
+.rv-role-mathcheck { background: #2f8a4e; }          /* green — in Mathlib? */
+.rv-role-escalation { background: #c0392b; }         /* red   — a worker hit a wall */
+.rv-role-agent { background: var(--grey); color: var(--ink); }
+
+/* --- "Agents · ready" palette: draggable agent cards (drag → node = dispatch) --- */
+.rv-sec-head {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .05em; color: #8a8575; margin: 4px 0 6px;
+}
+.rv-sec-ready { color: var(--clean); }
+.rv-sec-dot { color: var(--grey); }
+.rv-sec-count {
+  font-size: 11px; font-weight: 700; color: #6c665a;
+  background: var(--paper); border: 1px solid var(--line);
+  border-radius: 9px; padding: 0 6px; margin-left: 2px;
+}
+/* --- backend selector (which prover backend the agents run on) --- */
+.rv-backend {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 0 0 12px; padding: 8px 10px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+}
+.rv-be-label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #8a8575;
+}
+.rv-be-select {
+  font: inherit; font-size: 13px; padding: 3px 8px; border-radius: 8px;
+  border: 1.5px solid var(--accent); background: #fff; color: var(--accent);
+  font-weight: 600; cursor: pointer;
+}
+.rv-be-select:disabled { opacity: .6; cursor: progress; }
+.rv-be-billing { flex-basis: 100%; font-size: 11px; color: #8a8575; font-style: italic; }
+
+.rv-palette-sec { margin-bottom: 12px; }
+.rv-palette { display: flex; flex-direction: column; gap: 6px; }
+.rv-palette-card {
+  display: flex; align-items: center; gap: 9px;
+  border: 1px solid var(--line); border-left-width: 3px; border-radius: 7px;
+  padding: 7px 9px; background: #fff; cursor: grab;
+  transition: border-color .12s, box-shadow .12s, transform .06s;
+  user-select: none;
+}
+.rv-palette-card:hover {
+  border-color: var(--grey);
+  box-shadow: 0 1px 4px rgba(31, 29, 26, .08);
+}
+.rv-palette-card:active { cursor: grabbing; }
+/* the dragged card lifts + fades while in flight */
+.rv-palette-card.rv-dragging { opacity: .5; transform: scale(.98); }
+/* left accent edge = the agent's role color (mirrors the role badges) */
+.rv-palette-card.rv-role-reviewer { border-left-color: var(--flagged); }
+.rv-palette-card.rv-role-worker { border-left-color: var(--in-mathlib); }
+.rv-palette-card.rv-role-planner { border-left-color: #6b4fb0; }
+.rv-palette-card.rv-role-graphreview { border-left-color: #138d90; }
+.rv-palette-card.rv-role-contentreview { border-left-color: #b0467e; }
+.rv-palette-card.rv-role-holistic { border-left-color: #3f51b5; }
+.rv-palette-card.rv-role-mathcheck { border-left-color: #2f8a4e; }
+.rv-palette-card.rv-role-escalation { border-left-color: #c0392b; }
+.rv-palette-card.rv-role-agent { border-left-color: var(--grey); }
+.rv-pc-icon {
+  font-size: 17px; line-height: 1; flex: 0 0 auto; width: 20px;
+  text-align: center; color: var(--ink);
+}
+.rv-pc-text { display: flex; flex-direction: column; min-width: 0; }
+.rv-pc-label { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rv-pc-blurb {
+  font-size: 11px; color: #8a8575;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* while a drag is active, hint that nodes are live drop targets */
+body.rv-drag-active .rv-graph .node { cursor: copy; }
+
+/* --- "Tasks": queued + running dispatch tasks --- */
+.rv-tasks-sec { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.rv-tasks { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+.rv-task {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px;
+  background: #fbfaf6;
+}
+.rv-task-running { background: #eaf4ee; border-color: var(--clean); }
+.rv-task-main {
+  display: flex; align-items: center; gap: 5px; min-width: 0; flex: 1 1 auto;
+}
+.rv-task-agent {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .03em; padding: 1px 6px; border-radius: 8px; color: #fff;
+  flex: 0 0 auto;
+}
+.rv-task-arrow { color: #b3ac9d; flex: 0 0 auto; }
+.rv-task-node {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rv-task-right { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.rv-chip {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .03em; padding: 2px 7px; border-radius: 9px;
+  border: 1px solid var(--grey); color: #6c665a; background: #fff;
+}
+.rv-chip-queued { color: var(--flagged); border-color: var(--flagged);
+  background: #faf3e3; }
+.rv-chip-running { color: var(--clean); border-color: var(--clean);
+  background: #eaf4ee; }
+.rv-chip-running { animation: rv-blink 1.6s ease-in-out infinite; }
+.rv-task-cancel {
+  border: 1px solid var(--line); background: #fff; color: #8a8575;
+  width: 20px; height: 20px; border-radius: 50%; line-height: 1;
+  font-size: 14px; cursor: pointer; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.rv-task-cancel:hover {
+  color: var(--rejected); border-color: var(--rejected); background: #fbeceb;
+}
+.rv-task-cancel:disabled { opacity: .4; cursor: default; }
+
+/* --- cluster deck --- */
+.rv-cluster-rollup {
+  display: inline-block; padding: 6px 14px; border-radius: 6px;
+  border: 2px solid var(--grey); margin: 4px 0;
+}
+.rv-cluster-rollup.rv-clean { border-color: var(--clean); color: var(--clean); }
+.rv-cluster-rollup.rv-flagged { border-color: var(--flagged); color: var(--flagged); }
+.rv-cluster-rollup.rv-rejected { border-color: var(--rejected); color: var(--rejected); }
+.rv-rollup-rule { font-size: 12px; color: #8a8575; margin: 4px 0; }
+.rv-counts { font-size: 13px; color: #6c665a; }
+.rv-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+.rv-table th, .rv-table td {
+  text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+}
+.rv-table th { font-size: 12px; text-transform: uppercase; color: #8a8575; }
+.rv-verdict-cell { font-weight: 600; }
+.rv-row.rv-in_mathlib .rv-verdict-cell { color: var(--in-mathlib); }
+.rv-row.rv-clean .rv-verdict-cell { color: var(--clean); }
+.rv-row.rv-flagged .rv-verdict-cell { color: var(--flagged); }
+.rv-row.rv-rejected .rv-verdict-cell { color: var(--rejected); }
+.rv-row.rv-unreviewed .rv-verdict-cell { color: #8a8575; }
+
+/* --- node packet --- */
+.rv-packet { display: flex; gap: 22px; align-items: flex-start; }
+.rv-packet-left { flex: 1 1 55%; min-width: 0; }
+.rv-packet-right { flex: 1 1 45%; min-width: 0; }
+.rv-thm-env {
+  background: #fff; border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  border-radius: 6px; padding: 14px 16px;
+}
+.rv-thm-raw pre { white-space: pre-wrap; word-break: break-word; }
+.rv-node-id { margin: 0 0 2px; }
+.rv-node-sub { margin: 0 0 12px; color: #8a8575; font-size: 13px; }
+.rv-card {
+  background: #fff; border: 1px solid var(--line); border-radius: 6px;
+  padding: 10px 14px; margin-bottom: 12px;
+}
+.rv-card h4 { margin: 0 0 6px; font-size: 13px; }
+.rv-card ul { margin: 0; padding-left: 18px; }
+.rv-card code { background: #f0ece2; padding: 1px 4px; border-radius: 3px; }
+.rv-kernel pre {
+  background: #1f1d1a; color: #e8e3d6; padding: 10px; border-radius: 5px;
+  overflow-x: auto; font-size: 12px;
+}
+
+/* Lean source panel on a module packet (real source read from lean_root). */
+.rv-lean { margin: 20px 0 4px; }
+.rv-lean-h { font-size: 14px; color: #6c665a; margin: 0 0 7px; font-weight: 600; }
+.rv-lean-h code {
+  color: var(--accent); background: #f0ece2; padding: 1px 6px; border-radius: 3px;
+  font-size: 12px;
+}
+.rv-lean-trunc { font-style: italic; color: #8a8575; margin-left: 8px; font-size: 12px; font-weight: 400; }
+.rv-lean-sorry {
+  margin-left: 8px; font-size: 12px; font-weight: 600; color: var(--sorry);
+  border: 1.5px solid var(--sorry); background: var(--sorry-fill);
+  padding: 1px 8px; border-radius: 10px;
+}
+.rv-lean-sorry code { background: none; color: inherit; padding: 0; font-size: inherit; }
+.rv-lean-pre {
+  background: #1f1d1a; color: #e8e3d8; border: 1px solid var(--line);
+  border-radius: 8px; padding: 14px 16px; overflow: auto; max-height: 62vh;
+  font: 12px/1.55 "SF Mono", Menlo, Consolas, monospace; margin: 0;
+}
+.rv-lean-pre code { font: inherit; background: none; padding: 0; }
+.rv-note { color: #8a8575; font-size: 12px; }
+.rv-score-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.rv-score-table th, .rv-score-table td {
+  text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line);
+}
+.rv-score-table .rv-w { color: #8a8575; font-size: 11px; }
+.rv-score-total td { font-weight: 600; border-top: 2px solid var(--line); }
+
+/* --- verdict panel --- */
+.rv-verdict-panel {
+  margin-top: 18px; background: #fff; border: 1px solid var(--line);
+  border-radius: 6px; padding: 14px 16px;
+}
+.rv-verdict-panel h4 { margin: 0 0 10px; }
+.rv-eff {
+  font-size: 12px; padding: 2px 8px; border-radius: 10px; margin-left: 8px;
+  border: 1.5px solid var(--grey);
+}
+.rv-eff.rv-in_mathlib { border-color: var(--in-mathlib); color: var(--in-mathlib); }
+.rv-eff.rv-clean { border-color: var(--clean); color: var(--clean); }
+.rv-eff.rv-flagged { border-color: var(--flagged); color: var(--flagged); }
+.rv-eff.rv-rejected { border-color: var(--rejected); color: var(--rejected); }
+.rv-vp-row { margin-bottom: 10px; display: flex; gap: 14px; align-items: center;
+  flex-wrap: wrap; }
+.rv-radio { display: inline-flex; gap: 4px; align-items: center; }
+.rv-vp-row textarea { width: 100%; min-height: 50px; font: inherit;
+  border: 1px solid var(--line); border-radius: 4px; padding: 6px; }
+.rv-vp-row input[type=number] { width: 60px; }
+.rv-verdict-panel button {
+  background: var(--accent); color: #fff; border: 0; border-radius: 5px;
+  padding: 7px 16px; font: inherit; cursor: pointer;
+}
+.rv-verdict-panel button:hover { background: #15407a; }
+.rv-vp-status { font-size: 13px; color: var(--clean); }
+.rv-err { color: var(--rejected); }
+
+/* --- PART 6: anchor-view banner (reuses the focus-banner slot) --------------- */
+.rv-fb-nb { color: #6c665a; font-size: 12px; }
+.rv-anchor-banner .rv-fb-ico { color: var(--accent); }
+.rv-anchor-banner .rv-fb-text strong { color: var(--accent); }
+.rv-nb-controls { display: inline-flex; gap: 8px; align-items: center; }
+.rv-nb-expand {
+  font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 12px;
+  border: 1.5px solid var(--accent); background: var(--accent); color: #fff;
+}
+.rv-nb-expand:hover { background: #15407a; text-decoration: none; }
+.rv-nb-expand.rv-nb-maxed {
+  background: #fff; color: #8a8575; border-color: var(--grey);
+  font-weight: 500; cursor: default;
+}
+
+/* --- PART 5: too-large placeholder + entry-point picker ---------------------- */
+.rv-toolarge {
+  background: #fff; border: 1px solid var(--line); border-radius: 10px;
+  padding: 20px 22px; max-width: 640px; margin: 6px auto;
+  box-shadow: 0 1px 3px rgba(31, 29, 26, .05);
+}
+.rv-tl-head { display: flex; align-items: flex-start; gap: 12px; }
+.rv-tl-ico {
+  font-size: 22px; color: var(--accent); line-height: 1.2; flex: 0 0 auto;
+}
+.rv-tl-title { margin: 0; font-size: 17px; line-height: 1.35; }
+.rv-tl-guide { color: #6c665a; font-size: 13.5px; margin: 12px 0 16px; }
+.rv-tl-guide strong { color: var(--ink); }
+.rv-tl-search { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.rv-tl-input {
+  flex: 1 1 320px; font: inherit; font-size: 14px;
+  padding: 9px 13px; border: 1.5px solid var(--grey); border-radius: 8px;
+  background: var(--paper);
+}
+.rv-tl-input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(26, 75, 140, .12); background: #fff;
+}
+.rv-tl-hint { font-size: 12px; color: #8a8575; white-space: nowrap; }
+.rv-tl-list {
+  list-style: none; margin: 14px 0 0; padding: 0;
+  max-height: 360px; overflow-y: auto;
+}
+.rv-tl-item { margin: 0 0 6px; }
+.rv-tl-pick {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; width: 100%;
+  text-align: left; font: inherit; cursor: pointer;
+  padding: 8px 12px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--paper);
+  transition: border-color .12s, background .12s;
+}
+.rv-tl-pick:hover {
+  border-color: var(--accent); background: var(--in-mathlib-fill);
+}
+.rv-tl-id {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+  font-weight: 600; color: var(--ink);
+}
+.rv-tl-sub { font-size: 12.5px; color: #6c665a;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.rv-tl-parent { font-size: 11.5px; color: #8a8575; }
+.rv-tl-go {
+  margin-left: auto; font-size: 12px; font-weight: 600; color: var(--accent);
+  white-space: nowrap;
+}
+.rv-tl-pick:hover .rv-tl-go { text-decoration: underline; }
+.rv-tl-none { padding: 10px 4px; color: #8a8575; font-size: 13px; font-style: italic; }
+
+/* --- PART 7: node packet "view neighborhood ▸" link ------------------------- */
+.rv-nb-link-row {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+.rv-nb-link {
+  font-weight: 600; font-size: 13px; padding: 5px 12px; border-radius: 14px;
+  border: 1.5px solid var(--accent); background: var(--accent); color: #fff;
+}
+.rv-nb-link:hover { background: #15407a; text-decoration: none; }
+.rv-nb-link-sub { font-size: 11.5px; color: #8a8575; }

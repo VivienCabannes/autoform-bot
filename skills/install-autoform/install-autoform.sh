@@ -2,7 +2,7 @@
 # Set up the full autoform environment.
 # Checks uv, Python deps, Lean 4, and optional Zulip access.
 #
-# Usage: bash setup-autoform.sh
+# Usage: bash install-autoform.sh
 # Safe to re-run — skips steps that are already done.
 
 set -euo pipefail
@@ -187,6 +187,22 @@ else:
     error="$(printf '%s' "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error', 'unknown'))" 2>/dev/null || echo "unknown")"
     warn "Cannot connect to Zulip: $error — check your .zuliprc credentials"
   fi
+fi
+
+# =========================================================================
+# 6. Lean Explore API key (optional)
+# =========================================================================
+log "Checking Lean Explore (optional)"
+
+if [ -n "${LEANEXPLORE_API_KEY:-}" ]; then
+  ok "LEANEXPLORE_API_KEY set — semantic Mathlib search via the lean-explore skill is available"
+else
+  skip "LEANEXPLORE_API_KEY not set — the lean-explore skill is optional"
+  echo ""
+  echo "  To enable semantic Mathlib search (the lean-explore skill):"
+  echo "    1. Get a key at https://www.leanexplore.com"
+  echo "    2. export LEANEXPLORE_API_KEY=<your-key>"
+  echo ""
 fi
 
 # =========================================================================
