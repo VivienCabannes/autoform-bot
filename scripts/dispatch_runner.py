@@ -251,6 +251,40 @@ def _node_escalations(queue: list, node_id: str) -> list:
     return [x for x in queue if x.get("agent") == "escalation" and x.get("node") == node_id]
 
 
+def sweep_stale_running(queue_path: Path, feed_path: Path) -> int:
+    """Crash recovery, run once at engine startup: reset every reviewer/worker task
+    stranded in ``running`` back to ``queued`` (with a note appended), under the
+    cross-process lock. Returns the number of tasks recovered.
+
+    A task is only ever ``running`` while THIS engine is executing it, so at startup
+    any ``running`` engine-kind task is a leftover of an engine that died mid-flight.
+    Without the sweep such a task is unrecoverable: the drain takes only ``queued``,
+    the dashboard can't cancel a ``running`` task, and both dedups (server + CLI)
+    block a re-enqueue. Only the engine's own kinds are swept — an orchestrator-owned
+    task (escalation/planner/…) may legitimately be ``running`` in another session."""
+    with fslock.locked(queue_path):
+        try:
+            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if not isinstance(queue, list):
+            return 0
+        n = 0
+        for t in queue:
+            if (isinstance(t, dict) and t.get("agent") in dq._ENGINE_KINDS
+                    and t.get("status") == "running"):
+                t["status"] = "queued"
+                t.pop("started_at", None)
+                note = str(t.get("note") or "").strip()
+                stamp = "requeued after engine restart"
+                t["note"] = f"{note} · {stamp}" if note else stamp
+                n += 1
+        if n:
+            dq._save(queue_path, queue)
+            dq._save(feed_path, dq._feed_for(queue))
+    return n
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic parallel review dispatcher.")
     ap.add_argument("project", type=Path, help="dir holding graph.json + task_queue.json")
@@ -275,6 +309,12 @@ def main(argv=None) -> int:
     queue_path = proj / "task_queue.json"
     feed_path = proj / "agents_status.json"
     repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
+
+    if not a.dry_run:                       # crash recovery: un-strand 'running' tasks
+        swept = sweep_stale_running(queue_path, feed_path)
+        if swept:
+            print(f"recovered {swept} task(s) stranded in 'running' → re-queued "
+                  f"(previous engine died mid-flight)", flush=True)
 
     initial = [t for t in (json.loads(queue_path.read_text()) if queue_path.exists() else [])
                if t.get("status") == "queued" and t.get("agent") == "reviewer"]

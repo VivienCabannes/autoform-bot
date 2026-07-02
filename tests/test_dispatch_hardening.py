@@ -8,6 +8,9 @@ Covers the crash-safety fixes:
     dies on ``rubrics[axis]``.
   * per-task failure isolation — an unexpected exception while preparing one
     task marks THAT task ``failed`` (error in ``result``) and the rest proceed.
+  * startup sweep — reviewer/worker tasks stranded in ``running`` (a previous
+    engine died) are reset to ``queued`` with a "requeued after engine restart"
+    note; orchestrator-owned kinds are left alone.
 
 All jury runs are simulated by monkeypatching ``run_judge`` / ``load_rubrics``;
 no ``claude`` subprocess is ever spawned.
@@ -113,6 +116,59 @@ def test_one_bad_task_fails_alone_others_proceed(tmp_path, monkeypatch):
     assert "synthetic prompt failure" in t1["result"]
     assert t2["status"] == "done"
     assert _sidecar(proj)["reviews"]["s2"]["ai"]["verdict"] == "clean"
+
+
+# ---------------------------------------------------------------------------
+# startup sweep — 'running' engine tasks from a dead engine are re-queued
+# ---------------------------------------------------------------------------
+
+def test_sweep_requeues_stranded_running_engine_tasks(tmp_path):
+    proj = _proj(tmp_path, [
+        {"id": "reviewer:s1", "agent": "reviewer", "node": "s1",
+         "status": "running", "started_at": "2026-01-01T00:00:00Z"},
+        {"id": "worker:s2", "agent": "worker", "node": "s2",
+         "status": "running", "note": "prior note"},
+        {"id": "esc-1", "agent": "escalation", "node": "s1", "status": "running"},
+        {"id": "reviewer:s2", "agent": "reviewer", "node": "s2", "status": "done"},
+    ])
+    n = dr.sweep_stale_running(proj / "task_queue.json", proj / "agents_status.json")
+    assert n == 2
+    rev = _by_id(proj, "reviewer:s1")
+    assert rev["status"] == "queued"
+    assert rev["note"] == "requeued after engine restart"
+    assert "started_at" not in rev
+    wk = _by_id(proj, "worker:s2")
+    assert wk["status"] == "queued"
+    assert wk["note"] == "prior note · requeued after engine restart"
+    # orchestrator-owned + finished tasks are untouched
+    assert _by_id(proj, "esc-1")["status"] == "running"
+    assert _by_id(proj, "reviewer:s2")["status"] == "done"
+    # the feed reflects the swept queue (nothing running -> idle)
+    feed = json.loads((proj / "agents_status.json").read_text())
+    assert all(a["role"] != "reviewer" for a in feed["agents"])
+
+
+def test_sweep_noop_without_stranded_tasks(tmp_path):
+    proj = _proj(tmp_path, [
+        {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "queued"}])
+    before = _queue(proj)
+    assert dr.sweep_stale_running(proj / "task_queue.json",
+                                  proj / "agents_status.json") == 0
+    assert _queue(proj) == before
+
+
+def test_main_runs_the_sweep_then_drains_the_requeued_task(tmp_path, monkeypatch):
+    # A stranded 'running' reviewer is recovered at startup AND then drained.
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    monkeypatch.setattr(dr, "run_judge",
+                        lambda axis, prompt, repo, model, timeout:
+                        {"score": 4, "reasoning": "ok"})
+    proj = _proj(tmp_path, [
+        {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "running"}])
+    assert dr.main([str(proj)]) == 0
+    t = _by_id(proj, "reviewer:s1")
+    assert t["status"] == "done"
+    assert "requeued after engine restart" in t["note"]
 
 
 if __name__ == "__main__":
