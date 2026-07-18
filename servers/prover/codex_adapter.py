@@ -132,6 +132,11 @@ class _CodexRun:
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
     dropped_steers: int = 0             # steers skipped for lack of a session id
+    # Token accounting across every turn (codex ``turn.completed`` events carry
+    # a usage dict; read defensively wherever one appears).
+    input_tokens: int = 0
+    output_tokens: int = 0
+    turns: int = 0
 
 
 class CodexAdapter(ProverAdapter):
@@ -215,6 +220,8 @@ class CodexAdapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         state: _CodexRun = run.handle
         text = (state.final_text or "").strip()
+        usage = {"input_tokens": state.input_tokens, "output_tokens": state.output_tokens,
+                 "turns": state.turns}
         if state.timed_out:
             return ProofResult(
                 status="failed",
@@ -223,11 +230,12 @@ class CodexAdapter(ProverAdapter):
                 backend=self.name,
                 landed_files=0,
                 meta={"session_id": state.session_id, "model": state.model or "codex-default",
-                      "sub_status": "timeout"},
+                      "sub_status": "timeout", "usage": usage},
             )
         proved = not _looks_failed(text)
         meta: dict[str, Any] = {"session_id": state.session_id,
-                                "model": state.model or "codex-default"}
+                                "model": state.model or "codex-default",
+                                "usage": usage}
         if state.dropped_steers:
             meta["dropped_steers"] = state.dropped_steers
         return ProofResult(
@@ -251,6 +259,14 @@ class CodexAdapter(ProverAdapter):
         args += self._autonomy_args + state.extra_args + [prompt]
 
         for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)):
+            usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
+            if usage is None and isinstance(obj.get("item"), dict):
+                iu = obj["item"].get("usage")
+                usage = iu if isinstance(iu, dict) else None
+            if usage:
+                state.input_tokens += int(usage.get("input_tokens") or 0)
+                state.output_tokens += int(usage.get("output_tokens") or 0)
+                state.turns += 1
             event, final, sid = _classify_codex_event(obj)
             if sid:
                 state.session_id = sid

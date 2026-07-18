@@ -52,6 +52,7 @@ identical honesty gate, only the adapter differs.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -158,6 +159,7 @@ def prove(
     # is reused on a post-fold re-verify: it is a static pre-run snapshot, so the
     # corrective turn's edits are attributed exactly like the first turn's.
     baseline = capture_baseline(project_dir) if verifier is not None else None
+    started_at = time.monotonic()
     run = adapter.start(node, spec, project_dir)
     goal = run.goal or spec
 
@@ -211,12 +213,34 @@ def prove(
                     _judge_steer()  # the judgement-call signal → confirmation
 
     def _stamp_steering(res: ProofResult) -> None:
-        res.meta = {**(res.meta or {}), "steering": {
+        """Merge steering telemetry AND the run's usage rollup into the meta.
+
+        The adapter reports its own flat worker usage in ``meta["usage"]``;
+        here it is nested under ``usage.worker`` and joined by the judge's
+        accumulated usage (when the steerer tracks it — injected fakes may
+        not) and the run's wall clock. This is the only place worker and
+        judge totals meet, so the ledger entry one level up (the prover
+        server) sees the complete, final numbers on every exit path.
+        """
+        meta = dict(res.meta or {})
+        worker_usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+        if isinstance(worker_usage, dict) and "worker" in worker_usage:
+            worker_usage = worker_usage["worker"]  # idempotent re-stamp
+        usage: dict[str, Any] = {
+            "worker": worker_usage,
+            "wall_seconds": round(time.monotonic() - started_at, 3),
+        }
+        judge_calls = getattr(judge, "calls", None)
+        if judge_calls is not None:
+            usage["judge"] = {**(getattr(judge, "usage", None) or {}), "calls": judge_calls}
+        meta["usage"] = usage
+        meta["steering"] = {
             "capability": capability.value,
             "policy": judge_policy,
             "steers": state["steers"],
             "signals": engine.summary(),
-        }}
+        }
+        res.meta = meta
 
     _consume()
     result = adapter.result(run)

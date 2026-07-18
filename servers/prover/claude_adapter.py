@@ -186,6 +186,13 @@ class _ClaudeRun:
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
     dropped_steers: int = 0             # steers skipped for lack of a session id
+    # Token accounting, accumulated across EVERY turn (initial + steers + folds)
+    # from each turn's terminal ``result`` stream object. Feeds the usage ledger
+    # behind formalization.yaml — capture here or the numbers are lost.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0               # claude's reported figure (notional on Max)
+    turns: int = 0
 
 
 class ClaudeAdapter(ProverAdapter):
@@ -311,6 +318,8 @@ class ClaudeAdapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         state: _ClaudeRun = run.handle
         text = (state.final_text or "").strip()
+        usage = {"input_tokens": state.input_tokens, "output_tokens": state.output_tokens,
+                 "cost_usd": round(state.cost_usd, 6), "turns": state.turns}
         if state.timed_out:
             return ProofResult(
                 status="failed",
@@ -318,10 +327,11 @@ class ClaudeAdapter(ProverAdapter):
                 reason=f"timeout: run exceeded max_wait_seconds ({self._max_wait_seconds}s); worker killed",
                 backend=self.name,
                 landed_files=0,
-                meta={"session_id": state.session_id, "model": state.model, "sub_status": "timeout"},
+                meta={"session_id": state.session_id, "model": state.model,
+                      "sub_status": "timeout", "usage": usage},
             )
         proved = not _looks_failed(text)
-        meta = {"session_id": state.session_id, "model": state.model}
+        meta = {"session_id": state.session_id, "model": state.model, "usage": usage}
         if state.dropped_steers:
             meta["dropped_steers"] = state.dropped_steers
         return ProofResult(
@@ -354,6 +364,17 @@ class ClaudeAdapter(ProverAdapter):
             sid = obj.get("session_id")
             if sid:
                 state.session_id = sid
+            if obj.get("type") == "result":
+                # The terminal object of each turn carries the turn's token usage
+                # and claude's cost figure — accumulate them per run.
+                usage = obj.get("usage") or {}
+                state.input_tokens += int(usage.get("input_tokens") or 0)
+                state.output_tokens += int(usage.get("output_tokens") or 0)
+                try:
+                    state.cost_usd += float(obj.get("total_cost_usd") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                state.turns += 1
             event = _classify_stream_event(obj)
             if event is None:
                 continue

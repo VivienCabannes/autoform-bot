@@ -62,31 +62,47 @@ STEER_JUDGE_RUBRIC = (
 _EVENTS_FENCE_OPEN = "<<<EVENTS_BEGIN"
 _EVENTS_FENCE_CLOSE = "EVENTS_END>>>"
 
-# A judge takes the assembled prompt and returns the model's raw text reply.
-Judge = Callable[[str], str]
+# A judge takes the assembled prompt and returns the model's raw text reply —
+# or a ``(text, usage_dict)`` tuple when it can report its own token usage (the
+# default CLI judge does; injected test fakes may keep returning plain text).
+Judge = Callable[[str], "str | tuple[str, dict]"]
 
 
-def _claude_cli_judge(prompt: str, *, timeout: int = 180) -> str:
+def _claude_cli_judge(prompt: str, *, timeout: int = 180) -> tuple[str, dict]:
     """Default judge: invoke the ``claude`` CLI on Max (``ANTHROPIC_API_KEY`` scrubbed).
 
-    Mirrors ``aristotle_agent._claude_cli``. Returns stdout, or ``""`` on any
-    failure (a judge that errors simply declines to steer).
+    Runs with ``--output-format json`` so the reply carries its token usage —
+    with ``text`` mode the judge's spend was structurally invisible. Returns
+    ``(reply_text, usage)``; ``("", {})`` on any failure (a judge that errors
+    simply declines to steer).
     """
     env = os.environ.copy()
     env.pop("ANTHROPIC_API_KEY", None)    # → Max OAuth, never API-billed
     env.pop("ANTHROPIC_AUTH_TOKEN", None)  # ditto for the token-based auth path
     try:
         proc = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "text"],
+            ["claude", "-p", prompt, "--output-format", "json"],
             capture_output=True,
             text=True,
             env=env,
             timeout=timeout,
         )
-        return (proc.stdout or "").strip()
+        raw = (proc.stdout or "").strip()
     except Exception as err:  # pragma: no cover - environment-dependent
         logger.warning("claude steer-judge CLI failed: %s", err)
-        return ""
+        return "", {}
+    try:
+        obj = json.loads(raw)
+        usage = obj.get("usage") or {}
+        return str(obj.get("result", "")).strip(), {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cost_usd": float(obj.get("total_cost_usd") or 0.0),
+        }
+    except (json.JSONDecodeError, TypeError, ValueError):
+        # Older CLI or unexpected shape: fall back to treating stdout as the
+        # reply text with no usage — never lose the verdict over accounting.
+        return raw, {}
 
 
 def _render_window(window: Sequence[Event], *, last: int = 8) -> str:
@@ -149,6 +165,11 @@ class Steerer:
     #: telemetry for the trigger-gated policy (expected ≈ one per fired
     #: judgement-call signal, an order of magnitude below per-window cadence).
     calls: int = field(default=0, init=False)
+    #: Accumulated judge token usage across this run (fed by judges that return
+    #: ``(text, usage)`` tuples — the default CLI judge does). Rolled into the
+    #: usage ledger behind formalization.yaml by the driver.
+    usage: dict[str, Any] = field(default_factory=lambda: {
+        "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}, init=False)
     _last_call: float = field(default=0.0, init=False)
     _reasons: list[str] = field(default_factory=list, init=False)
     # Cache so off_course() + correction() over the SAME window cost one judge
@@ -185,7 +206,14 @@ class Steerer:
 
         prompt = _build_prompt(goal, window, self._reasons)
         self.calls += 1
-        raw = self.judge(prompt)
+        reply = self.judge(prompt)
+        if isinstance(reply, tuple):
+            raw, judge_usage = reply
+            for k in ("input_tokens", "output_tokens"):
+                self.usage[k] += int((judge_usage or {}).get(k) or 0)
+            self.usage["cost_usd"] += float((judge_usage or {}).get("cost_usd") or 0.0)
+        else:
+            raw = reply
         self._last_call = now
         decision = _parse_decision(raw)
         self._cached = decision

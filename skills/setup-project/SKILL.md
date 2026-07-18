@@ -22,6 +22,25 @@ The script:
 2. Runs `customize_template.py` to rename `Project` → `<ProjectName>` everywhere
 3. Fetches Mathlib cache (`lake exe cache get` — ~2 GB download)
 4. Runs `lake build` to verify
+5. Seeds **`formalization.yaml`** — the [mathlib-initiative self-reporting
+   manifest](https://github.com/mathlib-initiative/formalization.yaml) (v0.3) —
+   with the project name, git author, and an `automation.methods` entry for
+   autoform. From then on every prover run appends token/cost/wall-time data to
+   `.autoform/usage.jsonl` and auto-refreshes the manifest's machine-owned
+   fields, so the reported models, spend, token totals, and sorry counts stay
+   accurate without manual bookkeeping. Human-owned fields (sources, review,
+   fidelity, …) are never touched — remind the user to fill in the `sources:`
+   TODO entries and the license.
+
+**Existing project?** Seed the manifest alone with:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/formalization.py" init <project-dir>
+```
+
+(and `… update <project-dir>` to refresh it manually at any time — any
+already-accumulated `.autoform/usage.jsonl` ledger is rolled up on init, so a
+late opt-in backfills accurate totals).
 
 **Prerequisites:** git, python3, lean/lake. If `lake` is not found, suggest `/install-lean` first.
 

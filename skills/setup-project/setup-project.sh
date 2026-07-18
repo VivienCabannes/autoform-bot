@@ -67,6 +67,20 @@ else
   fail "Build failed — check errors above"
 fi
 
+# --- formalization.yaml (mathlib-initiative self-reporting manifest) ---
+# Seeded here because this script is the one thing that knows the project name
+# and directory at creation time. The prover keeps it accurate afterwards: every
+# run appends to .autoform/usage.jsonl and refreshes the manifest's machine
+# fields (models, wall time, spend, token totals, sorry counts).
+log "Creating formalization.yaml (mathlib-initiative manifest)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if python3 "$PLUGIN_ROOT/scripts/formalization.py" init . --name "$PROJECT_NAME"; then
+  ok "formalization.yaml created (fill in sources + license; see header comments)"
+else
+  echo "  [warn] formalization.yaml not created — run: python3 $PLUGIN_ROOT/scripts/formalization.py init <project-dir>"
+fi
+
 # --- Done ---
 echo ""
 ok "Project $PROJECT_NAME is ready at $TARGET_DIR"
