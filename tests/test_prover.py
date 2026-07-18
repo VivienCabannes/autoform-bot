@@ -731,3 +731,34 @@ def test_prove_node_unknown_backend_fails_gracefully(tmp_path):
     gp = _write_plan(tmp_path)
     with pytest.raises(ValueError):
         run_prove_node(graph_path=str(gp), node_id="Thm", project_dir=str(tmp_path), backend="bogus")
+
+
+def test_shared_steerer_usage_is_stamped_per_run_not_cumulative():
+    """One Steerer injected across two prove() calls must not double-count the
+    first run's judge usage in the second run's ledger stamp."""
+    from servers.prover.steerer import Steerer
+
+    s = Steerer(min_gap_s=0.0,
+                judge=lambda p: ('{"steer": false, "prompt": ""}',
+                                 {"input_tokens": 10, "output_tokens": 5, "cost_usd": 1.0}))
+    for _ in range(2):
+        adapter = FakeAdapter([_ev(EventKind.EDIT)], ProofResult(status="proved"))
+        result = prove(adapter, "N", "spec", "/proj", steerer=s,
+                       verifier=None, judge_policy="always")
+    judge = result.meta["usage"]["judge"]
+    assert judge["calls"] == 1           # THIS run's call, not both
+    assert judge["cost_usd"] == 1.0      # delta, not the 2.0 cumulative
+
+
+def test_cli_judge_tolerates_json_scalar_stdout(monkeypatch):
+    """A JSON-scalar stdout ("null") must decline to steer, not crash prove()."""
+    from servers.prover import steerer as steerer_mod
+
+    def fake_run(args, capture_output, text, env, timeout):
+        class P:
+            stdout = "null"
+        return P()
+
+    monkeypatch.setattr(steerer_mod.subprocess, "run", fake_run)
+    text, usage = steerer_mod._claude_cli_judge("hi")
+    assert text == "" and usage == {}

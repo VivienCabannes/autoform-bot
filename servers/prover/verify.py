@@ -164,7 +164,7 @@ def capture_baseline(project_dir: str) -> Baseline:
     the gate behaves exactly as it did without one.
     """
     try:
-        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z"],
+        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z", "--untracked-files=all"],
                              capture_output=True, timeout=30)
         if out.returncode != 0:
             return Baseline()
@@ -208,7 +208,7 @@ def _git_lean_changes(project_dir: str) -> list[str]:
     """Touched ``.lean`` files: uncommitted (``status``) first, else the worker's last
     commit (``diff HEAD~1 HEAD``) — so a worker that committed its proof is covered."""
     try:
-        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z"],
+        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z", "--untracked-files=all"],
                              capture_output=True, timeout=30).stdout
         files = parse_porcelain_z(out)
         if files:
@@ -248,7 +248,7 @@ def _attributable_lean(project_dir: str, baseline: Baseline) -> list[str]:
     NOT attributed (they are the user's / a sibling worker's, not this run's)."""
     files: list[str] = []
     try:
-        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z"],
+        out = subprocess.run(["git", "-C", project_dir, "status", "--porcelain", "-z", "--untracked-files=all"],
                              capture_output=True, timeout=30).stdout
         root = Path(project_dir)
         for f in parse_porcelain_z(out):

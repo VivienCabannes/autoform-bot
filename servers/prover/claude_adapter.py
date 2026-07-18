@@ -191,6 +191,8 @@ class _ClaudeRun:
     # behind formalization.yaml — capture here or the numbers are lost.
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0          # cache reads dominate agentic sessions —
+    cache_creation_tokens: int = 0      # recorded so totals reconcile with cost
     cost_usd: float = 0.0               # claude's reported figure (notional on Max)
     turns: int = 0
 
@@ -319,6 +321,8 @@ class ClaudeAdapter(ProverAdapter):
         state: _ClaudeRun = run.handle
         text = (state.final_text or "").strip()
         usage = {"input_tokens": state.input_tokens, "output_tokens": state.output_tokens,
+                 "cache_read_tokens": state.cache_read_tokens,
+                 "cache_creation_tokens": state.cache_creation_tokens,
                  "cost_usd": round(state.cost_usd, 6), "turns": state.turns}
         if state.timed_out:
             return ProofResult(
@@ -367,9 +371,17 @@ class ClaudeAdapter(ProverAdapter):
             if obj.get("type") == "result":
                 # The terminal object of each turn carries the turn's token usage
                 # and claude's cost figure — accumulate them per run.
+                # VERIFY-LIVE: this SUMS across resumed turns on the reasoning
+                # that each `claude -p` invocation reports its own turn. If any
+                # CLI version reports session-cumulative usage/cost on
+                # --resume, this overstates — confirm with two live turns
+                # (docs/avocado-handoff.md documents the 2-minute probe).
                 usage = obj.get("usage") or {}
                 state.input_tokens += int(usage.get("input_tokens") or 0)
                 state.output_tokens += int(usage.get("output_tokens") or 0)
+                state.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
+                state.cache_creation_tokens += int(
+                    usage.get("cache_creation_input_tokens") or 0)
                 try:
                     state.cost_usd += float(obj.get("total_cost_usd") or 0.0)
                 except (TypeError, ValueError):

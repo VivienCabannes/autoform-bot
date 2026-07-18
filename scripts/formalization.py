@@ -241,8 +241,8 @@ def _rollup(entries: list[dict[str, Any]]) -> dict[str, Any]:
     models: set[str] = set()
     tokens_in = tokens_out = 0
     wall = 0.0
-    notional = 0.0
-    subscription_runs = api_runs = 0
+    notional = 0.0                       # subscription runs only: what the API WOULD have cost
+    subscription_runs = api_runs = external_runs = 0
     for e in entries:
         model = str(e.get("model") or "").strip()
         backend = str(e.get("backend") or "").strip()
@@ -251,16 +251,20 @@ def _rollup(entries: list[dict[str, Any]]) -> dict[str, Any]:
         elif model:
             models.add(model)
         wall += float(e.get("wall_seconds") or 0.0)
+        billing = str(e.get("billing") or "")
         usage = e.get("usage") or {}
         for part in ("worker", "judge"):
             u = usage.get(part) or {}
             tokens_in += int(u.get("input_tokens") or 0)
             tokens_out += int(u.get("output_tokens") or 0)
-            notional += float(u.get("cost_usd") or 0.0)
-        if e.get("billing") == "api":
+            if billing == "subscription":
+                notional += float(u.get("cost_usd") or 0.0)
+        if billing == "api":
             api_runs += 1
-        else:
+        elif billing == "subscription":
             subscription_runs += 1
+        else:
+            external_runs += 1           # aristotle compute, codex's own auth, unknown
     spend_parts = []
     if subscription_runs:
         note = f"subscription-based usage ({subscription_runs} runs"
@@ -270,6 +274,9 @@ def _rollup(entries: list[dict[str, Any]]) -> dict[str, Any]:
         spend_parts.append(note)
     if api_runs:
         spend_parts.append(f"API-billed runs: {api_runs} (see .autoform/usage.jsonl)")
+    if external_runs:
+        spend_parts.append(f"externally-billed runs: {external_runs} "
+                           "(Aristotle compute / other-vendor auth)")
     return {
         "models": sorted(models),
         "wall_time": _format_wall_time(wall),
@@ -284,9 +291,55 @@ def _rollup(entries: list[dict[str, Any]]) -> dict[str, Any]:
 _DECL_RE = re.compile(
     r"\b(theorem|lemma|example|def|abbrev|instance|structure|class|inductive)\b")
 _SORRY_RE = re.compile(r"\bsorry\b")
-_LINE_COMMENT_RE = re.compile(r"--.*$", re.MULTILINE)
-_BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
 _DEF_KEYWORDS = {"def", "abbrev", "instance", "structure", "class", "inductive"}
+
+
+def _strip_lean_noise(src: str) -> str:
+    """Blank out comments and string literals, preserving offsets.
+
+    A single-pass scanner rather than regexes: Lean block comments NEST, a
+    ``--`` line comment may *mention* ``/-`` (a regex approach opens a phantom
+    block there and swallows real code — undercounting sorries, the dangerous
+    direction), and a ``sorry`` inside a string literal is prose, not a proof
+    hole. Replaced spans become spaces so positions stay comparable.
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if ch == "-" and nxt == "-":                     # line comment
+            j = src.find("\n", i)
+            j = n if j == -1 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        elif ch == "/" and nxt == "-":                   # nested block comment
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/-", j):
+                    depth += 1
+                    j += 2
+                elif src.startswith("-/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif ch == '"':                                  # string literal
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            j = min(j + 1, n)
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
 
 
 def count_sorries(project_dir: str | Path) -> tuple[int, int]:
@@ -315,8 +368,7 @@ def count_sorries(project_dir: str | Path) -> tuple[int, int]:
             src = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        src = _BLOCK_COMMENT_RE.sub(" ", src)
-        src = _LINE_COMMENT_RE.sub(" ", src)
+        src = _strip_lean_noise(src)
         last_decl = ""
         events = sorted(
             [(m.start(), "decl", m.group(1)) for m in _DECL_RE.finditer(src)]
@@ -336,22 +388,38 @@ def count_sorries(project_dir: str | Path) -> tuple[int, int]:
 
 
 def _autoform_method(data: dict[str, Any]) -> dict[str, Any]:
-    """The machine-owned method entry (created and appended when missing)."""
-    methods = data["automation"].setdefault("methods", [])
-    for entry in methods:
+    """The machine-owned method entry (created and appended when missing).
+
+    Tolerant of hand-mangled shapes: a human who typed a scalar where the
+    schema wants a mapping/list gets their value pushed aside (into the shape
+    the machine needs) rather than a traceback — "human fields tolerated"
+    must include human mistakes in machine-adjacent paths.
+    """
+    if not isinstance(data.get("automation"), dict):
+        data["automation"] = {"methods": [], "spend_usd": "", "notes": ""}
+    automation = data["automation"]
+    if not isinstance(automation.get("methods"), list):
+        automation["methods"] = []
+    for entry in automation["methods"]:
         if isinstance(entry, dict) and entry.get("framework") == AUTOFORM_FRAMEWORK:
+            if not isinstance(entry.get("cost"), dict):
+                entry["cost"] = {"wall_time": "", "spend_usd": "", "hardware": ""}
             return entry
     entry = _fresh_autoform_method()
-    methods.append(entry)
+    automation["methods"].append(entry)
     return entry
 
 
 def _stamp(entry: dict[str, Any]) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     notes = str(entry.get("notes") or "")
+    # Replace (never accumulate) the stamp line; preserve the human's other
+    # lines verbatim, blank lines included.
     lines = [ln for ln in notes.splitlines() if not ln.startswith(_STAMP_PREFIX)]
+    while lines and not lines[-1].strip():
+        lines.pop()
     lines.append(_STAMP_PREFIX + ts)
-    entry["notes"] = "\n".join(ln for ln in lines if ln.strip())
+    entry["notes"] = "\n".join(lines).strip("\n")
 
 
 def _strip_stamp(text: str) -> str:
@@ -381,6 +449,8 @@ def update_formalization(project_dir: str | Path, *, count_lean_sorries: bool = 
     entry["tokens"] = roll["tokens"]
     if count_lean_sorries:
         total, in_defs = count_sorries(project_dir)
+        if not isinstance(data.get("status"), dict):
+            data["status"] = {}      # a hand-typed scalar: machine counts still land
         data["status"]["sorry_count"] = total
         data["status"]["sorry_in_definitions"] = in_defs
     _stamp(entry)

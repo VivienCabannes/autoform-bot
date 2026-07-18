@@ -27,8 +27,9 @@ work-laptop checklist lives in ``docs/avocado-handoff.md``.
 
 **Interface assumptions** (the codex-adapter discipline): this targets OpenAI
 Chat Completions — ``POST {base}/chat/completions`` with ``{model, messages,
-n, max_tokens}``, choices at ``choices[i].message.content``, token usage at
-``usage.{prompt_tokens, completion_tokens}``. Non-streaming. The proved/failed
+n}``, choices at ``choices[i].message.content``, token usage at
+``usage.{prompt_tokens, completion_tokens}``. Non-streaming; the provider's
+default output cap applies (a truncated fence degrades to an honest failure). The proved/failed
 verdict rests on the reply's ``FAILED — <reason>`` line and on whether a Lean
 block actually landed — never on schema details — so a gateway with a slightly
 different envelope degrades to an honest failure, not a false proof. Every
@@ -106,13 +107,18 @@ def _env(preset: str, suffix: str) -> str:
 
 
 def _resolve_target_file(graph_path: str, node: str, project_dir: str) -> Path | None:
-    """The node's Lean file: the plan's explicit ``lean_file`` pin, when present."""
+    """The node's Lean file: the plan's explicit ``lean_file`` pin, when present.
+
+    The pin gets the same sanitization as a model-declared header — the graph
+    is user-owned, but a landing path must never escape the project regardless
+    of where it came from.
+    """
     try:
         graph = json.loads(Path(graph_path).read_text(encoding="utf-8"))
         entry = (graph.get("nodes") or {}).get(node) or {}
-        lean_file = str(entry.get("lean_file") or "").strip()
-        if lean_file:
-            return Path(project_dir) / lean_file
+        rel = _sanitize_rel(str(entry.get("lean_file") or ""))
+        if rel:
+            return Path(project_dir) / rel
     except Exception:  # noqa: BLE001 — resolution is best-effort; the run fails honestly
         pass
     return None
@@ -198,6 +204,9 @@ class OpenAICompatAdapter(ProverAdapter):
         self._samples = max(1, int(samples))
         self._timeout = float(max_wait_seconds) if max_wait_seconds else 600.0
         self._transport = transport or _urllib_transport
+        if self._base_url.startswith("http://"):
+            logger.warning("%s: base_url %s is plain http — acceptable only for a "
+                           "VPN-internal gateway", self.name, self._base_url)
 
     # ------------------------------------------------------------------ surface
 
@@ -249,26 +258,35 @@ class OpenAICompatAdapter(ProverAdapter):
         state.input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
         state.output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
 
+        # Examine EVERY candidate: the first that actually lands wins; an
+        # honest FAILED is only the verdict if NO candidate lands (aborting on
+        # the first FAILED choice would defeat requesting n samples).
         choices = resp.get("choices") or []
+        first_failed = ""
         for choice in choices:
             msg = (choice.get("message") or {})
             text = str(msg.get("content") or "").strip()
             if not text:
                 continue
-            state.finish_reason = str(choice.get("finish_reason") or "")
             yield Event(EventKind.MESSAGE, text[:2000])
             if _looks_failed(text):
-                state.final_text = text
-                break
+                first_failed = first_failed or text
+                continue
             landed = self._land(state, text)
             if landed is not None:
-                state.final_text = text
                 yield landed
-                break
-        if not state.final_text and choices:
-            # No candidate produced a fence or an honest FAILED — record the
-            # first reply so the failure reason is inspectable.
-            state.final_text = str(((choices[0].get("message") or {}).get("content")) or "")
+                if state.landed_files:
+                    state.final_text = text
+                    state.finish_reason = str(choice.get("finish_reason") or "")
+                    break
+        if not state.final_text:
+            if first_failed:
+                state.final_text = first_failed
+            elif choices:
+                # No fence and no honest FAILED — keep the first reply so the
+                # failure reason is inspectable.
+                state.final_text = str(
+                    ((choices[0].get("message") or {}).get("content")) or "")
         yield Event(EventKind.RESULT, state.final_text[:2000] if state.final_text
                     else (state.error or "empty response"))
 
@@ -313,10 +331,15 @@ class OpenAICompatAdapter(ProverAdapter):
         model-declared ``-- FILE: <rel>`` header inside the fence; else the
         landing fails (and so, honestly, does the run).
         """
-        m = _LEAN_FENCE_RE.search(text)
-        if not m:
+        # A chatty reply may carry several fences (a sketch, then the full
+        # file). Landing the FIRST would land the snippet — and a snippet with
+        # no target declaration can slip past the whole-project build as a
+        # false proved. Take the LARGEST fence: the complete file dominates
+        # any sketch of itself.
+        fences = _LEAN_FENCE_RE.findall(text)
+        if not fences:
             return None
-        content = m.group(1)
+        content = max(fences, key=len)
         target = _resolve_target_file(self._graph_path, state.node, state.project_dir)
         if target is None:
             header = _FILE_HEADER_RE.match(content)

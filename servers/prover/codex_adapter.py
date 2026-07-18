@@ -136,6 +136,7 @@ class _CodexRun:
     # a usage dict; read defensively wherever one appears).
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
     turns: int = 0
 
 
@@ -221,7 +222,7 @@ class CodexAdapter(ProverAdapter):
         state: _CodexRun = run.handle
         text = (state.final_text or "").strip()
         usage = {"input_tokens": state.input_tokens, "output_tokens": state.output_tokens,
-                 "turns": state.turns}
+                 "cached_tokens": state.cached_tokens, "turns": state.turns}
         if state.timed_out:
             return ProofResult(
                 status="failed",
@@ -264,8 +265,13 @@ class CodexAdapter(ProverAdapter):
                 iu = obj["item"].get("usage")
                 usage = iu if isinstance(iu, dict) else None
             if usage:
+                # VERIFY-LIVE: assumes per-event usage deltas; if a codex build
+                # emits cumulative snapshots (or duplicates usage on nested and
+                # top-level events for the same tokens), this overcounts —
+                # check one live `codex exec --json` transcript.
                 state.input_tokens += int(usage.get("input_tokens") or 0)
                 state.output_tokens += int(usage.get("output_tokens") or 0)
+                state.cached_tokens += int(usage.get("cached_input_tokens") or 0)
                 state.turns += 1
             event, final, sid = _classify_codex_event(obj)
             if sid:

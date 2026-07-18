@@ -164,6 +164,11 @@ def prove(
     goal = run.goal or spec
 
     engine = triggers if triggers is not None else TriggerEngine(node_hint=node)
+    # Judge-usage BASELINE: a caller may inject one shared Steerer across many
+    # runs; stamping its cumulative counters would double-count earlier runs in
+    # every later ledger entry. Stamp per-run deltas instead.
+    judge_calls0 = getattr(judge, "calls", 0) or 0
+    judge_usage0 = dict(getattr(judge, "usage", None) or {})
 
     # Shared across the initial consume and any post-fold corrective consume, so
     # max_steers is a genuine per-run cap and the window never leaks across folds.
@@ -232,7 +237,11 @@ def prove(
         }
         judge_calls = getattr(judge, "calls", None)
         if judge_calls is not None:
-            usage["judge"] = {**(getattr(judge, "usage", None) or {}), "calls": judge_calls}
+            judge_now = getattr(judge, "usage", None) or {}
+            delta = {k: round(v - float(judge_usage0.get(k) or 0), 6)
+                     for k, v in judge_now.items()
+                     if isinstance(v, (int, float))}
+            usage["judge"] = {**delta, "calls": judge_calls - judge_calls0}
         meta["usage"] = usage
         meta["steering"] = {
             "capability": capability.value,
@@ -262,6 +271,10 @@ def prove(
         if folds:
             result.meta["gate_folds"] = folds
         if gate.ok:
+            _stamp_steering(result)  # refresh wall_seconds to include the gate
+            result.meta = {**result.meta, "verify": gate.checks}
+            if folds:
+                result.meta["gate_folds"] = folds
             return result
 
         logger.warning(
@@ -276,6 +289,10 @@ def prove(
         if not can_fold:
             # Terminal downgrade — the pre-fold behaviour, and the only path for
             # an IN_FLIGHT backend (whose result() must not be called twice).
+            _stamp_steering(result)  # refresh wall_seconds to include the gate
+            result.meta = {**result.meta, "verify": gate.checks}
+            if folds:
+                result.meta["gate_folds"] = folds
             result.meta["claimed_proved"] = True
             result.status = "failed"
             result.reason = f"verification gate: {gate.reason}"

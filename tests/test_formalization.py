@@ -94,8 +94,12 @@ def test_rollup_math_across_backends(tmp_path):
     assert entry["tokens"] == {"input": 1210, "output": 505, "runs": 3}
     assert entry["models"] == ["Aristotle", "muse-spark-1.1", "opus"]
     assert entry["cost"]["wall_time"] == "2h 7m"          # 7630s
+    # Notional sums SUBSCRIPTION entries only (claude: 1.25 + 0.01); the
+    # aristotle run is externally billed, never "subscription".
+    assert "subscription-based usage (1 runs" in entry["cost"]["spend_usd"]
     assert "notional API-equivalent $1.26" in entry["cost"]["spend_usd"]
     assert "API-billed runs: 1" in entry["cost"]["spend_usd"]
+    assert "externally-billed runs: 1" in entry["cost"]["spend_usd"]
 
 
 def test_torn_ledger_line_is_skipped(tmp_path):
@@ -221,3 +225,37 @@ def test_server_record_usage_never_raises(tmp_path):
     # A nonexistent project dir must not break the proof result path.
     _record_usage(str(tmp_path / "nope" / "deeper"), "N", "claude",
                   ProofResult(status="failed"))
+
+
+def test_sorry_scan_survives_comment_pathologies(tmp_path):
+    """Line comments mentioning /- must not swallow real code (undercount);
+    nested block comments and string literals must not add phantom sorries."""
+    (tmp_path / "A.lean").write_text(
+        "-- see the /- old attempt\n"
+        "theorem real : True := by sorry\n"
+        "-- end of notes -/\n"
+        "/- outer /- nested -/ still comment: sorry -/\n"
+        'def msg : String := "please do not sorry here"\n',
+        encoding="utf-8")
+    assert fz.count_sorries(tmp_path) == (1, 0)
+
+
+def test_update_tolerates_hand_typed_scalars(tmp_path):
+    """A human replacing machine-adjacent mappings with scalars gets a working
+    refresh, not a traceback."""
+    fz.init_formalization(tmp_path, name="X")
+    (tmp_path / "formalization.yaml").write_text(
+        "version: v0.3\n"
+        "project: {name: X, authors: [a], license: MIT}\n"
+        "sources: [{title: T, authors: [a], id: I}]\n"
+        "automation: autoform\n"          # scalar!
+        "status: in progress\n"           # scalar!
+        "review: {status: unchecked}\n",
+        encoding="utf-8")
+    fz.record_run(tmp_path, {"node": "A", "backend": "claude", "model": "opus",
+                             "billing": "subscription",
+                             "usage": {"worker": {"input_tokens": 1, "output_tokens": 1}}})
+    assert fz.update_formalization(tmp_path) is not None
+    data = _read_yaml(tmp_path)
+    assert data["status"]["sorry_count"] == 0
+    assert _autoform_entry(data)["tokens"]["runs"] == 1

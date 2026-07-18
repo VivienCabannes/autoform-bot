@@ -220,3 +220,46 @@ def test_event_stream_is_normalized(tmp_path, keyed):
     assert kinds[-1] is EventKind.RESULT
     # Re-entry yields nothing (request/response is one-shot).
     assert list(adapter.events(run)) == []
+
+
+def test_multi_fence_reply_lands_the_largest_fence(tmp_path, keyed):
+    """A chatty reply (sketch fence + full-file fence) must land the FULL file —
+    landing the first/snippet fence produced an end-to-end false proved."""
+    reply = (
+        "First a sketch:\n```lean\nexample : True := trivial\n```\n"
+        "Now the complete file:\n```lean\nimport Mathlib\n\n"
+        "theorem chernoff : True := trivial\n\n"
+        "theorem helper : 1 = 1 := rfl\n```\n")
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path),
+                                  transport=FakeTransport(_reply(reply)))
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=None)
+    assert result.proved
+    landed = (tmp_path / "Prob" / "Chernoff.lean").read_text()
+    assert "theorem chernoff" in landed and "import Mathlib" in landed
+    assert landed.strip() != "example : True := trivial"
+
+
+def test_second_sample_proves_after_first_fails(tmp_path, keyed):
+    """Requesting n candidates must examine all of them — aborting on the first
+    FAILED choice defeated the point of sampling."""
+    resp = {"choices": [
+        {"message": {"content": "FAILED — first attempt gave up"}, "finish_reason": "stop"},
+        {"message": {"content": PROOF_REPLY}, "finish_reason": "stop"},
+    ], "usage": {"prompt_tokens": 10, "completion_tokens": 20}}
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path), samples=2,
+                                  transport=FakeTransport(resp))
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=None)
+    assert result.proved
+    assert (tmp_path / "Prob" / "Chernoff.lean").exists()
+
+
+def test_graph_lean_file_is_sanitized(tmp_path, keyed):
+    """A traversal path in the plan's own lean_file pin must not escape."""
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path, lean_file="../ESCAPE.lean"),
+                                  transport=FakeTransport(_reply(PROOF_REPLY)))
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=None)
+    assert result.status == "failed"
+    assert not (tmp_path.parent / "ESCAPE.lean").exists()

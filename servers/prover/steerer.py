@@ -93,13 +93,17 @@ def _claude_cli_judge(prompt: str, *, timeout: int = 180) -> tuple[str, dict]:
         return "", {}
     try:
         obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            # A bare JSON scalar/array is not the envelope; treat as no reply
+            # rather than crashing — a judge that errors declines to steer.
+            return "", {}
         usage = obj.get("usage") or {}
         return str(obj.get("result", "")).strip(), {
             "input_tokens": int(usage.get("input_tokens") or 0),
             "output_tokens": int(usage.get("output_tokens") or 0),
             "cost_usd": float(obj.get("total_cost_usd") or 0.0),
         }
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
         # Older CLI or unexpected shape: fall back to treating stdout as the
         # reply text with no usage — never lose the verdict over accounting.
         return raw, {}
