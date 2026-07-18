@@ -148,6 +148,7 @@ class _ApiRun:
     finish_reason: str = ""
     done: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
+    backup: dict[str, Any] | None = None  # landed target's pre-land raw bytes, for restore-on-reject
 
 
 class OpenAICompatAdapter(ProverAdapter):
@@ -301,6 +302,10 @@ class OpenAICompatAdapter(ProverAdapter):
                  "turns": 1 if state.done else 0}
         meta = {"model": self._model, "usage": usage,
                 "finish_reason": state.finish_reason, "landed_path": state.landed_path}
+        if state.backup is not None:
+            # In-memory only: the driver consumes this to restore a clobbered target
+            # on gate rejection, then drops it — it is never persisted to the ledger.
+            meta["landed_backup"] = state.backup
         if state.error and not text:
             return ProofResult(status="failed", reason=state.error, backend=self.name,
                                landed_files=0, meta=meta)
@@ -350,6 +355,23 @@ class OpenAICompatAdapter(ProverAdapter):
             state.error = ("cannot resolve a target file for the landed proof: the plan "
                            "node has no lean_file and the reply declared no -- FILE: header")
             return Event(EventKind.ERROR, state.error)
+        # Snapshot THIS target's prior bytes BEFORE overwriting, so the driver can
+        # restore them if the honesty gate later rejects this claim (a request/
+        # response backend has no session to roll back, and the gate needs the file
+        # on disk, so we must write first). RAW BYTES: never decodes (a non-UTF-8
+        # prior cannot crash the run) and restores verbatim (no newline
+        # translation). The snapshot is committed to state ONLY after a successful
+        # write and keyed to the file that actually lands — so across multiple
+        # candidates the backup always names the file on disk, never an earlier
+        # candidate that failed to write. In-memory only; the driver pops it before
+        # the ledger ever sees the result.
+        existed = target.exists()
+        prior: bytes | None = None
+        if existed:
+            try:
+                prior = target.read_bytes()
+            except OSError:
+                prior = None  # unreadable at land time → restore can only warn
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content if content.endswith("\n") else content + "\n",
@@ -359,4 +381,5 @@ class OpenAICompatAdapter(ProverAdapter):
             return Event(EventKind.ERROR, state.error)
         state.landed_files = 1
         state.landed_path = str(target)
+        state.backup = {"path": str(target), "existed": existed, "prior": prior}
         return Event(EventKind.EDIT, f"landed {target}", path=str(target), payload=content)

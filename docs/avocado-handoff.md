@@ -99,13 +99,19 @@ ledger = the backend is real. Then check `.autoform/usage.jsonl` and
 
 ## Known limitations (documented, deliberate scope cuts)
 
-- **A failed avocado/openai run can overwrite an existing target file** with a
-  rejected candidate: `_land` writes before verification, and a request/
-  response backend has no session to restore the old content. The gate keeps
-  the *verdict* honest, but previously-good uncommitted content at that path
-  is clobbered. Mitigation until a backup/restore lands: run against
-  committed trees (the worktree-per-worker design in proposal #7 makes this
-  moot).
+- **[FIXED] A failed avocado/openai run overwriting an existing target file.**
+  Backup/restore has landed. `_land` still writes before verification (the gate
+  needs the file on disk), but it now records the target's pre-land bytes in
+  `meta["landed_backup"]`, and the driver restores them when the honesty gate
+  rejects the claim — rewriting the prior content, or deleting a file the run
+  newly created (`servers/prover/driver.py::_restore_landed`, keyed off the meta
+  contract not the backend name, so any request/response adapter gets it for
+  free). The backup lives in memory only and is popped before the ledger sees the
+  result; the tool response surfaces `landed_restored`. Covered by
+  `tests/test_openai_adapter.py::test_clobber_*`. Residual: the stale `.olean`
+  from the rejected build is left for the next `lake build` to recompile, so
+  running against committed trees / worktree-per-worker (proposal #7) is still
+  the cleanest isolation.
 
 ## Future work (explicitly out of scope on the personal laptop)
 

@@ -223,7 +223,8 @@ def create_prover_server() -> FastMCP:
         # gate's checks, fold count, dropped steers — so the orchestrator (and a
         # human reading the tool output) sees WHY a verdict is what it is.
         meta = result.meta or {}
-        for key in ("steering", "verify", "gate_folds", "dropped_steers", "sub_status", "usage"):
+        for key in ("steering", "verify", "gate_folds", "dropped_steers", "sub_status",
+                    "landed_restored", "usage"):
             if key in meta:
                 payload[key] = meta[key]
         return json.dumps(payload, indent=2)

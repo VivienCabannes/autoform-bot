@@ -198,6 +198,130 @@ def test_gate_rejection_downgrades_without_fold(tmp_path, keyed):
     assert len(transport.calls) == 1        # exactly one API call, no fold retry
 
 
+def test_clobber_restored_when_gate_rejects(tmp_path, keyed):
+    """Request/response backends write BEFORE the gate runs; if the gate rejects,
+    previously-good (uncommitted) content at the target must be restored, not lost."""
+    landed = tmp_path / "Prob" / "Chernoff.lean"
+    landed.parent.mkdir(parents=True)
+    prior = "import Mathlib\n\ntheorem chernoff : True := trivial  -- GOOD prior proof\n"
+    landed.write_text(prior, encoding="utf-8")
+
+    transport = FakeTransport(_reply(PROOF_REPLY))
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path), transport=transport)
+    verifier = _FakeVerifier([VerifyResult(ok=False, reason="sorry remains")])
+
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=verifier)
+
+    assert result.status == "failed"
+    assert result.meta.get("landed_restored") is True
+    assert "landed_backup" not in result.meta          # content consumed, not persisted
+    assert landed.read_text() == prior                  # prior good content restored verbatim
+
+
+def test_clobber_new_file_removed_when_gate_rejects(tmp_path, keyed):
+    """When the run CREATED the target, a gate rejection removes it — there was no
+    prior content, so leaving a rejected candidate on disk would be the clobber."""
+    landed = tmp_path / "Prob" / "Chernoff.lean"
+    assert not landed.exists()
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path),
+                                  transport=FakeTransport(_reply(PROOF_REPLY)))
+    verifier = _FakeVerifier([VerifyResult(ok=False, reason="does not compile")])
+
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=verifier)
+
+    assert result.status == "failed"
+    assert result.meta.get("landed_restored") is True
+    assert not landed.exists()                          # newly-created rejected file removed
+
+
+def test_gate_pass_keeps_landed_file_and_drops_backup(tmp_path, keyed):
+    """When the gate accepts, the landed proof stays and the backup bookkeeping is
+    dropped (it must never reach the ledger)."""
+    landed = tmp_path / "Prob" / "Chernoff.lean"
+    landed.parent.mkdir(parents=True)
+    landed.write_text("-- old placeholder\n", encoding="utf-8")
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path),
+                                  transport=FakeTransport(_reply(PROOF_REPLY)))
+    verifier = _FakeVerifier([VerifyResult(ok=True)])
+
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=verifier)
+
+    assert result.proved
+    assert "theorem chernoff : True := trivial" in landed.read_text()  # new proof kept
+    assert "landed_backup" not in result.meta
+    assert "landed_restored" not in result.meta         # no restore happened on the pass path
+
+
+def test_clobber_restore_is_byte_exact_even_for_non_utf8_prior(tmp_path, keyed):
+    """The prior is backed up as RAW BYTES: a non-UTF-8 / CRLF target must neither
+    crash the run (no decode) nor be mangled on restore (no newline translation)."""
+    landed = tmp_path / "Prob" / "Chernoff.lean"
+    landed.parent.mkdir(parents=True)
+    prior = b"import Mathlib\r\ntheorem chernoff : True := trivial\r\n-- raw \x89\xff bytes\r\n"
+    landed.write_bytes(prior)
+
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path),
+                                  transport=FakeTransport(_reply(PROOF_REPLY)))
+    verifier = _FakeVerifier([VerifyResult(ok=False, reason="rejected")])
+
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=verifier)
+
+    assert result.status == "failed"                    # run did not crash on the non-UTF-8 prior
+    assert result.meta.get("landed_restored") is True
+    assert landed.read_bytes() == prior                 # CRLF + non-UTF-8 bytes restored verbatim
+
+
+def test_backup_tracks_the_file_that_actually_lands(tmp_path, keyed):
+    """samples>1 + header fallback: if an earlier candidate resolves a target it
+    CANNOT write and a later candidate lands a DIFFERENT file, backup/restore must
+    track the file that actually landed — not the first target resolved."""
+    prob = tmp_path / "Prob"
+    prob.mkdir(parents=True)
+    (prob / "A.lean").mkdir()                            # A is a dir → writing it as a file fails
+    b = prob / "B.lean"
+    b_prior = "import Mathlib\ntheorem b_good : True := trivial\n"
+    b.write_text(b_prior, encoding="utf-8")
+
+    resp = {"choices": [
+        {"message": {"content": "```lean\n-- FILE: Prob/A.lean\nimport Mathlib\ntheorem a : True := trivial\n```"},
+         "finish_reason": "stop"},
+        {"message": {"content": "```lean\n-- FILE: Prob/B.lean\nimport Mathlib\ntheorem b_bad : True := trivial\n```"},
+         "finish_reason": "stop"},
+    ], "usage": {"prompt_tokens": 10, "completion_tokens": 20}}
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path, lean_file=None), samples=2,
+                                  transport=FakeTransport(resp))
+    verifier = _FakeVerifier([VerifyResult(ok=False, reason="rejected")])
+
+    result = prove(adapter, "Chernoff bound", "spec", str(tmp_path),
+                   steerer=_FakeSteerer(), verifier=verifier)
+
+    assert result.status == "failed"
+    assert result.meta.get("landed_restored") is True
+    assert b.read_text() == b_prior                      # the LANDED file is the one restored
+
+
+def test_restore_leaves_unreadable_prior_untouched(tmp_path):
+    """existed=True but prior=None (unreadable at land time): the driver must NOT
+    delete the file (that would also lose data) and reports landed_restored=False."""
+    from servers.prover.base import ProofResult
+    from servers.prover.driver import _restore_landed
+
+    f = tmp_path / "T.lean"
+    f.write_text("rejected candidate on disk\n", encoding="utf-8")
+    result = ProofResult(status="failed",
+                         meta={"landed_backup": {"path": str(f), "existed": True, "prior": None}})
+
+    _restore_landed(result)
+
+    assert result.meta["landed_restored"] is False
+    assert f.read_text() == "rejected candidate on disk\n"  # left as-is, NOT deleted
+    assert "landed_backup" not in result.meta              # content consumed
+
+
 def test_make_adapter_knows_openai_and_avocado(monkeypatch):
     from servers.prover.server import _make_adapter
 

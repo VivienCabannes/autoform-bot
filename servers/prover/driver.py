@@ -54,6 +54,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from .base import ProofResult, ProverAdapter, SteeringCapability
@@ -96,6 +97,44 @@ def _fold_correction(reason: str) -> str:
         "Fix exactly this in the project and reconfirm. If it cannot be fixed "
         "honestly, reply with FAILED — <the concrete blocker>."
     )
+
+
+def _restore_landed(result: ProofResult) -> None:
+    """Undo a request/response backend's landed file when its claim did NOT stand.
+
+    A ``SteeringCapability.NONE`` adapter (openai/avocado) has no session to roll
+    back, so it writes its candidate to the target BEFORE the honesty gate runs
+    (the gate needs the file on disk) and records the landed target's pre-land raw
+    bytes in ``meta['landed_backup']``. If the gate then rejects the claim, the
+    previously good — possibly uncommitted, hence unrecoverable from git — content
+    at that path would be lost. This restores it byte-exact: rewrite the prior
+    bytes, or delete a file the run newly created. An ``existed`` target whose
+    prior bytes could not be read (``prior is None``) is left as-is with
+    ``landed_restored=False`` (deleting it would also lose data). Keyed off the
+    meta contract, not the backend name, so ANY request/response adapter recording
+    a backup gets restore-on-reject for free; the backup content is popped here so
+    it never reaches the ledger. Best-effort: never raises. (The stale ``.olean``
+    from the rejected build is left for the next ``lake build`` to recompile.)
+    """
+    meta = result.meta if isinstance(result.meta, dict) else {}
+    result.meta = meta
+    backup = meta.pop("landed_backup", None)
+    if not isinstance(backup, dict) or not backup.get("path"):
+        return
+    path = Path(backup["path"])
+    try:
+        if backup.get("existed"):
+            prior = backup.get("prior")
+            if prior is None:
+                meta["landed_restored"] = False  # existed but was unreadable at land time
+                return
+            path.write_bytes(prior)              # raw bytes → byte-exact restore
+        elif path.exists():
+            path.unlink()
+        meta["landed_restored"] = True
+    except OSError as err:
+        logger.warning("driver: could not restore clobbered %s: %s", path, err)
+        meta["landed_restored"] = False
 
 
 def prove(
@@ -258,6 +297,11 @@ def prove(
     _stamp_steering(result)
 
     if not (result.proved and verifier is not None):
+        # No gate on this path (honest failure, or gate disabled → an unverified
+        # proved claim stands and its landed file is kept). Nothing to undo — drop
+        # the backup bookkeeping so it never lingers in the returned result.
+        if isinstance(result.meta, dict):
+            result.meta.pop("landed_backup", None)
         return result
 
     # Honesty gate: a backend's "proved" is the worker's CLAIM. Independently verify
@@ -275,6 +319,7 @@ def prove(
             result.meta = {**result.meta, "verify": gate.checks}
             if folds:
                 result.meta["gate_folds"] = folds
+            result.meta.pop("landed_backup", None)  # proof stands — target is correct; drop the backup
             return result
 
         logger.warning(
@@ -296,6 +341,7 @@ def prove(
             result.meta["claimed_proved"] = True
             result.status = "failed"
             result.reason = f"verification gate: {gate.reason}"
+            _restore_landed(result)  # undo a clobbered target (no-session backend); no-op otherwise
             return result
 
         folds += 1
