@@ -131,6 +131,7 @@ class _CodexRun:
     extra_args: list[str] = field(default_factory=list)
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
+    dropped_steers: int = 0             # steers skipped for lack of a session id
 
 
 class CodexAdapter(ProverAdapter):
@@ -195,6 +196,7 @@ class CodexAdapter(ProverAdapter):
                 if not state.session_id:
                     # No session captured → cannot resume with context; drop the steer
                     # rather than run a context-less turn (best-effort, never raises).
+                    state.dropped_steers += 1
                     logger.info("codex adapter: no session id; dropping steer (no resume context)")
                     break
                 yield from self._run_turn(state, correction, resume=True)
@@ -224,13 +226,17 @@ class CodexAdapter(ProverAdapter):
                       "sub_status": "timeout"},
             )
         proved = not _looks_failed(text)
+        meta: dict[str, Any] = {"session_id": state.session_id,
+                                "model": state.model or "codex-default"}
+        if state.dropped_steers:
+            meta["dropped_steers"] = state.dropped_steers
         return ProofResult(
             status="proved" if proved else "failed",
             proof_text=text,
             reason="" if proved else _failure_reason(text),
             backend=self.name,
             landed_files=0,  # files are written in-place by codex's own tools
-            meta={"session_id": state.session_id, "model": state.model or "codex-default"},
+            meta=meta,
         )
 
     # ---------------------------------------------------------------- internals

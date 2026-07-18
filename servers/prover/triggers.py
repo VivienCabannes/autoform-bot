@@ -45,6 +45,7 @@ SIGNAL_STALL = "stall"
 SIGNAL_FORBIDDEN = "forbidden_token"
 
 _SORRY_RE = re.compile(r"\b(?:sorry|admit)\b")
+_WORD_RE = re.compile(r"[a-z0-9]+")
 # A NEW axiom keyword at line start, or native_decide anywhere. Deliberately
 # high-precision (an `axiom` inside an identifier like `axiom_of_choice` does
 # not match): a trigger is an early-warning steer, not the gate — the honesty
@@ -106,9 +107,13 @@ class TriggerEngine:
     the dispatch layer can fold that into the *next attempt's* prompt.
 
     Args:
-        node_hint: The target node id (e.g. ``"Foo.Bar.baz_thm"``); used to
-            classify edit paths as on-goal/off-goal. ``""`` disables the
-            off-goal signal (no hint → never flag).
+        node_hint: The target node id — either a natural-language plan id
+            (``"Chernoff bound"``, the production shape per the plan schema) or
+            a dotted Lean-style name (``"Foo.Bar.baz_thm"``). Split into words
+            and matched against the *whole words* of an edit path, so
+            ``Chernoff bound`` matches ``ProbBook/Chernoff.lean`` while
+            ``Bar`` does NOT match ``Barrier/``. ``""`` disables the off-goal
+            signal (no hint → never flag).
         config: Thresholds and cooldowns.
         clock: Injectable monotonic clock (tests pass a fake).
     """
@@ -122,7 +127,7 @@ class TriggerEngine:
     ) -> None:
         self._cfg = config or TriggerConfig()
         self._clock = clock
-        self._goal_tokens = [t for t in node_hint.split(".") if len(t) > 2]
+        self._goal_words = {w for w in _WORD_RE.findall(node_hint.lower()) if len(w) > 2}
         self._goal_path = (node_hint.replace(".", "/") + ".lean") if node_hint else ""
         self._fp_counts: Counter[str] = Counter()
         self._fp_fired: set[str] = set()
@@ -172,16 +177,18 @@ class TriggerEngine:
 
     # ------------------------------------------------------------- internals
 
-    def _emit(self, out: list[Trigger], signal: str, detail: str, correction: str = "") -> None:
+    def _emit(self, out: list[Trigger], signal: str, detail: str, correction: str = "") -> bool:
+        """Fire ``signal`` unless its cooldown swallows it; True iff it fired."""
         now = self._clock()
         cooldown = self._cfg.cooldown_s.get(signal, 300.0)
         last = self._last_fired.get(signal)
         if last is not None and (now - last) < cooldown:
             self.suppressed[signal] += 1
-            return
+            return False
         self._last_fired[signal] = now
         self.fired[signal] += 1
         out.append(Trigger(signal=signal, detail=detail, correction=correction))
+        return True
 
     def _observe_error(self, out: list[Trigger], event: Event) -> None:
         fp = error_fingerprint(event.content)
@@ -190,11 +197,13 @@ class TriggerEngine:
         self._fp_counts[fp] += 1
         n = self._fp_counts[fp]
         # Each distinct fingerprint fires at most once (repeats past the
-        # threshold are the SAME stuck loop, not new information).
+        # threshold are the SAME stuck loop, not new information) — but it is
+        # consumed only by an ACTUAL fire: a threshold-crossing swallowed by the
+        # signal cooldown re-arms, so the loop gets its steer on a later repeat
+        # instead of losing it for the whole run.
         if n >= self._cfg.repeat_error_threshold and fp not in self._fp_fired:
-            self._fp_fired.add(fp)
             first_line = (event.content or "").strip().splitlines()[0][:200]
-            self._emit(
+            fired = self._emit(
                 out, SIGNAL_REPEATED_ERROR,
                 f"same error x{n}: {first_line}",
                 correction=(
@@ -204,6 +213,8 @@ class TriggerEngine:
                     "before editing again."
                 ),
             )
+            if fired:
+                self._fp_fired.add(fp)
 
     def _observe_edit(self, out: list[Trigger], event: Event) -> None:
         payload = event.payload or ""
@@ -255,9 +266,13 @@ class TriggerEngine:
                     )
 
     def _on_goal(self, path: str) -> bool:
-        if not self._goal_tokens and not self._goal_path:
+        if not self._goal_words and not self._goal_path:
             return True  # no hint → never flag an edit as off-goal
         p = path.lower()
         if self._goal_path and p.endswith(self._goal_path.lower()):
             return True
-        return any(t.lower() in p for t in self._goal_tokens)
+        # Whole-word overlap, with the ``.lean`` extension dropped first so the
+        # word "lean" in a hint can never blanket-match every source file. Word
+        # matching (not substring) keeps "Bar" from matching "Barrier".
+        stem = p[:-5] if p.endswith(".lean") else p
+        return bool(self._goal_words & set(_WORD_RE.findall(stem)))

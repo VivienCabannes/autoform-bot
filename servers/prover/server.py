@@ -130,8 +130,12 @@ def create_prover_server() -> FastMCP:
                 default so it can actually Edit/Write/Bash.
 
         Returns:
-            JSON ``{node_id, backend, status, reason, landed_files, proof_text}``
-            where ``status`` is "proved" or "failed".
+            JSON ``{node_id, backend, status, reason, landed_files, proof_text,
+            steering, verify, gate_folds}`` where ``status`` is "proved" or
+            "failed", ``steering`` is the run's telemetry ({capability, policy,
+            steers, signals}), ``verify`` the honesty gate's checks, and
+            ``gate_folds`` how many times a rejected claim was folded back as a
+            corrective turn (absent when zero).
         """
         try:
             result = run_prove_node(
@@ -149,17 +153,22 @@ def create_prover_server() -> FastMCP:
                 {"node_id": node_id, "backend": backend, "status": "failed", "reason": str(err)},
                 indent=2,
             )
-        return json.dumps(
-            {
-                "node_id": node_id,
-                "backend": result.backend,
-                "status": result.status,
-                "reason": result.reason,
-                "landed_files": result.landed_files,
-                "proof_text": result.proof_text[:4000],
-            },
-            indent=2,
-        )
+        payload = {
+            "node_id": node_id,
+            "backend": result.backend,
+            "status": result.status,
+            "reason": result.reason,
+            "landed_files": result.landed_files,
+            "proof_text": result.proof_text[:4000],
+        }
+        # Surface the driver's audit trail: steering telemetry, the honesty
+        # gate's checks, fold count, dropped steers — so the orchestrator (and a
+        # human reading the tool output) sees WHY a verdict is what it is.
+        meta = result.meta or {}
+        for key in ("steering", "verify", "gate_folds", "dropped_steers", "sub_status"):
+            if key in meta:
+                payload[key] = meta[key]
+        return json.dumps(payload, indent=2)
 
     return server
 

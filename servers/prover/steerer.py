@@ -151,25 +151,28 @@ class Steerer:
     calls: int = field(default=0, init=False)
     _last_call: float = field(default=0.0, init=False)
     _reasons: list[str] = field(default_factory=list, init=False)
-    # Cache so off_course() + correction() over the SAME window cost one judge call.
-    _cached_key: int | None = field(default=None, init=False)
+    # Cache so off_course() + correction() over the SAME window cost one judge
+    # call. Keyed on the window OBJECT (a held strong reference — so a freed
+    # list's id can never be recycled into a stale cache hit) plus its length
+    # (the driver appends in place, so growth invalidates).
+    _cached_window: Any = field(default=None, init=False, repr=False)
+    _cached_len: int = field(default=-1, init=False)
     _cached: dict[str, Any] | None = field(default=None, init=False)
 
     def _decide(self, goal: str, window: Sequence[Event]) -> dict[str, Any] | None:
         """Run (or reuse) the judge for this window; returns the parsed verdict.
 
-        The decision is cached on ``(id(window), len(window))`` so that the driver's
-        paired ``off_course`` / ``correction`` calls over one window invoke the
-        judge once.
+        The decision is cached on the window object identity + length so that the
+        driver's paired ``off_course`` / ``correction`` calls over one window
+        invoke the judge once.
         """
-        key = (id(window), len(window))
-        cache_key = hash(key)
-        if self._cached_key == cache_key:
+        if self._cached_window is window and self._cached_len == len(window):
             return self._cached
 
         # Reset cache for this window up front so a rate-limit/no-op short-circuit
         # below is still remembered (we don't re-call the judge for correction()).
-        self._cached_key = cache_key
+        self._cached_window = window
+        self._cached_len = len(window)
         self._cached = None
 
         rendered = _render_window(window)

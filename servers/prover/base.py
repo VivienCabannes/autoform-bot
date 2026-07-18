@@ -207,6 +207,14 @@ class ProverAdapter(abc.ABC):
         An iterator (generator). Each item is a normalized :class:`Event`; the
         driver appends it to the steer window. When the iterator is exhausted the
         run is finished and the driver calls :meth:`result`.
+
+        RE-ENTRANCY CONTRACT (fold-capable adapters): for a backend whose
+        :attr:`steering` is ``BETWEEN_TURNS`` or ``AT_TOOL_CALLS``, the driver's
+        verify-gate fold may call :meth:`steer` *after* this iterator exhausted
+        and then call ``events(run)`` **again**. That re-entry must run ONLY the
+        queued corrective turn — never replay the initial turn. The CLI adapters
+        implement this with a ``started`` flag on their run state; a new
+        fold-capable adapter must do the equivalent.
         """
 
     @abc.abstractmethod

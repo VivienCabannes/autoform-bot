@@ -153,6 +153,53 @@ def test_off_goal_disabled_without_hint():
         assert eng.observe(_edit("src/Anywhere/File.lean", "x")) == []
 
 
+def test_natural_language_node_id_matches_its_file():
+    """Production node ids are plan phrases ('Chernoff bound'), not dotted Lean
+    names — the on-goal match must work word-wise, or every edit of an on-goal
+    run gets flagged (the adversarial-review bug)."""
+    eng, _ = _engine(node_hint="Chernoff bound")
+    assert eng.observe(_edit("ProbBook/Chernoff.lean", "x")) == []
+    assert eng.observe(_edit("ProbBook/Chernoff.lean", "x")) == []
+    assert eng.observe(_edit("ProbBook/Bound.lean", "x")) == []   # word "bound" matches
+    assert eng.fired[SIGNAL_OFF_GOAL] == 0
+
+
+def test_word_match_rejects_substring_false_positives():
+    """'Bar' must NOT match 'Barrier' — whole-word matching, not substring
+    (the other half of the adversarial-review bug)."""
+    eng, _ = _engine(node_hint="Foo.Bar.baz_thm")
+    eng.observe(_edit("src/Barrier/One.lean", "x"))
+    fired = eng.observe(_edit("src/Barrier/Two.lean", "x"))
+    assert [t.signal for t in fired] == [SIGNAL_OFF_GOAL]
+
+
+def test_lean_extension_never_counts_as_goal_word():
+    # A node mentioning "Lean" must not blanket-match every .lean file via
+    # the extension; only real stem words count.
+    eng, _ = _engine(node_hint="Lean encoding of graphs")
+    eng.observe(_edit("src/Other/Qux.lean", "x"))
+    fired = eng.observe(_edit("src/Other/Zap.lean", "x"))
+    assert [t.signal for t in fired] == [SIGNAL_OFF_GOAL]
+    eng2, _ = _engine(node_hint="Lean encoding of graphs")
+    assert eng2.observe(_edit("src/Graphs/Encoding.lean", "x")) == []  # real word hit
+
+
+def test_suppressed_fingerprint_rearms_after_cooldown():
+    """A threshold-crossing swallowed by the signal cooldown must NOT consume
+    the fingerprint's one fire (the adversarial-review bug): the loop gets its
+    steer on a later repeat once the cooldown clears."""
+    eng, clock = _engine()
+    for _ in range(3):
+        eng.observe(_err("error: alpha failed"))                # alpha fires at t=0
+    for _ in range(3):
+        eng.observe(_err("error: beta failed"))                 # beta crossing suppressed
+    assert eng.suppressed[SIGNAL_REPEATED_ERROR] == 1
+    clock.t = 1000                                              # cooldown cleared
+    fired = eng.observe(_err("error: beta failed"))             # beta repeats → re-armed
+    assert [t.signal for t in fired] == [SIGNAL_REPEATED_ERROR]
+    assert eng.fired[SIGNAL_REPEATED_ERROR] == 2
+
+
 def test_stall_fires_on_quiet_reasoning_and_resets():
     eng, clock = _engine(config=TriggerConfig(stall_seconds=900))
     eng.observe(_edit("A.lean", "x"))                           # progress at t=0
