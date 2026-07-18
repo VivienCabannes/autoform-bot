@@ -45,7 +45,7 @@ from servers.aristotle.core import (
     load_node,
 )
 
-from .base import Event, EventKind, ProofResult, ProverAdapter, Run
+from .base import Event, EventKind, ProofResult, ProverAdapter, Run, SteeringCapability
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,11 @@ class AristotleAdapter(ProverAdapter):
     """
 
     name = "aristotle"
+    #: Aristotle accepts a mid-run correction on the LIVE task (``project.ask``),
+    #: so the per-event judge steers it in flight. Its ``result()`` is terminal
+    #: (files landed, private loop closed), so the driver never folds a rejected
+    #: claim back into it — a gate failure downgrades immediately.
+    steering = SteeringCapability.IN_FLIGHT
 
     def __init__(
         self,

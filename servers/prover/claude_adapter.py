@@ -61,7 +61,7 @@ from ._cli_common import (
     _subprocess_line_runner,
     build_worker_prompt,
 )
-from .base import Event, EventKind, ProofResult, ProverAdapter, Run
+from .base import Event, EventKind, ProofResult, ProverAdapter, Run, SteeringCapability
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,10 @@ class ClaudeAdapter(ProverAdapter):
     """
 
     name = "claude"
+    #: Turn-granular: a correction lands only as the next ``--resume`` turn, so
+    #: the driver skips the per-event judge by default and steers this backend
+    #: via the verify-gate fold. See :class:`~servers.prover.base.SteeringCapability`.
+    steering = SteeringCapability.BETWEEN_TURNS
 
     def __init__(
         self,
@@ -250,9 +254,15 @@ class ClaudeAdapter(ProverAdapter):
         state: _ClaudeRun = run.handle
 
         try:
-            # First turn: system prompt + spec.
-            first_prompt = _build_spec_prompt(state.node, state.spec)
-            yield from self._run_turn(state, first_prompt, resume=False)
+            # First turn: system prompt + spec. Guarded so the generator is
+            # RE-ENTRANT: after the initial call exhausted the stream, the
+            # driver's verify-gate fold queues a steer and calls events() again —
+            # that re-entry must run ONLY the corrective resume turn below,
+            # never replay the first turn.
+            if not state.started:
+                state.started = True
+                first_prompt = _build_spec_prompt(state.node, state.spec)
+                yield from self._run_turn(state, first_prompt, resume=False)
 
             # Drain any steers the driver queued during the turn (turn-granular
             # steering — see the module docstring on the mechanism).

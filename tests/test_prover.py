@@ -18,7 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from servers.prover.base import Event, EventKind, ProofResult, ProverAdapter, Run
+from servers.prover.base import (
+    Event,
+    EventKind,
+    ProofResult,
+    ProverAdapter,
+    Run,
+    SteeringCapability,
+)
 from servers.prover.claude_adapter import ClaudeAdapter, _classify_stream_event, _looks_failed
 from servers.prover.driver import prove
 from servers.prover.steerer import Steerer
@@ -39,6 +46,10 @@ class FakeAdapter(ProverAdapter):
     """
 
     name = "fake"
+    # A live fake: its steer() acts immediately, so declare IN_FLIGHT — the
+    # driver's default judge_policy ("auto") then live-judges it, and the legacy
+    # driver/steerer equivalence tests below exercise the cadence loop unchanged.
+    steering = SteeringCapability.IN_FLIGHT
 
     def __init__(self, script: list[Event], final: ProofResult) -> None:
         self._script = script
@@ -352,7 +363,10 @@ def test_claude_adapter_steer_resumes_session():
     # it as a resumed follow-up turn.
     steerer = FakeSteerer(steer_at={2})
 
-    result = prove(adapter, "T", "prove True", "/proj", max_steers=1, steerer=steerer, verifier=None)
+    # ClaudeAdapter is BETWEEN_TURNS, so the per-event judge needs "always"
+    # (the default "auto" reserves it for in-flight backends).
+    result = prove(adapter, "T", "prove True", "/proj", max_steers=1, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert result.proved
     assert "theorem t" in result.proof_text
@@ -434,7 +448,8 @@ def test_claude_steer_without_session_is_dropped():
     adapter = ClaudeAdapter(runner=runner)
     steerer = FakeSteerer(steer_at={1})  # driver queues a steer during the turn
 
-    result = prove(adapter, "T", "spec", "/proj", max_steers=1, steerer=steerer, verifier=None)
+    result = prove(adapter, "T", "spec", "/proj", max_steers=1, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert len(runner.calls) == 1              # no second (context-free) turn launched
     assert result.proved                       # verdict comes from the REAL turn

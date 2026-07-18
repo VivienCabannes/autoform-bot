@@ -44,7 +44,7 @@ from ._cli_common import (
     _subprocess_line_runner,
     build_worker_prompt,
 )
-from .base import Event, EventKind, ProofResult, ProverAdapter, Run
+from .base import Event, EventKind, ProofResult, ProverAdapter, Run, SteeringCapability
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,7 @@ class _CodexRun:
     session_id: str = ""
     pending_steer: str | None = None
     final_text: str = ""
+    started: bool = False
     extra_args: list[str] = field(default_factory=list)
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
@@ -139,6 +140,9 @@ class CodexAdapter(ProverAdapter):
     """
 
     name = "codex"
+    #: Turn-granular, exactly like the Claude CLI: corrections land as the next
+    #: ``codex exec resume`` turn; the driver steers this backend via the fold.
+    steering = SteeringCapability.BETWEEN_TURNS
 
     def __init__(
         self,
@@ -173,9 +177,14 @@ class CodexAdapter(ProverAdapter):
         state: _CodexRun = run.handle
         try:
             # codex exec has no separate system-prompt flag, so the worker discipline is
-            # prepended to the first user prompt.
-            first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
-            yield from self._run_turn(state, first, resume=False)
+            # prepended to the first user prompt. Guarded for RE-ENTRANCY: the
+            # driver's verify-gate fold re-enters events() after the stream
+            # exhausted, and that re-entry must run ONLY the corrective resume
+            # turn, never replay the first turn.
+            if not state.started:
+                state.started = True
+                first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
+                yield from self._run_turn(state, first, resume=False)
 
             while state.pending_steer:
                 correction = state.pending_steer
