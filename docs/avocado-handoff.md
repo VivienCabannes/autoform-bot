@@ -84,6 +84,29 @@ ledger = the backend is real. Then check `.autoform/usage.jsonl` and
 - **Internal surface is a Python SDK**: mirror `aristotle_adapter.py` (lazy
   import, injectable fake lib, sync ABC surface over an async core).
 
+## Two-minute live probes to run on ANY laptop with claude/codex access
+
+- **Claude cost accounting (VERIFY-LIVE, flagged in claude_adapter.py):** the
+  adapter SUMS each turn's `total_cost_usd`/`usage` across `--resume` turns on
+  the reasoning that each `claude -p` invocation reports its own turn. Verify:
+  `claude -p "hi" --output-format json` (note cost/usage), then
+  `claude --resume <session_id> -p "hi again" --output-format json`. If the
+  second figure is its own tiny turn → the code is correct; if it's roughly
+  first + tiny → it's session-cumulative and the adapter must diff, not sum.
+- **Codex usage events:** confirm on one `codex exec --json` transcript that
+  usage dicts are per-event deltas, not cumulative snapshots (the adapter sums
+  every usage dict it sees).
+
+## Known limitations (documented, deliberate scope cuts)
+
+- **A failed avocado/openai run can overwrite an existing target file** with a
+  rejected candidate: `_land` writes before verification, and a request/
+  response backend has no session to restore the old content. The gate keeps
+  the *verdict* honest, but previously-good uncommitted content at that path
+  is clobbered. Mitigation until a backup/restore lands: run against
+  committed trees (the worktree-per-worker design in proposal #7 makes this
+  moot).
+
 ## Future work (explicitly out of scope on the personal laptop)
 
 - **Agent mode** (tool loop via chat-completions tool-calling, proposal #4's
