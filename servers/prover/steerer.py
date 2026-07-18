@@ -145,6 +145,10 @@ class Steerer:
 
     min_gap_s: float = 120.0
     judge: Judge = _claude_cli_judge
+    #: How many times the underlying judge was actually invoked this run —
+    #: telemetry for the trigger-gated policy (expected ≈ one per fired
+    #: judgement-call signal, an order of magnitude below per-window cadence).
+    calls: int = field(default=0, init=False)
     _last_call: float = field(default=0.0, init=False)
     _reasons: list[str] = field(default_factory=list, init=False)
     # Cache so off_course() + correction() over the SAME window cost one judge call.
@@ -177,6 +181,7 @@ class Steerer:
             return None  # rate-limited: decline without spending a judge call
 
         prompt = _build_prompt(goal, window, self._reasons)
+        self.calls += 1
         raw = self.judge(prompt)
         self._last_call = now
         decision = _parse_decision(raw)

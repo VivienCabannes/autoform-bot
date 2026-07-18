@@ -135,8 +135,20 @@ def _classify_stream_event(obj: dict[str, Any]) -> Event | None:
                 tin = block.get("input", {})
                 # Edits to .lean files are the load-bearing "edit" signal.
                 target = str(tin.get("file_path") or tin.get("path") or "")
-                kind = EventKind.EDIT if name in ("Edit", "Write", "MultiEdit") else EventKind.TOOL
-                return Event(kind, f"{name} {target}".strip(), raw=obj)
+                if name in ("Edit", "Write", "MultiEdit"):
+                    # Normalize the WRITTEN text into Event.payload so the
+                    # structured triggers (sorry-count, forbidden-token) stay
+                    # backend-agnostic. Write carries `content`, Edit
+                    # `new_string`, MultiEdit a list of edits.
+                    payload = str(tin.get("new_string") or tin.get("content") or "")
+                    if not payload and isinstance(tin.get("edits"), list):
+                        payload = "\n".join(
+                            str(e.get("new_string", ""))
+                            for e in tin["edits"] if isinstance(e, dict)
+                        )
+                    return Event(EventKind.EDIT, f"{name} {target}".strip(), raw=obj,
+                                 path=target, payload=payload)
+                return Event(EventKind.TOOL, f"{name} {target}".strip(), raw=obj, path=target)
         return None
 
     if etype == "user":

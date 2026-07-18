@@ -153,19 +153,21 @@ def test_auto_policy_skips_judge_for_between_turns():
     assert steerer.off_course_calls == 0  # …and the judge was never even consulted
 
 
-def test_auto_policy_runs_judge_for_in_flight():
+def test_auto_policy_in_flight_is_trigger_gated_not_cadence():
+    """Under ``auto`` even an in-flight backend is not cadence-judged: with no
+    structured trigger firing, the judge is never consulted. (The positive
+    trigger-fires cases live in test_triggers.py.)"""
     adapter = _FoldFakeAdapter(
         capability=SteeringCapability.IN_FLIGHT,
-        script=[_ev(EventKind.EDIT) for _ in range(3)],
-        # In-flight steers act on the live run; the fake's corrective replay is
-        # irrelevant here (no fold for IN_FLIGHT) — silence it.
+        script=[_ev(EventKind.EDIT) for _ in range(3)],  # no path/payload → no signals
         corrective_script=[],
         results=[_proved()],
     )
-    result = prove(adapter, "N", "spec", "/proj",
-                   steerer=_FakeSteerer(steer_at={2}), verifier=None)
+    steerer = _FakeSteerer(steer_at={1, 2, 3})
+    result = prove(adapter, "N", "spec", "/proj", steerer=steerer, verifier=None)
     assert result.proved
-    assert adapter.steers == ["course-correct at 2"]
+    assert adapter.steers == []
+    assert steerer.off_course_calls == 0
 
 
 def test_always_policy_restores_judge_for_between_turns():

@@ -16,16 +16,19 @@ The contract::
 1. ``adapter.start`` launches the run.
 2. We consume ``adapter.events`` one at a time, appending each to a rolling
    ``window``.
-3. While under the ``max_steers`` cap, we ask the shared steerer whether the run
-   is off-course; if so we inject ``adapter.steer(run, correction)``, count it,
-   and clear the window (so the next judgement is made on post-steer behaviour).
-   This runs only when the correction can act on the *current* run — i.e. for an
-   ``IN_FLIGHT`` backend (Aristotle). For a turn-granular ``BETWEEN_TURNS`` backend
-   (``claude -p`` / ``codex exec``) a correction can land only as the *next* resumed
-   turn, so per-event judging is low-value for its cost (a judge call per window
-   plus an extra turn) and is **skipped by default** (``judge_policy="auto"``);
-   such backends are steered by the verify-gate fold instead, which fires on the
-   highest-signal event — a rejected proof. See
+3. Every event also feeds the **structured trigger engine**
+   (:mod:`servers.prover.triggers`) — deterministic signals (repeated build
+   error, sorry-count stuck, off-goal edits, stall, forbidden token) with
+   per-signal cooldowns. Under the default ``judge_policy="auto"``, an
+   ``IN_FLIGHT`` backend (Aristotle) is steered when a signal fires: a
+   self-composing signal steers directly (zero judge calls); the one
+   judgement-call signal (off-goal) summons the shared steerer as
+   *confirmation*. For a turn-granular ``BETWEEN_TURNS`` backend
+   (``claude -p`` / ``codex exec``) a correction can land only as the *next*
+   resumed turn, so no mid-run steering happens at all — signals accumulate
+   silently into the result meta, and the backend is steered by the verify-gate
+   fold below. ``judge_policy="always"`` restores the old per-window cadence
+   judging for every backend; ``"never"`` disables all mid-run steering. See
    :class:`~servers.prover.base.SteeringCapability`.
 4. When the event stream ends we take ``adapter.result(run)``.
 5. **Honesty gate** — a backend's ``proved`` is the worker's *claim*. Before it
@@ -54,6 +57,7 @@ from typing import Any
 
 from .base import ProofResult, ProverAdapter, SteeringCapability
 from .steerer import Steerer
+from .triggers import TriggerEngine
 from .verify import VerifyResult, capture_baseline, verify_proof
 
 logger = logging.getLogger(__name__)
@@ -68,14 +72,18 @@ _FOLD_CAPABLE = frozenset(
 
 
 def _live_judge_enabled(capability: SteeringCapability, judge_policy: str) -> bool:
-    """Whether the per-event steering judge runs for this backend."""
+    """Whether the live judge may run AT ALL for this backend.
+
+    Under ``"auto"`` this is a *permission*, not a cadence: an in-flight backend
+    is judged only when a structured trigger fires (see the consume loop). A
+    turn-granular backend can act on a correction only as its NEXT resumed turn,
+    so per-event judging is low-value for its cost — it is steered by the
+    gate-fold, and its triggers accumulate silently as telemetry.
+    """
     if judge_policy == "always":
         return True
     if judge_policy == "never":
         return False
-    # "auto": reserve the per-event judge for a live-steerable backend. A
-    # turn-granular one can act on a correction only as its NEXT resumed turn, so
-    # per-event judging is low-value for its cost — it is steered by the gate-fold.
     return capability is SteeringCapability.IN_FLIGHT
 
 
@@ -100,6 +108,7 @@ def prove(
     verifier: Callable[..., VerifyResult] | None = verify_proof,
     judge_policy: str = "auto",
     max_gate_folds: int = 1,
+    triggers: TriggerEngine | None = None,
 ) -> ProofResult:
     """Drive ``adapter`` to prove ``node`` against ``spec``, steering as needed.
 
@@ -121,13 +130,19 @@ def prove(
             (and tests inject a fake). Defaults to :func:`servers.prover.verify.verify_proof`.
             Called as ``verifier(node, project_dir, baseline=baseline)`` where
             ``baseline`` is the git snapshot captured below.
-        judge_policy: When the per-event live judge runs. ``"auto"`` (default) —
-            only for an ``IN_FLIGHT`` backend; ``"always"`` — every backend (the
-            pre-capability behaviour, restoring turn-granular drift-steering for
-            the CLI backends); ``"never"`` — no live judge at all.
+        judge_policy: When mid-run steering happens. ``"auto"`` (default) —
+            trigger-gated steering for an ``IN_FLIGHT`` backend only (a
+            self-composing signal steers directly; the off-goal signal summons
+            the judge as confirmation); ``"always"`` — per-window cadence
+            judging for every backend (the pre-capability behaviour, restoring
+            turn-granular drift-steering for the CLI backends); ``"never"`` —
+            no mid-run steering at all (signals still accumulate as telemetry).
         max_gate_folds: How many times a rejected ``proved`` claim may be folded
             back as a corrective turn for a fold-capable backend. ``0`` disables
             the fold (a rejected claim downgrades immediately, pre-fold behaviour).
+        triggers: The structured-signal engine; injected in tests (a fresh
+            engine keyed to ``node`` is built when ``None``). Its summary lands
+            in ``result.meta["steering"]["signals"]`` for every policy/backend.
 
     Returns:
         The adapter's terminal :class:`ProofResult` (``proved`` or ``failed``) —
@@ -146,12 +161,30 @@ def prove(
     run = adapter.start(node, spec, project_dir)
     goal = run.goal or spec
 
+    engine = triggers if triggers is not None else TriggerEngine(node_hint=node)
+
     # Shared across the initial consume and any post-fold corrective consume, so
     # max_steers is a genuine per-run cap and the window never leaks across folds.
     state: dict[str, Any] = {"steers": 0, "window": []}
 
+    def _deliver(correction: str, source: str) -> None:
+        logger.info(
+            "driver: steering %s run (#%d, %s): %s",
+            adapter.name, state["steers"] + 1, source, correction[:120],
+        )
+        adapter.steer(run, correction)
+        state["steers"] += 1
+        state["window"] = []  # judge post-steer behaviour afresh
+
+    def _judge_steer() -> None:
+        """Consult the shared judge over the current window; steer if it says so."""
+        if judge.off_course(goal, state["window"]):
+            correction = judge.correction(goal, state["window"])
+            if correction:
+                _deliver(correction, "judge")
+
     def _consume() -> None:
-        """Drain ``adapter.events(run)``, live-judging when enabled.
+        """Drain ``adapter.events(run)``, steering per the capability policy.
 
         Adapters guard re-entry (a ``started`` flag): after the initial consume
         exhausted the stream, a fold's ``steer()`` + re-entry runs ONLY the
@@ -159,23 +192,37 @@ def prove(
         """
         for event in adapter.events(run):
             state["window"].append(event)
-            if not judge_live or state["steers"] >= max_steers:
+            fired = engine.observe(event)  # always observed — telemetry is free
+            if state["steers"] >= max_steers:
                 continue
-            if judge.off_course(goal, state["window"]):
-                correction = judge.correction(goal, state["window"])
-                if correction:
-                    logger.info(
-                        "driver: steering %s run (#%d): %s",
-                        adapter.name, state["steers"] + 1, correction[:120],
-                    )
-                    adapter.steer(run, correction)
-                    state["steers"] += 1
-                    state["window"] = []  # judge post-steer behaviour afresh
+            if judge_policy == "always":
+                # Legacy escape hatch: per-window cadence judging, any backend.
+                _judge_steer()
+                continue
+            if not judge_live:
+                continue  # "never", or auto on a turn-granular backend
+            # "auto" on an in-flight backend: steer only when a signal fires.
+            for trig in fired:
+                if state["steers"] >= max_steers:
+                    break
+                if trig.correction:
+                    _deliver(trig.correction, trig.signal)  # zero judge calls
+                else:
+                    _judge_steer()  # the judgement-call signal → confirmation
+
+    def _stamp_steering(res: ProofResult) -> None:
+        res.meta = {**(res.meta or {}), "steering": {
+            "capability": capability.value,
+            "policy": judge_policy,
+            "steers": state["steers"],
+            "signals": engine.summary(),
+        }}
 
     _consume()
     result = adapter.result(run)
     if not result.backend:
         result.backend = adapter.name
+    _stamp_steering(result)
 
     if not (result.proved and verifier is not None):
         return result
@@ -223,6 +270,7 @@ def prove(
         result = adapter.result(run)
         if not result.backend:
             result.backend = adapter.name
+        _stamp_steering(result)
         result.meta = {**(result.meta or {}), "gate_folds": folds}
         if not result.proved:
             # The corrective turn ended in an honest FAILED (or a timeout) —

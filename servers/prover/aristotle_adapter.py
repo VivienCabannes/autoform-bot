@@ -65,7 +65,11 @@ def _normalize(raw_event: Any) -> Event:
     name = getattr(getattr(raw_event, "event_type", None), "name", "") or ""
     kind = _EVENT_KIND_MAP.get(name, EventKind.OTHER)
     content = str(getattr(raw_event, "content", "") or "")
-    return Event(kind, content, raw=raw_event)
+    # EDITING_FILE's content IS the touched path — surface it for the
+    # structured triggers' on-goal/off-goal attribution. (Aristotle's stream
+    # does not expose the written text, so payload stays unknown.)
+    path = content if kind is EventKind.EDIT else ""
+    return Event(kind, content, raw=raw_event, path=path)
 
 
 @dataclass

@@ -105,7 +105,10 @@ def _classify_codex_event(obj: dict[str, Any]) -> tuple[Event | None, str | None
     if itype in _THINK_ITEMS or "reason" in itype or "think" in itype:
         return Event(EventKind.THINKING, text, raw=obj), None, sid
     if itype in _EDIT_ITEMS or "patch" in itype or "file_change" in itype:
-        return Event(EventKind.EDIT, text, raw=obj), None, sid
+        # Path best-effort across codex schema variants; the patch/file text
+        # itself doubles as the written payload for the structured triggers.
+        path = str(item.get("path") or item.get("file") or item.get("file_path") or "")
+        return Event(EventKind.EDIT, text, raw=obj, path=path, payload=text), None, sid
     if itype in _TOOL_ITEMS or "command" in itype or "tool" in itype or "exec" in itype:
         return Event(EventKind.TOOL, text, raw=obj), None, sid
     if itype in ("completed", "result") and text:

@@ -46,9 +46,10 @@ class FakeAdapter(ProverAdapter):
     """
 
     name = "fake"
-    # A live fake: its steer() acts immediately, so declare IN_FLIGHT — the
-    # driver's default judge_policy ("auto") then live-judges it, and the legacy
-    # driver/steerer equivalence tests below exercise the cadence loop unchanged.
+    # A live fake: its steer() acts immediately, so declare IN_FLIGHT. The
+    # legacy driver/steerer equivalence tests below exercise the per-window
+    # CADENCE loop, which now lives behind judge_policy="always" (the default
+    # "auto" is trigger-gated — see test_triggers.py).
     steering = SteeringCapability.IN_FLIGHT
 
     def __init__(self, script: list[Event], final: ProofResult) -> None:
@@ -106,7 +107,8 @@ def test_driver_steers_when_steerer_says_off_course():
     adapter = FakeAdapter(script, ProofResult(status="proved", proof_text="done"))
     steerer = FakeSteerer(steer_at={2})  # off-course after the 2nd event
 
-    result = prove(adapter, "N", "spec", "/proj", max_steers=3, steerer=steerer, verifier=None)
+    result = prove(adapter, "N", "spec", "/proj", max_steers=3, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert result.proved
     assert adapter.steers == ["get back on course (saw 2 events)"]  # exactly one steer
@@ -131,7 +133,8 @@ def test_driver_respects_max_steers_cap():
     # After each steer the window resets to [], so off-course fires at len==1.
     steerer = FakeSteerer(steer_at={1, 2, 3, 4, 5, 6})
 
-    result = prove(adapter, "N", "spec", "/proj", max_steers=2, steerer=steerer, verifier=None)
+    result = prove(adapter, "N", "spec", "/proj", max_steers=2, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert len(adapter.steers) == 2  # cap honoured
     assert result.status == "failed"
@@ -144,7 +147,8 @@ def test_driver_clears_window_after_steer():
     adapter = FakeAdapter(script, ProofResult(status="proved"))
     steerer = FakeSteerer(steer_at={2})
 
-    prove(adapter, "N", "spec", "/proj", max_steers=5, steerer=steerer, verifier=None)
+    prove(adapter, "N", "spec", "/proj", max_steers=5, steerer=steerer,
+          verifier=None, judge_policy="always")
 
     # events: 1,(2→steer,reset),1,(2→steer,reset)  -> exactly 2 steers
     assert len(adapter.steers) == 2
@@ -170,8 +174,10 @@ def test_driver_is_backend_agnostic_same_loop_two_adapters():
     a2 = FakeAdapter(list(script), ProofResult(status="proved"))
     a2.name = "backendB"
 
-    prove(a1, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}), verifier=None)
-    prove(a2, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}), verifier=None)
+    prove(a1, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}),
+          verifier=None, judge_policy="always")
+    prove(a2, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}),
+          verifier=None, judge_policy="always")
 
     # Identical steering behaviour for both backends.
     assert a1.steers == a2.steers == ["get back on course (saw 2 events)"]

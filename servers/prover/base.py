@@ -56,11 +56,22 @@ class Event:
             text, …) — what the steering judge actually reads.
         raw: The backend's native event object, kept for adapters that need it
             (never read by the shared driver/steerer).
+        path: For ``EDIT`` (and file-touching ``TOOL``) events: the file path
+            the event touched, when the backend exposes it. The structured
+            steering triggers (:mod:`servers.prover.triggers`) use it for
+            on-goal/off-goal attribution; ``""`` = unknown.
+        payload: For ``EDIT`` events: the text actually *written* (the new
+            file/patch content), when the backend exposes it. The triggers
+            compute sorry-counts and forbidden-token hits from it — normalized
+            here precisely so the trigger layer stays backend-agnostic;
+            ``""`` = unknown.
     """
 
     kind: EventKind
     content: str = ""
     raw: Any = None
+    path: str = ""
+    payload: str = ""
 
     def render(self, *, limit: int = 300) -> str:
         """One-line ``[KIND] content`` rendering for the steer window."""
