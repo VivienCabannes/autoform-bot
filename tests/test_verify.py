@@ -21,7 +21,9 @@ from servers.prover.verify import (
 
 # convenient fakes
 _CLEAN_BUILD = lambda pdir: (0, "")                                   # noqa: E731
-_CLEAN_PROBE = lambda probe, pdir: (0, "'foo' depends on axioms: [propext]")  # noqa: E731
+# The real env-enumeration probe ends with an `AUTOFORM_PROBE_OK decls=N` sentinel;
+# fakes must include it or the gate fails closed (see test_probe_must_complete_or_fail_closed).
+_CLEAN_PROBE = lambda probe, pdir: (0, "'foo' depends on axioms: [propext]\nAUTOFORM_PROBE_OK decls=1")  # noqa: E731
 
 
 # --- pure helpers --------------------------------------------------------------
@@ -93,7 +95,7 @@ def test_sorryAx_fails_even_with_clean_source_and_build():
 def test_clean_proof_passes():
     r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
                      reader=lambda p: "theorem t : 1=1 := rfl", builder=_CLEAN_BUILD,
-                     prober=lambda probe, pdir: (0, "'t' does not depend on any axioms"))
+                     prober=lambda probe, pdir: (0, "'t' does not depend on any axioms\nAUTOFORM_PROBE_OK decls=1"))
     assert r.ok and r.checks["kernel"] == "clean"
 
 
@@ -106,10 +108,47 @@ def test_unverifiable_when_probe_has_no_report():
 
 
 def test_no_decls_passes_after_build():
+    # A module that owns no checkable declarations: the env probe completes (sentinel)
+    # and reports zero decls → treated as clean/no-decls.
     r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
                      reader=lambda p: "import Foo.Bar\nnamespace X\nend X", builder=_CLEAN_BUILD,
-                     prober=_CLEAN_PROBE)
+                     prober=lambda probe, pdir: (0, "AUTOFORM_PROBE_OK decls=0"))
     assert r.ok and r.checks["kernel"] == "no-decls"
+
+
+def test_build_probe_enumerates_from_environment():
+    """Regression (finding 14.2): the probe enumerates decls from the compiled
+    environment (authoritative) — not a source regex — so anonymous/generated decls are
+    covered. It imports the modules, walks env.constants by module, collects axioms,
+    and ends with a completion sentinel."""
+    from servers.prover.verify import _build_probe
+    probe, mods = _build_probe(["Foo/Bar.lean", "Foo/Bar.lean"], "/proj")
+    assert mods == ["Foo.Bar"]
+    assert "import Lean" in probe and "import Foo.Bar" in probe
+    assert "collectAxioms" in probe and "getModuleIdxFor?" in probe
+    assert "AUTOFORM_PROBE_OK" in probe
+
+
+def test_probe_must_complete_or_fail_closed():
+    """A probe that emits a clean-looking line but NO completion sentinel (e.g. it
+    crashed part-way) must not pass — a later decl's sorryAx could otherwise be missed."""
+    r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
+                     reader=lambda p: "theorem t : 1=1 := rfl", builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir: (0, "'t' does not depend on any axioms"))  # no sentinel
+    assert not r.ok and r.checks["kernel"] == "unverified"
+
+
+def test_regression_14_2_anonymous_decl_sorry_is_caught():
+    """Finding 14.2 at the seam: the touched source has NO literal sorry and the old
+    source regex saw NO named decl (an anonymous instance), yet the env probe enumerates
+    the module-owned decl and reports its transitive sorryAx → must fail. The pre-fix
+    gate returned ok=True ('no-decls') here."""
+    r = verify_proof("N", "/p", has_lakefile=True, touched=["MyProof/Pwned.lean"],
+                     reader=lambda p: "import MyProof.Stub\ninstance : Inhabited Nat := ⟨MyProof.Stub.n⟩",
+                     builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir:
+                         (0, "'instInhabitedNat_myProof' depends on axioms: [sorryAx]\nAUTOFORM_PROBE_OK decls=1"))
+    assert not r.ok and r.checks["kernel"] == "sorryAx"
 
 
 # --- axiom whitelist -------------------------------------------------------------
@@ -118,7 +157,7 @@ def test_standard_axioms_pass_and_are_recorded():
     r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
                      reader=lambda p: "theorem t : 1=1 := rfl", builder=_CLEAN_BUILD,
                      prober=lambda probe, pdir:
-                         (0, "'t' depends on axioms: [propext, Classical.choice, Quot.sound]"))
+                         (0, "'t' depends on axioms: [propext, Classical.choice, Quot.sound]\nAUTOFORM_PROBE_OK decls=1"))
     assert r.ok
     assert r.checks["axioms"] == ["Classical.choice", "Quot.sound", "propext"]
 
@@ -128,7 +167,7 @@ def test_rogue_axiom_fails_naming_it():
     r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
                      reader=lambda p: "theorem t : P := stub", builder=_CLEAN_BUILD,
                      prober=lambda probe, pdir:
-                         (0, "'t' depends on axioms: [propext, myEvilStub]"))
+                         (0, "'t' depends on axioms: [propext, myEvilStub]\nAUTOFORM_PROBE_OK decls=1"))
     assert not r.ok
     assert "myEvilStub" in r.reason
     assert r.checks["kernel"] == "axiom" and r.checks["rogue_axioms"] == ["myEvilStub"]
@@ -144,7 +183,7 @@ def test_ledger_whitelists_project_axioms(tmp_path):
                      reader=lambda p: "theorem t : P := ledgered", builder=_CLEAN_BUILD,
                      prober=lambda probe, pdir:
                          (0, "'t' depends on axioms: [Physics.continuum_hypothesis, "
-                             "Analysis.bigAssumption, propext]"))
+                             "Analysis.bigAssumption, propext]\nAUTOFORM_PROBE_OK decls=1"))
     assert r.ok
 
 
@@ -203,7 +242,7 @@ def test_baseline_new_file_is_attributed_and_verified(tmp_path):
     (repo / "Fresh.lean").write_text("theorem fresh : True := trivial\n", encoding="utf-8")
     r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
                      builder=_CLEAN_BUILD,
-                     prober=lambda probe, pdir: (0, "'fresh' depends on axioms: [propext]"))
+                     prober=lambda probe, pdir: (0, "'fresh' depends on axioms: [propext]\nAUTOFORM_PROBE_OK decls=1"))
     assert r.ok
     # Only the run's file is verified — the pre-existing dirty file is excluded.
     assert r.checks["files"] == ["Fresh.lean"]
