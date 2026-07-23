@@ -869,7 +869,8 @@
   var ROLE_LABEL = {
     reviewer: "reviewer", worker: "worker",
     planner: "planner", graphreview: "graphreview", contentreview: "contentreview",
-    holistic: "holistic", mathcheck: "mathcheck", escalation: "escalation"
+    holistic: "holistic", mathcheck: "mathcheck", escalation: "escalation",
+    splitter: "splitter", sourcesearch: "source-searcher"
   };
 
   // Known palette icons (fallback if the server entry omits one). The real icons
@@ -877,7 +878,8 @@
   var ROLE_ICON = {
     reviewer: "⚖", worker: "⛏",
     planner: "◷", graphreview: "🔗", contentreview: "📝",
-    holistic: "🔭", mathcheck: "🔎", escalation: "⚑"
+    holistic: "🔭", mathcheck: "🔎", escalation: "⚑",
+    splitter: "✂", sourcesearch: "🔍"
   };
 
   function initActivity() {

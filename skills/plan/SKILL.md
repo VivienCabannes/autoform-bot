@@ -37,6 +37,36 @@ Many tasks across this project form a **DAG** — partly parallelizable, partly 
 
 ---
 
+## Live feed — show your subagents in the dashboard
+
+The review dashboard (launched by `/autoform:setup`) renders a live activity feed from
+`<project>/agents_status.json`. During planning no engine is running to populate it, so
+reflect your OWN Task subagents there yourself, through the deterministic writer
+`${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_queue.py` (atomic + cross-process-locked, so it is
+safe under the parallel pool). `<project>` is the plan directory (the one holding `graph.json`).
+
+- **Set the phase** at each phase boundary (cheap — a few calls total):
+  `dispatch_queue.py <project> orchestrator --state working --phase "Phase 2: splitting" --detail "12/29 clusters"`
+- **Bracket every subagent** you launch — `agent-start` immediately before the `Task`,
+  `agent-done` in the same step it returns (do the `agent-done` even if the subagent failed),
+  keyed by a unique `--name`:
+  ```
+  dispatch_queue.py <project> agent-start --role <role> --name "<role>:<target>" --target "<target>"
+  … launch the Task subagent, await it …
+  dispatch_queue.py <project> agent-done --name "<role>:<target>"
+  ```
+- **Role mapping** (drives the dashboard badge): `splitter`→`splitter`,
+  `mathlib-checker`→`mathcheck`, `graph-reviewer`→`graphreview`, `content-reviewer`→`contentreview`,
+  `holistic-reviewer`→`holistic`, `source-searcher`→`sourcesearch`.
+- **When planning ends**, clear it: `dispatch_queue.py <project> idle`. The engine takes the
+  feed back over on `/autoform:orchestrate`.
+
+Best-effort visibility, never a gate: a missed `agent-done` only leaves a stale card until
+`idle`, and the feed never blocks the plan. Under workflow orchestration (ultracode) wrap
+each `agent()` the same way — `agent-start` before, `agent-done` after.
+
+---
+
 ## Phase 0 — lakefile precondition (before dispatching any prover worker)
 
 Planning (tiers 1–2) needs no Lean toolchain, but the **prove side** (dispatching
