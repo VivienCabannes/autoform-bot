@@ -11,21 +11,22 @@ One command from sources to a live, reviewable tiered DAG. Arguments: `$ARGUMENT
 ## Steps
 1. **Lean project.** Target dir = `$ARGUMENTS` path or CWD. If no `lakefile.*`, run the **`make-project`** skill (and **`install-lean`** first if `lake`/`elan` are missing) to create a Lean 4 + Mathlib project. Export `LEAN_PROJECT_DIR` to it. Echo the path.
 
-2. **Plan → the multi-tier DAG.** If `graph.json` is absent (or `--rebuild` is passed), run the **`plan`** skill:
-   - **Confirm sources + scope with the user** (which textbook/paper, in what format — LaTeX/Markdown/PDF — and which chapters/sections). Don't invent prerequisites; ask if the sources don't cover something.
-   - Move the source(s) into `sources/`, then build **tier-1** concept clusters (Phase 1) → **tier-2** definitions/statements (Phase 2), producing `graph.json` + one `informal_content/<id>.md` per node.
-   - If `graph.json` already exists and `--rebuild` was not passed, keep it and say so (skip re-planning).
-
-3. **Blueprint.** Run the **`plan-view`** skill to build the leanblueprint (toolchain check → `export_blueprint.py` → `make web`) so the dashboard can render the typeset statements.
-
-4. **Dashboard.** Pick the port — use `--port` if given, else **auto-find a free one** (don't hard-code 8765; it may be taken). Then launch the review UI on `127.0.0.1`, detached (idempotent — reuse if one already serves this graph):
+2. **Dashboard first — so the DAG is visible AS it is built.** Launch the review UI *before* planning, pointed at `<project>/graph.json`, so the user watches nodes appear as the `plan` skill writes each one through `merge_node.py`. Seed an empty shell first if `graph.json` doesn't exist yet, so the server has a file to read. Pick the port — `--port` if given, else **auto-find a free one** (don't hard-code 8765). Detached + idempotent (reuse if one already serves this graph):
    ```
+   [ -f <project>/graph.json ] || printf '{"version":2,"metadata":{"sources":[]},"nodes":{}}' > <project>/graph.json
    PORT="${port:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); p=s.getsockname()[1]; s.close(); print(p)')}"
    pgrep -f "serve_review.py.*<project>/graph.json" >/dev/null \
      && echo "dashboard already serving this graph" \
      || { nohup python3 ${CLAUDE_PLUGIN_ROOT}/scripts/review_ui/serve_review.py --graph <project>/graph.json --port "$PORT" >> <project>/serve_review.log 2>&1 & echo "started dashboard PID $! on http://127.0.0.1:$PORT/"; }
    ```
-   Report the actual `http://127.0.0.1:$PORT/` URL.
+   Report the `http://127.0.0.1:$PORT/` URL **now**, and tell the user to reload the graph view to see newly-planned nodes as the build proceeds.
+
+3. **Plan → the multi-tier DAG.** If `graph.json` has no `nodes` yet (or `--rebuild` is passed), run the **`plan`** skill:
+   - **Confirm sources + scope with the user** (which textbook/paper, in what format — LaTeX/Markdown/PDF — and which chapters/sections). Don't invent prerequisites; ask if the sources don't cover something.
+   - Move the source(s) into `sources/`, then build **tier-1** concept clusters (Phase 1) → **tier-2** definitions/statements (Phase 2), producing `graph.json` + one `informal_content/<id>.md` per node. Each merge lands live in the dashboard from step 2.
+   - If `graph.json` already has nodes and `--rebuild` was not passed, keep it and say so (skip re-planning).
+
+4. **Blueprint.** Run the **`plan-view`** skill to build the leanblueprint (toolchain check → `export_blueprint.py` → `make web`) so the dashboard can render the typeset statements. The dashboard is already up from step 2; the blueprint just enriches what it renders.
 
 5. **Report**: the dashboard URL (`http://127.0.0.1:<port>/`), the tier-1/2 node counts, and the next step — **`/autoform:orchestrate`** to start reviewing/proving (autonomously, or by dropping agents on nodes in the dashboard, or both).
 
