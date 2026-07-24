@@ -1,7 +1,7 @@
 {
   "name": "autoform",
-  "description": "Turn any AI coding assistant into a Lean 4 formalization agent. Mathlib conventions, proof strategies, review checklists, and statement extraction — distilled from 94k PR reviews.",
-  "version": "0.2.0",
+  "description": "Lean 4 formalization agent: Mathlib conventions, proof strategies, review, statement extraction, and textbook-to-blueprint formalization planning.",
+  "version": "0.3.0",
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"
@@ -17,9 +17,28 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "mcpServers": {
+    "lean-informal-planner-mathlib": {
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/run-mathlib-server.sh"],
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-${CLAUDE_PROJECT_DIR}}"
+      },
+      "description": "Mathlib search for the formalization planner"
+    },
     "autoform-repl": {
       "command": "uv",
       "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],

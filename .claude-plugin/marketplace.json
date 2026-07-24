@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "autoform",
-      "description": "Lean 4 + Mathlib formalization skills: conventions, proving, review, quality, extraction.",
+      "description": "Lean 4 + Mathlib formalization skills (conventions, proving, review, extraction) plus textbook-to-blueprint formalization planning.",
       "source": "./",
       "category": "productivity"
     }

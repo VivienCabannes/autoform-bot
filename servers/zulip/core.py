@@ -8,9 +8,7 @@ Dependency: ``zulip`` (provided by the ``zulip`` extra in pyproject.toml).
 
 from __future__ import annotations
 
-import configparser
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +21,7 @@ def _zulip_module():
     except ImportError:
         raise RuntimeError(
             "The 'zulip' package is required for Zulip search.\n"
-            "It should be installed automatically via uv. Run: /setup-autoform"
+            "It should be installed automatically via uv. Run: /install-autoform"
         )
     return zulip
 

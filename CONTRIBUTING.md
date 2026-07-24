@@ -17,14 +17,10 @@ Autoform is a **template plugin** — the wiring (manifests, hooks, discovery fi
 
 ### Skills (new)
 
-These skills don't exist yet. Create them from scratch — see `examples/skills/` for reference content.
+**Mathlib conventions** (`skills/autoform/`) and **proof strategies** (`skills/autoform-prove/`) are now active skills — their `examples/skills/` reference content was folded in, so contribute to them directly. The skills below don't exist yet. Create them from scratch — see `examples/skills/` for reference content.
 
 | Skill | Suggested location | Difficulty | What it should cover |
 |-------|--------------------|------------|---------------------|
-| **Mathlib conventions** | `skills/autoform/` | Medium | Lean 4 + Mathlib style, tactics, naming, pitfalls |
-| **Proof strategies** | `skills/autoform-prove/` | Medium | Incremental proving, REPL prototyping, sorry/axiom handling |
-| **Code review** | `skills/autoform-review/` | Medium | Faithfulness, cheating detection, structured checklist |
-| **Quality check** | `skills/autoform-quality/` | Easy | Naming, tactic usage, proof structure, code style |
 | **Statement extraction** | `skills/autoform-extract/` | Easy | Extract formalizable statements from LaTeX/Markdown to YAML |
 | **Crew orchestration** | `skills/autoform-crew/` | Medium | When and how to spawn worker/reviewer/reader subagents |
 
@@ -33,7 +29,7 @@ These skills don't exist yet. Create them from scratch — see `examples/skills/
 | Component | Location | Status | Difficulty | Notes |
 |-----------|----------|--------|------------|-------|
 | **Worker agent** | `agents/autoform-worker.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
-| **Reviewer agent** | `agents/autoform-reviewer.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
+| **Reviewer jury** | `agents/faithfulness-reviewer.md`, `agents/proof-integrity-reviewer.md`, `agents/code-quality-reviewer.md` | ✅ Implemented | — | Full single-axis judge prompts; shared rubrics live in `skills/eval-rubrics/references/` |
 | **Reader agent** | `agents/autoform-reader.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
 
 ## How to contribute a server
