@@ -1,0 +1,6 @@
+name = "MyBook"
+defaultTargets = ["MyBook"]
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"

@@ -1,0 +1,19 @@
+# Formalization targets for the demo project.
+#
+# Each entry is a node in the dependency DAG: a definition/theorem/lemma to
+# formalize, plus the IDs of the targets it depends on. The intended workflow
+# is to formalize in dependency order — definitions before the theorems that
+# use them. See examples/skills/autoform-extract/SKILL.md for the full schema.
+- id: def-convex-set
+  type: definition
+  source: "Definition 1.1"
+  statement: "A set s ⊆ ℝ is convex if for all x y ∈ s and t ∈ [0,1], t·x + (1-t)·y ∈ s."
+  dependencies: []
+  proved_in_book: false
+
+- id: thm-convex-inter
+  type: theorem
+  source: "Theorem 1.2"
+  statement: "The intersection of two convex sets is convex."
+  dependencies: [def-convex-set]
+  proved_in_book: true
