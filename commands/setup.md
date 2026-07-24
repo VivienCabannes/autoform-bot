@@ -21,10 +21,11 @@ One command from sources to a live, reviewable tiered DAG. Arguments: `$ARGUMENT
    ```
    Report the `http://127.0.0.1:$PORT/` URL **now**, and tell the user to reload the graph view to see newly-planned nodes as the build proceeds.
 
-3. **Plan → the multi-tier DAG.** If `graph.json` has no `nodes` yet (or `--rebuild` is passed), run the **`plan`** skill:
+3. **Plan → the multi-tier DAG.** Run the **`plan`** skill unless planning is already COMPLETE. It is INCOMPLETE — so run or RESUME it — when `graph.json` is absent/empty, any tier-1 cluster has no tier-2 children, or any node has `content: null`. `--rebuild` forces a fresh plan from scratch. When you run it:
    - **Confirm sources + scope with the user** (which textbook/paper, in what format — LaTeX/Markdown/PDF — and which chapters/sections). Don't invent prerequisites; ask if the sources don't cover something.
    - Move the source(s) into `sources/`, then build **tier-1** concept clusters (Phase 1) → **tier-2** definitions/statements (Phase 2), producing `graph.json` + one `informal_content/<id>.md` per node. Each merge lands live in the dashboard from step 2.
-   - If `graph.json` already has nodes and `--rebuild` was not passed, keep it and say so (skip re-planning).
+   - **Resume, don't restart.** `plan` re-derives readiness from the current `graph.json` on entry and writes each node through `merge_node.py` as it lands, so on a PARTIAL graph it continues — splitting only clusters with no tier-2 children and writing only `content: null` prose — instead of redoing finished work. So after a sleep/crash, just re-run `/autoform:setup` and it picks up where it stopped. (Only the subagent work in flight at the moment of the stop is lost; everything already merged is durable on disk.)
+   - If planning is already complete (every cluster split, no `content: null`) and `--rebuild` was not passed, keep the graph and say so (skip re-planning).
 
 4. **Blueprint.** Run the **`plan-view`** skill to build the leanblueprint (toolchain check → `export_blueprint.py` → `make web`) so the dashboard can render the typeset statements. The dashboard is already up from step 2; the blueprint just enriches what it renders.
 
