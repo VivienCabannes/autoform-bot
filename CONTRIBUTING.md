@@ -21,8 +21,6 @@ Autoform is a **template plugin** — the wiring (manifests, hooks, discovery fi
 
 | Skill | Suggested location | Difficulty | What it should cover |
 |-------|--------------------|------------|---------------------|
-| **Code review** | `skills/autoform-review/` | Medium | Faithfulness, cheating detection, structured checklist |
-| **Quality check** | `skills/autoform-quality/` | Easy | Naming, tactic usage, proof structure, code style |
 | **Statement extraction** | `skills/autoform-extract/` | Easy | Extract formalizable statements from LaTeX/Markdown to YAML |
 | **Crew orchestration** | `skills/autoform-crew/` | Medium | When and how to spawn worker/reviewer/reader subagents |
 
@@ -31,7 +29,7 @@ Autoform is a **template plugin** — the wiring (manifests, hooks, discovery fi
 | Component | Location | Status | Difficulty | Notes |
 |-----------|----------|--------|------------|-------|
 | **Worker agent** | `agents/autoform-worker.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
-| **Reviewer agent** | `agents/autoform-reviewer.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
+| **Reviewer jury** | `agents/faithfulness-reviewer.md`, `agents/proof-integrity-reviewer.md`, `agents/code-quality-reviewer.md` | ✅ Implemented | — | Full single-axis judge prompts; shared rubrics live in `skills/eval-rubrics/references/` |
 | **Reader agent** | `agents/autoform-reader.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
 
 ## How to contribute a server
