@@ -53,6 +53,7 @@
 
   var POLL_MS = 2500;          // dispatch poll cadence (~2.5s, per spec)
   var GRAPH_POLL_MS = 4000;    // graph auto-refresh cadence — re-fetch /api/dot and re-render ONLY when the DOT changed (so the DAG grows live during planning, no full reload)
+  var lastInteraction = 0;     // ms of the last user expand/collapse; the poll defers a re-render right after one
 
   // Human-facing tier labels (mirrors the server's TIER_LABELS) for the bar/banner.
   var TIER_LABELS = { 1: "clusters", 2: "statements", 3: "declarations" };
@@ -297,6 +298,7 @@
     window.DepGraphCore.renderDot(mount, dot, {
       useWorker: false,
       stageClass: "rv-graph-stage",
+      preserveZoom: !!transition,   // re-renders (expand/collapse/poll) keep the camera; first paint fits
       onSettle: function () {
         home.rendering = false;
         decorate(mount);
@@ -346,6 +348,8 @@
   function pollGraph() {
     if (!home.online || home.rendering) return;
     if (TOO_LARGE || NEIGHBORHOOD || ANCHOR || FOCUS) return;
+    if (Date.now() - lastInteraction < 1500) return;   // just navigated — don't re-render under the user
+
     var expand = Array.from(home.expanded).join(",");
     var url = DOT_URL + "?tier=" + encodeURIComponent(TIER)
       + "&expand=" + encodeURIComponent(expand);
@@ -362,11 +366,13 @@
 
   function expandNode(id) {
     if (home.rendering || home.expanded.has(id) || !hasChildren(id)) return;
+    lastInteraction = Date.now();
     home.expanded.add(id);
     refetchAndRender();
   }
   function collapseNode(id) {
     if (home.rendering || !home.expanded.has(id)) return;
+    lastInteraction = Date.now();
     home.expanded.delete(id);
     refetchAndRender();
   }
