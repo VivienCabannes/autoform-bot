@@ -130,6 +130,7 @@
 <script src="js/d3.min.js"></script>
 <script src="js/hpcc.min.js"></script>
 <script src="js/d3-graphviz.js"></script>
+<script src="js/dep_graph_core.js"></script>
 
 {# Our generated per-tier DOT strings + cluster metadata. #}
 <script src="js/tier_dots.js" type="text/javascript"></script>
@@ -216,10 +217,22 @@ function render(tier) {
         return;
     }
     currentTier = Number(tier);
-    const w = graphContainer.node().clientWidth;
-    const h = graphContainer.node().clientHeight;
-    _gv.width(w)
-       .height(h)
+    const mount = graphContainer.node();
+    // Shared renderer (js/dep_graph_core.js — the SAME d3-graphviz renderer the live
+    // review surface uses, so the two viewers don't duplicate it). Fresh-stage-per-
+    // render is robust to the structural change when the tier toggles; interactive()
+    // runs on settle (after the old stage is dropped) and wires the per-statement
+    // modals + dependency-cone highlight, so the stage wrapper is transparent to its
+    // `.node`/`#graph .node` selectors. Falls back to the original reused-instance
+    // renderer if the shared core isn't bundled (older builds) — never a regression.
+    try {
+        if (window.DepGraphCore && window.DepGraphCore.renderDot) {
+            window.DepGraphCore.renderDot(mount, _DOTS[tier], { useWorker: true, onSettle: interactive });
+            return;
+        }
+    } catch (e) { /* fall through to the bundled renderer */ }
+    _gv.width(mount.clientWidth)
+       .height(mount.clientHeight)
        .fit(true)
        .renderDot(_DOTS[tier])
        .on("end", interactive);

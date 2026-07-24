@@ -23,7 +23,7 @@ def _zulip_module():
     except ImportError:
         raise RuntimeError(
             "The 'zulip' package is required for Zulip search.\n"
-            "It should be installed automatically via uv. Run: /setup-autoform"
+            "It should be installed automatically via uv. Run: /install-autoform"
         )
     return zulip
 

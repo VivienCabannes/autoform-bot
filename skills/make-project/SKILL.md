@@ -1,10 +1,10 @@
 ---
-name: setup-project
+name: make-project
 description: >
   Set up a new Lean 4 + Mathlib formalization project from the LeanProject
   template. Clones, renames, fetches Mathlib cache, and builds. Use when
   starting a new formalization project.
-  Trigger: /setup-project, "new lean project", "create project",
+  Trigger: /make-project, "new lean project", "create project",
   "start formalization", "setup project".
 ---
 
@@ -13,7 +13,7 @@ description: >
 Ask the user for a **project name** (UpperCamelCase, e.g. `ConvexBodies`, `PrimeGaps`) and optionally a target directory, then run:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/skills/setup-project/setup-project.sh" <ProjectName> [target-dir]
+bash "${CLAUDE_PLUGIN_ROOT}/skills/make-project/make-project.sh" <ProjectName> [target-dir]
 ```
 
 The script:
