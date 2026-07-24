@@ -1,37 +1,37 @@
----
-name: autoform
-description: >
-  Mathlib & Lean 4 conventions for writing formalization-quality code.
-  Distilled from 94k PR review comments and 165k Zulip messages.
-  Use when writing Lean 4 code, formalizing mathematics, or working with Mathlib.
-  Triggers on: /autoform, "lean conventions", "mathlib style", "formalize".
----
+# Mathlib & Lean 4 conventions
 
-# Mathlib & Lean 4 Conventions
+Key conventions for writing Mathlib-compatible Lean 4 code, distilled from community Mathlib
+review practice (PR review comments and Zulip discussion).
 
-Key conventions for writing Mathlib-compatible Lean 4 code, distilled from 792 community conventions extracted from ~94k GitHub PR review comments and ~165k Zulip messages.
+## Proof style
 
-## Proof Style
-
-- **Search before proving.** Use `exact?`, `apply?`, `rw?` to find existing Mathlib lemmas. Prefer `exact`/`apply`/`rw` over reproving known facts.
-- **`simp only [...]`** with explicit lemma lists for non-terminal simplification. Plain `simp` is fine when it closes the goal.
-- **Clear structure over golfing.** No dense one-liners. Use `calc` for chained equalities/inequalities.
+- **Search before proving.** Use `exact?`, `apply?`, `rw?` to find existing Mathlib lemmas.
+  Prefer `exact`/`apply`/`rw` over reproving known facts.
+- **`simp only [...]`** with explicit lemma lists for non-terminal simplification. Plain `simp`
+  is fine when it closes the goal.
+- **Clear structure over golfing.** No dense one-liners. Use `calc` for chained
+  equalities/inequalities.
 - **`ext`/`funext`** for function/structure equality, not unfolding definitions.
 - **Factor repeated arguments** into `private` helper lemmas.
-- **Prefer API lemmas over `unfold`.** Use `rw`/`simp` with named lemmas (`foo_def`, `foo_apply`) instead of broad `unfold`.
-- **Handle trivial cases early.** Split off `x = 0`, `n = 0`, `s = ∅` at the start so the main proof stays clean.
-- **`suffices`** to expose key intermediate goals. **`have`** for facts, **`let`** for data, **`letI`/`haveI`** for local instances.
+- **Prefer API lemmas over `unfold`.** Use `rw`/`simp` with named lemmas (`foo_def`, `foo_apply`)
+  instead of broad `unfold`.
+- **Handle trivial cases early.** Split off `x = 0`, `n = 0`, `s = ∅` at the start so the main
+  proof stays clean.
+- **`suffices`** to expose key intermediate goals. **`have`** for facts, **`let`** for data,
+  **`letI`/`haveI`** for local instances.
 - **Prefer `refine` over `apply`** when you want visible subgoals with `?_` placeholders.
 
 ## Naming
 
-- `snake_case` for theorems/lemmas, `UpperCamelCase` for types/classes, `lowerCamelCase` for terms.
-- Standard suffixes: `_iff`, `_of_`, `_inj`, `_mono`, `_left`, `_right`, `_eq_`, `_def`, `_apply`.
+- `snake_case` for theorems/lemmas, `UpperCamelCase` for types/classes, `lowerCamelCase` for
+  terms.
+- Standard suffixes: `_iff`, `_of_`, `_inj`, `_mono`, `_left`, `_right`, `_eq_`, `_def`,
+  `_apply`.
 - One concept, one name. Check existing Mathlib names before inventing new ones.
 - Prefer standard mathematical and Mathlib terminology over ad hoc names.
-- **Namespaces = mathematical topics** (e.g., `GroupCohomology`, `GeometryOfNumbers`). Never chapter/section numbers.
+- A namespace names a *mathematical topic*, never a task, declaration, or chapter.
 
-## Types & Hypotheses
+## Types & hypotheses
 
 - **Weakest sufficient typeclasses** (`Semiring` over `Ring`, `Preorder` over `LinearOrder`).
 - Remove unused hypotheses. Implicit for inferable args, explicit otherwise.
@@ -39,7 +39,7 @@ Key conventions for writing Mathlib-compatible Lean 4 code, distilled from 792 c
 - Prefer `Finite` over `Fintype` in statements when only finiteness is needed.
 - Use `by classical` inside proofs rather than adding `Classical` to theorem statements.
 
-## Key Tactics
+## Key tactics
 
 | Goal shape | Tactic | Notes |
 |---|---|---|
@@ -57,24 +57,26 @@ Key conventions for writing Mathlib-compatible Lean 4 code, distilled from 792 c
 | Split on `if` | `split_ifs with h` | |
 | Large finite decision | `decide` or `by decide` | Never `native_decide` in Mathlib |
 
-## Simp Conventions
+## Simp conventions
 
 - **Terminal `simp`** (closing the goal) is fine with broad lemma sets.
 - **Non-terminal `simp`** must use `simp only [...]` with explicit lemmas.
-- **`@[simp]`** only for genuinely useful canonical lemmas (evaluation, coercion, projection, constructor). Avoid lemmas with hard side conditions.
+- **`@[simp]`** only for genuinely useful canonical lemmas (evaluation, coercion, projection,
+  constructor). Avoid lemmas with hard side conditions.
 - Orient simp lemmas: complicated expression on the left, simpler normal form on the right.
 - Use `@[simps]` to auto-generate projection lemmas for structures and equivalences.
 - Use `simp?` to discover good lemma lists, then replace with explicit `simp only [...]`.
 
-## API Design
+## API design
 
 - **Reuse existing Mathlib abstractions.** Don't redefine what exists.
 - Use canonical constructors (`Subtype.mk`, `.val`, `Equiv.ofBijective`).
 - After new definitions, provide `_def`/`_apply` lemmas and basic `@[simp]` lemmas.
 - Add `@[ext]` lemmas for structures with natural extensionality.
 - Prefer high-level APIs (universal properties, morphism lemmas) over element-chasing.
+- Keep one canonical concept per name. Derive variants as corollaries.
 
-## Code Style
+## Code style
 
 - Top-level declarations at column 0. Indent proof bodies by 2 spaces.
 - One tactic per line (unless a short one-liner proof).
@@ -83,42 +85,35 @@ Key conventions for writing Mathlib-compatible Lean 4 code, distilled from 792 c
 - Remove unnecessary parentheses, but add them when precedence is unclear.
 - Open namespaces sparingly. Prefer `open ... in` for narrow scope.
 - Put binders before the colon: `lemma foo (x : α) (h : P x) : Q x` not trailing `∀`.
+- 100-character line width.
 
-## Common Pitfalls
+## Common pitfalls
 
 - **`Real.log 0 = 0`** in Mathlib (not undefined). Same: `0⁻¹ = 0`, `0 / 0 = 0`.
 - **`Nat` subtraction truncates**: `5 - 7 = 0`. Use `Int` for negative results.
 - **`Nat.cast_sub` requires `h : b ≤ a`** — provide the proof or work in `ℤ`.
-- **`rpow` vs `pow`**: Use `rpow` for real exponents, `pow` for `ℕ` exponents. Key rewrite: `rpow_natCast`.
-- **`Finset.card_fin n`** (not `Finset.card_univ`) for `Finset.card (Finset.univ : Finset (Fin n)) = n`.
+- **`rpow` vs `pow`**: use `rpow` for real exponents, `pow` for `ℕ` exponents. Key rewrite:
+  `rpow_natCast`.
+- **`Finset.card_fin n`** (not `Finset.card_univ`) for
+  `Finset.card (Finset.univ : Finset (Fin n)) = n`.
 - **`div_le_iff₀`** (not `div_le_iff`) for the standard division-to-multiplication equivalence.
 - **`push_cast` before arithmetic** to normalize `↑(a - b)` → `↑a - ↑b`.
-- **Beta redexes after `unfold`**: Fix with `simp only [Function.comp]` or `beta_reduce`.
+- **Beta redexes after `unfold`**: fix with `simp only [Function.comp]` or `beta_reduce`.
 - **`Function.update_same`** (not `update_self`).
 - **Don't use `norm_num` on transcendentals** (exp, log). Chain bounds lemmas instead.
 - **`field_simp` on sums can explode.** Use targeted rewrites instead.
 - **`erw` is a last resort.** Prefer `rw` after `dsimp` or `change`.
 
-## Lean 4 Syntax Quick Reference
+## `unproved` vs `axiom` vs `sorry`
 
-- `theorem foo := by sorry` — gap visible via `#print axioms` as `sorryAx`.
-- `axiom foo` — permanent unproved constant. Worse than sorry.
-- `/-- ... -/` (double dash) is a docstring — MUST immediately precede a declaration.
-- `/- ... -/` (single dash) is a floating comment.
-- Use `universe u` when induction changes the codomain type.
-
-## Tactic Patterns & Pitfalls
-
-- `simp` can fail inside `conv` blocks — use `show`, `change`, or `rw` instead.
-- `unfold` also fails in `conv` — use equalities or `rw [show ... from ...]`.
-- Rewrite ordering matters: `rw [norm_mul, mul_pow, ...]` — distribute before simplifying.
-- `ring` does NOT work on `rpow` expressions. Only works after `congr 1` exposes the real exponent.
-- `ring` does NOT work when `•` (smul) mixed with `*` — use `smul_eq_mul` first.
-- `conv` blocks can cause heartbeat timeouts in large files — prefer direct `rw`.
-- For norm non-negativity: use `positivity` or `(iteratedFDeriv ℝ n f x).opNorm_nonneg`.
-
-## Existential Witnesses & Choice
-
-- When axiomatizing `∃ x, P x`, axiomatize `P c` for the specific witness `c`.
-- `choose` with guards creates dependent functions (can't use with `Finset.sup`). Fix: drop the guard.
-- Any two proofs of the same proposition are definitionally equal in rewrites.
+- **`sorry`** — the honest placeholder, and the **preferred** one. It introduces `sorryAx`,
+  which `#print axioms` reports loudly for everything downstream — the gap stays visible until
+  it is genuinely closed. When a proof won't finish, leave a `sorry`.
+- **`axiom`** — **worse than `sorry`.** It appears in every downstream `#print axioms`
+  silently, posing as a legitimate foundation, and reviewers reject it as a stand-in for a
+  proof. The only sanctioned use is under an audited-ledger discharge protocol (see the
+  **autoform-prove** axiom policy).
+- **Sanctioned placeholder macros** — a project-defined placeholder (e.g. an `unproved`
+  attribute-macro marking "the source doesn't prove this") is the best option for tracked,
+  justified gaps — but only **if the project defines one**. Check first; do not assume it
+  exists. Without one, use `sorry`.
