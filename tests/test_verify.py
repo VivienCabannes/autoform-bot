@@ -335,6 +335,6 @@ def test_baseline_new_file_in_new_directory_is_attributed(tmp_path):
         "theorem chernoff : True := trivial\n", encoding="utf-8")
     r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
                      builder=_CLEAN_BUILD,
-                     prober=lambda probe, pdir: (0, "'chernoff' depends on axioms: [propext]"))
+                     prober=lambda probe, pdir: (0, "'chernoff' depends on axioms: [propext]\nAUTOFORM_PROBE_OK decls=1"))
     assert r.ok
     assert r.checks["files"] == ["Prob/Chernoff.lean"]
