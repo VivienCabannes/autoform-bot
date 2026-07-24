@@ -57,7 +57,18 @@ def _make_adapter(
         from .codex_adapter import CodexAdapter
 
         return CodexAdapter(extra_args=extra_args, max_wait_seconds=max_wait_seconds)
-    raise ValueError(f"unknown backend {backend!r}; expected 'claude', 'aristotle', or 'codex'")
+    if backend in ("openai", "avocado"):
+        # Lazy import: the generic OpenAI-compatible HTTP backend. "avocado" is
+        # the Meta-internal preset (Avocado = the internal codename of Muse
+        # Spark; see docs/avocado-handoff.md for the work-laptop fill-ins).
+        from .openai_adapter import OpenAICompatAdapter
+
+        return OpenAICompatAdapter(graph_path=graph_path, preset=backend,
+                                   max_wait_seconds=max_wait_seconds)
+    raise ValueError(
+        f"unknown backend {backend!r}; expected 'claude', 'aristotle', 'codex', "
+        "'openai', or 'avocado'"
+    )
 
 
 def run_prove_node(
@@ -79,7 +90,54 @@ def run_prove_node(
     """
     spec = build_node_spec(Path(graph_path), node_id, project_dir=Path(project_dir))
     adapter = _make_adapter(backend, graph_path, max_wait_seconds, extra_args, mcp_config)
-    return prove(adapter, node_id, spec, project_dir, max_steers=max_steers)
+    result = prove(adapter, node_id, spec, project_dir, max_steers=max_steers)
+    _record_usage(project_dir, node_id, backend, result)
+    return result
+
+
+#: How each backend is billed — recorded per ledger entry so the manifest's
+#: spend line stays honest ("subscription" spend is notional, not dollars).
+_BILLING = {"claude": "subscription", "aristotle": "external-compute",
+            "codex": "external", "openai": "api", "avocado": "api"}
+
+
+def _record_usage(project_dir: str, node_id: str, backend: str, result: ProofResult) -> None:
+    """Append this run to the project's usage ledger and refresh formalization.yaml.
+
+    Best-effort by design: accounting must never break a proof result. The
+    ledger is the source of truth (append-only JSONL); the yaml refresh is a
+    derived view and a no-op when the project never opted into the manifest.
+    The formalization module lives in the plugin's ``scripts/`` (a standalone
+    CLI, not a package member), so it is loaded by path.
+    """
+    try:
+        import importlib.util
+        import time as _time
+
+        mod_path = Path(__file__).resolve().parents[2] / "scripts" / "formalization.py"
+        spec = importlib.util.spec_from_file_location("autoform_formalization", mod_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {mod_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        meta = result.meta or {}
+        usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+        entry = {
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "node": node_id,
+            "backend": backend,
+            "model": (meta.get("model") or ""),
+            "status": result.status,
+            "billing": _BILLING.get(backend, "unknown"),
+            "wall_seconds": usage.get("wall_seconds", 0),
+            "usage": {"worker": usage.get("worker") or {},
+                      "judge": usage.get("judge") or {}},
+        }
+        mod.record_run(project_dir, entry)
+        mod.update_formalization(project_dir)
+    except Exception as err:  # noqa: BLE001 — accounting is never fatal
+        logger.warning("usage ledger update failed (non-fatal): %s", err)
 
 
 def create_prover_server() -> FastMCP:
@@ -130,8 +188,12 @@ def create_prover_server() -> FastMCP:
                 default so it can actually Edit/Write/Bash.
 
         Returns:
-            JSON ``{node_id, backend, status, reason, landed_files, proof_text}``
-            where ``status`` is "proved" or "failed".
+            JSON ``{node_id, backend, status, reason, landed_files, proof_text,
+            steering, verify, gate_folds}`` where ``status`` is "proved" or
+            "failed", ``steering`` is the run's telemetry ({capability, policy,
+            steers, signals}), ``verify`` the honesty gate's checks, and
+            ``gate_folds`` how many times a rejected claim was folded back as a
+            corrective turn (absent when zero).
         """
         try:
             result = run_prove_node(
@@ -149,17 +211,23 @@ def create_prover_server() -> FastMCP:
                 {"node_id": node_id, "backend": backend, "status": "failed", "reason": str(err)},
                 indent=2,
             )
-        return json.dumps(
-            {
-                "node_id": node_id,
-                "backend": result.backend,
-                "status": result.status,
-                "reason": result.reason,
-                "landed_files": result.landed_files,
-                "proof_text": result.proof_text[:4000],
-            },
-            indent=2,
-        )
+        payload = {
+            "node_id": node_id,
+            "backend": result.backend,
+            "status": result.status,
+            "reason": result.reason,
+            "landed_files": result.landed_files,
+            "proof_text": result.proof_text[:4000],
+        }
+        # Surface the driver's audit trail: steering telemetry, the honesty
+        # gate's checks, fold count, dropped steers — so the orchestrator (and a
+        # human reading the tool output) sees WHY a verdict is what it is.
+        meta = result.meta or {}
+        for key in ("steering", "verify", "gate_folds", "dropped_steers", "sub_status",
+                    "landed_restored", "usage"):
+            if key in meta:
+                payload[key] = meta[key]
+        return json.dumps(payload, indent=2)
 
     return server
 

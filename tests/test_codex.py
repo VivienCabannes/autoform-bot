@@ -112,7 +112,8 @@ def test_codex_steer_resumes_session():
     )
     runner = FakeCodexRunner([turn1, turn2])
     adapter = CodexAdapter(runner=runner)
-    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer(), verifier=None)
+    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer(),
+                   verifier=None, judge_policy="always")
     assert len(runner.calls) == 2
     # second turn must resume the captured session
     assert "resume" in runner.calls[1]["args"] and "sess-9" in runner.calls[1]["args"]
@@ -124,7 +125,8 @@ def test_codex_steer_without_session_is_dropped():
     turn1 = _lines({"type": "item.completed", "item": {"type": "agent_message", "text": "no session here"}})
     runner = FakeCodexRunner([turn1])
     adapter = CodexAdapter(runner=runner)
-    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer(), verifier=None)
+    result = prove(adapter, "Foo", "spec", "/tmp/proj", max_steers=1, steerer=_StubSteerer(),
+                   verifier=None, judge_policy="always")
     assert len(runner.calls) == 1  # no second (resume) turn
     assert result.status == "proved"
 

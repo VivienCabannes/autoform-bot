@@ -5,7 +5,6 @@ backends cannot drift on "what counts as an honest FAILED" or the discipline tex
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 

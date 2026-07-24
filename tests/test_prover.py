@@ -18,7 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from servers.prover.base import Event, EventKind, ProofResult, ProverAdapter, Run
+from servers.prover.base import (
+    Event,
+    EventKind,
+    ProofResult,
+    ProverAdapter,
+    Run,
+    SteeringCapability,
+)
 from servers.prover.claude_adapter import ClaudeAdapter, _classify_stream_event, _looks_failed
 from servers.prover.driver import prove
 from servers.prover.steerer import Steerer
@@ -39,6 +46,11 @@ class FakeAdapter(ProverAdapter):
     """
 
     name = "fake"
+    # A live fake: its steer() acts immediately, so declare IN_FLIGHT. The
+    # legacy driver/steerer equivalence tests below exercise the per-window
+    # CADENCE loop, which now lives behind judge_policy="always" (the default
+    # "auto" is trigger-gated — see test_triggers.py).
+    steering = SteeringCapability.IN_FLIGHT
 
     def __init__(self, script: list[Event], final: ProofResult) -> None:
         self._script = script
@@ -95,7 +107,8 @@ def test_driver_steers_when_steerer_says_off_course():
     adapter = FakeAdapter(script, ProofResult(status="proved", proof_text="done"))
     steerer = FakeSteerer(steer_at={2})  # off-course after the 2nd event
 
-    result = prove(adapter, "N", "spec", "/proj", max_steers=3, steerer=steerer, verifier=None)
+    result = prove(adapter, "N", "spec", "/proj", max_steers=3, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert result.proved
     assert adapter.steers == ["get back on course (saw 2 events)"]  # exactly one steer
@@ -120,7 +133,8 @@ def test_driver_respects_max_steers_cap():
     # After each steer the window resets to [], so off-course fires at len==1.
     steerer = FakeSteerer(steer_at={1, 2, 3, 4, 5, 6})
 
-    result = prove(adapter, "N", "spec", "/proj", max_steers=2, steerer=steerer, verifier=None)
+    result = prove(adapter, "N", "spec", "/proj", max_steers=2, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert len(adapter.steers) == 2  # cap honoured
     assert result.status == "failed"
@@ -133,7 +147,8 @@ def test_driver_clears_window_after_steer():
     adapter = FakeAdapter(script, ProofResult(status="proved"))
     steerer = FakeSteerer(steer_at={2})
 
-    prove(adapter, "N", "spec", "/proj", max_steers=5, steerer=steerer, verifier=None)
+    prove(adapter, "N", "spec", "/proj", max_steers=5, steerer=steerer,
+          verifier=None, judge_policy="always")
 
     # events: 1,(2→steer,reset),1,(2→steer,reset)  -> exactly 2 steers
     assert len(adapter.steers) == 2
@@ -159,8 +174,10 @@ def test_driver_is_backend_agnostic_same_loop_two_adapters():
     a2 = FakeAdapter(list(script), ProofResult(status="proved"))
     a2.name = "backendB"
 
-    prove(a1, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}), verifier=None)
-    prove(a2, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}), verifier=None)
+    prove(a1, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}),
+          verifier=None, judge_policy="always")
+    prove(a2, "N", "spec", "/proj", steerer=FakeSteerer(steer_at={2}),
+          verifier=None, judge_policy="always")
 
     # Identical steering behaviour for both backends.
     assert a1.steers == a2.steers == ["get back on course (saw 2 events)"]
@@ -352,7 +369,10 @@ def test_claude_adapter_steer_resumes_session():
     # it as a resumed follow-up turn.
     steerer = FakeSteerer(steer_at={2})
 
-    result = prove(adapter, "T", "prove True", "/proj", max_steers=1, steerer=steerer, verifier=None)
+    # ClaudeAdapter is BETWEEN_TURNS, so the per-event judge needs "always"
+    # (the default "auto" reserves it for in-flight backends).
+    result = prove(adapter, "T", "prove True", "/proj", max_steers=1, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert result.proved
     assert "theorem t" in result.proof_text
@@ -434,7 +454,8 @@ def test_claude_steer_without_session_is_dropped():
     adapter = ClaudeAdapter(runner=runner)
     steerer = FakeSteerer(steer_at={1})  # driver queues a steer during the turn
 
-    result = prove(adapter, "T", "spec", "/proj", max_steers=1, steerer=steerer, verifier=None)
+    result = prove(adapter, "T", "spec", "/proj", max_steers=1, steerer=steerer,
+                   verifier=None, judge_policy="always")
 
     assert len(runner.calls) == 1              # no second (context-free) turn launched
     assert result.proved                       # verdict comes from the REAL turn
@@ -710,3 +731,34 @@ def test_prove_node_unknown_backend_fails_gracefully(tmp_path):
     gp = _write_plan(tmp_path)
     with pytest.raises(ValueError):
         run_prove_node(graph_path=str(gp), node_id="Thm", project_dir=str(tmp_path), backend="bogus")
+
+
+def test_shared_steerer_usage_is_stamped_per_run_not_cumulative():
+    """One Steerer injected across two prove() calls must not double-count the
+    first run's judge usage in the second run's ledger stamp."""
+    from servers.prover.steerer import Steerer
+
+    s = Steerer(min_gap_s=0.0,
+                judge=lambda p: ('{"steer": false, "prompt": ""}',
+                                 {"input_tokens": 10, "output_tokens": 5, "cost_usd": 1.0}))
+    for _ in range(2):
+        adapter = FakeAdapter([_ev(EventKind.EDIT)], ProofResult(status="proved"))
+        result = prove(adapter, "N", "spec", "/proj", steerer=s,
+                       verifier=None, judge_policy="always")
+    judge = result.meta["usage"]["judge"]
+    assert judge["calls"] == 1           # THIS run's call, not both
+    assert judge["cost_usd"] == 1.0      # delta, not the 2.0 cumulative
+
+
+def test_cli_judge_tolerates_json_scalar_stdout(monkeypatch):
+    """A JSON-scalar stdout ("null") must decline to steer, not crash prove()."""
+    from servers.prover import steerer as steerer_mod
+
+    def fake_run(args, capture_output, text, env, timeout):
+        class P:
+            stdout = "null"
+        return P()
+
+    monkeypatch.setattr(steerer_mod.subprocess, "run", fake_run)
+    text, usage = steerer_mod._claude_cli_judge("hi")
+    assert text == "" and usage == {}

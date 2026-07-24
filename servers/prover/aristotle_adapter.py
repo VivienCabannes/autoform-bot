@@ -45,7 +45,7 @@ from servers.aristotle.core import (
     load_node,
 )
 
-from .base import Event, EventKind, ProofResult, ProverAdapter, Run
+from .base import Event, EventKind, ProofResult, ProverAdapter, Run, SteeringCapability
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,11 @@ def _normalize(raw_event: Any) -> Event:
     name = getattr(getattr(raw_event, "event_type", None), "name", "") or ""
     kind = _EVENT_KIND_MAP.get(name, EventKind.OTHER)
     content = str(getattr(raw_event, "content", "") or "")
-    return Event(kind, content, raw=raw_event)
+    # EDITING_FILE's content IS the touched path — surface it for the
+    # structured triggers' on-goal/off-goal attribution. (Aristotle's stream
+    # does not expose the written text, so payload stays unknown.)
+    path = content if kind is EventKind.EDIT else ""
+    return Event(kind, content, raw=raw_event, path=path)
 
 
 @dataclass
@@ -97,6 +101,11 @@ class AristotleAdapter(ProverAdapter):
     """
 
     name = "aristotle"
+    #: Aristotle accepts a mid-run correction on the LIVE task (``project.ask``),
+    #: so the per-event judge steers it in flight. Its ``result()`` is terminal
+    #: (files landed, private loop closed), so the driver never folds a rejected
+    #: claim back into it — a gate failure downgrades immediately.
+    steering = SteeringCapability.IN_FLIGHT
 
     def __init__(
         self,

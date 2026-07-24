@@ -61,7 +61,7 @@ from ._cli_common import (
     _subprocess_line_runner,
     build_worker_prompt,
 )
-from .base import Event, EventKind, ProofResult, ProverAdapter, Run
+from .base import Event, EventKind, ProofResult, ProverAdapter, Run, SteeringCapability
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +135,20 @@ def _classify_stream_event(obj: dict[str, Any]) -> Event | None:
                 tin = block.get("input", {})
                 # Edits to .lean files are the load-bearing "edit" signal.
                 target = str(tin.get("file_path") or tin.get("path") or "")
-                kind = EventKind.EDIT if name in ("Edit", "Write", "MultiEdit") else EventKind.TOOL
-                return Event(kind, f"{name} {target}".strip(), raw=obj)
+                if name in ("Edit", "Write", "MultiEdit"):
+                    # Normalize the WRITTEN text into Event.payload so the
+                    # structured triggers (sorry-count, forbidden-token) stay
+                    # backend-agnostic. Write carries `content`, Edit
+                    # `new_string`, MultiEdit a list of edits.
+                    payload = str(tin.get("new_string") or tin.get("content") or "")
+                    if not payload and isinstance(tin.get("edits"), list):
+                        payload = "\n".join(
+                            str(e.get("new_string", ""))
+                            for e in tin["edits"] if isinstance(e, dict)
+                        )
+                    return Event(EventKind.EDIT, f"{name} {target}".strip(), raw=obj,
+                                 path=target, payload=payload)
+                return Event(EventKind.TOOL, f"{name} {target}".strip(), raw=obj, path=target)
         return None
 
     if etype == "user":
@@ -174,6 +186,15 @@ class _ClaudeRun:
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
     dropped_steers: int = 0             # steers skipped for lack of a session id
+    # Token accounting, accumulated across EVERY turn (initial + steers + folds)
+    # from each turn's terminal ``result`` stream object. Feeds the usage ledger
+    # behind formalization.yaml — capture here or the numbers are lost.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0          # cache reads dominate agentic sessions —
+    cache_creation_tokens: int = 0      # recorded so totals reconcile with cost
+    cost_usd: float = 0.0               # claude's reported figure (notional on Max)
+    turns: int = 0
 
 
 class ClaudeAdapter(ProverAdapter):
@@ -203,6 +224,10 @@ class ClaudeAdapter(ProverAdapter):
     """
 
     name = "claude"
+    #: Turn-granular: a correction lands only as the next ``--resume`` turn, so
+    #: the driver skips the per-event judge by default and steers this backend
+    #: via the verify-gate fold. See :class:`~servers.prover.base.SteeringCapability`.
+    steering = SteeringCapability.BETWEEN_TURNS
 
     def __init__(
         self,
@@ -250,9 +275,15 @@ class ClaudeAdapter(ProverAdapter):
         state: _ClaudeRun = run.handle
 
         try:
-            # First turn: system prompt + spec.
-            first_prompt = _build_spec_prompt(state.node, state.spec)
-            yield from self._run_turn(state, first_prompt, resume=False)
+            # First turn: system prompt + spec. Guarded so the generator is
+            # RE-ENTRANT: after the initial call exhausted the stream, the
+            # driver's verify-gate fold queues a steer and calls events() again —
+            # that re-entry must run ONLY the corrective resume turn below,
+            # never replay the first turn.
+            if not state.started:
+                state.started = True
+                first_prompt = _build_spec_prompt(state.node, state.spec)
+                yield from self._run_turn(state, first_prompt, resume=False)
 
             # Drain any steers the driver queued during the turn (turn-granular
             # steering — see the module docstring on the mechanism).
@@ -289,6 +320,10 @@ class ClaudeAdapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         state: _ClaudeRun = run.handle
         text = (state.final_text or "").strip()
+        usage = {"input_tokens": state.input_tokens, "output_tokens": state.output_tokens,
+                 "cache_read_tokens": state.cache_read_tokens,
+                 "cache_creation_tokens": state.cache_creation_tokens,
+                 "cost_usd": round(state.cost_usd, 6), "turns": state.turns}
         if state.timed_out:
             return ProofResult(
                 status="failed",
@@ -296,10 +331,11 @@ class ClaudeAdapter(ProverAdapter):
                 reason=f"timeout: run exceeded max_wait_seconds ({self._max_wait_seconds}s); worker killed",
                 backend=self.name,
                 landed_files=0,
-                meta={"session_id": state.session_id, "model": state.model, "sub_status": "timeout"},
+                meta={"session_id": state.session_id, "model": state.model,
+                      "sub_status": "timeout", "usage": usage},
             )
         proved = not _looks_failed(text)
-        meta = {"session_id": state.session_id, "model": state.model}
+        meta = {"session_id": state.session_id, "model": state.model, "usage": usage}
         if state.dropped_steers:
             meta["dropped_steers"] = state.dropped_steers
         return ProofResult(
@@ -332,6 +368,25 @@ class ClaudeAdapter(ProverAdapter):
             sid = obj.get("session_id")
             if sid:
                 state.session_id = sid
+            if obj.get("type") == "result":
+                # The terminal object of each turn carries the turn's token usage
+                # and claude's cost figure — accumulate them per run.
+                # VERIFY-LIVE: this SUMS across resumed turns on the reasoning
+                # that each `claude -p` invocation reports its own turn. If any
+                # CLI version reports session-cumulative usage/cost on
+                # --resume, this overstates — confirm with two live turns
+                # (docs/avocado-handoff.md documents the 2-minute probe).
+                usage = obj.get("usage") or {}
+                state.input_tokens += int(usage.get("input_tokens") or 0)
+                state.output_tokens += int(usage.get("output_tokens") or 0)
+                state.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
+                state.cache_creation_tokens += int(
+                    usage.get("cache_creation_input_tokens") or 0)
+                try:
+                    state.cost_usd += float(obj.get("total_cost_usd") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                state.turns += 1
             event = _classify_stream_event(obj)
             if event is None:
                 continue

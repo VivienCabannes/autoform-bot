@@ -44,7 +44,7 @@ from ._cli_common import (
     _subprocess_line_runner,
     build_worker_prompt,
 )
-from .base import Event, EventKind, ProofResult, ProverAdapter, Run
+from .base import Event, EventKind, ProofResult, ProverAdapter, Run, SteeringCapability
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,10 @@ def _classify_codex_event(obj: dict[str, Any]) -> tuple[Event | None, str | None
     if itype in _THINK_ITEMS or "reason" in itype or "think" in itype:
         return Event(EventKind.THINKING, text, raw=obj), None, sid
     if itype in _EDIT_ITEMS or "patch" in itype or "file_change" in itype:
-        return Event(EventKind.EDIT, text, raw=obj), None, sid
+        # Path best-effort across codex schema variants; the patch/file text
+        # itself doubles as the written payload for the structured triggers.
+        path = str(item.get("path") or item.get("file") or item.get("file_path") or "")
+        return Event(EventKind.EDIT, text, raw=obj, path=path, payload=text), None, sid
     if itype in _TOOL_ITEMS or "command" in itype or "tool" in itype or "exec" in itype:
         return Event(EventKind.TOOL, text, raw=obj), None, sid
     if itype in ("completed", "result") and text:
@@ -124,9 +127,17 @@ class _CodexRun:
     session_id: str = ""
     pending_steer: str | None = None
     final_text: str = ""
+    started: bool = False
     extra_args: list[str] = field(default_factory=list)
     deadline: float | None = None       # absolute time.monotonic() wall-clock cap
     timed_out: bool = False
+    dropped_steers: int = 0             # steers skipped for lack of a session id
+    # Token accounting across every turn (codex ``turn.completed`` events carry
+    # a usage dict; read defensively wherever one appears).
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    turns: int = 0
 
 
 class CodexAdapter(ProverAdapter):
@@ -139,6 +150,9 @@ class CodexAdapter(ProverAdapter):
     """
 
     name = "codex"
+    #: Turn-granular, exactly like the Claude CLI: corrections land as the next
+    #: ``codex exec resume`` turn; the driver steers this backend via the fold.
+    steering = SteeringCapability.BETWEEN_TURNS
 
     def __init__(
         self,
@@ -173,9 +187,14 @@ class CodexAdapter(ProverAdapter):
         state: _CodexRun = run.handle
         try:
             # codex exec has no separate system-prompt flag, so the worker discipline is
-            # prepended to the first user prompt.
-            first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
-            yield from self._run_turn(state, first, resume=False)
+            # prepended to the first user prompt. Guarded for RE-ENTRANCY: the
+            # driver's verify-gate fold re-enters events() after the stream
+            # exhausted, and that re-entry must run ONLY the corrective resume
+            # turn, never replay the first turn.
+            if not state.started:
+                state.started = True
+                first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
+                yield from self._run_turn(state, first, resume=False)
 
             while state.pending_steer:
                 correction = state.pending_steer
@@ -183,6 +202,7 @@ class CodexAdapter(ProverAdapter):
                 if not state.session_id:
                     # No session captured → cannot resume with context; drop the steer
                     # rather than run a context-less turn (best-effort, never raises).
+                    state.dropped_steers += 1
                     logger.info("codex adapter: no session id; dropping steer (no resume context)")
                     break
                 yield from self._run_turn(state, correction, resume=True)
@@ -201,6 +221,8 @@ class CodexAdapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         state: _CodexRun = run.handle
         text = (state.final_text or "").strip()
+        usage = {"input_tokens": state.input_tokens, "output_tokens": state.output_tokens,
+                 "cached_tokens": state.cached_tokens, "turns": state.turns}
         if state.timed_out:
             return ProofResult(
                 status="failed",
@@ -209,16 +231,21 @@ class CodexAdapter(ProverAdapter):
                 backend=self.name,
                 landed_files=0,
                 meta={"session_id": state.session_id, "model": state.model or "codex-default",
-                      "sub_status": "timeout"},
+                      "sub_status": "timeout", "usage": usage},
             )
         proved = not _looks_failed(text)
+        meta: dict[str, Any] = {"session_id": state.session_id,
+                                "model": state.model or "codex-default",
+                                "usage": usage}
+        if state.dropped_steers:
+            meta["dropped_steers"] = state.dropped_steers
         return ProofResult(
             status="proved" if proved else "failed",
             proof_text=text,
             reason="" if proved else _failure_reason(text),
             backend=self.name,
             landed_files=0,  # files are written in-place by codex's own tools
-            meta={"session_id": state.session_id, "model": state.model or "codex-default"},
+            meta=meta,
         )
 
     # ---------------------------------------------------------------- internals
@@ -233,6 +260,19 @@ class CodexAdapter(ProverAdapter):
         args += self._autonomy_args + state.extra_args + [prompt]
 
         for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)):
+            usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
+            if usage is None and isinstance(obj.get("item"), dict):
+                iu = obj["item"].get("usage")
+                usage = iu if isinstance(iu, dict) else None
+            if usage:
+                # VERIFY-LIVE: assumes per-event usage deltas; if a codex build
+                # emits cumulative snapshots (or duplicates usage on nested and
+                # top-level events for the same tokens), this overcounts —
+                # check one live `codex exec --json` transcript.
+                state.input_tokens += int(usage.get("input_tokens") or 0)
+                state.output_tokens += int(usage.get("output_tokens") or 0)
+                state.cached_tokens += int(usage.get("cached_input_tokens") or 0)
+                state.turns += 1
             event, final, sid = _classify_codex_event(obj)
             if sid:
                 state.session_id = sid

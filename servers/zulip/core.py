@@ -8,9 +8,7 @@ Dependency: ``zulip`` (provided by the ``zulip`` extra in pyproject.toml).
 
 from __future__ import annotations
 
-import configparser
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

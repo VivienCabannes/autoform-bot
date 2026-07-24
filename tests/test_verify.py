@@ -282,3 +282,20 @@ def test_driver_gate_only_runs_on_proved():
 def test_driver_gate_disabled_when_none():
     res = prove(_FakeAdapter("proved"), "N", "spec", "/p", max_steers=0, verifier=None)
     assert res.status == "proved"
+
+
+def test_baseline_new_file_in_new_directory_is_attributed(tmp_path):
+    """git collapses an untracked dir to `?? Dir/` without -uall — a proof landed
+    into a FRESH directory must still attribute (the openai/avocado adapter and
+    any worker creating a new module dir land exactly this shape)."""
+    repo = _make_repo(tmp_path)
+    baseline = capture_baseline(str(repo))
+
+    (repo / "Prob").mkdir()
+    (repo / "Prob" / "Chernoff.lean").write_text(
+        "theorem chernoff : True := trivial\n", encoding="utf-8")
+    r = verify_proof("N", str(repo), baseline=baseline, has_lakefile=True,
+                     builder=_CLEAN_BUILD,
+                     prober=lambda probe, pdir: (0, "'chernoff' depends on axioms: [propext]"))
+    assert r.ok
+    assert r.checks["files"] == ["Prob/Chernoff.lean"]
