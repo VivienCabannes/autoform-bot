@@ -52,6 +52,8 @@
   };
 
   var POLL_MS = 2500;          // dispatch poll cadence (~2.5s, per spec)
+  var GRAPH_POLL_MS = 4000;    // graph auto-refresh cadence — re-fetch /api/dot and re-render ONLY when the DOT changed (so the DAG grows live during planning, no full reload)
+  var lastInteraction = 0;     // ms of the last user expand/collapse; the poll defers a re-render right after one
 
   // Human-facing tier labels (mirrors the server's TIER_LABELS) for the bar/banner.
   var TIER_LABELS = { 1: "clusters", 2: "statements", 3: "declarations" };
@@ -161,6 +163,7 @@
       if (ok && window.d3 && window.d3.select(mount).graphviz) {
         home.online = true;
         renderGraph(home.dot, false);
+        startGraphPolling();
       } else {
         home.online = false;
         renderFallback(mount);
@@ -295,6 +298,7 @@
     window.DepGraphCore.renderDot(mount, dot, {
       useWorker: false,
       stageClass: "rv-graph-stage",
+      preserveZoom: !!transition,   // re-renders (expand/collapse/poll) keep the camera; first paint fits
       onSettle: function () {
         home.rendering = false;
         decorate(mount);
@@ -330,13 +334,45 @@
     });
   }
 
+  // ---- live graph auto-refresh -------------------------------------------------
+  // While the DAG is being built (planning) or reviewed, re-fetch the current tier's
+  // DOT on a timer and re-render ONLY when it actually changed, so new nodes appear
+  // without a full page reload. Reuses the same /api/dot path as refetchAndRender,
+  // preserving the current tier + `expanded` set. Skipped for local/too-large/offline
+  // views (whose DOT isn't the flat /api/dot) and while a render is in flight; a
+  // byte-identical DOT is a no-op, so a settled graph never flickers.
+  function startGraphPolling() {
+    if (TOO_LARGE || NEIGHBORHOOD || ANCHOR || FOCUS) return;  // only the plain live home view
+    setInterval(pollGraph, GRAPH_POLL_MS);
+  }
+  function pollGraph() {
+    if (!home.online || home.rendering) return;
+    if (TOO_LARGE || NEIGHBORHOOD || ANCHOR || FOCUS) return;
+    if (Date.now() - lastInteraction < 1500) return;   // just navigated — don't re-render under the user
+
+    var expand = Array.from(home.expanded).join(",");
+    var url = DOT_URL + "?tier=" + encodeURIComponent(TIER)
+      + "&expand=" + encodeURIComponent(expand);
+    fetch(url, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (res) {
+      if (!res || typeof res.dot !== "string" || res.dot === home.dot) return;  // unchanged → no re-render
+      home.dot = res.dot;
+      if (res.id_by_slug) home.idBySlug = res.id_by_slug;
+      if (res.kinds) home.kinds = res.kinds;
+      if (res.topo) home.topo = res.topo;
+      renderGraph(res.dot, true);
+      renderExpandedBar();
+    }).catch(function () { /* transient; the next tick retries */ });
+  }
+
   function expandNode(id) {
     if (home.rendering || home.expanded.has(id) || !hasChildren(id)) return;
+    lastInteraction = Date.now();
     home.expanded.add(id);
     refetchAndRender();
   }
   function collapseNode(id) {
     if (home.rendering || !home.expanded.has(id)) return;
+    lastInteraction = Date.now();
     home.expanded.delete(id);
     refetchAndRender();
   }
@@ -839,7 +875,8 @@
   var ROLE_LABEL = {
     reviewer: "reviewer", worker: "worker",
     planner: "planner", graphreview: "graphreview", contentreview: "contentreview",
-    holistic: "holistic", mathcheck: "mathcheck", escalation: "escalation"
+    holistic: "holistic", mathcheck: "mathcheck", escalation: "escalation",
+    splitter: "splitter", sourcesearch: "source-searcher"
   };
 
   // Known palette icons (fallback if the server entry omits one). The real icons
@@ -847,7 +884,8 @@
   var ROLE_ICON = {
     reviewer: "⚖", worker: "⛏",
     planner: "◷", graphreview: "🔗", contentreview: "📝",
-    holistic: "🔭", mathcheck: "🔎", escalation: "⚑"
+    holistic: "🔭", mathcheck: "🔎", escalation: "⚑",
+    splitter: "✂", sourcesearch: "🔍"
   };
 
   function initActivity() {

@@ -49,6 +49,14 @@
     stage.style.cssText = "width:100%;height:100%;";
     mount.appendChild(stage);
 
+    // Camera preservation (opts.preserveZoom): capture the PREVIOUS render's zoom/pan so a
+    // re-render (expand/collapse/poll) keeps the user's viewport instead of snapping back to
+    // fit. Best-effort — any d3-graphviz API mismatch is swallowed and the normal .fit() stands.
+    var prevT = null;
+    if (opts.preserveZoom && mount.__dgGv) {
+      try { prevT = global.d3.zoomTransform(mount.__dgGv.zoomSelection().node()); } catch (e) { prevT = null; }
+    }
+
     var settled = false;
     function settle() {
       if (settled) return;
@@ -56,6 +64,10 @@
       var stages = mount.querySelectorAll("." + stageClass);
       for (var i = 0; i < stages.length; i++) {
         if (stages[i] !== stage) stages[i].remove();
+      }
+      mount.__dgGv = gv;                         // remember this render's graphviz for next-time capture
+      if (prevT) {                               // re-apply the saved camera → no fit-jump on re-render
+        try { gv.zoomSelection().call(gv.zoomBehavior().transform, prevT); } catch (e) {}
       }
       if (opts.onSettle) opts.onSettle(mount);
     }

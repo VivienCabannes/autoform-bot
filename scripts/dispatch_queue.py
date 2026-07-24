@@ -27,6 +27,9 @@ Usage::
   dispatch_queue.py <project> status               # one line per task (banners all orchestrator-owned work)
   dispatch_queue.py <project> escalations          # open escalations + full notes (engine-raised walls)
   dispatch_queue.py <project> mine                 # ALL open orchestrator-owned tasks — your full worklist
+  dispatch_queue.py <project> orchestrator --state working --phase P [--detail D]   # set the live-feed orchestrator line
+  dispatch_queue.py <project> agent-start --role R --name N [--target T] [--target-label L]  # show a subagent live
+  dispatch_queue.py <project> agent-done --name N  # clear a subagent from the live feed
 
 ``enqueue`` lets the orchestrator (Claude, or any caller) add its OWN tasks to the
 same queue the dashboard writes — so autonomous and human-dropped work share one
@@ -128,7 +131,8 @@ def _open_orchestrator_tasks(tasks: list) -> list:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Drain/sync the review dashboard queue.")
     ap.add_argument("project", type=Path, help="review project dir (holds task_queue.json)")
-    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue", "escalations", "mine"])
+    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue",
+                                    "escalations", "mine", "orchestrator", "agent-start", "agent-done"])
     ap.add_argument("id", nargs="?", help="task id (for claim/done/fail)")
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
@@ -138,6 +142,12 @@ def main(argv=None) -> int:
     ap.add_argument("--node-label", default="", help="enqueue: display label (defaults to --node)")
     ap.add_argument("--note", default="", help="enqueue: free-text payload (e.g. a worker's escalation reason)")
     ap.add_argument("--source", default="orchestrator", help="enqueue: who raised it (orchestrator|engine|human)")
+    ap.add_argument("--role", default="", help="agent-start: subagent role (splitter|mathcheck|graphreview|contentreview|holistic|sourcesearch|…)")
+    ap.add_argument("--name", default="", help="agent-start/agent-done: unique live-feed entry name (e.g. 'splitter:Covering spaces')")
+    ap.add_argument("--target", default="", help="agent-start: node/cluster the subagent is working on")
+    ap.add_argument("--target-label", default="", help="agent-start: display label for the target (defaults to --target)")
+    ap.add_argument("--state", default="", help="orchestrator: state (working|idle|…; default working)")
+    ap.add_argument("--phase", default="", help="orchestrator: phase label (e.g. 'Phase 2: splitting')")
     a = ap.parse_args(argv)
 
     qp = a.project / "task_queue.json"
@@ -225,6 +235,54 @@ def main(argv=None) -> int:
             _save(qp, tasks)
             _save(fp, _feed_for(tasks))
         print(f"enqueued {tid}")
+        return 0
+
+    # --- live-feed writers (agents_status.json directly; NOT queue-derived) --------
+    # Let the `plan` orchestrator surface its Task subagents in the dashboard during
+    # setup, when no engine runs to sync the feed from the queue. Each preserves the
+    # other entries (keyed by `name`) under the feed's own lock, so parallel splitters
+    # coexist. Handled before the id-required branch since none take a task id.
+    _DEFAULT_FEED = {"orchestrator": {"state": "idle"}, "agents": []}
+    if a.cmd in ("orchestrator", "agent-start", "agent-done"):
+        with fslock.locked(fp):
+            feed = _load(fp, dict(_DEFAULT_FEED))
+            if not isinstance(feed, dict):
+                feed = {"orchestrator": {"state": "idle"}, "agents": []}
+            feed.setdefault("agents", [])
+            if not isinstance(feed.get("agents"), list):
+                feed["agents"] = []
+            if a.cmd == "orchestrator":
+                orch = {"state": a.state or "working"}
+                if a.phase:
+                    orch["phase"] = a.phase
+                if a.detail:
+                    orch["detail"] = a.detail
+                feed["orchestrator"] = orch
+                msg = f"orchestrator -> {orch['state']}" + (f" · {a.phase}" if a.phase else "")
+            elif a.cmd == "agent-start":
+                if not (a.role and a.name):
+                    ap.error("agent-start needs --role and --name")
+                feed["agents"] = [x for x in feed["agents"]
+                                  if not (isinstance(x, dict) and x.get("name") == a.name)]
+                feed["agents"].append({
+                    "role": a.role, "name": a.name,
+                    "target": a.target, "target_label": a.target_label or a.target,
+                    "status": "running", "detail": a.detail,
+                })
+                orch = feed.get("orchestrator") or {}
+                if not isinstance(orch, dict) or orch.get("state", "idle") == "idle":
+                    orch = dict(orch) if isinstance(orch, dict) else {}
+                    orch["state"] = "working"
+                    feed["orchestrator"] = orch
+                msg = f"agent-start {a.name}" + (f" -> {a.target}" if a.target else "")
+            else:  # agent-done
+                if not a.name:
+                    ap.error("agent-done needs --name")
+                feed["agents"] = [x for x in feed["agents"]
+                                  if not (isinstance(x, dict) and x.get("name") == a.name)]
+                msg = f"agent-done {a.name}"
+            _save(fp, feed)
+        print(msg)
         return 0
 
     if not a.id:

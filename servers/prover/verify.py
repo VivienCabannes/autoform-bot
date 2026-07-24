@@ -76,6 +76,11 @@ _AXIOM_LEDGER_NAMES = ("AXIOM_AUDIT.md", "AXIOM_AUDIT.txt", "axiom_audit.md", "A
 _AXIOM_REPORT_RE = re.compile(r"depends on axioms:\s*\[([^\]]*)\]")
 _LEDGER_AXIOM_RE = re.compile(r"\baxiom\s+`?([A-Za-z_][A-Za-z0-9_.']*)`?")
 
+#: Sentinel the enumeration probe prints once it has scanned EVERY declaration the
+#: touched modules own. Its absence means the probe died mid-scan → fail closed.
+_PROBE_DONE = "AUTOFORM_PROBE_OK"
+_PROBE_DONE_RE = re.compile(r"AUTOFORM_PROBE_OK decls=(\d+)")
+
 
 @dataclass
 class VerifyResult:
@@ -311,6 +316,13 @@ def _axioms_in_report(pout: str) -> set[str]:
     return names
 
 
+def _decls_probed(pout: str) -> int:
+    """How many module-owned declarations the enumeration probe reported (0 if the
+    sentinel is absent)."""
+    m = _PROBE_DONE_RE.search(pout)
+    return int(m.group(1)) if m else 0
+
+
 # ------------------------------------------------------------ module + decl parse
 
 def _module_of(file: str, project_dir: str) -> str | None:
@@ -353,23 +365,51 @@ def _decls_of(src: str) -> list[str]:
     return list(dict.fromkeys(decls))
 
 
-def _build_probe(files: list[str], project_dir: str, reader: Callable[[Path], str]) -> tuple[str, list[str], list[str]]:
-    """Assemble the ``#print axioms`` probe: ``import <modules>`` + one ``#print
-    axioms <decl>`` per touched declaration."""
-    modules, decls = [], []
+def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
+    """Assemble an AUTHORITATIVE ``#print axioms`` probe.
+
+    Rather than scraping declaration names from source with a regex (which cannot see
+    anonymous ``instance``s, ``alias``/``structure``/``axiom``, macro-generated decls,
+    or multiline signatures — any of which can carry a transitive ``sorryAx`` past the
+    gate), this imports the touched modules and enumerates every declaration those
+    modules OWN directly from the compiled Lean **environment** (the build artifact),
+    printing each one's axiom set in the same ``depends on axioms: [...]`` form the
+    downstream parser already understands. A final ``AUTOFORM_PROBE_OK decls=N``
+    sentinel proves the scan ran to completion, so a probe that dies mid-enumeration
+    fails closed instead of silently skipping the un-scanned (possibly tainted) decls.
+
+    ``_decls_of`` (the old source regex) is kept only for the fast literal-sorry
+    pre-filter's siblings and tests; it is no longer the authority for the gate."""
+    modules: list[str] = []
     for f in files:
         mod = _module_of(f, project_dir)
         if mod and mod not in modules:
             modules.append(mod)
-        fp = Path(f) if Path(f).is_absolute() else Path(project_dir) / f
-        try:
-            decls.extend(_decls_of(reader(fp)))
-        except Exception:
-            continue
-    decls = list(dict.fromkeys(decls))
-    body = "\n".join(f"import {m}" for m in modules)
-    body += "\n" + "\n".join(f"#print axioms {d}" for d in decls)
-    return body, modules, decls
+    if not modules:
+        return "", []
+    imports = "\n".join(f"import {m}" for m in modules)
+    mod_lits = ", ".join(f"`{m}" for m in modules)
+    probe = (
+        "import Lean\n"
+        f"{imports}\n"
+        "open Lean in\n"
+        "run_cmd do\n"
+        "  let env ← getEnv\n"
+        f"  let mods : List Name := [{mod_lits}]\n"
+        "  let idxs := mods.filterMap env.getModuleIdx?\n"
+        "  let mut n : Nat := 0\n"
+        "  for (nm, _ci) in env.constants.toList do\n"
+        "    if let some i := env.getModuleIdxFor? nm then\n"
+        "      if idxs.contains i && !nm.isInternalDetail then\n"
+        "        n := n + 1\n"
+        "        let axs ← collectAxioms nm\n"
+        "        if axs.isEmpty then\n"
+        "          logInfo m!\"'{nm}' does not depend on any axioms\"\n"
+        "        else\n"
+        "          logInfo m!\"'{nm}' depends on axioms: {axs.toList}\"\n"
+        f"  logInfo m!\"{_PROBE_DONE} decls={{n}}\"\n"
+    )
+    return probe, modules
 
 
 # ----------------------------------------------------------------- real runners
@@ -481,19 +521,21 @@ def verify_proof(
         return VerifyResult(False, f"`lake build` failed (exit {rc}): {' '.join(bout.split())[-300:]}",
                             {"verified": True, "files": files, "build": "error"})
 
-    # 3. AUTHORITATIVE kernel check — #print axioms must show no sorryAx (catches a
-    #    sorry reached through an imported/untouched file too).
-    probe, modules, decls = _build_probe(files, project_dir, read)
-    if not decls:
-        # no declarations to kernel-check; the build + pre-filter passed.
-        return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean", "kernel": "no-decls"})
+    # 3. AUTHORITATIVE kernel check — enumerate the touched modules' declarations from
+    #    the compiled environment and #print their axioms; must show no sorryAx (catches
+    #    a sorry reached through an imported/untouched file, an anonymous instance, or
+    #    any decl form a source scan would miss). The sentinel guarantees completeness.
+    probe, modules = _build_probe(files, project_dir)
+    if not modules:
+        return VerifyResult(False, "could not resolve a Lean module from the touched files — cannot kernel-verify",
+                            {"verified": True, "files": files, "kernel": "no-modules"})
     prove_probe = prober or _run_probe
     prc, pout = prove_probe(probe, project_dir)
     if "sorryAx" in pout:
         return VerifyResult(False, "proof depends on `sorryAx` — a sorry/admit, possibly via an imported file",
                             {"verified": True, "files": files, "kernel": "sorryAx"})
-    if "axioms" not in pout:   # no #print-axioms report ran (import failed / module not built)
-        return VerifyResult(False, f"could not kernel-verify (no axiom report; lean exit {prc}): {' '.join(pout.split())[-200:]}",
+    if _PROBE_DONE not in pout:   # enumeration did not finish (import failed / not built / crash) → fail closed
+        return VerifyResult(False, f"could not kernel-verify (axiom enumeration did not complete; lean exit {prc}): {' '.join(pout.split())[-200:]}",
                             {"verified": True, "files": files, "kernel": "unverified"})
 
     # 4. axiom WHITELIST — sorryAx is not the only way to fake a proof: an
@@ -508,6 +550,8 @@ def verify_proof(
             f"proof depends on non-standard axiom(s) not in the project ledger: {', '.join(rogue)}",
             {"verified": True, "files": files, "kernel": "axiom",
              "axioms": sorted(axioms), "rogue_axioms": rogue})
+    ndecls = _decls_probed(pout)
     return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean",
-                                   "modules": modules, "decls": len(decls), "kernel": "clean",
+                                   "modules": modules, "decls": ndecls,
+                                   "kernel": "clean" if ndecls else "no-decls",
                                    "axioms": sorted(axioms)})
