@@ -37,6 +37,37 @@ Many tasks across this project form a **DAG** — partly parallelizable, partly 
 
 ---
 
+## Phase 0 — lakefile precondition (before dispatching any prover worker)
+
+Planning (tiers 1–2) needs no Lean toolchain, but the **prove side** (dispatching
+`autoform-worker` or the Aristotle backend to fill a node's `sorry`/discharge an
+axiom) does. **Before dispatching any prover worker, run this precondition once, in
+the orchestrator** — it is the orchestrator's job, not each worker's:
+
+1. **A lakefile must be reachable** from the working directory the workers will
+   write and build from — a `lakefile.toml` or `lakefile.lean` in that directory or
+   an ancestor. If the target lives under a subdir whose lakefile is elsewhere
+   (e.g. the code is `lean4/src/Foo.lean` but the lakefile is under `lean4/`),
+   identify the real project root.
+2. **`lake env lean` must actually run there.** Confirm the toolchain works on an
+   *untouched* file (or a trivial `import Mathlib` scratch in a fresh repo) before
+   any worker touches anything — run it with the API key scrubbed:
+   `env -u ANTHROPIC_API_KEY lake env lean <file>` and see it exit cleanly. Fix the
+   toolchain/cache first if it does not (see the worker's `tool-usage` reference).
+
+If either check fails — no reachable lakefile, or `lake env lean` will not run —
+**STOP and report**: name the project root and the `cd` to run from, or the
+toolchain failure. Do **not** dispatch workers anyway: with no working build, a
+worker cannot compile-to-iterate and any "proof" it returns would be fiction. This
+precondition is run **once** here, so workers never each re-check it.
+
+Billing note: everything the orchestrator and its in-session workers do runs on the
+Claude Max subscription (free, no metered API). Scrub `ANTHROPIC_API_KEY` from every
+subprocess (`env -u ANTHROPIC_API_KEY …`) so no repo script or `lake`/`git` child
+can silently bill the Anthropic API.
+
+---
+
 ## Phase 1: Build the coarse (tier-1) graph
 
 Phase 1 produces a high-level map: the textbook's mathematics grouped into coherent concept clusters, each grounded down to Mathlib. It is deliberately coarse — a quick, user-reviewable picture of scope that also hands Phase 2 its starting partition (top-down splitting of known clusters is far more tractable than clustering fine nodes bottom-up).
