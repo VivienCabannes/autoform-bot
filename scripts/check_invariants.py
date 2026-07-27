@@ -5,7 +5,7 @@ A review wave partitions the graph by responsibility; this checker verifies the
 global structural invariants that span the whole graph. The orchestrator runs it
 after each review wave to confirm the graph stayed well-formed.
 
-It separates two kinds of check, against skills/plan/references/plan-json-schema.md:
+It separates two kinds of check, against internal/references/plan-json-schema.md:
 
   Structural integrity (must hold at every stage):
   - reference integrity: every depends_on target and every non-null parent

@@ -1,10 +1,11 @@
 ---
 name: setup
 description: >-
-  Initialize or resume a specific Autoform Lean formalization project: create
-  its Lean/Mathlib project, durable DAG, blueprint, dashboard, and host roles.
-  Use for project initialization/resume/reset, not for installing Autoform's
-  own uv, Python, Lean, or Zulip prerequisites.
+  Set up, repair, inspect, plan, visualize, or resume an Autoform Lean
+  formalization project. Handles Autoform and Lean prerequisites, Lean/Mathlib
+  project creation, workspace status, the durable DAG, blueprint, dashboard,
+  and host roles. Use for setup, install, initialize, resume, reset, inspect
+  workspace, plan a formalization, or view its graph.
 ---
 
 # Set up an Autoform project
@@ -16,20 +17,38 @@ Use the current host's native tools and subagents.
 Resolve one absolute plugin root. Prefer a valid `AUTOFORM_PLUGIN_ROOT`,
 `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. The result must be the
-directory containing both `scripts/` and `skills/`.
+directory containing `scripts/`, `skills/`, and `internal/`.
 
 Print the resolved plugin root and target project. Stop if the root does not
-contain both `scripts/merge_node.py` and `skills/plan/SKILL.md`.
+contain both `scripts/merge_node.py` and `internal/runbooks/planning.md`.
 In every command below, replace `<AUTOFORM_PLUGIN_ROOT>` with that quoted
 absolute path; do not depend on a variable exported by a previous shell call.
 
 ## Procedure
 
-1. Resolve the target project from an explicit argument, otherwise the current
+1. Check or repair the environment when this is a first run, when the user asks
+   to install/repair Autoform, or when a required command is missing:
+
+   ```bash
+   bash "<AUTOFORM_PLUGIN_ROOT>/scripts/install_autoform.sh"
+   ```
+
+   The script checks uv, Python dependencies, Lean, and optional Zulip access.
+   If `lean`, `lake`, or `elan` is still missing and the requested operation
+   needs Lean, run:
+
+   ```bash
+   bash "<AUTOFORM_PLUGIN_ROOT>/scripts/install_lean.sh"
+   ```
+
+   These are internal Setup operations, not separate user commands.
+
+2. Resolve the target project from an explicit argument, otherwise the current
    directory. If there is no `lakefile.*`, create the Lean project as an
    internal setup step:
 
-   - Run `install-lean` first only when `lake` or `elan` is missing.
+   - Run the internal Lean installer first only when `lake` or `elan` is
+     missing.
    - Ask for a project name in UpperCamelCase (for example `ConvexBodies`) and
      an optional target directory when they were not supplied.
    - Require a target directory that does not already exist, then run:
@@ -42,13 +61,24 @@ absolute path; do not depend on a variable exported by a previous shell call.
    - Resolve and echo the newly created directory as `PROJECT_DIR`.
 
    Project creation is deliberately bundled into Setup rather than exposed as
-   a separate user-facing skill.
+   a separate user-facing command.
 
    Resolve `DISPATCH_PROJECT` from an explicit plan directory, otherwise use the
    Lean project itself. Create an explicitly requested missing plan directory
    only after echoing both absolute paths.
 
-2. On Codex, install the canonical role agents into the project:
+3. For an existing project, inspect its current state before changing it:
+
+   ```bash
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" "$PROJECT_DIR"
+   ```
+
+   Use `--search`, `--declarations`, or `--targets` when the request is
+   specifically about code search, declarations, or target status. Treat this
+   inspection as the resume source of truth.
+
+4. On Codex, install the canonical role agents into the project:
 
    ```bash
    uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
@@ -64,7 +94,7 @@ absolute path; do not depend on a variable exported by a previous shell call.
    full canonical `agents/<role>.md` body in its task. Claude Code reads those
    canonical plugin agents directly.
 
-3. Initialize durable planning state without overwriting existing work:
+5. Initialize durable planning state without overwriting existing work:
 
    ```bash
    uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
@@ -82,7 +112,7 @@ absolute path; do not depend on a variable exported by a previous shell call.
    reviews, and activity will be reset and that a timestamped snapshot will be
    retained under `<dispatch-project>/.autoform/snapshots/`.
 
-4. Start the dashboard before
+6. Start the dashboard before
    planning so graph changes appear live. Use a free loopback port unless the
    user supplied one. Reuse a server already serving this exact graph.
 
@@ -97,7 +127,10 @@ absolute path; do not depend on a variable exported by a previous shell call.
    server's first log line (it reports the actual bound port), verify the
    process is still alive, and report `http://127.0.0.1:<actual-port>/`.
 
-5. Run or resume the `plan` skill. Planning is incomplete when the graph is
+7. Read and follow
+   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`, including its schema
+   at `<AUTOFORM_PLUGIN_ROOT>/internal/references/plan-json-schema.md`. Planning
+   is incomplete when the graph is
    absent or empty, a tier-1 cluster has no tier-2 children, or a node has null
    content. Preserve every durable node already merged.
 
@@ -106,10 +139,12 @@ absolute path; do not depend on a variable exported by a previous shell call.
    canonical roles (`splitter`, `mathlib-checker`, and reviewers), and route all
    graph edits through `scripts/merge_node.py`.
 
-6. Run `plan-view` to export and build the blueprint.
+8. Read and follow
+   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to export and
+   build the blueprint. Visualization is part of Setup, not a separate command.
 
-7. Report the dashboard URL, tier-1 and tier-2 counts, native role-agent install
-   status, and the next step: run the `orchestrate` skill.
+9. Report the dashboard URL, tier-1 and tier-2 counts, native role-agent install
+   status, and the next step: run Orchestrate.
 
 ## Resume semantics
 

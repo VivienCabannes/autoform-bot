@@ -1,25 +1,15 @@
----
-name: review
-description: >
-  This skill should be used when the user asks to "review" a node / cluster / the
-  formalization, "build the reviewer packet", "open the review UI", "show the review
-  graph", "check faithfulness of the statements", "score the formalization", or set
-  the review dial. DAG-native human-review surface over the tiered plan: a headless
-  text reviewer packet by default, or a local review UI with `--view`.
----
-
-# Review — the human-review surface
+# Human-review runbook
 
 Resolve the absolute plugin root from a valid host variable or
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. Substitute it into every
 helper path.
 
 A formalization is only trustworthy when a human Lean expert will vouch for the
-**statements** (the kernel already vouches for the proofs). This skill produces the
+**statements** (the kernel already vouches for the proofs). This runbook produces the
 artifacts that make that vouching fast and decisive, **DAG-native** over the tiered
 plan (`graph.json` + the built blueprint), keyed by node `id`.
 
-Two outputs from one skill:
+Two outputs from the review path:
 
 - **`review <id>`** (default, headless, CI-friendly) — emit the **text reviewer
   packet** for a node or cluster: spec sheet + kernel evidence + jury scorecard. No
@@ -34,7 +24,8 @@ drag-and-drop / `POST /api/request` enqueues into for the orchestrate engine).
 `graph.json` and `informal_content/` stay pristine.
 
 The packet's structure, trust-class taxonomy, and the rules that make it honest live
-in `references/reviewer-packet.md` — read it before producing any packet.
+in `<AUTOFORM_PLUGIN_ROOT>/internal/references/reviewer-packet.md` — read it
+before producing any packet.
 
 ## Two encodings on the graph (never conflate them)
 
@@ -46,7 +37,8 @@ in `references/reviewer-packet.md` — read it before producing any packet.
 
 ## Two review sources per node (sidecar slots `ai` + `human`)
 
-- **`ai`** — the **weighted jury** (see the `eval-rubrics` skill): three blind
+- **`ai`** — the **weighted jury** (see
+  `internal/runbooks/evaluation.md`): three blind
   single-axis judges — `faithfulness`, `proof_integrity`, `code_quality` (0–5 each).
   Displayed score = `0.40·faith + 0.40·integ + 0.20·qual`. Verdict is
   **threshold-gated, not the average**: **clean** = all pass (faith ≥4, integ ≥3,
@@ -105,7 +97,8 @@ Resolve `<id>` to a node or a tier-1 cluster in `graph.json`, then emit the pack
    (verbatim signature) · the source statement (verbatim, from `source_refs`) ·
    one-sentence plain-math meaning · source citation · trust class
    (`DEF`/`STMT`/`INSTANCE`/`NOTATION`/`PROOF`/`AXIOM`/`SORRY`). Order so the
-   must-read lines come first; state the must-read line count. (`reviewer-packet.md`.)
+   must-read lines come first; state the must-read line count. See
+   `internal/references/reviewer-packet.md`.
 2. **Kernel evidence** — paste real output, never a summary: `#print axioms <decl>`
    per `mathlib_declarations`, reported as a **delta vs base** (`propext`,
    `Classical.choice`, `Quot.sound`); a word-boundary grep for introduced
@@ -123,7 +116,7 @@ This default is text-only and writes nothing. It is the CI/agent path.
 1. **Build the blueprint if stale.** The UI injects the *built* `div.thm#<slug>`
    fragments (MathJax already run) — it never regenerates the informalization. If the
    blueprint under `blueprint_export/blueprint/web/` is missing or older than
-   `graph.json`, build it first by delegating to the **`plan-view`** skill's steps
+   `graph.json`, build it first by following the visualization runbook's steps
    (check toolchain → `export_blueprint.py` → `make web`). Do not call `plastex`
    directly.
 

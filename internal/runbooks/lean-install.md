@@ -1,14 +1,4 @@
----
-name: install-lean
-description: >
-  Install Lean 4, elan, and lake. Checks prerequisites, installs the toolchain
-  manager, and verifies the install. Use when starting from scratch or when
-  lean/elan/lake commands are not found.
-  Trigger: /install-lean, "install lean", "setup lean", "elan not found",
-  "lean not found".
----
-
-# Install Lean 4
+# Lean installation runbook
 
 Resolve an absolute plugin root from a valid host variable or
 `Path(<this loaded SKILL.md>).resolve().parents[2]`.
@@ -16,7 +6,7 @@ Resolve an absolute plugin root from a valid host variable or
 Run the install script:
 
 ```bash
-bash "<AUTOFORM_PLUGIN_ROOT>/skills/install-lean/install-lean.sh"
+bash "<AUTOFORM_PLUGIN_ROOT>/scripts/install_lean.sh"
 ```
 
 The script is idempotent — safe to re-run. It:
@@ -26,5 +16,5 @@ The script is idempotent — safe to re-run. It:
 3. Installs the default Lean toolchain if `lean` is not on PATH
 4. Verifies `lean --version` and `lake --version` both work
 
-After installation, suggest the `setup` skill to create or initialize the
+After installation, continue the Setup workflow to create or initialize the
 formalization project.

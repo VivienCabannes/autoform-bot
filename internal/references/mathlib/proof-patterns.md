@@ -6,7 +6,7 @@
 - Then prove the existential by `⟨c, axiom⟩`. This carries mathematical content (the witness),
   rather than asserting bare existence.
 - **Scope:** this pattern applies only within the sanctioned-placeholder / audited-ledger
-  regime, where the axiom is tracked and satisfiability-vetted (see the **autoform-prove**
+  regime, where the axiom is tracked and satisfiability-vetted (see the internal proving
   axiom policy) — never as a way to dodge a proof.
 
 ## `choose` pitfalls
@@ -25,7 +25,7 @@
 
 - If a hypothesis is always true (e.g. an emptiness condition that the types force), the
   statement can often be simplified — but check this is genuine, not a vacuity that makes the
-  whole statement trivial (a vacuous statement proves nothing; see the **autoform-prove**
+  whole statement trivial (a vacuous statement proves nothing; see the internal proving
   false-statements reference).
 
 ## Uniform limits & smoothness (pointers)

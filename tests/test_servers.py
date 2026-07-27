@@ -5,7 +5,7 @@ the ``create_*_server()`` factory produces a valid FastMCP instance.
 
 Stub servers (repl, lsp, aristotle) have zero-argument factories that
 return servers whose tools return "not implemented" strings.
-The zulip server wraps ``skills/zulip/zulip-search.py``.
+The Zulip server exposes the internal community-search capability.
 """
 
 from __future__ import annotations

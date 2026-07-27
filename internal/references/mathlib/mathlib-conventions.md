@@ -112,7 +112,7 @@ review practice (PR review comments and Zulip discussion).
 - **`axiom`** — **worse than `sorry`.** It appears in every downstream `#print axioms`
   silently, posing as a legitimate foundation, and reviewers reject it as a stand-in for a
   proof. The only sanctioned use is under an audited-ledger discharge protocol (see the
-  **autoform-prove** axiom policy).
+  internal proving runbook's axiom policy).
 - **Sanctioned placeholder macros** — a project-defined placeholder (e.g. an `unproved`
   attribute-macro marking "the source doesn't prove this") is the best option for tracked,
   justified gaps — but only **if the project defines one**. Check first; do not assume it

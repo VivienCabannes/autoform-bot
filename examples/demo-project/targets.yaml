@@ -4,7 +4,7 @@
 # formalize, plus the IDs of the targets it depends on. The intended workflow
 # is to formalize in dependency order — definitions before the theorems that
 # use them. The current durable plan schema lives at
-# skills/plan/references/plan-json-schema.md.
+# internal/references/plan-json-schema.md.
 - id: def-convex-set
   type: definition
   source: "Definition 1.1"

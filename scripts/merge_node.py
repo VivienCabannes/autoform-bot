@@ -15,7 +15,7 @@ Payload (JSON, from --payload FILE or stdin):
     }
 
 A node record is a structural node object as described in
-skills/plan/references/plan-json-schema.md. An upserted record's "id" must match
+internal/references/plan-json-schema.md. An upserted record's "id" must match
 its key (it is filled in from the key when omitted). Deleting a node strips it
 from every other node's ``depends_on`` and sets its children's ``parent`` to
 null. New unresolved references are rejected atomically instead of being

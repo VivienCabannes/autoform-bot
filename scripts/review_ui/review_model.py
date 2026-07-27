@@ -88,14 +88,14 @@ VERDICT_DOT = {
 IN_MATHLIB_STATUSES = {"exists", "in-mathlib", "in_mathlib", "mathlib"}
 
 # ---------------------------------------------------------------------------
-# Jury rubrics — SINGLE SOURCE OF TRUTH: skills/eval-rubrics/references/*.json.
+# Jury rubrics — SINGLE SOURCE OF TRUTH: internal/rubrics/*.json.
 # The axis set, weights, pass thresholds and gating roles are READ FROM THOSE FILES,
 # so the jury is modular: add a rubric file to add an axis, remove one to shrink the
 # jury (down to a single reviewer), and everything downstream — the weighted score,
 # the verdict gate, the parallel dispatcher — adapts with NO code change. A built-in
 # fallback keeps this module usable (tests / missing files) without the rubric dir.
 # ---------------------------------------------------------------------------
-_RUBRIC_DIR = Path(__file__).resolve().parents[2] / "skills" / "eval-rubrics" / "references"
+_RUBRIC_DIR = Path(__file__).resolve().parents[2] / "internal" / "rubrics"
 
 # The built-in three — used only if no rubric files are found.
 _FALLBACK_RUBRICS: List[dict] = [

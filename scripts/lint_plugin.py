@@ -17,9 +17,9 @@ Checks (all stdlib):
     and a semver-shaped `version`.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
-  - The core `setup`, `orchestrate`, and `set-backend` workflow skills exist.
-  - Internal helpers such as project creation do not reappear as user skills.
-  - Every `commands/*` (`.md` or `.toml`) carries a `description`.
+  - The user-visible skill set is exactly `setup`, `orchestrate`, and
+    `set-backend`; supporting runbooks do not reappear as slash commands.
+  - No legacy `commands/*` file adds a fourth user-visible command.
   - Every `references/<file>` a SKILL.md cites exists in that skill's `references/`.
   - No surviving mention of an agent/skill in REMOVED_AGENTS / REMOVED_SKILLS
     (the rename-regression guard; HTML/`<!-- -->` comments are stripped first so
@@ -54,8 +54,41 @@ EXPECTED_MCP_SERVERS = frozenset(
         "autoform-zulip",
     }
 )
-REQUIRED_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
-INTERNAL_ONLY_SKILLS = frozenset({"make-project"})
+PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
+REQUIRED_INTERNAL_ASSETS = (
+    "internal/runbooks/environment.md",
+    "internal/runbooks/evaluation.md",
+    "internal/runbooks/lean-install.md",
+    "internal/runbooks/mathlib-style.md",
+    "internal/runbooks/planning.md",
+    "internal/runbooks/proving.md",
+    "internal/runbooks/review.md",
+    "internal/runbooks/visualization.md",
+    "internal/runbooks/workspace.md",
+    "internal/runbooks/zulip.md",
+    "internal/references/plan-json-schema.md",
+    "internal/references/reviewer-packet.md",
+    "internal/references/zulip-configuration.md",
+    "internal/references/mathlib/lean4-syntax.md",
+    "internal/references/mathlib/mathlib-conventions.md",
+    "internal/references/mathlib/proof-patterns.md",
+    "internal/references/mathlib/tactic-patterns.md",
+    "internal/references/mathlib/type-coercions.md",
+    "internal/references/proving/axiom-policy.md",
+    "internal/references/proving/commit-and-submit.md",
+    "internal/references/proving/false-statements.md",
+    "internal/references/proving/proof-strategies.md",
+    "internal/references/proving/sorry-handling.md",
+    "internal/references/proving/task-management.md",
+    "internal/references/proving/tool-usage.md",
+    "internal/rubrics/code_quality.json",
+    "internal/rubrics/faithfulness.json",
+    "internal/rubrics/proof_integrity.json",
+    "scripts/install_autoform.sh",
+    "scripts/install_lean.sh",
+    "scripts/make_project.sh",
+    "scripts/workspace_inspector.py",
+)
 
 errors: list[str] = []
 checks = 0
@@ -98,19 +131,6 @@ def frontmatter(path: Path) -> dict[str, str] | None:
         m = re.match(r"([a-zA-Z][a-zA-Z0-9_-]*):(.*)", line)
         if m:
             keys[m.group(1)] = m.group(2).strip()
-    return keys
-
-
-def toml_top_keys(path: Path) -> set[str]:
-    """Top-level bare keys of a flat command .toml (no `tomllib` needed)."""
-    keys: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or s.startswith("["):
-            continue
-        m = re.match(r'([A-Za-z0-9_-]+)\s*=', s)
-        if m:
-            keys.add(m.group(1))
     return keys
 
 
@@ -284,45 +304,66 @@ def check_skills() -> int:
         for key in ("name", "description"):
             if key not in fm:
                 err(f"{rel(skill_md)}: skill frontmatter missing `{key}`")
+        if fm.get("name") and fm["name"] != skill_md.parent.name:
+            err(
+                f"{rel(skill_md)}: skill `name: {fm['name']}` != directory "
+                f"`{skill_md.parent.name}`"
+            )
         extras = set(fm) - {"name", "description"}
         if extras:
             err(
                 f"{rel(skill_md)}: non-portable skill frontmatter key(s): "
                 f"{', '.join(sorted(extras))}"
             )
-    for name in sorted(REQUIRED_WORKFLOW_SKILLS - found):
+    for name in sorted(PUBLIC_WORKFLOW_SKILLS - found):
         checks += 1
         err(
             f"missing core workflow skill: skills/{name}/SKILL.md "
             "(Setup, Orchestrate, and Set Backend must ship in every host)"
         )
-    for name in sorted(INTERNAL_ONLY_SKILLS & found):
+    for name in sorted(found - PUBLIC_WORKFLOW_SKILLS):
         checks += 1
         err(
-            f"internal helper exposed as a user skill: skills/{name}/SKILL.md "
-            "(project creation belongs inside Setup)"
+            f"unexpected user-facing skill: skills/{name}/SKILL.md "
+            "(Autoform exposes only Setup, Orchestrate, and Set Backend)"
+        )
+    expected_paths = {
+        (REPO_ROOT / "skills" / name / "SKILL.md").resolve()
+        for name in PUBLIC_WORKFLOW_SKILLS
+    }
+    for path in sorted(REPO_ROOT.rglob("SKILL.md")):
+        if ".git" in path.parts or path.resolve() in expected_paths:
+            continue
+        checks += 1
+        err(
+            f"stray SKILL.md outside the three-command surface: {rel(path)} "
+            "(store supporting material under internal/)"
         )
     return count
 
 
+def check_internal_assets() -> None:
+    """The three workflows retain their supporting implementation material."""
+    global checks
+    for path in REQUIRED_INTERNAL_ASSETS:
+        checks += 1
+        if not (REPO_ROOT / path).is_file():
+            err(f"missing internal workflow asset: {path}")
+
+
 def check_commands() -> None:
-    """Every command (`.md` frontmatter or `.toml`) needs a `description`."""
+    """Legacy command files would add a fourth user-visible slash command."""
     global checks
     cmd_dir = REPO_ROOT / "commands"
     if not cmd_dir.is_dir():
         return
     for path in sorted(cmd_dir.iterdir()):
-        if path.suffix == ".md":
+        if path.suffix in {".md", ".toml"}:
             checks += 1
-            fm = frontmatter(path)
-            if fm is None:
-                err(f"{rel(path)}: no frontmatter block")
-            elif "description" not in fm:
-                err(f"{rel(path)}: command frontmatter missing `description`")
-        elif path.suffix == ".toml":
-            checks += 1
-            if "description" not in toml_top_keys(path):
-                err(f"{rel(path)}: command .toml missing `description`")
+            err(
+                f"legacy user-facing command is not allowed: {rel(path)} "
+                "(use one of the three workflow skills)"
+            )
 
 
 def check_skill_references() -> None:
@@ -337,7 +378,10 @@ def check_skill_references() -> None:
     Backtick-quoted and bare path forms are both accepted; HTML comments stripped.
     """
     global checks
-    ref_cite = re.compile(r"references/([A-Za-z0-9_./-]+)")
+    # `internal/references/...` is rooted at the plugin and validated through
+    # REQUIRED_INTERNAL_ASSETS; only a skill-local `references/...` citation
+    # belongs beside that public SKILL.md.
+    ref_cite = re.compile(r"(?<!internal/)references/([A-Za-z0-9_./-]+)")
     for skill_md in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
         refs_dir = skill_md.parent / "references"
         body = strip_comments(skill_md.read_text(encoding="utf-8"))
@@ -390,6 +434,7 @@ def main() -> int:
     check_codex_plugin()
     n_agents = check_agents()
     n_skills = check_skills()
+    check_internal_assets()
     check_commands()
     check_skill_references()
     check_no_dangling_references()

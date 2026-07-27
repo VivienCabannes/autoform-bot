@@ -7,7 +7,17 @@
 
 set -euo pipefail
 
-PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+AUTOFORM_RESOLVED_ROOT="$(
+  if [ -n "${AUTOFORM_PLUGIN_ROOT:-}" ]; then
+    printf '%s' "$AUTOFORM_PLUGIN_ROOT"
+  elif [ -n "${PLUGIN_ROOT:-}" ]; then
+    printf '%s' "$PLUGIN_ROOT"
+  elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+    printf '%s' "$CLAUDE_PLUGIN_ROOT"
+  else
+    cd "$(dirname "$0")/.." && pwd
+  fi
+)"
 
 log()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
@@ -34,11 +44,11 @@ log "Checking Python dependencies"
 all_ok=true
 
 # Core (fastmcp — needed by every MCP server)
-if uv run --project "$PLUGIN_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')" 2>/dev/null; then
+if uv run --project "$AUTOFORM_RESOLVED_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')" 2>/dev/null; then
   ok "fastmcp (core)"
 else
   log "Installing core dependencies (first run)..."
-  if uv run --project "$PLUGIN_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')"; then
+  if uv run --project "$AUTOFORM_RESOLVED_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')"; then
     ok "fastmcp installed"
   else
     warn "Failed to install fastmcp"; all_ok=false
@@ -55,11 +65,11 @@ for extra in repl zulip aristotle; do
     aristotle) pkg="aristotlelib" ;;
   esac
 
-  if uv run --project "$PLUGIN_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
+  if uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
     ok "$extra ($pkg)"
   else
     log "Installing $extra dependencies..."
-    if uv run --project "$PLUGIN_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
+    if uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
       ok "$extra ($pkg) installed"
     else
       warn "Failed to install $extra extra — $extra server will not work"; all_ok=false
@@ -116,7 +126,7 @@ else
     warn "lake not found"
   fi
   echo ""
-  echo "  Run /install-lean to install Lean 4 and lake."
+  echo "  Run Autoform Setup to install Lean 4 and lake."
   echo ""
 fi
 
@@ -168,7 +178,7 @@ else
   fi
 
   # Test connectivity
-  result="$(uv run --project "$PLUGIN_ROOT" --extra zulip python -c "
+  result="$(uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra zulip python -c "
 import zulip, json
 client = zulip.Client(config_file='$ZULIPRC_FILE')
 r = client.get_server_settings()
@@ -195,11 +205,11 @@ fi
 log "Checking Lean Explore (optional)"
 
 if [ -n "${LEANEXPLORE_API_KEY:-}" ]; then
-  ok "LEANEXPLORE_API_KEY set — semantic Mathlib search via the lean-explore skill is available"
+  ok "LEANEXPLORE_API_KEY set — semantic Mathlib search integration is available"
 else
-  skip "LEANEXPLORE_API_KEY not set — the lean-explore skill is optional"
+  skip "LEANEXPLORE_API_KEY not set — semantic Mathlib search is optional"
   echo ""
-  echo "  To enable semantic Mathlib search (the lean-explore skill):"
+  echo "  To enable semantic Mathlib search:"
   echo "    1. Get a key at https://www.leanexplore.com"
   echo "    2. export LEANEXPLORE_API_KEY=<your-key>"
   echo ""

@@ -21,7 +21,7 @@ def _zulip_module():
     except ImportError:
         raise RuntimeError(
             "The 'zulip' package is required for Zulip search.\n"
-            "It should be installed automatically via uv. Run: /install-autoform"
+            "It should be installed automatically via uv. Run Autoform Setup."
         )
     return zulip
 
@@ -193,6 +193,6 @@ def get_client(config_file: str | None = None) -> ZulipClient:
                 "  4. ~/.config/.zuliprc\n"
                 "  5. ~/.config/zulip/.zuliprc\n"
                 "  6. ~/.config/zuliprc\n\n"
-                "Create one — see skills/zulip/README.md for instructions."
+                "Create one — see internal/references/zulip-configuration.md for instructions."
             )
     return ZulipClient(config_file=str(rc_path))

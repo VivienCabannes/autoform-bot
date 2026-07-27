@@ -1,13 +1,4 @@
----
-name: plan
-description: >
-  This skill should be used when the user asks to "plan a formalization",
-  "build a dependency graph", "map concepts to Mathlib", "analyze a textbook
-  for formalization", "create a formalization plan", "chart mathematical concepts",
-  or wants to plan Lean 4 formalization work from textbook sources.
----
-
-# Formalization Planning
+# Formalization planning runbook
 
 Resolve the absolute plugin root from a valid host variable or
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. Use the current host's
@@ -17,7 +8,7 @@ body in the generic native subagent task.
 
 Turn one or more textbooks into a **tiered dependency graph** that maps the mathematics onto Mathlib and carries its own content. The plan is built in two phases. Phase 1 produces a coarse map of concept clusters — a cheap scoping checkpoint. Phase 2 splits each cluster into fine definitions and statements, each written out in a universal, Mathlib-aligned voice. The result is `graph.json` plus an `informal_content/<id>.md` file per fine node, both rendered as an interactive blueprint.
 
-The graph is **generic over tiers**: tier 1 is coarse concept clusters, tier 2 is fine definitions and statements, and tier 3 (Lean statements) is planned for but not yet built. Every node names its `tier` and a single `parent` one tier up; everything coarser — a node's members, and the edges between clusters — is *derived* by the quotient rule, never stored. For the full data model, see `references/plan-json-schema.md`; this skill defers all schema detail there.
+The graph is **generic over tiers**: tier 1 is coarse concept clusters, tier 2 is fine definitions and statements, and tier 3 (Lean statements) is planned for but not yet built. Every node names its `tier` and a single `parent` one tier up; everything coarser — a node's members, and the edges between clusters — is *derived* by the quotient rule, never stored. For the full data model, see `<AUTOFORM_PLUGIN_ROOT>/internal/references/plan-json-schema.md`; this runbook defers all schema detail there.
 
 ## Guiding Principle
 
@@ -44,7 +35,7 @@ Many tasks across this project form a **DAG** — partly parallelizable, partly 
 
 ## Live feed — show your subagents in the dashboard
 
-The review dashboard (launched by `/autoform:setup`) renders a live activity feed from
+The review dashboard (launched by Setup) renders a live activity feed from
 `<project>/agents_status.json`. During planning no engine is running to populate it, so
 reflect your own native subagents there through the deterministic writer
 `<AUTOFORM_PLUGIN_ROOT>/scripts/dispatch_queue.py` (atomic + cross-process-locked, so it is
@@ -64,7 +55,7 @@ safe under the parallel pool). `<project>` is the plan directory (the one holdin
   `mathlib-checker`→`mathcheck`, `graph-reviewer`→`graphreview`, `content-reviewer`→`contentreview`,
   `holistic-reviewer`→`holistic`, `source-searcher`→`sourcesearch`.
 - **When planning ends**, clear it: `dispatch_queue.py <project> idle`. The engine takes the
-  feed back over on `/autoform:orchestrate`.
+  feed back over to Orchestrate.
 
 Best-effort visibility, never a gate: a missed `agent-done` only leaves a stale card until
 `idle`, and the feed never blocks the plan. Wrap every host-native spawn the
@@ -147,7 +138,11 @@ Throughout, apply high-confidence corrections and note each change; surface unce
 
 ### 1d. Export and view
 
-Confirm full grounding with `check_invariants.py --require-grounding`, then export and open the blueprint for the user to review (`/plan-view`). Phase 1 ends here, with a user-approved coarse map. Confirm the user is happy with the scope before moving on — correcting a cluster now is far cheaper than after it has been split.
+Confirm full grounding with `check_invariants.py --require-grounding`, then follow
+`internal/runbooks/visualization.md` to export and open the blueprint for the
+user to review. Phase 1 ends here, with a user-approved coarse map. Confirm the
+user is happy with the scope before moving on — correcting a cluster now is far
+cheaper than after it has been split.
 
 ---
 
@@ -210,7 +205,10 @@ With tier-2 final — after both review waves — rebuild tier-1 from it: tier-2
 - **Mechanical.** The tier-1 node set is the distinct `parent` values of the tier-2 nodes: prune clusters left empty, and materialise a cluster for every orphan (`parent: null`) or newly proposed parent. Tier-1 edges are the quotient of the tier-2 edges (cluster A → B iff some tier-2 node in A depends on one in B).
 - **Curated.** A cluster's metadata is *not* mechanically derived — re-curate it to match the new membership: name any new cluster, update descriptions, roll up `mathlib_status`, and merge or split clusters whose composition no longer coheres. Run `graph-reviewer` and `holistic-reviewer` over the re-projected tier-1 so it stays a meaningful coarse map rather than decaying into a bare rollup.
 
-Confirm full grounding with `check_invariants.py --require-grounding`, then export and open the full tiered blueprint via `/plan-view`, where the tier toggle reveals the coarse map and the fine graph with content.
+Confirm full grounding with `check_invariants.py --require-grounding`, then
+follow `internal/runbooks/visualization.md` to export and open the full tiered
+blueprint, where the tier toggle reveals the coarse map and the fine graph with
+content.
 
 (The same scaffold → build → re-project pattern will apply when tier 3 arrives: build tier-3 from tier-2, then re-project tier-2 and tier-1 from it.)
 
@@ -241,4 +239,4 @@ All agents include self-critique instructions. When processing agent results, ch
 ## Additional Resources
 
 For the full data model — the two-file encoding, every node field, the hierarchy invariant, the list of invariants, and a worked two-tier example:
-- **`references/plan-json-schema.md`** — Complete v2 plan schema reference.
+- **`internal/references/plan-json-schema.md`** — Complete v2 plan schema reference.

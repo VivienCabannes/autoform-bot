@@ -1,16 +1,4 @@
----
-name: autoform-crew
-description: >
-  Orchestration guide for parallel formalization with subagent teams.
-  Tells the main thread WHEN and HOW to spawn autoform-worker, the three-judge
-  review jury (faithfulness-reviewer, proof-integrity-reviewer, code-quality-reviewer),
-  and autoform-reader subagents for parallel proving, batch review, and
-  context-efficient file reading.
-  Trigger: "parallelize", "formalize chapter", "batch", "use crew",
-  "spawn workers", "delegate formalization".
----
-
-# Autoform Crew — Parallel Formalization
+# Archival crew-orchestration runbook
 
 Autoform-crew orchestrates multiple subagents for parallel formalization. The main thread plans and coordinates; subagents do the proving, reviewing, and reading.
 
@@ -24,7 +12,8 @@ Autoform-crew orchestrates multiple subagents for parallel formalization. The ma
 | `code-quality-reviewer` | opus | Judge: Mathlib conventions and idiomatic Lean 4 style | lsp, mathlib |
 | `autoform-reader` | haiku | Read: summarize large files cheaply | none |
 
-The three reviewer judges are blind single-axis jurors sharing the **eval-rubrics** skill; each
+The three reviewer judges are blind single-axis jurors sharing the
+`internal/rubrics/` data; each
 returns a 0–5 score for its own rubric, and the verdict (clean / flagged / rejected) is gated
 downstream.
 
@@ -181,7 +170,7 @@ Summary: <1-2 sentences on approach>
 {"score": <0-5>, "reasoning": "<evidence-grounded justification with file:line>"}
 ```
 The per-axis scores are combined downstream into the threshold-gated verdict
-(clean / flagged / rejected) per the **eval-rubrics** skill.
+(clean / flagged / rejected) per the internal rubric data.
 
 **`autoform-reader` returns:**
 Structured summary with section headings, theorem names, and line numbers. Concise — its whole point is saving main-thread context.
@@ -190,13 +179,13 @@ Structured summary with section headings, theorem names, and line numbers. Conci
 
 - Don't spawn a worker for a target whose dependencies aren't formalized yet — it will waste turns trying to import nonexistent definitions.
 - Don't spawn parallel workers that write to the same file — they'll conflict.
-- Don't use the correctness judges (`faithfulness-reviewer`, `proof-integrity-reviewer`) for style-only checks — spawn `code-quality-reviewer`, or apply the **eval-rubrics** skill's code_quality rubric in the main thread.
+- Don't use the correctness judges (`faithfulness-reviewer`, `proof-integrity-reviewer`) for style-only checks — spawn `code-quality-reviewer`, or apply the `code_quality` rubric in the main thread.
 - Don't spawn `autoform-reader` for small files (< 100 lines) — just read them directly.
 - Don't expect workers to coordinate with each other — they're independent. Cross-cutting concerns (shared namespaces, import organization) are the main thread's job.
 
 ## Maximizing parallelism
 
-1. **Extract targets first** (`/autoform-extract`) and identify the dependency graph.
+1. **Extract targets in Setup** and identify the dependency graph.
 2. **Separate independent clusters** — targets that share no definitions can be parallelized.
 3. **One file per target** — avoid merge conflicts by giving each worker its own output file.
 4. **Batch reviews** — after a wave completes, review all files in parallel.

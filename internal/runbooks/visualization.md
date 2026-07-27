@@ -1,13 +1,4 @@
----
-name: plan-view
-description: >
-  This skill should be used when the user asks to "view the plan",
-  "show the graph", "open the visualization", "regenerate the graph",
-  "refresh the plan view", or wants to see the interactive tiered
-  dependency graph for a formalization plan.
----
-
-# Plan Visualization
+# Plan visualization runbook
 
 Resolve the absolute plugin root from a valid host variable or
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. Replace

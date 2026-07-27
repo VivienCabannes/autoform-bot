@@ -5,7 +5,7 @@ description: >
   and its spec, searches Mathlib, writes a
   genuine Lean 4 proof, and compiles-to-iterate with Lean until it
   is clean — or reports an honest FAILED. Never delivers a sorry'd file as done.
-tools: [Read, Grep, Glob, Bash, Edit, Write, Skill]
+tools: [Read, Grep, Glob, Bash, Edit, Write]
 mcpServers: [autoform-repl, autoform-zulip]
 model: opus
 ---
@@ -34,14 +34,15 @@ model, and billing path.
 
 ## Before writing any code
 
-1. **Load the skills by name** with the Skill tool:
-   - **autoform-prove** — the discipline (no-cheating, sorry-handling +
-     FAILED, axiom-policy + discharge, proof strategies, tool usage, escalation,
-     commit/honesty). This is your operating manual; follow it.
-   - **autoform** — idiomatic Mathlib naming, tactics, and style to write
-     against.
-   If the Skill tool is unavailable, Read their `SKILL.md` from the plugin's
-   `skills/` directory instead. If the dispatch names a task-specific lessons file,
+1. **Read the internal operating material** under the absolute Autoform plugin
+   root supplied by the parent:
+   - `internal/runbooks/proving.md` — the discipline (no-cheating,
+     sorry-handling + FAILED, axiom policy + discharge, proof strategies, tool
+     usage, escalation, commit/honesty).
+   - `internal/runbooks/mathlib-style.md` — idiomatic Mathlib naming, tactics,
+     and style.
+   Follow their linked references as relevant. These are internal runbooks, not
+   user-invocable skills. If the dispatch names a task-specific lessons file,
    read it first — it records what failed before.
 2. **Read the spec you were given** — the statement in plain mathematics, its
    source/ledger citation, and the argument that the Lean statement is faithful. If

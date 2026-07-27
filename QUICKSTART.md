@@ -1,8 +1,8 @@
 # Quickstart
 
-Autoform turns your AI coding assistant into a **Lean 4 formalization agent** — it adds
-skills, slash commands, and MCP servers for working with Lean and Mathlib. This guide gets
-the plugin running **inside your assistant** in a few minutes.
+Autoform turns your AI coding assistant into a **Lean 4 formalization agent**.
+It exposes three workflow commands backed by role agents, internal runbooks,
+and MCP servers for Lean and Mathlib.
 
 > For the full formalization workflow and command reference, see [docs/usage.md](docs/usage.md).
 > For what's implemented vs. stubbed, see the status table in [README.md](README.md).
@@ -11,8 +11,7 @@ the plugin running **inside your assistant** in a few minutes.
 
 - **Claude Code** (shown here; Codex/Cursor/others in [README.md](README.md)).
 - That's it — `make setup` installs `uv` + Python deps for you.
-- **Lean 4** *(optional)* — only for the proof-checking servers. Install later with `/install-lean`
-  (or `elan default stable`).
+- **Lean 4** *(optional)* — Setup can install it when proof checking is needed.
 
 ## 1. Setup
 
@@ -48,28 +47,23 @@ Set `LEAN_PROJECT_DIR` so the skills and servers know which project to work on, 
 LEAN_PROJECT_DIR=/path/to/your/lean-project claude --plugin-dir /path/to/autoform-bot
 ```
 
-No Lean project yet? Create one from inside the assistant with `/setup-project MyBook`, or try it
-against the bundled sample at `examples/demo-project/`.
+No Lean project yet? Setup creates one from the LeanProject template, or you
+can try Autoform against the bundled sample at `examples/demo-project/`.
 
 ## 3. Use it — slash commands
 
-Type these in the assistant. **Working today:**
+Type these in the assistant. This is the complete user-visible surface:
 
 | Command | What it does |
 |---------|--------------|
-| `/workspace` | Triage the project — file/declaration counts, `sorry`/`axiom` tallies, the targets DAG |
-| `/zulip` | Search the Lean community Zulip for naming, proofs, prior art *(needs `~/.zuliprc`, below)* |
-| `/install-lean` | Install Lean 4, elan, lake |
-| `/setup-project MyBook` | Scaffold a new Lean 4 + Mathlib project |
-| `/setup-autoform` | Check/install the full environment (uv, deps, Lean, Zulip) |
+| `/autoform:setup` | Install or repair prerequisites, create or inspect a project, plan sources, build the blueprint, and open the dashboard |
+| `/autoform:orchestrate` | Prove, review, score, search prior art, handle escalations, and advance the plan |
+| `/autoform:set-backend` | Choose and explain the prover backend, authentication, billing, and data path |
 
-A good first move: `/workspace` — it scans `$LEAN_PROJECT_DIR` and hands the structure to the
-agent, so you can ask things like *"which targets have no dependencies yet?"*
-
-> **Not yet active on `main`:** `/autoform`, `/autoform-prove`, `/autoform-review`, and the
-> `repl`/`lsp`/`aristotle` MCP tools return "not implemented" — these are the formalization
-> components still being filled in. The end-to-end vision (extract → formalize → prove → review)
-> is described in [docs/usage.md](docs/usage.md).
+A good first move is `/autoform:setup`. Natural-language requests such as
+“inspect this workspace,” “show the graph,” or “install Lean” stay inside Setup
+instead of adding commands. Requests such as “review this node,” “prove this
+theorem,” or “search Zulip” stay inside Orchestrate.
 
 ## 4. Optional unlocks
 
@@ -83,7 +77,7 @@ key=YOUR_API_KEY
 site=https://leanprover.zulipchat.com
 ```
 
-Then `chmod 600 ~/.zuliprc`. Inside the assistant, `/setup-autoform` verifies connectivity.
+Then `chmod 600 ~/.zuliprc`. Setup verifies connectivity.
 
 ---
 
@@ -94,7 +88,7 @@ If you're **hacking on Autoform itself** (not just using it), there's a `Makefil
 ```bash
 make demo      # run the workspace scanner on the sample project (no deps)
 make test      # smoke tests — every MCP server constructs
-make lint      # ruff over servers/ and skills/
+make lint      # ruff over the Python implementation
 make help      # all targets
 ```
 

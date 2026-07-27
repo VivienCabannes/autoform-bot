@@ -1,12 +1,4 @@
----
-name: zulip
-description: >
-  Search the Lean/Mathlib Zulip for community discussions before formalizing.
-  Find naming conventions, proof strategies, prior art, and API decisions.
-  Trigger: /zulip, "search zulip", "check zulip", "zulip discussion".
----
-
-# Zulip
+# Zulip search runbook
 
 Search the Lean/Mathlib community Zulip before proving or naming anything non-trivial.
 
@@ -23,6 +15,9 @@ Search the Lean/Mathlib community Zulip before proving or naming anything non-tr
 2. Use `zulip_search` with mathematical terms (e.g., `"Hoeffding bound"`, `"concentration inequality"`).
 3. If a relevant topic is found, use `zulip_messages` to read the full thread.
 4. Use `zulip_streams` to discover available streams if unsure where to look.
+
+For credential setup and search examples, read
+`<AUTOFORM_PLUGIN_ROOT>/internal/references/zulip-configuration.md`.
 
 ## Key streams for Mathlib work
 

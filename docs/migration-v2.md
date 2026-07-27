@@ -26,8 +26,8 @@ but its runtime artifacts are not automatically convertible back to v1.
 
 | v1 surface | v2 status | Migration path |
 |---|---|---|
-| `python -m autoform.statement_extraction` | Removed | Put source material in the project and run the `setup` / `plan` skills. Review the resulting `graph.json`; no automatic `targets.yaml` conversion is provided. |
-| `python -m autoform.bot.main` and YAML run configuration | Removed | Run the host-native `setup` and `orchestrate` skills. Backend selection moves to `set-backend`; durable state lives beside the Lean project. |
+| `python -m autoform.statement_extraction` | Removed | Put source material in the project and run `setup`, which owns planning. Review the resulting `graph.json`; no automatic `targets.yaml` conversion is provided. |
+| `python -m autoform.bot.main` and YAML run configuration | Removed | Run the host-native `setup` and `orchestrate` workflows. Backend selection moves to `set-backend`; durable state lives beside the Lean project. |
 | Multi-node and SLURM coordination | Removed | The v2 dispatcher supports bounded local concurrency. Keep v1 for existing cluster runs until a separate distributed dispatcher is designed. |
 | `python -m autoform.eval` dataset evaluation | Removed | Use the node-level three-axis jury and review dashboard. Dataset metrics and historical evaluator outputs have no v2 importer. |
 | `python -m autoform.visualizer.app` run/trace dashboard | Removed | Use the DAG review dashboard for current plans. Historical v1 traces remain viewable only with a v1 checkout. |

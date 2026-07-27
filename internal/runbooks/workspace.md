@@ -1,14 +1,4 @@
----
-name: workspace
-description: >
-  Inspect a Lean 4 workspace — project structure, sorry/axiom counts,
-  declarations, targets, and readiness. Use at the start of any
-  formalization session to triage the project.
-  Trigger: /workspace, "inspect workspace", "scan project",
-  "how many sorry", "project status".
----
-
-# Workspace Inspection
+# Workspace inspection runbook
 
 Resolve an absolute plugin root from a valid host variable or
 `Path(<this loaded SKILL.md>).resolve().parents[2]`.
@@ -17,7 +7,7 @@ Run the inspection script to get a structured overview of the Lean project:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" [path]
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" [path]
 ```
 
 If no path is given, it uses `$LEAN_PROJECT_DIR` or the current directory.
@@ -34,19 +24,19 @@ For searching `.lean` files:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" --search "pattern" [path]
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" --search "pattern" [path]
 ```
 
 For listing declarations:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" --declarations [path]
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" --declarations [path]
 ```
 
 For reading targets:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" --targets [path]
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" --targets [path]
 ```

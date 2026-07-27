@@ -1,16 +1,4 @@
----
-name: eval-rubrics
-description: >-
-  Use when grading, scoring, or reviewing a Lean 4 formalization against a source text — judging
-  whether a Lean statement faithfully captures a source statement, whether a proof is genuine, or
-  whether code follows Mathlib style. Provides the autoform jury rubrics (faithfulness,
-  proof_integrity, code_quality) with weights, pass thresholds, and the threshold-gated verdict
-  mapping (clean / flagged / rejected) that drives the `ai` slot of the review_status.json sidecar.
-  Use for any "evaluate / rate / is this formalization good" request on Lean code, and as the
-  shared rubric source for the three single-axis reviewer agents.
----
-
-# Evaluation rubrics for formalized mathematics
+# Evaluation-rubric runbook
 
 Resolve the absolute plugin root from a valid host variable or
 `Path(<this loaded SKILL.md>).resolve().parents[2]` when a reviewer needs a
@@ -19,8 +7,8 @@ rubric path.
 The grading criteria the AI jury applies to a formalized node. The jury is **blind
 single-axis reviewers**, each given ONLY its own rubric — never the others'. Each rubric is an
 integer score 0–5 with a pass threshold; the criteria and prompt templates are the JSON files in
-`references/` (from a subagent, read them at
-`<AUTOFORM_PLUGIN_ROOT>/skills/eval-rubrics/references/<axis>.json` — subagents run with cwd set to
+`internal/rubrics/` (from a subagent, read them at
+`<AUTOFORM_PLUGIN_ROOT>/internal/rubrics/<axis>.json` — subagents run with cwd set to
 the user's project, so plugin-relative paths do not resolve).
 
 ## The jury rubrics
@@ -29,9 +17,10 @@ the user's project, so plugin-relative paths do not resolve).
 |---|---|---|---|---|
 | **faithfulness** | 0.40 | 4/5 | `faithfulness-reviewer` | the Lean **statement** captures the source statement *at full strength* (no weakening, no vacuity) |
 | **proof_integrity** | 0.40 | 3/5 | `proof-integrity-reviewer` | the **proof** chain is genuine work on sound foundations (axioms clean, no disguised `sorry`/cheats) |
-| **code_quality** | 0.20 | 3/5 | `code-quality-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = the **autoform** skill) |
+| **code_quality** | 0.20 | 3/5 | `code-quality-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = `internal/runbooks/mathlib-style.md`) |
 
-The jury is **whatever rubric files live in `references/`** — currently these three. The
+The jury is **whatever rubric files live in `internal/rubrics/`** — currently
+these three. The
 cheating-hunt splits along the two correctness axes: **statement-level** cheats (`: True`, weakened
 conclusion, smuggled hypotheses, proxy objects, theorem-as-`def…:Prop`, vacuity) belong to
 **faithfulness**; **proof-level** cheats (`sorry`/`axiom` in helpers, `decide`/`native_decide`
@@ -39,7 +28,7 @@ hiding, `False.elim` on a false goal, fake/circular proofs) belong to **proof_in
 
 ## Modular by design — the files ARE the jury
 
-The rubric files in `references/` are the **single source of truth**: the dashboard, the
+The rubric files in `internal/rubrics/` are the **single source of truth**: the dashboard, the
 deterministic dispatcher, and the verdict gate all read the axis set, weights, thresholds and
 gating roles from them at load time (`review_model.rubric_specs()`), so the reviewer system is
 changed by editing JSON, never code:
@@ -121,7 +110,8 @@ check on the project's main results against the source's actual main theorems. S
 
 ## Related
 
-Consumes **autoform** (the `code_quality` yardstick) and **autoform-prove** (the
-axiom/`sorry` honesty gates). The three rubrics drive the `ai` slot read by the `review` skill /
-review surface. `graph-reviewer` and `holistic-reviewer` review DAG structure — orthogonal to this
-node-level jury, not part of it.
+Consumes `internal/runbooks/mathlib-style.md` (the `code_quality` yardstick) and
+`internal/runbooks/proving.md` (the axiom/`sorry` honesty gates). The three
+rubrics drive the `ai` slot read by the review surface. `graph-reviewer` and
+`holistic-reviewer` review DAG structure — orthogonal to this node-level jury,
+not part of it.

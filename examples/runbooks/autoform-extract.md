@@ -1,13 +1,4 @@
----
-name: autoform-extract
-description: >
-  Extract formalizable mathematical statements from LaTeX or Markdown source material.
-  Produces structured YAML targets for the formalization pipeline.
-  Use when preparing source material for formalization.
-  Triggers on: /autoform-extract, "extract statements", "find theorems in".
----
-
-# Statement Extraction
+# Archival statement-extraction runbook
 
 Extract definitions, theorems, lemmas, and corollaries from LaTeX or Markdown source material into structured targets for Lean 4 formalization.
 

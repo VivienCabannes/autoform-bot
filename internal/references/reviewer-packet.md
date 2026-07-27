@@ -66,8 +66,8 @@ helpers so the reviewer can audit the bucketing itself.
    review surface reads it read-only; **verification stays independent of the
    producer** — the worker never self-certifies.
 
-3. **Jury scorecard** — the three blind single-axis judges from the `eval-rubrics`
-   skill, read from the sidecar's `ai` slot for this node:
+3. **Jury scorecard** — the three blind single-axis judges defined under
+   `internal/rubrics/`, read from the sidecar's `ai` slot for this node:
    - `faithfulness` (weight 0.40, pass ≥4) — Lean *statement* vs source;
    - `proof_integrity` (0.40, ≥3) — is the *proof* genuine;
    - `code_quality` (0.20, ≥3) — Mathlib idiom only.

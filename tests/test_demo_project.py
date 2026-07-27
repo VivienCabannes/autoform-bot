@@ -37,7 +37,7 @@ def test_demo_has_a_root_module_and_no_stale_schema_reference():
     root_module = (DEMO / "MyBook.lean").read_text()
     assert "import MyBook.Convex" in root_module
     targets = (DEMO / "targets.yaml").read_text()
-    assert "skills/plan/references/plan-json-schema.md" in targets
+    assert "internal/references/plan-json-schema.md" in targets
     assert "autoform-extract" not in targets
 
 
@@ -45,7 +45,7 @@ def test_demo_workspace_scanner_reports_the_intended_gaps():
     environment = os.environ.copy()
     environment["PATH"] = ""
     process = subprocess.run(
-        [sys.executable, str(ROOT / "skills" / "workspace" / "workspace_inspector.py"), str(DEMO)],
+        [sys.executable, str(ROOT / "scripts" / "workspace_inspector.py"), str(DEMO)],
         capture_output=True,
         text=True,
         check=True,
@@ -72,6 +72,30 @@ def test_project_creation_is_internal_to_setup():
     assert not (ROOT / "skills" / "make-project" / "SKILL.md").exists()
     assert "scripts/make_project.sh" in setup
     assert (ROOT / "scripts" / "make_project.sh").is_file()
+
+
+def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
+    public = {
+        path.parent.name
+        for path in (ROOT / "skills").glob("*/SKILL.md")
+    }
+    assert public == {"setup", "orchestrate", "set-backend"}
+
+    setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
+    orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
+    assert "internal/runbooks/planning.md" in setup
+    assert "scripts/workspace_inspector.py" in setup
+    assert "internal/runbooks/proving.md" in orchestrate
+    assert "internal/runbooks/review.md" in orchestrate
+
+    for path in (ROOT / "internal" / "runbooks").glob("*.md"):
+        assert not path.read_text().lstrip().startswith("---")
+
+
+def test_environment_installer_resolves_the_new_top_level_script_location():
+    installer = (ROOT / "scripts" / "install_autoform.sh").read_text()
+    assert 'cd "$(dirname "$0")/.." && pwd' in installer
+    assert '--project "$AUTOFORM_RESOLVED_ROOT"' in installer
 
 
 def test_project_creation_helper_runs_from_an_arbitrary_directory(tmp_path):

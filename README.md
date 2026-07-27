@@ -32,13 +32,14 @@ tests alone are not presented as end-to-end live validation.
 
 ```mermaid
 flowchart LR
-    A[textbook<br/>LaTeX / MD / PDF] -->|/autoform:plan| B[tiered dependency graph<br/>graph.json + prose per node]
+    A[textbook<br/>LaTeX / MD / PDF] -->|/autoform:setup| B[tiered dependency graph<br/>graph.json + prose per node]
     B -->|/autoform:orchestrate| C[prover workers<br/>claude · aristotle · codex · openai · avocado]
     C --> D{honesty gate<br/>lake build + #print axioms}
     D -->|rejected| C
     D -->|verified| E[3-judge review jury<br/>faithfulness · proof integrity · style]
     E --> F[review dashboard<br/>human sign-off]
-    B -.->|/autoform:plan-view| G[interactive blueprint]
+    B -.-> G[interactive blueprint]
+    H[/autoform:set-backend] -.-> C
 ```
 
 - **Plan** — a two-phase pipeline reads your sources and builds a tiered DAG:
@@ -83,14 +84,15 @@ Start a new task after installing or upgrading so the host reloads the plugin,
 then use:
 
 ```text
-/autoform:install-autoform      # check/install uv, Python deps, Lean, optional Zulip
 /autoform:setup                 # new Lean+Mathlib project → plan → blueprint → dashboard
 /autoform:orchestrate           # launch the engine: prover workers + review jury
+/autoform:set-backend           # choose the prover backend and billing/data path
 ```
 
 `/autoform:setup` walks you through creating a project (via the LeanProject
-template, with Mathlib cache), planning your sources into `graph.json`, and
-opening the review dashboard. `/autoform:set-backend` persists the default
+template, with Mathlib cache), repairing prerequisites, inspecting an existing
+workspace, planning your sources into `graph.json`, and opening the review
+dashboard. `/autoform:set-backend` persists the default
 prover backend (`max` | `aristotle` | `codex` | `openai` | `avocado`);
 `/autoform:orchestrate` then drives the
 formalization — autonomously, human-driven from the dashboard, or both, off one
@@ -132,16 +134,16 @@ existing project with `python3 scripts/formalization.py init <project-dir>`.
 
 ## The surface
 
-**Workflow skills** — `/autoform:setup` (end-to-end project setup),
+**The complete user command surface** — `/autoform:setup` (installation,
+inspection, planning, visualization, and project setup),
 `/autoform:orchestrate` (launch/drive the engine),
 `/autoform:set-backend` (persist the prover backend; shared with the
 dashboard).
 
-**Other skills** — `plan`, `plan-view`, `review` (the planning and review surfaces);
-`autoform` (Mathlib conventions), `autoform-prove` (worker proof discipline),
-`eval-rubrics` (the jury's rubrics); `install-autoform`, `install-lean`,
-`workspace` (environment repair and project triage); `zulip`
-(community search).
+Planning, visualization, review, Mathlib conventions, proof discipline,
+environment repair, workspace inspection, jury rubrics, and Zulip search are
+internal runbooks or MCP capabilities invoked by Setup and Orchestrate. They do
+not appear as extra slash commands.
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
 crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
@@ -158,7 +160,8 @@ crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 ## Repository layout
 
 ```
-skills/       user-invocable Agent Skills, including setup/orchestrate/backends
+skills/       exactly three user workflows: setup, orchestrate, set-backend
+internal/     non-discoverable runbooks, reference material, and jury rubrics
 agents/       worker, reader, planning crew, review jury
 servers/      MCP servers (prover, aristotle, mathlib, zulip; repl/lsp stubs)
 scripts/      plan/graph tooling, dispatch engine, review UI, formalization.py

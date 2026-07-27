@@ -1,4 +1,4 @@
-# Zulip Skill
+# Zulip configuration
 
 Search the Lean/Mathlib community Zulip ([leanprover.zulipchat.com](https://leanprover.zulipchat.com)) for relevant discussions before formalizing.
 
@@ -9,11 +9,8 @@ API decisions via the `autoform-zulip` MCP server.
 
 ## Usage
 
-```
-/zulip
-```
-
-Or naturally: "search Zulip for Hoeffding", "check if there's a Zulip discussion about this".
+Ask Orchestrate naturally: “search Zulip for Hoeffding” or “check if there is a
+Zulip discussion about this.”
 
 ## MCP tools
 
@@ -27,7 +24,7 @@ Or naturally: "search Zulip for Hoeffding", "check if there's a Zulip discussion
 
 ## Setup
 
-Run `/install-autoform` to check prerequisites and configure access, or set up manually:
+Run Setup to check prerequisites and configure access, or set up manually:
 
 ### Prerequisites
 

@@ -57,7 +57,7 @@ except Exception as _e:                 # prover deps absent → --workers repor
     _PROVER_OK, _PROVER_ERR, _build_node_spec = False, str(_e), None
 
 # The jury axes + rubrics come from review_model — the SINGLE SOURCE OF TRUTH
-# (skills/eval-rubrics/references/*.json). Add/remove a rubric file and the jury here
+# (internal/rubrics/*.json). Add/remove a rubric file and the jury here
 # follows with no edit: AXES, the per-node judge fan-out, and the verdict all adapt.
 AXES = rm.AXES
 load_rubrics = rm.load_rubrics
@@ -454,7 +454,7 @@ def _run_dispatch(a) -> int:
         """Reload + validate the rubrics BEFORE any task is claimed.
 
         Every jury axis must have a rubric file carrying a ``prompt_template``
-        (skills/eval-rubrics/references/*.json — sibling PR #12). Returns the rubric
+        (internal/rubrics/*.json). Returns the rubric
         dict when complete; otherwise prints one clear diagnostic and returns None,
         so the caller leaves every task queued instead of claiming work it would
         then crash on (KeyError at rubrics[axis])."""
@@ -466,9 +466,9 @@ def _run_dispatch(a) -> int:
             return rubrics
         if not _rubric_warned[0]:
             _rubric_warned[0] = True
-            print(f"eval-rubrics skill not found — no rubric with a prompt_template for "
-                  f"axis(es): {', '.join(missing)} (looked in skills/eval-rubrics/references/). "
-                  f"Merge PR #12 / install the rubrics; reviewer tasks stay QUEUED until then.",
+            print(f"Autoform rubric data not found — no rubric with a prompt_template for "
+                  f"axis(es): {', '.join(missing)} (looked in internal/rubrics/). "
+                  f"Reinstall Autoform; reviewer tasks stay QUEUED until then.",
                   flush=True)
         return None
 

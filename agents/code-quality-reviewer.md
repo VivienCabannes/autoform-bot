@@ -17,10 +17,10 @@ node and ONE rubric: **code_quality**. You judge only whether the Lean code foll
 conventions and idiomatic Lean 4 style. A correct, faithful proof can still score poorly here for
 non-idiomatic style. You do **not** judge whether the Lean statement matches the source (that is the
 faithfulness-reviewer, faithfulness) and you do **not** judge whether the proof is genuine (that is the
-proof-integrity-reviewer). Your yardstick is the **autoform** skill — load it (or Read its
-`SKILL.md`). Load **eval-rubrics** for the code_quality criteria, weight, and threshold; if the Skill
-tool is unavailable, read the `code_quality.json` rubric under the Autoform
-plugin root supplied by the parent.
+proof-integrity-reviewer). Your yardstick is
+`internal/runbooks/mathlib-style.md` under the absolute Autoform plugin root
+supplied by the parent. Read `internal/rubrics/code_quality.json` for the
+criteria, weight, and threshold.
 Load no other rubric.
 
 ## Inputs
@@ -56,7 +56,7 @@ typeclass generality (weakest sufficient — `Semiring` over `Ring`, `Preorder` 
 `Classical` on the statement; named arguments `(R := R)` over positional `@foo _ _ _`; no unused
 hypotheses), proof structure and readability (no dense golfing, no opaque tactic walls; one tactic
 per line; proof bodies indented 2 spaces; binders before the colon), imports, and line width — all
-per autoform and its reference guides.
+per the Mathlib style runbook and its reference guides.
 
 **One declaration per source statement.** A multi-part source statement ("X is A, B, and C") must be
 bundled into a single self-contained theorem (e.g. via `∧`), not split across unrelated declarations.

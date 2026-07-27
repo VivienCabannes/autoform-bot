@@ -1,6 +1,9 @@
 # Examples
 
-This directory contains full reference implementations for stubbed components in the autoform plugin. Each subdirectory mirrors the top-level layout (`servers/`, `skills/`, `agents/`) and provides a complete, working version that you can copy into the corresponding stub location and adapt.
+This directory contains reference implementations for stubbed components in
+the Autoform plugin. The `runbooks/` entries are archival workflow material,
+not discoverable commands; fold any useful behavior into Setup or Orchestrate
+rather than copying them under `skills/`.
 
 ## Directory map
 
@@ -13,8 +16,8 @@ This directory contains full reference implementations for stubbed components in
 | `servers/aristotle/server.py` | AristotleManager with multi-session support, polling, steering | `servers/aristotle/server.py` |
 | `servers/mathlib/` | Ripgrep-based Mathlib search, name finder, file reader | *(no stub — standalone reference)* |
 | `servers/trace/` | Append-only JSONL trace store with filtering and summaries | *(no stub — standalone reference)* |
-| `skills/autoform-extract/SKILL.md` | Complete extraction workflow | *(new skill — create `skills/autoform-extract/`)* |
-| `skills/autoform-crew/SKILL.md` | Full crew orchestration protocol | *(new skill — create `skills/autoform-crew/`)* |
+| `runbooks/autoform-extract.md` | Archival extraction workflow | Fold into Setup |
+| `runbooks/autoform-crew.md` | Archival crew orchestration protocol | Fold into Orchestrate |
 | `agents/autoform-worker.md` | Rich worker prompt with 5-step workflow, rules, integrity checks | `agents/autoform-worker.md` |
 | `agents/autoform-reader.md` | Complete reader prompt with reading strategies | `agents/autoform-reader.md` |
 

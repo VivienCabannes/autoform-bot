@@ -5,10 +5,18 @@ Codex. The host handles interactive planning, review, and escalation through
 native subagents; a deterministic dispatcher owns proof workers, jury runs,
 queue transitions, and persisted verdicts.
 
+## User command surface
+
+Autoform exposes exactly three user workflows: `setup`, `orchestrate`, and
+`set-backend`. Supporting functions such as installation, workspace
+inspection, planning, visualization, review, and Zulip search are internal to
+those workflows and do not appear as separate commands.
+
 ## 1. Install prerequisites
 
-Install the plugin through the host, then run the `install-autoform` skill. It
-checks `uv`, Python dependencies, Lean/Mathlib, and optional Zulip access.
+Install the plugin through the host, then run `setup`. It checks `uv`, Python
+dependencies, Lean/Mathlib, and optional Zulip access before creating or
+resuming a project.
 
 For repository development:
 
@@ -20,7 +28,7 @@ python3 scripts/lint_plugin.py
 
 ## 2. Create or resume a project
 
-Run the `setup` skill with the source material, desired chapters, Lean project
+Run `setup` with the source material, desired chapters, Lean project
 path, and—if separate—the directory that should own `graph.json`.
 
 Setup:
@@ -71,7 +79,7 @@ not consent for a real workload.
 
 ## 4. Orchestrate
 
-Run the `orchestrate` skill. It launches or reuses one dispatcher for the plan,
+Run `orchestrate`. It launches or reuses one dispatcher for the plan,
 then continuously drains interactive-host tasks:
 
 | Queue kind | Owner |
@@ -104,8 +112,8 @@ API writes from any run that is not accepted—including an honest failure or a
 rejected proof claim—are restored. Jury failures and malformed outputs abstain;
 they never synthesize a passing score.
 
-Use the `review` skill for a text packet or the local dashboard. Human verdicts
-are immutable and override AI verdicts.
+Ask Orchestrate for a text review packet or the local dashboard. Human
+verdicts are immutable and override AI verdicts.
 
 ## Provider environment
 

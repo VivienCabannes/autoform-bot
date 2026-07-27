@@ -3,7 +3,7 @@
 # Two steps to play:
 #   make setup           install Python deps (assistant-agnostic)
 #   make install-claude  install the plugin into Claude Code
-#                        → then launch `claude` and use /workspace, /zulip, /setup-autoform
+#                        → then launch `claude` and use /autoform:setup
 #
 # (Codex users: `make install-codex` instead.) Run `make help` for the list.
 
@@ -39,7 +39,7 @@ install-claude: ## Install the plugin into Claude Code (user scope)
 	@$(CLAUDE) plugin marketplace add "$(PLUGIN_DIR)" 2>/dev/null \
 		|| $(CLAUDE) plugin marketplace update $(MARKETPLACE) >/dev/null 2>&1 || true
 	@$(CLAUDE) plugin install $(PLUGIN)
-	@echo "✅ Installed — launch 'claude' and try /workspace, /zulip, /setup-autoform"
+	@echo "✅ Installed — launch 'claude' and try /autoform:setup"
 
 # Remove from Codex with:  codex plugin remove autoform@autoform-local
 .PHONY: install-codex
@@ -57,7 +57,7 @@ install-codex: ## Install the plugin into Codex CLI (local marketplace)
 
 .PHONY: demo
 demo: ## Scan the bundled sample Lean project (no deps)
-	@$(PYTHON) skills/workspace/workspace_inspector.py examples/demo-project
+	@$(PYTHON) scripts/workspace_inspector.py examples/demo-project
 
 .PHONY: test
 test: ## Run the test suite
@@ -65,7 +65,7 @@ test: ## Run the test suite
 
 .PHONY: lint
 lint: ## Lint the Python sources (ruff)
-	uv run --with ruff ruff check servers/ skills/
+	uv run --with ruff ruff check scripts/ servers/ tests/
 
 .PHONY: clean
 clean: ## Remove .venv and caches

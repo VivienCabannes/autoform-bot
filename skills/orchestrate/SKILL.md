@@ -4,8 +4,9 @@ description: >-
   Run or resume Autoform's durable formalization workflow: launch the
   deterministic jury/prover engine, drive native planning and review subagents,
   triage escalations, and advance the dependency graph to a clean trust
-  frontier. Use when the user asks to orchestrate, run, resume, automate, or
-  finish an Autoform plan.
+  frontier. Use when the user asks to orchestrate, run, resume, automate, prove,
+  review, score, search Lean Zulip for prior art, inspect progress, or finish an
+  Autoform plan.
 ---
 
 # Orchestrate Autoform
@@ -25,8 +26,20 @@ to a second agent host to emulate delegation.
 Resolve one absolute plugin root from a valid `AUTOFORM_PLUGIN_ROOT`,
 `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. Validate that it contains
-`scripts/dispatch_runner.py`. Substitute that quoted absolute path into every
-command; do not rely on shell state from an earlier tool call.
+`scripts/dispatch_runner.py` and `internal/runbooks/proving.md`. Substitute that
+quoted absolute path into every command; do not rely on shell state from an
+earlier tool call.
+
+Before proof or review work, load the internal operating material rather than
+expecting another user command:
+
+- proof work: `internal/runbooks/proving.md` and
+  `internal/runbooks/mathlib-style.md`;
+- jury or human review: `internal/runbooks/evaluation.md` and
+  `internal/runbooks/review.md`;
+- community prior-art search: `internal/runbooks/zulip.md`.
+
+Those runbooks and their references are implementation details of Orchestrate.
 
 Resolve:
 
@@ -183,3 +196,7 @@ Before reporting completion:
 - no proof was accepted without the shared verification gate;
 - the activity feed mirrors actual state;
 - remaining blocked frontier and provider-specific failures are explicit.
+
+When the user asks for a node packet, review UI, or a fresh score without a
+full autonomous run, follow `internal/runbooks/review.md` directly and perform
+only that bounded review operation.

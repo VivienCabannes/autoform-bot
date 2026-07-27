@@ -2,7 +2,7 @@
 
 Covers the crash-safety fixes:
 
-  * rubric validation BEFORE claiming — with the eval-rubrics files absent
+  * rubric validation BEFORE claiming — with the internal rubric files absent
     (sibling PR #12 not merged), the engine prints a diagnostic and leaves every
     reviewer task ``queued``; it never bulk-flips them to ``running`` and then
     dies on ``rubrics[axis]``.
@@ -74,7 +74,7 @@ def _sidecar(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_missing_rubrics_leaves_tasks_queued(tmp_path, monkeypatch, capsys):
-    # load_rubrics() returns {} when skills/eval-rubrics/references/ is absent.
+    # load_rubrics() returns {} when internal/rubrics/ is absent.
     monkeypatch.setattr(dr, "load_rubrics", lambda: {})
     proj = _proj(tmp_path, [
         {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "queued"},
@@ -84,8 +84,8 @@ def test_missing_rubrics_leaves_tasks_queued(tmp_path, monkeypatch, capsys):
     # nothing was claimed, nothing crashed — every task is still queued
     assert [t["status"] for t in _queue(proj)] == ["queued", "queued"]
     out = capsys.readouterr().out
-    assert "eval-rubrics" in out
-    assert "PR #12" in out
+    assert "Autoform rubric data not found" in out
+    assert "internal/rubrics" in out
 
 
 def test_rubric_without_prompt_template_also_blocks_claim(tmp_path, monkeypatch):
