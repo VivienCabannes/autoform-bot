@@ -1,5 +1,12 @@
 {
   "mcpServers": {
+    "lean-informal-planner-mathlib": {
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/run-mathlib-server.sh"],
+      "env": {
+        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
+      }
+    },
     "autoform-repl": {
       "command": "uv",
       "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],

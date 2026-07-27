@@ -10,10 +10,13 @@ description: >
 
 # Set Up a Lean 4 Formalization Project
 
+Resolve an absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`.
+
 Ask the user for a **project name** (UpperCamelCase, e.g. `ConvexBodies`, `PrimeGaps`) and optionally a target directory, then run:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/skills/make-project/make-project.sh" <ProjectName> [target-dir]
+bash "<AUTOFORM_PLUGIN_ROOT>/skills/make-project/make-project.sh" <ProjectName> [target-dir]
 ```
 
 The script:
@@ -35,7 +38,8 @@ The script:
 **Existing project?** Seed the manifest alone with:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/formalization.py" init <project-dir>
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/formalization.py" init <project-dir>
 ```
 
 (and `… update <project-dir>` to refresh it manually at any time — any
@@ -44,4 +48,5 @@ late opt-in backfills accurate totals).
 
 **Prerequisites:** git, python3, lean/lake. If `lake` is not found, suggest `/install-lean` first.
 
-After setup, suggest `/autoform-extract` to identify formalization targets from source material.
+After project creation, suggest the `setup` skill for the end-to-end workflow or
+the `plan` skill when the user wants planning only.

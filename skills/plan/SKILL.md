@@ -5,10 +5,15 @@ description: >
   "build a dependency graph", "map concepts to Mathlib", "analyze a textbook
   for formalization", "create a formalization plan", "chart mathematical concepts",
   or wants to plan Lean 4 formalization work from textbook sources.
-version: 0.3.0
 ---
 
 # Formalization Planning
+
+Resolve the absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`. Use the current host's
+native subagent interface for every role below. On Codex, if custom-role
+selection is unavailable, include the complete canonical `agents/<role>.md`
+body in the generic native subagent task.
 
 Turn one or more textbooks into a **tiered dependency graph** that maps the mathematics onto Mathlib and carries its own content. The plan is built in two phases. Phase 1 produces a coarse map of concept clusters — a cheap scoping checkpoint. Phase 2 splits each cluster into fine definitions and statements, each written out in a universal, Mathlib-aligned voice. The result is `graph.json` plus an `informal_content/<id>.md` file per fine node, both rendered as an interactive blueprint.
 
@@ -29,11 +34,11 @@ When the main agent (also called the orchestrator) receives a book, it moves the
 Many tasks across this project form a **DAG** — partly parallelizable, partly dependent. Phase-2 splitting is the main case, but the pattern recurs (per-concept Mathlib checks, reviews, future tiers). Whenever you launch many subagents on such a task set, schedule it like this:
 
 - **Maximize concurrency under the dependencies.** Run everything that *can* run at once, at once; let only real prerequisites hold a task back.
-- **Dispatch continuously, not in waves.** Use a Promise pool in a workflow (ultracode), or background subagents collected as they finish in plain mode. Reassess on **each completion** and launch whatever just became ready — rather than `parallel()`-style batches, where the whole batch waits on its slowest member.
+- **Dispatch continuously, not in waves.** Use the host's native parallel subagent pool and collect agents as they finish. Reassess on **each completion** and launch whatever just became ready rather than waiting for an unrelated slow agent.
 - **Keep genuine synchronization points.** When the next step truly needs *all* prior results — re-projecting tier-1 from a finished tier-2, deduping across all reviewer findings, a user-approval gate — wait for them. Avoid only *incidental* barriers, not necessary ones.
 - **Let the task graph emerge.** New tasks appear as the work reveals them — a splitter discovers a prerequisite, proposes a new cluster. Re-derive what's ready from the current graph after each completion and launch a task once it becomes ready, rather than from a plan fixed in advance.
 - **Persist each result as it lands, through one locked writer.** Fold each completed result into `graph.json` as it returns. Routing every write through the one locked writer (`merge_node.py`) keeps the file consistent under concurrent edits, the run stays durable as it grows, and memory stays bounded because each merge touches only that result.
-- **Intervene on a stuck subagent when warranted.** A runaway or hung subagent can be stopped with `TaskStop` and relaunched or flagged. This is per-subagent in plain mode; inside a workflow only the whole run can be stopped, so reserve that for a genuine stall.
+- **Intervene on a stuck subagent when warranted.** Use the host's native interrupt/stop control, then relaunch or flag the role. Preserve completed siblings.
 
 ---
 
@@ -41,18 +46,18 @@ Many tasks across this project form a **DAG** — partly parallelizable, partly 
 
 The review dashboard (launched by `/autoform:setup`) renders a live activity feed from
 `<project>/agents_status.json`. During planning no engine is running to populate it, so
-reflect your OWN Task subagents there yourself, through the deterministic writer
-`${CLAUDE_PLUGIN_ROOT}/scripts/dispatch_queue.py` (atomic + cross-process-locked, so it is
+reflect your own native subagents there through the deterministic writer
+`<AUTOFORM_PLUGIN_ROOT>/scripts/dispatch_queue.py` (atomic + cross-process-locked, so it is
 safe under the parallel pool). `<project>` is the plan directory (the one holding `graph.json`).
 
 - **Set the phase** at each phase boundary (cheap — a few calls total):
   `dispatch_queue.py <project> orchestrator --state working --phase "Phase 2: splitting" --detail "12/29 clusters"`
-- **Bracket every subagent** you launch — `agent-start` immediately before the `Task`,
+- **Bracket every subagent** you launch — `agent-start` immediately before the spawn,
   `agent-done` in the same step it returns (do the `agent-done` even if the subagent failed),
   keyed by a unique `--name`:
   ```
   dispatch_queue.py <project> agent-start --role <role> --name "<role>:<target>" --target "<target>"
-  … launch the Task subagent, await it …
+  … launch the native subagent, await it …
   dispatch_queue.py <project> agent-done --name "<role>:<target>"
   ```
 - **Role mapping** (drives the dashboard badge): `splitter`→`splitter`,
@@ -62,8 +67,8 @@ safe under the parallel pool). `<project>` is the plan directory (the one holdin
   feed back over on `/autoform:orchestrate`.
 
 Best-effort visibility, never a gate: a missed `agent-done` only leaves a stale card until
-`idle`, and the feed never blocks the plan. Under workflow orchestration (ultracode) wrap
-each `agent()` the same way — `agent-start` before, `agent-done` after.
+`idle`, and the feed never blocks the plan. Wrap every host-native spawn the
+same way — `agent-start` before, `agent-done` after.
 
 ---
 
@@ -91,10 +96,10 @@ toolchain failure. Do **not** dispatch workers anyway: with no working build, a
 worker cannot compile-to-iterate and any "proof" it returns would be fiction. This
 precondition is run **once** here, so workers never each re-check it.
 
-Billing note: everything the orchestrator and its in-session workers do runs on the
-Claude Max subscription (free, no metered API). Scrub `ANTHROPIC_API_KEY` from every
-subprocess (`env -u ANTHROPIC_API_KEY …`) so no repo script or `lake`/`git` child
-can silently bill the Anthropic API.
+Billing note: native subagents use the current host's configured subscription or
+API path. Headless workers use the explicitly selected backend. Echo that path
+before dispatch and do not forward unrelated provider credentials to child
+processes.
 
 ---
 
@@ -129,7 +134,7 @@ This step operates at **cluster grain**:
 
 The coarse graph passes through two sequential review waves — editing, then holistic. They run in sequence by necessity: the holistic wave needs the whole graph the editing wave produced (a genuine synchronization point, per the Parallelism section), while *within* a wave the reviewers run as a continuous pool. Each wave **loops until convergence** — a round that makes no substantive change (editing) or surfaces no new significant issue (holistic) — or until progress has clearly stalled.
 
-The helper scripts live under `${CLAUDE_PLUGIN_ROOT}/scripts/`. Before each wave the orchestrator snapshots `graph.json` (a plain file copy); after each wave it runs `check_invariants.py`, which separates two things a partitioned reviewer cannot see on its own:
+The helper scripts live under `<AUTOFORM_PLUGIN_ROOT>/scripts/`. Before each wave the orchestrator snapshots `graph.json` (a plain file copy); after each wave it runs `check_invariants.py`, which separates two things a partitioned reviewer cannot see on its own:
 
 - **Structural integrity** — reference integrity, tier discipline, per-tier acyclicity — must hold at every stage. On a violation the orchestrator fixes the offender or rolls the wave back from the snapshot before continuing.
 - **Grounding completeness** — every `missing` node tracing down to an in-mathlib root — is the *phase's* goal, not a per-wave gate. Mid-build, still-ungrounded nodes are simply the remaining work, and the check lists them as a worklist; the orchestrator requires full grounding (`--require-grounding`) only before the phase's export and sign-off.
@@ -222,7 +227,10 @@ The roster, by phase and capability:
 - **`holistic-reviewer`** — Wave B in **both phases**, **flag-only**. Judges overall graph quality (coherence, granularity by significance, root validity, coverage) — not formalization order. At least 3 run independently in parallel over the whole graph; the orchestrator applies their findings. Loops to convergence-or-stall.
 - **`source-searcher`** — utility, either phase. Given a book and a specific result or definition to find, it searches the book and returns just the needed extract, so the orchestrator can resolve a question without reading the book into its own context.
 
-When running with workflow orchestration (ultracode), use `parallel()` for the genuinely independent fan-outs — the per-concept `mathlib-checker` checks and the parallel reviewers — where the next step needs them all. Run the `splitter`s as a **continuous Promise pool** over the cluster graph (per the Parallelism section), launching each as its prerequisites complete rather than in `parallel()` batches. Without orchestration, the main agent drives the same readiness loop with background subagents, collecting each as it finishes — same shape, lower throughput.
+Use the host's native parallel fan-out for genuinely independent work such as
+per-concept `mathlib-checker` checks and independent reviewers. Run `splitter`
+roles as a continuous pool over the cluster graph, launching each as its
+prerequisites complete and collecting each result as it lands.
 
 ## Self-Critique Protocol
 

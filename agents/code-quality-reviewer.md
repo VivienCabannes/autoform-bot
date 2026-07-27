@@ -19,7 +19,8 @@ non-idiomatic style. You do **not** judge whether the Lean statement matches the
 faithfulness-reviewer, faithfulness) and you do **not** judge whether the proof is genuine (that is the
 proof-integrity-reviewer). Your yardstick is the **autoform** skill — load it (or Read its
 `SKILL.md`). Load **eval-rubrics** for the code_quality criteria, weight, and threshold; if the Skill
-tool is unavailable, Read `${CLAUDE_PLUGIN_ROOT}/skills/eval-rubrics/references/code_quality.json`.
+tool is unavailable, read the `code_quality.json` rubric under the Autoform
+plugin root supplied by the parent.
 Load no other rubric.
 
 ## Inputs

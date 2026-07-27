@@ -58,6 +58,8 @@ if str(_HERE.parent) not in sys.path:
 
 import fslock  # noqa: E402 — cross-process lock shared with dispatch_runner/_queue
 import review_model as rm  # noqa: E402
+import backend_config  # noqa: E402 — shared CLI/dashboard backend registry
+import dispatch_queue as dq  # noqa: E402 — shared durable queue validation/id contract
 
 # Repo root = .../scripts/review_ui -> up two. Assets live at <root>/assets/review/.
 _REPO_ROOT = _HERE.parent.parent
@@ -141,58 +143,21 @@ _PALETTE_IDS = {a["id"] for a in AGENT_PALETTE}
 # SAME config file (~/.autoform/config.json, override with $AUTOFORM_CONFIG). The
 # dashboard reads it for the backend dropdown and writes it when the user flips it,
 # so the UI and the CLI stay in sync. Backend is also the billing path: max = the Max
-# subscription (no API tokens), aristotle = Harmonic, codex = its own (planned).
-# Mirrors plugins/autoform/scripts/backend_config.py's registry.
+# subscription (no API tokens), aristotle = Harmonic, and the remaining options
+# use their own CLI/API billing paths. The registry and persistence logic are
+# imported rather than mirrored so the dashboard cannot drift from dispatch.
 # ---------------------------------------------------------------------------
-BACKENDS = {
-    "max": {"label": "Claude Max", "available": True,
-            "billing": "Max subscription · no API tokens"},
-    "aristotle": {"label": "Aristotle", "available": True,
-                  "billing": "Harmonic · ARISTOTLE_API_KEY"},
-    "codex": {"label": "Codex", "available": False,
-              "billing": "Codex · its own auth (planned)"},
-}
-_DEFAULT_BACKEND = "max"
-
-
-def _backend_config_path() -> Path:
-    return Path(os.environ.get(
-        "AUTOFORM_CONFIG", str(Path.home() / ".autoform" / "config.json")))
-
-
-def get_backend() -> str:
-    """The persisted prover backend, or ``max`` if unset/unreadable/unknown."""
-    try:
-        data = json.loads(_backend_config_path().read_text())
-        if data.get("backend") in BACKENDS:
-            return data["backend"]
-    except Exception:
-        pass
-    return _DEFAULT_BACKEND
+BACKENDS = backend_config.BACKENDS
 
 
 def set_backend(backend: str) -> None:
-    """Persist ``backend`` to the shared config (atomic). Raises ValueError if unknown."""
-    if backend not in BACKENDS:
-        raise ValueError(f"unknown backend {backend!r}")
-    p = _backend_config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(p.read_text())
-        if not isinstance(data, dict):
-            data = {}
-    except Exception:
-        data = {}
-    data["backend"] = backend
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    backend_config.set_backend(backend)
 
 
 def _backend_payload() -> dict:
     """The {current, options} the dashboard's backend dropdown renders from."""
     return {
-        "current": get_backend(),
+        "current": backend_config.get_backend(),
         "options": [{"id": k, "label": v["label"], "available": v["available"],
                      "billing": v["billing"]} for k, v in BACKENDS.items()],
     }
@@ -326,17 +291,18 @@ class Project:
         return rm.load_agents(self.agents_path)
 
     # --- the dispatch queue (the second deliberate write) ---
-    def task_queue(self) -> List[dict]:
+    def task_queue(self, *, strict: bool = False) -> List[dict]:
         """The current dispatch queue, read from ``task_queue.json`` next to graph.json.
 
-        A list of task-request records the orchestrator consumes. Absent file,
-        unreadable file, corrupt JSON, or a non-list root all degrade to ``[]`` — the
-        dashboard must never error just because nothing has been dispatched yet. Never
-        raises. Non-dict entries are dropped so a malformed queue can't crash a render.
+        Read-only dashboard rendering is best-effort: malformed state degrades
+        to an empty list instead of taking down the UI. Every mutation passes
+        ``strict=True`` and fails closed instead of overwriting durable work.
         """
         p = self.task_queue_path
         if not p.is_file():
             return []
+        if strict:
+            return dq.load_queue(p)
         try:
             data = json.loads(p.read_text())
         except (OSError, json.JSONDecodeError):
@@ -1439,7 +1405,7 @@ def make_handler(proj: Project):
             """POST /api/request {agent, node} → enqueue a dispatch request.
 
             400 unless ``agent`` is in AGENT_PALETTE AND ``node`` is in the graph.
-            Otherwise append a queued task record (id = f"{agent}:{node}", stable) and
+            Otherwise append a queued task record with a unique opaque id and
             DEDUPE — an identical agent+node already queued/running returns the existing
             queue unchanged, never a duplicate. Writes ONLY task_queue.json; never
             spawns an agent. Returns {ok:true, queue:[...]}.
@@ -1461,7 +1427,13 @@ def make_handler(proj: Project):
             # dispatch_queue) mutates the same file, so an unlocked cycle here could
             # erase its just-landed claim/finish (or vice versa).
             with fslock.locked(proj.task_queue_path):
-                queue = proj.task_queue()
+                try:
+                    queue = proj.task_queue(strict=True)
+                except dq.QueueStateError as error:
+                    return self._json(
+                        409,
+                        {"ok": False, "error": f"queue state error: {error}"},
+                    )
                 # Dedupe: an identical agent+node already queued or running blocks a
                 # duplicate — return the existing queue untouched (idempotent enqueue).
                 for t in queue:
@@ -1472,7 +1444,7 @@ def make_handler(proj: Project):
                 node_label = nodes[node].get("name") or node
                 now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 queue.append({
-                    "id": f"{agent}:{node}",
+                    "id": dq.new_task_id(agent, node, queue),
                     "agent": agent,
                     "node": node,
                     "node_label": node_label,
@@ -1496,7 +1468,13 @@ def make_handler(proj: Project):
                 return self._json(400, {"ok": False, "error": "bad json"})
             task_id = posted.get("id")
             with fslock.locked(proj.task_queue_path):   # see _post_request
-                queue = proj.task_queue()
+                try:
+                    queue = proj.task_queue(strict=True)
+                except dq.QueueStateError as error:
+                    return self._json(
+                        409,
+                        {"ok": False, "error": f"queue state error: {error}"},
+                    )
                 kept = [t for t in queue
                         if not (t.get("id") == task_id and t.get("status") == "queued")]
                 if len(kept) != len(queue):
@@ -1575,7 +1553,8 @@ def main(argv=None) -> int:
         proj.lean_root = args.lean_root.resolve()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(proj))
-    url = f"http://127.0.0.1:{args.port}/"
+    actual_port = int(server.server_address[1])
+    url = f"http://127.0.0.1:{actual_port}/"
     print(f"review server → {url}  (Ctrl-C to stop)")
     print(f"  graph:   {graph_path}")
     print(f"  sidecar: {proj.sidecar_path}")

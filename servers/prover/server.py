@@ -1,10 +1,9 @@
 """Unified prover MCP server — ONE tool, the backend is a parameter.
 
 ``prove_node(node_id, backend, project_dir, max_steers=3)`` proves one plan node
-with the chosen backend and writes the proof into the node. ``backend`` selects
-the adapter — ``"claude"`` (default, Claude-on-Max, free) or ``"aristotle"``
-(opt-in, free, needs the ``aristotle`` extra + ``ARISTOTLE_API_KEY`` + network) —
-but the **driver and steerer are the SAME for every backend**: only the adapter differs.
+with the chosen backend and writes the proof into the node. Supported adapters
+are Claude, Aristotle, Codex, OpenAI-compatible, and Avocado. The **driver,
+event contract, and verification gate are the same**; only the adapter differs.
 
 This is the unified replacement for PR C's one-shot ``aristotle_delegate_node``
 and PR D's in-session worker: both are now adapters behind one driver.
@@ -58,9 +57,8 @@ def _make_adapter(
 
         return CodexAdapter(extra_args=extra_args, max_wait_seconds=max_wait_seconds)
     if backend in ("openai", "avocado"):
-        # Lazy import: the generic OpenAI-compatible HTTP backend. "avocado" is
-        # the Meta-internal preset (Avocado = the internal codename of Muse
-        # Spark; see docs/avocado-handoff.md for the work-laptop fill-ins).
+        # Lazy import: the generic OpenAI-compatible HTTP backend. Avocado's
+        # private endpoint/model/auth must be configured explicitly.
         from .openai_adapter import OpenAICompatAdapter
 
         return OpenAICompatAdapter(graph_path=graph_path, preset=backend,
@@ -81,6 +79,8 @@ def run_prove_node(
     max_wait_seconds: float = 5400,
     extra_args: list[str] | None = None,
     mcp_config: str | None = None,
+    judge_policy: str = "never",
+    allow_api_egress: bool = False,
 ) -> ProofResult:
     """Build the node spec, run the unified driver with the chosen adapter.
 
@@ -88,9 +88,22 @@ def run_prove_node(
     a FAKE adapter). It returns the :class:`ProofResult`; the MCP tool serializes
     it to ``{status, reason, backend, ...}``.
     """
+    if backend in {"openai", "avocado"} and not allow_api_egress:
+        raise ValueError(
+            f"{backend}: explicit project-data egress consent is required; "
+            "set allow_api_egress=true only after the provider, base URL, and "
+            "project data scope were shown to the user"
+        )
     spec = build_node_spec(Path(graph_path), node_id, project_dir=Path(project_dir))
     adapter = _make_adapter(backend, graph_path, max_wait_seconds, extra_args, mcp_config)
-    result = prove(adapter, node_id, spec, project_dir, max_steers=max_steers)
+    result = prove(
+        adapter,
+        node_id,
+        spec,
+        project_dir,
+        max_steers=max_steers,
+        judge_policy=judge_policy,
+    )
     _record_usage(project_dir, node_id, backend, result)
     return result
 
@@ -154,16 +167,16 @@ def create_prover_server() -> FastMCP:
         max_wait_seconds: float = 5400,
         extra_args: list[str] | None = None,
         mcp_config: str | None = None,
+        judge_policy: str = "never",
+        allow_api_egress: bool = False,
     ) -> str:
         """Prove ONE plan node with a swappable backend; write the proof into the node.
 
-        The backend is a PARAMETER — ``"claude"`` (default, runs on the Claude Max
-        subscription, free) or ``"aristotle"`` (opt-in, free, needs the aristotle
-        extra + ARISTOTLE_API_KEY + network). The driver and the live-steering
-        judge are IDENTICAL across backends; only the thin adapter differs. The shared
-        steerer watches the run and injects a corrective instruction (in-flight
-        for Aristotle via project.ask, turn-granular for Claude via --resume) only
-        when the prover goes off-course, up to ``max_steers`` times.
+        The backend is a parameter. Every backend uses the same driver and
+        verification gate; only the thin adapter differs. The standalone MCP
+        defaults model-judged live steering off so it never hides a second
+        provider dependency. Deterministic verification-gate corrections still
+        apply where the adapter can resume.
 
         This tool ONLY writes a proof into the node. It does not review, score, or
         touch review_status.json — the jury and the review surface consume the
@@ -174,7 +187,8 @@ def create_prover_server() -> FastMCP:
             node_id: The target node id (verbatim, e.g. "Chernoff bound").
             project_dir: The Lean project directory (where the proof is written
                 and informal_content/ lives).
-            backend: "claude" (default), "aristotle", or "codex".
+            backend: "claude" (default), "aristotle", "codex", "openai", or
+                "avocado".
             max_steers: Cap on in-flight steers for this run (default 3).
             max_wait_seconds: Wall-clock ceiling for the run — honored by every
                 backend (Aristotle stops polling; claude/codex kill the worker
@@ -184,8 +198,15 @@ def create_prover_server() -> FastMCP:
             mcp_config: MCP config path for the claude worker's --mcp-config.
                 Default (None) auto-discovers: the AUTOFORM_MCP_CONFIG env var if
                 set, else the plugin's own .mcp.json next to this package; the
-                headless worker also runs with --dangerously-skip-permissions by
-                default so it can actually Edit/Write/Bash.
+                headless worker uses dontAsk with a narrow tool allowlist
+                by default. Unsafe bypass requires AUTOFORM_UNSAFE_FULL_ACCESS=1.
+            judge_policy: Live model-judged steering policy. The standalone MCP
+                default is "never" so it has no hidden Claude dependency;
+                deterministic verification-gate folds still run. The orchestrator
+                injects its explicitly selected jury provider for live steering.
+            allow_api_egress: Required for OpenAI or Avocado only. Set true only
+                after the caller has shown the provider/base URL and project data
+                scope and obtained explicit approval for this run.
 
         Returns:
             JSON ``{node_id, backend, status, reason, landed_files, proof_text,
@@ -205,6 +226,8 @@ def create_prover_server() -> FastMCP:
                 max_wait_seconds=max_wait_seconds,
                 extra_args=extra_args,
                 mcp_config=mcp_config,
+                judge_policy=judge_policy,
+                allow_api_egress=allow_api_egress,
             )
         except Exception as err:
             return json.dumps(

@@ -1,10 +1,11 @@
 # Autoform
 
-**An autoformalization engine for Claude Code: turn a mathematics textbook into
+**A host-neutral autoformalization engine for Claude Code and Codex: turn a mathematics textbook into
 kernel-verified Lean 4, with every proof independently checked and every verdict
 auditable.**
 
-Autoform is a Claude Code plugin that runs the full pipeline — plan a textbook
+Autoform is an Agent Skills plugin that runs the full pipeline on Claude Code
+or Codex — plan a textbook
 into a tiered dependency graph, prove nodes with swappable AI backends, verify
 every claimed proof against the Lean kernel, judge the result with a three-axis
 review jury, and put a human in charge of final sign-off through a local review
@@ -47,7 +48,8 @@ flowchart LR
 
 ## Quickstart
 
-Prereqs: [Claude Code](https://claude.com/claude-code), Python ≥ 3.10, and
+Prereqs: [Claude Code](https://claude.com/claude-code) or
+[Codex](https://developers.openai.com/codex/), Python ≥ 3.10, and
 [uv](https://docs.astral.sh/uv/) (the MCP servers launch via `uv run` and
 resolve their own deps on first start).
 
@@ -63,8 +65,8 @@ resolve their own deps on first start).
 `/autoform:setup` walks you through creating a project (via the LeanProject
 template, with Mathlib cache), planning your sources into `graph.json`, and
 opening the review dashboard. `/autoform:set-backend` persists the default
-prover backend (`max` | `aristotle` | `codex`; the `openai`/`avocado` backends
-are selected per-call on `prove_node`); `/autoform:orchestrate` then drives the
+prover backend (`max` | `aristotle` | `codex` | `openai` | `avocado`);
+`/autoform:orchestrate` then drives the
 formalization — autonomously, human-driven from the dashboard, or both, off one
 shared queue.
 
@@ -72,15 +74,20 @@ shared queue.
 
 One MCP tool proves a node — `prove_node(graph_path, node_id, project_dir,
 backend=...)` — and the driver, steerer, and honesty gate are identical for
-every backend; only the adapter differs.
+every backend; only the adapter differs. Direct OpenAI/Avocado calls also
+require `allow_api_egress=true` after explicit approval for that project/run.
 
 | backend | what it is | auth / env | steering |
 |---|---|---|---|
-| `claude` (default) | headless Claude Code worker on your Max subscription | your Claude login (API key scrubbed → subscription billing) | gate-fold (live judge opt-in) |
+| `max` | headless Claude Code worker on your Max subscription | your Claude login (API key scrubbed → subscription billing) | gate-fold (live judge opt-in) |
 | `aristotle` | Harmonic's Aristotle prover API | `ARISTOTLE_API_KEY` + `uv sync --extra aristotle` | **in-flight** (`project.ask`) |
 | `codex` | OpenAI Codex CLI | codex's own auth | gate-fold (live judge opt-in) |
-| `openai` | any OpenAI-compatible endpoint | `AUTOFORM_OPENAI_BASE_URL` / `_MODEL` / `_KEY_VAR` | request/response |
-| `avocado` | Meta's Muse Spark (public preset; internal fill-ins in [docs/avocado-handoff.md](docs/avocado-handoff.md)) | `MODEL_API_KEY` (overridable via `AUTOFORM_AVOCADO_*`) | request/response |
+| `openai` | any OpenAI-compatible endpoint | `AUTOFORM_OPENAI_BASE_URL` / `_MODEL` / `_KEY_VAR` | bounded local tool loop |
+| `avocado` | explicitly configured Meta-compatible deployment | configured key variable via `AUTOFORM_AVOCADO_*` | bounded local tool loop |
+
+Check API configuration without sending project data with
+`uv run python scripts/provider_check.py <openai|avocado>`. Add `--live` only to run a
+temporary-marker tool-call probe.
 
 Steering is capability-aware: Aristotle accepts corrections mid-run; headless
 CLIs get the deterministic **verify-gate fold** (the gate's rejection reason,
@@ -99,12 +106,12 @@ existing project with `python3 scripts/formalization.py init <project-dir>`.
 
 ## The surface
 
-**Commands** — `/autoform:setup` (end-to-end project setup),
+**Workflow skills** — `/autoform:setup` (end-to-end project setup),
 `/autoform:orchestrate` (launch/drive the engine),
 `/autoform:set-backend` (persist the prover backend; shared with the
 dashboard).
 
-**Skills** — `plan`, `plan-view`, `review` (the planning and review surfaces);
+**Other skills** — `plan`, `plan-view`, `review` (the planning and review surfaces);
 `autoform` (Mathlib conventions), `autoform-prove` (worker proof discipline),
 `eval-rubrics` (the jury's rubrics); `make-project`, `install-autoform`,
 `install-lean`, `workspace` (project scaffolding and triage); `zulip`
@@ -125,29 +132,31 @@ crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 ## Repository layout
 
 ```
-skills/       user-invocable skills (each a SKILL.md, some with scripts)
-commands/     /autoform:setup · orchestrate · set-backend
+skills/       user-invocable Agent Skills, including setup/orchestrate/backends
 agents/       worker, reader, planning crew, review jury
 servers/      MCP servers (prover, aristotle, mathlib, zulip; repl/lsp stubs)
 scripts/      plan/graph tooling, dispatch engine, review UI, formalization.py
-hooks/        SessionStart intro + slash-command fast-paths
+hooks/        Claude SessionStart context (skills are the workflow surface)
 docs/         pipeline architecture, usage guide, backend handoff notes
 examples/     reference implementations for the remaining stubs
-tests/        pytest suite (fake adapters/transports — no Lean or network needed)
+tests/        deterministic suite; optional local-Lean and loopback-HTTP smoke tests
 ```
 
 ## Development
 
 ```bash
-uv run --extra dev pytest tests/         # full suite
-python scripts/lint_plugin.py            # plugin-surface lint (CI runs this)
+uv sync --extra dev --extra repl --extra zulip
+uv run python -m pytest -q               # full suite
+python3 scripts/lint_plugin.py           # plugin-surface lint (CI runs this)
 uv run --extra dev ruff check servers/   # style
 ```
 
 CI lints the plugin surface (manifests, frontmatter, references, dangling-name
 guard) on pushes that touch it. See [CONTRIBUTING.md](CONTRIBUTING.md) for the component
 status table and how to contribute skills, agents, or server implementations,
-and [docs/pipeline.md](docs/pipeline.md) for the planner's architecture.
+and [docs/pipeline.md](docs/pipeline.md) for the planner's architecture. Use
+[docs/pilot-testing.md](docs/pilot-testing.md) for the release, live-host, and
+failure-drill checklist.
 
 ## License
 

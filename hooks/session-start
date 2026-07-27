@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# SessionStart hook — introduce the Lean Informal Planner plugin.
+# SessionStart hook — describe Autoform's portable workflow.
 # Silent-fails on all errors (never blocks session start).
 
 set -euo pipefail
 
-context="The Lean Informal Planner plugin is active. This plugin helps plan Lean 4 formalization efforts by building a tiered dependency graph from textbooks — coarse concept clusters first, then fine definitions and statements with their own paraphrased content — mapping it to Mathlib and rendering it as an interactive blueprint. When the user first interacts, introduce the plugin briefly and ask which textbook(s) to analyze (LaTeX, Markdown, or PDF) and which concepts or chapters are the formalization targets. Available skills: /lean-informal-planner:plan (the full two-phase planning pipeline) and /lean-informal-planner:plan-view (build and open the interactive blueprint, with a tier toggle)."
+context="Autoform is active. It turns mathematical sources into a durable Lean 4 formalization graph, proves nodes through explicitly selected backends, independently verifies every proof, and records a three-axis review jury. Use the setup, orchestrate, set-backend, plan, plan-view, review, workspace, and proof skills when relevant. Claude and Codex use their native skills, MCP servers, and subagents against the same graph and queue. Ask for source files and scope before beginning a new plan."
 
 escape_for_json() {
   local value="$1"

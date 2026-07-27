@@ -10,6 +10,10 @@ on:
       - "commands/**"
       - "examples/**"
       - ".claude-plugin/**"
+      - ".codex-plugin/**"
+      - ".mcp.json"
+      - "hooks/hooks.json"
+      - "hooks/**"
       - "scripts/lint_plugin.py"
       - "scripts/check_invariants.py"
       - ".github/workflows/plugin-lint.yml"
@@ -20,6 +24,10 @@ on:
       - "commands/**"
       - "examples/**"
       - ".claude-plugin/**"
+      - ".codex-plugin/**"
+      - ".mcp.json"
+      - "hooks/hooks.json"
+      - "hooks/**"
       - "scripts/lint_plugin.py"
       - "scripts/check_invariants.py"
       - ".github/workflows/plugin-lint.yml"
@@ -38,6 +46,10 @@ jobs:
       - name: Byte-compile scripts
         run: |
           python -m py_compile scripts/lint_plugin.py
+          python -m py_compile scripts/backend_config.py
+          python -m py_compile scripts/install_host_agents.py
+          python -m py_compile scripts/init_plan.py
+          python -m py_compile scripts/provider_check.py
           if [ -f scripts/check_invariants.py ]; then
             python -m py_compile scripts/check_invariants.py
           fi

@@ -53,7 +53,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _SORRY_RE = re.compile(r"\b(?:sorry|admit|sorryAx)\b(?!-)")
-_BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
+_UNSAFE_ELAB_RE = re.compile(
+    r"\b(?:run_cmd|initialize|elab|foreign|extern|syntax|"
+    r"macro|macro_rules|native_decide|run_tac|include_str|include_bytes)\b|"
+    r"#(?:eval|reduce|run)\b|"
+    r"\bunsafe\s+(?:def|abbrev|theorem|instance)\b"
+)
 _MODULE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*$")
 _NS_RE = re.compile(r"^namespace\s+([A-Za-z_][A-Za-z0-9_'.]*)")
 _DECL_RE = re.compile(
@@ -95,18 +100,78 @@ class VerifyResult:
 # --------------------------------------------------------------------------- utils
 
 def _strip_comments(src: str) -> str:
-    src = _BLOCK_COMMENT_RE.sub(" ", src)
-    out = []
-    for line in src.splitlines():
-        i = line.find("--")
-        out.append(line if i < 0 else line[:i])
-    return "\n".join(out)
+    """Remove Lean line/nested-block comments while preserving quoted strings.
+
+    Preserving strings is deliberately conservative for the unsafe-code scan:
+    a keyword in a string can cause a false rejection, but comment delimiters
+    embedded in a string cannot be used to hide a later executable directive.
+    """
+    out: list[str] = []
+    index = 0
+    block_depth = 0
+    in_string = False
+    escaped = False
+    while index < len(src):
+        pair = src[index : index + 2]
+        char = src[index]
+        if block_depth:
+            if pair == "/-":
+                block_depth += 1
+                out.extend("  ")
+                index += 2
+            elif pair == "-/":
+                block_depth -= 1
+                out.extend("  ")
+                index += 2
+            else:
+                out.append("\n" if char == "\n" else " ")
+                index += 1
+            continue
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if pair == "--":
+            while index < len(src) and src[index] != "\n":
+                out.append(" ")
+                index += 1
+            continue
+        if pair == "/-":
+            block_depth = 1
+            out.extend("  ")
+            index += 2
+            continue
+        out.append(char)
+        if char == '"':
+            in_string = True
+        index += 1
+    return "".join(out)
 
 
 def has_sorry(src: str) -> bool:
     """Fast pre-filter: a literal ``sorry``/``admit``/``sorryAx`` in source (outside
     comments). Not authoritative — the kernel check below is — but a cheap early out."""
     return bool(_SORRY_RE.search(_strip_comments(src)))
+
+
+def unsafe_elaboration_directive(src: str) -> str:
+    """Return a generated-code execution directive that must not reach ``lean``.
+
+    Lean elaboration is programmable. A provider-written file containing
+    ``run_cmd``, ``initialize``, custom elaborators/macros, native execution,
+    foreign declarations, or compile-time file inclusion can run code/read data
+    during the verification build, before the kernel/axiom audit gets a vote.
+    Autoform proof workers do not need these forms, so the gate fails closed on
+    touched files containing one.
+    """
+    match = _UNSAFE_ELAB_RE.search(_strip_comments(src))
+    return match.group(0).strip() if match else ""
 
 
 def _scrubbed_env() -> dict:
@@ -392,6 +457,41 @@ def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
     probe = (
         "import Lean\n"
         f"{imports}\n"
+        "namespace AutoformVerify\n"
+        "\n"
+        "open Lean\n"
+        "\n"
+        "structure AxiomState where\n"
+        "  visited : NameSet := {}\n"
+        "  axioms : Array Name := #[]\n"
+        "\n"
+        "abbrev AxiomM := ReaderT Environment (StateM AxiomState)\n"
+        "\n"
+        "partial def collectAxiomsCompat (c : Name) : AxiomM Unit := do\n"
+        "  let collectExpr (e : Expr) : AxiomM Unit :=\n"
+        "    e.getUsedConstants.forM collectAxiomsCompat\n"
+        "  let state ← get\n"
+        "  unless state.visited.contains c do\n"
+        "    modify fun s => { s with visited := s.visited.insert c }\n"
+        "    let env ← read\n"
+        "    match env.find? c with\n"
+        "    | some (ConstantInfo.axiomInfo _) =>\n"
+        "        modify fun s => { s with axioms := s.axioms.push c }\n"
+        "    | some (ConstantInfo.defnInfo v) => collectExpr v.type *> collectExpr v.value\n"
+        "    | some (ConstantInfo.thmInfo v) => collectExpr v.type *> collectExpr v.value\n"
+        "    | some (ConstantInfo.opaqueInfo v) => collectExpr v.type *> collectExpr v.value\n"
+        "    | some (ConstantInfo.quotInfo _) => pure ()\n"
+        "    | some (ConstantInfo.ctorInfo v) => collectExpr v.type\n"
+        "    | some (ConstantInfo.recInfo v) => collectExpr v.type\n"
+        "    | some (ConstantInfo.inductInfo v) => collectExpr v.type *> v.ctors.forM collectAxiomsCompat\n"
+        "    | none => pure ()\n"
+        "\n"
+        "def axiomsOf (env : Environment) (nm : Name) : Array Name :=\n"
+        "  let (_, state) := ((collectAxiomsCompat nm).run env).run {}\n"
+        "  state.axioms\n"
+        "\n"
+        "end AutoformVerify\n"
+        "\n"
         "open Lean in\n"
         "run_cmd do\n"
         "  let env ← getEnv\n"
@@ -402,7 +502,7 @@ def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
         "    if let some i := env.getModuleIdxFor? nm then\n"
         "      if idxs.contains i && !nm.isInternalDetail then\n"
         "        n := n + 1\n"
-        "        let axs ← collectAxioms nm\n"
+        "        let axs := AutoformVerify.axiomsOf env nm\n"
         "        if axs.isEmpty then\n"
         "          logInfo m!\"'{nm}' does not depend on any axioms\"\n"
         "        else\n"
@@ -501,13 +601,21 @@ def verify_proof(
 
     read = reader or (lambda pth: Path(pth).read_text(encoding="utf-8", errors="ignore"))
 
-    # 1. fast pre-filter — a literal sorry/admit in the touched source.
+    # 1. fast pre-filters — literal proof gaps and elaboration-time execution.
     for f in files:
         fp = Path(f) if Path(f).is_absolute() else Path(project_dir) / f
         try:
-            if has_sorry(read(fp)):
+            source = read(fp)
+            if has_sorry(source):
                 return VerifyResult(False, f"`{f}` contains a literal sorry/admit",
                                     {"verified": True, "files": files, "sorry_in": f})
+            unsafe = unsafe_elaboration_directive(source)
+            if unsafe:
+                return VerifyResult(
+                    False,
+                    f"`{f}` contains disallowed elaboration-time execution: {unsafe}",
+                    {"verified": True, "files": files, "unsafe_elaboration_in": f},
+                )
         except Exception:
             continue
 

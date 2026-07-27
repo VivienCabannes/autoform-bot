@@ -62,7 +62,6 @@ def test_never_drops_a_non_redundant_edge():
         for (u, v) in edges:
             others = {w for (x, w) in edges if x == u and w != v}
             # v reachable from some other direct successor of u (full closure)?
-            reach = dict()
             def closure(x, seen=None):
                 seen = seen if seen is not None else set()
                 acc = set()

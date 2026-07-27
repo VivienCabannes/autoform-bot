@@ -7,6 +7,7 @@ here by path exactly the way the prover server loads it.
 from __future__ import annotations
 
 import importlib.util
+import multiprocessing
 from pathlib import Path
 
 import yaml
@@ -108,6 +109,40 @@ def test_torn_ledger_line_is_skipped(tmp_path):
         fh.write('{"node": "torn...')  # crash mid-append
     entries = fz.read_ledger(tmp_path)
     assert len(entries) == 1 and entries[0]["node"] == "A"
+
+
+def _record_and_refresh(project: str, index: int) -> None:
+    fz.record_run(project, {
+        "node": f"N{index}",
+        "backend": "codex",
+        "model": "pilot",
+        "billing": "external",
+        "wall_seconds": 1,
+        "usage": {
+            "worker": {"input_tokens": 1, "output_tokens": 1},
+            "judge": {},
+        },
+    })
+    fz.update_formalization(project)
+
+
+def test_concurrent_ledger_writers_keep_every_run_and_latest_rollup(tmp_path):
+    fz.init_formalization(tmp_path, name="Concurrent")
+    ctx = multiprocessing.get_context("fork")
+    processes = [
+        ctx.Process(target=_record_and_refresh, args=(str(tmp_path), index))
+        for index in range(24)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(15)
+        assert process.exitcode == 0
+    entries = fz.read_ledger(tmp_path)
+    assert len(entries) == 24
+    assert {entry["node"] for entry in entries} == {f"N{i}" for i in range(24)}
+    method = _autoform_entry(_read_yaml(tmp_path))
+    assert method["tokens"] == {"input": 24, "output": 24, "runs": 24}
 
 
 def test_wall_time_formatting():

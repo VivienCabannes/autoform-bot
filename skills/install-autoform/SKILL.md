@@ -1,17 +1,21 @@
 ---
 name: install-autoform
 description: >
-  Set up the full autoform environment — uv, Python dependencies, Lean 4,
-  and optional Zulip access. Checks each component and installs what's missing.
-  Trigger: /install-autoform, "setup autoform", "install autoform", "setup environment".
+  Install or repair Autoform's own environment prerequisites: uv, Python
+  dependencies, Lean 4, and optional Zulip access. Use for toolchain/plugin
+  installation, not for creating or resuming a formalization project.
 ---
 
 # Set Up Autoform
 
+Resolve an absolute plugin root from a valid `AUTOFORM_PLUGIN_ROOT`,
+`PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
+`Path(<this loaded SKILL.md>).resolve().parents[2]`.
+
 Run the setup script:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/skills/install-autoform/install-autoform.sh"
+bash "<AUTOFORM_PLUGIN_ROOT>/skills/install-autoform/install-autoform.sh"
 ```
 
 The script is idempotent — safe to re-run. It checks and sets up:

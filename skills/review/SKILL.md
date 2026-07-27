@@ -6,10 +6,13 @@ description: >
   graph", "check faithfulness of the statements", "score the formalization", or set
   the review dial. DAG-native human-review surface over the tiered plan: a headless
   text reviewer packet by default, or a local review UI with `--view`.
-version: 0.1.0
 ---
 
 # Review — the human-review surface
+
+Resolve the absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`. Substitute it into every
+helper path.
 
 A formalization is only trustworthy when a human Lean expert will vouch for the
 **statements** (the kernel already vouches for the proofs). This skill produces the
@@ -74,7 +77,7 @@ recorded human verdict freezes the node: re-running the jury rewrites only the
   end-to-end.
 
 All of these are pure functions of (`graph.json`, `review_status.json`) implemented
-in `${CLAUDE_PLUGIN_ROOT}/scripts/review_ui/review_model.py` (`verdict_of`,
+in `<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/review_model.py` (`verdict_of`,
 `tainted_set`, `cluster_rollup`, `coverage`, `trust_frontier`, `recolor_dot`).
 
 ## The dial (spec-generation level)
@@ -127,8 +130,10 @@ This default is text-only and writes nothing. It is the CI/agent path.
 2. **Launch the server** (stdlib, binds `127.0.0.1` only):
 
    ```bash
-   python ${CLAUDE_PLUGIN_ROOT}/scripts/review_ui/serve_review.py \
-       --graph <path/to/graph.json> [--port 8765] [--open]
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+       "<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/serve_review.py" \
+       --graph <path/to/graph.json> [--lean-root <path/to/Lean/sources>] \
+       [--port 8765] [--open]
    ```
 
    Then open `http://127.0.0.1:<port>/`. The three screens:

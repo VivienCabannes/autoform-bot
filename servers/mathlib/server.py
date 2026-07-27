@@ -23,6 +23,7 @@ def create_mathlib_server(repo_root: str | Path) -> FastMCP:
         max_results: int = 50,
         context_lines: int = 0,
         literal: bool = False,
+        project_dir: str = "",
     ) -> str:
         """Search Mathlib source code using ripgrep.
 
@@ -33,9 +34,11 @@ def create_mathlib_server(repo_root: str | Path) -> FastMCP:
             max_results: Maximum results to return.
             context_lines: Lines of context around matches.
             literal: If true, treat pattern as literal string.
+            project_dir: Lean project containing the Mathlib dependency. Pass
+                explicitly when the host did not set LEAN_PROJECT_DIR.
         """
         return grep_mathlib(
-            repo_root,
+            Path(project_dir).resolve() if project_dir else repo_root,
             pattern,
             kind=kind,
             subdir=subdir,
@@ -49,6 +52,7 @@ def create_mathlib_server(repo_root: str | Path) -> FastMCP:
         name: str,
         exact: bool = False,
         max_results: int = 30,
+        project_dir: str = "",
     ) -> str:
         """Find a theorem, lemma, or definition by name in Mathlib.
 
@@ -56,14 +60,17 @@ def create_mathlib_server(repo_root: str | Path) -> FastMCP:
             name: Name to search for (e.g. sum_add_distrib, det_mul).
             exact: Match exact name only.
             max_results: Maximum results to return.
+            project_dir: Lean project containing the Mathlib dependency.
         """
-        return find_name_in_mathlib(repo_root, name, exact=exact, max_results=max_results)
+        root = Path(project_dir).resolve() if project_dir else repo_root
+        return find_name_in_mathlib(root, name, exact=exact, max_results=max_results)
 
     @server.tool
     def mathlib_read_file(
         file_path: str,
         start_line: int | None = None,
         end_line: int | None = None,
+        project_dir: str = "",
     ) -> str:
         """Read a Mathlib source file.
 
@@ -71,8 +78,10 @@ def create_mathlib_server(repo_root: str | Path) -> FastMCP:
             file_path: Path relative to Mathlib root (e.g. Mathlib/LinearAlgebra/Matrix/Determinant.lean).
             start_line: Starting line (1-indexed, optional).
             end_line: Ending line (inclusive, optional).
+            project_dir: Lean project containing the Mathlib dependency.
         """
-        return read_mathlib_file(repo_root, file_path, start_line=start_line, end_line=end_line)
+        root = Path(project_dir).resolve() if project_dir else repo_root
+        return read_mathlib_file(root, file_path, start_line=start_line, end_line=end_line)
 
     return server
 

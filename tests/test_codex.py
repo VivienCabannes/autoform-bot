@@ -82,7 +82,25 @@ def test_codex_adapter_single_turn_proves():
     assert result.meta["session_id"] == "sess-1"
     # autonomy flag + json mode in the invocation
     assert "--json" in runner.calls[0]["args"]
-    assert "--dangerously-bypass-approvals-and-sandbox" in runner.calls[0]["args"]
+    assert ["--sandbox", "workspace-write"] == runner.calls[0]["args"][
+        runner.calls[0]["args"].index("--sandbox") :
+        runner.calls[0]["args"].index("--sandbox") + 2
+    ]
+    assert "--dangerously-bypass-approvals-and-sandbox" not in runner.calls[0]["args"]
+
+
+def test_codex_unsafe_full_access_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("AUTOFORM_UNSAFE_FULL_ACCESS", "1")
+    runner = FakeCodexRunner([_lines(
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "theorem foo : True := trivial"
+        }},
+    )])
+    adapter = CodexAdapter(runner=runner)
+    prove(adapter, "Foo", "spec", "/tmp/proj", verifier=None)
+    args = runner.calls[0]["args"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in args
+    assert "--sandbox" not in args
 
 
 def test_codex_adapter_reports_honest_failed():
@@ -116,7 +134,10 @@ def test_codex_steer_resumes_session():
                    verifier=None, judge_policy="always")
     assert len(runner.calls) == 2
     # second turn must resume the captured session
-    assert "resume" in runner.calls[1]["args"] and "sess-9" in runner.calls[1]["args"]
+    resumed = runner.calls[1]["args"]
+    assert "resume" in resumed and "sess-9" in resumed
+    assert "--sandbox" not in resumed  # inherited; unsupported by `exec resume`
+    assert "--skip-git-repo-check" in resumed
     assert result.status == "proved"
 
 

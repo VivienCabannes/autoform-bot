@@ -8,7 +8,6 @@ description: >
   sorry/axiom, dealing with slow or timing-out builds, escalating a blocked task, or
   committing formalized code in Lean 4. Do NOT trigger for non-Lean theorem provers.
   Triggers on: /autoform-prove, "prove this", "sorry handling", "proof strategy".
-version: 0.3.0
 ---
 
 # Proof strategies & formalization workflow
@@ -24,10 +23,11 @@ load-bearing reference in `references/`; this file stays lean and points there.
 1. **Search first.** Look for the lemma in Mathlib (`mathlib_grep`, `mathlib_find_name`, or
    `exact?`/`apply?`/`rw?` in the REPL) before reproving anything — many standard results already
    exist. See `proof-strategies.md`.
-2. **Prototype in the REPL.** Test proof fragments with `run_lean_code` (the `autoform-repl` MCP)
-   before editing large files; only write to the file once a fragment compiles. Use the
-   `autoform-lsp` MCP (`lean_diagnostic_messages`, `lean_hover`) for files with custom defs the
-   REPL can't see, and reserve full `lake build` for final checks. See `tool-usage.md`.
+2. **Prototype and compile incrementally.** Test fragments with a working
+   REPL/LSP when one is available, otherwise use a temporary Lean file and
+   `lake env lean <file>`. Check the actual project file after each landed
+   change and reserve full `lake build` for the final check. See
+   `tool-usage.md`.
 3. **Work incrementally.** Fix compilation errors first, then triage `sorry`s by difficulty
    (easy → medium → hard); prove the easy ones first.
 4. **Commit often.** Each compiling step gets its own commit, named after the task

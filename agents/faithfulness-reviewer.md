@@ -18,7 +18,7 @@ completely captures the source statement, at full strength. You do **not** judge
 is genuine (that is the proof-integrity-reviewer) and you do **not** judge code style (that is the
 code-quality-reviewer). Load the **eval-rubrics** skill for the faithfulness criteria, weight, and
 threshold; if the Skill tool is unavailable, Read
-`${CLAUDE_PLUGIN_ROOT}/skills/eval-rubrics/references/faithfulness.json`.
+the `faithfulness.json` rubric under the Autoform plugin root supplied by the parent.
 
 ## Inputs
 
