@@ -5,7 +5,10 @@ The real kernel path is smoke-tested separately against a minimal Lean project.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
+
+import pytest
 
 from servers.prover.base import ProofResult, ProverAdapter, Run
 from servers.prover.driver import prove
@@ -15,6 +18,7 @@ from servers.prover.verify import (
     _module_of,
     capture_baseline,
     has_sorry,
+    unsafe_elaboration_directive,
     parse_porcelain_z,
     verify_proof,
 )
@@ -33,6 +37,48 @@ def test_has_sorry():
     assert not has_sorry("-- sorry-free\ntheorem t : 1=1 := rfl")
     assert not has_sorry("/- a sorry here -/\ndef x := 1")
     assert not has_sorry("def sorryHandler := 1")
+
+
+def test_unsafe_elaboration_directive():
+    for source in (
+        'run_cmd IO.println "pwn"',
+        "initialize x : Nat ← pure 1",
+        "unsafe def x := 1",
+        "#eval IO.getEnv \"HOME\"",
+        "by\n  run_tac Lean.Elab.Tactic.closeMainGoalUsing `True.intro",
+        "native_decide",
+        'open Lean in elab "danger" : command => do pure ()',
+        '#check include_str "/etc/passwd"',
+        '@[extern "system"] opaque callSystem : Unit → Unit',
+    ):
+        assert unsafe_elaboration_directive(source)
+    assert not unsafe_elaboration_directive(
+        "-- run_cmd is forbidden\n theorem t : True := trivial"
+    )
+    assert not unsafe_elaboration_directive(
+        "/- outer /- run_cmd nested -/ still comment -/\n"
+        "theorem t : True := trivial"
+    )
+    # A comment opener inside a string must not hide a later directive.
+    assert unsafe_elaboration_directive(
+        'def marker := "/-"\nrun_cmd IO.println "blocked"'
+    )
+
+
+def test_gate_rejects_elaboration_execution_before_build():
+    built = []
+    result = verify_proof(
+        "Foo",
+        "/project",
+        touched=["Foo.lean"],
+        reader=lambda path: 'run_cmd IO.println "secret"',
+        builder=lambda project: (built.append(project) or (0, "")),
+        prober=_CLEAN_PROBE,
+        has_lakefile=True,
+    )
+    assert not result.ok
+    assert "elaboration-time execution" in result.reason
+    assert built == []
 
 
 def test_parse_porcelain_z_skips_deletions_and_renames():
@@ -125,8 +171,39 @@ def test_build_probe_enumerates_from_environment():
     probe, mods = _build_probe(["Foo/Bar.lean", "Foo/Bar.lean"], "/proj")
     assert mods == ["Foo.Bar"]
     assert "import Lean" in probe and "import Foo.Bar" in probe
-    assert "collectAxioms" in probe and "getModuleIdxFor?" in probe
+    assert "collectAxiomsCompat" in probe and "getModuleIdxFor?" in probe
+    assert "AutoformVerify.axiomsOf env nm" in probe
     assert "AUTOFORM_PROBE_OK" in probe
+
+
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lean/Lake is not installed")
+def test_generated_probe_compiles_against_installed_lean(tmp_path):
+    """Exercise the generated environment probe against a real Lean kernel.
+
+    Most gate tests inject the expensive subprocesses. This smoke test catches
+    source-level API drift such as the Lean 4.9/4.32 ``collectAxioms`` mismatch
+    that a mocked prober cannot detect.
+    """
+    (tmp_path / "lakefile.toml").write_text(
+        'name = "ProbePilot"\n'
+        'version = "0.1.0"\n'
+        'defaultTargets = ["ProbePilot"]\n\n'
+        "[[lean_lib]]\n"
+        'name = "ProbePilot"\n'
+    )
+    (tmp_path / "ProbePilot.lean").write_text(
+        "theorem probePilot (n : Nat) : n + 0 = n := by\n"
+        "  exact Nat.add_zero n\n"
+    )
+    result = verify_proof(
+        "ProbePilot",
+        str(tmp_path),
+        has_lakefile=True,
+        touched=["ProbePilot.lean"],
+    )
+    assert result.ok, result.reason
+    assert result.checks["kernel"] == "clean"
+    assert result.checks["decls"] == 1
 
 
 def test_probe_must_complete_or_fail_closed():

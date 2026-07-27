@@ -311,9 +311,11 @@ class FakeClaudeRunner:
         self._turns = turns
         self._i = 0
         self.calls: list[list[str]] = []
+        self.envs: list[dict[str, str]] = []
 
     def __call__(self, args, env, cwd, deadline=None):
         self.calls.append(args)
+        self.envs.append(env)
         self.deadlines = getattr(self, "deadlines", [])
         self.deadlines.append(deadline)
         # The key must NOT be visible to the launched claude (Max billing).
@@ -421,9 +423,40 @@ def test_claude_adapter_default_argv_is_runnable(tmp_path, monkeypatch):
     prove(adapter, "T", "spec", "/proj", steerer=FakeSteerer(steer_at=set()), verifier=None)
 
     args = runner.calls[0]
-    assert "--dangerously-skip-permissions" in args
+    assert "--permission-mode" in args
+    assert "dontAsk" in args
+    allowlist = args[args.index("--allowedTools") + 1]
+    assert "Bash(lake build *)" in allowlist
+    assert ",Bash," not in f",{allowlist},"
+    assert "--dangerously-skip-permissions" not in args
     assert "--mcp-config" in args
     assert args[args.index("--mcp-config") + 1] == str(cfg)
+    assert "--strict-mcp-config" in args
+    assert args[args.index("--setting-sources") + 1] == "user"
+    assert "--disable-slash-commands" in args
+    assert "disableAllHooks" in args[args.index("--settings") + 1]
+    assert (Path(runner.envs[0]["CLAUDE_PLUGIN_ROOT"]) / ".mcp.json").exists()
+    assert runner.envs[0]["AUTOFORM_PLUGIN_ROOT"] == runner.envs[0]["CLAUDE_PLUGIN_ROOT"]
+    assert runner.envs[0]["LEAN_PROJECT_DIR"] == "/proj"
+
+
+def test_claude_unsafe_full_access_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("AUTOFORM_UNSAFE_FULL_ACCESS", "1")
+    runner = FakeClaudeRunner(
+        [_stream({"type": "result", "session_id": "s", "result": "ok proved"})]
+    )
+    adapter = ClaudeAdapter(runner=runner, mcp_config="")
+    prove(
+        adapter,
+        "T",
+        "spec",
+        "/proj",
+        steerer=FakeSteerer(steer_at=set()),
+        verifier=None,
+    )
+    args = runner.calls[0]
+    assert "--dangerously-skip-permissions" in args
+    assert "--permission-mode" not in args
 
 
 def test_claude_adapter_mcp_config_falls_back_to_plugin_mcp_json(monkeypatch):
@@ -733,6 +766,19 @@ def test_prove_node_unknown_backend_fails_gracefully(tmp_path):
         run_prove_node(graph_path=str(gp), node_id="Thm", project_dir=str(tmp_path), backend="bogus")
 
 
+def test_prove_node_api_backend_requires_explicit_egress_consent(tmp_path):
+    from servers.prover.server import run_prove_node
+
+    gp = _write_plan(tmp_path)
+    with pytest.raises(ValueError, match="egress consent"):
+        run_prove_node(
+            graph_path=str(gp),
+            node_id="Thm",
+            project_dir=str(tmp_path),
+            backend="avocado",
+        )
+
+
 def test_shared_steerer_usage_is_stamped_per_run_not_cumulative():
     """One Steerer injected across two prove() calls must not double-count the
     first run's judge usage in the second run's ledger stamp."""
@@ -748,6 +794,12 @@ def test_shared_steerer_usage_is_stamped_per_run_not_cumulative():
     judge = result.meta["usage"]["judge"]
     assert judge["calls"] == 1           # THIS run's call, not both
     assert judge["cost_usd"] == 1.0      # delta, not the 2.0 cumulative
+
+
+def test_unknown_judge_policy_fails_closed():
+    adapter = FakeAdapter([], ProofResult(status="failed"))
+    with pytest.raises(ValueError, match="unknown judge_policy"):
+        prove(adapter, "N", "spec", "/proj", verifier=None, judge_policy="autp")
 
 
 def test_cli_judge_tolerates_json_scalar_stdout(monkeypatch):

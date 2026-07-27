@@ -16,9 +16,10 @@ Payload (JSON, from --payload FILE or stdin):
 
 A node record is a structural node object as described in
 skills/plan/references/plan-json-schema.md. An upserted record's "id" must match
-its key (it is filled in from the key when omitted). Deleting a node also strips
-it from every other node's "depends_on", leaving the file self-consistent;
-stripped edges are reported so the orchestrator can see them.
+its key (it is filled in from the key when omitted). Deleting a node strips it
+from every other node's ``depends_on`` and sets its children's ``parent`` to
+null. New unresolved references are rejected atomically instead of being
+silently discarded; the caller can retry after the prerequisite lands.
 
 Usage:
     merge_node.py <graph.json> [--payload payload.json]
@@ -60,13 +61,21 @@ def _normalize_upsert(upsert) -> dict:
     if isinstance(upsert, list):
         out: dict = {}
         for rec in upsert:
+            if not isinstance(rec, dict):
+                raise ValueError(f"upsert record must be an object: {rec!r}")
             nid = rec.get("id")
-            if not nid:
+            if not isinstance(nid, str) or not nid:
                 raise ValueError(f"upsert record missing 'id': {rec!r}")
+            if nid in out:
+                raise ValueError(f"duplicate upsert id: {nid!r}")
             out[nid] = rec
         return out
     if isinstance(upsert, dict):
         for key, rec in upsert.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"upsert key must be a non-empty string: {key!r}")
+            if not isinstance(rec, dict):
+                raise ValueError(f"upsert record for {key!r} must be an object")
             rid = rec.get("id")
             if rid is not None and rid != key:
                 raise ValueError(f"upsert key {key!r} does not match record id {rid!r}")
@@ -97,27 +106,60 @@ def _atomic_write(path: str, data: dict) -> None:
 def merge(graph_path: str, payload: dict) -> dict:
     """Apply upserts and deletes to graph.json. Caller holds the lock."""
     upserts = _normalize_upsert(payload.get("upsert"))
-    deletes = list(payload.get("delete", []))
+    raw_deletes = payload.get("delete", [])
+    if not isinstance(raw_deletes, list) or not all(
+        isinstance(node_id, str) and node_id for node_id in raw_deletes
+    ):
+        raise ValueError("'delete' must be a list of non-empty node-id strings")
+    if len(raw_deletes) != len(set(raw_deletes)):
+        raise ValueError("'delete' contains duplicate node ids")
+    deletes = list(raw_deletes)
 
     with open(graph_path, encoding="utf-8") as f:
         graph = json.load(f)
     nodes = graph.setdefault("nodes", {})
+    if not isinstance(nodes, dict):
+        raise ValueError("graph.json must contain a nodes object")
 
     for nid in deletes:
         nodes.pop(nid, None)
     for nid, rec in upserts.items():
         nodes[nid] = rec
 
-    # Keep depends_on self-consistent: drop references to nodes no longer present.
-    stripped = []
+    # Deletion cleanup is explicit. Any OTHER missing reference is rejected:
+    # silently dropping a new edge when concurrently merged prerequisites land
+    # in the opposite order loses mathematical meaning.
+    deleted = set(deletes)
+    stripped: list[tuple[str, str]] = []
+    orphaned: list[tuple[str, str]] = []
     for nid, rec in nodes.items():
+        if not isinstance(rec, dict):
+            raise ValueError(f"node {nid!r} must be an object")
+        parent = rec.get("parent")
+        if parent is not None and parent not in nodes:
+            if parent in deleted:
+                rec["parent"] = None
+                orphaned.append((nid, parent))
+            else:
+                raise ValueError(
+                    f"node {nid!r} references absent parent {parent!r}; "
+                    "merge the parent in the same payload or first"
+                )
         deps = rec.get("depends_on")
         if not deps:
             continue
-        kept = [d for d in deps if d in nodes]
-        if len(kept) != len(deps):
-            stripped.extend((nid, d) for d in deps if d not in nodes)
-            rec["depends_on"] = kept
+        if not isinstance(deps, list) or not all(isinstance(dep, str) for dep in deps):
+            raise ValueError(f"node {nid!r} depends_on must be a list of strings")
+        missing = [dep for dep in deps if dep not in nodes]
+        unresolved = [dep for dep in missing if dep not in deleted]
+        if unresolved:
+            raise ValueError(
+                f"node {nid!r} references absent dependencies {unresolved!r}; "
+                "merge prerequisites in the same payload or first"
+            )
+        if missing:
+            stripped.extend((nid, dep) for dep in missing)
+            rec["depends_on"] = [dep for dep in deps if dep in nodes]
 
     graph.setdefault("metadata", {})["last_updated"] = _now()
 
@@ -126,6 +168,7 @@ def merge(graph_path: str, payload: dict) -> dict:
         "upserted": len(upserts),
         "deleted": len(deletes),
         "stripped_edges": stripped,
+        "orphaned_children": orphaned,
         "total_nodes": len(nodes),
     }
 
@@ -142,7 +185,11 @@ def main(argv=None) -> int:
         print(f"error: {args.graph} does not exist", file=sys.stderr)
         return 2
 
-    payload = _load_payload(args.payload)
+    try:
+        payload = _load_payload(args.payload)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        print(f"merge rejected: {error}", file=sys.stderr)
+        return 2
     if not payload.get("upsert") and not payload.get("delete"):
         print("nothing to merge (empty payload)", file=sys.stderr)
         return 0
@@ -154,7 +201,11 @@ def main(argv=None) -> int:
         if fcntl is not None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            result = merge(args.graph, payload)
+            try:
+                result = merge(args.graph, payload)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                print(f"merge rejected: {error}", file=sys.stderr)
+                return 2
         finally:
             if fcntl is not None:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -166,6 +217,14 @@ def main(argv=None) -> int:
     if result["stripped_edges"]:
         edges = ", ".join(f"{a} -> {b}" for a, b in result["stripped_edges"])
         msg += f"; stripped {len(result['stripped_edges'])} dangling edge(s): {edges}"
+    if result["orphaned_children"]:
+        children = ", ".join(
+            f"{child} -/-> {parent}"
+            for child, parent in result["orphaned_children"]
+        )
+        msg += (
+            f"; orphaned {len(result['orphaned_children'])} child(ren): {children}"
+        )
     print(msg)
     return 0
 

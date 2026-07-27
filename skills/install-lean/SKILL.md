@@ -10,10 +10,13 @@ description: >
 
 # Install Lean 4
 
+Resolve an absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`.
+
 Run the install script:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/skills/install-lean/install-lean.sh"
+bash "<AUTOFORM_PLUGIN_ROOT>/skills/install-lean/install-lean.sh"
 ```
 
 The script is idempotent — safe to re-run. It:

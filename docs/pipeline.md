@@ -1,6 +1,11 @@
 # Lean Informal Planner — Pipeline
 
-A developer-oriented description of how the plugin works: its artifacts, its subagents, how parallelism is handled, and who edits or flags what. The plugin **plans** Lean formalization from textbooks — it builds a tiered dependency graph of concepts mapped to Mathlib; it does not formalize. (The mathematical criteria the reviewers apply live in the individual agent definitions under `agents/`; this document covers the architecture.)
+A developer-oriented description of the planner subsystem: its artifacts, its
+subagents, how parallelism is handled, and who edits or flags what. This
+subsystem builds a tiered dependency graph of textbook concepts mapped to
+Mathlib; the separate dispatcher/prover subsystem formalizes the resulting
+nodes. (The mathematical criteria the reviewers apply live in the individual
+agent definitions under `agents/`; this document covers planning.)
 
 The pipeline runs in two phases, each ending in review, all driven by one top-level agent coordinating a small set of specialized subagents.
 
@@ -14,7 +19,7 @@ A plan lives in the user's project directory (next to `lakefile.toml`):
 - **`informal_content/<id>.md`** — the prose. One Markdown file per node (statement, plus proof when the concept is not in Mathlib).
 - **`sources/`** — the textbooks. The orchestrator moves received books here; `metadata.sources` records their paths.
 
-Three helper scripts under `${CLAUDE_PLUGIN_ROOT}/scripts/`: **`merge_node.py`** (the locked writer for `graph.json`), **`check_invariants.py`** (structural checker), **`export_blueprint.py`** (renders the plan to an interactive web view). Full data model: [`skills/plan/references/plan-json-schema.md`](../skills/plan/references/plan-json-schema.md).
+Three helper scripts under the resolved Autoform plugin root's `scripts/` directory: **`merge_node.py`** (the locked writer for `graph.json`), **`check_invariants.py`** (structural checker), **`export_blueprint.py`** (renders the plan to an interactive web view). Full data model: [`skills/plan/references/plan-json-schema.md`](../skills/plan/references/plan-json-schema.md).
 
 ### Two design decisions in the data model
 
@@ -64,7 +69,7 @@ The same scaffold → build → re-project pattern will apply when tier 3 arrive
 
 Much of the work is a **DAG of tasks** — partly parallel, partly dependent (Phase-2 splitting is the prime case). The scheduling decisions:
 
-- **Continuous dispatch, not fixed batches.** A task launches the moment its prerequisites are done; a freed worker immediately takes the next ready task. In ultracode this is a *promise pool* inside a workflow; in plain mode it's background subagents collected as they finish. One slow subagent blocks only its own dependents, never unrelated work.
+- **Continuous dispatch, not fixed batches.** A task launches the moment its prerequisites are done; a freed native subagent slot immediately takes the next ready task. One slow subagent blocks only its own dependents, never unrelated work.
 - **The task set emerges.** New tasks appear as the work reveals them (a splitter discovers a prerequisite; a reviewer finds a missing node). Readiness is re-derived from the current graph after each completion, not from a plan fixed up front.
 - **Genuine synchronization points are kept.** Some steps need everything before them — re-projecting tier-1, the two review *waves*, the Phase-1 approval gate. Those wait on purpose; only incidental batching barriers are avoided.
 - **One write path.** Every structural change funnels through `merge_node.py`, so concurrent writers serialize on it, results persist as they land, and no agent holds the whole graph in memory.

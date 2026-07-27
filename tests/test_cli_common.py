@@ -26,10 +26,16 @@ from servers.prover.codex_adapter import CODEX_SYSTEM_PROMPT
 # The claude-backend prompt parameters, pinned here so the lock-test below catches
 # any silent change to the shared skeleton OR these deltas.
 _CLAUDE_PARAMS = dict(
-    tools_clause="via the autoform-repl / autoform-lsp MCP tools",
+    tools_clause=(
+        "with direct `lake env lean` / `lake build` commands "
+        "(and MCP diagnostics when available)"
+    ),
     extra_hyp_clause=", no pinned-general parameter",
-    billing_paragraph=("Billing: scrub `ANTHROPIC_API_KEY` from every subprocess you spawn (`env -u "
-                       "ANTHROPIC_API_KEY …`) so no `lake`/`git`/script child can bill the Anthropic API.\n\n"),
+    billing_paragraph=(
+        "Billing: the parent process has already removed `ANTHROPIC_API_KEY` and "
+        "`ANTHROPIC_AUTH_TOKEN` from your environment. Do not inspect or manipulate "
+        "authentication; invoke the allowlisted Lean commands directly.\n\n"
+    ),
     repl_word="REPL ",
     build_phrase="build will not run",
     blocker_phrase="and the concrete blocker.",
@@ -103,7 +109,7 @@ def test_both_prompts_share_the_skeleton_and_differ_only_in_deltas():
     ):
         assert shared in WORKER_SYSTEM_PROMPT and shared in CODEX_SYSTEM_PROMPT
     # claude-only deltas
-    assert "autoform-repl / autoform-lsp" in WORKER_SYSTEM_PROMPT
+    assert "direct `lake env lean` / `lake build`" in WORKER_SYSTEM_PROMPT
     assert "ANTHROPIC_API_KEY" in WORKER_SYSTEM_PROMPT          # billing paragraph
     assert "no pinned-general parameter" in WORKER_SYSTEM_PROMPT
     # codex-only deltas

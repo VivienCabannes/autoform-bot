@@ -66,7 +66,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Status colors for the generated DOT strings. These mirror exactly what the
@@ -1109,13 +1109,13 @@ setup-venv: setup-gvlibs
 setup-mathlib: update cache build
 
 update:
-\t$(LAKE) update
+\tLC_ALL=C LANG=C $(LAKE) update
 
 cache:
-\t$(LAKE) exe cache get
+\tLC_ALL=C LANG=C $(LAKE) exe cache get
 
 build:
-\t$(LAKE) build
+\tLC_ALL=C LANG=C $(LAKE) build
 
 # --- Blueprint ---
 # The blueprint is standalone (no Lean project required), so we drive plasTeX

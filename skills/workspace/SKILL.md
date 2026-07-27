@@ -10,10 +10,14 @@ description: >
 
 # Workspace Inspection
 
+Resolve an absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`.
+
 Run the inspection script to get a structured overview of the Lean project:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/workspace/inspect.py" [path]
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" [path]
 ```
 
 If no path is given, it uses `$LEAN_PROJECT_DIR` or the current directory.
@@ -29,17 +33,20 @@ The script reports:
 For searching `.lean` files:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/workspace/inspect.py" --search "pattern" [path]
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" --search "pattern" [path]
 ```
 
 For listing declarations:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/workspace/inspect.py" --declarations [path]
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" --declarations [path]
 ```
 
 For reading targets:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/skills/workspace/inspect.py" --targets [path]
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" --targets [path]
 ```

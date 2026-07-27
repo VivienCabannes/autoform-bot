@@ -188,6 +188,10 @@ def prove(
         The adapter's terminal :class:`ProofResult` (``proved`` or ``failed``) —
         with a claimed ``proved`` only allowed to stand once the gate confirms it.
     """
+    if judge_policy not in {"auto", "always", "never"}:
+        raise ValueError(
+            f"unknown judge_policy {judge_policy!r}; expected auto, always, or never"
+        )
     judge = steerer if steerer is not None else Steerer()
     capability = getattr(adapter, "steering", SteeringCapability.BETWEEN_TURNS)
     judge_live = _live_judge_enabled(capability, judge_policy)
@@ -297,11 +301,14 @@ def prove(
     _stamp_steering(result)
 
     if not (result.proved and verifier is not None):
-        # No gate on this path (honest failure, or gate disabled → an unverified
-        # proved claim stands and its landed file is kept). Nothing to undo — drop
-        # the backup bookkeeping so it never lingers in the returned result.
-        if isinstance(result.meta, dict):
-            result.meta.pop("landed_backup", None)
+        # An honest terminal failure must not leave an API-written candidate on
+        # disk.  A proved claim with the gate explicitly disabled is different:
+        # callers asked to keep the unverified result (primarily a test seam).
+        if result.proved:
+            if isinstance(result.meta, dict):
+                result.meta.pop("landed_backup", None)
+        else:
+            _restore_landed(result)
         return result
 
     # Honesty gate: a backend's "proved" is the worker's CLAIM. Independently verify
@@ -361,6 +368,8 @@ def prove(
         result.meta = {**(result.meta or {}), "gate_folds": folds}
         if not result.proved:
             # The corrective turn ended in an honest FAILED (or a timeout) —
-            # stand as-is; re-verifying a non-claim would be meaningless.
+            # stand as-is; re-verifying a non-claim would be meaningless. Undo
+            # any request/response candidate before returning it.
+            _restore_landed(result)
             return result
         # A renewed proved claim: loop back and re-verify it.

@@ -133,9 +133,9 @@ class SteeringCapability(str, Enum):
     :mod:`servers.prover.driver`), so the loop stays backend-agnostic while doing
     the *right* thing per tier instead of one-size-fits-all:
 
-    * ``NONE`` — a request/response prover with no steerable session (a future
-      whole-proof sampling backend). No live judge and no fold; a correction can
-      only fold into the *next whole attempt*, handled above the driver.
+    * ``NONE`` — a terminal API tool loop or sampling backend with no resumable
+      host session. No live judge and no fold; a correction can only enter the
+      *next whole attempt*, handled above the driver.
     * ``BETWEEN_TURNS`` — a headless CLI (``claude -p`` / ``codex exec``) whose
       correction can land only as the *next turn* of a resumed session (a live
       judgement is delivered turn-granularly, not mid-turn). The per-event live

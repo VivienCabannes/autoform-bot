@@ -1,107 +1,114 @@
 # Contributing to Autoform
 
-## Overview
+Autoform is a host-neutral Lean formalization plugin. Claude Code and Codex use
+the same Agent Skills, durable graph/queue formats, prover contracts, jury
+schemas, and verification gate. Changes should preserve that shared contract
+instead of adding host-specific workflow copies.
 
-Autoform is a **template plugin** — the wiring (manifests, hooks, discovery files) is complete, but domain content is added via PRs. Each server, skill, and agent is independent, so you can contribute one without touching the others.
+Read `docs/full-parity-architecture.md` before changing orchestration, provider
+adapters, permissions, or plugin packaging.
 
-## What to work on
+## Current surfaces
 
-### Servers (stub → implementation)
+| Area | Location | Status |
+|---|---|---|
+| Portable workflow skills | `skills/` | Implemented |
+| Claude canonical agents | `agents/*.md` | Implemented |
+| Generated Codex agents | `scripts/install_host_agents.py` | Implemented |
+| Durable plan/queue/review control plane | `scripts/` | Implemented |
+| Unified prover and verification gate | `servers/prover/` | Implemented |
+| Mathlib and Zulip MCP servers | `servers/mathlib/`, `servers/zulip/` | Implemented |
+| Aristotle MCP/server adapter | `servers/aristotle/` | Implemented, optional dependency |
+| REPL and LSP MCP servers | `servers/repl/`, `servers/lsp/` | Stubs; reference implementations are under `examples/servers/` |
+| Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json`, `hooks/hooks.json` | Implemented |
 
-| Component | Location | Status | Difficulty | Notes |
-|-----------|----------|--------|------------|-------|
-| **Zulip server** | `servers/zulip/` | ✅ Implemented | — | Wraps `skills/zulip/zulip-search.py` |
-| **REPL server** | `servers/repl/` | ⬜ Stub | Hard | Subprocess management, non-blocking I/O, memory monitoring |
-| **LSP server** | `servers/lsp/` | ⬜ Stub | Hard | JSON-RPC language server, Content-Length framing, diagnostics |
-| **Aristotle server** | `servers/aristotle/` | ⬜ Stub | Medium | Multi-session wrapper around `aristotlelib`; requires API key |
+Useful next contributions include production REPL/LSP implementations, an
+OpenAI Responses transport beside Chat Completions, live opt-in provider
+contract tests, and additional adversarial verification fixtures.
 
-### Skills (new)
+## Compatibility rules
 
-**Mathlib conventions** (`skills/autoform/`) and **proof strategies** (`skills/autoform-prove/`) are now active skills — their `examples/skills/` reference content was folded in, so contribute to them directly. The skills below don't exist yet. Create them from scratch — see `examples/skills/` for reference content.
+- Put user-invocable workflows in `skills/<name>/SKILL.md` with only portable
+  `name` and `description` frontmatter.
+- Keep canonical role instructions in `agents/*.md`. Update the Codex generator
+  or its tests when the role contract changes; do not hand-maintain a second
+  prompt.
+- Keep graph writes behind `scripts/merge_node.py` and queue writes under the
+  existing lock/atomic-save discipline.
+- Add provider behavior behind the adapter and normalized event contracts. Do
+  not branch the shared driver on provider names.
+- Treat model output, repository text, tool arguments, paths, and Lean source as
+  untrusted data. Unknown providers and policies must fail closed.
+- Never add prompt-triggered shell execution. Session hooks may provide static
+  context but must not interpolate user prompts into commands.
+- Do not add guessed private endpoint URLs, model ids, authentication schemes,
+  or data-egress consent.
+- Preserve the independent Lean build, forbidden-execution scan, and axiom
+  audit for every proved claim.
 
-| Skill | Suggested location | Difficulty | What it should cover |
-|-------|--------------------|------------|---------------------|
-| **Statement extraction** | `skills/autoform-extract/` | Easy | Extract formalizable statements from LaTeX/Markdown to YAML |
-| **Crew orchestration** | `skills/autoform-crew/` | Medium | When and how to spawn worker/reviewer/reader subagents |
+## Adding or changing an MCP server
 
-### Agents (stub → rich prompt)
+Keep pure logic in `core.py` and the thin FastMCP wrapper in `server.py`. Optional
+SDK imports must remain lazy so plugin discovery works without every extra
+installed.
 
-| Component | Location | Status | Difficulty | Notes |
-|-----------|----------|--------|------------|-------|
-| **Worker agent** | `agents/autoform-worker.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
-| **Reviewer jury** | `agents/faithfulness-reviewer.md`, `agents/proof-integrity-reviewer.md`, `agents/code-quality-reviewer.md` | ✅ Implemented | — | Full single-axis judge prompts; shared rubrics live in `skills/eval-rubrics/references/` |
-| **Reader agent** | `agents/autoform-reader.md` | ⬜ Stub | Easy | Frontmatter correct; needs rich system prompt |
+Register a shared server consistently in:
 
-## How to contribute a server
+- `.claude-plugin/plugin.json`;
+- `.mcp.json`;
+- `scripts/lint_plugin.py`'s expected-server contract.
 
-The zulip server (`servers/zulip/`) is the reference implementation. Study its structure first.
+`scripts/lint_plugin.py` enforces the current shared server set. Add import,
+factory, path-confinement, and fake/injected behavior tests; CI must not require
+network access or paid credentials.
 
-1. **Read the reference.** Look at `servers/zulip/server.py` (FastMCP wrapper importing from a skill script) and `skills/zulip/zulip-search.py` (pure logic). For stubs, the server file already has tool definitions that return "not implemented".
+## Adding a provider
 
-2. **Read the example.** The `examples/servers/<name>/` directory contains a full working implementation for the server you want to build. This is your primary reference.
+Implement `ProverAdapter`, normalize events and usage, declare the correct
+`SteeringCapability`, and let `servers/prover/driver.py` apply the common
+verification gate. Add exact backend validation, configuration-only preflight,
+explicit data-egress consent where network project data is involved, and
+transport-injected tests.
 
-3. **Implement `core.py`.** Write the pure logic. No `fastmcp` imports in this file — it should be testable without MCP dependencies. Keep the existing dataclasses and function signatures so that `server.py` does not need changes.
+For a live test, use a temporary disposable Lean project and require an explicit
+flag. Never make a credentialed or billable request in the default suite.
 
-4. **Wire `server.py` tools.** The server file should already have the correct tool definitions calling into `core.py`. If you change core function signatures, update the server wiring to match.
+## Adding or changing a skill
 
-5. **Run tests.**
-   ```bash
-   pytest tests/test_servers.py
-   ```
-   The smoke tests verify that each server module imports without error and that `create_*_server()` returns a valid FastMCP instance.
+Make the skill independently executable from its loaded `SKILL.md`: resolve the
+plugin root explicitly, use absolute paths in commands, define durable resume
+semantics, and name the native-agent fallback when a host lacks role selection.
+Do not rely on shell state from an earlier command or duplicate the workflow in
+legacy `commands/`.
 
-6. **Test standalone.**
-   ```bash
-   uv run python -m servers.<name>
-   ```
-   This starts the MCP server on stdio. You can test it with any MCP client.
-
-## How to contribute a skill
-
-Skills are Markdown files with YAML frontmatter. Each skill is a self-contained reference document that the AI assistant loads into context when triggered.
-
-1. **Create the directory.** `skills/<name>/SKILL.md` with YAML frontmatter (`name`, `description` with trigger patterns).
-
-2. **Check examples.** The `examples/skills/<name>/SKILL.md` may contain a reference version.
-
-3. **Add scripts if needed.** If the skill automates a task, put the script alongside the SKILL.md (e.g. `skills/<name>/<name>.sh`). Add a case to `hooks/user-prompt-submit` to auto-run it.
-
-4. **Preserve the YAML frontmatter.** The `name`, `description`, and trigger patterns control when the skill is loaded.
-
-## How to contribute an agent prompt
-
-Agent prompts are Markdown files with YAML frontmatter that defines the agent's tools, MCP servers, and model.
-
-1. **Read the example.** The `examples/agents/<name>.md` contains the full reference version. Compare it with the stub at `agents/<name>.md`.
-
-2. **Preserve the frontmatter.** The `name`, `tools`, `mcpServers`, and `model` fields are correct in the stubs and must not change.
-
-3. **Expand the body.** Replace the `<!-- TODO -->` comments with concrete workflow steps, rules, integrity checks, and output specifications. The agent prompt should be specific enough that the model follows the workflow without ambiguity.
-
-4. **Keep it self-contained.** Agent prompts should not reference external files. Everything the model needs should be in the prompt itself (skills are loaded separately).
-
-## Testing
-
-Run the smoke tests from the repo root:
+Validate every skill:
 
 ```bash
-pytest tests/
+uv run python /path/to/skill-creator/scripts/quick_validate.py skills/<name>
 ```
 
-The test suite checks:
-- Every server module imports without error
-- Every `create_*_server()` function returns a FastMCP instance
-- The zulip skill's config discovery and CLI work correctly
+## Validation
 
-## Style
+From the repository root:
 
-- **Python:** Follow `ruff` with 120-character line length. Run `ruff check servers/` before submitting.
-- **Markdown:** YAML frontmatter is required for all skills and agents. Follow the existing section structure.
-- **Follow existing patterns.** When in doubt, look at the zulip server (for Python) or `skills/install-lean/` (for skills with scripts).
+```bash
+uv sync --extra dev --extra repl --extra zulip
+uv run python -m pytest -q
+python3 scripts/lint_plugin.py
+claude plugin validate .
+uv run ruff check <changed-python-files>
+git diff --check
+```
 
-## PR guidelines
+The default tests require no paid credentials and make no external network
+requests. They use fake CLIs/transports, a loopback HTTP server, and—when Lake is
+installed—small temporary real-kernel smoke projects. Document any
+environment-specific live check separately, including the CLI version and
+whether it could incur billing or disclose project data. The complete checklist
+is in `docs/pilot-testing.md`.
 
-- **One component at a time.** Each PR should add one server, one skill, or one agent. This keeps reviews focused.
-- **Include tests.** If you add a new server, add corresponding tests in `tests/test_servers.py`. If you change existing server APIs, update the existing tests.
-- **Run the full test suite** before submitting: `pytest tests/`.
-- **Reference the example.** In your PR description, note which `examples/` file you used as reference.
+## Pull requests
+
+Keep each pull request centered on one contract change. Include tests for both
+the success path and the fail-closed path, update architecture/user docs when
+behavior changes, and call out any remaining live-validation gap honestly.

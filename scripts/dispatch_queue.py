@@ -45,6 +45,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE / "review_ui") not in sys.path:
@@ -56,11 +57,69 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _load(path: Path, default):
+class QueueStateError(ValueError):
+    """The durable queue is present but cannot be trusted."""
+
+
+def _load_json(path: Path, default):
+    """Best-effort JSON for the ephemeral activity feed only."""
     try:
         return json.loads(path.read_text())
     except Exception:
         return default
+
+
+def load_queue(path: Path) -> list[dict[str, Any]]:
+    """Load and validate the durable queue, failing closed on corruption.
+
+    A missing queue is a valid empty queue. A present malformed queue must never
+    be treated as empty: doing so lets the next enqueue overwrite durable work.
+    Task ids are opaque but must be non-empty and unique because every lifecycle
+    mutation addresses exactly one id.
+    """
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise QueueStateError(f"cannot read valid queue JSON at {path}: {error}") from error
+    if not isinstance(data, list):
+        raise QueueStateError(f"{path}: queue root must be a JSON array")
+    tasks: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    active_keys: set[tuple[str, str]] = set()
+    for index, task in enumerate(data):
+        if not isinstance(task, dict):
+            raise QueueStateError(f"{path}: queue entry {index} must be an object")
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise QueueStateError(f"{path}: queue entry {index} has no non-empty string id")
+        if task_id in ids:
+            raise QueueStateError(f"{path}: duplicate task id {task_id!r}")
+        ids.add(task_id)
+        if task.get("status") in {"queued", "running"}:
+            agent, node = task.get("agent"), task.get("node")
+            if isinstance(agent, str) and isinstance(node, str):
+                key = (agent, node)
+                if key in active_keys:
+                    raise QueueStateError(
+                        f"{path}: duplicate active task for {agent!r} -> {node!r}"
+                    )
+                active_keys.add(key)
+        tasks.append(task)
+    return tasks
+
+
+def new_task_id(agent: str, node: str, tasks: list[dict[str, Any]]) -> str:
+    """Return a deterministic id that remains unique across re-enqueues."""
+    base = f"{agent}:{node}"
+    existing = {str(task.get("id")) for task in tasks}
+    if base not in existing:
+        return base
+    suffix = 2
+    while f"{base}:{suffix}" in existing:
+        suffix += 1
+    return f"{base}:{suffix}"
 
 
 def _save(path: Path, data) -> None:
@@ -81,23 +140,64 @@ def _save(path: Path, data) -> None:
         raise
 
 
-def _feed_for(tasks: list) -> dict:
+def _feed_for(tasks: list, existing: dict | None = None) -> dict:
     """The dashboard live feed reflecting exactly the tasks currently ``running`` —
-    never a fabricated ``running``: it is derived from real queue state."""
+    never a fabricated ``running``: queue agents are derived from real queue
+    state. Native host subagents have their own lifecycle and are preserved
+    across queue synchronization when marked ``managed_by: native``."""
     running = [t for t in tasks if t.get("status") == "running"]
-    if not running:
-        return {"orchestrator": {"state": "idle"}, "agents": []}
-    agents = [{
+    existing = existing if isinstance(existing, dict) else {}
+    native_agents = [
+        dict(agent)
+        for agent in existing.get("agents", [])
+        if isinstance(agent, dict) and agent.get("managed_by") == "native"
+    ] if isinstance(existing.get("agents"), list) else []
+    queue_agents = [{
         "role": t.get("agent", "agent"),
-        "name": t.get("agent", "agent"),
+        "name": t.get("id") or t.get("agent", "agent"),
         "target": t.get("node"),
         "target_label": t.get("node_label", t.get("node")),
         "status": "running",
         "detail": t.get("detail", ""),
+        "managed_by": "queue",
     } for t in running]
-    detail = "; ".join(f'{t.get("agent")} → {t.get("node")}' for t in running)
-    return {"orchestrator": {"state": "working", "phase": "dispatch", "detail": detail},
-            "agents": agents}
+    agents = native_agents + queue_agents
+    existing_orchestrator = existing.get("orchestrator")
+    native_orchestrator: dict = {}
+    if isinstance(existing_orchestrator, dict):
+        if existing_orchestrator.get("managed_by") == "native":
+            native_orchestrator = dict(existing_orchestrator)
+        elif isinstance(existing_orchestrator.get("native_orchestrator"), dict):
+            native_orchestrator = dict(existing_orchestrator["native_orchestrator"])
+    if running:
+        queue_detail = "; ".join(
+            f'{t.get("agent")} → {t.get("node")}' for t in running
+        )
+        native_detail = str(native_orchestrator.get("detail") or "").strip()
+        detail = "; ".join(part for part in (native_detail, queue_detail) if part)
+        orchestrator = {
+            "state": "working",
+            "phase": "dispatch",
+            "detail": detail,
+            "managed_by": "queue",
+        }
+        if native_orchestrator:
+            orchestrator["native_orchestrator"] = native_orchestrator
+    elif native_agents or native_orchestrator.get("state") not in (None, "idle"):
+        orchestrator = native_orchestrator or {
+            "state": "working",
+            "managed_by": "native",
+        }
+    else:
+        orchestrator = {"state": "idle"}
+    return {"orchestrator": orchestrator, "agents": agents}
+
+
+def sync_feed(path: Path, tasks: list) -> None:
+    """Atomically synchronize queue workers without erasing native subagents."""
+    with fslock.locked(path):
+        existing = _load_json(path, {"orchestrator": {"state": "idle"}, "agents": []})
+        _save(path, _feed_for(tasks, existing if isinstance(existing, dict) else None))
 
 
 def _open_escalations(tasks: list) -> list:
@@ -152,9 +252,14 @@ def main(argv=None) -> int:
 
     qp = a.project / "task_queue.json"
     fp = a.project / "agents_status.json"
-    tasks = _load(qp, [])
-    if not isinstance(tasks, list):
-        tasks = []
+    if a.cmd in {"idle", "orchestrator", "agent-start", "agent-done"}:
+        tasks: list[dict[str, Any]] = []
+    else:
+        try:
+            tasks = load_queue(qp)
+        except QueueStateError as error:
+            print(f"queue state error: {error}", file=sys.stderr)
+            return 2
 
     if a.cmd == "next":
         nxt = next((t for t in tasks if t.get("status") == "queued"), None)
@@ -172,7 +277,7 @@ def main(argv=None) -> int:
             breakdown = ", ".join(f"{n}×{k}" for k, n in sorted(tally.items()))
             print(f'  ⚑⚑ {len(open_orch)} TASK(S) AWAIT THE ORCHESTRATOR — the engine drains NONE of these;')
             print(f'      each needs claim → run → done:  {breakdown}')
-            print(f'      → worklist:  dispatch_queue.py <project> mine'
+            print('      → worklist:  dispatch_queue.py <project> mine'
                   + ('   ·  escalations carry a worker’s words' if tally.get("escalation") else ''))
             print()
         for t in tasks:
@@ -211,21 +316,24 @@ def main(argv=None) -> int:
         print("\n  Never leave one queued/running when a run ends (orchestrate.md step 5).")
         return 0
     if a.cmd == "idle":
-        _save(fp, {"orchestrator": {"state": "idle"}, "agents": []})
+        with fslock.locked(fp):
+            _save(fp, {"orchestrator": {"state": "idle"}, "agents": []})
         print("feed idle")
         return 0
     if a.cmd == "enqueue":
         if not (a.agent and a.node):
             ap.error("enqueue needs --agent and --node")
         with fslock.locked(qp):                      # cross-process: dashboard writes too
-            tasks = _load(qp, [])
-            if not isinstance(tasks, list):
-                tasks = []
+            try:
+                tasks = load_queue(qp)
+            except QueueStateError as error:
+                print(f"queue state error: {error}", file=sys.stderr)
+                return 2
             if any(t.get("status") in ("queued", "running") and t.get("agent") == a.agent
                    and t.get("node") == a.node for t in tasks):
                 print(f"already queued/running: {a.agent} -> {a.node} (skipped)")
                 return 0
-            tid = f"{a.agent}-{a.node}-{_now().replace(':', '').replace('-', '')}"
+            tid = new_task_id(a.agent, a.node, tasks)
             entry = {"id": tid, "agent": a.agent, "node": a.node,
                      "node_label": a.node_label or a.node, "status": "queued",
                      "at": _now(), "source": a.source or "orchestrator"}
@@ -233,7 +341,7 @@ def main(argv=None) -> int:
                 entry["note"] = a.note
             tasks.append(entry)
             _save(qp, tasks)
-            _save(fp, _feed_for(tasks))
+            sync_feed(fp, tasks)
         print(f"enqueued {tid}")
         return 0
 
@@ -245,14 +353,14 @@ def main(argv=None) -> int:
     _DEFAULT_FEED = {"orchestrator": {"state": "idle"}, "agents": []}
     if a.cmd in ("orchestrator", "agent-start", "agent-done"):
         with fslock.locked(fp):
-            feed = _load(fp, dict(_DEFAULT_FEED))
+            feed = _load_json(fp, dict(_DEFAULT_FEED))
             if not isinstance(feed, dict):
                 feed = {"orchestrator": {"state": "idle"}, "agents": []}
             feed.setdefault("agents", [])
             if not isinstance(feed.get("agents"), list):
                 feed["agents"] = []
             if a.cmd == "orchestrator":
-                orch = {"state": a.state or "working"}
+                orch = {"state": a.state or "working", "managed_by": "native"}
                 if a.phase:
                     orch["phase"] = a.phase
                 if a.detail:
@@ -268,11 +376,13 @@ def main(argv=None) -> int:
                     "role": a.role, "name": a.name,
                     "target": a.target, "target_label": a.target_label or a.target,
                     "status": "running", "detail": a.detail,
+                    "managed_by": "native",
                 })
                 orch = feed.get("orchestrator") or {}
                 if not isinstance(orch, dict) or orch.get("state", "idle") == "idle":
                     orch = dict(orch) if isinstance(orch, dict) else {}
                     orch["state"] = "working"
+                    orch["managed_by"] = "native"
                     feed["orchestrator"] = orch
                 msg = f"agent-start {a.name}" + (f" -> {a.target}" if a.target else "")
             else:  # agent-done
@@ -288,30 +398,60 @@ def main(argv=None) -> int:
     if not a.id:
         ap.error(f"{a.cmd} needs a task id")
     with fslock.locked(qp):                          # cross-process: dashboard writes too
-        tasks = _load(qp, [])
-        if not isinstance(tasks, list):
-            tasks = []
+        try:
+            tasks = load_queue(qp)
+        except QueueStateError as error:
+            print(f"queue state error: {error}", file=sys.stderr)
+            return 2
         t = next((t for t in tasks if t.get("id") == a.id), None)
         if t is None:
             print(f"no task {a.id!r} in {qp}", file=sys.stderr)
             return 1
+        current = t.get("status")
         if a.cmd == "claim":
+            if current == "running":
+                print(f"claim {a.id} -> running (already claimed)")
+                return 0
+            if current != "queued":
+                print(
+                    f"invalid transition for {a.id}: {current!r} -> running",
+                    file=sys.stderr,
+                )
+                return 1
             t["status"] = "running"
             t["started_at"] = _now()
             if a.detail:
                 t["detail"] = a.detail
         elif a.cmd == "done":
+            if current == "done":
+                print(f"done {a.id} -> done (already finished)")
+                return 0
+            if current != "running":
+                print(
+                    f"invalid transition for {a.id}: {current!r} -> done",
+                    file=sys.stderr,
+                )
+                return 1
             t["status"] = "done"
             t["finished_at"] = _now()
             if a.result:
                 t["result"] = a.result
         elif a.cmd == "fail":
+            if current == "failed":
+                print(f"fail {a.id} -> failed (already finished)")
+                return 0
+            if current != "running":
+                print(
+                    f"invalid transition for {a.id}: {current!r} -> failed",
+                    file=sys.stderr,
+                )
+                return 1
             t["status"] = "failed"
             t["finished_at"] = _now()
             if a.reason:
                 t["result"] = a.reason
         _save(qp, tasks)
-        _save(fp, _feed_for(tasks))
+        sync_feed(fp, tasks)
     print(f'{a.cmd} {a.id} -> {t["status"]}')
     return 0
 

@@ -136,7 +136,7 @@ def test_flat_too_large_no_full_graph(tmp_path):
     n = sv.LARGE + 30
     html = sv.render_home(_proj(tmp_path, n_tier3=n), "3", None)
     boot = _boot(html)
-    assert f'"tier": 3' in boot
+    assert '"tier": 3' in boot
     assert f'"count": {n}' in boot
     assert f'"threshold": {sv.LARGE}' in boot
     assert "window.__RV_TOO_LARGE__ = {" in boot

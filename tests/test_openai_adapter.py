@@ -9,6 +9,9 @@ env plumbing is exercised with monkeypatched variables.
 from __future__ import annotations
 
 import json
+import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -78,6 +81,7 @@ def test_proved_flow_lands_file_and_reports_usage(tmp_path, keyed):
 
     assert result.proved
     assert result.landed_files == 1
+    assert result.meta["mode"] == "sample-fallback"
     landed = tmp_path / "Prob" / "Chernoff.lean"
     assert landed.exists()
     assert "theorem chernoff : True := trivial" in landed.read_text()
@@ -153,6 +157,8 @@ def test_missing_credential_is_a_clean_start_error(tmp_path, monkeypatch):
 
 def test_avocado_preset_defaults_and_env_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_API_KEY", "meta-key")
+    monkeypatch.setenv("AUTOFORM_AVOCADO_BASE_URL", "https://meta.example.test/v1")
+    monkeypatch.setenv("AUTOFORM_AVOCADO_MODEL", "avocado-test")
     transport = FakeTransport(_reply(PROOF_REPLY))
     adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path), preset="avocado",
                                   transport=transport)
@@ -160,8 +166,8 @@ def test_avocado_preset_defaults_and_env_overrides(tmp_path, monkeypatch):
     prove(adapter, "Chernoff bound", "spec", str(tmp_path),
           steerer=_FakeSteerer(), verifier=None)
     req = transport.calls[0]
-    assert req["url"] == "https://api.meta.ai/v1/chat/completions"     # public preset
-    assert req["payload"]["model"] == "muse-spark-1.1"
+    assert req["url"] == "https://meta.example.test/v1/chat/completions"
+    assert req["payload"]["model"] == "avocado-test"
     assert req["headers"]["Authorization"] == "Bearer meta-key"
 
     # The internal gateway overrides everything without code changes:
@@ -180,6 +186,21 @@ def test_avocado_preset_defaults_and_env_overrides(tmp_path, monkeypatch):
     assert req2["payload"]["model"] == "muse1.1"
     assert req2["headers"]["Authorization"] == "Bearer internal-secret"
     assert req2["headers"]["X-Meta-Route"] == "avocado"
+
+
+def test_avocado_does_not_guess_private_endpoint_or_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_API_KEY", "meta-key")
+    monkeypatch.delenv("AUTOFORM_AVOCADO_BASE_URL", raising=False)
+    monkeypatch.delenv("AUTOFORM_AVOCADO_MODEL", raising=False)
+    monkeypatch.delenv("AUTOFORM_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("AUTOFORM_OPENAI_MODEL", raising=False)
+    adapter = OpenAICompatAdapter(
+        graph_path=_graph(tmp_path),
+        preset="avocado",
+        transport=FakeTransport(_reply(PROOF_REPLY)),
+    )
+    with pytest.raises(RuntimeError, match="no model configured"):
+        adapter.start("N", "spec", str(tmp_path))
 
 
 def test_gate_rejection_downgrades_without_fold(tmp_path, keyed):
@@ -326,11 +347,13 @@ def test_make_adapter_knows_openai_and_avocado(monkeypatch):
     from servers.prover.server import _make_adapter
 
     monkeypatch.setenv("AUTOFORM_OPENAI_MODEL", "m")
+    monkeypatch.setenv("AUTOFORM_AVOCADO_BASE_URL", "https://meta.example.test/v1")
+    monkeypatch.setenv("AUTOFORM_AVOCADO_MODEL", "avocado-test")
     a = _make_adapter("openai", "g.json", 60)
     assert a.name == "openai" and a.steering is SteeringCapability.NONE
     b = _make_adapter("avocado", "g.json", 60)
     assert b.name == "avocado"
-    assert b._model  # the public muse-spark default (env may override)
+    assert b._model == "avocado-test"
 
 
 def test_event_stream_is_normalized(tmp_path, keyed):
@@ -344,6 +367,289 @@ def test_event_stream_is_normalized(tmp_path, keyed):
     assert kinds[-1] is EventKind.RESULT
     # Re-entry yields nothing (request/response is one-shot).
     assert list(adapter.events(run)) == []
+
+
+def test_agentic_tool_loop_writes_target_and_iterates(tmp_path, keyed):
+    class ToolTransport:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, url, headers, payload, timeout):
+            self.calls.append(payload)
+            if len(self.calls) == 1:
+                names = {tool["function"]["name"] for tool in payload["tools"]}
+                assert "write_lean_file" in names and "run_lean" in names
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "write-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_lean_file",
+                                    "arguments": json.dumps({
+                                        "path": "Prob/Chernoff.lean",
+                                        "content": (
+                                            "import Mathlib\n\n"
+                                            "theorem chernoff : True := trivial\n"
+                                        ),
+                                    }),
+                                },
+                            }],
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 10},
+                }
+            assert self.calls[-1]["messages"][-1]["role"] == "tool"
+            return {
+                "choices": [{"message": {"content": "PROVED — compiled cleanly"}}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 8},
+            }
+
+    transport = ToolTransport()
+    adapter = OpenAICompatAdapter(graph_path=_graph(tmp_path), transport=transport)
+    result = prove(
+        adapter,
+        "Chernoff bound",
+        "spec",
+        str(tmp_path),
+        steerer=_FakeSteerer(),
+        verifier=None,
+    )
+    assert result.proved
+    assert result.meta["mode"] == "agentic"
+    assert result.meta["tool_rounds"] == 1
+    assert result.meta["usage"]["worker"]["turns"] == 2
+    assert "theorem chernoff" in (
+        tmp_path / "Prob" / "Chernoff.lean"
+    ).read_text()
+
+
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lean/Lake is not installed")
+def test_avocado_loopback_http_to_real_kernel_gate(tmp_path, monkeypatch):
+    """Exercise the complete provider boundary without a private credential.
+
+    A real loopback HTTP server speaks the Chat Completions tool-call protocol;
+    the adapter writes only the graph-pinned target and the actual Lean kernel
+    build/axiom gate must accept it.
+    """
+    (tmp_path / "lakefile.toml").write_text(
+        'name = "ProviderPilot"\n'
+        'version = "0.1.0"\n'
+        'defaultTargets = ["ProviderPilot"]\n\n'
+        "[[lean_lib]]\n"
+        'name = "ProviderPilot"\n'
+    )
+    target = tmp_path / "ProviderPilot.lean"
+    target.write_text(
+        "theorem providerPilot (n : Nat) : n + 0 = n := by\n"
+        "  sorry\n"
+    )
+    graph = tmp_path / "graph.json"
+    graph.write_text(json.dumps({
+        "nodes": {
+            "ProviderPilot": {
+                "id": "ProviderPilot",
+                "tier": 2,
+                "kind": "theorem",
+                "lean_file": "ProviderPilot.lean",
+            },
+        },
+    }))
+    payloads: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - stdlib handler contract
+            payload = json.loads(
+                self.rfile.read(int(self.headers["Content-Length"]))
+            )
+            payloads.append(payload)
+            if len(payloads) == 1:
+                response = {
+                    "choices": [{
+                        "message": {
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "write-proof",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_lean_file",
+                                    "arguments": json.dumps({
+                                        "path": "ProviderPilot.lean",
+                                        "content": (
+                                            "theorem providerPilot (n : Nat) : "
+                                            "n + 0 = n := by\n"
+                                            "  exact Nat.add_zero n\n"
+                                        ),
+                                    }),
+                                },
+                            }],
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 3},
+                }
+            else:
+                response = {
+                    "choices": [{
+                        "message": {"content": "PROVED — candidate written"},
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                }
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("PILOT_PROVIDER_TOKEN", "local-only")
+    try:
+        result = prove(
+            OpenAICompatAdapter(
+                graph_path=str(graph),
+                preset="avocado",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                model="loopback-avocado",
+                key_var="PILOT_PROVIDER_TOKEN",
+            ),
+            "ProviderPilot",
+            "prove the disposable provider pilot",
+            str(tmp_path),
+            max_steers=0,
+            steerer=_FakeSteerer(),
+        )
+    finally:
+        server.shutdown()
+        thread.join(5)
+        server.server_close()
+
+    assert result.proved, result.reason
+    assert result.meta["verify"]["kernel"] == "clean"
+    assert result.meta["verify"]["axioms"] == []
+    assert len(payloads) == 2
+    assert "exact Nat.add_zero n" in target.read_text()
+
+
+def test_agentic_honest_failure_restores_written_target(tmp_path, keyed):
+    """A tool-loop candidate is transactional even when the model itself gives up."""
+    target = tmp_path / "Prob" / "Chernoff.lean"
+    target.parent.mkdir(parents=True)
+    prior = b"import Mathlib\r\n-- prior user content \x89\xff\r\n"
+    target.write_bytes(prior)
+
+    class FailedAfterWrite:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _url, _headers, _payload, _timeout):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "write-then-fail",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_lean_file",
+                                    "arguments": json.dumps({
+                                        "path": "Prob/Chernoff.lean",
+                                        "content": "import Mathlib\nexample : False := by simp\n",
+                                    }),
+                                },
+                            }],
+                        },
+                    }],
+                }
+            return {
+                "choices": [{
+                    "message": {
+                        "content": "FAILED — the proposed proof does not compile"
+                    }
+                }]
+            }
+
+    result = prove(
+        OpenAICompatAdapter(
+            graph_path=_graph(tmp_path),
+            transport=FailedAfterWrite(),
+        ),
+        "Chernoff bound",
+        "spec",
+        str(tmp_path),
+        steerer=_FakeSteerer(),
+        verifier=_FakeVerifier([]),
+    )
+
+    assert result.status == "failed"
+    assert result.meta["landed_restored"] is True
+    assert target.read_bytes() == prior
+    assert "landed_backup" not in result.meta
+
+
+def test_agentic_mode_requires_graph_pinned_write_target(tmp_path, keyed):
+    """Tool participation disables the model-declared header escape hatch."""
+
+    class UnpinnedToolTransport:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, _url, _headers, payload, _timeout):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "unpinned-write",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_lean_file",
+                                    "arguments": json.dumps({
+                                        "path": "Prob/FromTool.lean",
+                                        "content": "import Mathlib\nexample : True := trivial\n",
+                                    }),
+                                },
+                            }],
+                        },
+                    }],
+                }
+            assert "graph-pinned lean_file" in payload["messages"][-1]["content"]
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            "```lean\n-- FILE: Prob/FromTool.lean\n"
+                            "import Mathlib\nexample : True := trivial\n```"
+                        )
+                    }
+                }]
+            }
+
+    result = prove(
+        OpenAICompatAdapter(
+            graph_path=_graph(tmp_path, lean_file=None),
+            transport=UnpinnedToolTransport(),
+        ),
+        "Chernoff bound",
+        "spec",
+        str(tmp_path),
+        steerer=_FakeSteerer(),
+        verifier=None,
+    )
+
+    assert result.status == "failed"
+    assert "graph-pinned lean_file" in result.reason
+    assert not (tmp_path / "Prob" / "FromTool.lean").exists()
 
 
 def test_multi_fence_reply_lands_the_largest_fence(tmp_path, keyed):

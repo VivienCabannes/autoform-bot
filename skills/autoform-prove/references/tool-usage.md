@@ -1,27 +1,33 @@
 # Tool usage (REPL, LSP, mathlib search) and the build-timeout playbook
 
-Use the right tool for the job, and know each tool's limits. This plugin exposes its Lean
-tooling through MCP servers — prefer them over raw shell.
+Use the right tool for the job, and know each tool's limits. Direct
+`lake env lean` checks are the portable baseline across Claude, Codex, and
+headless workers. The bundled REPL/LSP servers are compatibility stubs today;
+use a host-provided real Lean LSP/REPL when available, and otherwise use the
+direct commands below.
 
 ## `autoform-repl` MCP — `run_lean_code`, `get_repl_status`
 
-- `run_lean_code(code, timeout?)` sends a snippet to a pooled Lean REPL and returns formatted
+- A production `run_lean_code(code, timeout?)` sends a snippet to a pooled Lean REPL and returns formatted
   diagnostics (status, errors, `sorry` goals, warnings). Imports are cached, so repeated calls
   with the same imports reuse the environment and stay fast.
 - The REPL environment has **only `import Mathlib`** — it cannot see your project's custom
   definitions. For a fragment that references custom defs, paste those defs into the snippet, or
   check the actual file with the LSP instead.
-- Use it **heavily** to prototype: test fragments, inspect types with `#check`, probe for lemmas
+- When implemented, use it to prototype: test fragments, inspect types with `#check`, probe for lemmas
   with `exact?` / `apply?` / `rw?`, and build a proof up incrementally — only write to the file
   once a fragment compiles.
-- `get_repl_status()` reports pool capacity, memory, and shutdown state when a run is misbehaving.
+- `get_repl_status()` reports pool capacity, memory, and shutdown state when a
+  production pool is installed. A “Not yet implemented” response means to fall
+  back immediately; it is not a proof failure.
 
 ## `autoform-lsp` MCP — `lean_diagnostic_messages`, `lean_hover`
 
-- `lean_diagnostic_messages(file_path)` returns the language server's errors/warnings/info for a
+- A production `lean_diagnostic_messages(file_path)` returns the language server's errors/warnings/info for a
   real `.lean` file in the project — this is how you check a file that uses custom definitions
   the REPL can't see.
-- `lean_hover(file_path, line, character)` (0-indexed) gives the type/info at a position — use it
+- `lean_hover(file_path, line, character)` (0-indexed) gives the type/info at a position when a
+  real LSP is installed — use it
   to confirm what an expression elaborates to.
 
 ## `mathlib` MCP — search before proving

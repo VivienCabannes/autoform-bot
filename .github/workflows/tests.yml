@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install test environment
+        run: uv sync --extra dev --extra repl --extra zulip
+      - name: Run unit tests
+        run: uv run python -m pytest -q
+      - name: Lint Python surfaces
+        run: uv run ruff check scripts servers tests skills
+      - name: Lint plugin surfaces
+        run: python3 scripts/lint_plugin.py
