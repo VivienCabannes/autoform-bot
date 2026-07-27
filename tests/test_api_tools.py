@@ -54,6 +54,26 @@ def test_project_tools_hide_secret_like_project_files(tmp_path: Path):
     assert "hidden" not in tools.execute("search_text", {"query": "hidden"})
 
 
+def test_search_text_has_a_bounded_fallback_without_ripgrep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / "Proof.lean").write_text(
+        "theorem first : True := trivial\n"
+        "theorem second : True := trivial\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Notes.txt").write_text("theorem outside glob\n", encoding="utf-8")
+    monkeypatch.setattr("servers.prover.api_tools.shutil.which", lambda _: None)
+
+    searched = ProjectTools(tmp_path).execute(
+        "search_text", {"query": "theorem", "glob": "*.lean"}
+    )
+
+    assert "Proof.lean:1:theorem first" in searched
+    assert "Proof.lean:2:theorem second" in searched
+    assert "Notes.txt" not in searched
+
+
 def test_write_is_lean_only_and_project_rooted(tmp_path: Path):
     tools = ProjectTools(tmp_path, writable=True)
     result = tools.execute(

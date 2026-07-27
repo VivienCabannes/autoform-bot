@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -17,6 +19,9 @@ MAX_WRITE_BYTES = 1_000_000
 MAX_ASSISTANT_CONTENT_BYTES = 1_200_000
 MAX_TOOL_ARGUMENT_BYTES = 2_000_000
 MAX_TOOL_CALLS_PER_TURN = 32
+MAX_FALLBACK_SEARCH_FILES = 5_000
+MAX_FALLBACK_SEARCH_FILE_BYTES = 8_000_000
+MAX_FALLBACK_SEARCH_MATCHES = 200
 _RESERVED_PAYLOAD_KEYS = frozenset({"model", "messages", "tools", "tool_choice"})
 _LEAN_NAME_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*$"
@@ -43,6 +48,9 @@ _SENSITIVE_NAMES = frozenset(
 )
 _SENSITIVE_SUFFIXES = (".key", ".pem", ".p12", ".pfx")
 _SENSITIVE_DIRS = frozenset({".aws", ".git", ".gnupg", ".kube", ".ssh"})
+_SEARCH_SKIP_DIRS = _SENSITIVE_DIRS | frozenset(
+    {".lake", ".venv", "__pycache__", "node_modules", "runs", "traces"}
+)
 _RG_SECRET_EXCLUDES = (
     "!.aws/**",
     "!.git/**",
@@ -260,6 +268,8 @@ class ProjectTools:
             raise ToolPolicyError("query must not be empty")
         scope = self._path(str(args.get("path") or "."), must_exist=True)
         glob = str(args.get("glob") or "*")
+        if shutil.which("rg") is None:
+            return self._search_text_fallback(query, scope, glob)
         command = [
             "rg",
             "--fixed-strings",
@@ -284,6 +294,69 @@ class ProjectTools:
         if process.returncode not in (0, 1):
             raise ToolPolicyError(f"rg failed: {_clip(process.stderr, 2000)}")
         return _clip(process.stdout)
+
+    def _search_text_fallback(self, query: str, scope: Path, glob: str) -> str:
+        """Bounded, secret-aware fixed-string search when ripgrep is unavailable."""
+        deadline = time.monotonic() + self.command_timeout
+        matches: list[str] = []
+        files_seen = 0
+        skipped_large = 0
+
+        for path in self._fallback_search_paths(scope):
+            if time.monotonic() >= deadline:
+                raise ToolPolicyError("fallback search exceeded its deadline")
+            try:
+                resolved = path.resolve(strict=True)
+                relative = resolved.relative_to(self.root)
+            except (OSError, ValueError):
+                continue
+            if self._is_sensitive(relative) or not fnmatch.fnmatch(str(relative), glob):
+                continue
+            files_seen += 1
+            if files_seen > MAX_FALLBACK_SEARCH_FILES:
+                raise ToolPolicyError(
+                    f"fallback search exceeds {MAX_FALLBACK_SEARCH_FILES} files; "
+                    "narrow path or glob"
+                )
+            try:
+                if resolved.stat().st_size > MAX_FALLBACK_SEARCH_FILE_BYTES:
+                    skipped_large += 1
+                    continue
+                with resolved.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line_number, line in enumerate(handle, 1):
+                        if query not in line:
+                            continue
+                        matches.append(f"{relative}:{line_number}:{line.rstrip()}")
+                        if len(matches) >= MAX_FALLBACK_SEARCH_MATCHES:
+                            matches.append(
+                                f"...[search stopped after "
+                                f"{MAX_FALLBACK_SEARCH_MATCHES} matches]..."
+                            )
+                            return _clip("\n".join(matches))
+                        if time.monotonic() >= deadline:
+                            raise ToolPolicyError("fallback search exceeded its deadline")
+            except OSError:
+                continue
+
+        if skipped_large:
+            matches.append(
+                f"...[{skipped_large} file(s) over "
+                f"{MAX_FALLBACK_SEARCH_FILE_BYTES} bytes skipped]..."
+            )
+        return _clip("\n".join(matches))
+
+    @staticmethod
+    def _fallback_search_paths(scope: Path):
+        if scope.is_file():
+            yield scope
+            return
+        for directory, dirnames, filenames in os.walk(scope, followlinks=False):
+            dirnames[:] = sorted(
+                name for name in dirnames if name not in _SEARCH_SKIP_DIRS
+            )
+            base = Path(directory)
+            for filename in sorted(filenames):
+                yield base / filename
 
     def _run_lean(self, args: dict[str, Any]) -> str:
         executable = str(args.get("command") or "")

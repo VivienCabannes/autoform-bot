@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -37,11 +38,14 @@ def test_demo_has_a_root_module_and_no_stale_schema_reference():
 
 
 def test_demo_workspace_scanner_reports_the_intended_gaps():
+    environment = os.environ.copy()
+    environment["PATH"] = ""
     process = subprocess.run(
         [sys.executable, str(ROOT / "skills" / "workspace" / "inspect.py"), str(DEMO)],
         capture_output=True,
         text=True,
         check=True,
+        env=environment,
     )
     report = json.loads(process.stdout)
     assert report["lean_file_count"] == 2
