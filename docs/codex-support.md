@@ -1,12 +1,33 @@
-# Codex support
+# Codex implementation and release status
 
-Codex is a first-class Autoform host and prover backend.
+Autoform contains first-class Codex host and prover implementations. That is a
+code-status statement, not a blanket claim that every Codex version, account,
+permission profile, or project has passed a live Autoform run.
 
 The earlier version of this document treated skills, MCP servers, and native
 subagents as unconfirmed or absent in Codex. That premise is obsolete. Current
-Codex releases support plugin skills and MCP servers, native parallel subagents,
-project-scoped custom agents in `.codex/agents/*.toml`, steering, resumable work,
-and structured headless output.
+Codex documentation covers plugin skills and MCP servers, native parallel
+subagents, project-scoped custom agents in `.codex/agents/*.toml`, resumable
+work, and structured `codex exec` output.
+
+## Status boundary
+
+| Surface | Implemented and automated | Live release gate |
+|---|---|---|
+| Shared workflow skills and MCP registration | Plugin/static validation | Install the built plugin in the target Codex surface and confirm skill/MCP discovery |
+| Project Codex role agents | Idempotent generator, overwrite protection, and isolated-project tests | Start a new trusted project task and spawn at least one generated role |
+| Native interactive orchestration | Canonical role prompts and generic-subagent fallback | Complete setup/plan and one escalation or review delegation in the target Codex version; require child-thread evidence rather than a model self-report |
+| Headless Codex prover | CLI arguments, event normalization, timeout cleanup, steering, and fake-process tests | Passed on the 2026-07-27 disposable pilot; repeat on the final release SHA |
+| Headless Codex jury | Shared schema, abstention rules, and fake-process tests | Passed on the 2026-07-27 three-axis pilot; repeat on the final release SHA |
+
+Accordingly, release notes should say **Codex implementation complete** until
+the live gates in [pilot-testing.md](pilot-testing.md) have been recorded for
+the release candidate. Say **end-to-end Codex validated** only after those
+gates pass, including the Codex version, permission profile, Lean toolchain, and
+whether the run incurred billing or data egress.
+
+The dated evidence and remaining native-delegation blocker are recorded in
+[pilot-results-2026-07-27.md](pilot-results-2026-07-27.md).
 
 ## What parity means
 
@@ -23,8 +44,10 @@ Each host still uses its native execution surface. Claude consumes the plugin's
 `agents/*.md`. Autoform's setup installs equivalent namespaced role agents under
 the target project's `.codex/agents/` for Codex. When the active Codex spawn
 surface has no custom-role selector—or the current task predates installation—
-the orchestrator spawns a generic native subagent with the complete canonical
-role prompt inlined. It never launches `codex exec` or `claude -p` to imitate
+the orchestrator instructs the host to spawn a generic native subagent with the
+complete canonical role prompt inlined. This is the documented fallback design;
+the live release gate verifies that the target Codex surface follows it. The
+interactive workflow never shells out to `codex exec` or `claude -p` to imitate
 native delegation.
 
 Headless work is separate. `dispatch_runner.py` can use Claude or Codex for the

@@ -17,6 +17,8 @@ Checks (all stdlib):
     and a semver-shaped `version`.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
+  - The core `setup`, `orchestrate`, and `set-backend` workflow skills exist.
+  - Internal helpers such as project creation do not reappear as user skills.
   - Every `commands/*` (`.md` or `.toml`) carries a `description`.
   - Every `references/<file>` a SKILL.md cites exists in that skill's `references/`.
   - No surviving mention of an agent/skill in REMOVED_AGENTS / REMOVED_SKILLS
@@ -52,6 +54,8 @@ EXPECTED_MCP_SERVERS = frozenset(
         "autoform-zulip",
     }
 )
+REQUIRED_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
+INTERNAL_ONLY_SKILLS = frozenset({"make-project"})
 
 errors: list[str] = []
 checks = 0
@@ -268,8 +272,10 @@ def check_skills() -> int:
     Returns the number of skills checked (0 would mean a vacuous pass)."""
     global checks
     count = 0
+    found: set[str] = set()
     for skill_md in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
         count += 1
+        found.add(skill_md.parent.name)
         checks += 1
         fm = frontmatter(skill_md)
         if fm is None:
@@ -284,6 +290,18 @@ def check_skills() -> int:
                 f"{rel(skill_md)}: non-portable skill frontmatter key(s): "
                 f"{', '.join(sorted(extras))}"
             )
+    for name in sorted(REQUIRED_WORKFLOW_SKILLS - found):
+        checks += 1
+        err(
+            f"missing core workflow skill: skills/{name}/SKILL.md "
+            "(Setup, Orchestrate, and Set Backend must ship in every host)"
+        )
+    for name in sorted(INTERNAL_ONLY_SKILLS & found):
+        checks += 1
+        err(
+            f"internal helper exposed as a user skill: skills/{name}/SKILL.md "
+            "(project creation belongs inside Setup)"
+        )
     return count
 
 

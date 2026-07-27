@@ -1,6 +1,6 @@
 {
   "name": "autoform",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Turn any AI coding assistant into a Lean 4 formalization agent.",
   "author": {
     "name": "Vivien Cabannes"
@@ -16,9 +16,9 @@
     "category": "Coding",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": [
-      "Help me formalize this theorem in Lean 4.",
-      "Review this Lean formalization against the source statement.",
-      "Extract formalization targets from this mathematical text."
+      "Set up an Autoform Lean formalization project from my sources.",
+      "Run or resume the Autoform orchestration workflow.",
+      "Help me formalize this theorem in Lean 4."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/autoform-small.svg",

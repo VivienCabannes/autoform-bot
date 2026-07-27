@@ -57,6 +57,13 @@ The Codex check must report every generated role as `ok` and `changed=0`.
 Start a new project-rooted Codex task after installation so native role
 discovery sees the new TOML files.
 
+If role discovery is probed through `codex exec`, do **not** use `--ephemeral`:
+subagent delegation needs a registered parent thread. Judge the probe from the
+JSONL event stream, not from the model's final self-report. Success requires an
+actual spawned child id, a non-empty receiver set while waiting, and a terminal
+child result. A missing/failed spawn followed by a plausible statement such as
+`"used_agent": "autoform_reader"` is a failed pilot, not evidence of delegation.
+
 ## 3. API-provider preflight
 
 Configuration-only checks do not send a request:
@@ -140,3 +147,8 @@ Run these only on disposable copies:
 These drills are automated in the default test suite. The live steps above
 verify host authentication, CLI schema behavior, subscription permissions, and
 real Lean-version compatibility that injected tests cannot establish.
+
+Record release-candidate outcomes in a dated result file. The current local
+hardening run is [pilot-results-2026-07-27.md](pilot-results-2026-07-27.md);
+open gates in that record remain release blockers until a later result
+supersedes them.

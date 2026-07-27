@@ -7,17 +7,40 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install test environment
+        run: uv sync --extra dev --extra repl --extra zulip
+      - name: Run unit tests
+        run: uv run python -m pytest -q
+      - name: Run bundled demo
+        run: make demo PYTHON="uv run python"
+
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Install test environment
+      - name: Install quality environment
         run: uv sync --extra dev --extra repl --extra zulip
-      - name: Run unit tests
-        run: uv run python -m pytest -q
       - name: Lint Python surfaces
-        run: uv run ruff check scripts servers tests skills
+        run: |
+          make lint
+          uv run ruff check scripts tests
       - name: Lint plugin surfaces
         run: python3 scripts/lint_plugin.py
+      - name: Reject whitespace errors
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD

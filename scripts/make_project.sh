@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Set up a new Lean 4 + Mathlib project from the LeanProject template.
 #
-# Usage: bash scripts/make-project.sh <ProjectName> [target-dir]
+# Usage: bash scripts/make_project.sh <ProjectName> [target-dir]
 #
 # - Clones the LeanProject template
 # - Renames everything to <ProjectName>
 # - Fetches Mathlib cache (~2 GB)
 # - Runs lake build to verify
 #
-# Requires: git, python3, lean/lake (install via scripts/install-lean.sh)
+# Requires: git, python3, lean/lake (the setup skill installs Lean if needed)
 
 set -euo pipefail
 
 # Resolve the plugin root FIRST — a relative invocation breaks BASH_SOURCE
 # resolution after the cd into the target dir below.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 log()  { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
@@ -23,7 +23,7 @@ fail() { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; exit 1; }
 
 # --- Args ---
 if [ $# -lt 1 ]; then
-  echo "Usage: make-project.sh <ProjectName> [target-dir]"
+  echo "Usage: make_project.sh <ProjectName> [target-dir]"
   echo ""
   echo "  ProjectName   UpperCamelCase name (e.g. ConvexBodies, PrimeGaps)"
   echo "  target-dir    Where to create the project (default: ./<ProjectName>)"
@@ -37,7 +37,7 @@ TARGET_DIR="${2:-./$PROJECT_NAME}"
 log "Checking prerequisites"
 for cmd in git python3 lake; do
   if ! command -v "$cmd" &>/dev/null; then
-    fail "$cmd not found. Run /install-lean first."
+    fail "$cmd not found. Run the Autoform setup workflow after installing Lean."
   fi
   ok "$cmd"
 done
@@ -93,4 +93,4 @@ echo ""
 echo "  cd $TARGET_DIR"
 echo "  # Edit $PROJECT_NAME/Example.lean to get started"
 echo ""
-echo "Next: use the Autoform setup skill (or plan for planning only)."
+echo "Autoform setup can now continue with planning and dashboard initialization."

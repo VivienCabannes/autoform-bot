@@ -2,10 +2,10 @@
 """Inspect a Lean 4 workspace — project structure, sorry/axiom counts, declarations.
 
 Usage:
-    python3 inspect.py [path]                  # Full workspace summary
-    python3 inspect.py --search "pattern" [path]  # Search .lean files
-    python3 inspect.py --declarations [path]      # List declarations
-    python3 inspect.py --targets [path]           # Read targets file
+    python3 workspace_inspector.py [path]                  # Full workspace summary
+    python3 workspace_inspector.py --search "pattern" [path]  # Search .lean files
+    python3 workspace_inspector.py --declarations [path]      # List declarations
+    python3 workspace_inspector.py --targets [path]           # Read targets file
 """
 
 from __future__ import annotations

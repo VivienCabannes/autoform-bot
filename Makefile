@@ -57,7 +57,7 @@ install-codex: ## Install the plugin into Codex CLI (local marketplace)
 
 .PHONY: demo
 demo: ## Scan the bundled sample Lean project (no deps)
-	@$(PYTHON) skills/workspace/inspect.py examples/demo-project
+	@$(PYTHON) skills/workspace/workspace_inspector.py examples/demo-project
 
 .PHONY: test
 test: ## Run the test suite

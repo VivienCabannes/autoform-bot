@@ -26,8 +26,24 @@ absolute path; do not depend on a variable exported by a previous shell call.
 ## Procedure
 
 1. Resolve the target project from an explicit argument, otherwise the current
-   directory. If there is no `lakefile.*`, run the `make-project` skill. Run
-   `install-lean` first only when `lake` or `elan` is missing.
+   directory. If there is no `lakefile.*`, create the Lean project as an
+   internal setup step:
+
+   - Run `install-lean` first only when `lake` or `elan` is missing.
+   - Ask for a project name in UpperCamelCase (for example `ConvexBodies`) and
+     an optional target directory when they were not supplied.
+   - Require a target directory that does not already exist, then run:
+
+     ```bash
+     bash "<AUTOFORM_PLUGIN_ROOT>/scripts/make_project.sh" \
+       <ProjectName> [target-dir]
+     ```
+
+   - Resolve and echo the newly created directory as `PROJECT_DIR`.
+
+   Project creation is deliberately bundled into Setup rather than exposed as
+   a separate user-facing skill.
+
    Resolve `DISPATCH_PROJECT` from an explicit plan directory, otherwise use the
    Lean project itself. Create an explicitly requested missing plan directory
    only after echoing both absolute paths.

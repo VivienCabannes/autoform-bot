@@ -1,7 +1,7 @@
 ---
 name: plugin-insights
 description: "Analysis of four Claude Code plugin architectures (caveman, superpowers, lean4-skills, mathlib-quality) stored in inspiration/plugin/"
-metadata: 
+metadata:
   node_type: memory
   type: reference
   originSessionId: e1f8ec53-c526-4c46-b43f-f99da0e967f1

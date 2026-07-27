@@ -6,8 +6,12 @@ import json
 import os
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +45,7 @@ def test_demo_workspace_scanner_reports_the_intended_gaps():
     environment = os.environ.copy()
     environment["PATH"] = ""
     process = subprocess.run(
-        [sys.executable, str(ROOT / "skills" / "workspace" / "inspect.py"), str(DEMO)],
+        [sys.executable, str(ROOT / "skills" / "workspace" / "workspace_inspector.py"), str(DEMO)],
         capture_output=True,
         text=True,
         check=True,
@@ -55,9 +59,64 @@ def test_demo_workspace_scanner_reports_the_intended_gaps():
 
 
 def test_project_bootstrap_commands_use_a_portable_locale():
-    bootstrap = (ROOT / "skills" / "make-project" / "make-project.sh").read_text()
+    bootstrap = (ROOT / "scripts" / "make_project.sh").read_text()
     exporter = (ROOT / "scripts" / "export_blueprint.py").read_text()
     assert "LC_ALL=C LANG=C lake exe cache get" in bootstrap
     assert "LC_ALL=C LANG=C lake build" in bootstrap
     assert "LC_ALL=C LANG=C $(LAKE) update" in exporter
     assert "LC_ALL=C LANG=C $(LAKE) exe cache get" in exporter
+
+
+def test_project_creation_is_internal_to_setup():
+    setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
+    assert not (ROOT / "skills" / "make-project" / "SKILL.md").exists()
+    assert "scripts/make_project.sh" in setup
+    assert (ROOT / "scripts" / "make_project.sh").is_file()
+
+
+def test_project_creation_helper_runs_from_an_arbitrary_directory(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    call_log = tmp_path / "calls.log"
+
+    commands = {
+        "git": """#!/bin/sh
+if [ "$1" = "clone" ]; then
+  /bin/mkdir -p "$3/scripts"
+  : > "$3/scripts/customize_template.py"
+fi
+printf 'git %s\n' "$*" >> "$AUTOFORM_TEST_LOG"
+""",
+        "python3": """#!/bin/sh
+printf 'python3 %s\n' "$*" >> "$AUTOFORM_TEST_LOG"
+""",
+        "lake": """#!/bin/sh
+printf 'lake %s\n' "$*" >> "$AUTOFORM_TEST_LOG"
+""",
+    }
+    for name, body in commands.items():
+        executable = fake_bin / name
+        executable.write_text(body)
+        executable.chmod(0o755)
+
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    target = tmp_path / "CreatedProject"
+    environment = os.environ.copy()
+    environment["AUTOFORM_TEST_LOG"] = str(call_log)
+    environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+    process = subprocess.run(
+        ["/bin/bash", str(ROOT / "scripts" / "make_project.sh"), "CreatedProject", str(target)],
+        cwd=working_dir,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert process.returncode == 0, process.stderr
+    calls = call_log.read_text()
+    assert f"python3 {ROOT / 'scripts' / 'formalization.py'} init ." in calls
+    assert "python3 scripts/customize_template.py CreatedProject" in calls
+    assert "lake exe cache get" in calls
+    assert "lake build" in calls

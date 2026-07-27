@@ -7,7 +7,7 @@ import pytest
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
-    tomllib = None
+    import tomli as tomllib
 
 from scripts.install_host_agents import (
     GENERATED_MARKER,
@@ -49,8 +49,6 @@ def test_install_is_idempotent_and_checkable(tmp_path: Path):
     assert check_changed == 0
     assert (tmp_path / ".codex" / "agents" / "autoform_worker.toml").exists()
     assert (tmp_path / ".codex" / "agents" / "autoform_splitter.toml").exists()
-    if tomllib is None:
-        pytest.skip("tomllib is available on Python 3.11+")
     for path in (tmp_path / ".codex" / "agents").glob("*.toml"):
         parsed = tomllib.loads(path.read_text(encoding="utf-8"))
         assert {"name", "description", "developer_instructions"} <= set(parsed)

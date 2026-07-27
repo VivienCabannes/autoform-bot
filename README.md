@@ -15,6 +15,19 @@ rebuilds the project and audits its axioms (`sorryAx` and non-standard axioms
 are rejected), so adding a new — even unknown — model backend is safe by
 construction.
 
+The shared Codex paths are implemented and covered by deterministic tests, but
+operational parity remains a release gate: host authentication, project trust,
+generated-role discovery, CLI schema behavior, and one real proof/jury run must
+pass on the release candidate. See
+[Codex implementation and release status](docs/codex-support.md); automated
+tests alone are not presented as end-to-end live validation.
+
+> **Version 2 transition:** this plugin intentionally replaces the standalone
+> v1 Python research pipeline; it is not an in-place compatibility upgrade.
+> Existing v1 runs and Python integrations should remain pinned to an archival
+> v1 revision. See [the v2 migration guide](docs/migration-v2.md) for the
+> removed-capability map, migration procedure, and rollback boundary.
+
 ## How it works
 
 ```mermaid
@@ -53,10 +66,23 @@ Prereqs: [Claude Code](https://claude.com/claude-code) or
 [uv](https://docs.astral.sh/uv/) (the MCP servers launch via `uv run` and
 resolve their own deps on first start).
 
+Claude Code:
+
 ```text
 /plugin marketplace add VivienCabannes/autoform-bot
 /plugin install autoform@autoform
+```
 
+Codex, from a checkout of this repository:
+
+```bash
+make install-codex
+```
+
+Start a new task after installing or upgrading so the host reloads the plugin,
+then use:
+
+```text
 /autoform:install-autoform      # check/install uv, Python deps, Lean, optional Zulip
 /autoform:setup                 # new Lean+Mathlib project → plan → blueprint → dashboard
 /autoform:orchestrate           # launch the engine: prover workers + review jury
@@ -113,8 +139,8 @@ dashboard).
 
 **Other skills** — `plan`, `plan-view`, `review` (the planning and review surfaces);
 `autoform` (Mathlib conventions), `autoform-prove` (worker proof discipline),
-`eval-rubrics` (the jury's rubrics); `make-project`, `install-autoform`,
-`install-lean`, `workspace` (project scaffolding and triage); `zulip`
+`eval-rubrics` (the jury's rubrics); `install-autoform`, `install-lean`,
+`workspace` (environment repair and project triage); `zulip`
 (community search).
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
@@ -148,15 +174,17 @@ tests/        deterministic suite; optional local-Lean and loopback-HTTP smoke t
 uv sync --extra dev --extra repl --extra zulip
 uv run python -m pytest -q               # full suite
 python3 scripts/lint_plugin.py           # plugin-surface lint (CI runs this)
-uv run --extra dev ruff check servers/   # style
+uv run ruff check scripts servers tests skills
+make demo PYTHON="uv run python"
 ```
 
-CI lints the plugin surface (manifests, frontmatter, references, dangling-name
-guard) on pushes that touch it. See [CONTRIBUTING.md](CONTRIBUTING.md) for the component
-status table and how to contribute skills, agents, or server implementations,
-and [docs/pipeline.md](docs/pipeline.md) for the planner's architecture. Use
-[docs/pilot-testing.md](docs/pilot-testing.md) for the release, live-host, and
-failure-drill checklist.
+CI runs the deterministic suite and bundled demo on Python 3.10–3.14, plus
+Python and plugin-surface lint. These checks validate shared contracts without
+paid credentials; they do not establish that a particular host login, CLI
+version, or provider account works. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the component status table, [docs/pipeline.md](docs/pipeline.md) for the
+planner's architecture, and [docs/pilot-testing.md](docs/pilot-testing.md) for
+the required live-host and failure-drill release checklist.
 
 ## License
 

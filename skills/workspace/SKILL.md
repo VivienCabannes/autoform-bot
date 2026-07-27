@@ -17,7 +17,7 @@ Run the inspection script to get a structured overview of the Lean project:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" [path]
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" [path]
 ```
 
 If no path is given, it uses `$LEAN_PROJECT_DIR` or the current directory.
@@ -34,19 +34,19 @@ For searching `.lean` files:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" --search "pattern" [path]
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" --search "pattern" [path]
 ```
 
 For listing declarations:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" --declarations [path]
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" --declarations [path]
 ```
 
 For reading targets:
 
 ```bash
 uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/inspect.py" --targets [path]
+  "<AUTOFORM_PLUGIN_ROOT>/skills/workspace/workspace_inspector.py" --targets [path]
 ```

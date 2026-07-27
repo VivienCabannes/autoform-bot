@@ -18,7 +18,7 @@ import json
 import os
 import shutil
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 _SIDECARS = ("task_queue.json", "review_status.json", "agents_status.json")
@@ -57,7 +57,7 @@ def _load_graph(path: Path) -> dict:
 
 
 def _snapshot(project: Path) -> Path:
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     snapshots_root = (project / ".autoform" / "snapshots").resolve(strict=False)
     try:
         snapshots_root.relative_to(project)
