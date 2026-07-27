@@ -2,8 +2,8 @@
 
 Covers the write-only dispatch queue + the dispatch API:
 
-  * ``Project.task_queue`` — read ``task_queue.json`` next to graph.json; absent /
-    corrupt / mis-shaped → ``[]``; never raises.
+  * ``Project.task_queue`` — best-effort reads for rendering plus strict,
+    fail-closed reads for every mutation.
   * ``Project.write_task_queue`` — atomic (temp + ``os.replace``), capped at 200.
   * ``GET  /api/dispatch``        — ``{palette, queue, live, backend}`` (palette of 8,
     the existing agents feed under ``live``).
@@ -23,6 +23,8 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+import pytest
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "scripts" / "review_ui"))
@@ -78,6 +80,13 @@ def test_task_queue_drops_non_dict_entries(tmp_path):
     q = proj.task_queue()
     assert len(q) == 1
     assert q[0]["id"] == "worker:s1"
+
+
+def test_task_queue_strict_rejects_corrupt_state(tmp_path):
+    proj = _proj(tmp_path)
+    proj.task_queue_path.write_text("{not json")
+    with pytest.raises(sv.dq.QueueStateError):
+        proj.task_queue(strict=True)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +186,12 @@ def test_palette_partitions_into_engine_and_orchestrator_kinds():
     assert dq._ENGINE_KINDS == ("reviewer", "worker")
     assert not (set(dq._ENGINE_KINDS) & set(dq._ORCH_KINDS))        # disjoint
     assert set(dq._ENGINE_KINDS) | set(dq._ORCH_KINDS) == palette   # exhaustive
+
+
+def test_dashboard_backend_registry_covers_every_available_prover():
+    options = {item["id"]: item for item in sv._backend_payload()["options"]}
+    assert set(options) == {"max", "aristotle", "codex", "openai", "avocado"}
+    assert all(item["available"] for item in options.values())
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +375,38 @@ def test_request_dedupes_against_running(tmp_path):
         assert code == 200
         assert len(body["queue"]) == 1
         assert body["queue"][0]["status"] == "running"   # not faked back to queued
+    finally:
+        srv.close()
+
+
+def test_request_reenqueue_after_done_uses_unique_id(tmp_path):
+    proj = _proj(tmp_path)
+    srv = _Server(proj)
+    try:
+        first = srv.post("/api/request", {"agent": "reviewer", "node": "s1"})[1]
+        assert first["queue"][0]["id"] == "reviewer:s1"
+        queue = proj.task_queue(strict=True)
+        queue[0]["status"] = "done"
+        proj.write_task_queue(queue)
+        second = srv.post("/api/request", {"agent": "reviewer", "node": "s1"})[1]
+        assert [task["id"] for task in second["queue"]] == [
+            "reviewer:s1",
+            "reviewer:s1:2",
+        ]
+    finally:
+        srv.close()
+
+
+def test_request_refuses_to_overwrite_corrupt_queue(tmp_path):
+    proj = _proj(tmp_path)
+    original = b'[{\"id\":\"survives\"},BROKEN'
+    proj.task_queue_path.write_bytes(original)
+    srv = _Server(proj)
+    try:
+        code, body = srv.post("/api/request", {"agent": "reviewer", "node": "s1"})
+        assert code == 409
+        assert "queue state error" in body["error"]
+        assert proj.task_queue_path.read_bytes() == original
     finally:
         srv.close()
 

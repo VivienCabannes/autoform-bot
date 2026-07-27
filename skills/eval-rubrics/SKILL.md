@@ -12,11 +12,15 @@ description: >-
 
 # Evaluation rubrics for formalized mathematics
 
+Resolve the absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]` when a reviewer needs a
+rubric path.
+
 The grading criteria the AI jury applies to a formalized node. The jury is **blind
 single-axis reviewers**, each given ONLY its own rubric — never the others'. Each rubric is an
 integer score 0–5 with a pass threshold; the criteria and prompt templates are the JSON files in
 `references/` (from a subagent, read them at
-`${CLAUDE_PLUGIN_ROOT}/skills/eval-rubrics/references/<axis>.json` — subagents run with cwd set to
+`<AUTOFORM_PLUGIN_ROOT>/skills/eval-rubrics/references/<axis>.json` — subagents run with cwd set to
 the user's project, so plugin-relative paths do not resolve).
 
 ## The jury rubrics

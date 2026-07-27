@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -170,7 +169,8 @@ def _count_pattern(root: Path, pattern: str, *, regex: bool = False) -> int:
                 continue
         return count
 
-    compiled = re.compile(pattern) if regex else None
+    # ripgrep treats ^/$ as line anchors while Python needs MULTILINE explicitly.
+    compiled = re.compile(pattern, re.MULTILINE) if regex else None
     count = 0
     for file_path in _iter_files(root, ".lean", limit=5000):
         text = file_path.read_text(encoding="utf-8", errors="ignore")

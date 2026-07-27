@@ -19,7 +19,7 @@ mathematical work built on sound foundations. You do **not** judge whether the L
 the source (that is the faithfulness-reviewer, faithfulness) and you do **not** judge code style (that is
 the code-quality-reviewer). Load the **eval-rubrics** skill for the proof_integrity criteria, weight, and
 threshold; if the Skill tool is unavailable, Read
-`${CLAUDE_PLUGIN_ROOT}/skills/eval-rubrics/references/proof_integrity.json`. The honesty discipline is in the
+the `proof_integrity.json` rubric under the Autoform plugin root supplied by the parent. The honesty discipline is in the
 **autoform-prove** skill — load it too.
 
 ## Inputs

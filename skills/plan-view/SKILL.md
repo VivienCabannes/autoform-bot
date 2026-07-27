@@ -5,10 +5,13 @@ description: >
   "show the graph", "open the visualization", "regenerate the graph",
   "refresh the plan view", or wants to see the interactive tiered
   dependency graph for a formalization plan.
-version: 0.4.0
 ---
 
 # Plan Visualization
+
+Resolve the absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`. Replace
+`<AUTOFORM_PLUGIN_ROOT>` below with the quoted absolute path.
 
 Build and open the interactive tiered dependency graph for a formalization plan.
 The view is a `leanblueprint` web project, generated from the plan's `graph.json`
@@ -25,14 +28,14 @@ toolchain, export the blueprint project, build the web, then serve and open it.
 The view depends on graphviz and several Python packages. Verify them first:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/check_toolchain.sh
+"<AUTOFORM_PLUGIN_ROOT>/scripts/check_toolchain.sh"
 ```
 
 The script prints a `PASS`/`FAIL` line per requirement (Python >= 3.10, the `dot`
 binary, and each Python import) and the exact fix command for anything missing. It
 exits `0` only when everything passes. If it fails, stop here and run the Makefile's
 `make setup-venv` target (step 3) — that is the supported fix — or see
-`${CLAUDE_PLUGIN_ROOT}/SETUP.md` for the manual path. Do not attempt later steps
+`<AUTOFORM_PLUGIN_ROOT>/SETUP.md` for the manual path. Do not attempt later steps
 until the toolchain is set up.
 
 Note: a pygraphviz FAIL of the form *"installed, but its graphviz runtime libs are
@@ -46,7 +49,9 @@ step 3 — do not hand-install pygraphviz.
 Generate the blueprint project from the plan with the exporter:
 
 ```bash
-python ${CLAUDE_PLUGIN_ROOT}/scripts/export_blueprint.py <graph.json> [--content <dir>] [--out <dir>]
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/export_blueprint.py" <graph.json> \
+  [--content <dir>] [--out <dir>]
 ```
 
 `<graph.json>` is the plan's structure file. `--content` is the directory of

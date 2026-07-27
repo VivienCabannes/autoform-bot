@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """Deterministic parallel dispatcher for the DAG review dashboard.
 
-Reads ``task_queue.json`` and fans work out as parallel ``claude -p`` processes —
-with **no reliance on an LLM orchestrator choosing to delegate**. Each REVIEWER
+Reads ``task_queue.json`` and fans work out through an explicitly selected jury
+provider, with **no reliance on an LLM orchestrator choosing to delegate**. Each REVIEWER
 task spawns the 3-judge jury (faithfulness / proof_integrity / code_quality)
 concurrently; ALL queued nodes' judges run in one bounded process pool, so nodes
 are reviewed **in parallel, not one-by-one**. The single parent process is the
 only writer of ``review_status.json`` (atomic, under a lock) — no write race.
 
-Billing: every judge runs ``claude -p`` with ``ANTHROPIC_API_KEY`` AND
-``ANTHROPIC_AUTH_TOKEN`` scrubbed → the Max subscription. Judges get only
-Read/Grep/Glob/Bash (read the Lean, run ``#print axioms``) — never write the
-verdict file themselves; the parent does.
+Claude judges scrub API credentials to use the logged-in subscription; Codex
+uses its configured auth; API judges use the configured endpoint. Every judge
+is read-only and the parent process is the sole verdict writer.
 
 Usage::
 
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN python3 scripts/dispatch_runner.py <project-dir> \\
-      [--repo <lean-repo>] [--jobs 9] [--model opus] [--limit N] [--dry-run]
+      [--repo <lean-repo>] [--jobs 9] [--judge-backend claude|codex|openai|avocado]
+      [--model <provider-model>] [--limit N] [--dry-run]
 
 ``<project-dir>`` holds graph.json + task_queue.json + review_status.json.
 """
@@ -24,11 +24,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextlib
+import fcntl
 import json
 import os
-import re
-import signal
-import subprocess
 import sys
 import threading
 import time
@@ -39,14 +38,16 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "review_ui"))
 sys.path.insert(0, str(HERE))
-import fslock                      # cross-process lock shared with serve_review
-import review_model as rm          # load_sidecar / save_sidecar / jury_verdict
-import dispatch_queue as dq        # _save / _feed_for / _now (queue + live feed)
-import backend_config              # backend selection (max -> claude adapter, aristotle, codex)
-sys.path.insert(0, str(HERE.parent))   # plugin root, for the prover core (--workers)
+sys.path.insert(0, str(HERE.parent))   # plugin root, for prover/runtime imports
+import fslock  # noqa: E402  # cross-process lock shared with serve_review
+import review_model as rm  # noqa: E402  # load_sidecar / save_sidecar / jury_verdict
+import dispatch_queue as dq  # noqa: E402  # _save / _feed_for / _now
+import backend_config  # noqa: E402  # user-facing backend selection
+import judge_runtime  # noqa: E402  # structured jury across CLI/API providers
 try:
     from servers.prover.driver import prove as _prove
     from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
+    from servers.prover.steerer import Steerer as _Steerer
     try:
         from servers.aristotle.core import build_node_spec as _build_node_spec
     except Exception:
@@ -60,6 +61,48 @@ except Exception as _e:                 # prover deps absent → --workers repor
 # follows with no edit: AXES, the per-node judge fan-out, and the verdict all adapt.
 AXES = rm.AXES
 load_rubrics = rm.load_rubrics
+_ACTIVE_JUDGE_BACKEND = "claude"
+
+
+class DispatcherBusy(RuntimeError):
+    """Another dispatcher owns this project."""
+
+
+@contextlib.contextmanager
+def dispatcher_lease(project: Path):
+    """Hold one non-blocking process lease for the complete dispatcher run.
+
+    Queue locks protect individual transactions; this lease protects the
+    engine lifecycle. Without it, a second startup can mistake the first
+    engine's live ``running`` tasks for crash leftovers and requeue them.
+    """
+    project = project.resolve()
+    state_dir = project / ".autoform"
+    if state_dir.is_symlink():
+        raise ValueError(f"dispatcher state directory is a symlink: {state_dir}")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "dispatcher.lock"
+    if lock_path.is_symlink():
+        raise ValueError(f"dispatcher lease is a symlink: {lock_path}")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            lock.seek(0)
+            holder = lock.read().strip() or "unknown holder"
+            raise DispatcherBusy(
+                f"another dispatcher already owns {project} ({holder})"
+            ) from error
+        try:
+            lock.seek(0)
+            lock.truncate()
+            json.dump({"pid": os.getpid(), "started_at": dq._now()}, lock)
+            lock.write("\n")
+            lock.flush()
+            os.fsync(lock.fileno())
+            yield lock_path
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _now() -> str:
@@ -87,119 +130,72 @@ def build_prompt(rubric: dict, node_id: str, node: dict, content_text: str) -> s
     )
 
 
-def _balanced_objects(text: str) -> list:
-    """Every top-level {...} object in `text`, brace-balanced (handles NESTED JSON
-    like proof_integrity's `axiom_verdicts`, which a non-greedy regex cannot)."""
-    objs, depth, start = [], 0, None
-    in_str, esc = False, False
-    for i, ch in enumerate(text):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth > 0:
-            depth -= 1
-            if depth == 0 and start is not None:
-                objs.append(text[start:i + 1])
-                start = None
-    return objs
-
-
 def parse_score(stdout: str, axis: str) -> dict:
-    """Pull {score, reasoning} from a `claude -p --output-format json` result."""
-    text = (stdout or "").strip()
-    try:                                  # unwrap the claude envelope {type,result,...}
-        env = json.loads(text)
-        if isinstance(env, dict) and "result" in env:
-            text = env["result"]
-    except Exception:
-        pass
-    for cand in reversed(_balanced_objects(text)):   # last balanced obj carrying a score
-        try:
-            j = json.loads(cand)
-        except Exception:
-            continue
-        if isinstance(j, dict) and "score" in j:
-            s = j.get("score")
-            reasoning = str(j.get("reasoning", ""))[:500]
-            if isinstance(s, (int, float)):
-                return {"score": int(s), "reasoning": reasoning}
-            # Explicit abstain: {"score": null, "error": "…"} (e.g. missing source
-            # refs). Keep the judge's error text in the reasoning; a None score then
-            # flows through the same "usable" filtering as a timeout upstream.
-            err = str(j.get("error", "") or "").strip()
-            txt = " — ".join(x for x in (reasoning, err) if x) \
-                or f"{axis}: abstained (score null)"
-            return {"score": None, "reasoning": txt[:500], "error": "abstain"}
-    return {"score": None, "reasoning": f"{axis}: unparseable output: {text[:160]}", "error": "parse"}
-
-
-# Env vars scrubbed before every `claude -p` so judges bill the Max subscription,
-# never the API — the key AND the OAuth/bearer token are both auth paths.
-_SCRUBBED_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-
-
-def _kill_group(proc: subprocess.Popen) -> None:
-    """Kill a timed-out judge AND its whole process group. `claude` spawns its own
-    children (Bash tool, etc.); killing only the direct child would leave them
-    running — and still billing. Falls back to a plain kill if the group is gone."""
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.kill()
-    try:
-        proc.communicate(timeout=5)          # reap; never hang the pool on a zombie
-    except Exception:
-        pass
+    """Compatibility export for the shared structured-result parser."""
+    return judge_runtime.parse_score(stdout, axis)
 
 
 def run_judge(axis: str, prompt: str, repo: str, model: str, timeout: int) -> dict:
-    sysp = (f"You are the autoform {axis} judge. Score ONLY this one axis, strictly per the rubric in "
-            f"the prompt. Investigate the real Lean in your working directory (read the declarations; "
-            f"for proof_integrity run `#print axioms`). Do NOT write review_status.json — only output "
-            f"your JSON verdict as the final message.")
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_ENV_VARS}  # -> Max, never the API
-    args = ["claude", "-p", prompt, "--append-system-prompt", sysp,
-            "--allowedTools", "Read,Grep,Glob,Bash", "--output-format", "json", "--model", model]
-    # start_new_session=True puts the judge in its OWN process group, so a timeout
-    # kills the whole tree (claude + whatever it spawned), not just the direct child.
-    proc = subprocess.Popen(args, env=env, cwd=repo, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
-        return {"score": None, "reasoning": f"{axis}: judge timed out after {timeout}s", "error": "timeout"}
-    if proc.returncode != 0 and not stdout.strip():
-        return {"score": None, "reasoning": f"{axis}: claude exited {proc.returncode}: {stderr[:160]}", "error": "exit"}
-    return parse_score(stdout, axis)
+    """Run one rubric judge on the dispatcher-selected provider.
+
+    The five-argument surface is intentionally stable: existing injected tests
+    and downstream wrappers do not need provider-specific signatures.
+    """
+    return judge_runtime.run_judge(
+        axis,
+        prompt,
+        repo,
+        model,
+        timeout,
+        backend=_ACTIVE_JUDGE_BACKEND,
+    )
 
 
-def _worker_adapter(backend: str, repo: str, graph_path: str):
+def _worker_adapter(
+    backend: str,
+    repo: str,
+    graph_path: str,
+    max_wait_seconds: float,
+):
     """The prover adapter for the configured backend (the engine's worker path).
-    ``claude`` = headless Max worker (skip-permissions); ``aristotle``/``codex`` via
-    their adapters (imported lazily so the engine starts without those extras)."""
+    Every backend is explicit and imported lazily so the engine starts without
+    optional provider dependencies."""
     if backend == "aristotle":
         from servers.prover.aristotle_adapter import AristotleAdapter
-        return AristotleAdapter(graph_path=graph_path)
+        return AristotleAdapter(
+            graph_path=graph_path,
+            max_wait_seconds=max_wait_seconds,
+        )
     if backend == "codex":
         from servers.prover.codex_adapter import CodexAdapter
-        return CodexAdapter()
-    return _ClaudeAdapter(extra_args=["--dangerously-skip-permissions"])
+        return CodexAdapter(max_wait_seconds=max_wait_seconds)
+    if backend in {"openai", "avocado"}:
+        from servers.prover.openai_adapter import OpenAICompatAdapter
+        return OpenAICompatAdapter(
+            graph_path=graph_path,
+            preset=backend,
+            max_wait_seconds=max_wait_seconds,
+        )
+    if backend == "claude":
+        return _ClaudeAdapter(max_wait_seconds=max_wait_seconds)
+    raise ValueError(
+        f"unknown prover adapter {backend!r}; expected claude, aristotle, codex, openai, or avocado"
+    )
 
 
-def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str,
-               max_steers: int, backend: str = "claude") -> tuple:
+def run_worker(
+    node_id: str,
+    node: dict,
+    proj: Path,
+    graph_path: str,
+    repo: str,
+    max_steers: int,
+    backend: str = "claude",
+    judge_backend: str = "claude",
+    judge_model: str | None = None,
+    judge_timeout: int = 180,
+    worker_timeout: int = 600,
+) -> tuple:
     """Prove/repair one node via the prover core (#14) on the chosen ``backend``.
     Serial — workers write files. Returns (status, reason, detail): status
     'proved'|'failed' (honest — gated by the driver's verification gate), reason =
@@ -223,8 +219,23 @@ def run_worker(node_id: str, node: dict, proj: Path, graph_path: str, repo: str,
                 f"Find the declaration(s) in the repo and complete/repair the proof so the file "
                 f"compiles cleanly with NO sorry/admit/axiom — or report an honest FAILED.")
     try:                                       # the worker edits + builds autonomously
-        res = _prove(_worker_adapter(backend, repo, graph_path),
-                     node_id, spec, repo, max_steers=max_steers)
+        steer_judge = _Steerer(
+            judge=lambda prompt: judge_runtime.run_steer_judge(
+                prompt,
+                repo,
+                judge_model,
+                judge_timeout,
+                backend=judge_backend,
+            )
+        )
+        res = _prove(_worker_adapter(backend, repo, graph_path, worker_timeout),
+                     node_id, spec, repo, max_steers=max_steers,
+                     steerer=steer_judge)
+        # The MCP prover records usage itself, but the deterministic dispatcher
+        # calls the shared driver directly. Keep both entry points on the same
+        # append-only ledger contract.
+        from servers.prover.server import _record_usage
+        _record_usage(repo, node_id, backend, res)
         return res.status, (res.reason or ""), (res.proof_text or "")
     except Exception as e:
         return "failed", f"prover error: {e}", ""
@@ -274,7 +285,7 @@ def _raise_escalation(queue: list, node_id: str, label: str, note: str,
     if len(escs) >= max_escalations:
         return False                      # cap hit — stop the retry/escalate cycle
     queue.append({
-        "id": f"escalation-{node_id}-{dq._now().replace(':', '').replace('-', '')}",
+        "id": dq.new_task_id("escalation", node_id, queue),
         "agent": "escalation", "node": node_id, "node_label": (label or node_id),
         "status": "queued", "at": dq._now(), "source": "engine", "note": note})
     return True
@@ -297,12 +308,7 @@ def sweep_stale_running(queue_path: Path, feed_path: Path) -> int:
     block a re-enqueue. Only the engine's own kinds are swept — an orchestrator-owned
     task (escalation/planner/…) may legitimately be ``running`` in another session."""
     with fslock.locked(queue_path):
-        try:
-            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
-        except (OSError, json.JSONDecodeError):
-            return 0
-        if not isinstance(queue, list):
-            return 0
+        queue = dq.load_queue(queue_path)
         n = 0
         for t in queue:
             if (isinstance(t, dict) and t.get("agent") in dq._ENGINE_KINDS
@@ -315,7 +321,7 @@ def sweep_stale_running(queue_path: Path, feed_path: Path) -> int:
                 n += 1
         if n:
             dq._save(queue_path, queue)
-            dq._save(feed_path, dq._feed_for(queue))
+            dq.sync_feed(feed_path, queue)
     return n
 
 
@@ -323,18 +329,90 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic parallel review dispatcher.")
     ap.add_argument("project", type=Path, help="dir holding graph.json + task_queue.json")
     ap.add_argument("--repo", type=Path, default=None, help="Lean repo = judge cwd (default: graph metadata.lean_root, else <project>/../..)")
-    ap.add_argument("--jobs", type=int, default=max(3, 3 * len(AXES)), help=f"max concurrent claude judges (default = 3 nodes x {len(AXES)} axes)")
-    ap.add_argument("--model", default="opus")
-    ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--jobs", type=int, default=max(3, 3 * len(AXES)), help=f"max concurrent judges (default = 3 nodes x {len(AXES)} axes)")
+    ap.add_argument("--judge-backend", choices=judge_runtime.SUPPORTED_JUDGES,
+                    default=os.environ.get("AUTOFORM_JUDGE_BACKEND", "claude"),
+                    help="jury provider (default: AUTOFORM_JUDGE_BACKEND or claude)")
+    ap.add_argument("--model", default=None, help="judge model override (provider default when omitted)")
+    ap.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="wall-clock seconds allowed for each judge and worker run (default 600)",
+    )
     ap.add_argument("--limit", type=int, default=0, help="process only the first N reviewer tasks (0 = all)")
     ap.add_argument("--watch", action="store_true", help="keep running: drain, then re-poll for new drops every --poll s (Ctrl-C to stop)")
     ap.add_argument("--poll", type=int, default=10, help="seconds between polls in --watch (default 10)")
     ap.add_argument("--workers", action="store_true", help="ALSO drain worker tasks (serial) via the prover core — proves/repairs nodes")
     ap.add_argument("--max-steers", type=int, default=2, help="worker: max live steers per node (default 2)")
-    ap.add_argument("--backend", default=backend_config.get_backend(), help="prover backend for --workers (max|aristotle|codex; default: the persisted backend_config)")
+    ap.add_argument(
+        "--backend",
+        choices=tuple(backend_config.BACKENDS),
+        default=None,
+        help="prover backend for --workers (default: persisted backend_config)",
+    )
+    ap.add_argument(
+        "--allow-api-egress",
+        action="append",
+        choices=("openai", "avocado"),
+        default=[],
+        metavar="PROVIDER",
+        help=(
+            "confirm project-data egress to one API provider for this process; "
+            "repeat when prover and judge use different providers"
+        ),
+    )
     ap.add_argument("--max-escalations", type=int, default=3, help="worker: engine-side bound — stop re-proving/re-escalating a node after this many escalations (default 3), so a hard node can't loop forever")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
+    if a.timeout <= 0:
+        ap.error("--timeout must be greater than zero")
+    if a.jobs <= 0:
+        ap.error("--jobs must be greater than zero")
+    if a.poll <= 0:
+        ap.error("--poll must be greater than zero")
+    if a.max_steers < 0:
+        ap.error("--max-steers cannot be negative")
+    if a.max_escalations < 0:
+        ap.error("--max-escalations cannot be negative")
+    if a.backend is None:
+        try:
+            a.backend = backend_config.get_backend()
+        except ValueError as error:
+            ap.error(str(error))
+    required_egress = {
+        provider
+        for provider in (a.judge_backend,)
+        if provider in {"openai", "avocado"}
+    }
+    if a.workers and a.backend in {"openai", "avocado"}:
+        required_egress.add(a.backend)
+    missing_egress = required_egress - set(a.allow_api_egress)
+    if missing_egress:
+        ap.error(
+            "explicit per-run API egress confirmation required: add "
+            + " ".join(
+                f"--allow-api-egress {provider}"
+                for provider in sorted(missing_egress)
+            )
+            + " after reviewing provider/base URL and project data scope"
+        )
+    if a.dry_run:
+        return _run_dispatch(a)
+    try:
+        with dispatcher_lease(a.project):
+            return _run_dispatch(a)
+    except dq.QueueStateError as error:
+        print(f"queue state error: {error}", file=sys.stderr)
+        return 2
+    except (DispatcherBusy, ValueError, OSError) as error:
+        print(f"dispatcher startup failed: {error}", file=sys.stderr)
+        return 3
+
+
+def _run_dispatch(a) -> int:
+    global _ACTIVE_JUDGE_BACKEND
+    _ACTIVE_JUDGE_BACKEND = a.judge_backend
 
     proj = a.project
     graph = json.loads((proj / "graph.json").read_text())
@@ -344,18 +422,25 @@ def main(argv=None) -> int:
     feed_path = proj / "agents_status.json"
     repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
 
+    try:
+        dq.load_queue(queue_path)
+    except dq.QueueStateError as error:
+        print(f"queue state error: {error}", file=sys.stderr)
+        return 2
+
     if not a.dry_run:                       # crash recovery: un-strand 'running' tasks
         swept = sweep_stale_running(queue_path, feed_path)
         if swept:
             print(f"recovered {swept} task(s) stranded in 'running' → re-queued "
                   f"(previous engine died mid-flight)", flush=True)
 
-    initial = [t for t in (json.loads(queue_path.read_text()) if queue_path.exists() else [])
+    initial = [t for t in dq.load_queue(queue_path)
                if t.get("status") == "queued" and t.get("agent") == "reviewer"]
     print(f"project          : {proj}")
     print(f"repo (judge cwd) : {repo}")
     print(f"queued reviewers : {len(initial)}")
-    print(f"parallelism      : up to {a.jobs} concurrent judges · model {a.model} · judges→Max (key scrubbed)"
+    judge_model = a.model or "provider default"
+    print(f"parallelism      : up to {a.jobs} concurrent judges · model {judge_model} · judges→{a.judge_backend}"
           + (f" · workers→{a.backend} ({backend_config.prover_of(a.backend)} adapter)" if a.workers else "")
           + (f" · WATCH every {a.poll}s" if a.watch else ""))
     if a.dry_run:
@@ -391,13 +476,13 @@ def main(argv=None) -> int:
         """Mark ONE task failed with the error in ``result`` — an unexpected
         exception sinks that task, never the loop/engine."""
         with fslock.locked(queue_path):
-            cur = json.loads(queue_path.read_text()) if queue_path.exists() else []
+            cur = dq.load_queue(queue_path)
             for t in cur:
                 if t["id"] == tid:
                     t["status"], t["finished_at"] = "failed", dq._now()
                     t["result"] = f"error: {err}"[:300]
             dq._save(queue_path, cur)
-            dq._save(feed_path, dq._feed_for(cur))
+            dq.sync_feed(feed_path, cur)
         print(f"  ✗ task {tid} → FAILED ({err})", flush=True)
 
     def drain_once() -> int:
@@ -408,7 +493,7 @@ def main(argv=None) -> int:
         # Load-mutate-save cycles on the queue run under the cross-process lock —
         # the dashboard enqueues/cancels in the same file concurrently.
         with fslock.locked(queue_path):
-            queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+            queue = dq.load_queue(queue_path)
             rev = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "reviewer"]
             if a.limit:
                 rev = rev[:a.limit]
@@ -419,7 +504,7 @@ def main(argv=None) -> int:
                 if t["id"] in rev_ids:
                     t["status"], t["started_at"] = "running", dq._now()
             dq._save(queue_path, queue)
-            dq._save(feed_path, dq._feed_for(queue))
+            dq.sync_feed(feed_path, queue)
 
         results: dict[str, dict] = {t["id"]: {} for t in rev}
         lock = threading.Lock()
@@ -442,13 +527,13 @@ def main(argv=None) -> int:
                     **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
                 rm.save_sidecar(sidecar_path, sc)   # preserves any human slot
             with fslock.locked(queue_path):         # re-read: new drops may have arrived
-                cur = json.loads(queue_path.read_text())
+                cur = dq.load_queue(queue_path)
                 for t in cur:
                     if t["id"] == tid:
                         t["status"], t["finished_at"] = "done", dq._now()
                         t["result"] = f"{verdict} (" + " ".join(f"{ax[0]}{scores[ax]}" for ax in AXES) + ")"
                 dq._save(queue_path, cur)
-                dq._save(feed_path, dq._feed_for(cur))
+                dq.sync_feed(feed_path, cur)
             print(f"  ✓ {node_id:28} → {verdict.upper():9} {scores}", flush=True)
 
         with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
@@ -487,7 +572,7 @@ def main(argv=None) -> int:
         """Prove every queued worker node, one at a time (workers write files → serial)."""
         if not a.workers:
             return 0
-        queue = json.loads(queue_path.read_text()) if queue_path.exists() else []
+        queue = dq.load_queue(queue_path)
         wk = [t for t in queue if t.get("status") == "queued" and t.get("agent") == "worker"]
         n = 0
         for t in wk:
@@ -502,7 +587,10 @@ def main(argv=None) -> int:
         """Claim + prove one queued worker task; returns 1 when it was handled
         (proved / failed / blocked), 0 when skipped (open escalation)."""
         with fslock.locked(queue_path):     # re-read (new drops/escalations) + claim
-            c = json.loads(queue_path.read_text())
+            c = dq.load_queue(queue_path)
+            current = next((x for x in c if x.get("id") == t.get("id")), None)
+            if current is None or current.get("status") != "queued":
+                return 0
             escs = _node_escalations(c, t["node"])
             # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
             if any(e.get("status") in ("queued", "running") for e in escs):
@@ -512,19 +600,25 @@ def main(argv=None) -> int:
                     if x["id"] == t["id"]:
                         x["status"], x["finished_at"] = "failed", dq._now()
                         x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
-                dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+                dq._save(queue_path, c)
+                dq.sync_feed(feed_path, c)
                 print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
                 return 1
             for x in c:                                                 # claim
                 if x["id"] == t["id"]:
                     x["status"], x["started_at"] = "running", dq._now()
-            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+            dq._save(queue_path, c)
+            dq.sync_feed(feed_path, c)
         print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
         status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
                                             str(proj / "graph.json"), repo, a.max_steers,
-                                            backend=backend_config.prover_of(a.backend))
+                                            backend=backend_config.prover_of(a.backend),
+                                            judge_backend=a.judge_backend,
+                                            judge_model=a.model,
+                                            judge_timeout=min(a.timeout, 180),
+                                            worker_timeout=a.timeout)
         with fslock.locked(queue_path):     # finish (re-read for new drops)
-            c = json.loads(queue_path.read_text())
+            c = dq.load_queue(queue_path)
             for x in c:
                 if x["id"] == t["id"]:
                     x["status"] = "done" if status == "proved" else "failed"
@@ -534,12 +628,12 @@ def main(argv=None) -> int:
                 lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
                 escalated = _raise_escalation(c, t["node"], lbl,
                                               _escalation_note(reason, detail), a.max_escalations)
-            dq._save(queue_path, c); dq._save(feed_path, dq._feed_for(c))
+            dq._save(queue_path, c)
+            dq.sync_feed(feed_path, c)
         print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
               + ("  ⚑ escalation raised" if escalated else ""), flush=True)
         return 1
 
-    idle = {"orchestrator": {"state": "idle"}, "agents": []}
     if a.watch:
         print("WATCHING — drop reviewers on the dashboard and they auto-fire. Ctrl-C to stop.", flush=True)
         total = 0
@@ -555,15 +649,15 @@ def main(argv=None) -> int:
                     total += n
                     print(f"  …drained {n} (session total {total}); re-checking for new drops.", flush=True)
                 else:
-                    dq._save(feed_path, idle)
+                    dq.sync_feed(feed_path, dq.load_queue(queue_path))
                     time.sleep(a.poll)
         except KeyboardInterrupt:
-            dq._save(feed_path, idle)
+            dq.sync_feed(feed_path, dq.load_queue(queue_path))
             print(f"\nstopped — {total} reviewer node(s) scored this session.", flush=True)
         return 0
 
     n = drain_once() + drain_workers()
-    dq._save(feed_path, idle)
+    dq.sync_feed(feed_path, dq.load_queue(queue_path))
     print(f"\nDONE — {n} task(s) processed. Sidecar: {sidecar_path}", flush=True)
     return 0
 

@@ -8,7 +8,6 @@ description: >
   for lemmas, choosing tactics, naming declarations, or formalizing mathematics. Do NOT trigger
   for Coq/Rocq, Agda, Isabelle, HOL4, Mizar, Idris, or other non-Lean provers.
   Triggers on: /autoform, "lean conventions", "mathlib style", "formalize".
-version: 0.3.0
 ---
 
 # Mathlib & Lean 4 conventions
@@ -23,12 +22,12 @@ reviewer scores against and the style reference the worker writes to.
 
 Detect what's available and adapt:
 
-- **Search before proving.** Use `exact?`, `apply?`, `rw?` (inside a `run_lean_code` snippet via
-  the `autoform-repl` MCP), or the `mathlib` MCP search tools (`mathlib_grep`,
+- **Search before proving.** Use `exact?`, `apply?`, `rw?` in a temporary Lean
+  snippet or a working REPL, or the `mathlib` MCP search tools (`mathlib_grep`,
   `mathlib_find_name`) to find existing Mathlib lemmas before reproving anything.
-- **Build incrementally.** Type-check often: the `autoform-lsp` MCP (`lean_diagnostic_messages`,
-  `lean_hover`) for the actual project file, the `autoform-repl` MCP (`run_lean_code`) for
-  isolated fragments, else `lake env lean <file>` / `lake build <target>`.
+- **Build incrementally.** Type-check often with `lake env lean <file>` and use
+  `lake build <target>` for the final check. Real LSP/REPL tools may accelerate
+  feedback when available; optional compatibility stubs must not block progress.
 - **Do not read Mathlib source by absolute path.** Use the project's mathlib search tooling
   (`mathlib_grep` / `mathlib_read_file` via MCP, else `grep` over the mathlib checkout).
 

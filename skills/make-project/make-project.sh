@@ -61,12 +61,14 @@ ok "Project renamed"
 
 # --- Mathlib cache ---
 log "Fetching Mathlib cache (this may take a few minutes)"
-lake exe cache get
+# ``C.UTF-8`` is common on Linux but absent on stock macOS; inherited invalid
+# locale variables make the cache extractor's ``tar`` subprocess fail.
+LC_ALL=C LANG=C lake exe cache get
 ok "Mathlib cache fetched"
 
 # --- Build ---
 log "Building project"
-if lake build; then
+if LC_ALL=C LANG=C lake build; then
   ok "Build succeeded"
 else
   fail "Build failed — check errors above"
@@ -91,4 +93,4 @@ echo ""
 echo "  cd $TARGET_DIR"
 echo "  # Edit $PROJECT_NAME/Example.lean to get started"
 echo ""
-echo "Next: use /autoform-extract to identify formalization targets from your source material."
+echo "Next: use the Autoform setup skill (or plan for planning only)."

@@ -24,11 +24,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "scripts" / "review_ui"))
 sys.path.insert(0, str(_HERE.parent / "scripts"))
 
 import dispatch_runner as dr  # noqa: E402
+from servers.prover.base import ProofResult  # noqa: E402
 
 
 GRAPH = {
@@ -93,6 +96,42 @@ def test_rubric_without_prompt_template_also_blocks_claim(tmp_path, monkeypatch)
         {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "queued"}])
     assert dr.main([str(proj)]) == 0
     assert _by_id(proj, "reviewer:s1")["status"] == "queued"
+
+
+def test_api_backend_requires_explicit_per_process_egress_flag(
+    tmp_path, monkeypatch
+):
+    proj = _proj(tmp_path, [])
+    with pytest.raises(SystemExit):
+        dr.main(
+            [
+                str(proj),
+                "--dry-run",
+                "--backend",
+                "openai",
+                "--workers",
+                "--judge-backend",
+                "avocado",
+            ]
+        )
+    assert (
+        dr.main(
+            [
+                str(proj),
+                "--dry-run",
+                "--backend",
+                "openai",
+                "--workers",
+                "--judge-backend",
+                "avocado",
+                "--allow-api-egress",
+                "openai",
+                "--allow-api-egress",
+                "avocado",
+            ]
+        )
+        == 0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +199,118 @@ def test_sweep_noop_without_stranded_tasks(tmp_path):
     assert dr.sweep_stale_running(proj / "task_queue.json",
                                   proj / "agents_status.json") == 0
     assert _queue(proj) == before
+
+
+def test_sweep_refuses_corrupt_queue_instead_of_claiming_recovery(tmp_path):
+    queue = tmp_path / "task_queue.json"
+    queue.write_text("[BROKEN")
+    with pytest.raises(dr.dq.QueueStateError):
+        dr.sweep_stale_running(queue, tmp_path / "agents_status.json")
+    assert queue.read_text() == "[BROKEN"
+
+
+def test_dispatcher_lease_blocks_a_second_engine_and_releases(tmp_path, capsys):
+    proj = _proj(tmp_path, [])
+    with dr.dispatcher_lease(proj):
+        assert dr.main([str(proj), "--backend", "codex"]) == 3
+        assert "already owns" in capsys.readouterr().err
+    # The kernel releases flock on normal exit; a later dispatcher proceeds.
+    assert dr.main([str(proj), "--backend", "codex"]) == 0
+
+
+def test_dispatcher_lease_releases_after_exception(tmp_path):
+    proj = _proj(tmp_path, [])
+    with pytest.raises(RuntimeError, match="synthetic crash"):
+        with dr.dispatcher_lease(proj):
+            raise RuntimeError("synthetic crash")
+    with dr.dispatcher_lease(proj):
+        pass
+
+
+@pytest.mark.parametrize("backend", ["aristotle", "claude", "codex", "openai", "avocado"])
+def test_worker_timeout_reaches_every_adapter(backend):
+    adapter = dr._worker_adapter(backend, "/repo", "/repo/graph.json", 17)
+    if backend in {"openai", "avocado"}:
+        assert adapter._timeout == 17
+    else:
+        assert adapter._max_wait_seconds == 17
+
+
+def test_direct_dispatch_worker_records_the_shared_usage_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "_PROVER_OK", True)
+    monkeypatch.setattr(
+        dr,
+        "_build_node_spec",
+        lambda *args, **kwargs: "prove the pilot theorem",
+    )
+    monkeypatch.setattr(
+        dr,
+        "_worker_adapter",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        dr,
+        "_prove",
+        lambda *args, **kwargs: ProofResult(
+            status="proved",
+            backend="codex",
+            meta={
+                "model": "pilot-model",
+                "usage": {
+                    "worker": {"input_tokens": 12, "output_tokens": 3},
+                    "judge": {},
+                    "wall_seconds": 1.5,
+                },
+            },
+        ),
+    )
+    status, _reason, _detail = dr.run_worker(
+        "Pilot",
+        {"kind": "theorem"},
+        tmp_path,
+        str(tmp_path / "graph.json"),
+        str(tmp_path),
+        0,
+        backend="codex",
+        worker_timeout=17,
+    )
+    assert status == "proved"
+    entries = [
+        json.loads(line)
+        for line in (tmp_path / ".autoform" / "usage.jsonl").read_text().splitlines()
+    ]
+    assert len(entries) == 1
+    assert entries[0]["node"] == "Pilot"
+    assert entries[0]["backend"] == "codex"
+    assert entries[0]["usage"]["worker"]["input_tokens"] == 12
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--timeout", "0"),
+        ("--jobs", "0"),
+        ("--poll", "0"),
+        ("--max-steers", "-1"),
+        ("--max-escalations", "-1"),
+    ],
+)
+def test_dispatcher_rejects_nonpositive_runtime_bounds(tmp_path, flag, value):
+    proj = _proj(tmp_path, [])
+    with pytest.raises(SystemExit) as error:
+        dr.main([str(proj), "--backend", "codex", flag, value])
+    assert error.value.code == 2
+
+
+def test_escalation_ids_remain_unique_across_retries():
+    queue = []
+    assert dr._raise_escalation(queue, "s1", "S1", "first", max_escalations=3)
+    queue[0]["status"] = "done"
+    assert dr._raise_escalation(queue, "s1", "S1", "second", max_escalations=3)
+    assert [task["id"] for task in queue] == [
+        "escalation:s1",
+        "escalation:s1:2",
+    ]
 
 
 def test_main_runs_the_sweep_then_drains_the_requeued_task(tmp_path, monkeypatch):

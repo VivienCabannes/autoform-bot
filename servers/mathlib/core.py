@@ -96,9 +96,14 @@ def grep_mathlib(
     if not mathlib_path:
         return "Error: Mathlib not found. Check lakefile.toml or .lake/packages/mathlib."
 
-    search_path = mathlib_path / "Mathlib"
+    source_root = (mathlib_path / "Mathlib").resolve()
+    search_path = source_root
     if subdir:
-        search_path = search_path / subdir
+        search_path = (source_root / subdir).resolve()
+        try:
+            search_path.relative_to(source_root)
+        except ValueError:
+            return "Error: Mathlib subdirectory escapes the source root"
 
     if not search_path.exists():
         return f"Error: Path not found: {search_path}"
@@ -230,8 +235,15 @@ def read_mathlib_file(
     if not mathlib_path:
         return "Error: Mathlib not found"
 
-    full_path = mathlib_path / file_path
-    if not full_path.exists():
+    source_root = (mathlib_path / "Mathlib").resolve()
+    full_path = (mathlib_path / file_path).resolve()
+    try:
+        full_path.relative_to(source_root)
+    except ValueError:
+        return "Error: Mathlib file escapes the source root"
+    if full_path.suffix != ".lean":
+        return "Error: only Mathlib .lean source files may be read"
+    if not full_path.is_file():
         return f"Error: File not found: {file_path}"
 
     try:

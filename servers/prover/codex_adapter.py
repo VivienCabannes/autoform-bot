@@ -50,10 +50,38 @@ logger = logging.getLogger(__name__)
 
 #: The codex binary (overridable so a pinned path / wrapper can be used).
 DEFAULT_CODEX_BIN = os.environ.get("AUTOFORM_CODEX_BIN", "codex")
-#: Full autonomy (edit files + run ``lake``) — codex's analogue of Claude's
-#: ``--dangerously-skip-permissions``. Pass ``autonomy_args=[]`` to run codex under
-#: its default approvals/sandbox instead.
-DEFAULT_AUTONOMY_ARGS = ["--dangerously-bypass-approvals-and-sandbox"]
+#: Safe non-interactive default: edits and Lean commands are allowed only inside
+#: the selected workspace. Codex documents the bypass flag for externally
+#: sandboxed environments; Autoform enables it only through the explicit unsafe
+#: opt-in below.
+DEFAULT_AUTONOMY_ARGS = ["--sandbox", "workspace-write"]
+
+
+def _default_autonomy_args() -> list[str]:
+    if os.environ.get("AUTOFORM_UNSAFE_FULL_ACCESS") == "1":
+        logger.warning(
+            "AUTOFORM_UNSAFE_FULL_ACCESS=1: Codex approvals and sandbox are bypassed"
+        )
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return list(DEFAULT_AUTONOMY_ARGS)
+
+
+def _resume_autonomy_args(args: list[str]) -> list[str]:
+    """Drop first-turn-only options from ``codex exec resume`` arguments.
+
+    Current Codex resumes inherit the session sandbox.  The resume subcommand
+    accepts the dangerous bypass flag but not ``--sandbox <mode>`` itself.
+    """
+    result: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] == "--sandbox":
+            index += 2
+            continue
+        result.append(args[index])
+        index += 1
+    return result
+
 
 # The SAME no-cheating / honest-FAILED contract the Claude backend states, framed
 # for codex (no separate system-prompt flag, so it is inlined into the first turn) —
@@ -145,8 +173,9 @@ class CodexAdapter(ProverAdapter):
 
     Args mirror :class:`~servers.prover.claude_adapter.ClaudeAdapter`. ``runner`` is
     injectable ``(args, env, cwd) -> Iterator[str]`` (tests pass a fake so no live
-    ``codex`` runs). ``autonomy_args`` defaults to codex's full-access flag (parity
-    with Claude's ``--dangerously-skip-permissions``).
+    ``codex`` runs). ``autonomy_args`` defaults to a workspace-write sandbox.
+    Set ``AUTOFORM_UNSAFE_FULL_ACCESS=1`` only when an external sandbox provides
+    the missing boundary.
     """
 
     name = "codex"
@@ -168,7 +197,9 @@ class CodexAdapter(ProverAdapter):
         self._model = model
         self._system_prompt = system_prompt
         self._codex_bin = codex_bin
-        self._autonomy_args = list(autonomy_args if autonomy_args is not None else DEFAULT_AUTONOMY_ARGS)
+        self._autonomy_args = list(
+            autonomy_args if autonomy_args is not None else _default_autonomy_args()
+        )
         self._extra_args = list(extra_args or [])
         self._max_wait_seconds = max_wait_seconds
         self._runner = runner or _subprocess_line_runner
@@ -254,10 +285,15 @@ class CodexAdapter(ProverAdapter):
         args = [self._codex_bin, "exec"]
         if resume and state.session_id:
             args += ["resume", state.session_id]
-        args += ["--json"]
+        args += ["--json", "--skip-git-repo-check"]
         if state.model:
             args += ["-m", state.model]
-        args += self._autonomy_args + state.extra_args + [prompt]
+        autonomy = (
+            _resume_autonomy_args(self._autonomy_args)
+            if resume
+            else self._autonomy_args
+        )
+        args += autonomy + state.extra_args + [prompt]
 
         for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)):
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None

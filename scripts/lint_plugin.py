@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-"""Static lint for the autoform / niket-dev Claude Code plugin (root layout).
+"""Static lint for the host-neutral Autoform plugin (root layout).
 
-The plugin is markdown + JSON + TOML, so there is no logic to unit-test — but the
-artifacts can still rot: invalid JSON, an agent or skill missing frontmatter, a
-SKILL.md pointing at a `references/` file that was renamed, or a leftover mention
-of an agent/skill that a later PR removed or renamed. This script catches all of
-that with the standard library only (no PyYAML, no plugin package), so it runs in
-CI without installing anything.
+The plugin surface is Markdown + JSON + TOML and can rot independently of the
+Python suite: invalid manifests, non-portable skill frontmatter, broken
+hooks/MCP paths, or stale role references. This script catches those failures
+with the standard library only, so it runs without installing the package.
 
-This is the ROOT-LAYOUT variant: niket/dev is a root-level plugin (no `plugins/`
-dir), so `agents/`, `skills/`, `commands/`, and `.claude-plugin/` all sit at the
-repo root, and `marketplace.json` lists a single plugin whose `source` is `./`.
+This is a root-level plugin: host manifests, `agents/`, `skills/`, hooks, and MCP
+configuration all sit at the repository root.
 
 Checks (all stdlib):
   - `.claude-plugin/marketplace.json` is valid JSON with `name`/`plugins`, and
@@ -28,7 +25,7 @@ Checks (all stdlib):
   - At least one agent and one skill were actually checked (so wholesale
     deletion/renaming of `agents/` or `skills/` cannot produce a vacuous pass).
 
-Exit code 0 = clean, 1 = at least one error. Run: python scripts/lint_plugin.py
+Exit code 0 = clean, 1 = at least one error. Run: python3 scripts/lint_plugin.py
 """
 from __future__ import annotations
 
@@ -45,6 +42,16 @@ REPO_ROOT = SCRIPT.parents[1]            # root-level plugin: scripts/.. == repo
 # straggler reference is caught. Empty on the pristine niket/dev tree.
 REMOVED_AGENTS: tuple[str, ...] = ()
 REMOVED_SKILLS: tuple[str, ...] = ()
+EXPECTED_MCP_SERVERS = frozenset(
+    {
+        "lean-informal-planner-mathlib",
+        "autoform-repl",
+        "autoform-lsp",
+        "autoform-aristotle",
+        "autoform-prover",
+        "autoform-zulip",
+    }
+)
 
 errors: list[str] = []
 checks = 0
@@ -152,6 +159,86 @@ def check_plugin_json() -> None:
     checks += 1
     if not re.match(r"^\d+\.\d+\.\d+", str(version)):
         err(f"plugin.json version is not semver-shaped: {version!r}")
+    servers = data.get("mcpServers")
+    checks += 1
+    if not isinstance(servers, dict):
+        err(".claude-plugin/plugin.json: mcpServers must be an object")
+    elif set(servers) != EXPECTED_MCP_SERVERS:
+        err(
+            ".claude-plugin/plugin.json: MCP server set differs from the "
+            f"portable contract (got {', '.join(sorted(servers))})"
+        )
+    root_mcp = load_json(REPO_ROOT / ".mcp.json")
+    if root_mcp is not None:
+        root_servers = root_mcp.get("mcpServers")
+        checks += 1
+        if not isinstance(root_servers, dict) or set(root_servers) != EXPECTED_MCP_SERVERS:
+            err(".mcp.json: MCP server set differs from the portable contract")
+
+
+def check_codex_plugin() -> None:
+    """Validate Codex's manifest and portable MCP configuration."""
+    global checks
+    manifest_path = REPO_ROOT / ".codex-plugin" / "plugin.json"
+    data = load_json(manifest_path)
+    if data is None:
+        return
+    for key in ("name", "version", "description", "skills", "mcpServers"):
+        checks += 1
+        if key not in data:
+            err(f".codex-plugin/plugin.json missing required key: {key}")
+    claude = load_json(REPO_ROOT / ".claude-plugin" / "plugin.json")
+    if claude is not None:
+        checks += 1
+        if data.get("version") != claude.get("version"):
+            err(
+                "Claude and Codex plugin versions differ: "
+                f"{claude.get('version')!r} != {data.get('version')!r}"
+            )
+    skills = data.get("skills")
+    if isinstance(skills, str):
+        checks += 1
+        if not (REPO_ROOT / skills).is_dir():
+            err(f"Codex skills path does not resolve: {skills!r}")
+    # Current Codex discovers this default plugin-bundled location without a
+    # manifest override; it also satisfies older ingestion validators that do
+    # not yet accept the documented `hooks` manifest field.
+    hook_path = REPO_ROOT / "hooks" / "hooks.json"
+    hook_data = load_json(hook_path)
+    if hook_data is not None:
+        checks += 1
+        if not isinstance(hook_data.get("hooks"), dict):
+            err(f"{rel(hook_path)}: top-level hooks object is missing")
+        rendered_hooks = json.dumps(hook_data)
+        checks += 1
+        if "${PLUGIN_ROOT}/hooks/session-start" not in rendered_hooks:
+            err(
+                f"{rel(hook_path)}: SessionStart does not resolve through "
+                "the plugin-root environment"
+            )
+        checks += 1
+        if not (REPO_ROOT / "hooks" / "session-start").is_file():
+            err(f"{rel(hook_path)}: hooks/session-start does not exist")
+    mcp_rel = data.get("mcpServers")
+    if not isinstance(mcp_rel, str):
+        return
+    mcp_path = REPO_ROOT / mcp_rel
+    mcp = load_json(mcp_path)
+    if mcp is None:
+        return
+    servers = mcp.get("mcpServers")
+    checks += 1
+    if not isinstance(servers, dict) or not servers:
+        err(f"{rel(mcp_path)}: mcpServers must be a non-empty object")
+        return
+    checks += 1
+    if set(servers) != EXPECTED_MCP_SERVERS:
+        err(f"{rel(mcp_path)}: MCP server set differs from the portable contract")
+    for name, config in servers.items():
+        checks += 1
+        if not isinstance(config, dict) or not config.get("command"):
+            err(f"{rel(mcp_path)}: server {name!r} has no command")
+            continue
 
 
 def check_agents() -> int:
@@ -191,6 +278,12 @@ def check_skills() -> int:
         for key in ("name", "description"):
             if key not in fm:
                 err(f"{rel(skill_md)}: skill frontmatter missing `{key}`")
+        extras = set(fm) - {"name", "description"}
+        if extras:
+            err(
+                f"{rel(skill_md)}: non-portable skill frontmatter key(s): "
+                f"{', '.join(sorted(extras))}"
+            )
     return count
 
 
@@ -276,6 +369,7 @@ def main() -> int:
         return 1
     check_marketplace()
     check_plugin_json()
+    check_codex_plugin()
     n_agents = check_agents()
     n_skills = check_skills()
     check_commands()

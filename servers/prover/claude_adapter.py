@@ -1,9 +1,9 @@
 """Claude-Max adapter — drives a headless ``claude -p`` worker as a prover backend.
 
-This is the **default** backend: a full Claude Code session running headless
-(``claude -p``), so the prover can use the project's ``autoform-repl`` /
-``autoform-lsp`` / ``autoform-mathlib`` MCP tools to compile-to-iterate exactly as
-the in-session ``autoform-worker`` does. It runs on the **Claude Max
+This is the Claude Max backend: a full Claude Code session running headless
+(``claude -p``), so the prover can edit the project and compile-to-iterate with
+allowlisted ``lake``/``lean`` commands (plus MCP diagnostics when available),
+just as the in-session ``autoform-worker`` does. It runs on the **Claude Max
 subscription** — every ``claude`` invocation has ``ANTHROPIC_API_KEY`` scrubbed
 from its environment, so it is billed to the subscription, never the API.
 
@@ -68,19 +68,46 @@ logger = logging.getLogger(__name__)
 # Default model for the headless worker (overridable via ctor / env).
 DEFAULT_MODEL = "opus"
 
-#: Full autonomy for the headless worker (edit files + run ``lake``/git) — without
-#: this a bare ``claude -p`` child can approve nothing and cannot Edit/Write/Bash,
-#: so the WORKER_SYSTEM_PROMPT's compile-to-iterate loop is impossible. The same
-#: flag the dispatch runner (PR #13) and codex's ``DEFAULT_AUTONOMY_ARGS`` analogue
-#: use. Pass ``autonomy_args=[]`` to run under the default permission prompts.
-DEFAULT_AUTONOMY_ARGS = ["--dangerously-skip-permissions"]
+#: Safe non-interactive default. ``dontAsk`` hard-denies tools that are neither
+#: built-in read-only operations nor explicitly allowed. Bash is scoped to Lean
+#: checks, read-only search/git inspection, and target-directory creation.
+#: Compound-command parsing applies every subcommand's rule independently.
+DEFAULT_AUTONOMY_ARGS = [
+    "--permission-mode",
+    "dontAsk",
+    "--allowedTools",
+    (
+        "Read,Grep,Glob,Edit,Write,"
+        "Bash(lake build *),Bash(lake env lean *),Bash(lean *),"
+        "Bash(rg *),Bash(git status *),Bash(git diff *),Bash(mkdir *)"
+    ),
+]
+SESSION_ISOLATION_ARGS = [
+    # Keep subscription/keychain authentication (unlike --bare) while excluding
+    # repository-controlled settings, hooks, and skill expansion.
+    "--setting-sources",
+    "user",
+    "--settings",
+    '{"disableAllHooks":true}',
+    "--disable-slash-commands",
+]
+
+
+def _default_autonomy_args() -> list[str]:
+    if os.environ.get("AUTOFORM_UNSAFE_FULL_ACCESS") == "1":
+        logger.warning(
+            "AUTOFORM_UNSAFE_FULL_ACCESS=1: Claude permission checks are bypassed"
+        )
+        return ["--dangerously-skip-permissions"]
+    return list(DEFAULT_AUTONOMY_ARGS)
 
 
 def _default_mcp_config() -> str | None:
     """Auto-discover the MCP config for the headless worker.
 
-    The worker discipline promises the ``autoform-repl`` / ``autoform-lsp`` MCP
-    tools, so the child needs a ``--mcp-config``. Resolution order:
+    The worker can use ``autoform-repl`` / ``autoform-lsp`` MCP tools when those
+    optional servers are implemented, so the child receives a ``--mcp-config``.
+    Direct ``lake``/``lean`` verification remains authoritative. Resolution order:
 
     1. ``AUTOFORM_MCP_CONFIG`` env var (explicit override), else
     2. the plugin's own ``.mcp.json`` at the repo root relative to this package,
@@ -100,11 +127,15 @@ def _default_mcp_config() -> str | None:
 # (agents/autoform-worker.md), assembled from the shared skeleton in ``_cli_common``
 # so it cannot drift from the Codex backend's copy.
 WORKER_SYSTEM_PROMPT = build_worker_prompt(
-    tools_clause="via the autoform-repl / autoform-lsp MCP tools",
+    tools_clause=(
+        "with direct `lake env lean` / `lake build` commands "
+        "(and MCP diagnostics when available)"
+    ),
     extra_hyp_clause=", no pinned-general parameter",
     billing_paragraph=(
-        "Billing: scrub `ANTHROPIC_API_KEY` from every subprocess you spawn (`env -u "
-        "ANTHROPIC_API_KEY …`) so no `lake`/`git`/script child can bill the Anthropic API.\n\n"
+        "Billing: the parent process has already removed `ANTHROPIC_API_KEY` and "
+        "`ANTHROPIC_AUTH_TOKEN` from your environment. Do not inspect or manipulate "
+        "authentication; invoke the allowlisted Lean commands directly.\n\n"
     ),
     repl_word="REPL ",
     build_phrase="build will not run",
@@ -205,10 +236,10 @@ class ClaudeAdapter(ProverAdapter):
         system_prompt: The worker discipline (defaults to
             :data:`WORKER_SYSTEM_PROMPT`).
         autonomy_args: Permission flags for the headless worker (defaults to
-            :data:`DEFAULT_AUTONOMY_ARGS`, i.e. ``--dangerously-skip-permissions``
-            — without it the child cannot Edit/Write/Bash). ``[]`` disables.
+            :data:`DEFAULT_AUTONOMY_ARGS`, i.e. locked-down ``dontAsk`` plus an
+            explicit tool allowlist). ``[]`` disables.
         mcp_config: Path passed to ``--mcp-config`` so the worker gets the
-            ``autoform-repl``/``autoform-lsp`` tools its discipline promises.
+            optional ``autoform-repl``/``autoform-lsp`` tools.
             ``None`` (default) auto-discovers via :func:`_default_mcp_config`
             (``AUTOFORM_MCP_CONFIG`` env, else the plugin's own ``.mcp.json``);
             ``""`` disables the flag entirely.
@@ -242,7 +273,9 @@ class ClaudeAdapter(ProverAdapter):
     ) -> None:
         self._model = model
         self._system_prompt = system_prompt
-        self._autonomy_args = list(autonomy_args if autonomy_args is not None else DEFAULT_AUTONOMY_ARGS)
+        self._autonomy_args = list(
+            autonomy_args if autonomy_args is not None else _default_autonomy_args()
+        )
         self._mcp_config = _default_mcp_config() if mcp_config is None else (mcp_config or None)
         self._extra_args = list(extra_args or [])
         self._max_wait_seconds = max_wait_seconds
@@ -357,12 +390,23 @@ class ClaudeAdapter(ProverAdapter):
             args += ["--resume", state.session_id]
         elif not resume:
             args += ["--append-system-prompt", self._system_prompt]
-        args += self._autonomy_args
+        args += SESSION_ISOLATION_ARGS + self._autonomy_args
         if self._mcp_config:
-            args += ["--mcp-config", self._mcp_config]
+            args += ["--strict-mcp-config", "--mcp-config", self._mcp_config]
         args += state.extra_args
 
-        for obj in _iter_json_lines(self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)):
+        env = _scrubbed_env()
+        plugin_root = str(Path(__file__).resolve().parents[2])
+        # The shared headless MCP config uses Claude's documented variable.
+        # Set it explicitly because a Claude worker may be launched by Codex or
+        # a standalone dispatcher rather than from a Claude plugin session.
+        env.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
+        env.setdefault("AUTOFORM_PLUGIN_ROOT", plugin_root)
+        env["LEAN_PROJECT_DIR"] = state.project_dir
+        env.setdefault("MCP_CONNECTION_NONBLOCKING", "true")
+        for obj in _iter_json_lines(
+            self._runner(args, env, state.project_dir, state.deadline)
+        ):
             # Capture the session id (emitted on the ``system: init`` line and the
             # ``result`` line) so a steer can resume this exact conversation.
             sid = obj.get("session_id")

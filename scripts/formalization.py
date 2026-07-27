@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -188,6 +189,24 @@ def ledger_path_for(project_dir: str | Path) -> Path:
     return Path(project_dir) / LEDGER_RELPATH
 
 
+@contextlib.contextmanager
+def _usage_lock(project_dir: str | Path):
+    """Serialize ledger appends and derived-manifest refreshes per project."""
+    state_dir = Path(project_dir) / ".autoform"
+    if state_dir.is_symlink():
+        raise ValueError(f"usage state directory is a symlink: {state_dir}")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "usage.lock"
+    if lock_path.is_symlink():
+        raise ValueError(f"usage lock is a symlink: {lock_path}")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def record_run(project_dir: str | Path, entry: dict[str, Any]) -> Path:
     """Append one run's usage record to the project ledger (JSONL, append-only).
 
@@ -196,10 +215,12 @@ def record_run(project_dir: str | Path, entry: dict[str, Any]) -> Path:
     directory exists and the line is one valid JSON object.
     """
     path = ledger_path_for(project_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(entry, ensure_ascii=False, default=str)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    with _usage_lock(project_dir):
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
     return path
 
 
@@ -426,8 +447,12 @@ def _strip_stamp(text: str) -> str:
     return "\n".join(ln for ln in text.splitlines() if _STAMP_PREFIX not in ln)
 
 
-def update_formalization(project_dir: str | Path, *, count_lean_sorries: bool = True,
-                         create_if_missing: bool = False) -> Path | None:
+def _update_formalization_unlocked(
+    project_dir: str | Path,
+    *,
+    count_lean_sorries: bool = True,
+    create_if_missing: bool = False,
+) -> Path | None:
     """Refresh the machine-owned fields from the ledger; no-op when unchanged.
 
     Returns the yaml path when written, ``None`` when absent (and not created)
@@ -465,6 +490,17 @@ def update_formalization(project_dir: str | Path, *, count_lean_sorries: bool = 
             return None  # timestamp-only change: skip the write entirely
     write_formalization(project_dir, data)
     return path
+
+
+def update_formalization(project_dir: str | Path, *, count_lean_sorries: bool = True,
+                         create_if_missing: bool = False) -> Path | None:
+    """Refresh the derived manifest while excluding concurrent ledger writers."""
+    with _usage_lock(project_dir):
+        return _update_formalization_unlocked(
+            project_dir,
+            count_lean_sorries=count_lean_sorries,
+            create_if_missing=create_if_missing,
+        )
 
 
 # --------------------------------------------------------------------------- init

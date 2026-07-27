@@ -1,65 +1,69 @@
-# Codex support: current state and what a full port would take
+# Codex support
 
-**Status: Claude Code is the supported harness. Codex can run part of the stack today; full parity is a deliberate refactor, not a file-format change.** This note explains why, so the decision to build it (or not) is made with eyes open.
+Codex is a first-class Autoform host and prover backend.
 
-## The plugin is two layers
+The earlier version of this document treated skills, MCP servers, and native
+subagents as unconfirmed or absent in Codex. That premise is obsolete. Current
+Codex releases support plugin skills and MCP servers, native parallel subagents,
+project-scoped custom agents in `.codex/agents/*.toml`, steering, resumable work,
+and structured headless output.
 
-Everything autoform does splits cleanly into a harness-agnostic core and a Claude-Code-native orchestration layer. Only the second is Claude-specific.
+## What parity means
 
-### Layer 1 — deterministic core (already harness-agnostic)
-Plain Python, no model in the loop; runs identically no matter what launches it:
+Claude Code and Codex run the same Autoform skills against the same durable
+artifacts:
 
-- `scripts/dispatch_runner.py` — the parallel review-jury + prover-worker engine
-- `scripts/serve_review.py` — the review dashboard (a stdlib HTTP server)
-- `scripts/dispatch_queue.py`, `scripts/merge_node.py` — the task queue + the single graph writer
-- `servers/prover/verify.py` — the kernel honesty gate (`lake build` + `#print axioms`)
-- `servers/prover/driver.py` over `ProverAdapter` (`base.py`) — swappable backends: `claude`, `aristotle`, `codex`, `openai`/`avocado`
-- the `graph.json` DAG format
+- `graph.json` and node prose;
+- `task_queue.json` and the activity feed;
+- `review_status.json` and shared rubric thresholds;
+- the unified prover driver, event model, steering policy, and Lean verification
+  gate.
 
-Because of this, **the prove → verify → jury → dashboard loop already works from Codex** via `dispatch_runner.py --backend codex` (and `openai`/`avocado`). Nothing here needs porting.
+Each host still uses its native execution surface. Claude consumes the plugin's
+`agents/*.md`. Autoform's setup installs equivalent namespaced role agents under
+the target project's `.codex/agents/` for Codex. When the active Codex spawn
+surface has no custom-role selector—or the current task predates installation—
+the orchestrator spawns a generic native subagent with the complete canonical
+role prompt inlined. It never launches `codex exec` or `claude -p` to imitate
+native delegation.
 
-### Layer 2 — AI-orchestration (Claude-Code-native)
-This is what `/autoform:setup` and `/autoform:orchestrate` *are*, and it is built entirely from Claude Code primitives:
+Headless work is separate. `dispatch_runner.py` can use Claude or Codex for the
+jury and Claude, Codex, Aristotle, OpenAI, or Avocado for proof workers. Those
+adapters normalize results at Autoform's existing contracts; they do not replace
+the native interactive workflow.
 
-- **`.md` commands** whose body is a procedural algorithm the model executes (with `allowed-tools`, arguments).
-- **The Skill system** — `setup` invokes the `plan` / `make-project` / `plan-view` Skills (model-invoked `SKILL.md` procedures).
-- **The `Task` subagent tool** — the plan pipeline and `orchestrate` spawn ~8 subagent types (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`, `holistic-reviewer`, `source-searcher`, plus the jury reviewers), defined as `agents/*.md`, launched in parallel, results merged via `merge_node.py`.
-- **`${CLAUDE_PLUGIN_ROOT}`** and the `.mcp.json` MCP servers.
+## Install the Codex role agents
 
-None of these has a drop-in Codex equivalent.
+From the Autoform plugin root:
 
-## What Codex offers today (and where it differs)
+```bash
+uv run python scripts/install_host_agents.py install \
+  --host codex --project /path/to/LeanProject
+```
 
-The plugin already ships a Codex surface: `.codex-plugin/plugin.json` and a Codex-format command (`commands/zulip.toml`), and `make install-codex` wires a local Codex marketplace.
+The command is idempotent and preflights the complete install before writing. It
+updates or removes only files carrying Autoform's generated marker and refuses
+to overwrite user-managed agent files. Start a new Codex task rooted and trusted
+in the project to discover newly installed roles; prompt inlining covers the
+setup task itself.
 
-- **Commands:** Codex commands are `.toml` **prompt templates** (`description` + `prompt`), not the procedural, tool-carrying `.md` commands Claude uses.
-- **Skills:** no equivalent. The `plan`/`make-project`/`plan-view` skill logic has no Codex host.
-- **Subagents:** Codex has no confirmed drop-in for Claude's `Task` tool (spawn a sub-agent with its own system prompt + tools, return structured output). **[open question — verify]** the closest is driving multiple `codex exec` processes from a script, which is exactly the pattern `dispatch_runner` already uses for the jury/prover.
-- **Plugin root / MCP:** Codex uses its own plugin-root convention and MCP wiring **[verify]**, not `${CLAUDE_PLUGIN_ROOT}` / the Claude `.mcp.json`.
+## Permission model
 
-So adding `setup.toml`/`orchestrate.toml` gets you the *names* in Codex, but a `.toml` prompt cannot reproduce the Skill- and Task-driven procedure.
+Codex workers default to `workspace-write`; jury processes use `read-only`.
+Autoform does not use `--dangerously-bypass-approvals-and-sandbox` unless
+`AUTOFORM_UNSAFE_FULL_ACCESS=1` is explicitly set.
 
-## Two ways to close the gap
+This is an authority reduction, not a sufficient isolation boundary for a
+hostile Lean repository: Lean elaboration and build scripts can execute code
+while a proof worker iterates. Use an external VM/container or equivalent
+sandbox for untrusted projects.
 
-### Cheap tier — Codex drives the engine
-Add `commands/setup.toml` / `orchestrate.toml` as Codex prompts that launch the deterministic engine (`dispatch_runner.py --backend codex --watch --workers`) and enqueue work. You get prove → verify → jury → dashboard from Codex, **without** the Claude-native planning/autonomy niceties. Small, mostly-there already.
+## Known external boundary
 
-### Elegant tier — a `SubagentAdapter`, mirroring `ProverAdapter`
-The proving layer already made backends pluggable behind one `driver.py`. Apply the same pattern one level up, to orchestration:
+Codex custom agents are documented at project/user scope, not as a plugin
+manifest field. Autoform therefore materializes the role TOML files during
+setup. If Codex adds documented plugin-bundled agent configuration, the
+generator can become a compatibility fallback.
 
-- a `SubagentAdapter` ABC — `spawn(spec, payload) -> Result` + a parallel `spawn_many(...)`, with `AgentSpec` (harness-neutral: name, system prompt, tools, model, output schema) and a structured `Result`;
-- two adapters — `ClaudeTaskAdapter` (wraps today's `Task autoform:<agent>` behavior) and `CodexExecAdapter` (parallel `codex exec` with the spec's prompt inlined, JSON out, reusing the codex/openai subprocess machinery);
-- the plan pipeline + orchestrate autonomy loop moved into **one harness-neutral Python driver** that calls `SubagentAdapter` for fan-out and the existing `dispatch_queue`/`merge_node`/`dispatch_runner` for the deterministic parts;
-- the ~8 agents expressed as **harness-neutral specs** (data) instead of `agents/*.md`, rendered per harness;
-- thin per-harness entrypoints: a Claude `.md` command and a Codex `.toml`.
-
-This is the version that makes Codex a true peer for the full pipeline. It should be phased and regression-safe: **Phase 1** introduces the abstraction plus `ClaudeTaskAdapter` with **no observable change to Claude behavior** (the 387-test suite stays green); later phases move the logic into the shared driver, add `CodexExecAdapter` + Codex agent specs + `.toml` commands, and verify end-to-end on Codex.
-
-## Open questions to resolve before building the elegant tier
-- Does Codex expose a native parallel-subagent primitive with structured output, or must the fan-out be driven as parallel `codex exec` processes from Python?
-- Does Codex support MCP servers, and how is the plugin root provided?
-- The jury judges currently hardcode `claude -p` (`dispatch_runner.run_judge`); a Codex-only run needs a Codex judge path (or keep the judges on Claude/Max).
-- Data-handling approval for sending textbook + Lean source to the `codex`/`avocado` endpoints (see `docs/avocado-handoff.md`).
-
-## Recommendation
-If Codex users only need the pipeline, ship the **cheap tier** first. The **elegant tier** is the right long-term design (it mirrors `ProverAdapter` and makes the orchestration harness-pluggable), but it is a multi-phase investment and depends on resolving the open questions above. This note is the record of that decision; no orchestration code has been changed to add Codex support.
+See [full-parity-architecture.md](full-parity-architecture.md) for the complete
+host/provider split, contracts, data-egress model, and validation matrix.

@@ -9,8 +9,12 @@ Focus: the orchestrator-owned lifecycle surface, so planner/review/mathcheck tas
   * ``done``/``fail`` — both clear a task from the worklist; the engine never does.
 """
 import json
+import multiprocessing
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "scripts"))
@@ -66,6 +70,7 @@ def test_status_banner_appears_then_clears_on_resolve(tmp_path, capsys):
     dq.main([str(proj), "status"])
     assert "AWAIT THE ORCHESTRATOR" in capsys.readouterr().out
     for tid in ("pl-1", "gr-1", "mc-1", "esc-1"):
+        dq.main([str(proj), "claim", tid])
         dq.main([str(proj), "done", tid])
     capsys.readouterr()                               # discard the done-line output
     dq.main([str(proj), "status"])
@@ -80,10 +85,157 @@ def test_done_and_fail_both_clear_from_the_worklist(tmp_path):
         {"id": "esc-1", "agent": "escalation", "node": "b", "status": "queued", "note": "x"},
     ]
     proj = _proj(tmp_path, tasks)
+    dq.main([str(proj), "claim", "pl-1"])
     dq.main([str(proj), "done", "pl-1"])
+    dq.main([str(proj), "claim", "esc-1"])
     dq.main([str(proj), "fail", "esc-1", "--reason", "dup"])
     by = {t["id"]: t for t in json.loads((proj / "task_queue.json").read_text())}
     assert by["pl-1"]["status"] == "done"
     assert by["esc-1"]["status"] == "failed"
     assert by["esc-1"]["result"] == "dup"
     assert dq._open_orchestrator_tasks(list(by.values())) == []   # both gone
+
+
+def test_lifecycle_transitions_are_guarded_and_retries_are_idempotent(tmp_path):
+    proj = _proj(tmp_path, [
+        {"id": "pl-1", "agent": "planner", "node": "C", "status": "queued"},
+    ])
+    assert dq.main([str(proj), "done", "pl-1"]) == 1
+    assert dq.main([str(proj), "claim", "pl-1"]) == 0
+    assert dq.main([str(proj), "claim", "pl-1"]) == 0
+    assert dq.main([str(proj), "done", "pl-1"]) == 0
+    assert dq.main([str(proj), "done", "pl-1"]) == 0
+    assert dq.main([str(proj), "claim", "pl-1"]) == 1
+
+
+def test_corrupt_queue_is_never_replaced_by_enqueue(tmp_path):
+    queue = tmp_path / "task_queue.json"
+    original = b'[{\"id\":\"survives\"},BROKEN'
+    queue.write_bytes(original)
+    assert dq.main([
+        str(tmp_path), "enqueue", "--agent", "planner", "--node", "C",
+    ]) == 2
+    assert queue.read_bytes() == original
+
+
+def test_duplicate_ids_and_duplicate_active_work_fail_closed(tmp_path):
+    queue = tmp_path / "task_queue.json"
+    queue.write_text(json.dumps([
+        {"id": "same", "agent": "planner", "node": "A", "status": "done"},
+        {"id": "same", "agent": "planner", "node": "B", "status": "queued"},
+    ]))
+    with pytest.raises(dq.QueueStateError, match="duplicate task id"):
+        dq.load_queue(queue)
+
+    queue.write_text(json.dumps([
+        {"id": "one", "agent": "planner", "node": "A", "status": "queued"},
+        {"id": "two", "agent": "planner", "node": "A", "status": "running"},
+    ]))
+    with pytest.raises(dq.QueueStateError, match="duplicate active task"):
+        dq.load_queue(queue)
+
+
+def test_reenqueue_after_completion_gets_a_new_id(tmp_path):
+    proj = _proj(tmp_path, [])
+    args = [str(proj), "enqueue", "--agent", "planner", "--node", "C"]
+    assert dq.main(args) == 0
+    first = dq.load_queue(proj / "task_queue.json")[0]["id"]
+    assert dq.main([str(proj), "claim", first]) == 0
+    assert dq.main([str(proj), "done", first]) == 0
+    assert dq.main(args) == 0
+    ids = [task["id"] for task in dq.load_queue(proj / "task_queue.json")]
+    assert ids == ["planner:C", "planner:C:2"]
+
+
+def _enqueue_process(project: str, index: int) -> None:
+    rc = dq.main([
+        project, "enqueue", "--agent", "planner", "--node", f"node-{index}",
+    ])
+    if rc:
+        raise SystemExit(rc)
+
+
+def test_cross_process_enqueue_stress_has_no_lost_updates(tmp_path):
+    _proj(tmp_path, [])
+    ctx = multiprocessing.get_context("fork")
+    processes = [
+        ctx.Process(target=_enqueue_process, args=(str(tmp_path), index))
+        for index in range(24)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    tasks = dq.load_queue(tmp_path / "task_queue.json")
+    assert len(tasks) == 24
+    assert {task["node"] for task in tasks} == {f"node-{index}" for index in range(24)}
+
+
+def test_concurrent_duplicate_enqueue_is_idempotent(tmp_path):
+    _proj(tmp_path, [])
+    results: list[int] = []
+
+    def enqueue() -> None:
+        results.append(dq.main([
+            str(tmp_path), "enqueue", "--agent", "planner", "--node", "same",
+        ]))
+
+    threads = [threading.Thread(target=enqueue) for _ in range(24)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive()
+    assert results == [0] * 24
+    tasks = dq.load_queue(tmp_path / "task_queue.json")
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == "planner:same"
+
+
+def test_queue_sync_preserves_native_host_subagents(tmp_path):
+    proj = _proj(tmp_path, [])
+    assert dq.main([
+        str(proj),
+        "orchestrator",
+        "--state",
+        "working",
+        "--phase",
+        "planning",
+        "--detail",
+        "split chapter",
+    ]) == 0
+    assert dq.main([
+        str(proj),
+        "agent-start",
+        "--role",
+        "splitter",
+        "--name",
+        "splitter:chapter-1",
+        "--target",
+        "chapter-1",
+    ]) == 0
+    assert dq.main([
+        str(proj),
+        "enqueue",
+        "--agent",
+        "worker",
+        "--node",
+        "lemma-1",
+    ]) == 0
+    assert dq.main([str(proj), "claim", "worker:lemma-1"]) == 0
+
+    feed = json.loads((proj / "agents_status.json").read_text())
+    by_name = {agent["name"]: agent for agent in feed["agents"]}
+    assert set(by_name) == {"splitter:chapter-1", "worker:lemma-1"}
+    assert by_name["splitter:chapter-1"]["managed_by"] == "native"
+    assert by_name["worker:lemma-1"]["managed_by"] == "queue"
+
+    assert dq.main([str(proj), "done", "worker:lemma-1"]) == 0
+    feed = json.loads((proj / "agents_status.json").read_text())
+    assert [agent["name"] for agent in feed["agents"]] == ["splitter:chapter-1"]
+    assert feed["orchestrator"]["phase"] == "planning"
+    assert feed["orchestrator"]["detail"] == "split chapter"
+    assert dq.main([
+        str(proj), "agent-done", "--name", "splitter:chapter-1",
+    ]) == 0
