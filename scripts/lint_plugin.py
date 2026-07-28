@@ -87,6 +87,7 @@ REQUIRED_INTERNAL_ASSETS = (
     "scripts/install_autoform.sh",
     "scripts/install_lean.sh",
     "scripts/make_project.sh",
+    "scripts/service_control.py",
     "scripts/workspace_inspector.py",
 )
 

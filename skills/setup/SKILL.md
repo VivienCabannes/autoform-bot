@@ -112,20 +112,33 @@ absolute path; do not depend on a variable exported by a previous shell call.
    reviews, and activity will be reset and that a timestamped snapshot will be
    retained under `<dispatch-project>/.autoform/snapshots/`.
 
-6. Start the dashboard before
-   planning so graph changes appear live. Use a free loopback port unless the
-   user supplied one. Reuse a server already serving this exact graph.
+6. Start the dashboard before planning so graph changes appear live. Use a free
+   loopback port unless the user supplied one. Reuse a service already serving
+   this exact project.
+
+   On macOS (including Codex desktop and Claude Code), always install the
+   project-scoped launchd service:
 
    ```bash
-   nohup uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python -u \
-     "<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/serve_review.py" \
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/service_control.py" start review \
+     --project "$DISPATCH_PROJECT" --plugin-root "<AUTOFORM_PLUGIN_ROOT>" \
      --graph "$DISPATCH_PROJECT/graph.json" --lean-root "$PROJECT_DIR" \
-     --port <PORT_OR_0> >"$DISPATCH_PROJECT/serve_review.log" 2>&1 &
+     --port <PORT_OR_0>
    ```
 
-   Use the requested port or `0` to let the OS choose a free port. Read the
-   server's first log line (it reports the actual bound port), verify the
-   process is still alive, and report `http://127.0.0.1:<actual-port>/`.
+   This command is idempotent, binds only to `127.0.0.1`, persists after the
+   assistant task ends, and automatically restarts after an unexpected exit.
+   It prints the actual URL and keeps logs under
+   `$DISPATCH_PROJECT/.autoform/logs/`. Do not substitute `nohup` on macOS:
+   assistant hosts may reap task-owned background processes.
+
+   On a non-macOS host, run `serve_review.py` as a foreground process using the
+   host's durable service facility. If none is available, the existing
+   `nohup ... serve_review.py ... &` command is an explicitly session-scoped
+   fallback; tell the user it will need to be restarted after the host session
+   ends. In every case, verify the loopback port is listening before reporting
+   the URL.
 
 7. Read and follow
    `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`, including its schema
@@ -141,7 +154,8 @@ absolute path; do not depend on a variable exported by a previous shell call.
 
 8. Read and follow
    `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to export and
-   build the blueprint. Visualization is part of Setup, not a separate command.
+   build and durably serve the blueprint. Visualization is part of Setup, not a
+   separate command.
 
 9. Report the dashboard URL, tier-1 and tier-2 counts, native role-agent install
    status, and the next step: run Orchestrate.

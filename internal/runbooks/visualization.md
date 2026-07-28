@@ -107,6 +107,22 @@ No LaTeX is required — the web build is pure-Python plasTeX.
 
 ## 5. Serve and open
 
+On macOS, use Autoform's project-scoped service rather than `make serve`:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/service_control.py" start blueprint \
+  --project <dispatch-project> --directory <out>/blueprint/web --port 8005
+```
+
+The service binds only to `127.0.0.1`, survives the assistant task ending, and
+restarts automatically after an unexpected exit. Repeating the command refreshes
+its configuration after a plugin or project move. Its logs are under
+`<dispatch-project>/.autoform/logs/`.
+
+On non-macOS hosts, run `make serve` under the host's durable service facility,
+or run it in the foreground for a session-scoped view:
+
 ```bash
 cd <out>
 make serve
@@ -116,7 +132,8 @@ This kills any existing server on port 8005 and starts a new one serving the
 built blueprint. The dependency graph uses WASM (d3-graphviz), which requires
 HTTP — opening the HTML via `file://` leaves the graph blank.
 
-Open the **dependency-graph page** at `http://localhost:8005/dep_graph_document.html`.
+Open the **dependency-graph page** at
+`http://127.0.0.1:8005/dep_graph_document.html`.
 
 Point out the **Tier dropdown** at the top: it switches between the coarse tier-1
 cluster map and the fine tier-2 statement graph. Clicking a tier-2 node opens its

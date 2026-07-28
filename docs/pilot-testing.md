@@ -132,6 +132,10 @@ The run is complete only when:
 
 Run these only on disposable copies:
 
+- On macOS, start both project services with `scripts/service_control.py`,
+  terminate each named launchd job once, and require a new PID plus a responding
+  loopback port. End the assistant task and confirm both URLs still respond from
+  a new task;
 - malformed or duplicate queue records must return a state error without
   changing the file bytes;
 - two dispatchers for one plan must leave the second one rejected by the
