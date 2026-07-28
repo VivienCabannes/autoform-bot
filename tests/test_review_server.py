@@ -148,6 +148,13 @@ def test_topology_in_home_boot(tmp_path):
     assert '"s1": ["d1", "d2"]' in boot
 
 
+def test_home_boot_includes_every_node_id_for_activity_target_validation(tmp_path):
+    boot = _boot(sv.render_home(_proj(tmp_path), "2", None))
+    assert "window.__RV_KINDS__ = " in boot
+    for node_id in ("cA", "s1", "s2", "d1", "d2"):
+        assert f'"{node_id}":' in boot
+
+
 def test_home_has_focus_banner_and_expanded_bar_containers(tmp_path):
     html = sv.render_home(_proj(tmp_path), "2", None).decode("utf-8")
     # reliable HTML mounts the client fills — not SVG-injected

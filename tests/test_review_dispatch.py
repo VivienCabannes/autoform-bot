@@ -196,6 +196,23 @@ def test_dashboard_backend_registry_covers_every_available_prover():
     assert options["openai"]["label"] == "Custom API (OpenAI-compatible)"
 
 
+def test_activity_panel_links_only_targets_that_are_graph_nodes():
+    """Document-range/native workflow targets must not become broken node links."""
+    javascript = (
+        _HERE.parent / "assets" / "review" / "review.js"
+    ).read_text(encoding="utf-8")
+    assert (
+        "Object.prototype.hasOwnProperty.call(home.kinds || {}, id)"
+        in javascript
+    )
+    assert (
+        'target, a.target_label || target, "rv-agent-target"'
+        in javascript
+    )
+    assert 'targetMarkup(t.node || "", nodeLbl, "rv-task-node")' in javascript
+    assert ".filter(isGraphNodeTarget)" in javascript
+
+
 # ---------------------------------------------------------------------------
 # live HTTP server fixture — exercises do_GET / do_POST routing + codes
 # ---------------------------------------------------------------------------

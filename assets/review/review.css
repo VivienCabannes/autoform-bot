@@ -414,6 +414,7 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
 .rv-agent-arrow { color: #b3ac9d; }
 .rv-agent-target { font-family: "SF Mono", Menlo, Consolas, monospace;
   font-size: 12px; }
+.rv-workflow-target { color: #6c665a; cursor: default; }
 
 /* role badges — distinct colors per role */
 .rv-rolebadge {

@@ -134,6 +134,23 @@
     return id;
   }
 
+  // Activity targets are broader than graph nodes: native planning/review agents
+  // may report a document range or other workflow description. Only real graph
+  // node ids may link to /node/<id>; contextual targets remain readable plain text.
+  function isGraphNodeTarget(id) {
+    return !!id && Object.prototype.hasOwnProperty.call(home.kinds || {}, id);
+  }
+  function targetMarkup(id, label, className) {
+    var text = label || id || "";
+    if (isGraphNodeTarget(id)) {
+      return "<a class='" + className + "' href='/node/"
+        + encodeURIComponent(id) + "'>" + escapeHtml(text) + "</a>";
+    }
+    return "<span class='" + className
+      + " rv-workflow-target' title='workflow target (not a graph node)'>"
+      + escapeHtml(text) + "</span>";
+  }
+
   // ---- home screen bootstrap ----
   function initHome() {
     var mount = document.getElementById("rv-graph");
@@ -931,7 +948,9 @@
     // Live pulse: the node(s) agents are actively working on (the live feed's
     // targets) — unchanged behavior, just sourced from dispatch.live now.
     var agents = (dispatch.live && dispatch.live.agents) || [];
-    var nextTargets = agents.map(function (a) { return a && a.target; }).filter(Boolean);
+    var nextTargets = agents
+      .map(function (a) { return a && a.target; })
+      .filter(isGraphNodeTarget);
     if (nextTargets.join("|") !== home.targets.join("|")) {
       home.targets = nextTargets;
       applyPulse();
@@ -1048,8 +1067,9 @@
           + "</span>";
         if (target) {
           html += " <span class='rv-agent-arrow'>→</span> "
-            + "<a class='rv-agent-target' href='/node/"
-            + encodeURIComponent(target) + "'>" + escapeHtml(target) + "</a>";
+            + targetMarkup(
+              target, a.target_label || target, "rv-agent-target"
+            );
         }
         html += "</div></li>";
       });
@@ -1082,9 +1102,7 @@
               ROLE_LABEL[t.agent] ? t.agent : "agent")
           + "'>" + escapeHtml(t.agent || "agent") + "</span>"
           + "<span class='rv-task-arrow'>→</span>"
-          + "<a class='rv-task-node' href='/node/"
-          + encodeURIComponent(t.node || "") + "' title='" + escapeHtml(nodeLbl)
-          + "'>" + escapeHtml(nodeLbl) + "</a>"
+          + targetMarkup(t.node || "", nodeLbl, "rv-task-node")
           + "</div>"
           + "<div class='rv-task-right'>"
           + "<span class='rv-chip rv-chip-" + escapeHtml(statusClass) + "'>"
