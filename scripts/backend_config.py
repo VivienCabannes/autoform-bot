@@ -36,14 +36,16 @@ from pathlib import Path
 # Known backends. ``available`` = an adapter exists in servers/prover today; ``prover``
 # = the id passed to the prove_node MCP tool.
 BACKENDS: dict[str, dict] = {
-    "max": {"label": "Claude Max", "available": True, "prover": "claude",
-            "billing": "Max subscription · no API tokens"},
+    "max": {"label": "Claude Code (Max subscription)", "available": True,
+            "prover": "claude",
+            "billing": "Claude Max subscription · API credentials disabled"},
     "aristotle": {"label": "Aristotle", "available": True, "prover": "aristotle",
                   "billing": "Harmonic · ARISTOTLE_API_KEY"},
     "codex": {"label": "Codex", "available": True, "prover": "codex",
               "billing": "Codex · its own auth (ChatGPT/OpenAI login)"},
-    "openai": {"label": "OpenAI-compatible API", "available": True, "prover": "openai",
-               "billing": "API · OPENAI_API_KEY (project data may leave the machine)"},
+    "openai": {"label": "Custom API (OpenAI-compatible)", "available": True,
+               "prover": "openai",
+               "billing": "Configured API credential · project data may leave the machine"},
     "avocado": {"label": "Meta Avocado", "available": True, "prover": "avocado",
                 "billing": "Meta API/gateway · configured credential (project data may leave the machine)"},
 }
@@ -138,7 +140,10 @@ def main(argv=None) -> int:
             for name, m in BACKENDS.items():
                 mark = "*" if name == cur else " "
                 planned = "" if m["available"] else "  (planned — adapter not yet implemented)"
-                print(f" {mark} {name:10} → prove_node backend={m['prover']:10} — {m['billing']}{planned}")
+                print(
+                    f" {mark} {name:10} {m['label']} "
+                    f"→ prove_node backend={m['prover']:10} — {m['billing']}{planned}"
+                )
             return 0
     except ValueError as error:
         ap.error(str(error))
@@ -149,7 +154,10 @@ def main(argv=None) -> int:
     b = set_backend(a.backend)
     m = BACKENDS[b]
     warn = "" if m["available"] else "  ⚠ adapter not yet implemented — dispatch will error until it lands"
-    print(f"backend set to '{b}' (prove_node backend={m['prover']}) — billing: {m['billing']}{warn}")
+    print(
+        f"backend set to '{b}' — {m['label']} "
+        f"(prove_node backend={m['prover']}) — billing: {m['billing']}{warn}"
+    )
     return 0
 
 

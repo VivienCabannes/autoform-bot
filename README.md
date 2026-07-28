@@ -107,10 +107,10 @@ require `allow_api_egress=true` after explicit approval for that project/run.
 
 | backend | what it is | auth / env | steering |
 |---|---|---|---|
-| `max` | headless Claude Code worker on your Max subscription | your Claude login (API key scrubbed → subscription billing) | gate-fold (live judge opt-in) |
+| `max` | **Claude Code (Max subscription)** — headless Claude Code worker | your Claude login (API credentials disabled → subscription billing) | gate-fold (live judge opt-in) |
 | `aristotle` | Harmonic's Aristotle prover API | `ARISTOTLE_API_KEY` + `uv sync --extra aristotle` | **in-flight** (`project.ask`) |
 | `codex` | OpenAI Codex CLI | codex's own auth | gate-fold (live judge opt-in) |
-| `openai` | any OpenAI-compatible endpoint | `AUTOFORM_OPENAI_BASE_URL` / `_MODEL` / `_KEY_VAR` | bounded local tool loop |
+| `openai` | **Custom API (OpenAI-compatible)** — direct Chat Completions endpoint, not the Codex CLI | `AUTOFORM_OPENAI_BASE_URL` / `_MODEL` / `_KEY_VAR` | bounded local tool loop |
 | `avocado` | explicitly configured Meta-compatible deployment | configured key variable via `AUTOFORM_AVOCADO_*` | bounded local tool loop |
 
 Check API configuration without sending project data with

@@ -55,20 +55,22 @@ project to pick up installed roles naturally.
 
 Run `set-backend` to inspect or persist one of:
 
-| Selection | Prover adapter | Billing/auth path |
-|---|---|---|
-| `max` | Claude CLI | Claude Max login |
-| `codex` | Codex CLI | Codex/OpenAI login |
-| `aristotle` | Aristotle API | `ARISTOTLE_API_KEY` |
-| `openai` | OpenAI-compatible API | configured key variable |
-| `avocado` | explicitly configured Meta-compatible deployment | configured key variable |
+| Selection | User-facing backend | Execution path | Billing/auth path |
+|---|---|---|---|
+| `max` | Claude Code (Max subscription) | Claude CLI | Claude Max login; API credentials disabled |
+| `codex` | Codex | Codex CLI | Codex/OpenAI login |
+| `aristotle` | Aristotle | Aristotle API | `ARISTOTLE_API_KEY` |
+| `openai` | Custom API (OpenAI-compatible) | direct Chat Completions requests with Autoform's bounded tool loop | configured key variable |
+| `avocado` | Meta Avocado | explicitly configured Meta-compatible deployment | configured key variable |
 
 With no persisted selection, orchestration defaults to the current interactive
 host (`codex` in Codex, `max` in Claude). Persisted choices always win: selecting
 `max` while running Codex still requires a working Claude CLI.
 
-OpenAI/Avocado URLs and model IDs are configuration, not guesses. Check them
-without sending project data:
+The custom API backend is not Codex: it bypasses the Codex CLI and sends direct
+Chat Completions requests to the configured provider. OpenAI/Avocado URLs and
+model IDs are configuration, not guesses. Check them without sending project
+data:
 
 ```bash
 uv run python scripts/provider_check.py <openai|avocado>
@@ -117,7 +119,7 @@ verdicts are immutable and override AI verdicts.
 
 ## Provider environment
 
-Generic OpenAI-compatible settings:
+Custom API (OpenAI-compatible) settings:
 
 ```text
 AUTOFORM_OPENAI_BASE_URL

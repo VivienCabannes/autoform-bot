@@ -15,6 +15,28 @@ def test_every_configured_backend_maps_explicitly():
     assert backend_config.prover_of("avocado") == "avocado"
 
 
+def test_user_facing_labels_distinguish_cli_and_direct_api_backends():
+    assert backend_config.BACKENDS["max"]["label"] == (
+        "Claude Code (Max subscription)"
+    )
+    assert backend_config.BACKENDS["openai"]["label"] == (
+        "Custom API (OpenAI-compatible)"
+    )
+
+
+def test_list_and_set_show_user_facing_labels(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AUTOFORM_CONFIG", str(tmp_path / "config.json"))
+
+    assert backend_config.main(["list", "--fallback", "codex"]) == 0
+    listed = capsys.readouterr().out
+    assert "Claude Code (Max subscription)" in listed
+    assert "Custom API (OpenAI-compatible)" in listed
+
+    assert backend_config.main(["set", "max"]) == 0
+    selected = capsys.readouterr().out
+    assert "backend set to 'max' — Claude Code (Max subscription)" in selected
+
+
 def test_unknown_backend_fails_closed():
     with pytest.raises(ValueError, match="unknown backend"):
         backend_config.prover_of("codxe")

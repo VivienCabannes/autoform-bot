@@ -2,8 +2,9 @@
 name: set-backend
 description: >-
   Show or persist the Autoform proof-worker backend and its billing/data path.
-  Use when the user asks to choose, change, inspect, or configure Claude Max,
-  Aristotle, Codex, OpenAI, or Avocado as the prover.
+  Use when the user asks to choose, change, inspect, or configure Claude Code
+  on Max, Aristotle, Codex, a custom OpenAI-compatible API, or Avocado as the
+  prover.
 ---
 
 # Set the proof-worker backend
@@ -24,11 +25,13 @@ uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
 
 Supported user-facing backends:
 
-- `max`: Claude CLI authenticated by the user's Max session.
+- `max`: **Claude Code (Max subscription)**. Launches the Claude CLI using the
+  user's Max session and disables Anthropic API credentials for that worker.
 - `aristotle`: Harmonic Aristotle via `ARISTOTLE_API_KEY`.
 - `codex`: Codex CLI using its configured OpenAI/ChatGPT authentication.
-- `openai`: an OpenAI-compatible endpoint, configured by
-  `AUTOFORM_OPENAI_*`.
+- `openai`: **Custom API (OpenAI-compatible)**. Autoform calls a configured
+  Chat Completions endpoint directly and runs its own bounded tool loop; this is
+  not the Codex CLI. Configure it with `AUTOFORM_OPENAI_*`.
 - `avocado`: Meta's OpenAI-compatible deployment, configured by
   `AUTOFORM_AVOCADO_*`.
 
