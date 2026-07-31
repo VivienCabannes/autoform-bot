@@ -39,7 +39,7 @@ flowchart LR
     D -->|verified| E[3-judge review jury<br/>faithfulness · proof integrity · style]
     E --> F[review dashboard<br/>human sign-off]
     B -.-> G[interactive blueprint]
-    H[/autoform:set-backend] -.-> C
+    H["/autoform:set-backend"] -.-> C
 ```
 
 - **Plan** — a two-phase pipeline reads your sources and builds a tiered DAG:
