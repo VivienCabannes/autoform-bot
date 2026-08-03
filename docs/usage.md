@@ -21,7 +21,7 @@ resuming a project.
 For repository development:
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra zulip
 uv run python -m pytest -q
 python3 scripts/lint_plugin.py
 ```

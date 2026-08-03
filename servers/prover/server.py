@@ -5,17 +5,17 @@ with the chosen backend and writes the proof into the node. Supported adapters
 are Claude, Aristotle, Codex, Muse, OpenAI-compatible, and Avocado. The **driver,
 event contract, and verification gate are the same**; only the adapter differs.
 
-This is the unified replacement for PR C's one-shot ``aristotle_delegate_node``
-and PR D's in-session worker: both are now adapters behind one driver.
+This replaces the earlier one-shot Aristotle entry and in-session worker: both
+are now adapters behind one driver.
 
 HARD CONSTRAINT: ``prove_node`` ONLY writes a proof into a node. It does not
 review, score, taint, or touch ``review_status.json`` — the jury (PR E) and the
 review surface (PR A) consume the proof downstream. Nothing here imports any
 review/sidecar machinery.
 
-``aristotlelib`` is imported lazily (only when ``backend="aristotle"`` is actually
-used), so this server — and ``create_prover_server()`` — import cleanly without
-the opt-in extra.
+``aristotlelib`` is imported lazily only when ``backend="aristotle"`` is used,
+so starting the unified server does not initialize Aristotle or require its API
+credentials.
 """
 
 from __future__ import annotations
@@ -46,8 +46,7 @@ def _make_adapter(
         return ClaudeAdapter(extra_args=extra_args, mcp_config=mcp_config,
                              max_wait_seconds=max_wait_seconds)
     if backend == "aristotle":
-        # Lazy import: only pulled in when the Aristotle backend is actually
-        # selected, so the server imports without the ``aristotle`` extra.
+        # Lazy import: only initialize Aristotle when that backend is selected.
         from .aristotle_adapter import AristotleAdapter
 
         return AristotleAdapter(graph_path=graph_path, max_wait_seconds=max_wait_seconds)

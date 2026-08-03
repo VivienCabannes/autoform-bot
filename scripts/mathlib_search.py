@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Bash-callable Mathlib search — the same search the MCP server exposes, but
-usable by subagents.
+"""Bash-callable, stateless Mathlib source search for all agent roles.
 
-Plugin MCP tools are available only to the main orchestrator; subagents spawned
-via the Agent/Workflow tools do NOT inherit them, even when their definition
-lists `mcpServers:`. So `mathlib-checker`, `graph-reviewer`, and `splitter` would
-be blind to Mathlib if they relied on the MCP tools. This CLI gives them the
-identical search over the same resolved checkout, callable with Bash.
+Use Loogle for syntactic search and LeanExplore for semantic search first. This
+CLI verifies results against the project's resolved local Mathlib checkout and
+reads exact source ranges without starting a resident MCP server.
 
-It reuses servers/mathlib/core.py for both path resolution and search, so the
-MCP path and the Bash path can never drift.
+It reuses ``servers/mathlib/core.py`` for path resolution and search.
 
 Mathlib location is resolved exactly as the server does (see core.find_mathlib_path):
   1. $LEAN_PLANNER_MATHLIB or $MATHLIB_PATH (a dir containing Mathlib/)

@@ -2,40 +2,33 @@
 
 Use the right tool for the job, and know each tool's limits. Direct
 `lake env lean` checks are the portable baseline across Claude, Codex, and
-headless workers. The bundled REPL/LSP servers are compatibility stubs today;
-use a host-provided real Lean LSP/REPL when available, and otherwise use the
-direct commands below.
+headless workers. Autoform registers the real `lean-lsp-mcp` because proof
+state and language-server caches are stateful. Stateless search uses ordinary
+CLI and HTTP tools instead of resident MCP processes.
 
-## `autoform-repl` MCP — `run_lean_code`, `get_repl_status`
+## `lean-lsp-mcp` (stateful)
 
-- A production `run_lean_code(code, timeout?)` sends a snippet to a pooled Lean REPL and returns formatted
-  diagnostics (status, errors, `sorry` goals, warnings). Imports are cached, so repeated calls
-  with the same imports reuse the environment and stay fast.
-- The REPL environment has **only `import Mathlib`** — it cannot see your project's custom
-  definitions. For a fragment that references custom defs, paste those defs into the snippet, or
-  check the actual file with the LSP instead.
-- When implemented, use it to prototype: test fragments, inspect types with `#check`, probe for lemmas
-  with `exact?` / `apply?` / `rw?`, and build a proof up incrementally — only write to the file
-  once a fragment compiles.
-- `get_repl_status()` reports pool capacity, memory, and shutdown state when a
-  production pool is installed. A “Not yet implemented” response means to fall
-  back immediately; it is not a proof failure.
+- `lean_goal` inspects goals before and after a tactic line. Use it often while
+  constructing a proof.
+- `lean_diagnostic_messages` checks the real project file, including custom
+  definitions and imports.
+- `lean_hover_info` and `lean_code_actions` expose types, documentation, and
+  resolved `Try this` edits.
+- `lean_multi_attempt` tries several tactics against one proof state without
+  changing the file.
+- `lean_run_code` checks a self-contained snippet with its own imports.
+- `lean_verify` checks theorem axioms. The deterministic verification gate is
+  still authoritative for accepting a proof.
 
-## `autoform-lsp` MCP — `lean_diagnostic_messages`, `lean_hover`
+## Stateless search
 
-- A production `lean_diagnostic_messages(file_path)` returns the language server's errors/warnings/info for a
-  real `.lean` file in the project — this is how you check a file that uses custom definitions
-  the REPL can't see.
-- `lean_hover(file_path, line, character)` (0-indexed) gives the type/info at a position when a
-  real LSP is installed — use it
-  to confirm what an expression elaborates to.
-
-## `mathlib` MCP — search before proving
-
-- `mathlib_grep` / `mathlib_find_name` / `mathlib_read_file` search the Mathlib checkout. Use
-  them to find an existing lemma before reproving it, and to read the exact signature.
-- **Do not read Mathlib source by absolute path** — go through these tools (or `grep` over the
-  checkout if MCP is unavailable).
+- Use `loogle '<query>'` for declaration names, subexpressions, and type shapes.
+- Use `lean-explore search '<description>'` for semantic natural-language search.
+- Use `python3 <plugin>/scripts/mathlib_search.py {name|grep|read|path} ...`
+  when results must be verified against the project's local Mathlib checkout.
+- Use Lean-native `exact?`, `apply?`, `simp?`, and `rw?` inside the project.
+- Use the Zulip Python API only when community discussion or naming history is
+  relevant; follow `internal/runbooks/zulip.md`.
 
 ## `lean_diagnostic_messages` / a single file vs full `lake build`
 
@@ -55,7 +48,7 @@ The infrastructure has a hard timeout for `lake build` on full projects. A large
   re-running `lake build`; avoid full-file diagnostics on huge files (they time out too).
   Minimize edits and avoid adding imports — each change invalidates the `.olean` cache for the
   file and its dependents. Use `set_option maxHeartbeats 400000` (or higher) for heavy proofs,
-  placed **before** the declaration. Prototype in a standalone snippet via `run_lean_code` rather
+  placed **before** the declaration. Prototype in a standalone snippet via `lean_run_code` rather
   than rebuilding a large file. Once the LSP confirms the declaration, submit — don't keep
   iterating against a timeout you can't fix.
 

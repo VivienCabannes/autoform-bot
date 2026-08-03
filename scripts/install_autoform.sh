@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Set up the full autoform environment.
-# Checks uv, Python deps, Lean 4, and optional Zulip access.
+# Checks uv, Lean LSP MCP, Python deps, Lean 4, and optional Zulip access.
 #
 # Usage: bash install-autoform.sh
 # Safe to re-run — skips steps that are already done.
@@ -37,32 +37,49 @@ else
 fi
 
 # =========================================================================
-# 2. Python dependencies (resolve all extras via uv)
+# 2. Lean LSP MCP (stateful proof goals and diagnostics)
+# =========================================================================
+log "Checking Lean LSP MCP"
+
+if command -v lean-lsp-mcp &>/dev/null; then
+  ok "$(lean-lsp-mcp --version 2>/dev/null | head -1)"
+else
+  log "Installing lean-lsp-mcp..."
+  if uv tool install lean-lsp-mcp && command -v lean-lsp-mcp &>/dev/null; then
+    ok "$(lean-lsp-mcp --version 2>/dev/null | head -1)"
+  else
+    fail "lean-lsp-mcp installation failed; stateful Lean tools are required"
+  fi
+fi
+
+# =========================================================================
+# 3. Python dependencies (resolve required extras via uv)
 # =========================================================================
 log "Checking Python dependencies"
 
 all_ok=true
 
-# Core (fastmcp — needed by every MCP server)
-if uv run --project "$AUTOFORM_RESOLVED_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')" 2>/dev/null; then
-  ok "fastmcp (core)"
+# Unified prover environment (includes every supported prover adapter)
+PROVER_ENV="$AUTOFORM_RESOLVED_ROOT/.venv-autoform-prover"
+if UV_PROJECT_ENVIRONMENT="$PROVER_ENV" uv run --project "$AUTOFORM_RESOLVED_ROOT" \
+    python -c "import aristotlelib, fastmcp; print(f'fastmcp {fastmcp.__version__}')" 2>/dev/null; then
+  ok "unified prover (fastmcp + aristotlelib)"
 else
-  log "Installing core dependencies (first run)..."
-  if uv run --project "$AUTOFORM_RESOLVED_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')"; then
-    ok "fastmcp installed"
+  log "Installing unified prover dependencies (first run)..."
+  if UV_PROJECT_ENVIRONMENT="$PROVER_ENV" uv run --project "$AUTOFORM_RESOLVED_ROOT" \
+      python -c "import aristotlelib, fastmcp; print(f'fastmcp {fastmcp.__version__}')"; then
+    ok "unified prover dependencies installed"
   else
-    warn "Failed to install fastmcp"; all_ok=false
+    warn "Failed to install unified prover dependencies"; all_ok=false
   fi
 fi
 
 # Optional extras
-for extra in repl zulip aristotle; do
+for extra in zulip; do
   pkg="$extra"
   # Map extra name to import name
   case "$extra" in
-    repl)      pkg="psutil" ;;
     zulip)     pkg="zulip" ;;
-    aristotle) pkg="aristotlelib" ;;
   esac
 
   if uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
@@ -72,7 +89,7 @@ for extra in repl zulip aristotle; do
     if uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
       ok "$extra ($pkg) installed"
     else
-      warn "Failed to install $extra extra — $extra server will not work"; all_ok=false
+      warn "Failed to install $extra extra — the stateless $extra helper will not work"; all_ok=false
     fi
   fi
 done
@@ -82,7 +99,7 @@ if [ "$all_ok" = true ]; then
 fi
 
 # =========================================================================
-# 3. PDF tools (poppler-utils — pdftotext/pdftoppm, needed to read source PDFs)
+# 4. PDF tools (poppler-utils — pdftotext/pdftoppm, needed to read source PDFs)
 # =========================================================================
 log "Checking PDF tools (poppler-utils)"
 
@@ -107,7 +124,7 @@ else
 fi
 
 # =========================================================================
-# 4. Lean 4 (lean + lake)
+# 5. Lean 4 (lean + lake)
 # =========================================================================
 log "Checking Lean 4"
 
@@ -131,7 +148,7 @@ else
 fi
 
 # =========================================================================
-# 5. Zulip credentials (optional)
+# 6. Zulip credentials (optional)
 # =========================================================================
 log "Checking Zulip (optional)"
 
@@ -200,7 +217,7 @@ else:
 fi
 
 # =========================================================================
-# 6. Lean Explore API key (optional)
+# 7. Lean Explore API key (optional)
 # =========================================================================
 log "Checking Lean Explore (optional)"
 

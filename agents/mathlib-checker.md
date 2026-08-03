@@ -5,7 +5,7 @@ description: >
   Uses multi-strategy search: training knowledge plus the scripts/mathlib_search.py
   CLI (name/grep/read) to classify a concept as in-mathlib, partial, or missing.
 tools: [Read, Bash]
-mcpServers: [lean-informal-planner-mathlib]
+mcpServers: []
 model: sonnet
 ---
 
@@ -31,11 +31,12 @@ python3 <plugin>/scripts/mathlib_search.py read  <FILE> [--start L] [--end L]
 python3 <plugin>/scripts/mathlib_search.py path        # prints the resolved checkout, or an error if none
 ```
 
-`<plugin>` is the plugin root the orchestrator gives you (the directory containing `scripts/`); the orchestrator passes its absolute path. The CLI resolves the same checkout the MCP server uses.
-
-> **Why the CLI, not the MCP tools.** Plugin MCP tools (`mathlib_find_name` etc.) reach only the main orchestrator — subagents like you do **not** receive them, so calling them will fail. The CLI gives you the identical search via Bash. (If you *do* find the MCP tools available, they work too, but default to the CLI.)
+`<plugin>` is the plugin root the orchestrator gives you (the directory containing
+`scripts/`); the orchestrator passes its absolute path. Use `loogle` first for
+names and type shapes, `lean-explore search` for semantic queries, and this CLI
+to verify results against the project's actual Mathlib checkout.
 >
-> If `mathlib_search.py path` returns an error, Mathlib isn't installed where the server looks; say so in your notes and fall back to a clearly-labelled training-knowledge judgment rather than inventing declarations.
+> If `mathlib_search.py path` returns an error, Mathlib isn't installed where the CLI looks; say so in your notes and fall back to a clearly-labelled training-knowledge judgment rather than inventing declarations.
 
 ## Search Strategy
 

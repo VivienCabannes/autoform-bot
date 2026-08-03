@@ -11,12 +11,8 @@ from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 EXPECTED_COMMANDS = {"setup", "orchestrate", "set-backend"}
 EXPECTED_SKILLS = {f"{command}-skill" for command in EXPECTED_COMMANDS}
 EXPECTED_MCP_SERVERS = {
-    "lean-informal-planner-mathlib",
-    "autoform-repl",
-    "autoform-lsp",
-    "autoform-aristotle",
+    "lean-lsp-mcp",
     "autoform-prover",
-    "autoform-zulip",
 }
 
 
@@ -70,7 +66,7 @@ def test_muse_builder_emits_one_supported_manifest_family(tmp_path: Path):
     assert (output / ".muse-plugin" / "plugin.json").is_file()
     assert not (output / ".claude-plugin").exists()
     assert not (output / ".codex-plugin").exists()
-    assert not list(output.rglob(".venv"))
+    assert not [path for path in output.rglob("*") if path.name == ".venv" or path.name.startswith(".venv-")]
     assert not list(output.rglob(".lake"))
     assert not list(output.rglob("__pycache__"))
     assert not [path for path in output.rglob("*") if path.is_symlink()]
@@ -136,16 +132,16 @@ def test_muse_mcp_launcher_uses_plugin_data_environment(tmp_path: Path):
         }
     )
     subprocess.run(
-        ["bash", str(REPO_ROOT / "servers" / "run-muse-server.sh"), "mathlib"],
+        ["bash", str(REPO_ROOT / "servers" / "run-muse-server.sh"), "prover"],
         check=True,
         env=env,
     )
 
     cwd, uv_environment, project, args = capture.read_text().splitlines()
     assert cwd == str(REPO_ROOT)
-    assert uv_environment == str(plugin_data / "venv-core")
+    assert uv_environment == str(plugin_data / "venv-prover")
     assert project == str(lean_project)
-    assert args == "run python -m servers.mathlib.server"
+    assert args == "run python -m servers.prover.server"
 
 
 def test_session_start_context_names_muse_as_a_supported_host():

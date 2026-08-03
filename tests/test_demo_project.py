@@ -96,6 +96,7 @@ def test_environment_installer_resolves_the_new_top_level_script_location():
     installer = (ROOT / "scripts" / "install_autoform.sh").read_text()
     assert 'cd "$(dirname "$0")/.." && pwd' in installer
     assert '--project "$AUTOFORM_RESOLVED_ROOT"' in installer
+    assert "uv tool install lean-lsp-mcp" in installer
 
 
 def test_project_creation_helper_runs_from_an_arbitrary_directory(tmp_path):

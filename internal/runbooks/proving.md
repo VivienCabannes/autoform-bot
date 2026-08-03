@@ -9,12 +9,12 @@ and points there.
 
 ## Core workflow
 
-1. **Search first.** Look for the lemma in Mathlib (`mathlib_grep`, `mathlib_find_name`, or
-   `exact?`/`apply?`/`rw?` in the REPL) before reproving anything — many standard results already
+1. **Search first.** Look for the lemma in Mathlib (`loogle`, `lean-explore search`,
+   the local Mathlib search CLI, or `exact?`/`apply?`/`rw?`) before reproving anything — many standard results already
    exist. See `internal/references/proving/proof-strategies.md`.
-2. **Prototype and compile incrementally.** Test fragments with a working
-   REPL/LSP when one is available, otherwise use a temporary Lean file and
-   `lake env lean <file>`. Check the actual project file after each landed
+2. **Prototype and compile incrementally.** Inspect goals and test fragments
+   with `lean-lsp-mcp`, otherwise use a temporary Lean file and `lake env lean
+   <file>`. Check the actual project file after each landed
    change and reserve full `lake build` for the final check. See
    `internal/references/proving/tool-usage.md`.
 3. **Work incrementally.** Fix compilation errors first, then triage `sorry`s by difficulty

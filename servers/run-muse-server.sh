@@ -3,7 +3,7 @@ set -euo pipefail
 
 server="${1:-}"
 if [[ -z "$server" ]]; then
-  echo "usage: run-muse-server.sh <mathlib|repl|lsp|aristotle|prover|zulip>" >&2
+  echo "usage: run-muse-server.sh <lean-lsp|prover>" >&2
   exit 2
 fi
 
@@ -17,34 +17,13 @@ cd "$plugin_root"
 export PYTHONDONTWRITEBYTECODE=1
 
 case "$server" in
-  mathlib)
-    export LEAN_PROJECT_DIR="$workspace"
-    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-core"
-    exec uv run python -m servers.mathlib.server
-    ;;
-  repl)
-    export LEAN_PROJECT_DIR="$workspace"
-    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-repl"
-    exec uv run --extra repl python -m servers.repl.server
-    ;;
-  lsp)
-    export LEAN_PROJECT_DIR="$workspace"
-    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-core"
-    exec uv run python -m servers.lsp.server
-    ;;
-  aristotle)
-    export ARISTOTLE_DOWNLOAD_DIR="${ARISTOTLE_DOWNLOAD_DIR:-$plugin_data/aristotle-output}"
-    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-aristotle"
-    exec uv run --extra aristotle python -m servers.aristotle.server
+  lean-lsp)
+    cd "$workspace"
+    exec lean-lsp-mcp --disable-tools lean_leansearch,lean_loogle,lean_leanfinder
     ;;
   prover)
-    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-core"
+    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-prover"
     exec uv run python -m servers.prover.server
-    ;;
-  zulip)
-    export LEAN_PROJECT_DIR="$workspace"
-    export UV_PROJECT_ENVIRONMENT="$plugin_data/venv-zulip"
-    exec uv run --extra zulip python -m servers.zulip.server
     ;;
   *)
     echo "unknown Autoform Muse MCP server: $server" >&2

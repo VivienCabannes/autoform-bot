@@ -11,21 +11,30 @@ Search the Lean/Mathlib community Zulip before proving or naming anything non-tr
 
 ## How to use
 
-1. Run `zulip_status` to verify configuration.
-2. Use `zulip_search` with mathematical terms (e.g., `"Hoeffding bound"`, `"concentration inequality"`).
-3. If a relevant topic is found, use `zulip_messages` to read the full thread.
-4. Use `zulip_streams` to discover available streams if unsure where to look.
+Zulip search is stateless and does not need an MCP server. Use the official
+Python client on demand through Autoform's thin API helper:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" --extra zulip python -c \
+  'from servers.zulip.core import get_client; import json,sys; print(json.dumps(get_client().search_messages(sys.argv[1]), indent=2))' \
+  "Hoeffding bound"
+```
+
+For a known stream and topic, replace the final expression with
+`get_client().get_messages(sys.argv[1], sys.argv[2])` and pass the stream and
+topic as two arguments. Use `get_client().list_streams()` to discover streams.
+The helper reads `.zuliprc`, calls the Zulip API, and exits after printing JSON.
 
 For credential setup and search examples, read
 `<AUTOFORM_PLUGIN_ROOT>/internal/references/zulip-configuration.md`.
 
 ## Key streams for Mathlib work
 
-- **mathlib4** — main development discussions
-- **Is there code for X?** — ask before building from scratch
-- **new members** — beginner questions, often about API discovery
-- **general** — cross-cutting topics
-- **Autoformalization** — autoformalization projects and tools
+- **mathlib4**: main development discussions
+- **Is there code for X?**: ask before building from scratch
+- **new members**: beginner questions, often about API discovery
+- **general**: cross-cutting topics
+- **Autoformalization**: autoformalization projects and tools
 
 ## Citing Zulip in code
 

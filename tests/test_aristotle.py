@@ -1,7 +1,7 @@
 """Tests for the Aristotle backend core + node-delegation entry.
 
-These run WITHOUT the optional ``aristotlelib`` dependency and WITHOUT any
-network: a tiny in-memory fake stands in for ``aristotlelib.Project`` and is
+These run WITHOUT network or Aristotle credentials: a tiny in-memory fake
+stands in for ``aristotlelib.Project`` and is
 injected via the ``lib`` kwarg, so the real polling/landing logic is exercised
 end-to-end against a synthetic Aristotle result.
 """

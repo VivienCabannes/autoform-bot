@@ -11,14 +11,15 @@ reviewer scores against and the style reference the worker writes to.
 
 Detect what's available and adapt:
 
-- **Search before proving.** Use `exact?`, `apply?`, `rw?` in a temporary Lean
-  snippet or a working REPL, or the `mathlib` MCP search tools (`mathlib_grep`,
-  `mathlib_find_name`) to find existing Mathlib lemmas before reproving anything.
-- **Build incrementally.** Type-check often with `lake env lean <file>` and use
-  `lake build <target>` for the final check. Real LSP/REPL tools may accelerate
-  feedback when available; optional compatibility stubs must not block progress.
-- **Do not read Mathlib source by absolute path.** Use the project's mathlib search tooling
-  (`mathlib_grep` / `mathlib_read_file` via MCP, else `grep` over the mathlib checkout).
+- **Search before proving.** Use `exact?`, `apply?`, and `rw?` in a temporary
+  Lean snippet, `loogle` for type shapes and names, `lean-explore search` for
+  semantic queries, and the local Mathlib search CLI for source verification.
+- **Build incrementally.** Type-check often with `lean-lsp-mcp` or `lake env
+  lean <file>` and use `lake build <target>` for the final check. Direct Lean
+  commands remain the fallback when the language server cannot initialize.
+- **Do not read Mathlib source by an arbitrary absolute path.** Use
+  `scripts/mathlib_search.py read` or project-relative source search over the
+  resolved Mathlib checkout.
 
 ## The conventions, in brief
 

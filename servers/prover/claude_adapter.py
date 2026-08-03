@@ -105,8 +105,8 @@ def _default_autonomy_args() -> list[str]:
 def _default_mcp_config() -> str | None:
     """Auto-discover the MCP config for the headless worker.
 
-    The worker can use ``autoform-repl`` / ``autoform-lsp`` MCP tools when those
-    optional servers are implemented, so the child receives a ``--mcp-config``.
+    The worker can use the stateful ``lean-lsp-mcp`` tools, so the child
+    receives a ``--mcp-config``.
     Direct ``lake``/``lean`` verification remains authoritative. Resolution order:
 
     1. ``AUTOFORM_MCP_CONFIG`` env var (explicit override), else
@@ -239,7 +239,7 @@ class ClaudeAdapter(ProverAdapter):
             :data:`DEFAULT_AUTONOMY_ARGS`, i.e. locked-down ``dontAsk`` plus an
             explicit tool allowlist). ``[]`` disables.
         mcp_config: Path passed to ``--mcp-config`` so the worker gets the
-            optional ``autoform-repl``/``autoform-lsp`` tools.
+            stateful ``lean-lsp-mcp`` tools.
             ``None`` (default) auto-discovers via :func:`_default_mcp_config`
             (``AUTOFORM_MCP_CONFIG`` env, else the plugin's own ``.mcp.json``);
             ``""`` disables the flag entirely.

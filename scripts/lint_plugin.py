@@ -48,12 +48,8 @@ REMOVED_AGENTS: tuple[str, ...] = ()
 REMOVED_SKILLS: tuple[str, ...] = ()
 EXPECTED_MCP_SERVERS = frozenset(
     {
-        "lean-informal-planner-mathlib",
-        "autoform-repl",
-        "autoform-lsp",
-        "autoform-aristotle",
+        "lean-lsp-mcp",
         "autoform-prover",
-        "autoform-zulip",
     }
 )
 PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})

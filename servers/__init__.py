@@ -1,8 +1,6 @@
-"""Autoform MCP servers — standalone Lean 4 tooling.
+"""Autoform's stateful prover servers and shared implementation code.
 
-Each server is independent and can be started separately via uv:
-    uv run python -m servers.repl                    # Lean REPL pool
-    uv run python -m servers.lsp                     # Lean LSP diagnostics
-    uv run --extra aristotle python -m servers.aristotle  # Aristotle prover
-    uv run --extra zulip python -m servers.zulip     # Zulip community search
+The plugin uses the external ``lean-lsp-mcp`` executable for stateful Lean
+goals and diagnostics. Mathlib and Zulip helpers in this package are imported
+by one-shot CLI/API calls; they are not registered as MCP servers.
 """

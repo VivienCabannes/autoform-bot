@@ -8,9 +8,8 @@ onto two surfaces:
 
 * :class:`AristotleManager` — a thin, stateful wrapper over one
   ``aristotlelib.Project`` per ``session_id``: submit / poll / wait / steer /
-  events / list. This is what the MCP tools call. Ported from the proven
-  integration in ``core/inference/sdk/aristotle.py`` and
-  ``examples/servers/aristotle/server.py``.
+  events / list. This is what the unified prover's Aristotle adapter calls.
+  Ported from the proven integration in ``core/inference/sdk/aristotle.py``.
 
 * :func:`delegate_to_node` — the **prover-backend entry**. It is the C-side
   implementation of the one swappable interface the design pins down:
@@ -29,8 +28,8 @@ proof it lands feeds the SAME incremental jury -> ``review_status.json`` -> revi
 surface that the in-session worker feeds (built by PRs A/E). Nothing here reads or
 writes ``review_status.json`` or runs any verdict logic.
 
-``aristotlelib`` is an **opt-in** dependency (the ``aristotle`` extra). It is
-imported lazily, so this module imports cleanly without it installed.
+``aristotlelib`` is installed with the unified prover but imported lazily, so
+other prover backends never initialize Aristotle or require its credentials.
 
 Honest limitations (inherited from the backend):
 
@@ -98,7 +97,7 @@ class AristotleManager:
             and extracted here.
         lib: The ``aristotlelib`` module (injected for testing). When ``None`` it
             is imported lazily on first use — so this class is constructible and
-            importable without the optional dependency installed.
+            importable without initializing the client.
     """
 
     def __init__(self, *, download_dir: str | None = None, lib: Any | None = None) -> None:
@@ -110,10 +109,10 @@ class AristotleManager:
         if self._lib is None:
             try:
                 import aristotlelib  # lazy: only required when Aristotle is actually used
-            except ImportError as err:  # pragma: no cover - exercised only without the extra
+            except ImportError as err:  # pragma: no cover - broken installation only
                 raise RuntimeError(
-                    "aristotlelib is not installed. Install the opt-in extra:\n"
-                    "    uv sync --extra aristotle\n"
+                    "aristotlelib is missing from the Autoform prover environment. Run:\n"
+                    "    uv sync\n"
                     "and set ARISTOTLE_API_KEY (free key at "
                     "https://aristotle.harmonic.fun/dashboard/keys)."
                 ) from err
@@ -133,9 +132,9 @@ class AristotleManager:
                     f"aristotlelib {ver} has an incompatible API — this client needs the "
                     ">=2.0 API (Project.create_from_directory / ask / get_tasks). You are "
                     "likely running outside the plugin's locked env. Run the Aristotle "
-                    "backend via the prover MCP server (`uv run --extra aristotle python -m "
-                    "servers.prover.server`) or `uv sync --extra aristotle` (the pyproject "
-                    "pins aristotlelib>=2.0), not a stray global install."
+                    "backend through the unified prover MCP server (`uv run python -m "
+                    "servers.prover.server`) or run `uv sync`; the project pins "
+                    "aristotlelib>=2.0."
                 )
             self._lib = aristotlelib
         return self._lib

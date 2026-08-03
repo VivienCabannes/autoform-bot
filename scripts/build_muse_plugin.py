@@ -48,7 +48,9 @@ def _ignore(_directory: str, names: list[str]) -> set[str]:
     return {
         name
         for name in names
-        if name in IGNORED_NAMES or name.endswith((".pyc", ".pyo"))
+        if name in IGNORED_NAMES
+        or name.startswith(".venv-")
+        or name.endswith((".pyc", ".pyo"))
     }
 
 

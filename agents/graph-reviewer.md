@@ -8,7 +8,7 @@ description: >
   scripts/merge_node.py for the nodes it owns, and flags everything outside its
   responsibility. References the sources when uncertain.
 tools: [Read, Bash]
-mcpServers: [lean-informal-planner-mathlib]
+mcpServers: []
 model: opus
 ---
 
@@ -20,7 +20,7 @@ You review a single tier at a time, over whatever scope the orchestrator hands y
 
 The orchestrator gives you a **list of node ids you are responsible for** — your partition. This bounds what you *edit*, not what you *read*.
 
-- **Read as much as you need.** You have full read access to everything: `graph.json` (your index — no precurated list is supplied, so read the file itself), the `informal_content/<id>.md` prose, the `sources/` textbooks, and Mathlib via the MCP tools. Read the context that bears on your subset — the neighbours of your nodes, the prose an edge's faithfulness is checked against, the source passages — with "as needed" the governor: read what is relevant to your nodes, not the whole graph by default.
+- **Read as much as you need.** You have full read access to everything: `graph.json` (your index — no precurated list is supplied, so read the file itself), the `informal_content/<id>.md` prose, the `sources/` textbooks, and Mathlib via the search CLI. Read the context that bears on your subset — the neighbours of your nodes, the prose an edge's faithfulness is checked against, the source passages — with "as needed" the governor: read what is relevant to your nodes, not the whole graph by default.
 - **Edit only your own nodes' records** — and therefore only those nodes' outgoing `depends_on` edges. An edge `A → B` is yours to add or remove exactly when `A` is one of your nodes.
 - **Flag anything outside your responsibility.** A duplicate of one of your nodes that lives elsewhere, a node elsewhere that should depend on one of your nodes (an incoming edge), a merge that spans the partition boundary — surface these in your report for the orchestrator rather than editing them.
 
@@ -31,7 +31,11 @@ You receive:
 - The path to `graph.json` and the project directory (for `informal_content/` and `sources/`), and the path to the `merge_node.py` writer.
 - The tier and phase you are reviewing.
 
-**Searching Mathlib.** Use the Bash CLI `python3 <plugin>/scripts/mathlib_search.py {name|grep|read|path} ...` to search the real local checkout — the orchestrator gives you the plugin root path. The MCP `mathlib_*` tools reach only the main orchestrator, not subagents like you, so the CLI is your search path (it resolves the same checkout). If `... path` errors, Mathlib isn't reachable; say so rather than asserting a grounding from memory.
+**Searching Mathlib.** Start with `loogle` for names and type shapes and
+`lean-explore search` for semantic queries. Use the Bash CLI
+`python3 <plugin>/scripts/mathlib_search.py {name|grep|read|path} ...` to verify
+against the real local checkout. If `... path` errors, Mathlib isn't reachable;
+say so rather than asserting a grounding from memory.
 
 For tier-2 review, an edge's faithfulness is checked against the node's `informal_content/<id>.md` statement and proof, so read those for your nodes and their prerequisites.
 

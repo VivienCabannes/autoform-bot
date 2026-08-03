@@ -88,7 +88,7 @@ Unless a one-shot run was requested, launch one detached watch process for this
 exact dispatch project:
 
 ```bash
-uv run --directory "<AUTOFORM_PLUGIN_ROOT>" --extra aristotle \
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" \
   python -u "<AUTOFORM_PLUGIN_ROOT>/scripts/dispatch_runner.py" "$DISPATCH_PROJECT" \
   --repo "$LEAN_PROJECT" --backend "$PROVER_BACKEND" \
   --judge-backend "$JUDGE_BACKEND" <APPROVED_API_EGRESS_FLAGS> \
@@ -145,11 +145,14 @@ Codex native spawn tools do not all expose a custom-role selector, and role
 files installed during the current task may not be loaded until a new
 project-rooted task starts. In either case, use a generic native Codex subagent
 and paste the complete canonical `agents/<role>.md` instructions into its task.
+This prompt-inlining fallback is mandatory; never substitute a bare generic
+role description.
 On Muse, always use the generic native subagent interface and this same full-body
 prompt-inlining fallback because the public Muse plugin manifest does not expose
-an `agents` capability. This fallback is mandatory; never substitute a bare
-generic role description. Pass the absolute plugin root and project paths in the task.
-For Mathlib MCP calls, pass `project_dir` explicitly when the tool accepts it.
+an `agents` capability. Pass the absolute plugin root and project paths in the
+task.
+For `lean-lsp-mcp` calls, pass absolute project file paths when practical. Use
+Loogle, LeanExplore, and `scripts/mathlib_search.py` for stateless Mathlib search.
 
 ## Planner pipeline
 

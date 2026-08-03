@@ -7,7 +7,7 @@ description: >
   universal-voice prose for each. Returns structural data for the orchestrator to
   merge; writes only its content files.
 tools: [Read, Write, Bash]
-mcpServers: [lean-informal-planner-mathlib]
+mcpServers: []
 model: opus
 ---
 
@@ -48,7 +48,12 @@ Use the Mathlib search CLI to confirm a status when it matters — chiefly to se
 python3 <plugin>/scripts/mathlib_search.py {name|grep|read|path} ...
 ```
 
-`<plugin>` is the plugin root the orchestrator passes you. Prefer this CLI over the MCP `mathlib_*` tools: plugin MCP tools reach only the main orchestrator, not subagents like you, so the CLI is your reliable search path (it resolves the same checkout). Search the real source; don't decide `in-mathlib` from memory. When in doubt between `partial` and `missing`, prefer `partial`: a false "missing" wrongly demands a proof you then write, while a false "partial" is cheap for the checker to correct.
+`<plugin>` is the plugin root the orchestrator passes you. Use `loogle` for
+names and type shapes, `lean-explore search` for semantic queries, and this CLI
+to verify against the real checkout. Do not decide `in-mathlib` from memory.
+When in doubt between `partial` and `missing`, prefer `partial`: a false
+"missing" wrongly demands a proof you then write, while a false "partial" is
+cheap for the checker to correct.
 
 ### 3. Write `informal_content/<id>.md` for each node
 

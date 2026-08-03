@@ -121,7 +121,7 @@ require `allow_api_egress=true` after explicit approval for that project/run.
 | backend | what it is | auth / env | steering |
 |---|---|---|---|
 | `max` | **Claude Code (Max subscription)** — headless Claude Code worker | your Claude login (API credentials disabled → subscription billing) | gate-fold (live judge opt-in) |
-| `aristotle` | Harmonic's Aristotle prover API | `ARISTOTLE_API_KEY` + `uv sync --extra aristotle` | **in-flight** (`project.ask`) |
+| `aristotle` | Harmonic's Aristotle prover API | `ARISTOTLE_API_KEY` | **in-flight** (`project.ask`) |
 | `codex` | OpenAI Codex CLI | codex's own auth | gate-fold (live judge opt-in) |
 | `muse` | Muse/TBH CLI | configured Meta provider/authentication | one sandboxed run (no headless resume) |
 | `openai` | **Custom API (OpenAI-compatible)** — direct Chat Completions endpoint, not the Codex CLI | `AUTOFORM_OPENAI_BASE_URL` / `_MODEL` / `_KEY_VAR` | bounded local tool loop |
@@ -170,12 +170,11 @@ crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 `holistic-reviewer`, `source-searcher`); and the review jury
 (`faithfulness-reviewer`, `proof-integrity-reviewer`, `code-quality-reviewer`).
 
-**MCP servers** — `autoform-prover` (the unified `prove_node`),
-`autoform-aristotle` (session-level Aristotle access),
-`lean-informal-planner-mathlib` (ripgrep-backed Mathlib search),
-`autoform-zulip` (Zulip search; needs a `.zuliprc`), and `autoform-repl` /
-`autoform-lsp` (**stubs today** — reference implementations live in
-`examples/servers/`; a real pooled REPL is landing separately).
+**MCP servers**: `lean-lsp-mcp` (stateful proof goals, diagnostics, hover,
+code actions, and proof attempts) and `autoform-prover` (the unified
+`prove_node`, including the Aristotle backend).
+Mathlib and Zulip search are stateless: agents use Loogle, LeanExplore, the
+local Mathlib search CLI, and the Zulip API on demand.
 
 ## Repository layout
 
@@ -183,7 +182,7 @@ crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 skills/       exactly three user workflows: setup, orchestrate, set-backend
 internal/     non-discoverable runbooks, reference material, and jury rubrics
 agents/       worker, reader, planning crew, review jury
-servers/      MCP servers (prover, aristotle, mathlib, zulip; repl/lsp stubs)
+servers/      stateful MCP servers plus shared prover/search implementation code
 scripts/      plan/graph tooling, dispatch engine, review UI, formalization.py
 hooks/        Claude SessionStart context (skills are the workflow surface)
 docs/         pipeline architecture, usage guide, backend handoff notes
@@ -194,7 +193,7 @@ tests/        deterministic suite; optional local-Lean and loopback-HTTP smoke t
 ## Development
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra zulip
 uv run python -m pytest -q               # full suite
 python3 scripts/lint_plugin.py           # plugin-surface lint (CI runs this)
 uv run ruff check scripts servers tests skills

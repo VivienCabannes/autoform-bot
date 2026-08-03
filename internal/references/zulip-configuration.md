@@ -4,23 +4,28 @@ Search the Lean/Mathlib community Zulip ([leanprover.zulipchat.com](https://lean
 
 ## What it does
 
-Searches Zulip for naming conventions, proof strategies, prior art, and
-API decisions via the `autoform-zulip` MCP server.
+Searches Zulip for naming conventions, proof strategies, prior art, and API
+decisions with the official Python client. Calls are one-shot and do not start a
+resident MCP server.
 
 ## Usage
 
 Ask Orchestrate naturally: “search Zulip for Hoeffding” or “check if there is a
 Zulip discussion about this.”
 
-## MCP tools
+## API operations
 
-| Tool | Purpose |
+| Client method | Purpose |
 |------|---------|
-| `zulip_search` | Full-text search across messages (with optional stream/topic scope) |
-| `zulip_messages` | Read a conversation thread by stream + topic |
-| `zulip_streams` | List available streams (filterable) |
-| `zulip_topics` | List recent topics in a stream |
-| `zulip_status` | Check if `.zuliprc` is configured |
+| `search_messages` | Full-text search across messages with optional stream/topic scope |
+| `get_messages` | Read a conversation thread by stream and topic |
+| `list_streams` | List available streams |
+| `get_topics` | List recent topics in a stream |
+| `find_zuliprc` | Check which `.zuliprc` is configured |
+
+Invoke these through `servers.zulip.core` as shown in
+`internal/runbooks/zulip.md`. That module is a thin wrapper over the official
+`zulip` package and returns JSON-serializable dictionaries.
 
 ## Setup
 
@@ -65,5 +70,5 @@ The `.zuliprc` file is searched in order (first found wins):
 
 ## Dependencies
 
-Python dependencies (`zulip`, `fastmcp`) are managed automatically by `uv`
-from the plugin's `pyproject.toml` — no manual `pip install` needed.
+The `zulip` dependency is managed by the plugin's optional `zulip` extra. Run
+the one-shot commands with `uv run --directory <plugin> --extra zulip ...`.

@@ -6,7 +6,7 @@ description: >
   genuine Lean 4 proof, and compiles-to-iterate with Lean until it
   is clean — or reports an honest FAILED. Never delivers a sorry'd file as done.
 tools: [Read, Grep, Glob, Bash, Edit, Write]
-mcpServers: [autoform-repl, autoform-zulip]
+mcpServers: [lean-lsp-mcp]
 model: opus
 ---
 
@@ -55,10 +55,10 @@ model, and billing path.
    `[[lean_lib]]` name — that is where files go (e.g. `name = "BooleanFourier"` ⇒
    `BooleanFourier/…lean`). Reuse existing namespaces; a namespace names a
    **mathematical topic** in `UpperCamelCase`, never a task id or chapter.
-4. **Search Mathlib before formalizing anything that may already exist** — `exact?`,
-   `apply?`, `loogle`, the autoform-repl/LSP search tools, or the project's mathlib
-   search tooling. Do not read Mathlib source by absolute path. Check the Zulip
-   server for naming/prior-art when a lemma is hard to place.
+4. **Search Mathlib before formalizing anything that may already exist** using
+   `exact?`, `apply?`, `loogle`, `lean-explore search`, or the
+   project's local Mathlib search tooling. Do not read Mathlib source by absolute
+   path. Use the Zulip API for naming and prior art when a lemma is hard to place.
 
 ## Workflow — search → write → compile-to-iterate
 
@@ -71,11 +71,11 @@ This is your whole job. Loop until the proof is clean or you hit an honest wall:
    hand-rolled one; reuse beats reinvention.
 3. **Write** the next lemma or step.
 4. **Compile** the actual project file with `lake env lean <file>` after each
-   lemma lands, and use `lake build` for the final project check. If a real
-   REPL/LSP MCP is available, use it for faster intermediate feedback; if it
-   reports that it is not implemented or unavailable, continue with the direct
-   Lean commands. Resolve every error, every `sorry` goal, and warnings that
-   signal an unfinished goal.
+   lemma lands, and use `lake build` for the final project check. Use
+   `lean-lsp-mcp` tools such as `lean_goal`, `lean_diagnostic_messages`,
+   `lean_code_actions`, `lean_multi_attempt`, and `lean_run_code` for faster
+   intermediate feedback. Direct Lean commands remain authoritative. Resolve
+   every error, every `sorry` goal, and warnings that signal an unfinished goal.
 5. **Iterate.** Feed the error back in, adjust, re-compile. A red diagnostic is
    information, not a dead end. When genuinely stuck on one step, break it smaller,
    search again, or consult Zulip — do not paper over it.

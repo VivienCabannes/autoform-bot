@@ -16,10 +16,9 @@ drive Aristotle with no change:
   record the proof in the node's prose, and report a
   :class:`~servers.prover.base.ProofResult`.
 
-Aristotle is **opt-in and free**: it needs the ``aristotle`` extra
-(``aristotlelib``) plus ``ARISTOTLE_API_KEY`` and network. ``aristotlelib`` is
-imported lazily by ``AristotleManager``, so this module imports cleanly without
-the extra installed (the driver/steerer/contract never touch it).
+Aristotle API use is **opt-in and free**: it needs ``ARISTOTLE_API_KEY`` and
+network. ``aristotlelib`` is installed with the unified prover but imported
+lazily by ``AristotleManager``, so other backends never initialize it.
 
 The async ``AristotleManager`` is bridged to the synchronous adapter surface via
 a single private event loop owned by the adapter, so the driver stays a plain

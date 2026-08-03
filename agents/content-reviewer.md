@@ -7,7 +7,7 @@ description: >
   edits the informal_content/<id>.md files to fix what it finds. Flags structural issues
   for the graph-reviewers and orchestrator.
 tools: [Read, Write]
-mcpServers: [lean-informal-planner-mathlib]
+mcpServers: []
 model: opus
 ---
 
@@ -50,7 +50,7 @@ Catch any passage that tracks one book's wording or structure closely enough to 
 
 ## Sanity-checking in-mathlib pointers
 
-For an `in-mathlib` node, the prose should point at a real Mathlib declaration rather than reprove the result. Use `mathlib_find_name`, `mathlib_grep`, and `mathlib_read_file` to confirm the declaration named in `mathlib_declarations` (and any cited in the prose) actually exists and states what the node claims. Fix a pointer in the prose that names a declaration you cannot find or one whose Mathlib statement sits in a different generality than the node's prose claims — repoint it to the right declaration, or align the prose's statement with what Mathlib actually provides. When the right declaration name belongs in `graph.json`'s `mathlib_declarations` field rather than only the prose, flag that for the orchestrator. You are sanity-checking the content's pointers here, not re-running the full Mathlib classification.
+For an `in-mathlib` node, the prose should point at a real Mathlib declaration rather than reprove the result. Use `loogle`, `lean-explore search`, and `scripts/mathlib_search.py` to confirm the declaration named in `mathlib_declarations` (and any cited in the prose) actually exists and states what the node claims. Fix a pointer in the prose that names a declaration you cannot find or one whose Mathlib statement sits in a different generality than the node's prose claims — repoint it to the right declaration, or align the prose's statement with what Mathlib actually provides. When the right declaration name belongs in `graph.json`'s `mathlib_declarations` field rather than only the prose, flag that for the orchestrator. You are sanity-checking the content's pointers here, not re-running the full Mathlib classification.
 
 ## Editing guidelines
 

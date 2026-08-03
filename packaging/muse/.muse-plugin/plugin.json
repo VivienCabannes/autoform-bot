@@ -57,39 +57,12 @@
     ],
     "mcpServers": [
       {
-        "id": "lean-informal-planner-mathlib",
+        "id": "lean-lsp-mcp",
         "transport": "stdio",
         "command": [
           "bash",
           "servers/run-muse-server.sh",
-          "mathlib"
-        ]
-      },
-      {
-        "id": "autoform-repl",
-        "transport": "stdio",
-        "command": [
-          "bash",
-          "servers/run-muse-server.sh",
-          "repl"
-        ]
-      },
-      {
-        "id": "autoform-lsp",
-        "transport": "stdio",
-        "command": [
-          "bash",
-          "servers/run-muse-server.sh",
-          "lsp"
-        ]
-      },
-      {
-        "id": "autoform-aristotle",
-        "transport": "stdio",
-        "command": [
-          "bash",
-          "servers/run-muse-server.sh",
-          "aristotle"
+          "lean-lsp"
         ]
       },
       {
@@ -99,15 +72,6 @@
           "bash",
           "servers/run-muse-server.sh",
           "prover"
-        ]
-      },
-      {
-        "id": "autoform-zulip",
-        "transport": "stdio",
-        "command": [
-          "bash",
-          "servers/run-muse-server.sh",
-          "zulip"
         ]
       }
     ],
