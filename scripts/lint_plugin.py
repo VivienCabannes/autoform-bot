@@ -15,8 +15,9 @@ Checks (all stdlib):
     `<source>/.claude-plugin/plugin.json`.
   - `.claude-plugin/plugin.json` is valid JSON with `name`/`version`/`description`
     and a semver-shaped `version`.
-  - The native Muse manifest exposes exactly the three public skills and native
-    slash commands, one SessionStart hook, and the portable MCP server set.
+  - The native Muse manifest exposes exactly the three native slash commands,
+    one SessionStart hook, and the portable MCP server set without duplicate
+    skill entries in Muse's completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
   - The user-visible skill set is exactly `setup`, `orchestrate`, and
@@ -53,7 +54,6 @@ EXPECTED_MCP_SERVERS = frozenset(
     }
 )
 PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
-MUSE_SKILL_IDS = frozenset(f"{name}-skill" for name in PUBLIC_WORKFLOW_SKILLS)
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
@@ -305,20 +305,8 @@ def check_muse_plugin() -> None:
 
     skills = capabilities.get("skills")
     checks += 1
-    if not isinstance(skills, list) or {
-        item.get("id") for item in skills if isinstance(item, dict)
-    } != MUSE_SKILL_IDS:
-        err(f"{rel(MUSE_MANIFEST)}: Muse skill set differs from the namespaced workflow")
-    elif len(skills) != len(MUSE_SKILL_IDS):
-        err(f"{rel(MUSE_MANIFEST)}: Muse skills contain duplicate entries")
-    else:
-        for skill in skills:
-            path = skill.get("path")
-            checks += 1
-            workflow_id = skill["id"].removesuffix("-skill")
-            expected_path = f"skills/{workflow_id}/SKILL.md"
-            if path != expected_path or not (REPO_ROOT / expected_path).is_file():
-                err(f"{rel(MUSE_MANIFEST)}: skill path does not resolve: {path!r}")
+    if skills != []:
+        err(f"{rel(MUSE_MANIFEST)}: Muse skills must be empty; commands own completion")
 
     commands = capabilities.get("commands")
     checks += 1
@@ -337,6 +325,9 @@ def check_muse_plugin() -> None:
                     f"{rel(MUSE_MANIFEST)}: command {command['id']!r} must reuse "
                     f"the canonical skill at {expected_path!r}"
                 )
+            checks += 1
+            if not (REPO_ROOT / expected_path).is_file():
+                err(f"{rel(MUSE_MANIFEST)}: command path does not resolve: {expected_path!r}")
             checks += 1
             if command.get("enabledDefault") is not True:
                 err(

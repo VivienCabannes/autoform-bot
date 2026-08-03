@@ -9,7 +9,6 @@ from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 
 
 EXPECTED_COMMANDS = {"setup", "orchestrate", "set-backend"}
-EXPECTED_SKILLS = {f"{command}-skill" for command in EXPECTED_COMMANDS}
 EXPECTED_MCP_SERVERS = {
     "lean-lsp-mcp",
     "autoform-prover",
@@ -36,10 +35,7 @@ def test_native_muse_manifest_has_the_portable_autoform_surface():
         "mcpServers",
         "reminders",
     }
-    assert {item["id"] for item in capabilities["skills"]} == EXPECTED_SKILLS
-    for skill in capabilities["skills"]:
-        command_id = skill["id"].removesuffix("-skill")
-        assert skill["path"] == f"skills/{command_id}/SKILL.md"
+    assert capabilities["skills"] == []
     assert {item["id"] for item in capabilities["commands"]} == EXPECTED_COMMANDS
     for command in capabilities["commands"]:
         assert command["path"] == f"skills/{command['id']}/SKILL.md"
