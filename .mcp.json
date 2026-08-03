@@ -1,48 +1,34 @@
 {
   "mcpServers": {
     "lean-informal-planner-mathlib": {
-      "command": "bash",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/run-mathlib-server.sh"],
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      }
+      "command": "uv",
+      "args": ["run", "python", "-m", "servers.mathlib.server"],
+      "cwd": "."
     },
     "autoform-repl": {
       "command": "uv",
       "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      }
+      "cwd": "."
     },
     "autoform-lsp": {
       "command": "uv",
       "args": ["run", "python", "-m", "servers.lsp.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      }
+      "cwd": "."
     },
     "autoform-aristotle": {
       "command": "uv",
       "args": ["run", "--extra", "aristotle", "python", "-m", "servers.aristotle.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
-      }
+      "cwd": "."
     },
     "autoform-prover": {
       "command": "uv",
       "args": ["run", "python", "-m", "servers.prover.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}"
+      "cwd": "."
     },
     "autoform-zulip": {
       "command": "uv",
       "args": ["run", "--extra", "zulip", "python", "-m", "servers.zulip.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      }
+      "cwd": "."
     }
   }
 }

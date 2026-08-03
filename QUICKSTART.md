@@ -50,9 +50,12 @@ LEAN_PROJECT_DIR=/path/to/your/lean-project claude --plugin-dir /path/to/autofor
 No Lean project yet? Setup creates one from the LeanProject template, or you
 can try Autoform against the bundled sample at `examples/demo-project/`.
 
-## 3. Use it — slash commands
+## 3. Use it — workflow skills
 
-Type these in the assistant. This is the complete user-visible surface:
+In Claude Code, use the slash commands below. In Codex, open the `$` skill
+picker and choose the corresponding `$autoform:setup`,
+`$autoform:orchestrate`, or `$autoform:set-backend` skill. This is the complete
+user-visible surface:
 
 | Command | What it does |
 |---------|--------------|

@@ -264,6 +264,26 @@ def check_codex_plugin() -> None:
         if not isinstance(config, dict) or not config.get("command"):
             err(f"{rel(mcp_path)}: server {name!r} has no command")
             continue
+        checks += 1
+        if config.get("cwd") != ".":
+            err(
+                f"{rel(mcp_path)}: server {name!r} must use plugin-relative "
+                "cwd '.' for Codex"
+            )
+        checks += 1
+        if "${" in json.dumps(config):
+            err(
+                f"{rel(mcp_path)}: server {name!r} contains an unexpanded "
+                "shell/host placeholder"
+            )
+        if config.get("command") == "bash":
+            args = config.get("args")
+            checks += 1
+            if not isinstance(args, list) or not args or not (REPO_ROOT / args[0]).is_file():
+                err(
+                    f"{rel(mcp_path)}: server {name!r} has no resolvable "
+                    "plugin-relative launcher"
+                )
 
 
 def check_agents() -> int:

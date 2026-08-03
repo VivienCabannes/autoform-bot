@@ -80,13 +80,21 @@ Codex, from a checkout of this repository:
 make install-codex
 ```
 
-Start a new task after installing or upgrading so the host reloads the plugin,
-then use:
+Start a new task after installing or upgrading so the host reloads the plugin.
+Claude Code uses slash commands:
 
 ```text
 /autoform:setup                 # new Lean+Mathlib project → plan → blueprint → dashboard
 /autoform:orchestrate           # launch the engine: prover workers + review jury
 /autoform:set-backend           # choose the prover backend and billing/data path
+```
+
+Codex exposes the same three workflows through its `$` skill picker:
+
+```text
+$autoform:setup
+$autoform:orchestrate
+$autoform:set-backend
 ```
 
 `/autoform:setup` walks you through creating a project (via the LeanProject
