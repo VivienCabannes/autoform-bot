@@ -2,7 +2,7 @@
 
 ``prove_node(node_id, backend, project_dir, max_steers=3)`` proves one plan node
 with the chosen backend and writes the proof into the node. Supported adapters
-are Claude, Aristotle, Codex, OpenAI-compatible, and Avocado. The **driver,
+are Claude, Aristotle, Codex, Muse, OpenAI-compatible, and Avocado. The **driver,
 event contract, and verification gate are the same**; only the adapter differs.
 
 This is the unified replacement for PR C's one-shot ``aristotle_delegate_node``
@@ -56,6 +56,10 @@ def _make_adapter(
         from .codex_adapter import CodexAdapter
 
         return CodexAdapter(extra_args=extra_args, max_wait_seconds=max_wait_seconds)
+    if backend == "muse":
+        from .muse_adapter import MuseAdapter
+
+        return MuseAdapter(extra_args=extra_args, max_wait_seconds=max_wait_seconds)
     if backend in ("openai", "avocado"):
         # Lazy import: the generic OpenAI-compatible HTTP backend. Avocado's
         # private endpoint/model/auth must be configured explicitly.
@@ -65,7 +69,7 @@ def _make_adapter(
                                    max_wait_seconds=max_wait_seconds)
     raise ValueError(
         f"unknown backend {backend!r}; expected 'claude', 'aristotle', 'codex', "
-        "'openai', or 'avocado'"
+        "'muse', 'openai', or 'avocado'"
     )
 
 
@@ -111,7 +115,8 @@ def run_prove_node(
 #: How each backend is billed — recorded per ledger entry so the manifest's
 #: spend line stays honest ("subscription" spend is notional, not dollars).
 _BILLING = {"claude": "subscription", "aristotle": "external-compute",
-            "codex": "external", "openai": "api", "avocado": "api"}
+            "codex": "external", "muse": "external", "openai": "api",
+            "avocado": "api"}
 
 
 def _record_usage(project_dir: str, node_id: str, backend: str, result: ProofResult) -> None:
@@ -187,14 +192,14 @@ def create_prover_server() -> FastMCP:
             node_id: The target node id (verbatim, e.g. "Chernoff bound").
             project_dir: The Lean project directory (where the proof is written
                 and informal_content/ lives).
-            backend: "claude" (default), "aristotle", "codex", "openai", or
-                "avocado".
+            backend: "claude" (default), "aristotle", "codex", "muse",
+                "openai", or "avocado".
             max_steers: Cap on in-flight steers for this run (default 3).
             max_wait_seconds: Wall-clock ceiling for the run — honored by every
-                backend (Aristotle stops polling; claude/codex kill the worker
-                process group and fail with sub-status "timeout").
-            extra_args: Extra CLI args threaded through to the claude/codex
-                worker invocation.
+                backend (Aristotle stops polling; Claude, Codex, and Muse kill
+                the worker process group and fail with sub-status "timeout").
+            extra_args: Extra CLI args threaded through to the Claude, Codex,
+                or Muse worker invocation.
             mcp_config: MCP config path for the claude worker's --mcp-config.
                 Default (None) auto-discovers: the AUTOFORM_MCP_CONFIG env var if
                 set, else the plugin's own .mcp.json next to this package; the

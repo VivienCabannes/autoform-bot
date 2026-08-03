@@ -15,7 +15,7 @@ is read-only and the parent process is the sole verdict writer.
 Usage::
 
   env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN python3 scripts/dispatch_runner.py <project-dir> \\
-      [--repo <lean-repo>] [--jobs 9] [--judge-backend claude|codex|openai|avocado]
+      [--repo <lean-repo>] [--jobs 9] [--judge-backend claude|codex|muse|openai|avocado]
       [--model <provider-model>] [--limit N] [--dry-run]
 
 ``<project-dir>`` holds graph.json + task_queue.json + review_status.json.
@@ -28,6 +28,7 @@ import contextlib
 import fcntl
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -169,6 +170,9 @@ def _worker_adapter(
     if backend == "codex":
         from servers.prover.codex_adapter import CodexAdapter
         return CodexAdapter(max_wait_seconds=max_wait_seconds)
+    if backend == "muse":
+        from servers.prover.muse_adapter import MuseAdapter
+        return MuseAdapter(max_wait_seconds=max_wait_seconds)
     if backend in {"openai", "avocado"}:
         from servers.prover.openai_adapter import OpenAICompatAdapter
         return OpenAICompatAdapter(
@@ -179,7 +183,8 @@ def _worker_adapter(
     if backend == "claude":
         return _ClaudeAdapter(max_wait_seconds=max_wait_seconds)
     raise ValueError(
-        f"unknown prover adapter {backend!r}; expected claude, aristotle, codex, openai, or avocado"
+        f"unknown prover adapter {backend!r}; expected claude, aristotle, codex, "
+        "muse, openai, or avocado"
     )
 
 
@@ -380,6 +385,13 @@ def main(argv=None) -> int:
             a.backend = backend_config.get_backend()
         except ValueError as error:
             ap.error(str(error))
+    if (a.judge_backend == "muse" or (a.workers and a.backend == "muse")):
+        muse_bin = os.environ.get("AUTOFORM_MUSE_BIN", "tbh")
+        if shutil.which(muse_bin) is None:
+            ap.error(
+                f"Muse backend requires the {muse_bin!r} CLI; install it or set "
+                "AUTOFORM_MUSE_BIN"
+            )
     required_egress = {
         provider
         for provider in (a.judge_backend,)

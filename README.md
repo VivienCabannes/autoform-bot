@@ -1,11 +1,11 @@
 # Autoform
 
-**A host-neutral autoformalization engine for Claude Code and Codex: turn a mathematics textbook into
+**A host-neutral autoformalization engine for Claude Code, Codex, and Muse: turn a mathematics textbook into
 kernel-verified Lean 4, with every proof independently checked and every verdict
 auditable.**
 
-Autoform is an Agent Skills plugin that runs the full pipeline on Claude Code
-or Codex — plan a textbook
+Autoform is an Agent Skills plugin that runs the full pipeline on Claude Code,
+Codex, or Muse — plan a textbook
 into a tiered dependency graph, prove nodes with swappable AI backends, verify
 every claimed proof against the Lean kernel, judge the result with a three-axis
 review jury, and put a human in charge of final sign-off through a local review
@@ -33,7 +33,7 @@ tests alone are not presented as end-to-end live validation.
 ```mermaid
 flowchart LR
     A[textbook<br/>LaTeX / MD / PDF] -->|/autoform:setup| B[tiered dependency graph<br/>graph.json + prose per node]
-    B -->|/autoform:orchestrate| C[prover workers<br/>claude · aristotle · codex · openai · avocado]
+    B -->|/autoform:orchestrate| C[prover workers<br/>claude · aristotle · codex · muse · openai · avocado]
     C --> D{honesty gate<br/>lake build + #print axioms}
     D -->|rejected| C
     D -->|verified| E[3-judge review jury<br/>faithfulness · proof integrity · style]
@@ -62,8 +62,8 @@ flowchart LR
 
 ## Quickstart
 
-Prereqs: [Claude Code](https://claude.com/claude-code) or
-[Codex](https://developers.openai.com/codex/), Python ≥ 3.10, and
+Prereqs: [Claude Code](https://claude.com/claude-code),
+[Codex](https://developers.openai.com/codex/), or Muse/TBH; Python ≥ 3.10; and
 [uv](https://docs.astral.sh/uv/) (the MCP servers launch via `uv run` and
 resolve their own deps on first start).
 
@@ -80,6 +80,19 @@ Codex, from a checkout of this repository:
 make install-codex
 ```
 
+Muse/TBH, from a checkout of this repository:
+
+```bash
+make build-muse
+tbh plugins validate dist/muse/autoform --json
+tbh plugins install dist/muse/autoform
+tbh plugins enable autoform
+```
+
+Approve Autoform's hook and MCP capabilities in `/plugins` under the Runtime
+tab. Muse can orchestrate the existing backends or run proofs and jury reviews
+itself through the `muse` backend.
+
 Start a new task after installing or upgrading so the host reloads the plugin,
 then use:
 
@@ -93,7 +106,7 @@ then use:
 template, with Mathlib cache), repairing prerequisites, inspecting an existing
 workspace, planning your sources into `graph.json`, and opening the review
 dashboard. `/autoform:set-backend` persists the default
-prover backend (`max` | `aristotle` | `codex` | `openai` | `avocado`);
+prover backend (`max` | `aristotle` | `codex` | `muse` | `openai` | `avocado`);
 `/autoform:orchestrate` then drives the
 formalization — autonomously, human-driven from the dashboard, or both, off one
 shared queue.
@@ -110,17 +123,24 @@ require `allow_api_egress=true` after explicit approval for that project/run.
 | `max` | **Claude Code (Max subscription)** — headless Claude Code worker | your Claude login (API credentials disabled → subscription billing) | gate-fold (live judge opt-in) |
 | `aristotle` | Harmonic's Aristotle prover API | `ARISTOTLE_API_KEY` + `uv sync --extra aristotle` | **in-flight** (`project.ask`) |
 | `codex` | OpenAI Codex CLI | codex's own auth | gate-fold (live judge opt-in) |
+| `muse` | Muse/TBH CLI | configured Meta provider/authentication | one sandboxed run (no headless resume) |
 | `openai` | **Custom API (OpenAI-compatible)** — direct Chat Completions endpoint, not the Codex CLI | `AUTOFORM_OPENAI_BASE_URL` / `_MODEL` / `_KEY_VAR` | bounded local tool loop |
 | `avocado` | explicitly configured Meta-compatible deployment | configured key variable via `AUTOFORM_AVOCADO_*` | bounded local tool loop |
+
+Muse worker settings can be overridden with `AUTOFORM_MUSE_BIN`,
+`AUTOFORM_MUSE_PROVIDER`, `AUTOFORM_MUSE_MODEL`, `AUTOFORM_MUSE_PRESET`,
+`AUTOFORM_MUSE_REASONING_EFFORT`, `AUTOFORM_MUSE_MAX_MODEL_STEPS`, and
+`AUTOFORM_MUSE_RUNTIME_DIR`.
 
 Check API configuration without sending project data with
 `uv run python scripts/provider_check.py <openai|avocado>`. Add `--live` only to run a
 temporary-marker tool-call probe.
 
-Steering is capability-aware: Aristotle accepts corrections mid-run; headless
-CLIs get the deterministic **verify-gate fold** (the gate's rejection reason,
-fed back verbatim as one corrective turn); request/response backends retry at
-the dispatch layer. The steering judge runs on structured signals, not a timer.
+Steering is capability-aware: Aristotle accepts corrections mid-run; resumable
+Claude and Codex CLIs get the deterministic **verify-gate fold** (the gate's
+rejection reason, fed back verbatim as one corrective turn); Muse and
+request/response backends retry at the dispatch layer. The steering judge runs
+on structured signals, not a timer.
 
 ## Self-reporting: formalization.yaml + usage ledger
 

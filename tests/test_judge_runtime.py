@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -88,6 +89,70 @@ def test_claude_judge_requests_json_schema(tmp_path, monkeypatch):
     allowed = seen[seen.index("--allowedTools") + 1]
     assert "Bash(lake build *)" in allowed
     assert ",Bash," not in f",{allowed},"
+
+
+def test_muse_judge_is_read_only_and_parses_terminal_json(tmp_path, monkeypatch):
+    captured = {}
+    runtime = tmp_path / "muse-runtime"
+    monkeypatch.setenv("AUTOFORM_MUSE_BIN", "tbh-test")
+    monkeypatch.setenv("AUTOFORM_MUSE_RUNTIME_DIR", str(runtime))
+
+    def fake_process(args, *, repo, timeout, env=None):
+        captured.update(args=args, repo=repo, timeout=timeout, env=env)
+        stdout = json.dumps(
+            {
+                "schema_version": 1,
+                "stream": {"kind": "session", "id": "judge-session"},
+                "payload_type": "run.terminal.completed",
+                "payload": {
+                    "text": '{"score":4,"reasoning":"checked","error":null}',
+                    "usage": {"input_tokens": 7, "output_tokens": 2},
+                },
+            }
+        )
+        return stdout, "", 0
+
+    monkeypatch.setattr(judge_runtime, "_run_process", fake_process)
+    result = judge_runtime.run_judge(
+        "faithfulness", "rubric", str(tmp_path), None, 10, backend="muse"
+    )
+    assert result == {"score": 4, "reasoning": "checked"}
+    args = captured["args"]
+    assert args[:3] == ["tbh-test", "exec", "--json"]
+    assert "--disable-write" in args
+    assert "--disable-shell" in args
+    assert "--disable-web-tools" in args
+    assert "--disable-approval" in args
+    assert "--yolo" not in args
+    assert "--disable-sandbox" not in args
+    assert captured["env"]["XDG_DATA_HOME"] == str(runtime.resolve())
+    assert '"score"' in args[-1]
+
+
+def test_muse_steer_judge_uses_shared_schema_and_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_MUSE_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+    def fake_process(args, *, repo, timeout, env=None):
+        assert '"steer"' in args[-1]
+        stdout = json.dumps(
+            {
+                "schema_version": 1,
+                "stream": {"kind": "session", "id": "judge-session"},
+                "payload_type": "run.terminal.completed",
+                "payload": {
+                    "text": '{"steer":false,"reason":"on course","prompt":""}',
+                    "usage": {"input_tokens": 5, "output_tokens": 1},
+                },
+            }
+        )
+        return stdout, "", 0
+
+    monkeypatch.setattr(judge_runtime, "_run_process", fake_process)
+    raw, usage = judge_runtime.run_steer_judge(
+        "events", str(tmp_path), None, 10, backend="muse"
+    )
+    assert '"steer": false' in raw
+    assert usage == {"input_tokens": 5, "output_tokens": 1}
 
 
 def test_api_judge_uses_read_only_tool_loop(tmp_path, monkeypatch):

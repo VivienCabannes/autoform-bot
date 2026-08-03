@@ -1,0 +1,7 @@
+{
+  "event": "SessionStart",
+  "stdin": {
+    "hook_event_name": "SessionStart",
+    "source": "startup"
+  }
+}

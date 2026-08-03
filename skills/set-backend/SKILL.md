@@ -3,14 +3,14 @@ name: set-backend
 description: >-
   Show or persist the Autoform proof-worker backend and its billing/data path.
   Use when the user asks to choose, change, inspect, or configure Claude Code
-  on Max, Aristotle, Codex, a custom OpenAI-compatible API, or Avocado as the
-  prover.
+  on Max, Aristotle, Codex, Muse, a custom OpenAI-compatible API, or Avocado as
+  the prover.
 ---
 
 # Set the proof-worker backend
 
 Resolve an absolute plugin root from a valid `AUTOFORM_PLUGIN_ROOT`,
-`PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
+`MUSE_PLUGIN_ROOT`, `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. Substitute that absolute
 path into each command.
 
@@ -29,6 +29,10 @@ Supported user-facing backends:
   user's Max session and disables Anthropic API credentials for that worker.
 - `aristotle`: Harmonic Aristotle via `ARISTOTLE_API_KEY`.
 - `codex`: Codex CLI using its configured OpenAI/ChatGPT authentication.
+- `muse`: Muse/TBH CLI using its configured Meta provider and authentication.
+  Autoform isolates the worker's mutable Muse data so it does not recursively
+  load user plugins. The selected Muse provider may receive project material
+  through the worker's workspace tools.
 - `openai`: **Custom API (OpenAI-compatible)**. Autoform calls a configured
   Chat Completions endpoint directly and runs its own bounded tool loop; this is
   not the Codex CLI. Configure it with `AUTOFORM_OPENAI_*`.

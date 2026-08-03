@@ -24,7 +24,7 @@ to a second agent host to emulate delegation.
 ## Resolve paths and configuration
 
 Resolve one absolute plugin root from a valid `AUTOFORM_PLUGIN_ROOT`,
-`PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
+`MUSE_PLUGIN_ROOT`, `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. Validate that it contains
 `scripts/dispatch_runner.py` and `internal/runbooks/proving.md`. Substitute that
 quoted absolute path into every command; do not rely on shell state from an
@@ -48,15 +48,17 @@ Resolve:
 - Lean project: `graph.json` metadata `lean_root`, otherwise the dispatch
   project's repository parent;
 - proof backend: explicit argument, otherwise run `backend_config.py get
-  --fallback codex` on Codex or `--fallback max` on Claude. A persisted choice
-  still wins;
+  --fallback codex` on Codex, `--fallback max` on Claude, or `--fallback muse`
+  on Muse. A persisted choice still wins;
 - judge backend: explicit argument, otherwise `AUTOFORM_JUDGE_BACKEND`, otherwise
-  the host-native CLI (`claude` on Claude Code, `codex` on Codex).
+  the host-native CLI (`claude` on Claude Code, `codex` on Codex, `muse` on Muse).
 
 Echo all four before claiming work. Preflight the required host CLI. In
-particular, a persisted `max` choice on Codex still requires `claude`; if it is
-not installed/authenticated, stop and ask the user to select `codex` or install
-Claude. Never silently override a persisted choice.
+particular, a persisted `max` choice on Codex or Muse still requires `claude`;
+if it is not installed/authenticated, stop and ask the user to select another
+available backend or install Claude. The `muse` prover or judge requires the
+`tbh` CLI and its configured provider authentication. Never silently override a
+persisted choice.
 
 For every distinct API provider (`openai` or `avocado`) used by either prover or
 judge, run the local configuration check before launching:
@@ -143,8 +145,10 @@ Codex native spawn tools do not all expose a custom-role selector, and role
 files installed during the current task may not be loaded until a new
 project-rooted task starts. In either case, use a generic native Codex subagent
 and paste the complete canonical `agents/<role>.md` instructions into its task.
-This prompt-inlining fallback is mandatory; never substitute a bare generic
-role description. Pass the absolute plugin root and project paths in the task.
+On Muse, always use the generic native subagent interface and this same full-body
+prompt-inlining fallback because the public Muse plugin manifest does not expose
+an `agents` capability. This fallback is mandatory; never substitute a bare
+generic role description. Pass the absolute plugin root and project paths in the task.
 For Mathlib MCP calls, pass `project_dir` explicitly when the tool accepts it.
 
 ## Planner pipeline

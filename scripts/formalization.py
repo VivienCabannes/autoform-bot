@@ -95,8 +95,9 @@ def _fresh_autoform_method() -> dict[str, Any]:
         "models": [],
         "framework": AUTOFORM_FRAMEWORK,
         "tool_setup": (
-            "autoform Claude Code plugin: plan graph -> prover backends "
-            "(claude/aristotle/codex/openai) -> kernel honesty gate -> review jury"
+            "Autoform agent plugin: plan graph -> prover backends "
+            "(claude/aristotle/codex/muse/openai/avocado) -> kernel honesty gate "
+            "-> review jury"
         ),
         "cost": {"wall_time": "", "spend_usd": "", "hardware": ""},
         # Extra key (schema-tolerated): machine-accurate token accounting the

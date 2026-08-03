@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "name": "autoform",
+  "displayName": "AutoForm Bot",
+  "version": "0.4.4",
+  "description": "Lean 4 autoformalization workflows for coding agents.",
+  "compat": {
+    "source": "native",
+    "manifestDir": ".muse-plugin"
+  },
+  "capabilities": {
+    "skills": [
+      {
+        "id": "setup",
+        "path": "skills/setup/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "orchestrate",
+        "path": "skills/orchestrate/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "set-backend",
+        "path": "skills/set-backend/SKILL.md",
+        "enabledDefault": true
+      }
+    ],
+    "commands": [],
+    "hooks": [
+      {
+        "id": "session-start",
+        "event": "SessionStart",
+        "command": [
+          "bash",
+          "hooks/session-start"
+        ],
+        "timeoutMs": 10000,
+        "statusMessage": "Loading Autoform context"
+      }
+    ],
+    "mcpServers": [
+      {
+        "id": "lean-informal-planner-mathlib",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "mathlib"
+        ]
+      },
+      {
+        "id": "autoform-repl",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "repl"
+        ]
+      },
+      {
+        "id": "autoform-lsp",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "lsp"
+        ]
+      },
+      {
+        "id": "autoform-aristotle",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "aristotle"
+        ]
+      },
+      {
+        "id": "autoform-prover",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "prover"
+        ]
+      },
+      {
+        "id": "autoform-zulip",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "zulip"
+        ]
+      }
+    ],
+    "reminders": []
+  }
+}

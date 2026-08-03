@@ -6,8 +6,8 @@ Python suite: invalid manifests, non-portable skill frontmatter, broken
 hooks/MCP paths, or stale role references. This script catches those failures
 with the standard library only, so it runs without installing the package.
 
-This is a root-level plugin: host manifests, `agents/`, `skills/`, hooks, and MCP
-configuration all sit at the repository root.
+Claude and Codex use root-level manifests. Muse uses a native manifest template
+that the package builder copies into a clean single-manifest distribution root.
 
 Checks (all stdlib):
   - `.claude-plugin/marketplace.json` is valid JSON with `name`/`plugins`, and
@@ -15,6 +15,8 @@ Checks (all stdlib):
     `<source>/.claude-plugin/plugin.json`.
   - `.claude-plugin/plugin.json` is valid JSON with `name`/`version`/`description`
     and a semver-shaped `version`.
+  - The native Muse manifest exposes exactly the three public skills, one
+    SessionStart hook, and the portable MCP server set.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
   - The user-visible skill set is exactly `setup`, `orchestrate`, and
@@ -55,6 +57,7 @@ EXPECTED_MCP_SERVERS = frozenset(
     }
 )
 PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
+MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
     "internal/runbooks/evaluation.md",
@@ -266,6 +269,97 @@ def check_codex_plugin() -> None:
             continue
 
 
+def check_muse_plugin() -> None:
+    """Validate the native Muse template and its source-tree capabilities."""
+    global checks
+    data = load_json(MUSE_MANIFEST)
+    if data is None:
+        return
+
+    checks += 1
+    if data.get("schemaVersion") != 1:
+        err(f"{rel(MUSE_MANIFEST)}: schemaVersion must be 1")
+    checks += 1
+    if data.get("compat") != {"source": "native", "manifestDir": ".muse-plugin"}:
+        err(f"{rel(MUSE_MANIFEST)}: invalid native compatibility declaration")
+
+    claude = load_json(REPO_ROOT / ".claude-plugin" / "plugin.json")
+    codex = load_json(REPO_ROOT / ".codex-plugin" / "plugin.json")
+    if claude is not None and codex is not None:
+        checks += 1
+        if data.get("version") not in {claude.get("version"), codex.get("version")}:
+            err(
+                f"{rel(MUSE_MANIFEST)}: version {data.get('version')!r} does not "
+                "match either shipping host manifest"
+            )
+
+    capabilities = data.get("capabilities")
+    checks += 1
+    if not isinstance(capabilities, dict):
+        err(f"{rel(MUSE_MANIFEST)}: capabilities must be an object")
+        return
+    expected_kinds = {"skills", "commands", "hooks", "mcpServers", "reminders"}
+    checks += 1
+    if set(capabilities) != expected_kinds:
+        err(
+            f"{rel(MUSE_MANIFEST)}: capability families must be exactly "
+            f"{', '.join(sorted(expected_kinds))}"
+        )
+
+    skills = capabilities.get("skills")
+    checks += 1
+    if not isinstance(skills, list) or {
+        item.get("id") for item in skills if isinstance(item, dict)
+    } != PUBLIC_WORKFLOW_SKILLS:
+        err(f"{rel(MUSE_MANIFEST)}: Muse skill set differs from the public workflow")
+    elif len(skills) != len(PUBLIC_WORKFLOW_SKILLS):
+        err(f"{rel(MUSE_MANIFEST)}: Muse skills contain duplicate entries")
+    else:
+        for skill in skills:
+            path = skill.get("path")
+            checks += 1
+            if not isinstance(path, str) or not (REPO_ROOT / path).is_file():
+                err(f"{rel(MUSE_MANIFEST)}: skill path does not resolve: {path!r}")
+
+    hooks = capabilities.get("hooks")
+    checks += 1
+    expected_hook = ["bash", "hooks/session-start"]
+    if (
+        not isinstance(hooks, list)
+        or len(hooks) != 1
+        or hooks[0].get("event") != "SessionStart"
+        or hooks[0].get("command") != expected_hook
+    ):
+        err(f"{rel(MUSE_MANIFEST)}: expected one native SessionStart hook")
+
+    servers = capabilities.get("mcpServers")
+    checks += 1
+    if not isinstance(servers, list) or {
+        item.get("id") for item in servers if isinstance(item, dict)
+    } != EXPECTED_MCP_SERVERS:
+        err(f"{rel(MUSE_MANIFEST)}: Muse MCP server set differs from the portable contract")
+    elif len(servers) != len(EXPECTED_MCP_SERVERS):
+        err(f"{rel(MUSE_MANIFEST)}: Muse MCP servers contain duplicate entries")
+    else:
+        for server in servers:
+            command = server.get("command")
+            checks += 1
+            if (
+                not isinstance(command, list)
+                or command[:2] != ["bash", "servers/run-muse-server.sh"]
+                or len(command) != 3
+            ):
+                err(
+                    f"{rel(MUSE_MANIFEST)}: server {server.get('id')!r} does not "
+                    "use the native Muse launcher"
+                )
+
+    for path in (REPO_ROOT / "servers" / "run-muse-server.sh", REPO_ROOT / "scripts" / "build_muse_plugin.py"):
+        checks += 1
+        if not path.is_file():
+            err(f"missing Muse packaging asset: {rel(path)}")
+
+
 def check_agents() -> int:
     """Every agents/*.md needs `name` (== filename stem) and `description`.
 
@@ -333,7 +427,11 @@ def check_skills() -> int:
         for name in PUBLIC_WORKFLOW_SKILLS
     }
     for path in sorted(REPO_ROOT.rglob("SKILL.md")):
-        if ".git" in path.parts or path.resolve() in expected_paths:
+        relative_parts = path.relative_to(REPO_ROOT).parts
+        if (
+            any(part in {".git", ".venv", "dist"} for part in relative_parts)
+            or path.resolve() in expected_paths
+        ):
             continue
         checks += 1
         err(
@@ -433,6 +531,7 @@ def main() -> int:
     check_marketplace()
     check_plugin_json()
     check_codex_plugin()
+    check_muse_plugin()
     n_agents = check_agents()
     n_skills = check_skills()
     check_internal_assets()

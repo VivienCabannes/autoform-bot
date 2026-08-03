@@ -7,8 +7,8 @@ The chosen backend is the *swappable parameter* of the unified prover MCP
 (``servers/prover``, added by the prover PR): the orchestrator (the Claude Code
 session) stays the brain; only the backend that *proves a node* changes. **Backend is
 also the billing path** — ``max`` runs on the Max subscription, ``aristotle`` on
-Harmonic's key, ``codex`` on its own auth, or an explicitly configured
-OpenAI-compatible endpoint.
+Harmonic's key, ``codex`` on its own auth, Muse through ``tbh``, or an
+explicitly configured OpenAI-compatible endpoint.
 
 Each user-facing backend maps to the ``prove_node(node, backend=...)`` adapter id via
 its ``prover`` field (``max -> "claude"``, ``aristotle -> "aristotle"``), so the
@@ -43,6 +43,8 @@ BACKENDS: dict[str, dict] = {
                   "billing": "Harmonic · ARISTOTLE_API_KEY"},
     "codex": {"label": "Codex", "available": True, "prover": "codex",
               "billing": "Codex · its own auth (ChatGPT/OpenAI login)"},
+    "muse": {"label": "Muse/TBH", "available": True, "prover": "muse",
+             "billing": "Muse · configured Meta provider/authentication"},
     "openai": {"label": "Custom API (OpenAI-compatible)", "available": True,
                "prover": "openai",
                "billing": "Configured API credential · project data may leave the machine"},

@@ -59,7 +59,7 @@
       "command": "uv",
       "args": ["run", "python", "-m", "servers.prover.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "description": "Unified kernel-gated prover across Claude, Codex, Aristotle, OpenAI, and Avocado"
+      "description": "Unified kernel-gated prover across Claude, Codex, Muse, Aristotle, OpenAI, and Avocado"
     },
     "autoform-zulip": {
       "command": "uv",

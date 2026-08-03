@@ -4,21 +4,23 @@ Status: implementation contract
 
 Autoform supports three distinct things that must not be conflated:
 
-1. **Agent hosts** run the interactive workflow: Claude Code and Codex.
+1. **Agent hosts** run the interactive workflow: Claude Code, Codex, and Muse.
 2. **Model providers** supply headless inference: Anthropic, OpenAI-compatible
    endpoints, and Meta's Avocado deployment.
 3. **Specialist provers** solve Lean tasks through their own service: Aristotle.
 
-Claude, Codex, and Avocado are therefore not three interchangeable command-line
-programs. Claude and Codex are hosts with skills, subagents, MCP, permissions,
-and resumable sessions. Avocado is an OpenAI-compatible model endpoint and needs
-Autoform's bounded local tool loop when it is used without a separate agent host.
+Claude, Codex, Muse, and Avocado are therefore not interchangeable command-line
+programs. Claude, Codex, and Muse are hosts with skills, subagents, MCP, and
+permissions. Claude and Codex expose resumable headless sessions; stable Muse
+currently exposes one-shot headless runs. Avocado is an OpenAI-compatible model
+endpoint and needs Autoform's bounded local tool loop when it is used without a
+separate agent host.
 
 ## Design goals
 
 - The same durable graph, queue, review sidecar, usage ledger, rubrics, and kernel
   verification gate are authoritative on every host.
-- Claude and Codex keep their native skill, MCP, and subagent capabilities.
+- Claude, Codex, and Muse keep their native skill, MCP, and subagent capabilities.
 - Every provider is selected explicitly. Unknown names fail closed.
 - Headless jury results use one JSON Schema contract.
 - A provider never receives files implicitly. API-backed agents see only content
@@ -43,13 +45,17 @@ flowchart LR
     U["Human or automation"] --> H{"Native host"}
     H --> C["Claude Code"]
     H --> X["Codex"]
+    H --> M["Muse"]
     C --> S["Shared Autoform skills"]
     X --> S
+    M --> S
     C --> A["Native Claude subagents"]
     X --> B["Codex roles: installed TOML or inlined canonical prompt"]
+    M --> N["Muse roles: inlined canonical prompt"]
     S --> Q["Durable control plane"]
     A --> Q
     B --> Q
+    N --> Q
     Q --> G["graph.json"]
     Q --> T["task_queue.json"]
     Q --> R["review_status.json"]
@@ -59,13 +65,16 @@ flowchart LR
     D --> P{"Prover adapter"}
     J --> JC["Claude CLI"]
     J --> JX["Codex CLI"]
+    J --> JM["Muse CLI"]
     J --> JA["OpenAI-compatible API tool loop"]
     P --> PC["Claude CLI"]
     P --> PX["Codex CLI"]
+    P --> PM["Muse CLI"]
     P --> PA["OpenAI / Avocado API tool loop"]
     P --> PH["Aristotle"]
     PC --> V["Shared Lean verification gate"]
     PX --> V
+    PM --> V
     PA --> V
     PH --> V
 ```
@@ -93,9 +102,10 @@ may persist a private verdict format.
 ### 2. Native interactive host layer
 
 Agent Skills are the canonical workflow surface. Claude Code now treats legacy
-commands and skills as the same user-facing concept, while Codex installs plugin
-commands as skills. Autoform consequently ships `setup`, `orchestrate`, and
-`set-backend` as skills rather than maintaining host-specific prompt copies.
+commands and skills as the same user-facing concept, Codex installs plugin
+commands as skills, and Muse loads the same three skills from its native plugin
+manifest. Autoform consequently ships `setup`, `orchestrate`, and `set-backend`
+as skills rather than maintaining host-specific prompt copies.
 
 Claude consumes plugin agents from `agents/*.md`. Codex project agents are
 materialized into namespaced `.codex/agents/autoform_*.toml` files by
@@ -114,23 +124,28 @@ instructions inlined. Generated TOML is a discovery optimization, not the only
 role contract. The workflow must not shell out to another interactive host merely
 to simulate delegation.
 
+Muse's plugin manifest does not expose an agents capability. Muse therefore uses
+the same mandatory fallback: a generic native subagent receives the complete
+canonical role prompt plus absolute plugin and project paths.
+
 ### 3. Deterministic headless layer
 
 The dispatcher supports a separate prover backend and judge backend:
 
 ```text
---backend       max | aristotle | codex | openai | avocado
---judge-backend claude | codex | openai | avocado
+--backend       max | aristotle | codex | muse | openai | avocado
+--judge-backend claude | codex | muse | openai | avocado
 ```
 
 This separation is deliberate. A project can, for example, prove with Avocado
 and review with Codex. Backend lookup is exact; a misspelling is an error rather
 than an implicit Claude run.
 
-Claude and Codex headless judges both receive the same JSON Schema. Claude uses
-`--json-schema`; Codex uses `--output-schema` and a last-message file. API judges
-use the OpenAI-compatible tool loop and the same schema in the prompt/response
-contract.
+Claude, Codex, and Muse headless judges receive the same JSON Schema. Claude uses
+`--json-schema`; Codex uses `--output-schema` and a last-message file; Muse
+receives the schema in its isolated read-only headless prompt and returns it in
+the terminal JSONL event. API judges use the OpenAI-compatible tool loop and the
+same schema in the prompt/response contract.
 
 The selected jury provider also handles the rare model-judged live-steering
 signal for an in-flight prover. Deterministic trigger corrections and

@@ -190,7 +190,9 @@ def test_palette_partitions_into_engine_and_orchestrator_kinds():
 
 def test_dashboard_backend_registry_covers_every_available_prover():
     options = {item["id"]: item for item in sv._backend_payload()["options"]}
-    assert set(options) == {"max", "aristotle", "codex", "openai", "avocado"}
+    assert set(options) == {
+        "max", "aristotle", "codex", "muse", "openai", "avocado"
+    }
     assert all(item["available"] for item in options.values())
     assert options["max"]["label"] == "Claude Code (Max subscription)"
     assert options["openai"]["label"] == "Custom API (OpenAI-compatible)"

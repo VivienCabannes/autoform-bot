@@ -134,6 +134,17 @@ def test_api_backend_requires_explicit_per_process_egress_flag(
     )
 
 
+def test_missing_muse_cli_fails_before_queue_claim(tmp_path, monkeypatch):
+    proj = _proj(tmp_path, [
+        {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "queued"}
+    ])
+    monkeypatch.setattr(dr.shutil, "which", lambda _binary: None)
+    with pytest.raises(SystemExit) as error:
+        dr.main([str(proj), "--judge-backend", "muse"])
+    assert error.value.code == 2
+    assert _by_id(proj, "reviewer:s1")["status"] == "queued"
+
+
 # ---------------------------------------------------------------------------
 # per-task failure isolation — one bad task never sinks the run
 # ---------------------------------------------------------------------------
@@ -227,7 +238,9 @@ def test_dispatcher_lease_releases_after_exception(tmp_path):
         pass
 
 
-@pytest.mark.parametrize("backend", ["aristotle", "claude", "codex", "openai", "avocado"])
+@pytest.mark.parametrize(
+    "backend", ["aristotle", "claude", "codex", "muse", "openai", "avocado"]
+)
 def test_worker_timeout_reaches_every_adapter(backend):
     adapter = dr._worker_adapter(backend, "/repo", "/repo/graph.json", 17)
     if backend in {"openai", "avocado"}:

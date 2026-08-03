@@ -11,11 +11,15 @@ on:
       - "examples/**"
       - ".claude-plugin/**"
       - ".codex-plugin/**"
+      - "packaging/muse/**"
       - ".mcp.json"
       - "hooks/hooks.json"
       - "hooks/**"
       - "scripts/lint_plugin.py"
       - "scripts/service_control.py"
+      - "scripts/build_muse_plugin.py"
+      - "servers/run-muse-server.sh"
+      - "tests/test_muse_plugin.py"
       - "scripts/check_invariants.py"
       - ".github/workflows/plugin-lint.yml"
   pull_request:
@@ -26,11 +30,15 @@ on:
       - "examples/**"
       - ".claude-plugin/**"
       - ".codex-plugin/**"
+      - "packaging/muse/**"
       - ".mcp.json"
       - "hooks/hooks.json"
       - "hooks/**"
       - "scripts/lint_plugin.py"
       - "scripts/service_control.py"
+      - "scripts/build_muse_plugin.py"
+      - "servers/run-muse-server.sh"
+      - "tests/test_muse_plugin.py"
       - "scripts/check_invariants.py"
       - ".github/workflows/plugin-lint.yml"
 
@@ -48,6 +56,7 @@ jobs:
       - name: Byte-compile scripts
         run: |
           python -m py_compile scripts/lint_plugin.py
+          python -m py_compile scripts/build_muse_plugin.py
           python -m py_compile scripts/backend_config.py
           python -m py_compile scripts/install_host_agents.py
           python -m py_compile scripts/init_plan.py

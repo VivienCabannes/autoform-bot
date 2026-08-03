@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from servers.prover.api_tools import ProjectTools, run_tool_loop
+from servers.prover.muse_adapter import muse_runtime_env, parse_muse_terminal_output
 from servers.prover.openai_adapter import _PRESETS, _env, _urllib_transport
 
 SCORE_SCHEMA: dict[str, Any] = {
@@ -35,7 +36,7 @@ STEER_SCHEMA: dict[str, Any] = {
         "prompt": {"type": "string", "maxLength": 1000},
     },
 }
-SUPPORTED_JUDGES = ("claude", "codex", "openai", "avocado")
+SUPPORTED_JUDGES = ("claude", "codex", "muse", "openai", "avocado")
 _SCRUBBED_ANTHROPIC = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 _CLAUDE_JUDGE_TOOLS = (
     "Read,Grep,Glob,"
@@ -268,6 +269,82 @@ def _run_codex(axis: str, prompt: str, repo: str, model: str, timeout: int) -> s
     )
 
 
+def _run_muse_structured(
+    prompt: str,
+    repo: str,
+    model: str,
+    timeout: int,
+    *,
+    schema_data: dict[str, Any],
+    system_prompt: str,
+) -> tuple[str, dict[str, int]]:
+    """Run a read-only Muse judge and extract its terminal JSON response."""
+    muse_bin = os.environ.get("AUTOFORM_MUSE_BIN", "tbh")
+    provider = os.environ.get("AUTOFORM_MUSE_PROVIDER", "meta")
+    args = [
+        muse_bin,
+        "exec",
+        "--json",
+        "--provider",
+        provider,
+        "--workspace",
+        repo,
+        "--disable-approval",
+        "--user-input-auto-resolve",
+        "--disable-write",
+        "--disable-shell",
+        "--disable-web-tools",
+        "--no-foreign-personal-context",
+        "--no-session-log",
+        "--sandbox-network",
+        "restricted",
+    ]
+    preset = os.environ.get("AUTOFORM_MUSE_PRESET", "").strip()
+    selected_model = model or os.environ.get("AUTOFORM_MUSE_MODEL", "").strip()
+    reasoning = os.environ.get("AUTOFORM_MUSE_REASONING_EFFORT", "").strip()
+    max_steps = os.environ.get("AUTOFORM_MUSE_MAX_MODEL_STEPS", "").strip()
+    if preset:
+        args += ["--preset", preset]
+    if selected_model:
+        args += ["--model", selected_model]
+    if reasoning:
+        args += ["--reasoning-effort", reasoning]
+    if max_steps:
+        args += ["--max-model-steps", max_steps]
+    args.append(
+        f"{system_prompt}\n\n{prompt}\n\n"
+        "Return only one JSON object matching this schema:\n"
+        + json.dumps(schema_data)
+    )
+    stdout, stderr, code = _run_process(
+        args,
+        repo=repo,
+        timeout=timeout,
+        env=muse_runtime_env(),
+    )
+    final, terminal_error, usage = parse_muse_terminal_output(stdout)
+    if code:
+        detail = terminal_error or stderr.strip() or stdout.strip()
+        raise RuntimeError(f"muse exited {code}: {detail[:500]}")
+    if terminal_error:
+        raise RuntimeError(f"muse run failed: {terminal_error[:500]}")
+    if not final.strip():
+        raise RuntimeError("muse completed without a terminal response")
+    return final, usage
+
+
+def _run_muse(axis: str, prompt: str, repo: str, model: str, timeout: int) -> str:
+    raw, _usage = _run_muse_structured(
+        prompt,
+        repo,
+        model,
+        timeout,
+        schema_data=SCORE_SCHEMA,
+        system_prompt=_system_prompt(axis),
+    )
+    return raw
+
+
 def _run_api(
     backend: str,
     axis: str,
@@ -333,6 +410,8 @@ def run_judge(
             raw = _run_claude(axis, prompt, repo, model or "", timeout)
         elif backend == "codex":
             raw = _run_codex(axis, prompt, repo, model or "", timeout)
+        elif backend == "muse":
+            raw = _run_muse(axis, prompt, repo, model or "", timeout)
         else:
             raw = _run_api(
                 backend,
@@ -480,6 +559,15 @@ def run_steer_judge(
                 pass
         elif backend == "codex":
             raw = _run_codex_structured(
+                prompt,
+                repo,
+                model or "",
+                timeout,
+                schema_data=STEER_SCHEMA,
+                system_prompt=_steer_system_prompt(),
+            )
+        elif backend == "muse":
+            raw, usage = _run_muse_structured(
                 prompt,
                 repo,
                 model or "",

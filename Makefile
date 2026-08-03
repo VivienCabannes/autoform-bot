@@ -5,14 +5,17 @@
 #   make install-claude  install the plugin into Claude Code
 #                        → then launch `claude` and use /autoform:setup
 #
-# (Codex users: `make install-codex` instead.) Run `make help` for the list.
+# (Codex users: `make install-codex`; Muse users: `make install-muse`.)
+# Run `make help` for the list.
 
 SHELL       := /bin/bash
 PYTHON      ?= python3
 CLAUDE      ?= claude
+TBH         ?= tbh
 PLUGIN_DIR  := $(CURDIR)
 PLUGIN      := autoform@autoform
 MARKETPLACE := autoform
+MUSE_DIST   ?= $(CURDIR)/dist/muse/autoform
 
 .DEFAULT_GOAL := help
 
@@ -28,7 +31,7 @@ setup: ## Install Python deps (uv + project deps)
 	@command -v uv >/dev/null 2>&1 || { echo "installing uv..."; \
 		curl -LsSf https://astral.sh/uv/install.sh | sh || $(PYTHON) -m pip install --user uv; }
 	uv sync --all-extras
-	@echo "✅ Deps ready. Install the plugin:  make install-claude   (or  make install-codex)"
+	@echo "✅ Deps ready. Install the plugin with make install-claude, install-codex, or install-muse"
 
 # --- Install the plugin into an assistant -----------------------------------
 
@@ -52,6 +55,21 @@ install-codex: ## Install the plugin into Codex CLI (local marketplace)
 		printf '%s\n' '{"name":"autoform-local","interface":{"displayName":"AutoForm Local"},"plugins":[{"name":"autoform","source":{"source":"local","path":"./plugins/autoform"},"policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"},"category":"Coding"}]}' > "$$root/.agents/plugins/marketplace.json"; \
 		codex plugin marketplace add "$$root" 2>/dev/null || true; \
 		codex plugin add autoform@autoform-local
+
+.PHONY: build-muse
+build-muse: ## Build a clean single-manifest Muse/TBH plugin package
+	@$(PYTHON) scripts/build_muse_plugin.py --output "$(MUSE_DIST)" --force
+
+.PHONY: validate-muse
+validate-muse: build-muse ## Validate the staged plugin with the installed Muse/TBH CLI
+	@command -v $(TBH) >/dev/null 2>&1 || { echo "! '$(TBH)' CLI not found"; exit 1; }
+	@$(TBH) plugins validate "$(MUSE_DIST)" --json
+
+.PHONY: install-muse
+install-muse: validate-muse ## Install and enable the staged plugin in Muse/TBH
+	@$(TBH) plugins install "$(MUSE_DIST)"
+	@$(TBH) plugins enable autoform
+	@echo "✅ Installed — launch '$(TBH)' and try /autoform:setup"
 
 # --- Use & develop ----------------------------------------------------------
 

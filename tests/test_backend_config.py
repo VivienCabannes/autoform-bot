@@ -11,6 +11,7 @@ def test_every_configured_backend_maps_explicitly():
     assert backend_config.prover_of("max") == "claude"
     assert backend_config.prover_of("aristotle") == "aristotle"
     assert backend_config.prover_of("codex") == "codex"
+    assert backend_config.prover_of("muse") == "muse"
     assert backend_config.prover_of("openai") == "openai"
     assert backend_config.prover_of("avocado") == "avocado"
 

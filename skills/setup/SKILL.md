@@ -15,7 +15,7 @@ Use the current host's native tools and subagents.
 ## Resolve the plugin root
 
 Resolve one absolute plugin root. Prefer a valid `AUTOFORM_PLUGIN_ROOT`,
-`PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
+`MUSE_PLUGIN_ROOT`, `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
 `Path(<this loaded SKILL.md>).resolve().parents[2]`. The result must be the
 directory containing `scripts/`, `skills/`, and `internal/`.
 
@@ -93,6 +93,11 @@ absolute path; do not depend on a variable exported by a previous shell call.
    has no role selector—spawn a generic native Codex subagent and include the
    full canonical `agents/<role>.md` body in its task. Claude Code reads those
    canonical plugin agents directly.
+
+   On Muse, do not install Codex TOMLs. Muse's public plugin manifest does not
+   expose an `agents` capability. Spawn a generic native Muse subagent and put
+   the complete canonical `agents/<role>.md` body in its task, together with the
+   absolute plugin root and project paths.
 
 5. Initialize durable planning state without overwriting existing work:
 
