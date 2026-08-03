@@ -8,7 +8,8 @@ from pathlib import Path
 from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 
 
-EXPECTED_SKILLS = {"setup", "orchestrate", "set-backend"}
+EXPECTED_COMMANDS = {"setup", "orchestrate", "set-backend"}
+EXPECTED_SKILLS = {f"{command}-skill" for command in EXPECTED_COMMANDS}
 EXPECTED_MCP_SERVERS = {
     "lean-informal-planner-mathlib",
     "autoform-repl",
@@ -40,7 +41,13 @@ def test_native_muse_manifest_has_the_portable_autoform_surface():
         "reminders",
     }
     assert {item["id"] for item in capabilities["skills"]} == EXPECTED_SKILLS
-    assert capabilities["commands"] == []
+    for skill in capabilities["skills"]:
+        command_id = skill["id"].removesuffix("-skill")
+        assert skill["path"] == f"skills/{command_id}/SKILL.md"
+    assert {item["id"] for item in capabilities["commands"]} == EXPECTED_COMMANDS
+    for command in capabilities["commands"]:
+        assert command["path"] == f"skills/{command['id']}/SKILL.md"
+        assert command["enabledDefault"] is True
     assert capabilities["reminders"] == []
     assert capabilities["hooks"] == [
         {
@@ -71,6 +78,8 @@ def test_muse_builder_emits_one_supported_manifest_family(tmp_path: Path):
     manifest = _manifest(output)
     for skill in manifest["capabilities"]["skills"]:
         assert (output / skill["path"]).is_file()
+    for command in manifest["capabilities"]["commands"]:
+        assert (output / command["path"]).is_file()
     assert (output / "hooks" / "session-start").is_file()
     assert (output / "servers" / "run-muse-server.sh").is_file()
     assert (output / "pyproject.toml").is_file()

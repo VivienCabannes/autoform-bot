@@ -1,7 +1,7 @@
 {
   "name": "autoform",
   "description": "Lean 4 formalization agent: Mathlib conventions, proof strategies, review, statement extraction, and textbook-to-blueprint formalization planning.",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"

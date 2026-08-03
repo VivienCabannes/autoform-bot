@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "autoform",
   "displayName": "AutoForm Bot",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Lean 4 autoformalization workflows for coding agents.",
   "compat": {
     "source": "native",
@@ -10,6 +10,23 @@
   },
   "capabilities": {
     "skills": [
+      {
+        "id": "setup-skill",
+        "path": "skills/setup/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "orchestrate-skill",
+        "path": "skills/orchestrate/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "set-backend-skill",
+        "path": "skills/set-backend/SKILL.md",
+        "enabledDefault": true
+      }
+    ],
+    "commands": [
       {
         "id": "setup",
         "path": "skills/setup/SKILL.md",
@@ -26,7 +43,6 @@
         "enabledDefault": true
       }
     ],
-    "commands": [],
     "hooks": [
       {
         "id": "session-start",
