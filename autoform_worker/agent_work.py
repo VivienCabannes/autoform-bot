@@ -18,6 +18,7 @@ Two write paths, matching what the artifact is:
 from __future__ import annotations
 
 import contextlib
+import re
 from dataclasses import dataclass
 
 from . import agents, gitutil
@@ -44,6 +45,19 @@ AGENT_TIMEOUT_S = 3600
 #: Triage first, then structure, then breadth — the orchestrate skill's order.
 KIND_PRIORITY = ("escalation", "planner", "mathcheck", "graphreview",
                  "contentreview", "counterexample", "priorart", "holistic")
+
+
+def _recovery_outcome(log_path) -> str | None:
+    """Read the recovery coordinator's machine-readable final marker."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        match = re.match(r"^\s*RECOVERY:\s*(RETRY|REFUTED|PARK)\b", line)
+        if match:
+            return match.group(1)
+    return None
 
 
 def _changed_paths(repo, base_ref: str = "HEAD") -> set[str]:
@@ -79,6 +93,7 @@ class QueuedTask:
     node: str
     node_label: str
     note: str = ""
+    recovery: dict | None = None
 
 
 def queued_agent_tasks(cfg: WorkerConfig, registry: Registry) -> list[QueuedTask]:
@@ -94,6 +109,7 @@ def queued_agent_tasks(cfg: WorkerConfig, registry: Registry) -> list[QueuedTask
             task_id=str(t.get("id")), kind=str(t.get("agent")),
             node=str(t.get("node") or ""), node_label=str(t.get("node_label") or t.get("node") or ""),
             note=str(t.get("note") or ""),
+            recovery=t.get("recovery") if isinstance(t.get("recovery"), dict) else None,
         )
         for t in tasks
         if t.get("agent") in kinds and t.get("status") == "queued"
@@ -219,11 +235,32 @@ def do_agent_task(
 
             pushed = False
             changed = _changed_paths(work_cfg.lean_root, base_oid)
+            recovery_outcome = _recovery_outcome(log_path) if task.kind == "escalation" else None
+            recovery_fingerprint = ""
+            if task.kind == "escalation" and task.recovery:
+                recovery_fingerprint = scripts_modules()["recovery_state"].proof_fingerprint(
+                    work_cfg.graph_path,
+                    task.node,
+                    work_cfg.lean_root,
+                    str(task.recovery.get("backend") or ""),
+                )
+            invalid_recovery = task.kind == "escalation" and (
+                recovery_outcome is None
+                or (recovery_outcome in {"RETRY", "REFUTED"} and not changed)
+            )
             if not _agent_paths_allowed(role, work_cfg, changed):
                 paths = ", ".join(sorted(changed)[:8]) or "(none)"
                 dq.main([str(cfg.project), "fail", task.task_id, "--reason",
                          f"role write contract rejected: {paths}"])
                 return UnitResult(False, f"{task.kind} {task.node}: rejected out-of-contract paths: {paths}")
+            if invalid_recovery:
+                reason = ("recovery produced no outcome marker" if recovery_outcome is None
+                          else "recovery requested action without durable evidence")
+                args = [str(cfg.project), "park", task.task_id, "--reason", reason]
+                if recovery_fingerprint:
+                    args += ["--fingerprint", recovery_fingerprint]
+                dq.main(args)
+                return UnitResult(True, f"{task.kind} {task.node}: parked; {reason}")
             if changed:
                 if not gitutil.clean_tree(work_cfg.lean_root):
                     gitutil.run_git(["add", "-A"], cwd=work_cfg.lean_root)
@@ -240,8 +277,17 @@ def do_agent_task(
                              "CAS lost — base moved; will retry"])
                     return UnitResult(False, f"{task.kind} {task.node}: CAS lost, retry next round")
 
-            dq.main([str(cfg.project), "done", task.task_id, "--result",
-                     f"{role.name} completed" + (" (pushed)" if pushed else "")])
+            if task.kind == "escalation" and recovery_outcome in {"PARK", "REFUTED"}:
+                parked_reason = ("statement refuted; correct it before retry"
+                                 if recovery_outcome == "REFUTED"
+                                 else "recovery wave exhausted; evidence ledger preserved")
+                args = [str(cfg.project), "park", task.task_id, "--reason", parked_reason]
+                if recovery_fingerprint:
+                    args += ["--fingerprint", recovery_fingerprint]
+                dq.main(args)
+            else:
+                dq.main([str(cfg.project), "done", task.task_id, "--result",
+                         f"{role.name} completed" + (" (pushed)" if pushed else "")])
             counters.clear(counter_key)
             detail = "; ".join([f"{task.kind} {task.node}: {role.name} done"
                                 + (" + pushed" if pushed else " (no durable change)"), *notes])

@@ -47,6 +47,7 @@ ENGINE_KINDS = ("reviewer", "worker")
 #: rather than dropped on the queue themselves.
 _NON_QUEUE_ROLES = frozenset({
     "splitter", "autoform-reader", "autoform-worker", "source-searcher",
+    "proof-strategy-researcher",
 })
 
 

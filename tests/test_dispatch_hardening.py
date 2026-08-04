@@ -305,7 +305,6 @@ def test_direct_dispatch_worker_records_the_shared_usage_ledger(tmp_path, monkey
         ("--jobs", "0"),
         ("--poll", "0"),
         ("--max-steers", "-1"),
-        ("--max-escalations", "-1"),
     ],
 )
 def test_dispatcher_rejects_nonpositive_runtime_bounds(tmp_path, flag, value):
@@ -317,13 +316,50 @@ def test_dispatcher_rejects_nonpositive_runtime_bounds(tmp_path, flag, value):
 
 def test_escalation_ids_remain_unique_across_retries():
     queue = []
-    assert dr._raise_escalation(queue, "s1", "S1", "first", max_escalations=3)
+    assert dr._raise_escalation(queue, "s1", "S1", "first")
     queue[0]["status"] = "done"
-    assert dr._raise_escalation(queue, "s1", "S1", "second", max_escalations=3)
+    assert dr._raise_escalation(queue, "s1", "S1", "second")
     assert [task["id"] for task in queue] == [
         "escalation:s1",
         "escalation:s1:2",
     ]
+
+
+def test_parked_recovery_deduplicates_without_a_terminal_attempt_cap():
+    queue = []
+    for round_number in range(1, 6):
+        assert dr._raise_escalation(
+            queue, "s1", "S1", f"failure {round_number}",
+            {"round": round_number, "fingerprint": str(round_number)},
+        )
+        queue[-1]["status"] = "done"
+    assert len(queue) == 5
+    queue[-1]["status"] = "parked"
+    assert not dr._raise_escalation(queue, "s1", "S1", "duplicate")
+
+
+def test_worker_retry_is_rejected_when_recovery_changed_nothing(tmp_path, monkeypatch):
+    proj = _proj(tmp_path, [
+        {
+            "id": "escalation:s1",
+            "agent": "escalation",
+            "node": "s1",
+            "status": "done",
+            "recovery": {"fingerprint": "pending", "backend": "codex"},
+        },
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    fingerprint = dr.recovery_state.proof_fingerprint(
+        proj / "graph.json", "s1", proj, "codex"
+    )
+    queue = _queue(proj)
+    queue[0]["recovery"]["fingerprint"] = fingerprint
+    (proj / "task_queue.json").write_text(json.dumps(queue), encoding="utf-8")
+    monkeypatch.setattr(dr, "run_worker", lambda *args, **kwargs: pytest.fail("blind retry ran"))
+
+    assert dr.main([str(proj), "--repo", str(proj), "--workers", "--backend", "codex"]) == 0
+    assert _by_id(proj, "worker:s1")["status"] == "failed"
+    assert _by_id(proj, "escalation:s1")["status"] == "parked"
 
 
 def test_main_runs_the_sweep_then_drains_the_requeued_task(tmp_path, monkeypatch):

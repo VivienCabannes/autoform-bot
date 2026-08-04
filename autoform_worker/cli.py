@@ -330,7 +330,7 @@ def cmd_issues_sync(args) -> int:
               "(enable them in repo settings for cross-machine escalations)")
         return EX_OK
     if args.dry_run:
-        print("[dry-run] would sync open escalations to issues and close resolved ones")
+        print("[dry-run] would sync active proof recoveries to issues and close resolved ones")
         return EX_OK
     changed = _sync_escalation_issues(cfg, host, canonical)
     print(f"synced {changed} escalation issue(s)")

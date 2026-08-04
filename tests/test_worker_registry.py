@@ -334,6 +334,18 @@ def test_shipped_sub_roles_are_not_queue_kinds():
     assert "splitter" not in roles
     assert "source-searcher" not in roles
     assert "autoform-reader" not in roles
+    assert "proof-strategy-researcher" not in roles
+
+
+def test_recovery_outcome_reads_final_marker(tmp_path):
+    log = tmp_path / "agent.log"
+    log.write_text(
+        "considered RECOVERY: RETRY in the instructions\n"
+        "RECOVERY: RETRY - provisional\n"
+        "RECOVERY: PARK - no defensible route\n",
+        encoding="utf-8",
+    )
+    assert agent_work._recovery_outcome(log) == "PARK"
 
 
 # -- agent_work.queued_agent_tasks ------------------------------------------

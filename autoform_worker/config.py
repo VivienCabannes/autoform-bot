@@ -54,6 +54,7 @@ def scripts_modules():
     import dispatch_queue  # noqa: PLC0415
     import fslock  # noqa: PLC0415
     import judge_runtime  # noqa: PLC0415
+    import recovery_state  # noqa: PLC0415
     import review_model  # noqa: PLC0415
 
     return {
@@ -61,6 +62,7 @@ def scripts_modules():
         "dispatch_queue": dispatch_queue,
         "fslock": fslock,
         "judge_runtime": judge_runtime,
+        "recovery_state": recovery_state,
         "review_model": review_model,
     }
 

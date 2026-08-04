@@ -89,7 +89,6 @@ MAX_CI_ATTEMPTS = 3         # per PR head
 MAX_CI_PR_ATTEMPTS = 5      # per PR lifetime
 MAX_REBASE_ATTEMPTS = 3     # per PR
 MAX_REVIEW_ERRORS = 3       # per PR
-MAX_PROVE_ATTEMPTS = 3      # per node
 MAX_INFRA_REFUNDS = 20      # per counter — a refund cap so outages still terminate
 
 # ---------------------------------------------------------------------------

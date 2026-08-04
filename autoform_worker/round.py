@@ -116,7 +116,8 @@ def build_survey(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps):
     picture = survey_mod.collect(cfg, host, board, counters, canonical, default_branch,
                                  extra_identities=list(opts.extra_identities),
                                  allow_foreign_review=opts.review_foreign,
-                                 allow_unchecked_merge=opts.merge_without_ci)
+                                 allow_unchecked_merge=opts.merge_without_ci,
+                                 proof_backend=opts.backend)
     return picture, host, board, counters
 
 

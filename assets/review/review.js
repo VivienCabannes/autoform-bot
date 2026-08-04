@@ -991,11 +991,11 @@
       applyPulse();
     }
 
-    // Pending marker: every node carrying a queued/running task (from the queue).
+    // Pending marker: every node carrying a queued/running/parked task.
     var nextPending = dispatch.queue
       .filter(function (t) {
         var s = String(t && t.status || "");
-        return s === "queued" || s === "running";
+        return s === "queued" || s === "running" || s === "parked";
       })
       .map(function (t) { return t && t.node; })
       .filter(Boolean);
@@ -1163,7 +1163,8 @@
       tasks.forEach(function (t) {
         var status = String(t.status || "queued");
         var statusClass = (status === "running") ? "running"
-          : (status === "queued") ? "queued" : "other";
+          : (status === "queued") ? "queued"
+          : (status === "parked") ? "parked" : "other";
         var nodeLbl = t.node_label || t.node || "";
         html += "<li class='rv-task rv-task-" + escapeHtml(statusClass) + "'>"
           + "<div class='rv-task-main'>"
@@ -1222,13 +1223,13 @@
   // authoritative for queued + running tasks the orchestrator owns; we ADD a live
   // agent only if it has a target not already represented by a queue row (so a node
   // an agent is working on shows as "running" even before/without a queue entry).
-  // Never invents a status — queued rows stay queued, running rows/agents stay running.
+  // Never invents a status: queue rows retain queued, running, or parked.
   function buildTasks(queue, agents) {
     var tasks = [];
     var seenNodeAgent = {};
     (queue || []).forEach(function (t) {
       var status = String(t && t.status || "");
-      if (status !== "queued" && status !== "running") return;
+      if (status !== "queued" && status !== "running" && status !== "parked") return;
       tasks.push(t);
       if (t.agent && t.node) seenNodeAgent[t.agent + "\u0000" + t.node] = true;
       if (t.node) seenNodeAgent["\u0000" + t.node] = true;

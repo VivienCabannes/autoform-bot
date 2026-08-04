@@ -108,6 +108,33 @@ def test_lifecycle_transitions_are_guarded_and_retries_are_idempotent(tmp_path):
     assert dq.main([str(proj), "claim", "pl-1"]) == 1
 
 
+def test_recovery_can_be_parked_and_resumed_without_duplication(tmp_path):
+    proj = _proj(tmp_path, [{
+        "id": "escalation:b",
+        "agent": "escalation",
+        "node": "b",
+        "status": "queued",
+        "recovery": {"phase": "proof-research", "fingerprint": "abc"},
+    }])
+    assert dq.main([str(proj), "claim", "escalation:b"]) == 0
+    assert dq.main([
+        str(proj), "park", "escalation:b", "--reason", "routes exhausted",
+        "--fingerprint", "def",
+    ]) == 0
+    task = dq.load_queue(proj / "task_queue.json")[0]
+    assert task["status"] == "parked"
+    assert task["recovery"]["phase"] == "parked"
+    assert task["recovery"]["fingerprint"] == "def"
+    assert dq.main([
+        str(proj), "enqueue", "--agent", "escalation", "--node", "b",
+    ]) == 0
+    assert len(dq.load_queue(proj / "task_queue.json")) == 1
+    assert dq.main([str(proj), "resume", "escalation:b"]) == 0
+    task = dq.load_queue(proj / "task_queue.json")[0]
+    assert task["status"] == "queued"
+    assert task["recovery"]["phase"] == "proof-research"
+
+
 def test_corrupt_queue_is_never_replaced_by_enqueue(tmp_path):
     queue = tmp_path / "task_queue.json"
     original = b'[{\"id\":\"survives\"},BROKEN'

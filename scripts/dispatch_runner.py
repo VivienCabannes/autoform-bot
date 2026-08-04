@@ -45,6 +45,7 @@ import review_model as rm  # noqa: E402  # load_sidecar / save_sidecar / jury_ve
 import dispatch_queue as dq  # noqa: E402  # _save / _feed_for / _now
 import backend_config  # noqa: E402  # user-facing backend selection
 import judge_runtime  # noqa: E402  # structured jury across CLI/API providers
+import recovery_state  # noqa: E402  # evidence gate for proof retries
 try:
     from servers.prover.driver import prove as _prove
     from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
@@ -271,28 +272,29 @@ def _escalation_note(reason: str, detail: str, cap: int = _ESC_NOTE_CAP) -> str:
 
 
 def _raise_escalation(queue: list, node_id: str, label: str, note: str,
-                      max_escalations: int = 3) -> bool:
-    """Append an ``escalation`` task for the orchestrator to triage, with two
-    engine-side circuit breakers so safety never rests on LLM prose alone:
-      * **dedup** — at most one *open* (queued/running) escalation per node;
-      * **cap** — at most ``max_escalations`` escalations per node *ever* (``done``
-        ones count too). Past the cap the engine stops raising: a node still failing
-        after N grow-the-DAG rounds is a human's call, not an infinite Max-billed
-        retry loop. Returns True iff a new task was added.
+                      recovery: dict | None = None) -> bool:
+    """Append a proof-recovery task for the orchestrator.
+
+    At most one queued, running, or parked recovery may exist per node. There is
+    deliberately no attempt cap: retries are controlled by durable evidence,
+    not by declaring a theorem exhausted after an arbitrary number of calls.
+    Returns True iff a new task was added.
 
     The engine NEVER mutates ``graph.json`` from a worker result — whether a wall is a
     real new prerequisite, a duplicate, a cluster-level gap, or a non-DAG failure
     (toolchain / false statement / honest give-up) is a judgment call. It only raises
     the flag + the worker's own words (``note``); ``/autoform:orchestrate`` decides."""
-    escs = [x for x in queue if x.get("agent") == "escalation" and x.get("node") == node_id]
-    if any(e.get("status") in ("queued", "running") for e in escs):
-        return False                      # an open escalation is already pending
-    if len(escs) >= max_escalations:
-        return False                      # cap hit — stop the retry/escalate cycle
-    queue.append({
+    escs = _node_escalations(queue, node_id)
+    if any(e.get("status") in ("queued", "running", "parked") for e in escs):
+        return False
+    entry = {
         "id": dq.new_task_id("escalation", node_id, queue),
         "agent": "escalation", "node": node_id, "node_label": (label or node_id),
-        "status": "queued", "at": dq._now(), "source": "engine", "note": note})
+        "status": "queued", "at": dq._now(), "source": "engine", "note": note,
+    }
+    if recovery:
+        entry["recovery"] = recovery
+    queue.append(entry)
     return True
 
 
@@ -367,7 +369,6 @@ def main(argv=None) -> int:
             "repeat when prover and judge use different providers"
         ),
     )
-    ap.add_argument("--max-escalations", type=int, default=3, help="worker: engine-side bound — stop re-proving/re-escalating a node after this many escalations (default 3), so a hard node can't loop forever")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     if a.timeout <= 0:
@@ -378,8 +379,6 @@ def main(argv=None) -> int:
         ap.error("--poll must be greater than zero")
     if a.max_steers < 0:
         ap.error("--max-steers cannot be negative")
-    if a.max_escalations < 0:
-        ap.error("--max-escalations cannot be negative")
     if a.backend is None:
         try:
             a.backend = backend_config.get_backend()
@@ -597,7 +596,7 @@ def _run_dispatch(a) -> int:
 
     def _drain_one_worker(t: dict) -> int:
         """Claim + prove one queued worker task; returns 1 when it was handled
-        (proved / failed / blocked), 0 when skipped (open escalation)."""
+        (proved, failed, or parked), 0 when skipped for active recovery."""
         with fslock.locked(queue_path):     # re-read (new drops/escalations) + claim
             c = dq.load_queue(queue_path)
             current = next((x for x in c if x.get("id") == t.get("id")), None)
@@ -605,16 +604,24 @@ def _run_dispatch(a) -> int:
                 return 0
             escs = _node_escalations(c, t["node"])
             # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
-            if any(e.get("status") in ("queued", "running") for e in escs):
-                return 0                  # an open escalation on this node — leave it queued, skip
-            if len(escs) >= a.max_escalations:        # cap hit — stop re-proving a hard node
+            if any(e.get("status") in ("queued", "running", "parked") for e in escs):
+                return 0                  # recovery owns this node until it finds a route
+            adapter = backend_config.prover_of(a.backend)
+            if recovery_state.unchanged_recovery(
+                    c, t["node"], proj / "graph.json", Path(repo), adapter):
                 for x in c:
                     if x["id"] == t["id"]:
                         x["status"], x["finished_at"] = "failed", dq._now()
-                        x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
+                        x["result"] = "retry rejected: proof recovery produced no new prover input"
+                latest = recovery_state.latest_recovery(c, t["node"])
+                if latest is not None:
+                    latest["status"] = "parked"
+                    latest["finished_at"] = dq._now()
+                    latest["result"] = "parked: no new prover input"
+                    latest["recovery"]["phase"] = "parked"
                 dq._save(queue_path, c)
                 dq.sync_feed(feed_path, c)
-                print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
+                print(f"  worker {t['node']:24} → PARKED (no new recovery evidence)", flush=True)
                 return 1
             for x in c:                                                 # claim
                 if x["id"] == t["id"]:
@@ -624,7 +631,7 @@ def _run_dispatch(a) -> int:
         print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
         status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
                                             str(proj / "graph.json"), repo, a.max_steers,
-                                            backend=backend_config.prover_of(a.backend),
+                                            backend=adapter,
                                             judge_backend=a.judge_backend,
                                             judge_model=a.model,
                                             judge_timeout=min(a.timeout, 180),
@@ -636,14 +643,24 @@ def _run_dispatch(a) -> int:
                     x["status"] = "done" if status == "proved" else "failed"
                     x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
             escalated = False
-            if status != "proved":      # hand the worker's wall to the orchestrator — it decides, not us
+            if status != "proved":      # open ordered proof recovery; do not blindly retry
                 lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
+                fingerprint = recovery_state.proof_fingerprint(
+                    proj / "graph.json", t["node"], Path(repo), adapter
+                )
+                recovery = {
+                    "version": 1,
+                    "phase": "proof-research",
+                    "round": len(_node_escalations(c, t["node"])) + 1,
+                    "fingerprint": fingerprint,
+                    "backend": adapter,
+                }
                 escalated = _raise_escalation(c, t["node"], lbl,
-                                              _escalation_note(reason, detail), a.max_escalations)
+                                              _escalation_note(reason, detail), recovery)
             dq._save(queue_path, c)
             dq.sync_feed(feed_path, c)
         print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
-              + ("  ⚑ escalation raised" if escalated else ""), flush=True)
+              + ("  proof recovery raised" if escalated else ""), flush=True)
         return 1
 
     if a.watch:

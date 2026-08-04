@@ -26,7 +26,6 @@ from .constants import (
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_MERGE_ATTEMPTS,
-    MAX_PROVE_ATTEMPTS,
     MAX_REBASE_ATTEMPTS,
     MAX_REVIEW_ERRORS,
     STAGES,
@@ -194,6 +193,7 @@ def collect(
     extra_identities: list[str] | None = None,
     allow_foreign_review: bool = False,
     allow_unchecked_merge: bool = False,
+    proof_backend: str = "max",
 ) -> Survey:
     me = host.me()
     survey = Survey(canonical=canonical, default_branch=default_branch, me=me,
@@ -361,6 +361,14 @@ def collect(
     open_pr_nodes = {pr.node for pr in prs if pr.node}
     intentions = _intention_avoid_list(host, canonical) if survey.issues_enabled else set()
     eligible = eligible_prove_nodes(cfg)
+    try:
+        queue_tasks = scripts_modules()["dispatch_queue"].load_queue(
+            cfg.project / "task_queue.json"
+        )
+    except Exception:
+        queue_tasks = []
+    recovery_state = scripts_modules()["recovery_state"]
+    adapter = scripts_modules()["backend_config"].prover_of(proof_backend)
     # Decontend first (worker-seeded shuffle), then order by mission priority:
     # with declared targets, in-cone nodes come first, tallest untrusted chain
     # above them first (the critical path). The stable sort keeps ties in
@@ -387,8 +395,17 @@ def collect(
         if node_id in intentions:
             push_cand("prove", Candidate("prove", "human intention registered", node=node_id), False)
             continue
-        if counters.get(f"prove-{node_id}") >= MAX_PROVE_ATTEMPTS:
-            push_cand("prove", Candidate("prove", "attempt budget spent", node=node_id), False)
+        recovery = recovery_state.latest_recovery(queue_tasks, node_id)
+        if recovery and recovery.get("status") in {"queued", "running", "parked"}:
+            push_cand("prove", Candidate(
+                "prove", f"proof recovery {recovery.get('status')}", node=node_id
+            ), False)
+            continue
+        if recovery_state.unchanged_recovery(
+                queue_tasks, node_id, cfg.graph_path, cfg.lean_root, adapter):
+            push_cand("prove", Candidate(
+                "prove", "proof recovery produced no new prover input", node=node_id
+            ), False)
             continue
         push_cand("prove", Candidate("prove", reason, node=node_id), True)
 

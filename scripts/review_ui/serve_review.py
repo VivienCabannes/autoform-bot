@@ -102,10 +102,9 @@ AGENT_PALETTE = [
      "blurb": "big-picture pass over the whole graph", "applies": "any"},
     {"id": "mathcheck", "label": "Mathlib check", "icon": "🔎",
      "blurb": "is this concept already in Mathlib?", "applies": "any"},
-    # Raised by the engine when a worker hits a wall; the orchestrate agent triages it
-    # (a human may also drop it to ask the orchestrator to look at a node).
-    {"id": "escalation", "label": "Escalation", "icon": "⚑",
-     "blurb": "a worker hit a wall here — the orchestrator triages (grow the DAG / fix / surface)", "applies": "any"},
+    # Raised after a failed proof; Orchestrate runs the ordered recovery waves.
+    {"id": "escalation", "label": "Proof recovery", "icon": "⚑",
+     "blurb": "research, refute, or decompose before another proof attempt", "applies": "any"},
 ]
 
 def _registry_palette() -> list | None:
@@ -163,8 +162,8 @@ def _backend_payload() -> dict:
 TASK_QUEUE_CAP = 200
 
 # Statuses an entry may carry; only a *queued* task may be cancelled, and a
-# queued/running task with the same agent+node blocks a duplicate enqueue.
-_ACTIVE_STATUSES = {"queued", "running"}
+# queued/running/parked task with the same agent+node blocks a duplicate enqueue.
+_ACTIVE_STATUSES = {"queued", "running", "parked"}
 
 # Sentinel returned by the body reader on un-parseable JSON (distinct from a valid
 # ``{}`` body) so a POST handler answers 400 rather than treating it as empty.

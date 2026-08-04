@@ -3,7 +3,7 @@
 review dashboard's ``task_queue.json`` and the autoform run/review pipelines.
 
 Pure, deterministic file mechanics with **zero model tokens**: read the next queued
-task, flip its status (``queued`` -> ``running`` -> ``done``/``failed``), and keep
+task, flip its status (``queued`` -> ``running`` -> ``done``/``failed``/``parked``), and keep
 ``agents_status.json`` (the dashboard's live feed) in sync so a drop in the UI shows
 the agent *working* while the session does the real work. The privileged agent work
 (prove / review) is the command's job — this only moves the paperwork, atomically.
@@ -23,9 +23,11 @@ Usage::
   dispatch_queue.py <project> claim <id> [--detail D]
   dispatch_queue.py <project> done  <id> [--result R]
   dispatch_queue.py <project> fail  <id> [--reason R]
+  dispatch_queue.py <project> park  <id> [--reason R]
+  dispatch_queue.py <project> resume <id>
   dispatch_queue.py <project> idle                 # reset the feed to idle
   dispatch_queue.py <project> status               # one line per task (banners all orchestrator-owned work)
-  dispatch_queue.py <project> escalations          # open escalations + full notes (engine-raised walls)
+  dispatch_queue.py <project> escalations          # proof recoveries + full failure notes
   dispatch_queue.py <project> mine                 # ALL open orchestrator-owned tasks — your full worklist
   dispatch_queue.py <project> orchestrator --state working --phase P [--detail D]   # set the live-feed orchestrator line
   dispatch_queue.py <project> agent-start --role R --name N [--target T] [--target-label L]  # show a subagent live
@@ -33,7 +35,7 @@ Usage::
 
 ``enqueue`` lets the orchestrator (Claude, or any caller) add its OWN tasks to the
 same queue the dashboard writes — so autonomous and human-dropped work share one
-pipeline. It is idempotent: a duplicate (same agent+node already queued/running)
+pipeline. It is idempotent: a duplicate (same agent+node already queued/running/parked)
 is skipped, never double-queued.
 """
 from __future__ import annotations
@@ -97,7 +99,7 @@ def load_queue(path: Path) -> list[dict[str, Any]]:
         if task_id in ids:
             raise QueueStateError(f"{path}: duplicate task id {task_id!r}")
         ids.add(task_id)
-        if task.get("status") in {"queued", "running"}:
+        if task.get("status") in {"queued", "running", "parked"}:
             agent, node = task.get("agent"), task.get("node")
             if isinstance(agent, str) and isinstance(node, str):
                 key = (agent, node)
@@ -201,14 +203,15 @@ def sync_feed(path: Path, tasks: list) -> None:
 
 
 def _open_escalations(tasks: list) -> list:
-    """Queued/running ``escalation`` tasks — the orchestrator's triage worklist.
+    """Queued/running/parked proof-recovery tasks.
 
     These look like any other ``queued`` task but the deterministic engine NEVER
     drains them (it only drains ``reviewer``/``worker``); only ``/autoform:orchestrate``
     resolves them. Surfacing them distinctly is what stops the orchestrator from
     waiting on a queued escalation as if the engine would clear it (it never will)."""
     return [t for t in tasks
-            if t.get("agent") == "escalation" and t.get("status") in ("queued", "running")]
+            if t.get("agent") == "escalation"
+            and t.get("status") in ("queued", "running", "parked")]
 
 
 # The queue has two consumers. The deterministic engine drains exactly these:
@@ -244,22 +247,24 @@ _ORCH_KINDS = _orch_kinds()
 
 
 def _open_orchestrator_tasks(tasks: list) -> list:
-    """Open (queued/running) tasks the orchestrator owns — its FULL worklist, not just
+    """Open (queued/running/parked) tasks the orchestrator owns — its full worklist.
     escalations. None are engine-drained; each needs claim -> run -> done. Escalations
     are the subset the engine auto-raises (and that carry the worker's words in ``note``)."""
     return [t for t in tasks
-            if t.get("agent") in _ORCH_KINDS and t.get("status") in ("queued", "running")]
+            if t.get("agent") in _ORCH_KINDS
+            and t.get("status") in ("queued", "running", "parked")]
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Drain/sync the review dashboard queue.")
     ap.add_argument("project", type=Path, help="review project dir (holds task_queue.json)")
-    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "idle", "status", "enqueue",
+    ap.add_argument("cmd", choices=["next", "claim", "done", "fail", "park", "resume", "idle", "status", "enqueue",
                                     "escalations", "mine", "orchestrator", "agent-start", "agent-done"])
     ap.add_argument("id", nargs="?", help="task id (for claim/done/fail)")
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
     ap.add_argument("--reason", default="")
+    ap.add_argument("--fingerprint", default="", help="park: durable prover-input fingerprint after recovery")
     ap.add_argument("--agent", default="", help="enqueue: agent id — any palette kind (reviewer|worker|planner|graphreview|contentreview|holistic|mathcheck|escalation)")
     ap.add_argument("--node", default="", help="enqueue: target node id")
     ap.add_argument("--node-label", default="", help="enqueue: display label (defaults to --node)")
@@ -316,16 +321,16 @@ def main(argv=None) -> int:
     if a.cmd == "escalations":
         open_esc = _open_escalations(tasks)
         if not open_esc:
-            print("  (no open escalations)")
+            print("  (no proof recoveries)")
             return 0
-        print(f"  {len(open_esc)} open escalation(s) awaiting triage — these are YOURS, not the engine's:\n")
+        print(f"  {len(open_esc)} proof-recovery task(s) — these are YOURS, not the engine's:\n")
         for t in open_esc:
             print(f'  • {t.get("node","?")}   [{t.get("status","?")}]   id={t.get("id","?")}')
             for line in str(t.get("note", "")).strip().splitlines():
                 print(f'      {line}')
             print()
-        print("  Triage each (claim → grow the DAG via merge_node.py / run planner / surface to the")
-        print("  user → done), then the blocked node can be re-queued. Never leave one queued.")
+        print("  Run the ordered recovery waves, then mark each done for a retry or parked")
+        print("  with its evidence ledger. A parked recovery may be resumed later.")
         return 0
     if a.cmd == "mine":
         open_orch = _open_orchestrator_tasks(tasks)
@@ -340,7 +345,7 @@ def main(argv=None) -> int:
             if t.get("agent") == "escalation" and t.get("note"):  # the worker's own words
                 for line in str(t["note"]).strip().splitlines():
                     print(f'        {line}')
-        print("\n  Never leave one queued/running when a run ends (orchestrate.md step 5).")
+        print("\n  Finish actionable work; parked recoveries remain visible for later evidence.")
         return 0
     if a.cmd == "idle":
         with fslock.locked(fp):
@@ -356,9 +361,9 @@ def main(argv=None) -> int:
             except QueueStateError as error:
                 print(f"queue state error: {error}", file=sys.stderr)
                 return 2
-            if any(t.get("status") in ("queued", "running") and t.get("agent") == a.agent
+            if any(t.get("status") in ("queued", "running", "parked") and t.get("agent") == a.agent
                    and t.get("node") == a.node for t in tasks):
-                print(f"already queued/running: {a.agent} -> {a.node} (skipped)")
+                print(f"already queued/running/parked: {a.agent} -> {a.node} (skipped)")
                 return 0
             tid = new_task_id(a.agent, a.node, tasks)
             entry = {"id": tid, "agent": a.agent, "node": a.node,
@@ -479,6 +484,40 @@ def main(argv=None) -> int:
             t["finished_at"] = _now()
             if a.reason:
                 t["result"] = a.reason
+        elif a.cmd == "park":
+            if current == "parked":
+                print(f"park {a.id} -> parked (already parked)")
+                return 0
+            if current != "running":
+                print(
+                    f"invalid transition for {a.id}: {current!r} -> parked",
+                    file=sys.stderr,
+                )
+                return 1
+            t["status"] = "parked"
+            t["finished_at"] = _now()
+            if a.reason:
+                t["result"] = a.reason
+            if isinstance(t.get("recovery"), dict):
+                t["recovery"]["phase"] = "parked"
+                if a.fingerprint:
+                    t["recovery"]["fingerprint"] = a.fingerprint
+        elif a.cmd == "resume":
+            if current == "queued":
+                print(f"resume {a.id} -> queued (already queued)")
+                return 0
+            if current != "parked":
+                print(
+                    f"invalid transition for {a.id}: {current!r} -> queued",
+                    file=sys.stderr,
+                )
+                return 1
+            t["status"] = "queued"
+            t["at"] = _now()
+            t.pop("started_at", None)
+            t.pop("finished_at", None)
+            if isinstance(t.get("recovery"), dict):
+                t["recovery"]["phase"] = "proof-research"
         _save(qp, tasks)
         sync_feed(fp, tasks)
     print(f'{a.cmd} {a.id} -> {t["status"]}')
