@@ -2,8 +2,8 @@
 """Static lint for the host-neutral Autoform plugin (root layout).
 
 The plugin surface is Markdown + JSON + TOML and can rot independently of the
-Python suite: invalid manifests, non-portable skill frontmatter, broken
-hooks/MCP paths, or stale role references. This script catches those failures
+Python suite: invalid manifests, non-portable skill frontmatter, broken MCP
+paths, or stale role references. This script catches those failures
 with the standard library only, so it runs without installing the package.
 
 Claude and Codex use root-level manifests. Muse uses a native manifest template
@@ -15,9 +15,9 @@ Checks (all stdlib):
     `<source>/.claude-plugin/plugin.json`.
   - `.claude-plugin/plugin.json` is valid JSON with `name`/`version`/`description`
     and a semver-shaped `version`.
-  - The native Muse manifest exposes exactly the public native slash commands,
-    one SessionStart hook, and the portable MCP server set without duplicate
-    skill entries in Muse's completion menu.
+  - The native Muse manifest exposes exactly the public native slash commands
+    and the portable MCP server set without duplicate skill entries in Muse's
+    completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
   - The user-visible skill set is exactly `setup`, `roadmap`, `orchestrate`, and
@@ -195,11 +195,8 @@ def check_plugin_json() -> None:
             "the shared './.mcp.json' configuration"
         )
     checks += 1
-    if data.get("hooks") != "./hooks/hooks.json":
-        err(
-            ".claude-plugin/plugin.json: hooks must reference "
-            "the shared './hooks/hooks.json' configuration"
-        )
+    if "hooks" in data:
+        err(".claude-plugin/plugin.json: Autoform must not inject session hooks")
     root_mcp = load_json(REPO_ROOT / ".mcp.json")
     if root_mcp is not None:
         root_servers = root_mcp.get("mcpServers")
@@ -232,28 +229,9 @@ def check_codex_plugin() -> None:
         checks += 1
         if not (REPO_ROOT / skills).is_dir():
             err(f"Codex skills path does not resolve: {skills!r}")
-    # Current Codex discovers this default plugin-bundled location without a
-    # manifest override; it also satisfies older ingestion validators that do
-    # not yet accept the documented `hooks` manifest field.
-    hook_path = REPO_ROOT / "hooks" / "hooks.json"
-    hook_data = load_json(hook_path)
-    if hook_data is not None:
-        checks += 1
-        if not isinstance(hook_data.get("hooks"), dict):
-            err(f"{rel(hook_path)}: top-level hooks object is missing")
-        rendered_hooks = json.dumps(hook_data)
-        checks += 1
-        if (
-            "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT}}/hooks/session-start"
-            not in rendered_hooks
-        ):
-            err(
-                f"{rel(hook_path)}: SessionStart does not resolve through the "
-                "Claude/Codex plugin-root environments"
-            )
-        checks += 1
-        if not (REPO_ROOT / "hooks" / "session-start").is_file():
-            err(f"{rel(hook_path)}: hooks/session-start does not exist")
+    checks += 1
+    if (REPO_ROOT / "hooks").exists():
+        err("hooks/: Autoform must remain invocation-driven, not session-global")
     mcp_rel = data.get("mcpServers")
     if not isinstance(mcp_rel, str):
         return
@@ -305,7 +283,7 @@ def check_muse_plugin() -> None:
     if not isinstance(capabilities, dict):
         err(f"{rel(MUSE_MANIFEST)}: capabilities must be an object")
         return
-    expected_kinds = {"skills", "commands", "hooks", "mcpServers", "reminders"}
+    expected_kinds = {"skills", "commands", "mcpServers", "reminders"}
     checks += 1
     if set(capabilities) != expected_kinds:
         err(
@@ -345,16 +323,9 @@ def check_muse_plugin() -> None:
                     "enabled by default"
                 )
 
-    hooks = capabilities.get("hooks")
     checks += 1
-    expected_hook = ["bash", "hooks/session-start"]
-    if (
-        not isinstance(hooks, list)
-        or len(hooks) != 1
-        or hooks[0].get("event") != "SessionStart"
-        or hooks[0].get("command") != expected_hook
-    ):
-        err(f"{rel(MUSE_MANIFEST)}: expected one native SessionStart hook")
+    if "hooks" in capabilities:
+        err(f"{rel(MUSE_MANIFEST)}: Autoform must not inject session hooks")
 
     servers = capabilities.get("mcpServers")
     checks += 1

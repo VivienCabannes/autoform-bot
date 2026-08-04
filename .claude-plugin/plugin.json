@@ -6,6 +6,5 @@
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"
   },
-  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json"
 }

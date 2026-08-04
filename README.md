@@ -228,7 +228,6 @@ agents/          worker, reader, planning crew, review jury
 servers/         stateful MCP servers plus shared prover/search implementation code
 scripts/         plan/graph tooling, dispatch engine, review UI, formalization.py
 autoform_worker/ the distributed worker CLI (rounds, claims, scoreboards, PRs)
-hooks/           Claude SessionStart context (skills are the workflow surface)
 docs/            maintained architecture, usage, release, and worker contracts
 tests/           deterministic suite, fixtures, and optional live smoke tests
 ```

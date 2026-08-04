@@ -26,28 +26,8 @@ def test_claude_and_codex_share_root_capability_configs():
     codex = json.loads((REPO_ROOT / ".codex-plugin" / "plugin.json").read_text())
 
     assert claude["mcpServers"] == codex["mcpServers"] == "./.mcp.json"
-    assert claude["hooks"] == "./hooks/hooks.json"
-
-
-def test_shared_hook_supports_claude_and_codex_plugin_roots():
-    hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
-    command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-
-    for root_variable in ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"):
-        environment = os.environ.copy()
-        environment.pop("CLAUDE_PLUGIN_ROOT", None)
-        environment.pop("PLUGIN_ROOT", None)
-        environment[root_variable] = str(REPO_ROOT)
-        completed = subprocess.run(
-            command,
-            shell=True,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        payload = json.loads(completed.stdout)
-        assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "hooks" not in claude
+    assert not (REPO_ROOT / "hooks").exists()
 
 
 def test_native_muse_manifest_has_the_portable_autoform_surface():
@@ -62,7 +42,6 @@ def test_native_muse_manifest_has_the_portable_autoform_surface():
     assert set(capabilities) == {
         "skills",
         "commands",
-        "hooks",
         "mcpServers",
         "reminders",
     }
@@ -72,15 +51,7 @@ def test_native_muse_manifest_has_the_portable_autoform_surface():
         assert command["path"] == f"skills/{command['id']}/SKILL.md"
         assert command["enabledDefault"] is True
     assert capabilities["reminders"] == []
-    assert capabilities["hooks"] == [
-        {
-            "id": "session-start",
-            "event": "SessionStart",
-            "command": ["bash", "hooks/session-start"],
-            "timeoutMs": 10000,
-            "statusMessage": "Loading Autoform context",
-        }
-    ]
+    assert "hooks" not in capabilities
     assert {item["id"] for item in capabilities["mcpServers"]} == EXPECTED_MCP_SERVERS
     for server in capabilities["mcpServers"]:
         assert server["transport"] == "stdio"
@@ -103,7 +74,7 @@ def test_muse_builder_emits_one_supported_manifest_family(tmp_path: Path):
         assert (output / skill["path"]).is_file()
     for command in manifest["capabilities"]["commands"]:
         assert (output / command["path"]).is_file()
-    assert (output / "hooks" / "session-start").is_file()
+    assert not (output / "hooks").exists()
     assert (output / "servers" / "run-muse-server.sh").is_file()
     assert (output / "autoform_worker" / "__init__.py").is_file()
     assert (output / "pyproject.toml").is_file()
@@ -175,17 +146,3 @@ def test_muse_mcp_launcher_uses_plugin_data_environment(tmp_path: Path):
     assert uv_environment == str(plugin_data / "venv-prover")
     assert project == str(lean_project)
     assert args == "run python -m servers.prover.server"
-
-
-def test_session_start_context_names_muse_as_a_supported_host():
-    completed = subprocess.run(
-        ["bash", str(REPO_ROOT / "hooks" / "session-start")],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    payload = json.loads(completed.stdout)
-    context = payload["hookSpecificOutput"]["additionalContext"]
-    assert "Muse" in context
-    assert "setup, roadmap, orchestrate, and evaluate" in context
-    assert "Orchestrate owns backend selection" in context

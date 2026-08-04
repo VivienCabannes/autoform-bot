@@ -24,7 +24,7 @@ explicit artifact boundary; that would create a second orchestration stack.
 | Mathlib and Zulip stateless helpers | `servers/mathlib/`, `servers/zulip/` | Implemented; invoked on demand, not MCP servers |
 | Aristotle prover backend | `servers/aristotle/`, `servers/prover/aristotle_adapter.py` | Implemented inside the unified prover |
 | Lean LSP | external `lean-lsp-mcp` | Stateful MCP dependency installed by Setup |
-| Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json`, `hooks/hooks.json` | Implemented |
+| Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json` | Implemented |
 | Distributed worker CLI (claims, rounds, auto-merge gate, role registry) | `autoform_worker/`, `./autoform` | Implemented; design contract in `docs/worker-cli.md` |
 
 Useful next contributions include an OpenAI Responses transport beside Chat

@@ -17,7 +17,6 @@ DIRECTORIES = (
     "assets",
     "autoform_worker",
     "docs",
-    "hooks",
     "internal",
     "scripts",
     "servers",
