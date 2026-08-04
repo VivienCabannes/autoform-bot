@@ -39,6 +39,29 @@ distinguishes `[HARD]` safety from `[COOP]` throughput):
    scoreboards by the `progress` unit — so every clone converges to the same
    sidecar without merge conflicts.
 
+```mermaid
+flowchart LR
+    subgraph A["machine A — autoform work --loop"]
+        A1["prove node<br/>(claim → prover → verify gate)"]
+    end
+    subgraph G["GitHub — canonical repo"]
+        C["claim refs<br/>refs/autoform-claims/*"]
+        P["PR + target marker<br/>+ scoreboard comment"]
+        M["auto-merge gate"]
+        R["roadmap: graph.json,<br/>Lean, review_status.json"]
+    end
+    subgraph B["machine B — autoform work --loop"]
+        B1["review PR — 3-axis jury"]
+    end
+    A1 -. "lease (CAS ref)" .-> C
+    C -. "lease visible →<br/>pick other work" .-> B1
+    A1 -- "CAS push + PR" --> P
+    B1 -- "post verdict" --> P
+    P --> M
+    M -- "clean + green CI" --> R
+    R -- "progress fold →<br/>dashboards republish" --> R
+```
+
 ### Lease schema
 
 ```json
@@ -55,31 +78,65 @@ lease may be taken over. The claims repo defaults to the project's canonical rep
 (`AUTOFORM_CLAIM_REPO` overrides — point it anywhere all collaborators can push,
 e.g. one member's fork).
 
+The protocol under contention — and why a crashed machine never wedges anyone:
+
+```mermaid
+sequenceDiagram
+    participant A as worker A
+    participant R as refs/autoform-claims/…
+    participant B as worker B
+    A->>R: ls-remote — key absent
+    A->>R: push lease commit (create-only CAS) ✓
+    B->>R: acquire
+    R-->>B: live lease held — refused
+    Note over B: picks other work
+    loop every 300 s (TTL 1500 s)
+        A->>R: renew — CAS on own lease
+    end
+    Note over A: machine dies — no release
+    Note over R: lease expires at TTL
+    B->>R: acquire — expired, takeover ✓
+    Note over A,B: safety never depends on the lease — every branch<br/>push is force-with-lease, exactly one writer wins
+```
+
 ## Work units
 
 One round = one survey pass + at most one executed unit, first actionable stage
 wins (TauCeti's cascade). Detection is a single pass over `gh pr list --json` +
 the local graph/sidecar + the claim board.
 
+```mermaid
+flowchart TD
+    L["autoform work --loop"] --> R["one round — own subprocess,<br/>process group, 90 min hard cap"]
+    R --> S["survey (read-only): open PRs ·<br/>claim board · graph + sidecar · task queue"]
+    S --> C{"cascade — first actionable stage wins:<br/>rebase → fix-ci → fix → review →<br/>merge → progress → agents → prove"}
+    C -- "ran one unit" --> E0["exit 0 — next round in 20 s"]
+    C -- "nothing actionable" --> E75["exit 75 — poll again in 5 min"]
+    C -- "error / timeout" --> EB["backoff 30 s → 15 min"]
+```
+
 | Stage | Candidate | Execution |
 |---|---|---|
-| `merge` | PR with green CI + a trusted `clean` scoreboard at the exact head, allowlisted paths, no hold label, no human flag | deterministic: `gh pr merge --squash --match-head-commit` (merge-time CAS) |
-| `agents` | a machine-local queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, escalation, …) | spawns the host CLI with that role's own Markdown body; declared write paths are enforced before curation is CAS-pushed to the default branch |
-| `rebase` | own open PR with `mergeable == CONFLICTING` | host agent (claude/codex) with `prompts/rebase.md`; pushes via CAS |
+| `rebase` | own open PR with `mergeable == CONFLICTING` | host agent (claude/codex) with `prompts/rebase.md`; harness pushes via CAS |
 | `fix-ci` | own open PR with failing checks | host agent with `prompts/fix-ci.md` |
 | `fix` | own open PR whose scoreboard (at head) has a blocking verdict | host agent with `prompts/fix.md` |
-| `review` | open non-draft autoform PR, checks green, head not scoreboarded | deterministic: checkout head, run the 3-axis jury (`judge_runtime`), post scoreboard |
-| `progress` | merged autoform PRs newer than the last fold, or stale site export | deterministic: fold scoreboards → `review_status.json`, re-export the static dashboard, sync escalation issues, CAS-push |
-| `prove` | eligible graph node: tier-2, not in Mathlib, unproved/defective, prerequisites trusted, unclaimed, no open PR for it | claim `author/<node>`, branch, reuse `dispatch_runner.run_worker()` (spec build + prover driver + verification gate + usage ledger), commit, CAS-push, `pr create` with target marker |
+| `review` | open non-draft autoform PR from a trusted author, checks not failing/pending, head not scoreboarded | deterministic: checkout head, run the 3-axis jury (`judge_runtime`), post scoreboard |
+| `merge` | PR with a genuine CI `success` + a trusted `clean` scoreboard at the exact head, allowlisted paths, no hold label, no human flag | deterministic: `gh pr merge --squash --match-head-commit` (merge-time CAS). A head with **no** checks never merges (`--merge-without-ci` is the explicit opt-out) |
+| `progress` | merged autoform PRs newer than the last fold | deterministic: fold scoreboards → `review_status.json`, CAS-push (the Pages workflow republishes), sync escalation issues |
+| `agents` | a machine-local queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, escalation, …) | spawns the host CLI with that role's own Markdown body; the role's declared write paths are enforced before curation is CAS-pushed to the default branch |
+| `prove` | eligible graph node: tier-2, not in Mathlib, unproved/defective, prerequisites trusted, unclaimed, no open PR for it | claim the author lease, branch, reuse `dispatch_runner.run_worker()` (spec build + prover driver + verification gate + usage ledger), commit, CAS-push, `pr create` with target marker |
 
 `prove` is deliberately last: it is the expensive, work-generating stage; tending
-existing PRs always comes first. Every mutating stage must leave a visible GitHub
-mark (new head OID, new comment, or new PR) — a round that claims success without
-one exits `75` (no-progress), TauCeti's guard against silent burn.
+existing PRs always comes first, and `agents` runs planning/checking/refutation
+roles before new proofs so compute goes into a vetted roadmap. Every mutating
+stage must leave a visible GitHub mark (new head OID, new comment, a merge, or a
+new PR) — a round that claims success without one exits `75` (no-progress),
+TauCeti's guard against silent burn.
 
-Attempt budgets (per PR / per node, persisted in worker state): fix 3, fix-ci 3
-per head + 5 per PR, rebase 3, review errors 3, prove 3 per node. Provider-infra
-failures (5xx/429/transport) refund the attempt rather than burning it.
+Attempt budgets (persisted in worker state): fix 3 per head, fix-ci 3 per head +
+5 per PR, rebase 3 per PR, review errors 3 per PR, merge 3 per PR, prove 3 per
+node, agent tasks 3 per (kind, node). Provider-infra failures (5xx/429/transport)
+refund the attempt rather than burning it.
 
 ## Where humans sit in the loop
 
@@ -190,8 +247,12 @@ doctor note) when Issues are disabled.
 ```
 autoform work   [--loop] [--only S1,S2] [--skip S1] [--backend B] [--dry-run]
                 [--project DIR] [--worker-id ID] [--allow-api-egress P]...
-autoform status [--json]            # survey + claims + quota-free state snapshot
-autoform claim  acquire|renew|release|holds|read|list|gc [key] [--ttl N] [--steal]
+                [--review-foreign] [--merge-without-ci] [--ignore-claims]
+                [--extra-identities L1,L2]
+autoform status [--json]            # survey + claims + state snapshot
+autoform agents [--json]            # the discovered role registry (agents/*.md)
+autoform claim  acquire|renew|release|holds|read|list|gc [key] [--node ID]
+                [--ttl N] [--steal]
 autoform push   <ref> [--expect OID] [--remote URL]     # CAS push (git-safe-push)
 autoform pr-create ... --body-file F                    # marker+lease-gated gh pr create
 autoform sync   [--json]            # fast-forward local default branch to canonical state
@@ -232,15 +293,45 @@ enforced by process-group kill.
 - Sandboxed rounds (TauCeti `--bubble`) — Autoform's allowlisted agent flags are
   the current containment story.
 
+## Life of one node
+
+```mermaid
+stateDiagram-v2
+    [*] --> Missing: prerequisites trusted
+    Missing --> Proving: prove round — claim + prover + verify gate
+    Proving --> Escalated: FAILED (honest wall)
+    Escalated --> Missing: triage — grow DAG / fix statement
+    Proving --> InReview: PR opens (target marker)
+    InReview --> Fixing: verdict flagged or rejected
+    Fixing --> InReview: new head — re-review
+    InReview --> Gated: trusted clean verdict at head
+    Gated --> Merged: green CI · roadmap paths · no holds (CAS merge)
+    Merged --> Trusted: progress fold → review_status.json
+    Trusted --> [*]: frontier advances — dependents unlock
+    note right of Gated
+        a human flagged/rejected verdict
+        or a hold label keeps it here —
+        the jury cannot overrule a human
+    end note
+```
+
+The review→fix loop is budget-bounded (3 fix attempts per head, then the PR
+waits for a human), and the escalation exit is capped per node — a stubborn
+wall becomes a human question, not an infinite retry loop.
+
 ## Multi-machine walkthrough
 
 Machine A (Vivien) and machine B (Jack) both clone `org/formal-project`, both run
 `autoform work --loop`. A's survey finds nodes `alpha`,`beta` eligible; B's finds
 the same. A claims `author/alpha` (ref CAS — B's later acquire of `alpha` returns
 "held", B takes `beta`). Both prove, push branches to their forks, open PRs with
-target markers. B's next round picks stage `review` for A's PR (green CI, no
-scoreboard), runs the jury, posts the scoreboard: `clean`. A human (or auto-merge
-policy, later) merges. Either machine's next `progress` round folds the merged
-scoreboard into `review_status.json`, re-exports the static dashboard, pushes.
-The other machine's `sync` fast-forwards to that committed state. The graph advanced by two nodes with
-zero human coordination beyond the merge click.
+target markers. B's next round picks stage `review` for A's PR (CI green, no
+scoreboard), runs the jury, posts the scoreboard: `clean`. The next round on
+either machine hits the `merge` stage: genuine CI success + trusted clean verdict
+at that head + roadmap-only paths → the PR auto-merges under a merge-time CAS.
+A `progress` round then folds the merged scoreboard into `review_status.json` and
+CAS-pushes; the Pages workflow republishes the roadmap site, and every other
+machine's `sync` fast-forwards to that committed state on its next round. The
+graph advanced by two nodes with zero human coordination — the humans watched it
+on the roadmap site, and either could have held the gate from their review
+dashboard at any point.
