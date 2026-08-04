@@ -506,7 +506,9 @@ def test_agent_task_pushes_only_declared_content(world):
         _git(["add", "-A"], Path(cwd).parents[0])
         _git(["commit", "--quiet", "-m", "agent committed allowed content"],
              Path(cwd).parents[0])
-        return 0, world.cfg.log_dir / "agent.log"
+        log = world.cfg.log_dir / "agent.log"
+        log.write_text("reviewed node-a\n", encoding="utf-8")
+        return 0, log
 
     result = agent_work.do_agent_task(
         world.cfg, GitHost(runner=RecordingRunner()), None, world.counters, _survey(), candidate,
@@ -516,6 +518,7 @@ def test_agent_task_pushes_only_declared_content(world):
     assert _git_out(["show", "main:plan/informal_content/node-a.md"], world.bare) == "# Node A\n"
     queue = json.loads((world.project / "task_queue.json").read_text())
     assert queue[0]["status"] == "done"
+    assert queue[0]["report"] == "reviewed node-a\n"
 
 
 def test_agent_task_without_push_access_stays_queued(world):
@@ -543,7 +546,9 @@ def test_claude_agent_argv_isolates_repo_controlled_config():
     assert "--setting-sources user" in joined
     assert '{"disableAllHooks":true}' in joined
     assert "--disable-slash-commands" in joined
-    assert "--strict-mcp-config" in joined and '{"mcpServers":{}}' in joined
+    assert "--strict-mcp-config" in joined and '"lean-lsp-mcp"' in joined
+    assert '"autoform-prover"' not in joined
+    assert "Agent" in joined and "Bash(python3 *)" in joined
     assert "--dangerously-skip-permissions" not in joined  # allowlist path by default
 
 

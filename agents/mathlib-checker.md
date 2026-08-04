@@ -80,8 +80,16 @@ FILE: primary Mathlib source file path (e.g., Mathlib/Topology/Separation/Basic.
 
 NOTES: explanation of the match — generality differences, naming differences, how the
 textbook statement relates to what Mathlib has. If partial, explain what exists and
-what's missing. If missing, explain what you searched for.
+what’s missing. If missing, explain what you searched for.
 ```
+
+## Persist the classification
+
+For a queued task, update the target node through `scripts/merge_node.py` with
+the verified `mathlib_status`, `mathlib_declarations`, `mathlib_file`, and
+`mathlib_notes`, preserving every other node field. If the existing fields are
+already correct, make no graph edit; the worker harness preserves this report on
+the completed queue task.
 
 ## Self-Critique
 

@@ -13,7 +13,7 @@ kind: graphreview
 label: Graph reviewer
 icon: 🔗
 blurb: audit and fix dependency edges here
-applies: tier1
+applies: any
 drained_by: agent
 writes: graph
 ---
@@ -58,7 +58,7 @@ The payload is `{"upsert": {"<id>": {<full node record>}, ...}, "delete": ["<id>
 
 - **Edge add/remove:** upsert the owning node (one of yours) with its `depends_on` array edited.
 - **Within-partition node merge:** send one complete payload — upsert each neighbour you own that pointed at the absorbed node so it points at the survivor instead, upsert the survivor with any edges and metadata folded in, then `delete` the absorbed node. The merge is yours to perform only when every node that must change is in your partition; if re-pointing a neighbour would require editing a node you don't own, flag the merge instead.
-- **Adding a missing intermediate (Phase 2):** create the structural node via upsert — give it `tier`, `parent` (its cluster), `kind`, `description`, the `depends_on` and incoming re-points within your partition, the right `mathlib_status`/`mathlib_declarations`, `source_refs`, and **`content: null`** (content-pending). The orchestrator's "nodes awaiting content" step then has its prose written. Re-point any incoming edge that crosses the partition boundary by flagging it.
+- **Adding a missing intermediate (Phase 2):** create the structural node via upsert — give it `tier`, `parent` (its cluster), `kind`, `description`, the `depends_on` and incoming re-points within your partition, the right `mathlib_status`/`mathlib_declarations`, `source_refs`, an explicit `origin` (`cited`, `bridged`, or `background`), and **`content: null`** (content-pending). The orchestrator's "nodes awaiting content" step then has its prose written. Re-point any incoming edge that crosses the partition boundary by flagging it.
 
 ## Review tasks
 

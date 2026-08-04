@@ -38,6 +38,12 @@ def test_rendered_agent_has_required_codex_contract():
         agent for agent in discover_agents() if agent.name == "holistic-reviewer"
     )
     assert 'sandbox_mode = "read-only"' in render_codex_agent(read_only_role)
+    strategy = next(
+        agent for agent in discover_agents() if agent.name == "proof-strategy-researcher"
+    )
+    checker = next(agent for agent in discover_agents() if agent.name == "mathlib-checker")
+    assert 'sandbox_mode = "read-only"' in render_codex_agent(strategy)
+    assert 'sandbox_mode = "workspace-write"' in render_codex_agent(checker)
 
 
 def test_install_is_idempotent_and_checkable(tmp_path: Path):

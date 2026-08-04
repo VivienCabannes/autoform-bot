@@ -213,8 +213,10 @@ def do_agent_task(
         with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
 
             counters.bump(counter_key)
-            dq.main([str(cfg.project), "claim", task.task_id, "--detail",
-                     f"{role.name} via autoform worker {cfg.worker_id}"])
+            claimed = dq.main([str(cfg.project), "claim", task.task_id, "--detail",
+                               f"{role.name} via autoform worker {cfg.worker_id}"])
+            if claimed != 0:
+                return UnitResult(False, f"{task.kind} {task.node}: queue task was claimed meanwhile")
             feed_name = f"worker-cli:{task.kind}:{task.node}"
             _feed_start(cfg, task.kind, feed_name, task.node)
             try:
@@ -227,10 +229,10 @@ def do_agent_task(
                 infra = agents.classify_infra_failure(log_path)
                 if infra and counters.refund(counter_key):
                     dq.main([str(cfg.project), "fail", task.task_id, "--reason",
-                             f"{infra} (attempt refunded)"])
+                             f"{infra} (attempt refunded)", "--report-file", str(log_path)])
                     return UnitResult(False, f"{task.kind} {task.node}: {infra}", infra_failure=infra)
                 dq.main([str(cfg.project), "fail", task.task_id, "--reason",
-                         f"agent rc={rc} (log: {log_path})"])
+                         f"agent rc={rc} (log: {log_path})", "--report-file", str(log_path)])
                 return UnitResult(False, f"{task.kind} {task.node}: agent failed rc={rc}")
 
             pushed = False
@@ -257,6 +259,8 @@ def do_agent_task(
                 reason = ("recovery produced no outcome marker" if recovery_outcome is None
                           else "recovery requested action without durable evidence")
                 args = [str(cfg.project), "park", task.task_id, "--reason", reason]
+                if log_path.is_file():
+                    args += ["--report-file", str(log_path)]
                 if recovery_fingerprint:
                     args += ["--fingerprint", recovery_fingerprint]
                 dq.main(args)
@@ -282,12 +286,17 @@ def do_agent_task(
                                  if recovery_outcome == "REFUTED"
                                  else "recovery wave exhausted; evidence ledger preserved")
                 args = [str(cfg.project), "park", task.task_id, "--reason", parked_reason]
+                if log_path.is_file():
+                    args += ["--report-file", str(log_path)]
                 if recovery_fingerprint:
                     args += ["--fingerprint", recovery_fingerprint]
                 dq.main(args)
             else:
-                dq.main([str(cfg.project), "done", task.task_id, "--result",
-                         f"{role.name} completed" + (" (pushed)" if pushed else "")])
+                done_args = [str(cfg.project), "done", task.task_id, "--result",
+                             f"{role.name} completed" + (" (pushed)" if pushed else "")]
+                if log_path.is_file():
+                    done_args += ["--report-file", str(log_path)]
+                dq.main(done_args)
             counters.clear(counter_key)
             detail = "; ".join([f"{task.kind} {task.node}: {role.name} done"
                                 + (" + pushed" if pushed else " (no durable change)"), *notes])

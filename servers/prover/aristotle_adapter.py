@@ -1,7 +1,7 @@
 """Aristotle adapter — wraps the existing Aristotle integration as a prover backend.
 
-A thin :class:`~servers.prover.base.ProverAdapter` over the proven Aristotle
-integration in :mod:`servers.aristotle.core` (the C-side work). It exposes the
+A thin :class:`~servers.prover.base.ProverAdapter` over the shared Aristotle
+integration in :mod:`servers.aristotle.core`. It exposes the
 SAME four-method surface as the Claude adapter, so the SHARED driver + steerer
 drive Aristotle with no change:
 

@@ -99,6 +99,7 @@ For each node created:
   mathlib_declarations: [declaration names, if found]
   mathlib_file: [primary Mathlib file, if found]
   mathlib_notes: [generality/naming notes, or what's missing]
+  origin: [cited | bridged | background]
   source_refs: [{file, location}]   (internal provenance for the reviewer)
   content: [informal_content/<slug>.md — the file you wrote]
 

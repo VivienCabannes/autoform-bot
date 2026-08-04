@@ -362,6 +362,48 @@ def test_worker_retry_is_rejected_when_recovery_changed_nothing(tmp_path, monkey
     assert _by_id(proj, "escalation:s1")["status"] == "parked"
 
 
+def test_failed_retry_consumes_old_park_and_raises_fresh_recovery(tmp_path, monkeypatch):
+    proj = _proj(tmp_path, [
+        {
+            "id": "escalation:s1",
+            "agent": "escalation",
+            "node": "s1",
+            "status": "parked",
+            "recovery": {"phase": "parked", "fingerprint": "old", "backend": "codex"},
+        },
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    monkeypatch.setattr(dr, "run_worker", lambda *args, **kwargs: ("failed", "still stuck", "detail"))
+
+    assert dr.main([str(proj), "--repo", str(proj), "--workers", "--backend", "codex"]) == 0
+    queue = _queue(proj)
+    assert _by_id(proj, "escalation:s1")["status"] == "done"
+    fresh = [task for task in queue if task["agent"] == "escalation" and task["id"] != "escalation:s1"]
+    assert len(fresh) == 1
+    assert fresh[0]["status"] == "queued"
+
+
+def test_worker_stays_queued_when_spend_budget_is_exhausted(tmp_path, monkeypatch):
+    import time
+
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    state = proj / ".autoform"
+    state.mkdir()
+    (state / "budget.json").write_text(
+        json.dumps({"window_hours": 5, "max_runs": 1}), encoding="utf-8"
+    )
+    (state / "usage.jsonl").write_text(
+        json.dumps({"ts": time.time(), "backend": "codex", "status": "failed"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dr, "run_worker", lambda *args, **kwargs: pytest.fail("paced worker ran"))
+
+    assert dr.main([str(proj), "--repo", str(proj), "--workers", "--backend", "codex"]) == 0
+    assert _by_id(proj, "worker:s1")["status"] == "queued"
+
+
 def test_main_runs_the_sweep_then_drains_the_requeued_task(tmp_path, monkeypatch):
     # A stranded 'running' reviewer is recovered at startup AND then drained.
     monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)

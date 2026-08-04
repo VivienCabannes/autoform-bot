@@ -81,6 +81,16 @@ def test_static_audit_rejects_unsafe_and_opaque_inputs(tmp_path: Path):
     }
 
 
+def test_sorry_definition_is_attributed_to_its_own_declaration(tmp_path: Path):
+    project, corpus, statement, _proof = _task_project(tmp_path)
+    statement.write_text("def clean := 1\ndef bad : Nat := by sorry\n", encoding="utf-8")
+    report = evaluate.audit(corpus, project_root=project)
+    findings = [item for item in report["cases"][0]["findings"]
+                if item["kind"] == "sorry_definition"]
+    assert len(findings) == 1
+    assert "'bad'" in findings[0]["message"]
+
+
 def test_model_audit_requires_separate_model_and_api_approvals(tmp_path: Path):
     project, corpus, _statement, _proof = _task_project(tmp_path)
 
@@ -93,6 +103,12 @@ def test_model_audit_requires_separate_model_and_api_approvals(tmp_path: Path):
             judge_backend="openai",
             confirm_model_use=True,
         )
+
+
+def test_compile_audit_requires_explicit_project_code_execution_consent(tmp_path: Path):
+    project, corpus, _statement, _proof = _task_project(tmp_path)
+    with pytest.raises(evaluate.EvaluationError, match="allow-project-code-execution"):
+        evaluate.audit(corpus, project_root=project, compile_statements=True)
 
 
 def test_model_audit_reuses_structured_faithfulness_judge(tmp_path: Path, monkeypatch):
@@ -114,6 +130,26 @@ def test_model_audit_reuses_structured_faithfulness_judge(tmp_path: Path, monkey
     assert report["summary"]["clean"] == 1
     assert calls[0][0][0] == "faithfulness"
     assert calls[0][1]["backend"] == "codex"
+    assert "<natural-language-evidence>" in calls[0][0][1]
+    assert "Prove that True holds." in calls[0][0][1]
+    assert "theorem task_one" in calls[0][0][1]
+
+
+def test_benchmark_mathlib_cache_is_private_copy(tmp_path: Path):
+    source = tmp_path / "source"
+    package = source / ".lake" / "packages" / "mathlib"
+    package.mkdir(parents=True)
+    marker = package / "marker"
+    marker.write_text("source", encoding="utf-8")
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+
+    evaluate._link_mathlib_cache(source, isolated)
+    copied = isolated / ".lake" / "packages" / "mathlib" / "marker"
+    assert copied.read_text(encoding="utf-8") == "source"
+    assert not (isolated / ".lake" / "packages").is_symlink()
+    copied.write_text("changed", encoding="utf-8")
+    assert marker.read_text(encoding="utf-8") == "source"
 
 
 def test_benchmark_isolates_tasks_and_preserves_reference_files(tmp_path: Path):

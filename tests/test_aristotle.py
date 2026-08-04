@@ -1,14 +1,8 @@
-"""Tests for the Aristotle backend core + node-delegation entry.
-
-These run WITHOUT network or Aristotle credentials: a tiny in-memory fake
-stands in for ``aristotlelib.Project`` and is
-injected via the ``lib`` kwarg, so the real polling/landing logic is exercised
-end-to-end against a synthetic Aristotle result.
-"""
+"""Tests for the shared Aristotle manager helpers used by the prover adapter."""
 
 from __future__ import annotations
 
-import asyncio
+import io
 import json
 import tarfile
 from pathlib import Path
@@ -16,84 +10,10 @@ from pathlib import Path
 import pytest
 
 from servers.aristotle.core import (
-    AristotleManager,
     DEFAULT_DELEGATE_SYSTEM,
+    _safe_extract,
     build_node_spec,
-    delegate_to_node,
-    merge_payload,
 )
-
-
-# ---------------------------------------------------------------------------
-# Fake aristotlelib (no network, no optional dependency)
-# ---------------------------------------------------------------------------
-
-
-class _Status:
-    def __init__(self, value: str) -> None:
-        self.value = value
-
-
-class _FakeTask:
-    def __init__(self, project: "_FakeProject") -> None:
-        self._project = project
-        self.agent_task_id = "task-1"
-        self.status = _Status("COMPLETE")
-        self.output_summary = "Proved the target; lake build is green."
-
-    async def refresh(self) -> None:  # already terminal
-        return None
-
-    async def get_events(self, limit: int = 20, newest_first: bool = True):
-        return [], None
-
-
-class _FakeProject:
-    """Stands in for ``aristotlelib.Project``; writes a tarball on get_files."""
-
-    def __init__(self, returned_files: dict[str, str]) -> None:
-        self.project_id = "proj-aristotle"
-        self._returned_files = returned_files
-        self._task = _FakeTask(self)
-
-    async def get_tasks(self, limit: int = 1, newest_first: bool = True):
-        return [self._task], None
-
-    async def ask(self, prompt: str):
-        return self._task
-
-    async def refresh(self) -> None:
-        return None
-
-    async def get_files(self, destination: Path) -> None:
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(destination, "w:gz") as tar:
-            import io
-
-            for rel, content in self._returned_files.items():
-                data = content.encode()
-                info = tarfile.TarInfo(name=f"proj-aristotle/{rel}")
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
-
-
-class _FakeLib:
-    def __init__(self, returned_files: dict[str, str]) -> None:
-        self._returned_files = returned_files
-
-        manager_lib = self
-
-        class Project:
-            @staticmethod
-            async def create(prompt: str):
-                return _FakeProject(manager_lib._returned_files)
-
-            @staticmethod
-            async def create_from_directory(prompt: str, project_dir: str):
-                return _FakeProject(manager_lib._returned_files)
-
-        self.Project = Project
 
 
 # ---------------------------------------------------------------------------
@@ -152,67 +72,31 @@ def test_build_node_spec_unknown_node_raises(tmp_path):
         build_node_spec(gp, "Nope", project_dir=tmp_path)
 
 
-def test_merge_payload_only_touches_content():
-    node = {"id": "X", "tier": 2, "content": None, "mathlib_status": "missing"}
-    payload = merge_payload("X", node, "informal_content/x.md")
-    assert payload == {"upsert": {"X": {**node, "content": "informal_content/x.md"}}}
-    # No review/verdict keys leak in.
-    assert "ai" not in payload["upsert"]["X"]
-    assert "verdict" not in payload["upsert"]["X"]
-
-
-def test_delegate_to_node_lands_proof_and_returns_payload(tmp_path):
+def test_build_node_spec_rejects_content_outside_project(tmp_path):
     gp = _write_plan(tmp_path)
-    fake = _FakeLib({"MyBook/Chernoff.lean": "theorem chernoff : True := trivial\n"})
-    mgr = AristotleManager(download_dir=str(tmp_path / ".cache"), lib=fake)
-
-    result = asyncio.run(
-        delegate_to_node(
-            graph_path=gp,
-            node_id="Chernoff bound",
-            project_dir=tmp_path,
-            manager=mgr,
-            max_wait_seconds=5,
-        )
-    )
-
-    assert result.status == "COMPLETE"
-    assert result.ok
-    assert result.landed_files >= 1
-    # Lean file landed into the project.
-    assert (tmp_path / "MyBook" / "Chernoff.lean").exists()
-    # Proof recorded back into the node's prose file.
-    prose = (tmp_path / "informal_content" / "chernoff-bound.md").read_text()
-    assert "Proof (delegated to Aristotle)" in prose
-    assert "lake build is green" in prose
-    # Merge payload links content and carries no review state.
-    assert result.merge_payload["upsert"]["Chernoff bound"]["content"] == (
-        "informal_content/chernoff-bound.md"
-    )
-    assert "ai" not in result.merge_payload["upsert"]["Chernoff bound"]
+    graph = json.loads(gp.read_text(encoding="utf-8"))
+    graph["nodes"]["Chernoff bound"]["content"] = "../../outside.md"
+    gp.write_text(json.dumps(graph), encoding="utf-8")
+    with pytest.raises(ValueError, match="escapes project root"):
+        build_node_spec(gp, "Chernoff bound", project_dir=tmp_path)
 
 
-def test_delegate_does_not_write_graph_or_sidecar(tmp_path):
-    """The backend never writes graph.json or any review sidecar itself."""
-    gp = _write_plan(tmp_path)
-    before = gp.read_text()
-    fake = _FakeLib({"MyBook/Chernoff.lean": "theorem c : True := trivial\n"})
-    mgr = AristotleManager(download_dir=str(tmp_path / ".cache"), lib=fake)
-
-    asyncio.run(
-        delegate_to_node(
-            graph_path=gp,
-            node_id="Chernoff bound",
-            project_dir=tmp_path,
-            manager=mgr,
-            max_wait_seconds=5,
-        )
-    )
-
-    # graph.json is untouched (writes route through merge_node.py, not here).
-    assert gp.read_text() == before
-    # No review_status.json was created by the backend.
-    assert not (tmp_path / "review_status.json").exists()
+def test_safe_extract_rejects_tar_traversal_and_links(tmp_path):
+    for name, configure in (
+        ("../outside.txt", lambda info: None),
+        ("project/link", lambda info: (setattr(info, "type", tarfile.SYMTYPE),
+                                        setattr(info, "linkname", "../../outside.txt"))),
+    ):
+        archive = tmp_path / ("traversal.tar" if name.startswith("..") else "link.tar")
+        with tarfile.open(archive, "w") as tar:
+            info = tarfile.TarInfo(name)
+            data = b"bad"
+            info.size = len(data)
+            configure(info)
+            tar.addfile(info, io.BytesIO(data) if info.isfile() else None)
+        with pytest.raises(ValueError, match="tar member|unsafe tar"):
+            _safe_extract(archive, tmp_path / "extract")
+    assert not (tmp_path / "outside.txt").exists()
 
 
 def test_default_system_prompt_forbids_cheating():

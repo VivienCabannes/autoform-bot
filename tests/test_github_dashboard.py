@@ -183,6 +183,28 @@ def test_export_escapes_html_and_handles_missing_or_traversal_content(tmp_path):
         exporter.export_site(graph, tmp_path.parent / "escaped-site", tmp_path, git_commit=COMMIT)
 
 
+def test_export_rejects_destructive_or_overlapping_output_paths(tmp_path):
+    graph, site = _project(tmp_path)
+    marker = tmp_path / "keep-me"
+    marker.write_text("safe", encoding="utf-8")
+
+    for output in (tmp_path, graph.parent):
+        with pytest.raises(exporter.ExportError, match="dedicated"):
+            exporter.export_site(graph, output, tmp_path, git_commit=COMMIT)
+    alias = tmp_path / "site-alias"
+    alias.symlink_to(graph.parent, target_is_directory=True)
+    with pytest.raises(exporter.ExportError, match="symlink"):
+        exporter.export_site(graph, alias, tmp_path, git_commit=COMMIT)
+    nested_alias = tmp_path / "nested-alias"
+    nested_alias.symlink_to(graph.parent, target_is_directory=True)
+    with pytest.raises(exporter.ExportError, match="symlink"):
+        exporter.export_site(graph, nested_alias / "site", tmp_path, git_commit=COMMIT)
+
+    assert marker.read_text(encoding="utf-8") == "safe"
+    assert graph.is_file()
+    assert not site.exists()
+
+
 def test_export_remains_complete_after_plugin_cache_is_deleted(tmp_path):
     graph, site = _project(tmp_path)
     plugin_cache = tmp_path / "plugin-cache"

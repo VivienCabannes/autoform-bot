@@ -95,6 +95,7 @@ class ProjectTools:
 
     root: Path
     writable: bool = False
+    allow_execution: bool = True
     on_write: Callable[[Path, str], str] | None = None
     command_timeout: float = 120.0
 
@@ -168,6 +169,9 @@ class ProjectTools:
                     },
                 },
             },
+        ]
+        if self.allow_execution:
+            functions.extend([
             {
                 "name": "run_lean",
                 "description": (
@@ -200,7 +204,7 @@ class ProjectTools:
                     },
                 },
             },
-        ]
+            ])
         if self.writable:
             functions.append(
                 {
@@ -227,8 +231,12 @@ class ProjectTools:
         if name == "search_text":
             return self._search_text(arguments)
         if name == "run_lean":
+            if not self.allow_execution:
+                raise ToolPolicyError("command execution is disabled")
             return self._run_lean(arguments)
         if name == "check_axioms":
+            if not self.allow_execution:
+                raise ToolPolicyError("command execution is disabled")
             return self._check_axioms(arguments)
         if name == "write_lean_file" and self.writable:
             return self._write_lean(arguments)

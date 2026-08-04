@@ -90,7 +90,7 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
 
     try:
         from .config import scripts_modules
-        spend = scripts_modules()["spend_governor"].check(cfg.project, "claude")
+        spend = scripts_modules()["spend_governor"].check(cfg.lean_root, "claude")
         if not spend.get("paced"):
             checks.append(("spend pacing", True,
                            "no budget configured — prover runs are unpaced "

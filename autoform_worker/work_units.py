@@ -229,11 +229,17 @@ def do_prove(
     with _cooperative_claim(board, cfg.respect_claims, author_claim_key(node_id), notes) as (acquired, hb):
         if not acquired:
             return UnitResult(False, f"prove {node_id}: claimed by a live peer meanwhile")
+        governor = mods["spend_governor"]
+        reservation = governor.reserve(cfg.lean_root, adapter)
+        if not reservation["allowed"]:
+            return UnitResult(False, f"prove {node_id}: paced — {reservation['reason']}")
         gitutil.fetch(cfg.lean_root, gitutil.slug_url(survey.canonical), survey.default_branch)
         with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
 
             counters.bump(f"prove-{node_id}")
             _feed_start(cfg, "worker", feed_name, node_id)
+            started = time.monotonic()
+            status = "failed"
             try:
                 status, reason, detail = prover(
                     node_id, node, work_cfg.project, str(work_cfg.graph_path), str(work_cfg.lean_root),
@@ -242,6 +248,10 @@ def do_prove(
                 )
             finally:
                 _feed_done(cfg, feed_name)
+                if reservation.get("paced"):
+                    governor.record_run(cfg.lean_root, adapter, status,
+                                        time.monotonic() - started, node=node_id)
+                governor.release(cfg.lean_root, reservation.get("reservation_id"))
 
             if status != "proved":
                 note = f"{reason}\n\n{detail}".strip()[:2400]

@@ -29,18 +29,29 @@ exhausts its budget recovers gradually rather than stampeding at a reset.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
+import os
 import sys
+import tempfile
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 DEFAULT_BUDGET_FILE = "budget.json"
+RESERVATIONS_FILE = "spend_reservations.json"
+RESERVATION_TTL_SECONDS = 6 * 3600
 #: Spend classes that actually cost the operator something. A `subscription`
 #: run still consumes a rate window, so it is paced too — only cost-free
 #: bookkeeping would be exempt, and there is none.
 _COUNTED_STATUSES = ("proved", "failed")
+
+
+class BudgetConfigError(ValueError):
+    """The repository opted into pacing but its budget file is invalid."""
 
 
 @dataclass
@@ -61,28 +72,46 @@ def budget_path(project_dir: str | Path) -> Path:
 
 
 def load_budget(project_dir: str | Path) -> Budget:
-    """The project's budget, or an unlimited one. A malformed budget is treated
-    as unlimited *and* reported by the caller — failing closed here would stall
-    an unattended fleet on a typo, which is worse than an unpaced run."""
+    """The project's budget, or an unlimited one when no file exists.
+
+    An existing malformed file raises: silently disabling an explicit spending
+    control is more dangerous than leaving work queued until the file is fixed.
+    """
     path = budget_path(project_dir)
     if not path.exists():
         return Budget()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return Budget()
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise BudgetConfigError(f"cannot parse {path}: {error}") from error
     if not isinstance(data, dict):
-        return Budget()
+        raise BudgetConfigError(f"{path} must contain a JSON object")
     backends = data.get("backends")
-    # Per-field coercion must fail open too: a typo ("5h", "forty") is a
-    # configuration mistake, and stalling an unattended fleet over one is worse
-    # than running that dimension unpaced.
+    if backends is not None and not isinstance(backends, dict):
+        raise BudgetConfigError(f"{path}: backends must be an object")
+    normalized_backends = {}
+    for name, limits in (backends or {}).items():
+        if not isinstance(limits, dict):
+            raise BudgetConfigError(f"{path}: backend {name!r} limits must be an object")
+        normalized_backends[normalize_backend(str(name))] = {
+            "max_runs": int(_budget_number(limits, "max_runs", path, integer=True)),
+            "max_wall_seconds": _budget_number(limits, "max_wall_seconds", path),
+        }
     return Budget(
-        window_hours=_number(data.get("window_hours")),
-        max_runs=int(_number(data.get("max_runs"))),
-        max_wall_seconds=_number(data.get("max_wall_seconds")),
-        backends=backends if isinstance(backends, dict) else {},
+        window_hours=_budget_number(data, "window_hours", path),
+        max_runs=int(_budget_number(data, "max_runs", path, integer=True)),
+        max_wall_seconds=_budget_number(data, "max_wall_seconds", path),
+        backends=normalized_backends,
     )
+
+
+def _budget_number(data: dict, key: str, path: Path, *, integer: bool = False) -> float:
+    value = data.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise BudgetConfigError(f"{path}: {key} must be a non-negative number")
+    if integer and int(value) != value:
+        raise BudgetConfigError(f"{path}: {key} must be an integer")
+    return float(value)
 
 
 def _number(value: Any) -> float:
@@ -94,6 +123,72 @@ def _number(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return number if number > 0 else 0.0
+
+
+def normalize_backend(backend: str) -> str:
+    """Map user-facing backend names to ledger adapter identifiers."""
+    return {"max": "claude"}.get(backend, backend)
+
+
+def _state_dir(project_dir: str | Path) -> Path:
+    return Path(project_dir) / ".autoform"
+
+
+@contextlib.contextmanager
+def _reservation_lock(project_dir: str | Path):
+    state = _state_dir(project_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    lock_path = state / "spend.lock"
+    if lock_path.is_symlink():
+        raise BudgetConfigError(f"spend lock must not be a symlink: {lock_path}")
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield state
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _load_reservations(state: Path, now: float) -> list[dict]:
+    path = state / RESERVATIONS_FILE
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)
+            and isinstance(item.get("at"), (int, float))
+            and now - float(item["at"]) < RESERVATION_TTL_SECONDS]
+
+
+def _save_reservations(state: Path, reservations: list[dict]) -> None:
+    path = state / RESERVATIONS_FILE
+    if path.is_symlink():
+        raise BudgetConfigError(f"reservation file must not be a symlink: {path}")
+    fd, tmp = tempfile.mkstemp(dir=state, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(reservations, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _add_reservations(usage: dict, reservations: list[dict]) -> dict:
+    usage = {"runs": usage["runs"], "wall_seconds": usage["wall_seconds"],
+             "backends": {key: dict(value) for key, value in usage["backends"].items()}}
+    for item in reservations:
+        backend = normalize_backend(str(item.get("backend") or "unknown"))
+        usage["runs"] += 1
+        slot = usage["backends"].setdefault(backend, {"runs": 0, "wall_seconds": 0.0})
+        slot["runs"] += 1
+    return usage
 
 
 def _parse_ts(value: Any) -> float | None:
@@ -137,7 +232,7 @@ def window_usage(project_dir: str | Path, window_hours: float, now: float) -> di
             continue
         seconds = entry.get("wall_seconds")
         seconds = float(seconds) if isinstance(seconds, (int, float)) else 0.0
-        backend = str(entry.get("backend") or "unknown")
+        backend = normalize_backend(str(entry.get("backend") or "unknown"))
         runs += 1
         wall += seconds
         slot = per.setdefault(backend, {"runs": 0, "wall_seconds": 0.0})
@@ -146,21 +241,9 @@ def window_usage(project_dir: str | Path, window_hours: float, now: float) -> di
     return {"runs": runs, "wall_seconds": wall, "backends": per}
 
 
-def check(project_dir: str | Path, backend: str, now: float | None = None) -> dict:
-    """Whether an expensive run may start now.
-
-    Returns ``{"allowed": bool, "reason": str, "usage": {...}, "budget": {...}}``.
-    ``allowed`` is True whenever no budget is configured — pacing is opt-in.
-    """
-    import time
-
-    now = time.time() if now is None else now
-    budget = load_budget(project_dir)
-    if not budget.enabled:
-        return {"allowed": True, "reason": "no budget configured", "usage": {}, "paced": False}
-    usage = window_usage(project_dir, budget.window_hours, now)
+def _evaluate(budget: Budget, usage: dict, backend: str) -> dict:
+    backend = normalize_backend(backend)
     window = f"{budget.window_hours:g}h window"
-
     if budget.max_runs and usage["runs"] >= budget.max_runs:
         return {"allowed": False, "paced": True, "usage": usage,
                 "reason": f"{usage['runs']}/{budget.max_runs} prover runs used in the {window}"}
@@ -182,6 +265,90 @@ def check(project_dir: str | Path, backend: str, now: float | None = None) -> di
                            f"seconds used in the {window}")}
     return {"allowed": True, "paced": True, "usage": usage,
             "reason": f"within budget ({usage['runs']} runs in the {window})"}
+
+
+def check(project_dir: str | Path, backend: str, now: float | None = None) -> dict:
+    """Whether an expensive run may start now.
+
+    Returns ``{"allowed": bool, "reason": str, "usage": {...}, "budget": {...}}``.
+    ``allowed`` is True whenever no budget is configured — pacing is opt-in.
+    """
+    import time
+
+    now = time.time() if now is None else now
+    try:
+        budget = load_budget(project_dir)
+    except BudgetConfigError as error:
+        return {"allowed": False, "reason": str(error), "usage": {}, "paced": True,
+                "configuration_error": True}
+    if not budget.enabled:
+        return {"allowed": True, "reason": "no budget configured", "usage": {}, "paced": False}
+    with _reservation_lock(project_dir) as state:
+        usage = window_usage(project_dir, budget.window_hours, now)
+        usage = _add_reservations(usage, _load_reservations(state, now))
+    return _evaluate(budget, usage, backend)
+
+
+def reserve(project_dir: str | Path, backend: str, now: float | None = None) -> dict:
+    """Atomically claim one run slot, returning the same decision shape as check()."""
+    import time
+
+    now = time.time() if now is None else now
+    try:
+        budget = load_budget(project_dir)
+    except BudgetConfigError as error:
+        return {"allowed": False, "reason": str(error), "usage": {}, "paced": True,
+                "configuration_error": True, "reservation_id": None}
+    if not budget.enabled:
+        return {"allowed": True, "reason": "no budget configured", "usage": {},
+                "paced": False, "reservation_id": None}
+    with _reservation_lock(project_dir) as state:
+        reservations = _load_reservations(state, now)
+        usage = _add_reservations(
+            window_usage(project_dir, budget.window_hours, now), reservations
+        )
+        result = _evaluate(budget, usage, backend)
+        if not result["allowed"]:
+            result["reservation_id"] = None
+            return result
+        reservation_id = uuid.uuid4().hex
+        reservations.append({"id": reservation_id, "backend": normalize_backend(backend), "at": now})
+        _save_reservations(state, reservations)
+        result["reservation_id"] = reservation_id
+        return result
+
+
+def release(project_dir: str | Path, reservation_id: str | None) -> None:
+    if not reservation_id:
+        return
+    import time
+
+    with _reservation_lock(project_dir) as state:
+        reservations = _load_reservations(state, time.time())
+        _save_reservations(state, [item for item in reservations if item.get("id") != reservation_id])
+
+
+def record_run(project_dir: str | Path, backend: str, status: str, wall_seconds: float,
+               *, node: str = "") -> None:
+    """Append a central usage entry for work executed in a disposable checkout."""
+    state = _state_dir(project_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    ledger = state / "usage.jsonl"
+    if ledger.is_symlink():
+        raise BudgetConfigError(f"usage ledger must not be a symlink: {ledger}")
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "node": node,
+        "backend": normalize_backend(backend),
+        "status": status if status in _COUNTED_STATUSES else "failed",
+        "wall_seconds": max(0.0, float(wall_seconds)),
+    }
+    encoded = (json.dumps(entry, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
 
 
 def main(argv=None) -> int:

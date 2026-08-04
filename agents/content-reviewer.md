@@ -6,7 +6,7 @@ description: >
   recompose the original theorem), too-close-to-source, and in-mathlib pointers, and
   edits the informal_content/<id>.md files to fix what it finds. Flags structural issues
   for the graph-reviewers and orchestrator.
-tools: [Read, Write]
+tools: [Read, Write, Bash]
 mcpServers: []
 kind: contentreview
 label: Content reviewer
@@ -43,7 +43,7 @@ Compare each node's prose to the source passage it paraphrases. The mathematics 
 
 ### 2. Correctness
 
-Judge the prose on its own terms, as a piece of mathematics. Is the statement true as written, and is the proof sound — each step following from the stated hypotheses and the cluster's prerequisite nodes? Look for gaps presented as obvious that are not, appeals to facts no prerequisite supplies, edge cases the proof ignores, and notation used before it is introduced. A faithful paraphrase of a flawed source is still flawed; correctness is checked independently of faithfulness. Repair the unsound step, fill the gap, or — where the source itself is wrong — fix the statement to what actually holds.
+Judge the prose on its own terms, as a piece of mathematics. Is the statement true as written, and is the proof sound — each step following from the stated hypotheses and the cluster's prerequisite nodes? Look for gaps presented as obvious that are not, appeals to facts no prerequisite supplies, edge cases the proof ignores, and notation used before it is introduced. A faithful paraphrase of a flawed source is still flawed; correctness is checked independently of faithfulness. Repair the unsound step or fill the gap. Where the source itself appears wrong, do not silently replace the sourced claim: leave it unchanged and flag the source defect for an orchestrator provenance decision.
 
 ### 3. Split-correctness
 

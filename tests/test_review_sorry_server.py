@@ -99,6 +99,30 @@ def test_explicit_lean_file_overrides_path(tmp_path):
     assert ss == {"pinNode", "A.B", "cl"}
 
 
+def test_shared_lean_file_flags_every_declaration_node(tmp_path):
+    root = _lean(tmp_path)
+    (root / "shared.lean").write_text("def p := by sorry\n")
+    extra = [
+        {"id": "first", "tier": 3, "parent": "A.B", "kind": "theorem",
+         "lean_file": "shared.lean"},
+        {"id": "second", "tier": 3, "parent": "A.B", "kind": "lemma",
+         "lean_file": "shared.lean"},
+    ]
+    proj = sv.Project(_graph(tmp_path, extra_nodes=extra))
+    proj.lean_root = root.resolve()
+    assert {"first", "second", "A.B", "cl"} <= proj.sorry_set(proj.nodes())
+
+
+def test_sorry_scan_skips_dependency_caches(tmp_path):
+    root = _lean(tmp_path)
+    cached = root / ".lake" / "packages" / "mathlib" / "A" / "B"
+    cached.mkdir(parents=True)
+    (cached / "C.lean").write_text("theorem cached := by sorry\n")
+    proj = sv.Project(_graph(tmp_path))
+    proj.lean_root = root.resolve()
+    assert proj.sorry_set(proj.nodes()) == set()
+
+
 def test_orphan_lean_file_contributes_no_phantom_id(tmp_path):
     root = _lean(tmp_path)
     # A .lean with no corresponding graph node must add nothing.

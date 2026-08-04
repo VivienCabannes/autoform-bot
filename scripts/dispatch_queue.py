@@ -263,6 +263,8 @@ def main(argv=None) -> int:
     ap.add_argument("id", nargs="?", help="task id (for claim/done/fail)")
     ap.add_argument("--detail", default="")
     ap.add_argument("--result", default="")
+    ap.add_argument("--report-file", type=Path, default=None,
+                    help="done: persist the agent's textual report on the queue task")
     ap.add_argument("--reason", default="")
     ap.add_argument("--fingerprint", default="", help="park: durable prover-input fingerprint after recovery")
     ap.add_argument("--agent", default="", help="enqueue: agent id — any palette kind (reviewer|worker|planner|graphreview|contentreview|holistic|mathcheck|escalation)")
@@ -444,8 +446,8 @@ def main(argv=None) -> int:
         current = t.get("status")
         if a.cmd == "claim":
             if current == "running":
-                print(f"claim {a.id} -> running (already claimed)")
-                return 0
+                print(f"claim {a.id} refused: task is already running", file=sys.stderr)
+                return 1
             if current != "queued":
                 print(
                     f"invalid transition for {a.id}: {current!r} -> running",
@@ -470,6 +472,13 @@ def main(argv=None) -> int:
             t["finished_at"] = _now()
             if a.result:
                 t["result"] = a.result
+            if a.report_file is not None:
+                try:
+                    report = a.report_file.read_text(encoding="utf-8", errors="replace")
+                except OSError as error:
+                    print(f"cannot read report file: {error}", file=sys.stderr)
+                    return 1
+                t["report"] = report[-40_000:]
         elif a.cmd == "fail":
             if current == "failed":
                 print(f"fail {a.id} -> failed (already finished)")
@@ -484,6 +493,9 @@ def main(argv=None) -> int:
             t["finished_at"] = _now()
             if a.reason:
                 t["result"] = a.reason
+            if a.report_file is not None and a.report_file.is_file():
+                t["report"] = a.report_file.read_text(
+                    encoding="utf-8", errors="replace")[-40_000:]
         elif a.cmd == "park":
             if current == "parked":
                 print(f"park {a.id} -> parked (already parked)")
@@ -498,6 +510,9 @@ def main(argv=None) -> int:
             t["finished_at"] = _now()
             if a.reason:
                 t["result"] = a.reason
+            if a.report_file is not None and a.report_file.is_file():
+                t["report"] = a.report_file.read_text(
+                    encoding="utf-8", errors="replace")[-40_000:]
             if isinstance(t.get("recovery"), dict):
                 t["recovery"]["phase"] = "parked"
                 if a.fingerprint:

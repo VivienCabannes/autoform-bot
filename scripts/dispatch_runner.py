@@ -46,6 +46,7 @@ import dispatch_queue as dq  # noqa: E402  # _save / _feed_for / _now
 import backend_config  # noqa: E402  # user-facing backend selection
 import judge_runtime  # noqa: E402  # structured jury across CLI/API providers
 import recovery_state  # noqa: E402  # evidence gate for proof retries
+import spend_governor  # noqa: E402  # atomic pacing immediately before paid work
 try:
     from servers.prover.driver import prove as _prove
     from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
@@ -629,19 +630,35 @@ def _run_dispatch(a) -> int:
                 dq.sync_feed(feed_path, c)
                 print(f"  worker {t['node']:24} → PARKED (no new recovery evidence)", flush=True)
                 return 1
+            # A changed-input retry consumes the old park. Leaving it active would
+            # suppress the next recovery task if this retry also fails.
+            for esc in escs:
+                if esc.get("status") == "parked":
+                    esc["status"] = "done"
+                    esc["finished_at"] = dq._now()
+                    esc["result"] = "resumed after prover inputs changed"
+                    if isinstance(esc.get("recovery"), dict):
+                        esc["recovery"]["phase"] = "resumed"
+            reservation = spend_governor.reserve(Path(repo), adapter)
+            if not reservation["allowed"]:
+                print(f"  worker {t['node']:24} → PACED ({reservation['reason']})", flush=True)
+                return 0
             for x in c:                                                 # claim
                 if x["id"] == t["id"]:
                     x["status"], x["started_at"] = "running", dq._now()
             dq._save(queue_path, c)
             dq.sync_feed(feed_path, c)
         print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
-        status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                            str(proj / "graph.json"), repo, a.max_steers,
-                                            backend=adapter,
-                                            judge_backend=a.judge_backend,
-                                            judge_model=a.model,
-                                            judge_timeout=min(a.timeout, 180),
-                                            worker_timeout=a.timeout)
+        try:
+            status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
+                                                str(proj / "graph.json"), repo, a.max_steers,
+                                                backend=adapter,
+                                                judge_backend=a.judge_backend,
+                                                judge_model=a.model,
+                                                judge_timeout=min(a.timeout, 180),
+                                                worker_timeout=a.timeout)
+        finally:
+            spend_governor.release(Path(repo), reservation.get("reservation_id"))
         with fslock.locked(queue_path):     # finish (re-read for new drops)
             c = dq.load_queue(queue_path)
             for x in c:

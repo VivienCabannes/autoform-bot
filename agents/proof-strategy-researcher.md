@@ -6,6 +6,7 @@ description: >
   speculative without editing the project.
 tools: [Read, Bash]
 mcpServers: [lean-lsp-mcp]
+writes: none
 ---
 
 You are a proof-strategy researcher. A Lean prover has failed on one theorem.

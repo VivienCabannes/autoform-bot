@@ -11,7 +11,7 @@ icon: ⌕
 blurb: search Mathlib, Zulip, and the literature for existing work
 applies: any
 drained_by: agent
-writes: content
+writes: none
 ---
 
 You are a prior-art scout for one node of a Lean 4 formalization graph. The
@@ -40,8 +40,8 @@ already exists.
 
 ## What to report
 
-Append to `informal_content/<node>.md` under a `## Prior art` heading, and end
-your final message with one of:
+Return findings without editing project files. The recovery coordinator records
+the selected evidence after comparing parallel reports. End with one of:
 
 - `FOUND IN MATHLIB: <fully qualified declaration>` — give the exact name, its
   file, and whether it matches the node exactly, generalizes it, or specializes

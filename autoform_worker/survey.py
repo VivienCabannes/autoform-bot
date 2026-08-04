@@ -364,7 +364,7 @@ def collect(
     # recovery retries are deliberately uncapped. The governor bounds resources
     # only — it never ends work, and the fleet self-resumes as the rolling
     # window clears.
-    spend = scripts_modules()["spend_governor"].check(cfg.project, proof_backend)
+    spend = scripts_modules()["spend_governor"].check(cfg.lean_root, proof_backend)
     if not spend["allowed"]:
         survey.notes.append(f"prove paced: {spend['reason']}")
     open_pr_nodes = {pr.node for pr in prs if pr.node}

@@ -27,8 +27,9 @@ from .errors import Die
 # read-only for checks/logs. `git push` is deliberately absent — prompts forbid
 # it and the harness owns the (claim-checked, CAS) push after the agent exits.
 _CLAUDE_ALLOWED_TOOLS = (
-    "Read,Grep,Glob,Edit,Write,"
+    "Read,Grep,Glob,Edit,Write,Agent,mcp__lean-lsp-mcp__*,"
     "Bash(lake *),Bash(lake env lean *),Bash(lean *),Bash(elan *),Bash(rg *),Bash(mkdir *),"
+    "Bash(python *),Bash(python3 *),Bash(uv *),Bash(loogle *),Bash(lean-explore *),"
     "Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git add *),Bash(git commit *),"
     "Bash(git merge *),Bash(git fetch *),Bash(git checkout *),Bash(git restore *),Bash(git rev-parse *),"
     "Bash(gh pr view *),Bash(gh pr checks *),Bash(gh pr diff *),Bash(gh run view *),Bash(gh api *)"
@@ -79,7 +80,9 @@ _CLAUDE_ISOLATION_ARGS = (
     "--setting-sources", "user",
     "--settings", '{"disableAllHooks":true}',
     "--disable-slash-commands",
-    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--strict-mcp-config", "--mcp-config",
+    '{"mcpServers":{"lean-lsp-mcp":{"command":"lean-lsp-mcp",'
+    '"args":["--disable-tools","lean_leansearch,lean_loogle,lean_leanfinder"]}}}',
 )
 
 

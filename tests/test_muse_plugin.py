@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 
 
@@ -100,6 +102,18 @@ def test_muse_builder_requires_force_to_replace_output(tmp_path: Path):
 
     build_muse_plugin(output, force=True)
     assert not marker.exists()
+
+
+def test_muse_builder_rejects_repository_and_source_overlap(tmp_path: Path):
+    for output in (REPO_ROOT, REPO_ROOT / "scripts" / "dist-muse", REPO_ROOT.parent):
+        with pytest.raises(ValueError, match="must not overlap"):
+            build_muse_plugin(output, force=True)
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        build_muse_plugin(alias / "package", force=True)
 
 
 def test_muse_mcp_launcher_keeps_uv_state_outside_plugin_cache():

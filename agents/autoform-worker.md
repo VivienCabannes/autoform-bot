@@ -100,9 +100,9 @@ gaps hidden behind opaque definitions. Specifically:
 - Do not hide a gap behind a `macro`, an `opaque`, a `def … : Prop` standing in for
   a theorem, a structure field smuggling the claim, or a `False.elim`/vacuous proof.
   `decide` is fine only when it genuinely closes the goal by kernel computation.
-- **Grep the whole project, not just your file**, for `sorry`/`admit`/`axiom`
-  before you call anything done — a gap anywhere in the dependency chain of your
-  target taints it.
+- **Check the target and its dependency chain** for `sorry`/`admit`/unledgered
+  `axiom`, and check the diff for newly introduced gaps. Unrelated unfinished
+  nodes elsewhere in an incremental project do not make this target fail.
 - The **only** sanctioned gap is the project's placeholder convention (e.g. an
   `unproved` macro) and **only** when the *source itself* omits the proof
   ("omitted" / "exercise" / cites a reference). If the project defines no such
@@ -148,7 +148,7 @@ truthful `FAILED`.
 ## Output — finished, or honest FAILED
 
 **On success** — the target `sorry`/`axiom`/open goal is gone, the touched file
-compiles cleanly through the REPL, and a project-wide grep shows no new
+compiles cleanly through the REPL, and a target/dependency scan plus the diff show no new
 `sorry`/`admit`/unledgered `axiom` — write the proof back into the node's file and
 return:
 

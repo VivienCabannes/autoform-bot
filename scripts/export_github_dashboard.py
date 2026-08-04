@@ -526,12 +526,35 @@ def _write(path: Path, payload: bytes) -> None:
     path.write_bytes(payload)
 
 
+def _path_uses_symlink(path: Path, stop: Path) -> bool:
+    current = path
+    stop = stop.resolve()
+    while current != current.parent:
+        if current.is_symlink():
+            return True
+        if current == stop:
+            return False
+        current = current.parent
+    return False
+
+
 def export_site(graph_path: Path, output: Path, repo_root: Path, *, git_commit: str,
                 blueprint: Path | None = None) -> Path:
     repo_root = repo_root.resolve()
+    raw_output = output if output.is_absolute() else repo_root / output
+    if _path_uses_symlink(raw_output, repo_root):
+        raise ExportError("output path must not contain a symlink")
     output = _safe_path(repo_root, output, label="output")
-    if output.is_symlink():
-        raise ExportError("output directory must not be a symlink")
+    graph_path = _safe_path(repo_root, graph_path, label="graph")
+    protected = {repo_root, graph_path, graph_path.parent}
+    if output in protected:
+        raise ExportError("output must be a dedicated directory separate from repository inputs")
+    if any(output in path.parents for path in protected):
+        raise ExportError("output must not contain the repository or dashboard inputs")
+    if blueprint is not None:
+        blueprint_path = _safe_path(repo_root, blueprint, label="blueprint")
+        if output == blueprint_path or output in blueprint_path.parents or blueprint_path in output.parents:
+            raise ExportError("output and blueprint directories must not overlap")
     snapshot, content, kernel = build_snapshot(graph_path, repo_root, git_commit)
     node_by_id = {node["id"]: node for node in snapshot["nodes"]}
 

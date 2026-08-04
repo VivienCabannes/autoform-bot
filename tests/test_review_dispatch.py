@@ -242,9 +242,14 @@ class _Server:
     def _url(self, path):
         return f"http://127.0.0.1:{self.port}{path}"
 
-    def get(self, path):
-        with urllib.request.urlopen(self._url(path)) as r:
-            return r.status, json.loads(r.read())
+    def get(self, path, host=None):
+        headers = {"Host": host} if host is not None else {}
+        req = urllib.request.Request(self._url(path), headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
 
     def post(self, path, body, token=True, host=None):
         """POST with the CSRF token by default; ``token=False`` / ``host=…``
@@ -298,6 +303,16 @@ def test_api_agents_still_works(tmp_path):
         code, body = srv.get("/api/agents")
         assert code == 200
         assert body == {"orchestrator": {"state": "idle"}, "agents": []}
+    finally:
+        srv.close()
+
+
+def test_get_with_non_loopback_host_is_403(tmp_path):
+    srv = _serve(tmp_path)
+    try:
+        code, body = srv.get("/api/dispatch", host="attacker.example")
+        assert code == 403
+        assert "not loopback" in body["error"]
     finally:
         srv.close()
 

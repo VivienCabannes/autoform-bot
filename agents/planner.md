@@ -39,8 +39,8 @@ only sequences the work.
    `in-mathlib` root through the dependency graph, or it is unprovable by
    construction. Keep each tier acyclic.
 4. **Write the prose.** One `informal_content/<node>.md` per node: the statement
-   in universal mathematical voice, the hypotheses in full, and the source
-   reference. This is what a prover reads, so an ambiguity here becomes a wrong
+   in universal mathematical voice and the hypotheses in full. Record the source
+   reference only in the node's `source_refs` field. This is what a prover reads, so an ambiguity here becomes a wrong
    formalization later.
 
 ## Rules

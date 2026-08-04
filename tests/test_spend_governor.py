@@ -1,7 +1,6 @@
 """Spend-governor tests — deterministic pacing over the project prover ledger.
 
-Covers scripts/spend_governor.py: budget loading (incl. the deliberate
-fail-OPEN on a malformed budget), the rolling-window ledger fold, check()'s
+Covers scripts/spend_governor.py: fail-closed budget loading, the rolling-window ledger fold, check()'s
 global and per-backend caps, main()'s exit codes, and the survey integration
 that turns an exhausted budget into SUPPRESSED prove candidates.
 
@@ -90,16 +89,16 @@ def test_no_budget_file_is_unlimited(tmp_path):
     "",
     "null",
 ])
-def test_malformed_budget_fails_open(tmp_path, raw):
-    """Deliberate fail-OPEN: a typo must not stall an unattended fleet."""
+def test_malformed_budget_fails_closed(tmp_path, raw):
     proj = make_project(tmp_path)
     write_budget(proj, raw)
     # A ledger that would blow any real cap — irrelevant, since nothing is configured.
     write_ledger(proj, [run_entry(NOW, wall=9999.0) for _ in range(50)])
-    assert sg.load_budget(proj) == sg.Budget()
+    with pytest.raises(sg.BudgetConfigError):
+        sg.load_budget(proj)
     result = sg.check(proj, "claude", now=NOW)
-    assert result["allowed"] is True and result["paced"] is False
-    assert result["reason"] == "no budget configured"
+    assert result["allowed"] is False and result["paced"] is True
+    assert result["configuration_error"] is True
 
 
 def test_budget_with_window_but_no_limits_is_disabled(tmp_path):
@@ -124,9 +123,10 @@ def test_budget_enabled_matrix(tmp_path):
     assert not enabled({"window_hours": 5, "max_runs": 0, "max_wall_seconds": 0, "backends": {}})
     # A window is mandatory: limits without one configure nothing.
     assert not enabled({"max_runs": 1, "max_wall_seconds": 60})
-    # A non-dict `backends` is ignored rather than fatal.
+    # A non-dict `backends` is an invalid spending policy.
     write_budget(proj, {"window_hours": 5, "max_runs": 2, "backends": ["aristotle"]})
-    assert sg.load_budget(proj).backends == {}
+    with pytest.raises(sg.BudgetConfigError):
+        sg.load_budget(proj)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +295,26 @@ def test_check_per_backend_caps_bind_only_the_named_backend(tmp_path):
     assert sg.check(proj, "max", now=NOW)["allowed"] is True
 
 
+def test_max_backend_name_uses_claude_ledger_and_limits(tmp_path):
+    proj = make_project(tmp_path)
+    write_budget(proj, {"window_hours": 5, "backends": {"max": {"max_runs": 1}}})
+    write_ledger(proj, [run_entry(NOW, backend="claude")])
+    result = sg.check(proj, "max", now=NOW)
+    assert result["allowed"] is False
+    assert "backend claude: 1/1" in result["reason"]
+
+
+def test_reservation_atomically_consumes_last_run_slot(tmp_path):
+    proj = make_project(tmp_path)
+    write_budget(proj, {"window_hours": 5, "max_runs": 1})
+    first = sg.reserve(proj, "claude", now=NOW)
+    second = sg.reserve(proj, "claude", now=NOW)
+    assert first["allowed"] is True and first["reservation_id"]
+    assert second["allowed"] is False and second["reservation_id"] is None
+    sg.release(proj, first["reservation_id"])
+    assert sg.reserve(proj, "claude", now=NOW)["allowed"] is True
+
+
 def test_check_global_cap_outranks_an_unspent_backend_cap(tmp_path):
     proj = make_project(tmp_path)
     write_budget(proj, {"window_hours": 5, "max_runs": 2,
@@ -382,8 +402,8 @@ def test_survey_suppresses_prove_when_the_budget_is_spent(tmp_path, monkeypatch)
 
     cfg = make_cfg(tmp_path, monkeypatch)
     # collect() defaults to the "max" backend; a global cap paces it regardless.
-    write_budget(cfg.project, {"window_hours": 5, "max_runs": 2})
-    write_ledger(cfg.project, [run_entry(time.time(), backend="max", wall=60.0) for _ in range(2)])
+    write_budget(cfg.lean_root, {"window_hours": 5, "max_runs": 2})
+    write_ledger(cfg.lean_root, [run_entry(time.time(), backend="max", wall=60.0) for _ in range(2)])
 
     s = run_collect(cfg, make_runner())
     assert s.actionable("prove") == []
@@ -401,21 +421,19 @@ def test_survey_prove_returns_once_the_ledger_ages_out(tmp_path, monkeypatch):
     import time
 
     cfg = make_cfg(tmp_path, monkeypatch)
-    write_budget(cfg.project, {"window_hours": 1, "max_runs": 1})
-    write_ledger(cfg.project, [run_entry(time.time() - 6 * HOUR, backend="max", wall=60.0)])
+    write_budget(cfg.lean_root, {"window_hours": 1, "max_runs": 1})
+    write_ledger(cfg.lean_root, [run_entry(time.time() - 6 * HOUR, backend="max", wall=60.0)])
     s = run_collect(cfg, make_runner())
     assert set(prove_map(s)) == {"no-lean", "sorried", "rejected"}
     assert not [note for note in s.notes if "paced" in note]
 
 
 # ---------------------------------------------------------------------------
-# fail-open regression: a typo in a budget VALUE must not raise
+# fail-closed regression: a typo in a budget value must pace work
 # ---------------------------------------------------------------------------
 
-#: The module contract is explicit — "a malformed budget is treated as unlimited"
-#: because "failing closed here would stall an unattended fleet on a typo". A
-#: mistyped *value* is exactly that typo, and check() is called unguarded from
-#: autoform_worker/survey.py:367, so an exception here aborts the whole round.
+# Existing but invalid policies must suppress paid work with a configuration
+# error rather than silently turning pacing off.
 TYPOED_BUDGETS = [
     {"window_hours": "5h", "max_runs": 3},
     {"window_hours": 5, "max_runs": "forty"},
@@ -425,13 +443,10 @@ TYPOED_BUDGETS = [
 ]
 
 
-def test_typoed_budget_values_fail_open(tmp_path):
-    raised = {}
+def test_typoed_budget_values_fail_closed(tmp_path):
     for index, data in enumerate(TYPOED_BUDGETS):
         proj = make_project(tmp_path, f"proj{index}")
         write_budget(proj, data)
-        try:
-            assert sg.check(proj, "claude", now=NOW)["allowed"] is True
-        except (TypeError, ValueError, AttributeError) as error:
-            raised[json.dumps(data)] = f"{type(error).__name__}: {error}"
-    assert raised == {}
+        result = sg.check(proj, "claude", now=NOW)
+        assert result["allowed"] is False
+        assert result["configuration_error"] is True
