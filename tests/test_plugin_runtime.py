@@ -8,9 +8,20 @@ import sys
 import zipfile
 
 
-def test_plugin_surface_is_two_skills_and_two_domain_servers(repo_root):
+def test_plugin_surface_is_three_skills_and_two_servers(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
-    assert skills == {"setup", "orchestrate"}
+    assert skills == {"setup", "orchestrate", "review"}
+
+    review_dir = repo_root / "skills" / "review"
+    references = {
+        "faithfulness.md",
+        "proof-integrity.md",
+        "code-quality.md",
+        "mathlib-style.md",
+    }
+    assert {path.name for path in (review_dir / "references").glob("*.md")} == references
+    skill_text = (review_dir / "SKILL.md").read_text()
+    assert all(f"references/{name}" in skill_text for name in references)
 
     codex = json.loads((repo_root / ".mcp.json").read_text())
     claude = json.loads((repo_root / ".claude-plugin" / "plugin.json").read_text())

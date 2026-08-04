@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Lean Formalization"
+  short_description: "Review Lean faithfulness, integrity, and style"
+  default_prompt: "Use $review to review this Lean formalization against its source and proof chain."

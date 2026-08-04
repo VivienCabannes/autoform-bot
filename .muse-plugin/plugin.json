@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "name": "autoform",
+  "displayName": "AutoForm Bot",
+  "version": "0.4.4",
+  "description": "Plan, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
+  "compat": {
+    "source": "native",
+    "manifestDir": ".muse-plugin"
+  },
+  "capabilities": {
+    "skills": [],
+    "commands": [
+      {
+        "id": "setup",
+        "path": "skills/setup/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "orchestrate",
+        "path": "skills/orchestrate/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "review",
+        "path": "skills/review/SKILL.md",
+        "enabledDefault": true
+      }
+    ],
+    "hooks": [],
+    "mcpServers": [
+      {
+        "id": "autoform-lsp",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "lsp"
+        ]
+      },
+      {
+        "id": "autoform-repl",
+        "transport": "stdio",
+        "command": [
+          "bash",
+          "servers/run-muse-server.sh",
+          "repl"
+        ]
+      }
+    ],
+    "reminders": []
+  }
+}

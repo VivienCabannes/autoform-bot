@@ -1,6 +1,6 @@
 # Autoform
 
-Autoform is a small Lean 4 plugin: two expert skills, a Markdown dependency
+Autoform is a small Lean 4 plugin: three expert skills, a Markdown dependency
 graph, and exactly two stateful MCP servers—LSP and REPL. Planning stays
 readable and editable by people while the coding agent supplies the
 orchestration.
@@ -68,10 +68,22 @@ uv run pytest -q
 The visualization is self-contained and works directly from `file://`; clicking
 a node opens its Markdown file.
 
+## Muse/TBH
+
+Muse can use the repository directly through `.muse-plugin/plugin.json`, beside
+the native Claude and Codex manifests:
+
+```bash
+tbh plugins validate . --json
+tbh plugins install .
+tbh plugins enable autoform
+```
+
 ## Plugin surface
 
 - `setup` creates or repairs the Markdown blueprint after confirming sources and scope.
 - `orchestrate` works ready nodes with native subagents and Lean tools.
+- `review` independently checks faithfulness, proof integrity, and Mathlib code quality.
 - `autoform-lsp` provides Lean diagnostics and hover information.
 - `autoform-repl` executes snippets through a persistent Lean process.
 
@@ -82,7 +94,10 @@ search stays outside the server surface and uses host-native tools when useful.
 ## Repository layout
 
 ```text
-skills/         two short expert nudges
+.claude-plugin/  Claude Code manifest
+.codex-plugin/   Codex manifest
+.muse-plugin/    Muse/TBH source manifest
+skills/         three short expert nudges with on-demand review rubrics
 autoform/       Markdown graph parser and validator
 servers/        exactly two stateful servers: Lean LSP and REPL
 visualization/  static HTML graph exporter
