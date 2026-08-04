@@ -141,3 +141,32 @@ local-only — say so rather than silently losing the sync.
   a spawned agent is a defect.
 - Merging follows the worker's verified auto-merge gate; dashboard verdicts and
   hold labels remain the human override.
+
+## Unattended operation
+
+Two mechanisms keep a loop running without a human in the room.
+
+**Parking is never permanent.** A proof recovery that produces no new prover
+input parks its node instead of retrying. The evidence gate is symmetric: the
+moment the node's durable inputs change — a merged sibling proof, a Mathlib
+bump, a re-planned cluster, an edited statement — the round resumes the parked
+recovery automatically and the node becomes prove-eligible again on that same
+pass. Never treat a parked node as finished; `autoform status --json` lists
+`resumable_parks` when inputs have moved.
+
+**Spend is paced, judgment is not.** Recovery retries are deliberately uncapped
+in count, so the only bound is resources. `scripts/spend_governor.py` reads the
+project's own append-only prover ledger (`.autoform/usage.jsonl`) against an
+optional `.autoform/budget.json`:
+
+```json
+{"window_hours": 5, "max_runs": 40, "max_wall_seconds": 14400,
+ "backends": {"aristotle": {"max_runs": 10}}}
+```
+
+With no budget file, nothing is paced. When a rolling window's budget is spent,
+the prove stage is suppressed with a `paced — …` reason and the loop keeps
+tending PRs, reviewing, and draining role tasks; prove work resumes by itself
+as entries age out of the window. Pacing never ends work and never asks a human
+anything — a paced fleet is still fully autonomous, just solvent.
+

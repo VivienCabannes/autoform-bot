@@ -7,6 +7,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import recovery_state  # noqa: E402
 
 from autoform_worker import scoreboard, survey
 from autoform_worker.claims import ClaimBoard, author_claim_key
@@ -307,7 +312,15 @@ def test_collect_suppresses_proof_while_recovery_is_parked(tmp_path, monkeypatch
         "agent": "escalation",
         "node": "no-lean",
         "status": "parked",
-        "recovery": {"fingerprint": "old", "backend": "claude"},
+        "recovery": {
+            # The CURRENT fingerprint: parking suppresses the node only while
+            # its durable inputs are unchanged. A stale fingerprint means new
+            # evidence arrived and the recovery is resumable instead — covered
+            # in tests/test_recovery_resume.py.
+            "fingerprint": recovery_state.proof_fingerprint(
+                cfg.graph_path, "no-lean", cfg.lean_root, "claude"),
+            "backend": "claude",
+        },
     }]), encoding="utf-8")
     s = run_collect(cfg, make_runner())
     assert prove_map(s, actionable=False)["no-lean"] == "proof recovery parked"

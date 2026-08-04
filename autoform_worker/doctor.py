@@ -88,6 +88,18 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
     except Die as error:
         checks.append(("canonical repo", False, str(error)))
 
+    try:
+        from .config import scripts_modules
+        spend = scripts_modules()["spend_governor"].check(cfg.project, "claude")
+        if not spend.get("paced"):
+            checks.append(("spend pacing", True,
+                           "no budget configured — prover runs are unpaced "
+                           "(.autoform/budget.json sets a rolling window)"))
+        else:
+            checks.append(("spend pacing", spend["allowed"], spend["reason"]))
+    except Exception as error:
+        checks.append(("spend pacing", True, f"not evaluated: {error}"))
+
     checks.append(("worker id", True, cfg.worker_id))
     checks.append(("state dir", True, str(cfg.state_dir)))
     return checks

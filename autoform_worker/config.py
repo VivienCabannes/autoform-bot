@@ -56,6 +56,7 @@ def scripts_modules():
     import judge_runtime  # noqa: PLC0415
     import recovery_state  # noqa: PLC0415
     import review_model  # noqa: PLC0415
+    import spend_governor  # noqa: PLC0415
 
     return {
         "backend_config": backend_config,
@@ -64,6 +65,7 @@ def scripts_modules():
         "judge_runtime": judge_runtime,
         "recovery_state": recovery_state,
         "review_model": review_model,
+        "spend_governor": spend_governor,
     }
 
 

@@ -33,12 +33,32 @@ jobs:
           ref: __AUTOFORM_REVISION__
           path: .autoform-tooling
 
+      # The blueprint is the shared informal argument. Building it needs a LaTeX
+      # toolchain, so it is opt-in: create blueprint/ in the project (Roadmap's
+      # leanblueprint export) and this step publishes it under /blueprint/.
+      # Delete this step to publish the dashboard alone.
+      - name: Build the informal blueprint (optional)
+        id: blueprint
+        run: |
+          set -euo pipefail
+          if [ ! -f blueprint/web.tex ] && [ ! -f blueprint/src/web.tex ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no blueprint/ in the project — publishing the dashboard alone"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends texlive-full graphviz
+          python -m pip install --quiet leanblueprint plastexdepgraph
+          ( cd blueprint && leanblueprint web )
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
       - name: Export read-only dashboard
         run: >-
           python .autoform-tooling/scripts/export_github_dashboard.py
           --repo-root "$GITHUB_WORKSPACE"
           --graph __GRAPH_PATH__
           --output __SITE_PATH__
+          ${{ steps.blueprint.outputs.present == 'true' && '--blueprint blueprint/web' || '' }}
 
       - name: Configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b

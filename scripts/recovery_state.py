@@ -94,3 +94,32 @@ def unchanged_recovery(
     return bool(previous) and previous == proof_fingerprint(
         graph_path, node_id, lean_root, backend
     )
+
+
+def resumable_park(
+    tasks: list[dict[str, Any]],
+    node_id: str,
+    graph_path: Path,
+    lean_root: Path,
+    backend: str,
+) -> dict[str, Any] | None:
+    """A parked recovery whose durable inputs have since CHANGED, or None.
+
+    Parking is a resting state, not a grave. A node parks because its own
+    recovery produced no new prover input — but the inputs can still move for
+    reasons outside that node: a sibling proof merges and changes a dependency,
+    a Mathlib bump lands, a cluster is re-planned, a human edits the prose. The
+    evidence gate is symmetric: the same fingerprint that justifies refusing a
+    retry justifies granting one the moment it differs.
+
+    Without this, a parked node is unreachable forever and an unattended fleet
+    silently loses it. Returns the parked task so the caller can resume it.
+    """
+    task = latest_recovery(tasks, node_id)
+    if task is None or task.get("status") != "parked":
+        return None
+    previous = task.get("recovery", {}).get("fingerprint")
+    if not previous:
+        return None
+    current = proof_fingerprint(graph_path, node_id, lean_root, backend)
+    return task if current != previous else None

@@ -93,6 +93,7 @@ class Survey:
     can_push: bool = False
     issues_enabled: bool = False
     targets: dict = field(default_factory=dict)   # target id -> distance metrics
+    resumable_parks: list = field(default_factory=list)   # (node_id, task_id) — parked but inputs moved
     allow_unchecked_merge: bool = False
     extra_identities: tuple = ()
 
@@ -128,6 +129,7 @@ class Survey:
             ],
             "notes": self.notes,
             "targets": self.targets,
+            "resumable_parks": [{"node": n, "task": t} for n, t in self.resumable_parks],
         }
 
 
@@ -358,6 +360,13 @@ def collect(
     survey.suppressed["agents"].extend(held)
 
     # --- prove --------------------------------------------------------------
+    # Spend pacing: an unattended fleet has nobody watching the meter, and
+    # recovery retries are deliberately uncapped. The governor bounds resources
+    # only — it never ends work, and the fleet self-resumes as the rolling
+    # window clears.
+    spend = scripts_modules()["spend_governor"].check(cfg.project, proof_backend)
+    if not spend["allowed"]:
+        survey.notes.append(f"prove paced: {spend['reason']}")
     open_pr_nodes = {pr.node for pr in prs if pr.node}
     intentions = _intention_avoid_list(host, canonical) if survey.issues_enabled else set()
     eligible = eligible_prove_nodes(cfg)
@@ -396,6 +405,22 @@ def collect(
             push_cand("prove", Candidate("prove", "human intention registered", node=node_id), False)
             continue
         recovery = recovery_state.latest_recovery(queue_tasks, node_id)
+        # A parked recovery whose inputs have since moved is resumable: the
+        # evidence gate works in both directions, so upstream progress (a merged
+        # sibling, a Mathlib bump, a re-plan) revives the node without anyone
+        # asking. Checked BEFORE the parked suppression below, which would
+        # otherwise make parking permanent and silently cost the fleet a node.
+        resumable = recovery_state.resumable_park(
+            queue_tasks, node_id, cfg.graph_path, cfg.lean_root, adapter)
+        if resumable is not None:
+            # Report it, but do NOT make it prove-actionable: the round resumes
+            # the recovery and re-surveys, so claiming a prove here would make
+            # --dry-run promise work a real round does not do on this pass.
+            survey.resumable_parks.append((node_id, str(resumable.get("id") or "")))
+            push_cand("prove", Candidate(
+                "prove", "parked recovery resumable — resuming on this round", node=node_id
+            ), False)
+            continue
         if recovery and recovery.get("status") in {"queued", "running", "parked"}:
             push_cand("prove", Candidate(
                 "prove", f"proof recovery {recovery.get('status')}", node=node_id
@@ -406,6 +431,9 @@ def collect(
             push_cand("prove", Candidate(
                 "prove", "proof recovery produced no new prover input", node=node_id
             ), False)
+            continue
+        if not spend["allowed"]:
+            push_cand("prove", Candidate("prove", f"paced — {spend['reason']}", node=node_id), False)
             continue
         push_cand("prove", Candidate("prove", reason, node=node_id), True)
 

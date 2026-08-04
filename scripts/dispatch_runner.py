@@ -604,8 +604,14 @@ def _run_dispatch(a) -> int:
                 return 0
             escs = _node_escalations(c, t["node"])
             # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
-            if any(e.get("status") in ("queued", "running", "parked") for e in escs):
+            if any(e.get("status") in ("queued", "running") for e in escs):
                 return 0                  # recovery owns this node until it finds a route
+            # A parked recovery blocks the node only while its inputs are
+            # unchanged; once they move, the evidence gate below re-admits it.
+            if any(e.get("status") == "parked" for e in escs) and not recovery_state.resumable_park(
+                    c, t["node"], proj / "graph.json", Path(repo),
+                    backend_config.prover_of(a.backend)):
+                return 0
             adapter = backend_config.prover_of(a.backend)
             if recovery_state.unchanged_recovery(
                     c, t["node"], proj / "graph.json", Path(repo), adapter):
