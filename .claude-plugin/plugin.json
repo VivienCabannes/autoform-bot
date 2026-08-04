@@ -6,18 +6,6 @@
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"
   },
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  },
+  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json"
 }

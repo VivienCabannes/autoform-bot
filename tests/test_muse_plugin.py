@@ -3,20 +3,51 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 
 
-EXPECTED_COMMANDS = {"setup", "roadmap", "orchestrate", "evaluate"}
-EXPECTED_MCP_SERVERS = {
-    "lean-lsp-mcp",
-    "autoform-prover",
+EXPECTED_COMMANDS = {
+    path.parent.name for path in (REPO_ROOT / "skills").glob("*/SKILL.md")
 }
+EXPECTED_MCP_SERVERS = set(
+    json.loads((REPO_ROOT / ".mcp.json").read_text())["mcpServers"]
+)
 
 
 def _manifest(root: Path) -> dict:
     return json.loads((root / ".muse-plugin" / "plugin.json").read_text())
+
+
+def test_claude_and_codex_share_root_capability_configs():
+    claude = json.loads((REPO_ROOT / ".claude-plugin" / "plugin.json").read_text())
+    codex = json.loads((REPO_ROOT / ".codex-plugin" / "plugin.json").read_text())
+
+    assert claude["mcpServers"] == codex["mcpServers"] == "./.mcp.json"
+    assert claude["hooks"] == "./hooks/hooks.json"
+
+
+def test_shared_hook_supports_claude_and_codex_plugin_roots():
+    hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())
+    command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+
+    for root_variable in ("CLAUDE_PLUGIN_ROOT", "PLUGIN_ROOT"):
+        environment = os.environ.copy()
+        environment.pop("CLAUDE_PLUGIN_ROOT", None)
+        environment.pop("PLUGIN_ROOT", None)
+        environment[root_variable] = str(REPO_ROOT)
+        completed = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        payload = json.loads(completed.stdout)
+        assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
 
 def test_native_muse_manifest_has_the_portable_autoform_surface():
@@ -74,8 +105,14 @@ def test_muse_builder_emits_one_supported_manifest_family(tmp_path: Path):
         assert (output / command["path"]).is_file()
     assert (output / "hooks" / "session-start").is_file()
     assert (output / "servers" / "run-muse-server.sh").is_file()
+    assert (output / "autoform_worker" / "__init__.py").is_file()
     assert (output / "pyproject.toml").is_file()
     assert (output / "uv.lock").is_file()
+    subprocess.run(
+        [sys.executable, "-c", "import autoform_worker"],
+        cwd=output,
+        check=True,
+    )
 
 
 def test_muse_builder_requires_force_to_replace_output(tmp_path: Path):

@@ -15,6 +15,7 @@ MANIFEST = Path("packaging/muse/.muse-plugin/plugin.json")
 DIRECTORIES = (
     "agents",
     "assets",
+    "autoform_worker",
     "docs",
     "hooks",
     "internal",

@@ -194,6 +194,12 @@ def check_plugin_json() -> None:
             ".claude-plugin/plugin.json: mcpServers must reference "
             "the shared './.mcp.json' configuration"
         )
+    checks += 1
+    if data.get("hooks") != "./hooks/hooks.json":
+        err(
+            ".claude-plugin/plugin.json: hooks must reference "
+            "the shared './hooks/hooks.json' configuration"
+        )
     root_mcp = load_json(REPO_ROOT / ".mcp.json")
     if root_mcp is not None:
         root_servers = root_mcp.get("mcpServers")
@@ -237,10 +243,13 @@ def check_codex_plugin() -> None:
             err(f"{rel(hook_path)}: top-level hooks object is missing")
         rendered_hooks = json.dumps(hook_data)
         checks += 1
-        if "${PLUGIN_ROOT}/hooks/session-start" not in rendered_hooks:
+        if (
+            "${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT}}/hooks/session-start"
+            not in rendered_hooks
+        ):
             err(
-                f"{rel(hook_path)}: SessionStart does not resolve through "
-                "the plugin-root environment"
+                f"{rel(hook_path)}: SessionStart does not resolve through the "
+                "Claude/Codex plugin-root environments"
             )
         checks += 1
         if not (REPO_ROOT / "hooks" / "session-start").is_file():
