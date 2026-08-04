@@ -65,6 +65,7 @@ REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/proving.md",
     "internal/runbooks/review.md",
     "internal/runbooks/visualization.md",
+    "internal/runbooks/worker.md",
     "internal/runbooks/workspace.md",
     "internal/runbooks/zulip.md",
     "internal/references/plan-json-schema.md",

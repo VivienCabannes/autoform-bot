@@ -37,7 +37,8 @@ expecting another user command:
   `internal/runbooks/mathlib-style.md`;
 - jury or human review: `internal/runbooks/evaluation.md` and
   `internal/runbooks/review.md`;
-- community prior-art search: `internal/runbooks/zulip.md`.
+- community prior-art search: `internal/runbooks/zulip.md`;
+- multi-machine/team progress: `internal/runbooks/worker.md`.
 
 Those runbooks and their references are implementation details of Orchestrate.
 
@@ -101,6 +102,35 @@ Replace `<APPROVED_API_EGRESS_FLAGS>` with the approved repeated flags, or omit
 the placeholder entirely when neither selected backend is an API provider.
 
 For a one-shot run, omit `--watch` and wait for the process to exit.
+
+## Distributed mode (shared GitHub roadmap)
+
+When the Lean project has a GitHub `origin` remote and the user wants
+multi-machine or team progress, route cross-machine coordination through the
+worker CLI (`python -m autoform_worker`, run through the plugin root) and
+follow `internal/runbooks/worker.md`:
+
+1. Preflight once per session: `python -m autoform_worker doctor --json`.
+   Surface failing checks to the user before starting.
+2. Converge local review state first: `python -m autoform_worker sync
+   --project "$DISPATCH_PROJECT"` (folds merged PRs' scoreboards into the local
+   sidecar; idempotent).
+3. Before enqueueing a `worker` task or proving any node, check and take the
+   cooperative lease: `autoform claim acquire --node "<node id>"`. "held by a
+   live peer" means pick different work — never race a peer on a node. Release
+   the lease when the attempt ends.
+4. For autonomous distributed progress, prefer one detached
+   `python -m autoform_worker work --loop --project "$DISPATCH_PROJECT"`
+   (log to `worker.log`, reuse an existing loop) over hand-driving rounds. The
+   local engine and dashboard continue to run exactly as below — the worker
+   adds PR/claim/scoreboard coordination on top; it does not replace the queue.
+5. Surface `python -m autoform_worker status` in progress reports (open PRs by
+   stage, live claims, suppressed candidates and why).
+
+In distributed mode a proof lands as a pull request with an
+`autoform-target:v1` marker and gets its jury verdict as a scoreboard comment
+on the PR; the committed sidecar is updated by the worker's `progress` unit
+after merge. Local-only projects (no remote): skip this section entirely.
 
 ## Queue ownership
 

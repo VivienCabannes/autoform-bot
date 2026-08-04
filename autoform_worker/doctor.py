@@ -1,0 +1,74 @@
+"""``autoform doctor`` — environment/auth/repo capability audit.
+
+Answers "can this machine be a worker?" before any round runs: tool presence,
+gh auth, project resolution, remote shape, push access, fork, Issues, and a
+claim-board probe. Each check is (name, ok, detail); ``--json`` for machines.
+"""
+from __future__ import annotations
+
+import shutil
+
+from .claims import ClaimBoard
+from .config import WorkerConfig
+from .errors import ClaimTransportError, Die
+from .githost import GitHost
+from .gitutil import is_git_repo, origin_url, parse_slug, slug_url
+
+
+def _tool(name: str) -> tuple[str, bool, str]:
+    path = shutil.which(name)
+    return (name, path is not None, path or "not on PATH")
+
+
+def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tuple[str, bool, str]]:
+    host = host or GitHost()
+    checks: list[tuple[str, bool, str]] = []
+    for tool in ("git", "gh", "uv", "lake", "lean"):
+        checks.append(_tool(tool))
+    checks.append(("claude or codex CLI",
+                   bool(shutil.which("claude") or shutil.which("codex")),
+                   "needed for fix-like units and the max/codex backends"))
+
+    try:
+        login = host.me()
+        checks.append(("gh auth", True, f"authenticated as {login}"))
+    except Die as error:
+        checks.append(("gh auth", False, str(error)))
+        return checks
+
+    if cfg is None:
+        checks.append(("project", False, "no dispatch project resolved — pass --project"))
+        return checks
+    checks.append(("project", True, str(cfg.project)))
+    checks.append(("graph.json", cfg.graph_path.exists(), str(cfg.graph_path)))
+    checks.append(("lean repo", is_git_repo(cfg.lean_root), str(cfg.lean_root)))
+
+    url = origin_url(cfg.lean_root)
+    slug = parse_slug(url) if url else None
+    checks.append(("origin remote", slug is not None, url or "missing"))
+    if not slug:
+        return checks
+
+    try:
+        canonical, default_branch = host.canonical_of(slug)
+        checks.append(("canonical repo", True, f"{canonical} (default: {default_branch})"))
+        can_push = host.can_push(canonical)
+        checks.append(("push access", True,
+                       f"{'yes' if can_push else 'no'} — "
+                       f"{'PRs push directly' if can_push else 'PRs go through your fork'}"))
+        issues = host.has_issues(canonical)
+        checks.append(("issues enabled", True,
+                       "yes — escalation/intention sync active" if issues
+                       else "no (default on forks) — escalation issue sync degrades to local-only"))
+        board = ClaimBoard(slug_url(canonical), cfg.worker_id, cfg.claims_scratch)
+        try:
+            board.list()
+            checks.append(("claim board", True, f"refs/autoform-claims/* reachable on {canonical}"))
+        except ClaimTransportError as error:
+            checks.append(("claim board", False, f"{error} — rounds run uncoordinated"))
+    except Die as error:
+        checks.append(("canonical repo", False, str(error)))
+
+    checks.append(("worker id", True, cfg.worker_id))
+    checks.append(("state dir", True, str(cfg.state_dir)))
+    return checks

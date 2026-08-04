@@ -1,0 +1,18 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Run-from-checkout shim for the autoform worker CLI (mirrors TauCeti's ./tauceti).
+
+Installed wheels get the same entry as the `autoform` console script; a checkout
+gets it via `./autoform ...` with zero setup beyond uv.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from autoform_worker.cli import cli_main  # noqa: E402
+
+raise SystemExit(cli_main())
