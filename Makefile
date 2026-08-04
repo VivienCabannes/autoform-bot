@@ -74,8 +74,8 @@ install-muse: validate-muse ## Install and enable the staged plugin in Muse/TBH
 # --- Use & develop ----------------------------------------------------------
 
 .PHONY: demo
-demo: ## Scan the bundled sample Lean project (no deps)
-	@$(PYTHON) scripts/workspace_inspector.py examples/demo-project
+demo: ## Scan the Lean workspace regression fixture (no deps)
+	@$(PYTHON) scripts/workspace_inspector.py tests/fixtures/demo-project
 
 .PHONY: test
 test: ## Run the test suite

@@ -8,7 +8,6 @@ on:
       - "agents/**"
       - "skills/**"
       - "commands/**"
-      - "examples/**"
       - ".claude-plugin/**"
       - ".codex-plugin/**"
       - "packaging/muse/**"
@@ -27,7 +26,6 @@ on:
       - "agents/**"
       - "skills/**"
       - "commands/**"
-      - "examples/**"
       - ".claude-plugin/**"
       - ".codex-plugin/**"
       - "packaging/muse/**"
@@ -70,25 +68,3 @@ jobs:
       # dangling-reference guard.
       - name: Lint plugin
         run: python scripts/lint_plugin.py
-
-      # Structural graph check, if the repo ships an example plan to validate.
-      - name: Check graph invariants (if an example graph exists)
-        run: |
-          if [ -f scripts/check_invariants.py ]; then
-            # globstar so ** recurses; nullglob so an empty match yields an
-            # empty array instead of the literal pattern. `examples/**/...`
-            # also matches examples/graph.json itself (** matches zero dirs).
-            shopt -s globstar nullglob
-            graphs=(examples/**/graph.json)
-            if [ ${#graphs[@]} -gt 0 ]; then
-              for g in "${graphs[@]}"; do
-                echo "::group::check_invariants $g"
-                python scripts/check_invariants.py "$g"
-                echo "::endgroup::"
-              done
-            else
-              echo "no example graph.json found — skipping invariant check"
-            fi
-          else
-            echo "scripts/check_invariants.py not present — skipping"
-          fi

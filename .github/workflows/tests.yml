@@ -22,7 +22,7 @@ jobs:
         run: uv sync --extra dev --extra zulip
       - name: Run unit tests
         run: uv run python -m pytest -q
-      - name: Run bundled demo
+      - name: Run workspace fixture
         run: make demo PYTHON="uv run python"
 
   quality:

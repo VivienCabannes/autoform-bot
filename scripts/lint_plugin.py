@@ -510,7 +510,7 @@ def check_skill_references() -> None:
 
 
 def _plugin_markdown() -> list[Path]:
-    """Markdown on the plugin surface (agents/skills/commands) — not docs/examples."""
+    """Markdown on the plugin surface (agents/skills/commands), not docs or fixtures."""
     out: list[Path] = []
     for sub in ("agents", "skills", "commands"):
         out.extend((REPO_ROOT / sub).rglob("*.md"))

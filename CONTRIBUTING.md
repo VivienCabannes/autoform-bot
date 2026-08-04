@@ -22,15 +22,15 @@ rather than silently creating a second orchestration stack.
 | Generated Codex agents | `scripts/install_host_agents.py` | Implemented |
 | Durable plan/queue/review control plane | `scripts/` | Implemented |
 | Unified prover and verification gate | `servers/prover/` | Implemented |
-| Mathlib and Zulip MCP servers | `servers/mathlib/`, `servers/zulip/` | Implemented |
-| Aristotle MCP/server adapter | `servers/aristotle/` | Implemented, optional dependency |
-| REPL and LSP MCP servers | `servers/repl/`, `servers/lsp/` | Stubs; reference implementations are under `examples/servers/` |
+| Mathlib and Zulip stateless helpers | `servers/mathlib/`, `servers/zulip/` | Implemented; invoked on demand, not MCP servers |
+| Aristotle prover backend | `servers/aristotle/`, `servers/prover/aristotle_adapter.py` | Implemented inside the unified prover |
+| Lean LSP | external `lean-lsp-mcp` | Stateful MCP dependency installed by Setup |
 | Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json`, `hooks/hooks.json` | Implemented |
 | Distributed worker CLI (claims, rounds, auto-merge gate, role registry) | `autoform_worker/`, `./autoform` | Implemented; design contract in `docs/worker-cli.md` |
 
-Useful next contributions include production REPL/LSP implementations, an
-OpenAI Responses transport beside Chat Completions, live opt-in provider
-contract tests, and additional adversarial verification fixtures.
+Useful next contributions include an OpenAI Responses transport beside Chat
+Completions, live opt-in provider contract tests, and additional adversarial
+verification fixtures.
 
 ## Compatibility rules
 

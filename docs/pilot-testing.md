@@ -23,11 +23,11 @@ against the installed toolchain and runs the real kernel axiom probe. Without
 Lake, those tests skip. Provider tests use an in-process loopback HTTP server;
 they never contact an external model.
 
-The bundled demo is deliberately incomplete, so `lake build` succeeds with
+The workspace fixture is deliberately incomplete, so `lake build` succeeds with
 expected `sorry` warnings. A true cold start also downloads the Mathlib cache:
 
 ```bash
-cp -R examples/demo-project /tmp/autoform-demo-pilot
+cp -R tests/fixtures/demo-project /tmp/autoform-demo-pilot
 cd /tmp/autoform-demo-pilot
 LC_ALL=C LANG=C lake update
 LC_ALL=C LANG=C lake exe cache get

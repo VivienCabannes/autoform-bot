@@ -1,4 +1,4 @@
-"""Regression checks for the bundled cold-start demo project."""
+"""Regression checks for the cold-start Lean workspace fixture."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = ROOT / "examples" / "demo-project"
+DEMO = ROOT / "tests" / "fixtures" / "demo-project"
 
 
 def test_demo_lake_manifest_is_explicit_and_buildable():

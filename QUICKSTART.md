@@ -47,8 +47,7 @@ Set `LEAN_PROJECT_DIR` so the skills and servers know which project to work on, 
 LEAN_PROJECT_DIR=/path/to/your/lean-project claude --plugin-dir /path/to/autoform-bot
 ```
 
-No Lean project yet? Setup creates one from the LeanProject template, or you
-can try Autoform against the bundled sample at `examples/demo-project/`.
+No Lean project yet? Setup creates one from the LeanProject template.
 
 ## 3. Use it — slash commands
 
@@ -86,7 +85,7 @@ Then `chmod 600 ~/.zuliprc`. Setup verifies connectivity.
 If you're **hacking on Autoform itself** (not just using it), there's a `Makefile`:
 
 ```bash
-make demo      # run the workspace scanner on the sample project (no deps)
+make demo      # run the workspace scanner on its regression fixture (no deps)
 make test      # smoke tests — every MCP server constructs
 make lint      # ruff over the Python implementation
 make help      # all targets

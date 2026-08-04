@@ -236,8 +236,7 @@ scripts/         plan/graph tooling, dispatch engine, review UI, formalization.p
 autoform_worker/ the distributed worker CLI (rounds, claims, scoreboards, PRs)
 hooks/           Claude SessionStart context (skills are the workflow surface)
 docs/            pipeline architecture, usage guide, backend handoff notes
-examples/        reference implementations for the remaining stubs
-tests/           deterministic suite; optional local-Lean and loopback-HTTP smoke tests
+tests/           deterministic suite, fixtures, and optional live smoke tests
 ```
 
 ## Development
@@ -250,8 +249,8 @@ uv run ruff check scripts servers tests skills
 make demo PYTHON="uv run python"
 ```
 
-CI runs the deterministic suite and bundled demo on Python 3.10–3.14, plus
-Python and plugin-surface lint. These checks validate shared contracts without
+CI runs the deterministic suite and workspace fixture on Python 3.10–3.14,
+plus Python and plugin-surface lint. These checks validate shared contracts without
 paid credentials; they do not establish that a particular host login, CLI
 version, or provider account works. See [CONTRIBUTING.md](CONTRIBUTING.md) for
 the component status table, [docs/pipeline.md](docs/pipeline.md) for the

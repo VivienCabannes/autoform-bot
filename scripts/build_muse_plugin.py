@@ -16,7 +16,6 @@ DIRECTORIES = (
     "agents",
     "assets",
     "docs",
-    "examples",
     "hooks",
     "internal",
     "scripts",
