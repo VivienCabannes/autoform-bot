@@ -67,16 +67,11 @@ may touch. Report those transitions when they occur.
    knowledge for a missing text. If sources are named but absent from the
    machine, say exactly what is missing and stop.
 
-   For a fresh roadmap, or when the repository's intended layout is unclear,
-   read the worked-repository reference linked by Setup. Its companion asset is
-   a teaching example, not a scaffold: preserve the target repository's
-   toolchain and conventions, and replace every source and statement.
-
-   Map the whole requested source at roadmap/coverage granularity before
+   Map the whole requested source at roadmap and coverage granularity before
    decomposing theorem nodes, then build the detailed DAG only for the approved
    milestone. Every detailed node must retain a stable `source_refs` anchor.
-   Node prose is a planning and exposition artifact; the cited source remains
-   authoritative for statement recovery and faithfulness review.
+   The cited source remains authoritative for statement recovery and
+   faithfulness review.
 
 4. Ensure the dashboard is visible so the DAG appears while it grows: reuse a
    service already serving this project, otherwise start it exactly as Setup

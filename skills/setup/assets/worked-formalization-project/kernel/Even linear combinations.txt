@@ -1,2 +1,0 @@
-#print axioms WorkedExample.linearCombination_isEven
-'WorkedExample.linearCombination_isEven' depends on axioms: []

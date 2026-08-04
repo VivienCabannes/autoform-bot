@@ -1,2 +1,0 @@
-#print axioms WorkedExample.isEven_add
-'WorkedExample.isEven_add' depends on axioms: []
