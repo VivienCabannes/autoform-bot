@@ -1,9 +1,40 @@
-# Autoform
+# AutoformBot
 
-Autoform is a small Lean 4 plugin: three expert skills, a Markdown dependency
+AutoformBot is a small Lean 4 plugin: four expert skills, a Markdown dependency
 graph, and exactly two public MCP servers—LSP and REPL—backed by one shared,
 node-local Lean runtime. Planning stays readable and editable by people while
 the coding agent supplies the orchestration.
+
+## Install as a plugin
+
+### Claude Code
+
+Install AutoformBot directly from its GitHub marketplace:
+
+```text
+/plugin marketplace add facebookresearch/autoform-bot
+/plugin install autoform@autoform
+```
+
+To install a local checkout instead, clone the repository and add its directory
+as the marketplace:
+
+```bash
+git clone https://github.com/facebookresearch/autoform-bot.git
+cd autoform-bot
+claude plugin marketplace add "$(pwd)"
+claude plugin install autoform@autoform
+```
+
+Start a new Claude Code session after installing or updating the plugin so its
+skills and MCP servers are reloaded. The installed package and commands retain
+the `autoform` identifier; AutoformBot is the project name.
+
+For development, install the repository's Python dependencies separately:
+
+```bash
+make setup
+```
 
 ## The blueprint
 
@@ -27,10 +58,11 @@ blueprint/
 Open `blueprint/` directly as an Obsidian vault: standard relative links power
 its backlinks and graph view, while `.obsidian/` remains ignored. The same
 Markdown can be rendered by MkDocs and deployed by GitHub Pages. See the
-setup skill's concise [Cabannes thesis example](skills/setup/references/thesis-blueprint.md)
-for a complete vault, site configuration, and workflow. Roadmap and coverage
-organization remains project policy; Autoform deliberately enforces only the
-fine-grained node DAG.
+[Setup repository example](skills/setup/assets/cabannes-thesis-project/README.md)
+for the complete repository shell and the Roadmap skill's concise
+[Cabannes thesis example](skills/roadmap/references/cabannes-thesis-roadmap.md)
+for source-to-DAG planning. Roadmap and coverage organization remains project
+policy; AutoformBot deliberately enforces only the fine-grained node DAG.
 
 Every Markdown file below `blueprint/nodes/` is one node. Its relative path
 without `.md` is its stable ID. The H1 is its human title; optional frontmatter
@@ -87,7 +119,8 @@ builders configured to emit `.html` pages, as in the setup skill's MkDocs asset.
 
 ## Plugin surface
 
-- `setup` creates or repairs the Markdown blueprint after confirming sources and scope.
+- `setup` creates or repairs the Lean repository, Markdown vault, CI, and Pages infrastructure.
+- `roadmap` confirms sources and scope, then builds roadmap, coverage, and theorem DAG notes.
 - `orchestrate` works ready nodes with native subagents and Lean tools.
 - `review` independently checks faithfulness, proof integrity, and Mathlib code quality.
 - `autoform-lsp` provides Lean diagnostics and hover information.
@@ -101,7 +134,7 @@ search stays outside the server surface and uses host-native tools when useful.
 
 Plugin hosts still start the two stdio MCP processes automatically. They are
 lightweight adapters: the first Lean tool call race-safely starts a detached
-runtime for the current Autoform installation, Unix user, and compute node.
+runtime for the current AutoformBot installation, Unix user, and compute node.
 That runtime owns one resident REPL pool and LSP session per active Lean
 project, so sessions using that installation reuse the same warmed processes.
 Closing the session that happened to start it does not stop it; after a crash,
@@ -137,7 +170,7 @@ when unusually large worker pools need more than the default 15 minutes to warm.
 ```text
 .claude-plugin/  Claude Code manifest
 .codex-plugin/   Codex manifest
-skills/         expert workflows, references, and a compact thesis project asset
+skills/         four expert workflows, references, and a compact thesis project asset
 autoform_cli/   blueprint validation and visualization commands
 servers/        two public MCP adapters plus the shared Lean runtime
 tests/          graph, packaging, and server contracts

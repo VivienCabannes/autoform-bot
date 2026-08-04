@@ -1,7 +1,7 @@
 {
   "name": "autoform",
-  "version": "0.4.4+codex.20260804153415",
-  "description": "Plan, publish, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
+  "version": "0.5.0+codex.20260804184750",
+  "description": "Set up Lean repositories, build source-grounded Markdown roadmaps, prove ready nodes, and review formalizations.",
   "author": {
     "name": "Vivien Cabannes"
   },
@@ -10,8 +10,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "AutoForm Bot",
-    "shortDescription": "Lean planning, review, LSP, and REPL",
-    "longDescription": "AutoForm keeps a Lean formalization plan as an Obsidian-compatible Markdown vault, publishes it with GitHub Pages, checks proofs through two public Lean MCP servers backed by a shared node-local runtime, and reviews faithfulness, proof integrity, and Mathlib style.",
+    "shortDescription": "Lean setup, roadmaps, review, LSP, and REPL",
+    "longDescription": "AutoForm separates repository setup from source-grounded roadmap construction, keeps the plan in an Obsidian-compatible Markdown vault, publishes it with GitHub Pages, checks proofs through two public Lean MCP servers, and reviews faithfulness, proof integrity, and Mathlib style.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
     "capabilities": [
@@ -19,7 +19,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Create an in-repository Autoform blueprint, Obsidian vault, and Pages site from my sources.",
+      "Set up this Lean repository with an Autoform vault, verification CI, and GitHub Pages without planning the mathematics.",
+      "Build or refine an Autoform roadmap from my mathematical sources.",
       "Work through the ready nodes in my Autoform blueprint.",
       "Review this Lean formalization against its source and proof chain."
     ],

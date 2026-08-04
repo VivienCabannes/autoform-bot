@@ -8,8 +8,9 @@ status: adopted
 Vivien Cabannes, *From Weakly Supervised Learning to Active Labeling*, PhD
 thesis, 2022. Stable public record: [arXiv:2209.11629](https://arxiv.org/abs/2209.11629).
 
-The initial DAG is anchored in the “Infimum Loss” chapter. When working from
-the thesis source tree, verify these labels in `infimum/core.tex`:
+The initial DAG is anchored in the “Infimum Loss” chapter. These labels occur
+in `infimum/core.tex` in the public e-print source; verify them again against
+the source revision adopted by the project:
 
 | Blueprint target | Source label |
 | --- | --- |

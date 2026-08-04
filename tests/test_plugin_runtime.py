@@ -10,9 +10,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-def test_plugin_surface_is_three_skills_and_two_servers(repo_root):
+def test_plugin_surface_is_four_skills_and_two_servers(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
-    assert skills == {"setup", "orchestrate", "review"}
+    assert skills == {"setup", "roadmap", "orchestrate", "review"}
 
     review_dir = repo_root / "skills" / "review"
     references = {
@@ -40,6 +40,18 @@ def test_plugin_surface_is_three_skills_and_two_servers(repo_root):
     for config in (codex, claude):
         for name, module in expected_modules.items():
             assert config["mcpServers"][name]["args"][-2:] == ["-m", module]
+
+    codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
+    assert len(codex_manifest["interface"]["defaultPrompt"]) == 4
+    muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
+    assert [command["id"] for command in muse["capabilities"]["commands"]] == [
+        "setup",
+        "roadmap",
+        "orchestrate",
+        "review",
+    ]
+    for command in muse["capabilities"]["commands"]:
+        assert (repo_root / command["path"]).is_file()
 
 
 def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
