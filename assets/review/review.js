@@ -295,12 +295,38 @@
   // Render `dot` into the mount via d3-graphviz. `transition` => animate from the
   // current layout to the new one (used on expand/collapse). On first paint we skip
   // the transition (nothing to morph from) but still fit.
+  // A graph with no real nodes renders as a silent white void — indistinguishable
+  // from a hang. Overlay a message that tracks the live orchestrator state, so an
+  // empty canvas during planning reads as "loading", not "broken".
+  function dotHasNodes(dot) {
+    return /"[^"]+"\s*\[[^\]]*label/.test(String(dot || ""));
+  }
+
+  function syncEmptyOverlay(mount, hasNodes) {
+    var overlay = mount.querySelector(".rv-graph-empty");
+    if (hasNodes) {
+      if (overlay) overlay.remove();
+      return;
+    }
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "rv-graph-empty";
+      mount.appendChild(overlay);
+    }
+    var orch = (dispatch.live || {}).orchestrator || {};
+    overlay.textContent = orch.state === "working"
+      ? "Roadmap planning is in progress — nodes appear here as they merge. "
+        + (orch.phase ? "(" + orch.phase + ")" : "")
+      : "No roadmap yet — run /autoform:roadmap to build the dependency graph.";
+  }
+
   function renderGraph(dot, transition) {
     var mount = home.mount;
     if (!mount) return;
     home.rendering = true;
     var loading = mount.querySelector(".rv-graph-loading");
     if (loading) loading.remove();
+    syncEmptyOverlay(mount, dotHasNodes(dot));
     // The d3-graphviz rendering (fresh-stage-per-render + settle/timeout backstop) is
     // the shared DepGraphCore.renderDot — the SAME renderer the leanblueprint dep-graph
     // page uses, so the two viewers don't duplicate it. We pass our own stage class
@@ -994,6 +1020,27 @@
       + "<span class='rv-pill-dot'></span>" + escapeHtml(ostate) + "</span>"
       + "</div>";
 
+    // --- orchestrator phase/detail — DIRECTLY under the pill, never below the
+    //     palette fold: a "working" badge with no visible reason reads as a
+    //     hang. This is the instant-feedback line ("Phase 1: coarse
+    //     extraction — reading source"), and it explains a working state even
+    //     while no subagent has registered yet. ---
+    html += "<div class='rv-act-orch'>";
+    if (orch.phase) {
+      html += "<div class='rv-orch-phase'>" + escapeHtml(orch.phase) + "</div>";
+    }
+    if (orch.detail) {
+      html += "<div class='rv-orch-detail'>" + escapeHtml(orch.detail) + "</div>";
+    }
+    if (!orch.phase && !orch.detail) {
+      html += "<div class='rv-orch-detail'>"
+        + (ostate === "working"
+            ? "working — waiting for the first status report…"
+            : "orchestrator " + escapeHtml(ostate))
+        + "</div>";
+    }
+    html += "</div>";
+
     // --- backend selector: which prover backend the agents run on (shared with
     //     Orchestrate via ~/.autoform/config.json; also the billing path) ---
     var be = dispatch.backend;
@@ -1033,20 +1080,6 @@
         + "</div></div>";
     });
     html += "</div></div>";
-
-    // --- orchestrator phase/detail (the existing live feed chrome) ---
-    html += "<div class='rv-act-orch'>";
-    if (orch.phase) {
-      html += "<div class='rv-orch-phase'>" + escapeHtml(orch.phase) + "</div>";
-    }
-    if (orch.detail) {
-      html += "<div class='rv-orch-detail'>" + escapeHtml(orch.detail) + "</div>";
-    }
-    if (!orch.phase && !orch.detail) {
-      html += "<div class='rv-orch-detail'>orchestrator " + escapeHtml(ostate)
-        + "</div>";
-    }
-    html += "</div>";
 
     // --- the live agent cards (running agents from the live feed) ---
     if (agents.length) {

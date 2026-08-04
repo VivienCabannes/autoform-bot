@@ -457,6 +457,9 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
   font: inherit; font-size: 13px; padding: 3px 8px; border-radius: 8px;
   border: 1.5px solid var(--accent); background: #fff; color: var(--accent);
   font-weight: 600; cursor: pointer;
+  /* A <select> sizes to its widest <option> ("Claude Code (Max subscription)")
+     and would overflow the sidebar card — clamp it to its container. */
+  max-width: 100%; box-sizing: border-box; text-overflow: ellipsis;
 }
 .rv-be-select:disabled { opacity: .6; cursor: progress; }
 .rv-be-billing { flex-basis: 100%; font-size: 11px; color: #8a8575; font-style: italic; }
@@ -726,3 +729,10 @@ body.rv-drag-active .rv-graph .node { cursor: copy; }
 }
 .rv-nb-link:hover { background: #15407a; text-decoration: none; }
 .rv-nb-link-sub { font-size: 11.5px; color: #8a8575; }
+
+/* Empty-graph overlay: an empty canvas must never read as a hang. */
+.rv-graph-empty {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; text-align: center; padding: 32px;
+  color: #8a8575; font-style: italic; font-size: 14px; pointer-events: none;
+}
