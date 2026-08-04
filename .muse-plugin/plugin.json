@@ -33,18 +33,30 @@
         "id": "autoform-lsp",
         "transport": "stdio",
         "command": [
-          "bash",
-          "servers/run-muse-server.sh",
-          "lsp"
+          "uv",
+          "run",
+          "--project",
+          ".",
+          "--locked",
+          "python",
+          "-m",
+          "servers.lsp.server"
         ]
       },
       {
         "id": "autoform-repl",
         "transport": "stdio",
         "command": [
-          "bash",
-          "servers/run-muse-server.sh",
-          "repl"
+          "uv",
+          "run",
+          "--project",
+          ".",
+          "--locked",
+          "--extra",
+          "repl",
+          "python",
+          "-m",
+          "servers.repl.server"
         ]
       }
     ],
