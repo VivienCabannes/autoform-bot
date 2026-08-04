@@ -1,15 +1,20 @@
 # AutoformBot
 
-AutoformBot is a small Lean 4 plugin: four expert skills, a Markdown dependency
-graph, and exactly two public MCP servers—LSP and REPL—backed by one shared,
-node-local Lean runtime. Planning stays readable and editable by people while
-the coding agent supplies the orchestration.
+AutoformBot is a Lean 4 plugin that gives AI agents the minimal guidance
+experts typically provide to keep formalization on track. It combines
+orchestration and visualization with execution and search tools. Its
+human-editable Markdown roadmap and wiki capture the high-level direction and
+theorem-sized dependency nodes, so people can refine the plan while agents
+coordinate the work.
 
 ## Install as a plugin
 
-### Claude Code
+Install AutoformBot in your favorite agent. The repository includes plugin
+manifests for Claude Code, Codex, and Muse Spark; the commands below use Claude
+Code as a concrete example, with similar marketplace and install commands
+available in Codex and Muse Spark.
 
-Install AutoformBot directly from its GitHub marketplace:
+To install AutoformBot directly from GitHub in Claude Code:
 
 ```text
 /plugin marketplace add facebookresearch/autoform-bot
@@ -17,7 +22,7 @@ Install AutoformBot directly from its GitHub marketplace:
 ```
 
 To install a local checkout instead, clone the repository and add its directory
-as the marketplace:
+as a Claude Code marketplace:
 
 ```bash
 git clone https://github.com/facebookresearch/autoform-bot.git
@@ -26,9 +31,9 @@ claude plugin marketplace add "$(pwd)"
 claude plugin install autoform@autoform
 ```
 
-Start a new Claude Code session after installing or updating the plugin so its
-skills and MCP servers are reloaded. The installed package and commands retain
-the `autoform` identifier; AutoformBot is the project name.
+Start a new agent session after installing or updating the plugin so its skills
+and MCP servers are reloaded. The installed package and commands retain the
+`autoform` identifier; AutoformBot is the project name.
 
 For development, install the repository's Python dependencies separately:
 
