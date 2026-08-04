@@ -21,6 +21,7 @@ logger = getLogger(__name__)
 
 DEFAULT_MAX_DIAGNOSTICS = 10
 DEFAULT_SMOKE_TEST_TIMEOUT = 10
+DEFAULT_REPL_STARTUP_TIMEOUT = 180.0
 
 ALLOWED_IMPORTS = frozenset({"Mathlib", "Aesop", "Batteries", "LeanSearchClient"})
 WARMUP_IMPORTS = frozenset({"Mathlib"})
@@ -116,7 +117,7 @@ class LeanReplConfig:
     env: dict[str, str] = field(default_factory=dict)
 
     request_timeout: float = 30.0
-    startup_timeout: float = 180.0
+    startup_timeout: float = DEFAULT_REPL_STARTUP_TIMEOUT
     chunk_size: int = 4096
 
     instance_mem_limit_gb: int = 16
@@ -279,8 +280,20 @@ class LeanRepl:
         if config.validate_imports and config.allowed_imports:
             self._allowed_import_roots = config.allowed_imports
 
-    def start(self) -> None:
-        """Start the Lean REPL process."""
+    def start(self, startup_timeout: float | None = None) -> None:
+        """Start and warm the Lean REPL within one startup deadline."""
+        timeout = self.config.startup_timeout if startup_timeout is None else min(
+            self.config.startup_timeout,
+            startup_timeout,
+        )
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError(f"REPL startup timed out after {timeout:g} seconds")
+            return value
+
         env = _inherit_clean_env()
         env.update(self.config.env)
 
@@ -297,7 +310,7 @@ class LeanRepl:
             if self.config.warmup_imports:
                 header = "\n".join(f"import {root}" for root in self.config.warmup_imports)
                 logger.info("Loading imports at startup: %s", self.config.warmup_imports)
-                resp = self._run(code=header, env_id=None, timeout=self.config.startup_timeout)
+                resp = self._run(code=header, env_id=None, timeout=remaining())
                 if "env" not in resp:
                     raise RuntimeError(f"Failed to preload imports: {resp}")
 
@@ -308,7 +321,11 @@ class LeanRepl:
 
                 self._base_env_id = resp["env"]
 
-                smoke = self._run(code="#check Nat", env_id=self._base_env_id, timeout=DEFAULT_SMOKE_TEST_TIMEOUT)
+                smoke = self._run(
+                    code="#check Nat",
+                    env_id=self._base_env_id,
+                    timeout=min(DEFAULT_SMOKE_TEST_TIMEOUT, remaining()),
+                )
                 smoke_errors = [
                     m for m in smoke.get("messages", []) if isinstance(m, dict) and m.get("severity") == "error"
                 ]
@@ -331,10 +348,17 @@ class LeanRepl:
             self.process = None
             self._base_env_id = None
 
-    def restart(self) -> None:
-        """Restart the Lean REPL process."""
+    def restart(self, timeout: float | None = None) -> None:
+        """Restart the Lean REPL process within an optional total timeout."""
+        deadline = time.monotonic() + timeout if timeout is not None else None
         self.close()
-        self.start()
+        if deadline is None:
+            self.start()
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"REPL restart timed out after {timeout:g} seconds")
+        self.start(startup_timeout=remaining)
 
     def is_alive(self) -> bool:
         """Check if the REPL process is alive."""
@@ -345,8 +369,16 @@ class LeanRepl:
         return _get_process_memory_gb(self.process)
 
     def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
-        """Send code to the REPL and get the response."""
-        timeout = timeout or self.request_timeout
+        """Send code to the REPL within one deadline across recovery attempts."""
+        timeout = self.request_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError(f"REPL command timed out after {timeout:g} seconds")
+            return value
+
         run_from_env = env_id is not None
         max_retries = 0 if run_from_env else self.max_retries
 
@@ -369,34 +401,52 @@ class LeanRepl:
 
         last_exception: Exception | None = None
         with self._process_lock:
-            self._check_memory_and_maybe_restart()
+            try:
+                if not self.is_alive():
+                    self.restart(timeout=remaining())
+                self._check_memory_and_maybe_restart(timeout=remaining())
+            except (TimeoutError, RuntimeError) as error:
+                self.close()
+                return {"repl_error": str(error)}
+
             for i in range(max_retries + 1):
                 try:
-                    resp = self._run(code=code, env_id=env_id, timeout=timeout)
+                    resp = self._run(code=code, env_id=env_id, timeout=remaining())
                     _adjust_line_numbers(resp, header_line_count)
                     return resp
                 except ReplProcessExited as e:
                     last_exception = e
                     logger.error("REPL process exited: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
-                    if not run_from_env and i < max_retries:
-                        backoff = min(2**i, 30) + random.uniform(0, 1)
-                        time.sleep(backoff)
-                    self.restart()
                     if run_from_env:
+                        self.close()
                         raise ReplProcessRestarted(str(e)) from e
                 except (TimeoutError, RuntimeError, json.JSONDecodeError) as e:
                     last_exception = e
                     logger.error("Error running command: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
-                    if not run_from_env and i < max_retries:
-                        backoff = min(2**i, 30) + random.uniform(0, 1)
-                        time.sleep(backoff)
-                    self.restart()
                     if run_from_env:
+                        self.close()
                         raise ReplProcessRestarted(str(e)) from e
+
+                if i >= max_retries:
+                    self.close()
+                    break
+
+                backoff = min(2**i, 30) + random.uniform(0, 1)
+                try:
+                    if backoff >= remaining():
+                        raise TimeoutError(
+                            f"REPL command timed out after {timeout:g} seconds"
+                        )
+                    time.sleep(backoff)
+                    self.restart(timeout=remaining())
+                except (TimeoutError, RuntimeError) as error:
+                    last_exception = error
+                    self.close()
+                    break
             logger.error("Exceeded maximum retries for Lean REPL command")
             return {"repl_error": str(last_exception)}
 
-    def _check_memory_and_maybe_restart(self) -> None:
+    def _check_memory_and_maybe_restart(self, timeout: float | None = None) -> None:
         """Proactively restart if memory usage is near the limit."""
         if self.mem_limit_gb <= 0 or self.config.mem_restart_ratio <= 0:
             return
@@ -405,7 +455,9 @@ class LeanRepl:
             threshold_gb = self.mem_limit_gb * self.config.mem_restart_ratio
             if usage_gb >= threshold_gb:
                 logger.info("REPL memory %.2fGB >= threshold %.2fGB, restarting...", usage_gb, threshold_gb)
-                self.restart()
+                self.restart(timeout=timeout)
+        except (TimeoutError, RuntimeError):
+            raise
         except Exception:
             logger.warning("Memory check failed, continuing", exc_info=True)
 
@@ -416,18 +468,47 @@ class LeanRepl:
             cmd_obj["env"] = env_id
         command = json.dumps(cmd_obj) + "\n\n"
 
-        if self.process is None or self.process.poll() is not None:
+        if (
+            self.process is None
+            or self.process.poll() is not None
+            or self.process.stdin is None
+            or self.process.stdout is None
+            or self.process.stderr is None
+        ):
             raise ReplProcessExited("REPL process is not running.")
 
-        self.process.stdin.write(command.encode("utf-8"))
-        self.process.stdin.flush()
+        end_time = time.monotonic() + timeout
+        stdin_fd = self.process.stdin.fileno()
+        os.set_blocking(stdin_fd, False)
+        payload = memoryview(command.encode("utf-8"))
+        offset = 0
+        while offset < len(payload):
+            remaining = end_time - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"REPL command timed out after {timeout} seconds while writing"
+                )
+            _, writable, _ = select.select([], [stdin_fd], [], remaining)
+            if not writable:
+                raise TimeoutError(
+                    f"REPL command timed out after {timeout} seconds while writing"
+                )
+            try:
+                written = os.write(stdin_fd, payload[offset:])
+            except BlockingIOError:
+                continue
+            except OSError as error:
+                raise ReplProcessExited(
+                    f"REPL process closed stdin while writing: {error}"
+                ) from error
+            if written <= 0:
+                raise ReplProcessExited("REPL process closed stdin while writing")
+            offset += written
 
         stdout_fd = self.process.stdout.fileno()
         stderr_fd = self.process.stderr.fileno()
-
         response_buffer = ""
         stderr_buffer = ""
-        end_time = time.monotonic() + timeout
         max_buffer = self.config.max_buffer_bytes
 
         while True:

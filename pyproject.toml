@@ -10,17 +10,18 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=3.0,<4",
+    "fastmcp>=3.4.5,<4",
+    "psutil>=5.9",
 ]
 
 [project.scripts]
 autoform = "autoform.__main__:main"
 autoform-visualize = "visualization.export_graph:main"
+autoform-lean-runtime = "servers.lean_runtime:main"
 
 [project.optional-dependencies]
-repl = [
-    "psutil>=5.9",
-]
+# Kept as an empty compatibility extra for existing plugin launch commands.
+repl = []
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",

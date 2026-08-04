@@ -11,13 +11,13 @@
       "command": "uv",
       "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "servers.lsp.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "description": "Lean diagnostics and hover; each call requires project_dir"
+      "description": "Shared node-local Lean diagnostics and hover; each call requires project_dir"
     },
     "autoform-repl": {
       "command": "uv",
       "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--extra", "repl", "python", "-m", "servers.repl.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "description": "Persistent Lean snippet execution; each call requires project_dir"
+      "description": "Shared node-local Lean snippet execution; each call requires project_dir"
     }
   }
 }

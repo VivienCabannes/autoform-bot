@@ -93,6 +93,7 @@ version = "0.4.4"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "psutil" },
 ]
 
 [package.optional-dependencies]
@@ -100,14 +101,11 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
-repl = [
-    { name = "psutil" },
-]
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = ">=3.0,<4" },
-    { name = "psutil", marker = "extra == 'repl'", specifier = ">=5.9" },
+    { name = "fastmcp", specifier = ">=3.4.5,<4" },
+    { name = "psutil", specifier = ">=5.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
 ]

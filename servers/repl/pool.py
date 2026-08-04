@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Any
 
-from .core import LeanRepl, LeanReplConfig, ReplProcessRestarted
+from .core import LeanRepl, LeanReplConfig
 
 logger = getLogger(__name__)
 
@@ -90,14 +91,29 @@ class LeanReplPool:
                 break
 
     def run(self, code: str, **kwargs: Any) -> dict[str, Any]:
-        """Run code on an idle REPL, retrying once on restart."""
-        repl = self._idle.get()
+        """Run code on an idle REPL within one queue-and-execution timeout."""
+        timeout = kwargs.pop("timeout", None)
+        deadline = time.monotonic() + timeout if timeout is not None else None
         try:
-            try:
-                return repl.run(code, **kwargs)
-            except ReplProcessRestarted:
-                logger.info("REPL was restarted, retrying command...")
-                return repl.run(code, **kwargs)
+            repl = self._idle.get(timeout=timeout)
+        except queue.Empty as error:
+            raise TimeoutError(
+                f"timed out after {timeout:g}s waiting for an idle Lean REPL"
+            ) from error
+
+        def run_once() -> dict[str, Any]:
+            call_kwargs = dict(kwargs)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"timed out after {timeout:g}s waiting for an idle Lean REPL"
+                    )
+                call_kwargs["timeout"] = remaining
+            return repl.run(code, **call_kwargs)
+
+        try:
+            return run_once()
         finally:
             self._idle.put(repl)
 

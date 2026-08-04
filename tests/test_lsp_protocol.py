@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -130,7 +132,7 @@ def test_get_diagnostics_closes_document_after_timeout(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         session,
         "_send_notification",
-        lambda method, params: notifications.append(method),
+        lambda method, params, **kwargs: notifications.append(method),
     )
 
     def timeout(uri, timeout):
@@ -157,10 +159,10 @@ def test_hover_opens_and_closes_document(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         session,
         "_send_notification",
-        lambda method, params: notifications.append((method, params)),
+        lambda method, params, **kwargs: notifications.append((method, params)),
     )
 
-    def send_request(method, params):
+    def send_request(method, params, timeout=30):
         assert method == "textDocument/hover"
         assert params["textDocument"]["uri"] == source.resolve().as_uri()
         return {"contents": {"kind": "plaintext", "value": "Nat : Type"}}
@@ -187,7 +189,11 @@ def test_document_operations_are_serialized_per_session(tmp_path: Path, monkeypa
     calls = 0
     calls_lock = threading.Lock()
 
-    monkeypatch.setattr(session, "_send_notification", lambda method, params: None)
+    monkeypatch.setattr(
+        session,
+        "_send_notification",
+        lambda method, params, **kwargs: None,
+    )
 
     def collect(uri, timeout):
         nonlocal calls
@@ -219,3 +225,56 @@ def test_document_operations_are_serialized_per_session(tmp_path: Path, monkeypa
 
     assert second_entered.is_set()
     assert all(not thread.is_alive() for thread in threads)
+
+
+def test_lsp_queue_wait_is_bounded_by_session_timeout(tmp_path: Path):
+    source = tmp_path / "Queued.lean"
+    source.write_text("#check Nat\n")
+    session = lsp.LeanLspSession(lsp.LspConfig(timeout=0.01))
+    session._operation_lock.acquire()
+    try:
+        with pytest.raises(TimeoutError, match="waiting for the Lean LSP session"):
+            session.hover(str(source), 0, 0)
+    finally:
+        session._operation_lock.release()
+
+
+@pytest.mark.parametrize(
+    "partial",
+    [
+        b"Content-Length: 10\r\n",
+        b"Content-Length: 10\r\n\r\n{}",
+    ],
+)
+def test_partial_lsp_frame_cannot_block_past_deadline(partial):
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "rb", buffering=0)
+    session = lsp.LeanLspSession(lsp.LspConfig())
+    session.process = SimpleNamespace(stdout=reader)
+    try:
+        os.write(write_fd, partial)
+        with pytest.raises(TimeoutError, match="reading an LSP"):
+            session._read_message(timeout=0.01)
+    finally:
+        os.close(write_fd)
+        reader.close()
+
+
+def test_lsp_write_cannot_block_on_a_full_pipe():
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    while True:
+        try:
+            os.write(write_fd, b"x" * 4096)
+        except BlockingIOError:
+            break
+
+    writer = os.fdopen(write_fd, "wb", buffering=0)
+    session = lsp.LeanLspSession(lsp.LspConfig())
+    session.process = SimpleNamespace(stdin=writer)
+    try:
+        with pytest.raises(TimeoutError, match="writing an LSP message"):
+            session._write_message({"jsonrpc": "2.0"}, timeout=0.01)
+    finally:
+        writer.close()
+        os.close(read_fd)

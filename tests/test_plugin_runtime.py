@@ -69,6 +69,8 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
         assert {
             "autoform/__main__.py",
             "autoform/graph.py",
+            "servers/lean_client.py",
+            "servers/lean_runtime.py",
             "servers/lsp/server.py",
             "servers/repl/core.py",
             "servers/repl/server.py",
@@ -78,6 +80,15 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             name.startswith(("scripts/", "autoform/prover/", "servers/lean/", "servers/search/"))
             for name in names
         )
+        entry_points = archive.read(
+            next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
+        ).decode()
+        assert "autoform-lean-runtime = servers.lean_runtime:main" in entry_points
+        metadata = archive.read(
+            next(name for name in names if name.endswith(".dist-info/METADATA"))
+        ).decode()
+        assert "Requires-Dist: psutil>=5.9" in metadata
+        assert "Provides-Extra: repl" in metadata
         archive.extractall(site)
 
     probe = subprocess.run(
@@ -91,17 +102,28 @@ from pathlib import Path
 site = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(site))
 from autoform import graph
+from servers import lean_client, lean_runtime
 from servers.lsp import server as lsp_server
 from servers.repl import server as repl_server
 from visualization import export_graph
 assert Path(graph.__file__).resolve().is_relative_to(site)
+assert Path(lean_client.__file__).resolve().is_relative_to(site)
+assert Path(lean_runtime.__file__).resolve().is_relative_to(site)
 assert Path(lsp_server.__file__).resolve().is_relative_to(site)
 assert Path(repl_server.__file__).resolve().is_relative_to(site)
 assert Path(export_graph.__file__).resolve().is_relative_to(site)
+client = lean_client.LeanRuntimeClient(socket_path=sys.argv[2], startup_timeout=15)
+try:
+    assert client.ensure_running()["install_id"] == lean_client.INSTALL_ID
+finally:
+    client.stop()
 """,
             str(site),
+            str(tmp_path / "wheel-runtime.sock"),
         ],
-        cwd=tmp_path,
+        # Deliberately run beside the source checkout. The installed client
+        # must launch the installed daemon, not import this cwd's servers/.
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
