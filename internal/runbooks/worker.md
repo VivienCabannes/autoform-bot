@@ -169,4 +169,3 @@ the prove stage is suppressed with a `paced — …` reason and the loop keeps
 tending PRs, reviewing, and draining role tasks; prove work resumes by itself
 as entries age out of the window. Pacing never ends work and never asks a human
 anything — a paced fleet is still fully autonomous, just solvent.
-
