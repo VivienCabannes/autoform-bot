@@ -128,6 +128,7 @@ then use:
 /autoform:setup                 # prepare the Lean repository, dashboard, CI, and Pages
 /autoform:roadmap               # sources → reviewed dependency graph + blueprint
 /autoform:orchestrate           # choose backends and launch prover workers + review jury
+/autoform:evaluate              # audit a corpus or benchmark a prover without mutating tasks
 ```
 
 `/autoform:setup` walks you through creating a project (via the LeanProject
@@ -138,7 +139,8 @@ and optionally renders the mathematical blueprint. `/autoform:orchestrate`
 selects the prover backend (`max` | `aristotle` | `codex` | `muse` | `openai` |
 `avocado`) and drives the formalization autonomously, from the dashboard, or
 both, off one shared queue. Ask Orchestrate to persist a backend as the default
-when needed.
+when needed. `/autoform:evaluate` runs read-only statement audits or isolated
+prover benchmarks outside that durable queue.
 
 ## Prover backends
 
@@ -186,11 +188,12 @@ existing project with `python3 scripts/formalization.py init <project-dir>`.
 **The complete user command surface** — `/autoform:setup` (repository
 installation, inspection, services, CI, and publication setup),
 `/autoform:roadmap` (source scope, dependency planning, review, and visualization),
-and `/autoform:orchestrate` (backend selection and launch/drive the engine).
+`/autoform:orchestrate` (backend selection and launch/drive the engine), and
+`/autoform:evaluate` (read-only corpus audits and isolated prover benchmarks).
 
 Mathlib conventions, proof discipline, environment repair, workspace
 inspection, jury rubrics, and Zulip search are internal runbooks or MCP
-capabilities invoked by the three workflows. They do not appear as extra slash
+capabilities invoked by the four workflows. They do not appear as extra slash
 commands.
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
@@ -228,7 +231,7 @@ contract, with diagrams.
 ## Repository layout
 
 ```
-skills/          three user workflows: setup, roadmap, orchestrate
+skills/          four user workflows: setup, roadmap, orchestrate, evaluate
 internal/        non-discoverable runbooks, reference material, and jury rubrics
 agents/          worker, reader, planning crew, review jury
 servers/         stateful MCP servers plus shared prover/search implementation code

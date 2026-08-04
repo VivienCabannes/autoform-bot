@@ -1,7 +1,7 @@
 # Quickstart
 
 Autoform turns your AI coding assistant into a **Lean 4 formalization agent**.
-It exposes three workflow commands backed by role agents, internal runbooks,
+It exposes four workflow commands backed by role agents, internal runbooks,
 and MCP servers for Lean and Mathlib.
 
 > For the full formalization workflow and command reference, see [docs/usage.md](docs/usage.md).
@@ -58,11 +58,13 @@ Type these in the assistant. This is the complete user-visible surface:
 | `/autoform:setup` | Install or repair prerequisites, create or inspect a project, and open the dashboard |
 | `/autoform:roadmap` | Plan sources and build or review the blueprint |
 | `/autoform:orchestrate` | Choose a backend, prove, review, score, search prior art, handle escalations, and advance the plan |
+| `/autoform:evaluate` | Audit formalization corpora or benchmark a prover in disposable project copies |
 
 A good first move is `/autoform:setup`. Natural-language requests such as
 “inspect this workspace” or “install Lean” stay inside Setup; “show the graph”
 stays inside Roadmap. Requests such as “review this node,” “prove this theorem,”
-“choose a prover,” or “search Zulip” stay inside Orchestrate.
+“choose a prover,” or “search Zulip” stay inside Orchestrate. Bulk corpus QA and
+prover regression runs stay inside Evaluate.
 
 ## 4. Optional unlocks
 

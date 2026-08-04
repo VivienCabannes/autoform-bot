@@ -20,7 +20,8 @@ Checks (all stdlib):
     skill entries in Muse's completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
-  - The user-visible skill set is exactly `setup`, `roadmap`, and `orchestrate`;
+  - The user-visible skill set is exactly `setup`, `roadmap`, `orchestrate`, and
+    `evaluate`;
     supporting runbooks do not reappear as slash commands.
   - No legacy `commands/*` file adds an extra user-visible command.
   - Every `references/<file>` a SKILL.md cites exists in that skill's `references/`.
@@ -53,7 +54,7 @@ EXPECTED_MCP_SERVERS = frozenset(
         "autoform-prover",
     }
 )
-PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate"})
+PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate", "evaluate"})
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
@@ -430,13 +431,13 @@ def check_skills() -> int:
         checks += 1
         err(
             f"missing core workflow skill: skills/{name}/SKILL.md "
-            "(Setup, Roadmap, and Orchestrate must ship in every host)"
+            "(Setup, Roadmap, Orchestrate, and Evaluate must ship in every host)"
         )
     for name in sorted(found - PUBLIC_WORKFLOW_SKILLS):
         checks += 1
         err(
             f"unexpected user-facing skill: skills/{name}/SKILL.md "
-            "(Autoform exposes only Setup, Roadmap, and Orchestrate)"
+            "(Autoform exposes only Setup, Roadmap, Orchestrate, and Evaluate)"
         )
     expected_paths = {
         (REPO_ROOT / "skills" / name / "SKILL.md").resolve()
@@ -451,7 +452,7 @@ def check_skills() -> int:
             continue
         checks += 1
         err(
-            f"stray SKILL.md outside the three-command surface: {rel(path)} "
+            f"stray SKILL.md outside the four-command surface: {rel(path)} "
             "(store supporting material under internal/)"
         )
     return count

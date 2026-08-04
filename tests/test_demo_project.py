@@ -79,16 +79,18 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
         path.parent.name
         for path in (ROOT / "skills").glob("*/SKILL.md")
     }
-    assert public == {"setup", "roadmap", "orchestrate"}
+    assert public == {"setup", "roadmap", "orchestrate", "evaluate"}
 
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     roadmap = (ROOT / "skills" / "roadmap" / "SKILL.md").read_text()
     orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
+    evaluate = (ROOT / "skills" / "evaluate" / "SKILL.md").read_text()
     assert "internal/runbooks/planning.md" in roadmap
     assert "scripts/workspace_inspector.py" in setup
     assert "internal/runbooks/proving.md" in orchestrate
     assert "internal/runbooks/review.md" in orchestrate
     assert "scripts/backend_config.py" in orchestrate
+    assert "scripts/evaluate.py" in evaluate
 
     for path in (ROOT / "internal" / "runbooks").glob("*.md"):
         assert not path.read_text().lstrip().startswith("---")

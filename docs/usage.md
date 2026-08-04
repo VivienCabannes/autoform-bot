@@ -7,10 +7,10 @@ queue transitions, and persisted verdicts.
 
 ## User command surface
 
-AutoformBot exposes exactly three user workflows: `setup`, `roadmap`, and
-`orchestrate`. Supporting functions such as installation, workspace
-inspection, planning, visualization, review, and Zulip search are internal to
-those workflows and do not appear as separate commands.
+AutoformBot exposes exactly four user workflows: `setup`, `roadmap`,
+`orchestrate`, and `evaluate`. Supporting functions such as installation,
+workspace inspection, planning, visualization, review, and Zulip search are
+internal to those workflows and do not appear as separate commands.
 
 ## 1. Install prerequisites
 
@@ -127,7 +127,21 @@ they never synthesize a passing score.
 Ask Orchestrate for a text review packet or the local dashboard. Human
 verdicts are immutable and override AI verdicts.
 
-## 6. Publish a read-only snapshot
+## 6. Evaluate a corpus or prover
+
+Run `evaluate` for work outside the durable roadmap queue:
+
+- `audit` performs read-only static statement checks, optional Lean
+  compilation, and an optional structured faithfulness judgment;
+- `benchmark` copies each task into a disposable Lean project, runs the unified
+  prover and kernel gate, and rejects changed theorem headers.
+
+Both model-backed modes require explicit approval. Direct OpenAI or Avocado
+use also requires explicit API-egress approval. Benchmark outputs results,
+summaries, and proof artifacts under a caller-selected directory; it never
+blanks or edits the source corpus.
+
+## 7. Publish a read-only snapshot
 
 The local dashboard remains the only operational surface. GitHub Pages is an
 optional snapshot of committed graph structure, theorem content, proof status,
