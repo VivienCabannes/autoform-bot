@@ -1,10 +1,10 @@
-# Autoform
+# AutoformBot
 
 **A host-neutral autoformalization engine for Claude Code, Codex, and Muse: turn a mathematics textbook into
 kernel-verified Lean 4, with every proof independently checked and every verdict
 auditable.**
 
-Autoform is an Agent Skills plugin that runs the full pipeline on Claude Code,
+AutoformBot is an Agent Skills plugin that runs the full pipeline on Claude Code,
 Codex, or Muse — plan a textbook
 into a tiered dependency graph, prove nodes with swappable AI backends, verify
 every claimed proof against the Lean kernel, judge the result with a three-axis
@@ -32,7 +32,9 @@ tests alone are not presented as end-to-end live validation.
 
 ```mermaid
 flowchart LR
-    A[textbook<br/>LaTeX / MD / PDF] -->|/autoform:setup| B[tiered dependency graph<br/>graph.json + prose per node]
+    A[Lean + Mathlib repository] -->|/autoform:setup| R[AutoformBot-ready repository<br/>dashboard + CI + Pages]
+    S[textbook<br/>LaTeX / MD / PDF] -->|/autoform:roadmap| B[tiered dependency graph<br/>graph.json + prose per node]
+    R --> B
     B -->|/autoform:orchestrate| C[prover workers<br/>claude · aristotle · codex · muse · openai · avocado]
     C --> D{honesty gate<br/>lake build + #print axioms}
     D -->|rejected| C
@@ -60,52 +62,67 @@ flowchart LR
   clean / flagged / rejected verdict. Humans review packets or use the local
   dashboard; a human verdict is immutable and always wins over the AI's.
 
-## Quickstart
+## Install as a plugin
 
-Prereqs: [Claude Code](https://claude.com/claude-code),
+Prerequisites: [Claude Code](https://claude.com/claude-code),
 [Codex](https://developers.openai.com/codex/), or Muse/TBH; Python ≥ 3.10; and
 [uv](https://docs.astral.sh/uv/) (the MCP servers launch via `uv run` and
 resolve their own deps on first start).
 
-Claude Code:
+First clone the repository and install its dependencies:
+
+```bash
+git clone https://github.com/VivienCabannes/autoform-bot.git
+cd autoform-bot
+make setup
+```
+
+Then install AutoformBot into your host. For Claude Code, either install it
+directly from GitHub:
 
 ```text
 /plugin marketplace add VivienCabannes/autoform-bot
 /plugin install autoform@autoform
 ```
 
-Codex, from a checkout of this repository:
+or install the local checkout with `make install-claude`. For Codex:
 
 ```bash
 make install-codex
 ```
 
-Muse/TBH, from a checkout of this repository:
+For Muse/TBH:
 
 ```bash
-make build-muse
-tbh plugins validate dist/muse/autoform --json
-tbh plugins install dist/muse/autoform
-tbh plugins enable autoform
+make install-muse
 ```
 
-Approve Autoform's hook and MCP capabilities in `/plugins` under the Runtime
-tab. Muse can orchestrate the existing backends or run proofs and jury reviews
-itself through the `muse` backend.
+These commands install AutoformBot as a host plugin; they do not install it
+into the Lean project that you later formalize. The plugin keeps the
+`autoform` identifier, so its package names and slash commands remain
+`autoform@...` and `/autoform:...`.
+
+In Muse, approve AutoformBot's hook and MCP capabilities in `/plugins` under
+the Runtime tab. Muse can orchestrate the existing backends or run proofs and
+jury reviews itself through the `muse` backend.
+
+## Quickstart
 
 Start a new task after installing or upgrading so the host reloads the plugin,
 then use:
 
 ```text
-/autoform:setup                 # new Lean+Mathlib project → plan → blueprint → dashboard
+/autoform:setup                 # prepare the Lean repository, dashboard, CI, and Pages
+/autoform:roadmap               # sources → reviewed dependency graph + blueprint
 /autoform:orchestrate           # launch the engine: prover workers + review jury
 /autoform:set-backend           # choose the prover backend and billing/data path
 ```
 
 `/autoform:setup` walks you through creating a project (via the LeanProject
 template, with Mathlib cache), repairing prerequisites, inspecting an existing
-workspace, planning your sources into `graph.json`, and opening the review
-dashboard. `/autoform:set-backend` persists the default
+workspace, initializing durable state, and opening the review dashboard.
+`/autoform:roadmap` then scopes the sources, builds and reviews `graph.json`,
+and optionally renders the mathematical blueprint. `/autoform:set-backend` persists the default
 prover backend (`max` | `aristotle` | `codex` | `muse` | `openai` | `avocado`);
 `/autoform:orchestrate` then drives the
 formalization — autonomously, human-driven from the dashboard, or both, off one
@@ -144,7 +161,7 @@ on structured signals, not a timer.
 
 ## Self-reporting: formalization.yaml + usage ledger
 
-Projects created by autoform carry a
+Projects created by AutoformBot carry a
 [mathlib-initiative `formalization.yaml`](https://github.com/mathlib-initiative/formalization.yaml)
 manifest (v0.3). Every prover run appends token/cost/wall-time telemetry to an
 append-only ledger (`.autoform/usage.jsonl`) and refreshes the manifest's
@@ -154,16 +171,17 @@ existing project with `python3 scripts/formalization.py init <project-dir>`.
 
 ## The surface
 
-**The complete user command surface** — `/autoform:setup` (installation,
-inspection, planning, visualization, and project setup),
+**The complete user command surface** — `/autoform:setup` (repository
+installation, inspection, services, CI, and publication setup),
+`/autoform:roadmap` (source scope, dependency planning, review, and visualization),
 `/autoform:orchestrate` (launch/drive the engine),
 `/autoform:set-backend` (persist the prover backend; shared with the
 dashboard).
 
-Planning, visualization, review, Mathlib conventions, proof discipline,
-environment repair, workspace inspection, jury rubrics, and Zulip search are
-internal runbooks or MCP capabilities invoked by Setup and Orchestrate. They do
-not appear as extra slash commands.
+Mathlib conventions, proof discipline, environment repair, workspace
+inspection, jury rubrics, and Zulip search are internal runbooks or MCP
+capabilities invoked by the four workflows. They do not appear as extra slash
+commands.
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
 crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
@@ -195,7 +213,7 @@ design contract.
 ## Repository layout
 
 ```
-skills/          exactly three user workflows: setup, orchestrate, set-backend
+skills/          four user workflows: setup, roadmap, orchestrate, set-backend
 internal/        non-discoverable runbooks, reference material, and jury rubrics
 agents/          worker, reader, planning crew, review jury
 servers/         stateful MCP servers plus shared prover/search implementation code
