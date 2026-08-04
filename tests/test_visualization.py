@@ -50,6 +50,36 @@ def test_cli_writes_an_explicit_destination(tmp_path: Path, capsys: pytest.Captu
     assert 'href="../blueprint/nodes/only.md"' in output.read_text(encoding="utf-8")
 
 
+def test_static_site_links_use_html_and_show_status(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    node = blueprint / "nodes" / "foundations" / "base lemma.md"
+    node.parent.mkdir(parents=True)
+    node.write_text(
+        "---\nkind: lemma\nstatus: proved\nlean: Example.baseLemma\n---\n\n# Base lemma\n",
+        encoding="utf-8",
+    )
+    output = blueprint / "dependencies.html"
+
+    export_graph(blueprint, output, link_extension=".html")
+
+    document = output.read_text(encoding="utf-8")
+    assert 'href="nodes/foundations/base%20lemma.html"' in document
+    assert 'class="node status-proved"' in document
+    assert 'data-status="proved"' in document
+    assert "1 proved" in document
+
+
+def test_cli_accepts_html_link_extension(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "nodes" / "only.md", "Only node")
+    output = blueprint / "dependencies.html"
+
+    assert main([str(blueprint), "--output", str(output), "--link-extension", ".html"]) == 0
+
+    assert str(output.resolve()) in capsys.readouterr().out
+    assert 'href="nodes/only.html"' in output.read_text(encoding="utf-8")
+
+
 def test_cli_reports_invalid_blueprint(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit, match="2"):
         main([str(tmp_path / "missing")])

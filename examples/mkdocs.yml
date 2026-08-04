@@ -1,0 +1,17 @@
+site_name: Autoform example
+docs_dir: blueprint
+site_dir: site
+use_directory_urls: false
+
+theme:
+  name: mkdocs
+
+markdown_extensions:
+  - fenced_code
+  - tables
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js

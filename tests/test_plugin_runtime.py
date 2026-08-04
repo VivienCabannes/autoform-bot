@@ -6,6 +6,8 @@ import json
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 def test_plugin_surface_is_three_skills_and_two_servers(repo_root):
@@ -91,12 +93,13 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
         assert "Provides-Extra: repl" in metadata
         archive.extractall(site)
 
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            """
+    with TemporaryDirectory(prefix="autoform-wheel-", dir="/tmp") as runtime_dir:
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                """
 import sys
 from pathlib import Path
 site = Path(sys.argv[1]).resolve()
@@ -110,22 +113,20 @@ assert Path(lean_client.__file__).resolve().is_relative_to(site)
 assert Path(lean_runtime.__file__).resolve().is_relative_to(site)
 assert Path(lsp_server.__file__).resolve().is_relative_to(site)
 assert Path(repl_server.__file__).resolve().is_relative_to(site)
-assert Path(export_graph.__file__).resolve().is_relative_to(site)
+assert Path(visualize.__file__).resolve().is_relative_to(site)
 client = lean_client.LeanRuntimeClient(socket_path=sys.argv[2], startup_timeout=15)
 try:
     assert client.ensure_running()["install_id"] == lean_client.INSTALL_ID
 finally:
     client.stop()
-assert Path(lsp_server.__file__).resolve().is_relative_to(site)
-assert Path(repl_server.__file__).resolve().is_relative_to(site)
 """,
-            str(site),
-            str(tmp_path / "wheel-runtime.sock"),
-        ],
-        # Deliberately run beside the source checkout. The installed client
-        # must launch the installed daemon, not import this cwd's servers/.
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+                str(site),
+                str(Path(runtime_dir) / "runtime.sock"),
+            ],
+            # Deliberately run beside the source checkout. The installed client
+            # must launch the installed daemon, not import this cwd's servers/.
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
     assert probe.returncode == 0, probe.stderr

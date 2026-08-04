@@ -7,17 +7,29 @@ the coding agent supplies the orchestration.
 
 ## The blueprint
 
-Each Lean project keeps its graph in a committed wiki:
+Each Lean project keeps its planning material beside its Lean source. The
+recommended layout is a portable Markdown vault rather than a generated
+database:
 
 ```text
 blueprint/
-├── README.md
-└── nodes/
+├── README.md                 project landing page
+├── roadmap/                  high-level direction and milestones
+├── coverage/                 project-defined completion targets
+├── sources/                  optional mathematical source notes
+└── nodes/                    theorem-sized executable DAG
     ├── definitions/
     │   └── convex.md
     └── theorems/
         └── separating-hyperplane.md
 ```
+
+Open `blueprint/` directly as an Obsidian vault: standard relative links power
+its backlinks and graph view, while `.obsidian/` remains ignored. The same
+Markdown can be rendered by MkDocs and deployed by GitHub Pages. See the
+repo-shaped [`examples/`](examples/README.md) directory for the complete vault,
+site configuration, and workflow. Roadmap and coverage organization remains
+project policy; Autoform deliberately enforces only the fine-grained node DAG.
 
 Every Markdown file below `blueprint/nodes/` is one node. Its relative path
 without `.md` is its stable ID. The H1 is its human title; optional frontmatter
@@ -53,8 +65,8 @@ targets, escaping paths, self-links, and missing H1 titles are rejected.
 node should name its compiled declaration in `lean`. The checker validates graph
 structure but leaves mathematical and Lean correctness to the agent and Lean.
 
-The Markdown files are the sole source of truth. `graph.html` is a derived,
-read-only visualization and may be regenerated at any time.
+The Markdown files are the sole source of truth. Generated graph and site files
+are derived, read-only views and may be regenerated at any time.
 
 ## Commands
 
@@ -62,11 +74,15 @@ read-only visualization and may be regenerated at any time.
 uv sync --extra dev --extra repl
 uv run autoform check blueprint
 uv run autoform-visualize blueprint
+uv run autoform-visualize blueprint \
+  --output blueprint/dependencies.html \
+  --link-extension .html
 uv run pytest -q
 ```
 
 The visualization is self-contained and works directly from `file://`; clicking
-a node opens its Markdown file.
+a node opens its Markdown file. The HTML-link mode is intended for static-site
+builders configured to emit `.html` pages, as in the bundled MkDocs example.
 
 ## Plugin surface
 
@@ -122,6 +138,6 @@ when unusually large worker pools need more than the default 15 minutes to warm.
 .codex-plugin/   Codex manifest
 skills/         three short expert nudges with on-demand review rubrics
 autoform_cli/   blueprint validation and visualization commands
-servers/        exactly two stateful servers: Lean LSP and REPL
+servers/        two public MCP adapters plus the shared Lean runtime
 tests/          graph, packaging, and server contracts
 ```

@@ -23,6 +23,8 @@ autoform-lean-runtime = "servers.lean_runtime:main"
 # Kept as an empty compatibility extra for existing plugin launch commands.
 repl = []
 dev = [
+    "mkdocs>=1.6,<2",
+    "pymdown-extensions>=10,<11",
     "pytest>=7.0",
     "ruff>=0.4",
 ]

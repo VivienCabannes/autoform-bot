@@ -1,7 +1,7 @@
 {
   "name": "autoform",
-  "version": "0.4.4+codex.20260804140451",
-  "description": "Plan, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
+  "version": "0.4.4+codex.20260804144637",
+  "description": "Plan, publish, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
   "author": {
     "name": "Vivien Cabannes"
   },
@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "AutoForm Bot",
     "shortDescription": "Lean planning, review, LSP, and REPL",
-    "longDescription": "AutoForm keeps a Lean formalization plan as a linked Markdown wiki, checks it through two public Lean MCP servers backed by a shared node-local runtime, and reviews faithfulness, proof integrity, and Mathlib style.",
+    "longDescription": "AutoForm keeps a Lean formalization plan as an Obsidian-compatible Markdown vault, publishes it with GitHub Pages, checks proofs through two public Lean MCP servers backed by a shared node-local runtime, and reviews faithfulness, proof integrity, and Mathlib style.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
     "capabilities": [
@@ -19,7 +19,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Create an Autoform Markdown blueprint from my sources.",
+      "Create an in-repository Autoform blueprint, Obsidian vault, and Pages site from my sources.",
       "Work through the ready nodes in my Autoform blueprint.",
       "Review this Lean formalization against its source and proof chain."
     ],

@@ -19,4 +19,4 @@ jobs:
       - run: uv sync --extra dev --extra repl
       - run: uv run ruff check autoform_cli servers tests
       - run: uv run pytest -q
-      - run: uv run autoform check examples/blueprint
+      - run: make check-example

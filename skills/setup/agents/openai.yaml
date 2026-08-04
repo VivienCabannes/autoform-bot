@@ -1,0 +1,4 @@
+interface:
+  display_name: "Set Up Autoform Blueprint"
+  short_description: "Create a Lean blueprint vault and Pages site"
+  default_prompt: "Use $setup to add an in-repository blueprint, GitHub Pages site, and Obsidian vault to this Lean project."

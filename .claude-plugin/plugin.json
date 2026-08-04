@@ -1,6 +1,6 @@
 {
   "name": "autoform",
-  "description": "Plan, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
+  "description": "Plan, publish, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
   "version": "0.4.4+codex.local-20260804-121435",
   "author": {
     "name": "Vivien Cabannes",

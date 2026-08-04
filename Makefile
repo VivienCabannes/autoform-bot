@@ -11,3 +11,7 @@ lint:
 
 check-example:
 	uv run autoform check examples/blueprint
+	uv run autoform-visualize examples/blueprint \
+		--output examples/blueprint/dependencies.html \
+		--link-extension .html
+	uv run --extra dev mkdocs build --strict --config-file examples/mkdocs.yml

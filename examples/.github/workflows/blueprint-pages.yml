@@ -1,0 +1,64 @@
+name: Blueprint Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blueprint-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      # Pin a release or commit instead of `main` once the project settles on
+      # an Autoform version.
+      - name: Validate the theorem DAG
+        run: >-
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@main
+          autoform check blueprint
+
+      - name: Generate the dependency graph
+        run: >-
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@main
+          autoform-visualize blueprint
+          --output blueprint/dependencies.html
+          --link-extension .html
+
+      - name: Build the Markdown site
+        run: >-
+          uvx --from mkdocs==1.6.1
+          --with pymdown-extensions==10.21.3
+          mkdocs build --strict
+
+      - name: Upload the Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

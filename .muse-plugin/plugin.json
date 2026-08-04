@@ -3,7 +3,7 @@
   "name": "autoform",
   "displayName": "AutoForm Bot",
   "version": "0.4.4",
-  "description": "Plan, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
+  "description": "Plan, publish, prove, and review Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
   "compat": {
     "source": "native",
     "manifestDir": ".muse-plugin"

@@ -72,16 +72,17 @@ def _positions(graph: Graph) -> tuple[dict[str, tuple[int, int]], int, int]:
     return positions, width, height
 
 
-def _link_to(node: Node, output: Path) -> str:
+def _link_to(node: Node, output: Path, link_extension: str) -> str:
     relative = os.path.relpath(node.path.resolve(), output.resolve().parent)
-    return quote(Path(relative).as_posix(), safe="/:")
+    linked = Path(relative).with_suffix(link_extension)
+    return quote(linked.as_posix(), safe="/:")
 
 
 def _shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def render_graph(graph: Graph, output: Path) -> str:
+def render_graph(graph: Graph, output: Path, *, link_extension: str = ".md") -> str:
     """Return a complete HTML document whose nodes link to their Markdown files."""
     positions, width, height = _positions(graph)
     edges: list[str] = []
@@ -106,10 +107,13 @@ def render_graph(graph: Graph, output: Path) -> str:
         x, y = positions[node.id]
         title = html.escape(node.title)
         label = html.escape(_shorten(node.title, 34))
-        identifier = html.escape(_shorten(node.id, 38))
-        href = html.escape(_link_to(node, output), quote=True)
+        href = html.escape(_link_to(node, output, link_extension), quote=True)
+        status = (node.status or "unspecified").casefold()
+        identifier = html.escape(_shorten(f"{node.id} · {status}", 34))
+        status_class = status if status in {"blocked", "planned", "proved", "ready"} else "unspecified"
         nodes.append(
-            f'<a class="node" id="node-{index}" href="{href}" '
+            f'<a class="node status-{status_class}" id="node-{index}" href="{href}" '
+            f'data-status="{html.escape(status, quote=True)}" '
             f'aria-label="Open {html.escape(node.title, quote=True)}">'
             f'<title>{title} ({html.escape(node.id)})</title>'
             f'<rect x="{x}" y="{y}" width="{BOX_WIDTH}" height="{BOX_HEIGHT}" rx="10" />'
@@ -122,6 +126,13 @@ def render_graph(graph: Graph, output: Path) -> str:
         nodes.append(f'<text class="empty" x="{width // 2}" y="{height // 2}">No nodes</text>')
 
     project_name = html.escape(graph.blueprint_dir.name or "Blueprint")
+    status_counts: dict[str, int] = defaultdict(int)
+    for node in graph.nodes.values():
+        status_counts[node.status or "unspecified"] += 1
+    statuses = " · ".join(
+        f"{count} {html.escape(status)}" for status, count in sorted(status_counts.items())
+    )
+    status_summary = f" · {statuses}" if statuses else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -138,6 +149,10 @@ def render_graph(graph: Graph, output: Path) -> str:
     svg {{ display: block; min-width: 100%; height: auto; }}
     .edge {{ fill: none; stroke: #8290a5; stroke-width: 2; marker-end: url(#arrow); }}
     .node rect {{ fill: #fff; stroke: #526a93; stroke-width: 2; }}
+    .node.status-proved rect {{ fill: #e9f8ef; stroke: #27864b; }}
+    .node.status-ready rect {{ fill: #eaf2ff; stroke: #2563eb; }}
+    .node.status-blocked rect {{ fill: #fff0f0; stroke: #c33c3c; }}
+    .node.status-planned rect {{ fill: #f4f4f5; stroke: #71717a; }}
     .node:hover rect, .node:focus rect {{ fill: #edf4ff; stroke: #175dcc; stroke-width: 3; }}
     .node text {{ pointer-events: none; }}
     .title {{ fill: #172033; font-size: 14px; font-weight: 650; }}
@@ -148,6 +163,10 @@ def render_graph(graph: Graph, output: Path) -> str:
       header {{ background: #182132; border-color: #364156; }}
       p, .identifier {{ color: #aeb8ca; }}
       .node rect {{ fill: #182132; stroke: #7890ba; }}
+      .node.status-proved rect {{ fill: #153524; stroke: #58bd7b; }}
+      .node.status-ready rect {{ fill: #172d52; stroke: #75a7ff; }}
+      .node.status-blocked rect {{ fill: #442020; stroke: #f08080; }}
+      .node.status-planned rect {{ fill: #282832; stroke: #a1a1aa; }}
       .node:hover rect, .node:focus rect {{ fill: #20304a; stroke: #75a7ff; }}
       .title {{ fill: #f3f4f6; }}
       .identifier, .empty {{ fill: #aeb8ca; }}
@@ -158,7 +177,7 @@ def render_graph(graph: Graph, output: Path) -> str:
 <body>
   <header>
     <h1>{project_name}</h1>
-    <p>{len(graph.nodes)} nodes · {graph.edge_count} dependencies · arrows point from prerequisite to dependent</p>
+    <p>{len(graph.nodes)} nodes · {graph.edge_count} dependencies{status_summary} · arrows point from prerequisite to dependent</p>
   </header>
   <main class="canvas">
     <svg viewBox="0 0 {width} {height}" role="img" aria-label="Dependency graph">
@@ -176,13 +195,18 @@ def render_graph(graph: Graph, output: Path) -> str:
 """
 
 
-def export_graph(blueprint_dir: Path, output: Path | None = None) -> Path:
+def export_graph(
+    blueprint_dir: Path,
+    output: Path | None = None,
+    *,
+    link_extension: str = ".md",
+) -> Path:
     """Load and export ``blueprint_dir``; return the written HTML path."""
     blueprint_dir = blueprint_dir.resolve()
     destination = (output or blueprint_dir / "graph.html").resolve()
     graph = load_graph(blueprint_dir)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(render_graph(graph, destination), encoding="utf-8")
+    destination.write_text(render_graph(graph, destination, link_extension=link_extension), encoding="utf-8")
     return destination
 
 
@@ -190,9 +214,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("blueprint_dir", type=Path, help="directory containing nodes/**/*.md")
     parser.add_argument("-o", "--output", type=Path, help="output HTML (default: <blueprint-dir>/graph.html)")
+    parser.add_argument(
+        "--link-extension",
+        choices=(".md", ".html"),
+        default=".md",
+        help="node-link extension: .md for local files or .html for a static site",
+    )
     args = parser.parse_args(argv)
     try:
-        output = export_graph(args.blueprint_dir, args.output)
+        output = export_graph(args.blueprint_dir, args.output, link_extension=args.link_extension)
     except GraphValidationError as error:
         parser.exit(2, f"error: {error}\n")
     print(output)
