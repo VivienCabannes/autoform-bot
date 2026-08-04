@@ -8,10 +8,9 @@ instead of adding host-specific workflow copies.
 Read `docs/full-parity-architecture.md` before changing orchestration, provider
 adapters, permissions, or plugin packaging.
 
-Version 2 intentionally replaces the former standalone Python application.
-Read `docs/migration-v2.md` before restoring a v1 module, command, dependency,
-or run format; compatibility work must define an explicit artifact boundary
-rather than silently creating a second orchestration stack.
+The plugin intentionally replaces the former standalone Python application.
+Do not restore a legacy module, command, dependency, or run format without an
+explicit artifact boundary; that would create a second orchestration stack.
 
 ## Current surfaces
 

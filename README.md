@@ -15,18 +15,9 @@ rebuilds the project and audits its axioms (`sorryAx` and non-standard axioms
 are rejected), so adding a new — even unknown — model backend is safe by
 construction.
 
-The shared Codex paths are implemented and covered by deterministic tests, but
-operational parity remains a release gate: host authentication, project trust,
-generated-role discovery, CLI schema behavior, and one real proof/jury run must
-pass on the release candidate. See
-[Codex implementation and release status](docs/codex-support.md); automated
-tests alone are not presented as end-to-end live validation.
-
-> **Version 2 transition:** this plugin intentionally replaces the standalone
-> v1 Python research pipeline; it is not an in-place compatibility upgrade.
-> Existing v1 runs and Python integrations should remain pinned to an archival
-> v1 revision. See [the v2 migration guide](docs/migration-v2.md) for the
-> removed-capability map, migration procedure, and rollback boundary.
+Claude Code, Codex, and Muse share the same durable workflow contracts while
+using their native plugin and subagent surfaces. See the
+[host/provider architecture](docs/full-parity-architecture.md) for the boundary.
 
 ## How it works
 
@@ -238,7 +229,7 @@ servers/         stateful MCP servers plus shared prover/search implementation c
 scripts/         plan/graph tooling, dispatch engine, review UI, formalization.py
 autoform_worker/ the distributed worker CLI (rounds, claims, scoreboards, PRs)
 hooks/           Claude SessionStart context (skills are the workflow surface)
-docs/            pipeline architecture, usage guide, backend handoff notes
+docs/            maintained architecture, usage, release, and worker contracts
 tests/           deterministic suite, fixtures, and optional live smoke tests
 ```
 

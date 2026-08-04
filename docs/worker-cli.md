@@ -8,9 +8,9 @@ implementation lives in `autoform_worker/`.
 
 ## Problem
 
-Everything in Autoform today is single-machine: `fslock` advisory locks, one
-`dispatcher.lock` lease per project, a local `task_queue.json`. Multiple people
-running Autoform against the *same* formalization project (a shared GitHub repo
+Autoform's local dispatcher is intentionally single-machine: `fslock` advisory
+locks, one `dispatcher.lock` lease per project, and a local `task_queue.json`.
+Multiple people running against the *same* formalization project (a shared GitHub repo
 holding `graph.json`, `informal_content/`, `kernel/`, `review_status.json`, and the
 Lean sources) would collide: two machines proving the same node, review state
 diverging per clone, no shared progress view.
@@ -122,8 +122,8 @@ flowchart TD
 | `fix` | own open PR whose scoreboard (at head) has a blocking verdict | host agent with `prompts/fix.md` |
 | `review` | open non-draft autoform PR from a trusted author, checks not failing/pending, head not scoreboarded | deterministic: checkout head, run the 3-axis jury (`judge_runtime`), post scoreboard |
 | `merge` | PR with a genuine CI `success` + a trusted `clean` scoreboard at the exact head, allowlisted paths, no hold label, no human flag | deterministic: `gh pr merge --squash --match-head-commit` (merge-time CAS). A head with **no** checks never merges (`--merge-without-ci` is the explicit opt-out) |
-| `progress` | merged autoform PRs newer than the last fold | deterministic: fold scoreboards → `review_status.json`, CAS-push (the Pages workflow republishes), sync escalation issues |
-| `agents` | a machine-local queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, escalation, …) | spawns the host CLI with that role's own Markdown body; the role's declared write paths are enforced before curation is CAS-pushed to the default branch |
+| `progress` | merged autoform PRs newer than the last fold | deterministic: fold scoreboards → `review_status.json`, CAS-push (the Pages workflow republishes), sync proof-recovery issues |
+| `agents` | a machine-local queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, proof recovery, …) | spawns the host CLI with that role's own Markdown body; the role's declared write paths are enforced before curation is CAS-pushed to the default branch |
 | `prove` | eligible graph node: tier-2, not in Mathlib, unproved/defective, prerequisites trusted, unclaimed, no open PR for it | claim the author lease, branch, reuse `dispatch_runner.run_worker()` (spec build + prover driver + verification gate + usage ledger), commit, CAS-push, `pr create` with target marker |
 
 `prove` is deliberately last: it is the expensive, work-generating stage; tending
@@ -134,9 +134,11 @@ new PR) — a round that claims success without one exits `75` (no-progress),
 TauCeti's guard against silent burn.
 
 Attempt budgets (persisted in worker state): fix 3 per head, fix-ci 3 per head +
-5 per PR, rebase 3 per PR, review errors 3 per PR, merge 3 per PR, prove 3 per
-node, agent tasks 3 per (kind, node). Provider-infra failures (5xx/429/transport)
-refund the attempt rather than burning it.
+5 per PR, rebase 3 per PR, review errors 3 per PR, merge 3 per PR, and agent
+execution failures 3 per (kind, node). Proof attempts are evidence-gated instead
+of count-capped: a failed proof opens ordered recovery, and the next attempt
+requires a changed durable input fingerprint. Provider-infra failures
+(5xx/429/transport) refund the attempt rather than burning it.
 
 ## Where humans sit in the loop
 
@@ -151,7 +153,7 @@ human wants to *say* to the system is said there:
   overrule it;
 - dropping a role onto a node in the local dashboard queues that role for a
   worker on the same machine; cross-machine work is coordinated through durable
-  graph state, PRs, scoreboards, claims, and escalation issues, not the local queue;
+  graph state, PRs, scoreboards, claims, and proof-recovery issues, not the local queue;
 - a `hold`/`human`/`wip` label on a PR takes it out of the gate entirely.
 
 Merging is otherwise automatic: green CI, a trusted `clean` jury verdict at the
@@ -235,9 +237,9 @@ Verdicts land in the committed sidecar only when the PR merges (via `progress`).
 ## GitHub issues
 
 When the project repo has Issues enabled, `progress` (and `autoform issues sync`)
-mirrors open engine escalations from `task_queue.json` to issues labeled
-`autoform:escalation` (title `escalation: <node-id>`, body = the worker's own
-words + machine marker), and closes issues whose escalations resolved. Humans can
+mirrors active proof recoveries from `task_queue.json` to issues labeled
+`autoform:escalation` (the label and title retain the historical queue-kind name
+for compatibility). Parked recoveries remain open; resolved ones close. Humans can
 also claim intent by assigning themselves issues labeled `autoform:intention`;
 assigned intentions join the prove avoid-list. Both degrade to no-ops (with a
 doctor note) when Issues are disabled.
@@ -258,7 +260,7 @@ autoform claim  acquire|renew|release|holds|read|list|gc [key] [--node ID]
 autoform push   <ref> [--expect OID] [--remote URL]     # CAS push (git-safe-push)
 autoform pr-create ... --body-file F                    # marker+lease-gated gh pr create
 autoform sync   [--json]            # fast-forward local default branch to canonical state
-autoform issues sync [--dry-run]    # escalations <-> GitHub issues
+autoform issues sync [--dry-run]    # proof recoveries <-> GitHub issues
 autoform dashboard export|serve     # thin wrappers over the existing scripts
 autoform doctor [--json]            # environment + auth + repo capability audit
 ```
@@ -301,8 +303,13 @@ enforced by process-group kill.
 stateDiagram-v2
     [*] --> Missing: prerequisites trusted
     Missing --> Proving: prove round — claim + prover + verify gate
-    Proving --> Escalated: FAILED (honest wall)
-    Escalated --> Missing: triage — grow DAG / fix statement
+    Proving --> Recovery: FAILED
+    Recovery --> Research: proof routes + prior art
+    Research --> Refutation: no viable route
+    Refutation --> Decompose: no disproof
+    Decompose --> Missing: changed strategy / dependencies
+    Decompose --> Parked: no defensible route this wave
+    Parked --> Recovery: new evidence
     Proving --> InReview: PR opens (target marker)
     InReview --> Fixing: verdict flagged or rejected
     Fixing --> InReview: new head — re-review
@@ -317,9 +324,10 @@ stateDiagram-v2
     end note
 ```
 
-The review→fix loop is budget-bounded (3 fix attempts per head, then the PR
-waits for a human), and the escalation exit is capped per node — a stubborn
-wall becomes a human question, not an infinite retry loop.
+The review-to-fix loop is budget-bounded. Proof recovery is not capped by an
+arbitrary attempt count: unchanged retries are rejected by a fingerprint over
+the theorem, prose strategy, Lean file, dependencies, and backend. Exhausted
+recovery waves park with an evidence ledger until new information appears.
 
 ## Multi-machine walkthrough
 

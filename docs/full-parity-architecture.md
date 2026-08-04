@@ -80,7 +80,7 @@ flowchart LR
 ```
 
 The deterministic dispatcher owns queue transitions and jury persistence.
-Interactive hosts own planning and escalation judgment. Subagents return
+Interactive hosts own planning and proof-recovery judgment. Subagents return
 proposals; `scripts/merge_node.py` remains the only graph writer.
 
 ## Compatibility layers
@@ -285,8 +285,9 @@ VM/container or other sandbox whose boundary does not depend on the agent host.
 - Unknown backend: fail closed.
 - Judge timeout or malformed result: abstain; never synthesize a score.
 - All judges abstain: task fails and no AI verdict is written.
-- Prover transport failure: honest `failed`; raise the existing bounded
-  escalation.
+- Prover failure: open ordered proof recovery. A durable input fingerprint
+  blocks another prover call until the statement, strategy, dependencies, Lean
+  file, or backend changes.
 - Honest API failure or verification failure: restore API-written files.
 - Host crash: the next dispatcher sweep requeues stranded work.
 - Partial orchestration: durable graph/queue state is authoritative on resume.

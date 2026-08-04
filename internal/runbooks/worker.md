@@ -43,7 +43,7 @@ progress → agents → prove`. Exit 0 = progressed, 75 = nothing actionable
 
 `agents` is not a single role — it drains **every** queue kind the role
 registry knows (planner, mathcheck, graphreview, contentreview, counterexample,
-priorart, holistic, escalation, plus any project-local role), spawning the host
+priorart, holistic, proof recovery, plus any project-local role), spawning the host
 CLI with that role's own Markdown body. It sits before `prove` so a cluster is
 planned, Mathlib-checked, and refutation-tested before compute goes into
 proving it. Run `python -m autoform_worker agents` to see what is registered.
@@ -121,11 +121,12 @@ run two loops for one worker id.
 - Human verdicts recorded in the local dashboard remain immutable; folds only
   write the `ai` slot.
 
-## Escalations ↔ GitHub issues
+## Proof recovery and GitHub issues
 
 When the canonical repo has Issues enabled, `progress` (or `autoform issues
-sync`) mirrors open engine escalations to issues labeled `autoform:escalation`
-and closes resolved ones. Humans register intent with assigned
+sync`) mirrors active proof recoveries to issues labeled `autoform:escalation`
+and closes resolved ones. The historical label remains for compatibility.
+Humans register intent with assigned
 `autoform:intention` issues titled `intention: <node-id>`; assigned intentions
 join every worker's prove avoid-list. With Issues disabled, both degrade to
 local-only — say so rather than silently losing the sync.
@@ -138,4 +139,5 @@ local-only — say so rather than silently losing the sync.
 - Agent-driven pushes go ONLY through `autoform push` (CAS + lease check) and
   PRs through `autoform pr-create` (marker + lease gate). Raw `git push` from
   a spawned agent is a defect.
-- Merging stays human (or explicit repo policy) — the worker never merges.
+- Merging follows the worker's verified auto-merge gate; dashboard verdicts and
+  hold labels remain the human override.

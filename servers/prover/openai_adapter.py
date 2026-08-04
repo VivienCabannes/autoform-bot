@@ -16,8 +16,8 @@ rejects it.
 OpenAI-SDK-compatible model API, but it does not establish the private
 Avocado deployment's endpoint, model id, authentication, or enabled
 capabilities. Autoform therefore has no guessed endpoint/model default for
-Avocado: configure both explicitly. The verification checklist lives in
-``docs/avocado-handoff.md``.
+Avocado: configure both explicitly and use ``scripts/provider_check.py`` before
+an approved live run.
 
 **Interface assumptions** (the codex-adapter discipline): this targets OpenAI
 Chat Completions — ``POST {base}/chat/completions`` with ``{model, messages,

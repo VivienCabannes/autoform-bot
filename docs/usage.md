@@ -1,9 +1,9 @@
 # Usage guide
 
-Autoform runs the same durable formalization workflow from Claude Code or
-Codex. The host handles interactive planning, review, and escalation through
-native subagents; a deterministic dispatcher owns proof workers, jury runs,
-queue transitions, and persisted verdicts.
+Autoform runs the same durable formalization workflow from Claude Code, Codex,
+or Muse. The host handles interactive planning, review, and proof recovery
+through native subagents; a deterministic dispatcher owns proof workers, jury
+runs, queue transitions, and persisted verdicts.
 
 ## User command surface
 
@@ -99,7 +99,7 @@ then continuously drains interactive-host tasks:
 | `worker` | deterministic engine + selected prover |
 | `reviewer` | deterministic engine + selected judge |
 | `planner`, `mathcheck`, graph/content/holistic review | native host subagents |
-| `escalation` | interactive host |
+| `escalation` (proof recovery) | interactive host |
 
 Prover and judge backends are independent. For example, Avocado may prove while
 Codex judges. When either side uses an API provider, orchestration checks every

@@ -104,8 +104,8 @@ LC_ALL=C LANG=C uv run python scripts/dispatch_runner.py <plan-dir> \
 
 Claude worker uses `--backend max`. A forced-timeout recovery check uses the
 same disposable node with `--timeout 1`; it must fail, mention that the child
-was killed, raise exactly one escalation, and leave no host child running.
-Claim and resolve that escalation before retrying the node.
+was killed, raise exactly one proof-recovery task, and leave no host child
+running. An unchanged retry must be rejected by the recovery fingerprint gate.
 
 For the three-axis jury:
 
@@ -152,7 +152,6 @@ These drills are automated in the default test suite. The live steps above
 verify host authentication, CLI schema behavior, subscription permissions, and
 real Lean-version compatibility that injected tests cannot establish.
 
-Record release-candidate outcomes in a dated result file. The current local
-hardening run is [pilot-results-2026-07-27.md](pilot-results-2026-07-27.md);
-open gates in that record remain release blockers until a later result
-supersedes them.
+Record release-candidate outcomes in the release or pull-request record,
+including the commit, host versions, permission profile, and any billing or
+data-egress path. Do not commit transient local pilot transcripts to `docs/`.
