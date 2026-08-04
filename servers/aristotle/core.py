@@ -450,6 +450,11 @@ def build_node_spec(
     kind = node.get("kind")
     if kind:
         lines.append(f"Kind: {kind}")
+    if node.get("lean_file"):
+        lines.append(f"Target Lean file (project-relative): {node['lean_file']}")
+    lean_decls = node.get("lean_declarations") or []
+    if lean_decls:
+        lines.append(f"Create or complete project declaration(s): {', '.join(lean_decls)}")
     decls = node.get("mathlib_declarations") or []
     if decls:
         lines.append(f"Realize the Mathlib declaration(s): {', '.join(decls)}")

@@ -32,6 +32,7 @@ sys.path.insert(0, str(_HERE.parent / "scripts"))
 
 import dispatch_runner as dr  # noqa: E402
 from servers.prover.base import ProofResult  # noqa: E402
+from servers.prover.verify import VerifyResult  # noqa: E402
 
 
 GRAPH = {
@@ -67,6 +68,36 @@ def _by_id(tmp_path, tid):
 def _sidecar(tmp_path):
     p = tmp_path / "review_status.json"
     return json.loads(p.read_text()) if p.exists() else {"reviews": {}}
+
+
+def test_nearest_lean_root_uses_dispatch_project_without_lakefile(tmp_path):
+    assert dr._nearest_lean_root(tmp_path) == tmp_path.resolve()
+
+
+def test_nearest_lean_root_finds_lakefile_ancestor(tmp_path):
+    (tmp_path / "lakefile.toml").write_text('name = "T"\n')
+    plan = tmp_path / "plans" / "main"
+    plan.mkdir(parents=True)
+    assert dr._nearest_lean_root(plan) == tmp_path.resolve()
+
+
+def test_build_prompt_prefers_project_target_file():
+    rubric = {
+        "criteria": {"c": "check it"},
+        "prompt_template": "review {lean_file} as {lean_declaration}",
+    }
+    prompt = dr.build_prompt(
+        rubric,
+        "target",
+        {
+            "lean_file": "Project/Target.lean",
+            "lean_declarations": ["Project.target"],
+            "mathlib_file": "Mathlib/Other.lean",
+            "mathlib_declarations": ["Mathlib.other"],
+        },
+        "",
+    )
+    assert prompt == "review Project/Target.lean as Project.target"
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +356,344 @@ def test_main_runs_the_sweep_then_drains_the_requeued_task(tmp_path, monkeypatch
     t = _by_id(proj, "reviewer:s1")
     assert t["status"] == "done"
     assert "requeued after engine restart" in t["note"]
+
+
+def test_watch_reloads_graph_before_reviewing_new_node(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    prompts = []
+    monkeypatch.setattr(
+        dr,
+        "run_judge",
+        lambda axis, prompt, repo, model, timeout: (
+            prompts.append(prompt) or {"score": 5, "reasoning": "fine"}
+        ),
+    )
+    proj = _proj(tmp_path, [])
+    polls = 0
+
+    def advance_watch(_seconds):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            graph = json.loads((proj / "graph.json").read_text())
+            graph["nodes"]["new"] = {
+                "tier": 2,
+                "parent": None,
+                "kind": "corollary",
+                "name": "New statement",
+                "mathlib_status": "missing",
+                "depends_on": [],
+            }
+            (proj / "graph.json").write_text(json.dumps(graph))
+            (proj / "task_queue.json").write_text(json.dumps([
+                {"id": "reviewer:new", "agent": "reviewer", "node": "new",
+                 "status": "queued"},
+            ]))
+        else:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(dr.time, "sleep", advance_watch)
+    assert dr.main([str(proj), "--watch", "--poll", "1"]) == 0
+    assert _by_id(proj, "reviewer:new")["status"] == "done"
+    assert len(prompts) == len(dr.AXES)
+    assert all("(corollary)" in prompt for prompt in prompts)
+
+
+def test_watch_reloads_graph_for_each_new_worker_task(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    seen_nodes = []
+
+    def worker(node_id, node, *args, **kwargs):
+        seen_nodes.append((node_id, node))
+        return "proved", "complete", ""
+
+    monkeypatch.setattr(dr, "run_worker", worker)
+    proj = _proj(tmp_path, [])
+    polls = 0
+
+    def advance_watch(_seconds):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            graph = json.loads((proj / "graph.json").read_text())
+            graph["nodes"]["new"] = {
+                "tier": 2,
+                "parent": None,
+                "kind": "lemma",
+                "name": "Fresh worker target",
+                "description": "Use the newly merged prerequisite",
+                "mathlib_status": "missing",
+                "depends_on": ["s2"],
+            }
+            (proj / "graph.json").write_text(json.dumps(graph))
+            (proj / "task_queue.json").write_text(json.dumps([
+                {"id": "worker:new", "agent": "worker", "node": "new",
+                 "status": "queued"},
+            ]))
+        else:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(dr.time, "sleep", advance_watch)
+    assert dr.main([
+        str(proj), "--watch", "--poll", "1", "--workers", "--backend", "codex",
+    ]) == 0
+    assert _by_id(proj, "worker:new")["status"] == "done"
+    assert seen_nodes == [("new", json.loads((proj / "graph.json").read_text())["nodes"]["new"])]
+
+
+def test_verified_explicit_target_is_marked_and_requeued_for_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    monkeypatch.setattr(
+        dr,
+        "run_worker",
+        lambda *args, **kwargs: ("proved", "kernel gate clean", "proof report"),
+    )
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    graph["nodes"]["s1"].update({
+        "spec_status": "ready",
+        "proof_status": "pending",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    (proj / "graph.json").write_text(json.dumps(graph))
+    target = proj / "Project" / "S1.lean"
+    target.parent.mkdir()
+    target.write_text("theorem s1 : True := by trivial\n")
+    (proj / "review_status.json").write_text(json.dumps({
+        "version": 1,
+        "settings": {"dial": "on-demand"},
+        "reviews": {"s1": {
+            "ai": {"verdict": "rejected"},
+            "human": {"verdict": "accepted"},
+        }},
+    }))
+
+    assert dr.main([
+        str(proj), "--workers", "--backend", "codex", "--judge-backend", "codex",
+    ]) == 0
+
+    saved = json.loads((proj / "graph.json").read_text())
+    assert saved["nodes"]["s1"]["proof_status"] == "proved"
+    assert saved["nodes"]["s1"]["proof_verified_at"]
+    assert saved["nodes"]["s1"]["proof_fingerprint"]
+    review = _sidecar(proj)["reviews"]["s1"]
+    assert "ai" not in review
+    assert review["human"] == {"verdict": "accepted"}
+    queue = _queue(proj)
+    assert _by_id(proj, "worker:s1")["status"] == "done"
+    queued = [t for t in queue if t["agent"] == "reviewer" and t["node"] == "s1"]
+    assert len(queued) == 1 and queued[0]["status"] == "queued"
+    assert queued[0]["source"] == "engine:verified-proof"
+
+
+def test_existing_clean_target_is_stamped_without_prover_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    monkeypatch.setattr(
+        dr,
+        "_verify_existing_proof",
+        lambda *args, **kwargs: VerifyResult(True, "", {"kernel": "clean"}),
+    )
+    monkeypatch.setattr(
+        dr,
+        "run_worker",
+        lambda *args, **kwargs: pytest.fail("clean existing target must skip prover"),
+    )
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    graph["nodes"]["s1"].update({
+        "spec_status": "ready",
+        "proof_status": "pending",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    (proj / "graph.json").write_text(json.dumps(graph))
+    target = proj / "Project" / "S1.lean"
+    target.parent.mkdir()
+    target.write_text("theorem s1 : True := by trivial\n")
+
+    assert dr.main([str(proj), "--workers", "--backend", "codex"]) == 0
+
+    saved = json.loads((proj / "graph.json").read_text())
+    assert saved["nodes"]["s1"]["proof_status"] == "proved"
+    assert saved["nodes"]["s1"]["proof_fingerprint"]
+    assert _by_id(proj, "worker:s1")["result"].startswith("proved: existing target verified")
+
+
+def test_repair_target_with_prior_proof_is_sent_to_prover(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    monkeypatch.setattr(
+        dr,
+        "_verify_existing_proof",
+        lambda *args, **kwargs: pytest.fail("repair must not use existing-target shortcut"),
+    )
+    called = False
+
+    def worker(*args, **kwargs):
+        nonlocal called
+        called = True
+        return "proved", "repaired", "proof report"
+
+    monkeypatch.setattr(dr, "run_worker", worker)
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    graph["nodes"]["s1"].update({
+        "spec_status": "ready",
+        "proof_status": "pending",
+        "proof_fingerprint": "previous-rejected-proof",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    (proj / "graph.json").write_text(json.dumps(graph))
+    target = proj / "Project" / "S1.lean"
+    target.parent.mkdir()
+    target.write_text("theorem s1 : True := by trivial\n")
+
+    assert dr.main([str(proj), "--workers", "--backend", "codex"]) == 0
+
+    assert called
+    saved = json.loads((proj / "graph.json").read_text())
+    assert saved["nodes"]["s1"]["proof_status"] == "proved"
+    assert saved["nodes"]["s1"]["proof_fingerprint"] != "previous-rejected-proof"
+
+
+def test_draft_explicit_target_is_not_sent_to_worker(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    called = False
+
+    def worker(*args, **kwargs):
+        nonlocal called
+        called = True
+        return "proved", "", ""
+
+    monkeypatch.setattr(dr, "run_worker", worker)
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    graph["nodes"]["s1"].update({
+        "spec_status": "draft",
+        "proof_status": "pending",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    (proj / "graph.json").write_text(json.dumps(graph))
+
+    assert dr.main([str(proj), "--workers", "--backend", "codex"]) == 0
+
+    assert not called
+    task = _by_id(proj, "worker:s1")
+    assert task["status"] == "failed"
+    assert "not proof-ready" in task["result"]
+
+
+def test_target_changed_during_worker_is_not_marked_proved(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    graph["nodes"]["s1"].update({
+        "spec_status": "ready",
+        "proof_status": "pending",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    (proj / "graph.json").write_text(json.dumps(graph))
+    target = proj / "Project" / "S1.lean"
+    target.parent.mkdir()
+    target.write_text("theorem s1 : True := by trivial\n")
+
+    def worker(*args, **kwargs):
+        changed = json.loads((proj / "graph.json").read_text())
+        changed["nodes"]["s1"]["description"] = "a changed statement"
+        (proj / "graph.json").write_text(json.dumps(changed))
+        return "proved", "kernel gate clean", "proof report"
+
+    monkeypatch.setattr(dr, "run_worker", worker)
+
+    assert dr.main([str(proj), "--workers", "--backend", "codex"]) == 0
+
+    saved = json.loads((proj / "graph.json").read_text())
+    assert saved["nodes"]["s1"]["proof_status"] == "pending"
+    task = _by_id(proj, "worker:s1")
+    assert task["status"] == "failed"
+    assert "specification changed" in task["result"]
+
+
+def test_proved_target_review_records_current_fingerprint(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    monkeypatch.setattr(
+        dr,
+        "run_judge",
+        lambda *args, **kwargs: {"score": 5, "reasoning": "clean"},
+    )
+    proj = _proj(tmp_path, [
+        {"id": "reviewer:s1", "agent": "reviewer", "node": "s1", "status": "queued"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    node = graph["nodes"]["s1"]
+    node.update({
+        "spec_status": "ready",
+        "proof_status": "proved",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    target = proj / "Project" / "S1.lean"
+    target.parent.mkdir()
+    target.write_text("theorem s1 : True := by trivial\n")
+    fingerprint = dr.target_state.artifact_fingerprint(proj, proj, "s1", node)
+    node["proof_fingerprint"] = fingerprint
+    (proj / "graph.json").write_text(json.dumps(graph))
+
+    assert dr.main([str(proj), "--judge-backend", "codex"]) == 0
+
+    ai = _sidecar(proj)["reviews"]["s1"]["ai"]
+    assert ai["verdict"] == "clean"
+    assert ai["fingerprint"] == fingerprint
+
+
+def test_escalation_cap_marks_explicit_target_blocked(tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "load_rubrics", lambda: _FAKE_RUBRICS)
+    monkeypatch.setattr(
+        dr,
+        "run_worker",
+        lambda *args, **kwargs: pytest.fail("capped target must not run"),
+    )
+    proj = _proj(tmp_path, [
+        {"id": "worker:s1", "agent": "worker", "node": "s1", "status": "queued"},
+        {"id": "escalation:s1", "agent": "escalation", "node": "s1", "status": "done"},
+    ])
+    graph = json.loads((proj / "graph.json").read_text())
+    graph["nodes"]["s1"].update({
+        "spec_status": "ready",
+        "proof_status": "pending",
+        "lean_file": "Project/S1.lean",
+        "lean_declarations": ["s1"],
+        "roadmap_id": "scalar.s1",
+    })
+    (proj / "graph.json").write_text(json.dumps(graph))
+
+    assert dr.main([
+        str(proj), "--workers", "--backend", "codex", "--max-escalations", "1",
+    ]) == 0
+
+    saved = json.loads((proj / "graph.json").read_text())
+    assert saved["nodes"]["s1"]["proof_status"] == "blocked"
+    assert saved["nodes"]["s1"]["proof_blocked_at"]
+    assert _by_id(proj, "worker:s1")["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

@@ -152,13 +152,38 @@ absolute path; do not depend on a variable exported by a previous shell call.
    canonical roles (`splitter`, `mathlib-checker`, and reviewers), and route all
    graph edits through `scripts/merge_node.py`.
 
+   An explicit repository roadmap (for example `ROADMAP.md` plus linked target
+   packets) is a valid confirmed source. When the user's request already names
+   that roadmap and its scope, do not ask for a textbook or repeat the scope
+   confirmation. Preserve roadmap order and do not invent targets beyond it.
+   Record the complete ordered stable-id list as graph metadata
+   `confirmed_scope` through `merge_node.py`; every roadmap target's
+   `roadmap_id` must match exactly one entry.
+
+   A tier-2 node that represents Lean work also records:
+
+   - `lean_file`: project-relative destination module;
+   - `lean_declarations`: declarations the target is expected to add;
+   - `spec_status`: `draft` until the exact Lean statement and dependencies are
+     audited, then `ready`;
+   - `proof_status`: `pending`, `proved`, or `blocked`.
+   - `roadmap_id`: the stable id from the confirmed repository roadmap.
+
+   Record existing Lean work as `pending` and `ready`; Orchestrate's deterministic
+   existing-target preflight builds it, checks the named declarations and axioms,
+   and stamps it `proved` without spending a prover run. Never set `proved` from
+   prose alone, enqueue a `draft` target, or create a committed placeholder Lean
+   file merely to give a worker a `sorry`.
+
 8. Read and follow
    `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to export and
    build and durably serve the blueprint. Visualization is part of Setup, not a
    separate command.
 
-9. Report the dashboard URL, tier-1 and tier-2 counts, native role-agent install
-   status, and the next step: run Orchestrate.
+9. Report the dashboard URL, tier-1 and tier-2 counts, and native role-agent
+   install status. If the original request also asked to prove or finish the
+   roadmap, continue directly with Orchestrate in this task; do not require a
+   second user command.
 
 ## Resume semantics
 

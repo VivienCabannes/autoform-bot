@@ -64,10 +64,11 @@ _NS_RE = re.compile(r"^namespace\s+([A-Za-z_][A-Za-z0-9_'.]*)")
 _DECL_RE = re.compile(
     r"^(?:@\[[^\]]*\]\s*)*"
     r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
-    r"(?:theorem|lemma|def|abbrev|instance)\s+([A-Za-z_][A-Za-z0-9_'.]*)"
+    r"(?:theorem|lemma|def|abbrev|instance|structure|class|inductive|axiom|opaque)\s+"
+    r"([A-Za-z_][A-Za-z0-9_'.]*)"
 )
 _BUILD_TIMEOUT = 900
-_PROBE_TIMEOUT = 300
+_PROBE_TIMEOUT = 900
 
 # The standard axioms a genuine Mathlib-style proof may rest on. Modern Lean 4
 # reports the core trio (funext is a theorem, derived from Quot.sound, but is kept
@@ -79,6 +80,8 @@ _STANDARD_AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound", "fune
 _AXIOM_LEDGER_NAMES = ("AXIOM_AUDIT.md", "AXIOM_AUDIT.txt", "axiom_audit.md", "AXIOMS.md")
 
 _AXIOM_REPORT_RE = re.compile(r"depends on axioms:\s*\[([^\]]*)\]")
+_DECL_REPORT_RE = re.compile(r"'([^'\n]+)'\s+(?:does not depend|depends)\b")
+_EXPECTED_DECL_OK_RE = re.compile(r"AUTOFORM_EXPECTED_DECL_OK\s+([^\s]+)")
 _LEDGER_AXIOM_RE = re.compile(r"\baxiom\s+`?([A-Za-z_][A-Za-z0-9_.']*)`?")
 
 #: Sentinel the enumeration probe prints once it has scanned EVERY declaration the
@@ -388,6 +391,23 @@ def _decls_probed(pout: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _declarations_in_report(pout: str) -> set[str]:
+    """Declaration names whose axiom report was emitted by the kernel probe."""
+    marked = {match.group(1) for match in _EXPECTED_DECL_OK_RE.finditer(pout)}
+    return marked or {match.group(1) for match in _DECL_REPORT_RE.finditer(pout)}
+
+
+def _project_relative(path: str, project_dir: str) -> str | None:
+    """Normalize a project-contained path for target-attribution comparisons."""
+    root = Path(project_dir).resolve()
+    candidate = Path(path)
+    candidate = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        return candidate.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
 # ------------------------------------------------------------ module + decl parse
 
 def _module_of(file: str, project_dir: str) -> str | None:
@@ -430,7 +450,13 @@ def _decls_of(src: str) -> list[str]:
     return list(dict.fromkeys(decls))
 
 
-def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
+def _build_probe(
+    files: list[str],
+    project_dir: str,
+    expected_declarations: list[str] | None = None,
+    *,
+    compat_axioms: bool = False,
+) -> tuple[str, list[str]]:
     """Assemble an AUTHORITATIVE ``#print axioms`` probe.
 
     Rather than scraping declaration names from source with a regex (which cannot see
@@ -450,13 +476,28 @@ def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
         mod = _module_of(f, project_dir)
         if mod and mod not in modules:
             modules.append(mod)
-    if not modules:
+    declarations = list(expected_declarations or [])
+    if not modules or not all(_MODULE_ID_RE.match(name) for name in declarations):
         return "", []
     imports = "\n".join(f"import {m}" for m in modules)
     mod_lits = ", ".join(f"`{m}" for m in modules)
-    probe = (
-        "import Lean\n"
-        f"{imports}\n"
+    decl_lits = ", ".join(f"`{name}" for name in declarations)
+    ownership_check = ""
+    if declarations:
+        ownership_check = (
+            f"  let expectedDecls : List Name := [{decl_lits}]\n"
+            "  for decl in expectedDecls do\n"
+            "    match env.getModuleIdxFor? decl with\n"
+            "    | some actual =>\n"
+            "        unless idxs.contains actual do\n"
+            "          throwError m!\"wrong owner for {decl}: expected one of {mods}\"\n"
+            "    | none => throwError m!\"missing declaration {decl}\"\n"
+            "    logInfo m!\"AUTOFORM_EXPECTED_DECL_OK {decl}\"\n"
+        )
+    compat_support = ""
+    axiom_call = "        let axs ← collectAxioms nm\n"
+    if compat_axioms:
+        compat_support = (
         "namespace AutoformVerify\n"
         "\n"
         "open Lean\n"
@@ -492,6 +533,12 @@ def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
         "\n"
         "end AutoformVerify\n"
         "\n"
+        )
+        axiom_call = "        let axs := AutoformVerify.axiomsOf env nm\n"
+    probe = (
+        "import Lean\n"
+        f"{imports}\n"
+        f"{compat_support}"
         "open Lean in\n"
         "run_cmd do\n"
         "  let env ← getEnv\n"
@@ -502,11 +549,12 @@ def _build_probe(files: list[str], project_dir: str) -> tuple[str, list[str]]:
         "    if let some i := env.getModuleIdxFor? nm then\n"
         "      if idxs.contains i && !nm.isInternalDetail then\n"
         "        n := n + 1\n"
-        "        let axs := AutoformVerify.axiomsOf env nm\n"
+        f"{axiom_call}"
         "        if axs.isEmpty then\n"
         "          logInfo m!\"'{nm}' does not depend on any axioms\"\n"
         "        else\n"
         "          logInfo m!\"'{nm}' depends on axioms: {axs.toList}\"\n"
+        f"{ownership_check}"
         f"  logInfo m!\"{_PROBE_DONE} decls={{n}}\"\n"
     )
     return probe, modules
@@ -560,6 +608,8 @@ def verify_proof(
     prober: Callable[[str, str], tuple[int, str]] | None = None,
     has_lakefile: bool | None = None,
     require_lakefile: bool = True,
+    expected_files: list[str] | None = None,
+    expected_declarations: list[str] | None = None,
 ) -> VerifyResult:
     """Independently verify a *claimed* proof for ``node`` in ``project_dir``.
 
@@ -599,6 +649,26 @@ def verify_proof(
         return VerifyResult(False, "no Lean file was written — nothing to verify",
                             {"verified": True, "files": []})
 
+    expected_normalized: set[str] = set()
+    if expected_files:
+        actual = {_project_relative(file, project_dir) for file in files}
+        for expected in expected_files:
+            normalized = _project_relative(expected, project_dir)
+            if normalized is None:
+                return VerifyResult(
+                    False,
+                    f"expected target file escapes the project: {expected}",
+                    {"verified": True, "files": files, "target_file": "unsafe"},
+                )
+            if normalized not in actual:
+                return VerifyResult(
+                    False,
+                    f"expected target file was not changed by this run: {normalized}",
+                    {"verified": True, "files": files, "target_file": "untouched",
+                     "expected_files": list(expected_files)},
+                )
+            expected_normalized.add(normalized)
+
     read = reader or (lambda pth: Path(pth).read_text(encoding="utf-8", errors="ignore"))
 
     # 1. fast pre-filters — literal proof gaps and elaboration-time execution.
@@ -616,8 +686,21 @@ def verify_proof(
                     f"`{f}` contains disallowed elaboration-time execution: {unsafe}",
                     {"verified": True, "files": files, "unsafe_elaboration_in": f},
                 )
-        except Exception:
-            continue
+            normalized = _project_relative(f, project_dir)
+            if expected_normalized and normalized not in expected_normalized and _decls_of(source):
+                return VerifyResult(
+                    False,
+                    f"off-target file `{f}` adds declarations; expected target file(s): "
+                    + ", ".join(sorted(expected_normalized)),
+                    {"verified": True, "files": files, "kernel": "off-target-declarations",
+                     "expected_files": sorted(expected_normalized)},
+                )
+        except Exception as error:
+            return VerifyResult(
+                False,
+                f"could not read attributable Lean file `{f}`: {error}",
+                {"verified": True, "files": files, "source_read": "error"},
+            )
 
     # 2. build clean — genuine compile errors only (rc). A `sorry` is just a warning
     #    (rc 0) and is the kernel check's job below; we do NOT scan build output for
@@ -633,12 +716,27 @@ def verify_proof(
     #    the compiled environment and #print their axioms; must show no sorryAx (catches
     #    a sorry reached through an imported/untouched file, an anonymous instance, or
     #    any decl form a source scan would miss). The sentinel guarantees completeness.
-    probe, modules = _build_probe(files, project_dir)
+    probe_files = sorted(expected_normalized) if expected_normalized else files
+    probe, modules = _build_probe(
+        probe_files,
+        project_dir,
+        expected_declarations=list(expected_declarations or []),
+    )
     if not modules:
         return VerifyResult(False, "could not resolve a Lean module from the touched files — cannot kernel-verify",
                             {"verified": True, "files": files, "kernel": "no-modules"})
     prove_probe = prober or _run_probe
     prc, pout = prove_probe(probe, project_dir)
+    if _PROBE_DONE not in pout and "collectAxioms" in pout:
+        # Lean 4.9 used a different ``collectAxioms`` API. Keep one compatibility
+        # retry for older projects; modern Lean uses its cached module summaries.
+        compat_probe, _ = _build_probe(
+            probe_files,
+            project_dir,
+            expected_declarations=list(expected_declarations or []),
+            compat_axioms=True,
+        )
+        prc, pout = prove_probe(compat_probe, project_dir)
     if "sorryAx" in pout:
         return VerifyResult(False, "proof depends on `sorryAx` — a sorry/admit, possibly via an imported file",
                             {"verified": True, "files": files, "kernel": "sorryAx"})
@@ -659,7 +757,29 @@ def verify_proof(
             {"verified": True, "files": files, "kernel": "axiom",
              "axioms": sorted(axioms), "rogue_axioms": rogue})
     ndecls = _decls_probed(pout)
+    if ndecls == 0:
+        return VerifyResult(
+            False,
+            "touched modules own no declarations — no formalization target was verified",
+            {"verified": True, "files": files, "build": "clean",
+             "modules": modules, "decls": 0, "kernel": "no-decls",
+             "axioms": sorted(axioms)},
+        )
+    if expected_declarations:
+        reported = _declarations_in_report(pout)
+        missing = [name for name in expected_declarations if name not in reported]
+        if missing:
+            return VerifyResult(
+                False,
+                "expected target declaration(s) were not found in the touched modules: "
+                + ", ".join(missing),
+                {"verified": True, "files": files, "build": "clean",
+                 "modules": modules, "decls": ndecls, "kernel": "missing-declaration",
+                 "expected_declarations": list(expected_declarations),
+                 "reported_declarations": sorted(reported),
+                 "axioms": sorted(axioms)},
+            )
     return VerifyResult(True, "", {"verified": True, "files": files, "build": "clean",
                                    "modules": modules, "decls": ndecls,
-                                   "kernel": "clean" if ndecls else "no-decls",
+                                   "kernel": "clean",
                                    "axioms": sorted(axioms)})

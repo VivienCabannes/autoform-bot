@@ -146,6 +146,22 @@ def test_build_node_spec_includes_statement_and_refs(tmp_path):
     assert "inf_t" in spec  # prose statement injected
 
 
+def test_build_node_spec_includes_project_target_location(tmp_path):
+    gp = _write_plan(tmp_path)
+    graph = json.loads(gp.read_text())
+    graph["nodes"]["Chernoff bound"]["lean_file"] = "Project/Chernoff.lean"
+    graph["nodes"]["Chernoff bound"]["lean_declarations"] = [
+        "ProbabilityTheory.chernoff_bound"
+    ]
+    gp.write_text(json.dumps(graph))
+
+    spec = build_node_spec(gp, "Chernoff bound", project_dir=tmp_path)
+
+    assert "Target Lean file (project-relative): Project/Chernoff.lean" in spec
+    assert "Create or complete project declaration(s): " \
+        "ProbabilityTheory.chernoff_bound" in spec
+
+
 def test_build_node_spec_unknown_node_raises(tmp_path):
     gp = _write_plan(tmp_path)
     with pytest.raises(KeyError):

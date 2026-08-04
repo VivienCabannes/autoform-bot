@@ -44,14 +44,21 @@ Those runbooks and their references are implementation details of Orchestrate.
 Resolve:
 
 - dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then a
-  running dashboard's graph parent;
-- Lean project: `graph.json` metadata `lean_root`, otherwise the dispatch
-  project's repository parent;
+  running dashboard's graph parent, otherwise the current project directory;
+- Lean project: `graph.json` metadata `lean_root`, otherwise the nearest current
+  directory or dispatch-project ancestor containing `lakefile.toml` or
+  `lakefile.lean` (never assume the repository parent);
 - proof backend: explicit argument, otherwise run `backend_config.py get
   --fallback codex` on Codex or `--fallback max` on Claude. A persisted choice
   still wins;
 - judge backend: explicit argument, otherwise `AUTOFORM_JUDGE_BACKEND`, otherwise
   the host-native CLI (`claude` on Claude Code, `codex` on Codex).
+
+If the dispatch graph is absent or empty, perform Setup's non-destructive
+inspection, initialization, and planning steps in this same task, then continue
+here. A request that explicitly names a repository roadmap and its full scope is
+already source/scope confirmation. Do not stop merely to ask the user to invoke
+Setup or Orchestrate again.
 
 Echo all four before claiming work. Preflight the required host CLI. In
 particular, a persisted `max` choice on Codex still requires `claude`; if it is
@@ -86,7 +93,7 @@ Unless a one-shot run was requested, launch one detached watch process for this
 exact dispatch project:
 
 ```bash
-uv run --directory "<AUTOFORM_PLUGIN_ROOT>" --extra aristotle \
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" \
   python -u "<AUTOFORM_PLUGIN_ROOT>/scripts/dispatch_runner.py" "$DISPATCH_PROJECT" \
   --repo "$LEAN_PROJECT" --backend "$PROVER_BACKEND" \
   --judge-backend "$JUDGE_BACKEND" <APPROVED_API_EGRESS_FLAGS> \
@@ -95,6 +102,8 @@ uv run --directory "<AUTOFORM_PLUGIN_ROOT>" --extra aristotle \
 
 Log to `<dispatch-project>/dispatch.log`. Reuse an existing matching watch
 process. Never run watch mode in the foreground.
+Add `--extra aristotle` to `uv run` only when the selected prover backend is
+`aristotle`; Codex-only runs must not resolve that optional dependency.
 Replace `<APPROVED_API_EGRESS_FLAGS>` with the approved repeated flags, or omit
 the placeholder entirely when neither selected backend is an API provider.
 
@@ -171,8 +180,14 @@ Unless manual/drop-only mode was requested:
 2. Drain interactive-host work first, escalations first.
 3. Traverse foundations-first:
    - unreviewed node → enqueue `reviewer`;
-   - defective or unproved node with clean prerequisites and no open escalation
-     → enqueue `worker`;
+   - target with `spec_status: draft` → audit and write its exact statement before
+     any proof task;
+   - target with `spec_status: ready`, `proof_status: pending`, proved
+     prerequisites, and no open escalation → enqueue `worker`;
+   - target with `proof_status: proved` but no clean current review → enqueue
+     `reviewer`;
+   - target whose current fingerprinted review is `flagged` or `rejected` → merge
+     `proof_status: pending` before enqueueing a repair worker;
    - unsplit tier-1 cluster → planner pipeline;
    - stale or guessed Mathlib status → `mathcheck`.
 4. Enqueue a bounded wave. Queue operations deduplicate; never double-run engine
@@ -189,6 +204,13 @@ engine's escalation cap.
 
 ## Completion
 
+Run the deterministic completion gate through the plugin environment:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/check_completion.py" "$DISPATCH_PROJECT"
+```
+
 Before reporting completion:
 
 - `dispatch_queue.py <project> mine` is empty;
@@ -196,6 +218,10 @@ Before reporting completion:
 - no proof was accepted without the shared verification gate;
 - the activity feed mirrors actual state;
 - remaining blocked frontier and provider-specific failures are explicit.
+- the deterministic completion command passes; an empty target set,
+  pending/blocked target, incomplete confirmed scope, missing Lean file,
+  stale/non-clean review, or open task is not completion;
+- the Lean project builds and the target declarations pass the axiom gate.
 
 When the user asks for a node packet, review UI, or a fresh score without a
 full autonomous run, follow `internal/runbooks/review.md` directly and perform

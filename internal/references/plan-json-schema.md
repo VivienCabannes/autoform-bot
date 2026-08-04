@@ -43,13 +43,21 @@ Schema version. Currently `2`. Increment on breaking changes.
 {
   "created_at": "2026-06-10T14:30:00Z",
   "last_updated": "2026-06-10T15:45:00Z",
+  "lean_root": "/absolute/path/to/lean-project",
+  "confirmed_scope": ["scalar.weighted_hoeffding"],
   "sources": [
     {"file": "sources/high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
   ]
 }
 ```
 
-`created_at` and `last_updated` are ISO 8601 timestamps. `sources` lists the textbooks the plan is built from; each entry has `file` (the book's path in the plan's `sources/` subfolder), `title`, and `format` (one of `"latex"`, `"markdown"`, `"pdf"`).
+`created_at` and `last_updated` are ISO 8601 timestamps. `lean_root` is the Lean
+project directory recorded by setup; target `lean_file` paths are relative to
+it. `confirmed_scope` is the nonempty ordered list of stable target ids approved
+by the user; completion requires an exact match with target `roadmap_id` values.
+`sources` lists the textbooks the plan is built from; each entry has `file`
+(the book's path in the plan's `sources/` subfolder), `title`, and `format` (one
+of `"latex"`, `"markdown"`, `"pdf"`).
 
 ## Node (structural) fields
 
@@ -70,6 +78,22 @@ Every node — whatever its tier — has the same shape. The fields below are *s
 | `mathlib_notes` | string | Free text on the Mathlib correspondence: generality or naming differences, how to import it, why the match is partial. |
 | `source_refs` | array | **Internal provenance only — never rendered** in the published content. Records where the concept appears in the sources, for faithfulness-checking. Each entry has `file` and `location` (free text: chapter, section, page). |
 | `content` | string or null | Path to this node's prose file, e.g. `"informal_content/markovs-inequality.md"`. `null` until the prose has been written. |
+| `proof_status` | string, optional | Marks an explicit formalization target. One of `"pending"`, `"proved"`, or `"blocked"`. Omit it on planning-only nodes. A run is complete only when at least one target exists and every target is `"proved"`. |
+| `lean_file` | string, required on targets | Path to the target's Lean source file, relative to `metadata.lean_root`, e.g. `"Concentration/Scalar/Hoeffding.lean"`. Omit it on planning-only nodes. |
+| `lean_declarations` | array of strings, required on targets | Project declarations that realize this target. This is distinct from `mathlib_declarations`, which records reusable upstream API. |
+| `spec_status` | string, required on targets | `"draft"` while the exact Lean statement or dependencies still need audit; `"ready"` only when the target packet is precise enough for a proof worker. |
+| `roadmap_id` | string, required for roadmap targets | Stable identifier copied from the repository roadmap, e.g. `"scalar.weighted_hoeffding"`. It binds the English graph node to `metadata.confirmed_scope`. |
+
+`proof_status` is the target marker; there is no separate target list. The
+deterministic completion gate (`scripts/check_completion.py`) also requires each
+target's `lean_file` to exist, its `review_status.json` AI verdict to be
+`"clean"`, its `spec_status` to be `"ready"`, its expected declarations to be
+named, and every queue task to be closed. Human review does not substitute for
+the AI verdict in this machine-completion check.
+
+Completion requires every `confirmed_scope` id to appear on exactly one explicit
+target as `roadmap_id`, with no extra targets. This prevents a partially imported
+roadmap from producing a vacuous COMPLETE result.
 
 ### What is *not* a field
 

@@ -149,6 +149,8 @@ def prove(
     judge_policy: str = "auto",
     max_gate_folds: int = 1,
     triggers: TriggerEngine | None = None,
+    expected_files: list[str] | None = None,
+    expected_declarations: list[str] | None = None,
 ) -> ProofResult:
     """Drive ``adapter`` to prove ``node`` against ``spec``, steering as needed.
 
@@ -317,7 +319,12 @@ def prove(
     # backend can report a sorry'd or non-compiling file as proved.
     folds = 0
     while True:
-        gate = verifier(node, project_dir, baseline=baseline)
+        verify_kwargs: dict[str, Any] = {"baseline": baseline}
+        if expected_files:
+            verify_kwargs["expected_files"] = expected_files
+        if expected_declarations:
+            verify_kwargs["expected_declarations"] = expected_declarations
+        gate = verifier(node, project_dir, **verify_kwargs)
         result.meta = {**(result.meta or {}), "verify": gate.checks}
         if folds:
             result.meta["gate_folds"] = folds

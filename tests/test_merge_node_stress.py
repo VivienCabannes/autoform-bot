@@ -103,6 +103,20 @@ def test_prerequisite_and_dependent_can_land_in_one_atomic_payload(tmp_path: Pat
     assert nodes["dependent"]["depends_on"] == ["prerequisite"]
 
 
+def test_metadata_patch_records_confirmed_scope_with_node_merge(tmp_path: Path):
+    graph = _graph(tmp_path)
+    result = mn.merge(
+        str(graph),
+        {
+            "metadata": {"confirmed_scope": ["scalar.weighted_hoeffding"]},
+            "upsert": {"weighted": _node("weighted")},
+        },
+    )
+    saved = json.loads(graph.read_text())
+    assert saved["metadata"]["confirmed_scope"] == ["scalar.weighted_hoeffding"]
+    assert result["metadata_updated"] == 1
+
+
 def test_delete_strips_dependencies_and_explicitly_orphans_children(tmp_path: Path):
     graph = _graph(
         tmp_path,

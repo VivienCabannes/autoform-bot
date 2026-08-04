@@ -11,7 +11,8 @@ Payload (JSON, from --payload FILE or stdin):
 
     {
       "upsert": {"<id>": {<node record>}, ...},   # or a list of node records
-      "delete": ["<id>", ...]                      # optional
+      "delete": ["<id>", ...],                     # optional
+      "metadata": {"confirmed_scope": [...]}       # optional shallow patch
     }
 
 A node record is a structural node object as described in
@@ -114,12 +115,19 @@ def merge(graph_path: str, payload: dict) -> dict:
     if len(raw_deletes) != len(set(raw_deletes)):
         raise ValueError("'delete' contains duplicate node ids")
     deletes = list(raw_deletes)
+    metadata_patch = payload.get("metadata", {})
+    if not isinstance(metadata_patch, dict):
+        raise ValueError("'metadata' must be an object")
 
     with open(graph_path, encoding="utf-8") as f:
         graph = json.load(f)
     nodes = graph.setdefault("nodes", {})
     if not isinstance(nodes, dict):
         raise ValueError("graph.json must contain a nodes object")
+    metadata = graph.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("graph.json metadata must be an object")
+    metadata.update(metadata_patch)
 
     for nid in deletes:
         nodes.pop(nid, None)
@@ -167,6 +175,7 @@ def merge(graph_path: str, payload: dict) -> dict:
     return {
         "upserted": len(upserts),
         "deleted": len(deletes),
+        "metadata_updated": len(metadata_patch),
         "stripped_edges": stripped,
         "orphaned_children": orphaned,
         "total_nodes": len(nodes),
@@ -190,7 +199,7 @@ def main(argv=None) -> int:
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         print(f"merge rejected: {error}", file=sys.stderr)
         return 2
-    if not payload.get("upsert") and not payload.get("delete"):
+    if not payload.get("upsert") and not payload.get("delete") and not payload.get("metadata"):
         print("nothing to merge (empty payload)", file=sys.stderr)
         return 0
 
@@ -212,7 +221,7 @@ def main(argv=None) -> int:
 
     msg = (
         f"merged: +{result['upserted']} upsert, -{result['deleted']} delete, "
-        f"{result['total_nodes']} nodes total"
+        f"{result['metadata_updated']} metadata field(s), {result['total_nodes']} nodes total"
     )
     if result["stripped_edges"]:
         edges = ", ".join(f"{a} -> {b}" for a, b in result["stripped_edges"])

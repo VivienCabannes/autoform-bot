@@ -153,13 +153,111 @@ def test_unverifiable_when_probe_has_no_report():
     assert not r.ok and r.checks["kernel"] == "unverified"
 
 
-def test_no_decls_passes_after_build():
+def test_no_decls_fails_after_build():
     # A module that owns no checkable declarations: the env probe completes (sentinel)
-    # and reports zero decls → treated as clean/no-decls.
+    # but there is no formalization target for the gate to certify.
     r = verify_proof("N", "/p", has_lakefile=True, touched=["A.lean"],
                      reader=lambda p: "import Foo.Bar\nnamespace X\nend X", builder=_CLEAN_BUILD,
                      prober=lambda probe, pdir: (0, "AUTOFORM_PROBE_OK decls=0"))
-    assert r.ok and r.checks["kernel"] == "no-decls"
+    assert not r.ok and r.checks["kernel"] == "no-decls"
+
+
+def test_expected_target_file_must_be_attributable_to_run():
+    r = verify_proof(
+        "N",
+        "/p",
+        has_lakefile=True,
+        touched=["Other.lean"],
+        expected_files=["Target.lean"],
+        reader=lambda p: "theorem other : True := by trivial",
+        builder=_CLEAN_BUILD,
+        prober=_CLEAN_PROBE,
+    )
+    assert not r.ok and r.checks["target_file"] == "untouched"
+
+
+def test_expected_target_declarations_must_be_in_kernel_report():
+    r = verify_proof(
+        "N",
+        "/p",
+        has_lakefile=True,
+        touched=["Target.lean"],
+        expected_files=["Target.lean"],
+        expected_declarations=["ProbabilityTheory.target"],
+        reader=lambda p: "theorem other : True := by trivial",
+        builder=_CLEAN_BUILD,
+        prober=lambda probe, pdir: (
+            0,
+            "'ProbabilityTheory.other' does not depend on any axioms\n"
+            "AUTOFORM_PROBE_OK decls=1",
+        ),
+    )
+    assert not r.ok and r.checks["kernel"] == "missing-declaration"
+
+
+def test_expected_target_declarations_pass_when_kernel_reports_them():
+    r = verify_proof(
+        "N",
+        "/p",
+        has_lakefile=True,
+        touched=["Target.lean"],
+        expected_files=["Target.lean"],
+        expected_declarations=["ProbabilityTheory.target"],
+        reader=lambda p: "theorem target : True := by trivial",
+        builder=_CLEAN_BUILD,
+        prober=lambda probe, pdir: (
+            0,
+            "'ProbabilityTheory.target' depends on axioms: [propext]\n"
+            "AUTOFORM_PROBE_OK decls=1",
+        ),
+    )
+    assert r.ok and r.checks["kernel"] == "clean"
+
+
+def test_off_target_declaration_edits_are_rejected():
+    def reader(path):
+        if str(path).endswith("Target.lean"):
+            return "theorem target : True := by trivial"
+        return "theorem unrelated : True := by trivial"
+
+    r = verify_proof(
+        "N",
+        "/p",
+        has_lakefile=True,
+        touched=["Target.lean", "Other.lean"],
+        expected_files=["Target.lean"],
+        expected_declarations=["target"],
+        reader=reader,
+        builder=_CLEAN_BUILD,
+        prober=lambda probe, pdir: (
+            0,
+            "'target' does not depend on any axioms\nAUTOFORM_PROBE_OK decls=1",
+        ),
+    )
+    assert not r.ok and r.checks["kernel"] == "off-target-declarations"
+
+
+def test_import_only_auxiliary_file_is_allowed():
+    def reader(path):
+        if str(path).endswith("Target.lean"):
+            return "theorem target : True := by trivial"
+        return "import Target"
+
+    r = verify_proof(
+        "N",
+        "/p",
+        has_lakefile=True,
+        touched=["Target.lean", "Root.lean"],
+        expected_files=["Target.lean"],
+        expected_declarations=["target"],
+        reader=reader,
+        builder=_CLEAN_BUILD,
+        prober=lambda probe, pdir: (
+            0,
+            "'target' does not depend on any axioms\nAUTOFORM_PROBE_OK decls=1",
+        ),
+    )
+    assert r.ok
 
 
 def test_build_probe_enumerates_from_environment():
@@ -171,9 +269,61 @@ def test_build_probe_enumerates_from_environment():
     probe, mods = _build_probe(["Foo/Bar.lean", "Foo/Bar.lean"], "/proj")
     assert mods == ["Foo.Bar"]
     assert "import Lean" in probe and "import Foo.Bar" in probe
-    assert "collectAxiomsCompat" in probe and "getModuleIdxFor?" in probe
-    assert "AutoformVerify.axiomsOf env nm" in probe
+    assert "let axs ← collectAxioms nm" in probe and "getModuleIdxFor?" in probe
     assert "AUTOFORM_PROBE_OK" in probe
+
+
+def test_probe_has_compatibility_axiom_collector_for_older_lean():
+    from servers.prover.verify import _build_probe
+
+    probe, mods = _build_probe(["Foo/Bar.lean"], "/proj", compat_axioms=True)
+    assert mods == ["Foo.Bar"]
+    assert "collectAxiomsCompat" in probe
+    assert "AutoformVerify.axiomsOf env nm" in probe
+
+
+def test_whole_module_probe_checks_exact_declaration_owner():
+    from servers.prover.verify import _build_probe
+
+    probe, modules = _build_probe(
+        ["Project/Target.lean"],
+        "/repo",
+        expected_declarations=["Project.target"],
+    )
+    assert modules == ["Project.Target"]
+    assert "for (nm, _ci) in env.constants.toList" in probe
+    assert "let axs ← collectAxioms nm" in probe
+    assert "env.getModuleIdxFor? decl" in probe
+    assert "idxs.contains actual" in probe
+    assert "AUTOFORM_EXPECTED_DECL_OK {decl}" in probe
+    assert "AUTOFORM_PROBE_OK decls={n}" in probe
+
+
+def test_expected_declaration_marker_handles_apostrophe_names():
+    from servers.prover.verify import _declarations_in_report
+
+    assert _declarations_in_report("AUTOFORM_EXPECTED_DECL_OK Project.target'") == {
+        "Project.target'"
+    }
+
+
+def test_unreadable_attributable_file_fails_closed():
+    def reader(path):
+        if str(path).endswith("Target.lean"):
+            return "theorem target : True := by trivial"
+        raise OSError("vanished")
+
+    r = verify_proof(
+        "N",
+        "/p",
+        has_lakefile=True,
+        touched=["Target.lean", "Vanished.lean"],
+        expected_files=["Target.lean"],
+        reader=reader,
+        builder=_CLEAN_BUILD,
+        prober=_CLEAN_PROBE,
+    )
+    assert not r.ok and r.checks["source_read"] == "error"
 
 
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lean/Lake is not installed")
@@ -386,6 +536,28 @@ def test_driver_passes_real_proved():
     res = prove(_FakeAdapter("proved"), "N", "spec", "/p", max_steers=0,
                 verifier=lambda node, pdir, baseline=None: VerifyResult(True, "", {"verified": True, "kernel": "clean"}))
     assert res.status == "proved" and res.meta["verify"]["kernel"] == "clean"
+
+
+def test_driver_forwards_expected_target_contract():
+    seen = {}
+
+    def verifier(node, project_dir, **kwargs):
+        seen.update(kwargs)
+        return VerifyResult(True, "", {"verified": True, "kernel": "clean"})
+
+    res = prove(
+        _FakeAdapter("proved"),
+        "N",
+        "spec",
+        "/p",
+        max_steers=0,
+        verifier=verifier,
+        expected_files=["Target.lean"],
+        expected_declarations=["ProbabilityTheory.target"],
+    )
+    assert res.status == "proved"
+    assert seen["expected_files"] == ["Target.lean"]
+    assert seen["expected_declarations"] == ["ProbabilityTheory.target"]
 
 
 def test_driver_gate_only_runs_on_proved():

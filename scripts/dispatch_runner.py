@@ -44,17 +44,22 @@ import review_model as rm  # noqa: E402  # load_sidecar / save_sidecar / jury_ve
 import dispatch_queue as dq  # noqa: E402  # _save / _feed_for / _now
 import backend_config  # noqa: E402  # user-facing backend selection
 import judge_runtime  # noqa: E402  # structured jury across CLI/API providers
+import merge_node  # noqa: E402  # locked graph writer
+import target_state  # noqa: E402  # proof/review freshness fingerprints
 try:
     from servers.prover.driver import prove as _prove
     from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
     from servers.prover.steerer import Steerer as _Steerer
+    from servers.prover.verify import verify_proof as _verify_existing_proof
     try:
         from servers.aristotle.core import build_node_spec as _build_node_spec
     except Exception:
         _build_node_spec = None
     _PROVER_OK, _PROVER_ERR = True, ""
 except Exception as _e:                 # prover deps absent → --workers reports it cleanly
-    _PROVER_OK, _PROVER_ERR, _build_node_spec = False, str(_e), None
+    _PROVER_OK, _PROVER_ERR, _build_node_spec, _verify_existing_proof = (
+        False, str(_e), None, None
+    )
 
 # The jury axes + rubrics come from review_model — the SINGLE SOURCE OF TRUTH
 # (internal/rubrics/*.json). Add/remove a rubric file and the jury here
@@ -109,10 +114,85 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _nearest_lean_root(project: Path) -> Path:
+    """Nearest project/ancestor with a lakefile; the dispatch project otherwise."""
+    project = project.resolve()
+    for candidate in (project, *project.parents):
+        if (candidate / "lakefile.toml").is_file() or (candidate / "lakefile.lean").is_file():
+            return candidate
+    return project
+
+
+def _mark_proof_verified(
+    graph_path: Path,
+    project: Path,
+    lean_root: Path,
+    node_id: str,
+    expected_spec_fingerprint: str,
+) -> None:
+    """Durably mark one explicit proof target after the shared kernel gate passes."""
+    lock_path = Path(str(graph_path) + ".lock")
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        node = graph.get("nodes", {}).get(node_id)
+        if not isinstance(node, dict):
+            raise ValueError(f"cannot mark absent graph node {node_id!r} proved")
+        current_spec = target_state.spec_fingerprint(project, node_id, node)
+        if current_spec != expected_spec_fingerprint:
+            raise ValueError("target specification changed while the proof worker was running")
+        if node.get("spec_status") != "ready" or node.get("proof_status") != "pending":
+            raise ValueError("target lifecycle changed while the proof worker was running")
+        updated = dict(node)
+        updated["proof_status"] = "proved"
+        updated["proof_verified_at"] = _now()
+        updated["proof_fingerprint"] = target_state.artifact_fingerprint(
+            project, lean_root, node_id, node
+        )
+        merge_node.merge(str(graph_path), {"upsert": {node_id: updated}})
+
+
+def _mark_proof_blocked(
+    graph_path: Path,
+    project: Path,
+    node_id: str,
+    expected_spec_fingerprint: str,
+) -> None:
+    """Make escalation exhaustion durable so the orchestrator cannot requeue forever."""
+    lock_path = Path(str(graph_path) + ".lock")
+    with lock_path.open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        node = graph.get("nodes", {}).get(node_id)
+        if not isinstance(node, dict) or "proof_status" not in node:
+            return
+        if (
+            node.get("proof_status") != "pending"
+            or node.get("spec_status") != "ready"
+            or target_state.spec_fingerprint(project, node_id, node)
+            != expected_spec_fingerprint
+        ):
+            raise ValueError("target changed before escalation block could be recorded")
+        updated = dict(node)
+        updated["proof_status"] = "blocked"
+        updated["proof_blocked_at"] = _now()
+        merge_node.merge(str(graph_path), {"upsert": {node_id: updated}})
+
+
+def _invalidate_ai_review(sidecar_path: Path, node_id: str) -> None:
+    """Remove only the stale AI slot after a verified proof changes target code."""
+    with fslock.locked(sidecar_path):
+        sidecar = rm.load_sidecar(sidecar_path)
+        review = sidecar.get("reviews", {}).get(node_id)
+        if isinstance(review, dict) and "ai" in review:
+            del review["ai"]
+            rm.save_sidecar(sidecar_path, sidecar)
+
+
 def build_prompt(rubric: dict, node_id: str, node: dict, content_text: str) -> str:
     """Fill the rubric's prompt_template from the node's graph data + prose."""
     crit = "\n".join(f"{k}: {v}" for k, v in rubric["criteria"].items())
-    decls = ", ".join(node.get("mathlib_declarations") or []) \
+    decls = ", ".join(node.get("lean_declarations") or node.get("mathlib_declarations") or []) \
         or "(the declaration names are listed in the node content below — find them in the repo)"
     loc = "; ".join(
         f'{r.get("file", "")}:{r.get("location", "")}' for r in (node.get("source_refs") or [])
@@ -123,7 +203,7 @@ def build_prompt(rubric: dict, node_id: str, node: dict, content_text: str) -> s
         location=loc,
         description=content_text or node.get("description", ""),
         lean_declaration=decls,
-        lean_file=node.get("mathlib_file", "(search the repo)"),
+        lean_file=node.get("lean_file") or node.get("mathlib_file", "(search the repo)"),
         id=node_id,
         criteria=crit,
         axioms="(not supplied — derive it yourself with `#print axioms` via `lake env lean`)",
@@ -183,6 +263,24 @@ def _worker_adapter(
     )
 
 
+def _verify_existing_target(node_id: str, node: dict, repo: str):
+    """Kernel-check an already present target before spending a prover run."""
+    lean_file = node.get("lean_file")
+    declarations = node.get("lean_declarations") or []
+    if not lean_file or _verify_existing_proof is None:
+        return None
+    target = target_state.target_lean_file(Path(repo), node_id, node)
+    if not target.is_file():
+        return None
+    return _verify_existing_proof(
+        node_id,
+        repo,
+        touched=[str(lean_file)],
+        expected_files=[str(lean_file)],
+        expected_declarations=list(declarations),
+    )
+
+
 def run_worker(
     node_id: str,
     node: dict,
@@ -230,7 +328,9 @@ def run_worker(
         )
         res = _prove(_worker_adapter(backend, repo, graph_path, worker_timeout),
                      node_id, spec, repo, max_steers=max_steers,
-                     steerer=steer_judge)
+                     steerer=steer_judge,
+                     expected_files=([node["lean_file"]] if node.get("lean_file") else None),
+                     expected_declarations=(node.get("lean_declarations") or None))
         # The MCP prover records usage itself, but the deterministic dispatcher
         # calls the shared driver directly. Keep both entry points on the same
         # append-only ledger contract.
@@ -415,12 +515,15 @@ def _run_dispatch(a) -> int:
     _ACTIVE_JUDGE_BACKEND = a.judge_backend
 
     proj = a.project
-    graph = json.loads((proj / "graph.json").read_text())
-    nodes = graph.get("nodes", {})
+    graph_path = proj / "graph.json"
+    graph = json.loads(graph_path.read_text())
     sidecar_path = proj / "review_status.json"
     queue_path = proj / "task_queue.json"
     feed_path = proj / "agents_status.json"
-    repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
+    configured_root = graph.get("metadata", {}).get("lean_root")
+    if configured_root and not Path(str(configured_root)).is_absolute():
+        configured_root = str((proj / str(configured_root)).resolve())
+    repo = str(a.repo or configured_root or _nearest_lean_root(proj))
 
     try:
         dq.load_queue(queue_path)
@@ -449,6 +552,10 @@ def _run_dispatch(a) -> int:
         return 0
 
     _rubric_warned = [False]                # one diagnostic per bad state, not per poll
+
+    def current_nodes() -> dict:
+        """Read the latest graph snapshot for each drain/task in watch mode."""
+        return json.loads(graph_path.read_text()).get("nodes", {})
 
     def usable_rubrics():
         """Reload + validate the rubrics BEFORE any task is claimed.
@@ -490,6 +597,7 @@ def _run_dispatch(a) -> int:
         rubrics = usable_rubrics()          # validate BEFORE claiming anything
         if rubrics is None:
             return 0                        # tasks stay queued — nothing was claimed
+        nodes = current_nodes()             # graph may grow between watch polls
         # Load-mutate-save cycles on the queue run under the cross-process lock —
         # the dashboard enqueues/cancels in the same file concurrently.
         with fslock.locked(queue_path):
@@ -507,6 +615,7 @@ def _run_dispatch(a) -> int:
             dq.sync_feed(feed_path, queue)
 
         results: dict[str, dict] = {t["id"]: {} for t in rev}
+        review_fingerprints: dict[str, str] = {}
         lock = threading.Lock()
 
         def finalize(tid: str, node_id: str) -> None:
@@ -521,10 +630,31 @@ def _run_dispatch(a) -> int:
             # about gaps (a missing axis blocks 'clean', a present failing correctness
             # axis rejects) — a judge timeout must never DOWNGRADE rejected→flagged.
             verdict = rm.jury_verdict(usable)
+            fingerprint = review_fingerprints.get(tid)
+            if fingerprint is not None:
+                current = current_nodes().get(node_id)
+                if not isinstance(current, dict):
+                    fail_task(tid, "target disappeared while review was running")
+                    return
+                try:
+                    current_fingerprint = target_state.artifact_fingerprint(
+                        proj, Path(repo), node_id, current
+                    )
+                except target_state.TargetStateError as error:
+                    fail_task(tid, str(error))
+                    return
+                if (
+                    current_fingerprint != fingerprint
+                    or current.get("proof_fingerprint") != fingerprint
+                ):
+                    fail_task(tid, "target changed while review was running")
+                    return
             with fslock.locked(sidecar_path):       # vs the dashboard's human verdicts
                 sc = rm.load_sidecar(sidecar_path)
                 sc["reviews"].setdefault(node_id, {})["ai"] = {
-                    **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner"}
+                    **scores, "verdict": verdict, "at": _now(), "source": "dispatch:runner",
+                    **({"fingerprint": fingerprint} if fingerprint is not None else {}),
+                }
                 rm.save_sidecar(sidecar_path, sc)   # preserves any human slot
             with fslock.locked(queue_path):         # re-read: new drops may have arrived
                 cur = dq.load_queue(queue_path)
@@ -541,6 +671,13 @@ def _run_dispatch(a) -> int:
             for t in rev:
                 try:                        # per-task: a bad node/prompt fails THAT task
                     node = nodes.get(t["node"], {})
+                    if node.get("proof_status") == "proved":
+                        fingerprint = target_state.artifact_fingerprint(
+                            proj, Path(repo), t["node"], node
+                        )
+                        if node.get("proof_fingerprint") != fingerprint:
+                            raise ValueError("proved target fingerprint is missing or stale")
+                        review_fingerprints[t["id"]] = fingerprint
                     content_text = ""
                     if node.get("content") and (proj / node["content"]).exists():
                         content_text = (proj / node["content"]).read_text()
@@ -586,6 +723,39 @@ def _run_dispatch(a) -> int:
     def _drain_one_worker(t: dict) -> int:
         """Claim + prove one queued worker task; returns 1 when it was handled
         (proved / failed / blocked), 0 when skipped (open escalation)."""
+        nodes = current_nodes()             # each serial worker gets the latest graph
+        node = nodes.get(t["node"], {})
+        expected_spec_fingerprint = None
+        if "proof_status" in node:
+            declarations = node.get("lean_declarations")
+            roadmap_id = node.get("roadmap_id")
+            try:
+                target_state.target_lean_file(Path(repo), t["node"], node)
+            except target_state.TargetStateError as error:
+                fail_task(t["id"], str(error))
+                return 1
+            if not isinstance(declarations, list) or not declarations or not all(
+                isinstance(name, str) and name.strip() for name in declarations
+            ):
+                fail_task(t["id"], "explicit target has no non-empty lean_declarations")
+                return 1
+            if not isinstance(roadmap_id, str) or not roadmap_id:
+                fail_task(t["id"], "explicit target has no non-empty roadmap_id")
+                return 1
+        if "proof_status" in node and (
+            node.get("spec_status") != "ready" or node.get("proof_status") != "pending"
+        ):
+            fail_task(
+                t["id"],
+                "target is not proof-ready: expected spec_status='ready' and "
+                f"proof_status='pending', got spec_status={node.get('spec_status')!r} "
+                f"proof_status={node.get('proof_status')!r}",
+            )
+            return 1
+        if "proof_status" in node:
+            expected_spec_fingerprint = target_state.spec_fingerprint(proj, t["node"], node)
+        cap_hit = False
+        capped_escalations = 0
         with fslock.locked(queue_path):     # re-read (new drops/escalations) + claim
             c = dq.load_queue(queue_path)
             current = next((x for x in c if x.get("id") == t.get("id")), None)
@@ -596,27 +766,64 @@ def _run_dispatch(a) -> int:
             if any(e.get("status") in ("queued", "running") for e in escs):
                 return 0                  # an open escalation on this node — leave it queued, skip
             if len(escs) >= a.max_escalations:        # cap hit — stop re-proving a hard node
+                cap_hit = True
+                capped_escalations = len(escs)
                 for x in c:
                     if x["id"] == t["id"]:
                         x["status"], x["finished_at"] = "failed", dq._now()
                         x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
                 dq._save(queue_path, c)
                 dq.sync_feed(feed_path, c)
-                print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
-                return 1
-            for x in c:                                                 # claim
-                if x["id"] == t["id"]:
-                    x["status"], x["started_at"] = "running", dq._now()
-            dq._save(queue_path, c)
-            dq.sync_feed(feed_path, c)
-        print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
-        status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                            str(proj / "graph.json"), repo, a.max_steers,
-                                            backend=backend_config.prover_of(a.backend),
-                                            judge_backend=a.judge_backend,
-                                            judge_model=a.model,
-                                            judge_timeout=min(a.timeout, 180),
-                                            worker_timeout=a.timeout)
+            else:
+                for x in c:                                             # claim
+                    if x["id"] == t["id"]:
+                        x["status"], x["started_at"] = "running", dq._now()
+                dq._save(queue_path, c)
+                dq.sync_feed(feed_path, c)
+        if cap_hit:
+            assert expected_spec_fingerprint is not None or "proof_status" not in node
+            if expected_spec_fingerprint is not None:
+                _mark_proof_blocked(
+                    graph_path, proj, t["node"], expected_spec_fingerprint
+                )
+            print(
+                f"  ⛔ worker {t['node']:24} → BLOCKED "
+                f"({capped_escalations} escalations, capped)",
+                flush=True,
+            )
+            return 1
+        existing_gate = (
+            _verify_existing_target(t["node"], node, repo)
+            if not node.get("proof_fingerprint")
+            else None
+        )
+        if existing_gate is not None and existing_gate.ok:
+            print(f"  ✓ existing target → {t['node']} (kernel gate clean)", flush=True)
+            status, reason, detail = "proved", "existing target verified", ""
+        else:
+            print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
+            status, reason, detail = run_worker(t["node"], node, proj,
+                                                str(proj / "graph.json"), repo, a.max_steers,
+                                                backend=backend_config.prover_of(a.backend),
+                                                judge_backend=a.judge_backend,
+                                                judge_model=a.model,
+                                                judge_timeout=min(a.timeout, 180),
+                                                worker_timeout=a.timeout)
+        explicit_target = "proof_status" in nodes.get(t["node"], {})
+        if status == "proved" and explicit_target:
+            try:
+                _invalidate_ai_review(sidecar_path, t["node"])
+                assert expected_spec_fingerprint is not None
+                _mark_proof_verified(
+                    graph_path,
+                    proj,
+                    Path(repo),
+                    t["node"],
+                    expected_spec_fingerprint,
+                )
+            except Exception as error:
+                status = "failed"
+                reason = f"proof landed but durable completion update failed: {error}"
         with fslock.locked(queue_path):     # finish (re-read for new drops)
             c = dq.load_queue(queue_path)
             for x in c:
@@ -624,7 +831,24 @@ def _run_dispatch(a) -> int:
                     x["status"] = "done" if status == "proved" else "failed"
                     x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
             escalated = False
-            if status != "proved":      # hand the worker's wall to the orchestrator — it decides, not us
+            if status == "proved" and explicit_target:
+                if not any(
+                    x.get("agent") == "reviewer"
+                    and x.get("node") == t["node"]
+                    and x.get("status") in ("queued", "running")
+                    for x in c
+                ):
+                    c.append({
+                        "id": dq.new_task_id("reviewer", t["node"], c),
+                        "agent": "reviewer",
+                        "node": t["node"],
+                        "node_label": (nodes.get(t["node"], {}).get("description")
+                                       or t["node"])[:60],
+                        "status": "queued",
+                        "at": dq._now(),
+                        "source": "engine:verified-proof",
+                    })
+            elif status != "proved":  # hand the worker's wall to the orchestrator — it decides, not us
                 lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
                 escalated = _raise_escalation(c, t["node"], lbl,
                                               _escalation_note(reason, detail), a.max_escalations)

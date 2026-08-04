@@ -68,6 +68,19 @@ A good first move is `/autoform:setup`. Natural-language requests such as
 instead of adding commands. Requests such as “review this node,” “prove this
 theorem,” or “search Zulip” stay inside Orchestrate.
 
+For a repository that already has a roadmap, one Codex prompt can cover both
+skills:
+
+```text
+Use AutoformBot to finish this repository's formalization roadmap. Treat
+ROADMAP.md and its linked target packets as the confirmed source and scope.
+Set up or resume the plan, then keep orchestrating with the Codex backend until
+the confirmed scope is complete or a concrete blocker genuinely needs me.
+```
+
+Autoform records the confirmed roadmap ids, exact Lean targets, proof and review
+fingerprints, and durable queue state before it can report completion.
+
 ## 4. Optional unlocks
 
 **Zulip search** — create `~/.zuliprc` (API key from
