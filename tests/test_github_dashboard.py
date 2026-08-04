@@ -142,6 +142,8 @@ def test_static_export_is_deterministic_and_allowlisted(tmp_path):
     assert "/api/" not in artifact
     assert "save human verdict" not in artifact
     assert "X-Review-Token" not in artifact
+    assert "rel='icon' type='image/svg+xml' href='assets/autoform-small.svg'" in artifact
+    assert "class='af-brand-mark' src='assets/autoform-small.svg'" in artifact
     for secret in (
         "SECRET_LOCAL_PATH",
         "SECRET_PROVIDER",
@@ -198,6 +200,7 @@ def test_export_remains_complete_after_plugin_cache_is_deleted(tmp_path):
             assert resolved == site.resolve() or site.resolve() in resolved.parents
             assert resolved.exists(), (page, target)
     assert (site / "data/state.json").is_file()
+    assert (site / "assets/autoform-small.svg").read_bytes() == exporter.BRAND_ASSET.read_bytes()
     assert (site / "assets/static_dashboard.js").is_file()
     assert "/api/" not in (site / "assets/static_dashboard.js").read_text()
 

@@ -52,7 +52,8 @@ OPERATIONAL_FILENAMES = frozenset(
         "formalization.yaml",
     }
 )
-ASSET_NAMES = ("static_dashboard.css", "static_dashboard.js")
+ASSET_NAMES = ("review.css", "static_dashboard.css", "static_dashboard.js")
+BRAND_ASSET = REPO_ROOT / "assets" / "autoform-small.svg"
 _INCOMPLETE = re.compile(r"\b(?:sorry|admit|sorryAx)\b")
 
 
@@ -385,11 +386,16 @@ def _page(title: str, body: str, *, depth: int, mathjax: bool = False, state_url
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{html.escape(title)}</title>"
+        f"<link rel='icon' type='image/svg+xml' href='{prefix}assets/{BRAND_ASSET.name}'>"
         f"<link rel='stylesheet' href='{prefix}assets/review.css'>"
         f"<link rel='stylesheet' href='{prefix}assets/static_dashboard.css'>"
         f"{scripts}</head><body class='af-static'>"
-        f"<header class='af-site-header'><a href='{prefix}'>Autoform</a>"
-        f"<span>{html.escape(title)}</span><strong>read-only snapshot</strong></header>"
+        f"<header class='af-site-header'><a class='af-brand' href='{prefix}' "
+        "aria-label='Autoform dashboard'>"
+        f"<img class='af-brand-mark' src='{prefix}assets/{BRAND_ASSET.name}' "
+        "width='24' height='24' alt=''><span>Autoform</span></a>"
+        f"<span class='af-site-title'>{html.escape(title)}</span>"
+        "<strong>read-only snapshot</strong></header>"
         f"<main class='af-site-main'>{body}</main></body></html>"
     ).encode("utf-8")
 
@@ -552,11 +558,14 @@ def export_site(graph_path: Path, output: Path, repo_root: Path, *, git_commit: 
                 _render_cluster_page(cluster, node_by_id),
             )
         asset_root = REPO_ROOT / "assets" / "review"
-        for name in ("review.css", *ASSET_NAMES):
+        for name in ASSET_NAMES:
             source = asset_root / name
             if not source.is_file():
                 raise ExportError(f"required dashboard asset is missing: {name}")
             _write(stage / "assets" / name, source.read_bytes())
+        if not BRAND_ASSET.is_file():
+            raise ExportError(f"required dashboard asset is missing: {BRAND_ASSET.name}")
+        _write(stage / "assets" / BRAND_ASSET.name, BRAND_ASSET.read_bytes())
 
         if output.exists():
             if not output.is_dir():

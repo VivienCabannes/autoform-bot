@@ -39,14 +39,29 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 /* --- header --- */
 .rv-header {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 14px;
   padding: 10px 22px;
   border-bottom: 1px solid var(--line);
   background: #fff;
 }
-.rv-home { font-weight: 700; color: var(--accent); }
-.rv-title { color: #6c665a; font-size: 13px; }
+.rv-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--accent);
+  font-weight: 700;
+  text-decoration: none;
+}
+.rv-brand-mark { display: block; width: 24px; height: 24px; flex: 0 0 24px; }
+.rv-title {
+  min-width: 0;
+  overflow: hidden;
+  color: #6c665a;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .rv-main { padding: 18px 22px; max-width: 1180px; margin: 0 auto; }
 
 /* --- home: header bar (coverage + frontier + dial) --- */

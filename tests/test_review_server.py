@@ -46,6 +46,14 @@ def _boot(html: bytes) -> str:
     return text[start:end]
 
 
+def test_shared_page_uses_autoform_mark_for_header_and_favicon():
+    html = sv._page("dependency graph", "").decode("utf-8")
+    assert "rel='icon' type='image/svg+xml' href='/assets/autoform-small.svg'" in html
+    assert "class='rv-brand-mark' src='/assets/autoform-small.svg'" in html
+    assert "<span>Autoform</span>" in html
+    assert sv._BRAND_ICON.is_file()
+
+
 # --- tier resolution --------------------------------------------------------
 
 def test_parse_tier_defaults_to_lowest_present(tmp_path):

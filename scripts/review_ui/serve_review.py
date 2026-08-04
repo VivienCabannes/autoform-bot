@@ -64,6 +64,7 @@ import dispatch_queue as dq  # noqa: E402 — shared durable queue validation/id
 # Repo root = .../scripts/review_ui -> up two. Assets live at <root>/assets/review/.
 _REPO_ROOT = _HERE.parent.parent
 _ASSETS_DIR = _REPO_ROOT / "assets" / "review"
+_BRAND_ICON = _REPO_ROOT / "assets" / "autoform-small.svg"
 
 # Regex to pull a single built blueprint fragment <div class="thm" id="slug" ...>
 # ... </div> out of dep_graph_document.html. The exported template renders each
@@ -585,13 +586,16 @@ def _page(title: str, body: str, bootstrap: str = "") -> bytes:
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{_E(title)}</title>"
+        "<link rel='icon' type='image/svg+xml' href='/assets/autoform-small.svg'>"
         "<link rel='stylesheet' href='/assets/review.css'>"
         "<script>window.MathJax={tex:{inlineMath:[['$','$'],['\\\\(','\\\\)']],"
         "displayMath:[['$$','$$'],['\\\\[','\\\\]']]},"
         "options:{skipHtmlTags:['script','noscript','style','textarea','pre','code']}};</script>"
         "<script async src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'></script>"
         "</head><body>"
-        "<header class='rv-header'><a class='rv-home' href='/'>review</a>"
+        "<header class='rv-header'><a class='rv-home' href='/' aria-label='Autoform dashboard'>"
+        "<img class='rv-brand-mark' src='/assets/autoform-small.svg' width='24' height='24' alt=''>"
+        "<span>Autoform</span></a>"
         f"<span class='rv-title'>{_E(title)}</span></header>"
         f"<main class='rv-main'>{body}</main>"
         f"{boot}"
@@ -1328,9 +1332,9 @@ def make_handler(proj: Project):
             })
 
         def _serve_asset(self, name):
-            # Only serve files under assets/review/ (no traversal).
+            # Only serve files under assets/review/ plus the canonical brand mark.
             safe = Path(name).name
-            f = _ASSETS_DIR / safe
+            f = _BRAND_ICON if safe == _BRAND_ICON.name else _ASSETS_DIR / safe
             if not f.is_file():
                 return self._send(404, b"asset not found")
             ctype = {
