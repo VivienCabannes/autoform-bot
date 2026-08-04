@@ -26,6 +26,7 @@ rather than silently creating a second orchestration stack.
 | Aristotle MCP/server adapter | `servers/aristotle/` | Implemented, optional dependency |
 | REPL and LSP MCP servers | `servers/repl/`, `servers/lsp/` | Stubs; reference implementations are under `examples/servers/` |
 | Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json`, `hooks/hooks.json` | Implemented |
+| Distributed worker CLI (claims, rounds, auto-merge gate, role registry) | `autoform_worker/`, `./autoform` | Implemented; design contract in `docs/worker-cli.md` |
 
 Useful next contributions include production REPL/LSP implementations, an
 OpenAI Responses transport beside Chat Completions, live opt-in provider
@@ -42,6 +43,12 @@ contract tests, and additional adversarial verification fixtures.
   existing lock/atomic-save discipline.
 - Add provider behavior behind the adapter and normalized event contracts. Do
   not branch the shared driver on provider names.
+- Add agent kinds as role files (`agents/<kind>.md` with `kind:`/`drained_by:`
+  frontmatter), never as hardcoded lists — the dashboard palette, the queue's
+  accepted kinds, and the worker's `agents` stage all derive from the registry.
+- Every branch write in worker code goes through the CAS push
+  (`gitutil.safe_push` / `autoform push`); claims are cooperative and must fail
+  open, CAS must fail closed.
 - Treat model output, repository text, tool arguments, paths, and Lean source as
   untrusted data. Unknown providers and policies must fail closed.
 - Never add prompt-triggered shell execution. Session hooks may provide static
