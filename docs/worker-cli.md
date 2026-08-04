@@ -249,7 +249,9 @@ autoform work   [--loop] [--only S1,S2] [--skip S1] [--backend B] [--dry-run]
                 [--project DIR] [--worker-id ID] [--allow-api-egress P]...
                 [--review-foreign] [--merge-without-ci] [--ignore-claims]
                 [--extra-identities L1,L2]
-autoform status [--json]            # survey + claims + state snapshot
+autoform status [--json]            # survey + claims + target distance snapshot
+autoform audit  [--json] [--enqueue] [--verify-decls] [--stamp-verified]
+                                    # roadmap completeness -> queued gap tasks
 autoform agents [--json]            # the discovered role registry (agents/*.md)
 autoform claim  acquire|renew|release|holds|read|list|gc [key] [--node ID]
                 [--ttl N] [--steal]

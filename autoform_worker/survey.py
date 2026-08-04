@@ -93,6 +93,7 @@ class Survey:
     claims: list = field(default_factory=list)
     can_push: bool = False
     issues_enabled: bool = False
+    targets: dict = field(default_factory=dict)   # target id -> distance metrics
     allow_unchecked_merge: bool = False
     extra_identities: tuple = ()
 
@@ -127,6 +128,7 @@ class Survey:
                 for lease in self.claims
             ],
             "notes": self.notes,
+            "targets": self.targets,
         }
 
 
@@ -359,8 +361,22 @@ def collect(
     open_pr_nodes = {pr.node for pr in prs if pr.node}
     intentions = _intention_avoid_list(host, canonical) if survey.issues_enabled else set()
     eligible = eligible_prove_nodes(cfg)
+    # Decontend first (worker-seeded shuffle), then order by mission priority:
+    # with declared targets, in-cone nodes come first, tallest untrusted chain
+    # above them first (the critical path). The stable sort keeps ties in
+    # shuffled order so parallel workers still spread. No targets → the
+    # shuffle alone stands, as before.
     rng = random.Random(cfg.worker_id)
     rng.shuffle(eligible)
+    try:
+        graph_nodes, graph_meta = rm.load_graph(cfg.graph_path)
+        priority = rm.prove_priority(graph_nodes, sidecar, graph_meta)
+        survey.targets = {t: rm.target_metrics(t, graph_nodes, sidecar)
+                          for t in rm.graph_targets(graph_meta) if t in graph_nodes}
+    except Exception:
+        priority = {}
+    if priority:
+        eligible.sort(key=lambda item: priority.get(item[0], (2, 0))[:2])
     for node_id, _node, reason in eligible:
         if node_id in open_pr_nodes:
             push_cand("prove", Candidate("prove", "open PR already targets it", node=node_id), False)

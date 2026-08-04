@@ -133,8 +133,30 @@ def check_acyclic(nodes: dict) -> bool:
     return _report("per-tier acyclicity", offenders)
 
 
+# mathlib_status vocabulary — MIRROR of review_model.STATUS_ALIASES, kept
+# dependency-free because this script must run stdlib-only in CI. A contract
+# test (tests/test_roadmap_audit.py) asserts the two tables stay identical;
+# edit both together.
+_STATUS_ALIASES = {
+    "in-mathlib": "in-mathlib", "exists": "in-mathlib", "in_mathlib": "in-mathlib",
+    "mathlib": "in-mathlib",
+    "partial": "partial", "partially": "partial", "partial-in-mathlib": "partial",
+    "missing": "missing", "absent": "missing", "not-in-mathlib": "missing",
+}
+
+
+def _normalize_status(raw) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    return _STATUS_ALIASES.get(raw.strip().lower())
+
+
 def check_reachability(nodes: dict) -> bool:
-    """Every 'missing' node reaches an 'in-mathlib' node; roots are 'in-mathlib'."""
+    """Every 'missing' node reaches an 'in-mathlib' node; roots are 'in-mathlib'.
+
+    Statuses are NORMALIZED first — a graph written with the dashboard's
+    tolerated ``"exists"`` spelling must audit exactly the way it renders.
+    """
     # A node "grounds" if it is in-mathlib or some depends_on target grounds.
     grounded: dict[str, bool] = {}
 
@@ -145,7 +167,7 @@ def check_reachability(nodes: dict) -> bool:
             return False
         seen.add(nid)
         rec = nodes[nid]
-        if rec.get("mathlib_status") == "in-mathlib":
+        if _normalize_status(rec.get("mathlib_status")) == "in-mathlib":
             grounded[nid] = True
             return True
         result = any(
@@ -157,11 +179,13 @@ def check_reachability(nodes: dict) -> bool:
 
     unsupported = [
         nid for nid, rec in nodes.items()
-        if rec.get("mathlib_status") == "missing" and not grounds(nid, set())
+        if _normalize_status(rec.get("mathlib_status")) == "missing"
+        and not grounds(nid, set())
     ]
     bad_roots = [
         nid for nid, rec in nodes.items()
-        if not (rec.get("depends_on") or []) and rec.get("mathlib_status") != "in-mathlib"
+        if not (rec.get("depends_on") or [])
+        and _normalize_status(rec.get("mathlib_status")) != "in-mathlib"
     ]
     offenders = (
         [f"{nid} (missing, no in-mathlib root)" for nid in unsupported]

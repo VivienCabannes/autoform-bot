@@ -70,6 +70,18 @@ Every node — whatever its tier — has the same shape. The fields below are *s
 | `mathlib_notes` | string | Free text on the Mathlib correspondence: generality or naming differences, how to import it, why the match is partial. |
 | `source_refs` | array | **Internal provenance only — never rendered** in the published content. Records where the concept appears in the sources, for faithfulness-checking. Each entry has `file` and `location` (free text: chapter, section, page). |
 | `content` | string or null | Path to this node's prose file, e.g. `"informal_content/markovs-inequality.md"`. `null` until the prose has been written. |
+| `lean_file` | string (optional) | Repo-relative path of the Lean file holding this node's statement/proof once one lands. Load-bearing for prove-eligibility (a sorry scan runs on it) and the static dashboard's proof-status; must stay inside the Lean repo (the audit's `leanpaths` clause enforces this). |
+| `mathlib_verified` | object (optional) | Verification stamp for an `in-mathlib` claim, written by `roadmap_audit.py --stamp-verified` (`{"at", "method", "declarations"}`). An in-Mathlib status without declarations *and* a stamp is flagged by the audit's `verified` clause — unverified claims silently poison the trust frontier, because `is_trusted` believes them by construction. |
+
+### Metadata: `targets`
+
+`metadata.targets` (optional) lists the mission sinks — the tier-2 statements
+the project exists to reach. Entries are node ids or `{"node": id, ...}`
+records, written only through `merge_node.py` (payload key `"metadata"`), which
+validates each entry resolves to an existing node. Targets drive the workers'
+prove ordering (critical-path first), the audit's target-reachability clause,
+and the distance metrics (`cone`, `unproved mass`, `ready`, `critical path`)
+reported by `autoform status` and the audit.
 
 ### What is *not* a field
 

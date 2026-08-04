@@ -220,7 +220,11 @@ Unless manual/drop-only mode was requested:
 
 1. Read graph, reviews, queue, and open escalations.
 2. Drain interactive-host work first, escalations first.
-3. Traverse foundations-first:
+3. Traverse foundations-first (with declared targets, critical path first):
+   - roadmap gaps → run `scripts/roadmap_audit.py "$DISPATCH_PROJECT/graph.json"
+     --enqueue` once per pass; it turns every completeness failure (status,
+     grounding, unverified in-Mathlib claims, missing prose, target
+     reachability) into a queued role task the loop drains;
    - unreviewed node → enqueue `reviewer`;
    - defective or unproved node with clean prerequisites and no open escalation
      → enqueue `worker`;

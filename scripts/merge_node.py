@@ -161,16 +161,44 @@ def merge(graph_path: str, payload: dict) -> dict:
             stripped.extend((nid, dep) for dep in missing)
             rec["depends_on"] = [dep for dep in deps if dep in nodes]
 
+    # Optional metadata merge — currently ONLY the mission targets. Targets are
+    # first-class graph state (the fleet's prove ordering and the audit's
+    # reachability clause read them), so they go through the single writer like
+    # every other structural change. Each entry must resolve to a node that
+    # exists after this payload's upserts/deletes.
+    meta_patch = payload.get("metadata")
+    targets_set = None
+    if meta_patch is not None:
+        if not isinstance(meta_patch, dict) or set(meta_patch) - {"targets"}:
+            raise ValueError("payload 'metadata' may only set 'targets'")
+        raw_targets = meta_patch.get("targets")
+        if not isinstance(raw_targets, list):
+            raise ValueError("'metadata.targets' must be a list")
+        normalized: list = []
+        for entry in raw_targets:
+            node_id = entry if isinstance(entry, str) else (
+                entry.get("node") if isinstance(entry, dict) else None)
+            if not isinstance(node_id, str) or not node_id:
+                raise ValueError(f"invalid targets entry {entry!r}")
+            if node_id not in nodes:
+                raise ValueError(f"targets entry {node_id!r} does not resolve to a node")
+            normalized.append(entry)
+        graph.setdefault("metadata", {})["targets"] = normalized
+        targets_set = len(normalized)
+
     graph.setdefault("metadata", {})["last_updated"] = _now()
 
     _atomic_write(graph_path, graph)
-    return {
+    result = {
         "upserted": len(upserts),
         "deleted": len(deletes),
         "stripped_edges": stripped,
         "orphaned_children": orphaned,
         "total_nodes": len(nodes),
     }
+    if targets_set is not None:
+        result["targets_set"] = targets_set
+    return result
 
 
 def main(argv=None) -> int:
