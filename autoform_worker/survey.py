@@ -1,0 +1,452 @@
+"""The survey — one pass that builds the whole work picture.
+
+Reads three sources and produces stage buckets of candidates:
+
+* GitHub PR state (``gh pr list --json`` on the canonical repo),
+* the local graph + review sidecar (prove eligibility, via ``review_model``),
+* the claim board (avoid nodes/branches other workers hold).
+
+Detection only — no unit execution here, so `status`/`--dry-run` are free of
+side effects. Candidate randomization is seeded by worker id so parallel
+workers naturally de-contend without coordinating.
+"""
+from __future__ import annotations
+
+import json
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import gitutil, scoreboard
+from .claims import ClaimBoard, author_claim_key
+from .config import WorkerConfig, scripts_modules
+from .constants import (
+    HOLD_LABELS,
+    MAX_CI_ATTEMPTS,
+    MAX_CI_PR_ATTEMPTS,
+    MAX_FIX_ATTEMPTS,
+    MAX_MERGE_ATTEMPTS,
+    MAX_PROVE_ATTEMPTS,
+    MAX_REBASE_ATTEMPTS,
+    MAX_REVIEW_ERRORS,
+    STAGES,
+    merge_paths_allowed,
+)
+from .counters import Counters
+from .errors import ClaimTransportError
+from .githost import GitHost, build_state_of
+
+
+@dataclass
+class PRInfo:
+    number: int
+    title: str
+    author: str
+    head_ref: str
+    head_oid: str
+    head_owner: str
+    is_draft: bool
+    mergeable: str
+    build: str          # success | failed | pending
+    labels: list[str]
+    node: str | None    # from the body's target marker
+    updated_at: str = ""
+    files: tuple = ()   # changed paths (the merge gate's path allowlist input)
+
+    @classmethod
+    def from_gh(cls, raw: dict) -> "PRInfo":
+        return cls(
+            number=int(raw.get("number", 0)),
+            title=str(raw.get("title", "")),
+            author=str((raw.get("author") or {}).get("login", "")),
+            head_ref=str(raw.get("headRefName", "")),
+            head_oid=str(raw.get("headRefOid", "")),
+            head_owner=str((raw.get("headRepositoryOwner") or {}).get("login", "")),
+            is_draft=bool(raw.get("isDraft")),
+            mergeable=str(raw.get("mergeable", "")),
+            build=build_state_of(raw),
+            labels=[label.get("name", "") for label in (raw.get("labels") or [])],
+            node=scoreboard.parse_target(raw.get("body")),
+            updated_at=str(raw.get("updatedAt", "")),
+            files=tuple(f.get("path", "") for f in (raw.get("files") or [])),
+        )
+
+
+@dataclass
+class Candidate:
+    kind: str
+    reason: str
+    pr: PRInfo | None = None
+    node: str | None = None
+    task: object = None      # QueuedTask for agent-stage candidates
+
+
+@dataclass
+class Survey:
+    canonical: str
+    default_branch: str
+    me: str
+    stages: dict = field(default_factory=dict)      # stage -> [Candidate]
+    suppressed: dict = field(default_factory=dict)  # stage -> [Candidate] (budget/claimed/waiting)
+    notes: list = field(default_factory=list)
+    prs: list = field(default_factory=list)
+    claims: list = field(default_factory=list)
+    can_push: bool = False
+    issues_enabled: bool = False
+    extra_identities: tuple = ()
+
+    def actionable(self, stage: str) -> list:
+        return self.stages.get(stage, [])
+
+    def to_json(self) -> dict:
+        return {
+            "canonical": self.canonical,
+            "default_branch": self.default_branch,
+            "me": self.me,
+            "can_push": self.can_push,
+            "issues_enabled": self.issues_enabled,
+            "stages": {
+                stage: [
+                    {"reason": c.reason, "pr": c.pr.number if c.pr else None, "node": c.node}
+                    for c in cands
+                ]
+                for stage, cands in self.stages.items()
+            },
+            "suppressed": {
+                stage: [
+                    {"reason": c.reason, "pr": c.pr.number if c.pr else None, "node": c.node}
+                    for c in cands
+                ]
+                for stage, cands in self.suppressed.items()
+            },
+            "claims": [
+                {k: v for k, v in lease.items() if not k.startswith("_")} | {
+                    "key": lease.get("_key"), "expired": lease.get("_expired"),
+                }
+                for lease in self.claims
+            ],
+            "notes": self.notes,
+        }
+
+
+def _tended(pr: PRInfo, me: str, extra_identities: list[str]) -> bool:
+    """A PR this worker may rewrite: authored by us (or a declared alias)."""
+    identities = {me, *extra_identities}
+    return pr.author in identities or pr.head_owner in identities
+
+
+def eligible_prove_nodes(cfg: WorkerConfig) -> list[tuple[str, dict, str]]:
+    """(node_id, node, reason) for every node prove-eligible from *local* state:
+    tier 2, not in Mathlib, unproved or defective, all prerequisites trusted."""
+    mods = scripts_modules()
+    rm = mods["review_model"]
+    try:
+        nodes, _meta = rm.load_graph(cfg.graph_path)
+    except Exception as error:
+        raise SystemExit(f"cannot load graph {cfg.graph_path}: {error}") from error
+    sidecar = rm.load_sidecar(cfg.project / "review_status.json")
+
+    import export_blueprint as eb  # noqa: PLC0415  — path set up by scripts_modules()
+
+    out: list[tuple[str, dict, str]] = []
+    for node_id, node in nodes.items():
+        if eb.node_tier(node) != 2 or rm.is_in_mathlib(node):
+            continue
+        verdict = rm.verdict_of(node_id, sidecar)
+        lean_file = node.get("lean_file")
+        lean_path = (cfg.lean_root / lean_file) if lean_file else None
+        if lean_path is not None:
+            # graph fields are data — never follow a path outside the repo
+            try:
+                lean_path.resolve().relative_to(cfg.lean_root.resolve())
+            except ValueError:
+                lean_path = None
+        has_lean = lean_path is not None and lean_path.exists()
+        sorried = has_lean and ("sorry" in lean_path.read_text(encoding="utf-8", errors="replace"))
+        if verdict == "rejected":
+            reason = "verdict rejected — needs repair"
+        elif not has_lean:
+            reason = "no Lean landed yet"
+        elif sorried:
+            reason = "Lean present but sorry'd"
+        else:
+            continue  # proved and not rejected — review's business, not prove's
+        deps = node.get("depends_on") or []
+        untrusted = [d for d in deps if d in nodes and not rm.is_trusted(d, nodes[d], sidecar)]
+        if untrusted:
+            continue  # foundations first — prerequisites must be trusted
+        out.append((node_id, node, reason))
+    return sorted(out, key=lambda item: item[0])
+
+
+def collect(
+    cfg: WorkerConfig,
+    host: GitHost,
+    board: ClaimBoard | None,
+    counters: Counters,
+    canonical: str,
+    default_branch: str,
+    extra_identities: list[str] | None = None,
+    allow_foreign_review: bool = False,
+    allow_unchecked_merge: bool = False,
+) -> Survey:
+    me = host.me()
+    survey = Survey(canonical=canonical, default_branch=default_branch, me=me,
+                    extra_identities=tuple(extra_identities or ()))
+    survey.can_push = host.can_push(canonical)
+    survey.issues_enabled = host.has_issues(canonical)
+    extra = extra_identities or []
+
+    def trusted(login: str) -> bool:
+        """The trust boundary for review targets, scoreboards, and markers."""
+        if not login:
+            return False
+        if login == me or login in extra:
+            return True
+        try:
+            return host.is_collaborator(canonical, login)
+        except Exception:
+            return False
+
+    prs = [PRInfo.from_gh(raw) for raw in host.pr_list(canonical)]
+    survey.prs = prs
+
+    # The local sidecar is the human's channel into the merge gate: a verdict
+    # recorded in the review dashboard outranks the jury and holds the PR.
+    rm = scripts_modules()["review_model"]
+    sidecar = rm.load_sidecar(cfg.project / "review_status.json")
+
+    claims: list[dict] = []
+    if board is not None and cfg.respect_claims:
+        try:
+            claims = board.list()
+        except ClaimTransportError as error:
+            survey.notes.append(f"claim board unreachable — proceeding uncoordinated: {error}")
+    survey.claims = claims
+    live_foreign = {
+        lease.get("resource"): lease
+        for lease in claims
+        if not lease.get("_expired") and lease.get("owner") != cfg.worker_id
+    }
+
+    for stage in STAGES:
+        survey.stages.setdefault(stage, [])
+        survey.suppressed.setdefault(stage, [])
+
+    def push_cand(stage: str, cand: Candidate, ok: bool) -> None:
+        (survey.stages if ok else survey.suppressed)[stage].append(cand)
+
+    # --- PR-tending stages --------------------------------------------------
+    for pr in prs:
+        if pr.is_draft:
+            continue
+        tended = _tended(pr, me, extra)
+        head12 = pr.head_oid[:12]
+
+        if tended and pr.mergeable == "CONFLICTING":
+            ok = counters.get(f"rebase-pr-{pr.number}") < MAX_REBASE_ATTEMPTS
+            claimed = f"branch/{pr.number}" in live_foreign
+            push_cand("rebase", Candidate("rebase", "conflicts with base" if ok and not claimed
+                                          else "budget spent" if not ok else "claimed by peer", pr=pr),
+                      ok and not claimed)
+            continue
+
+        if tended and pr.build == "failed":
+            ok = (counters.get(f"ci-{pr.number}-{head12}") < MAX_CI_ATTEMPTS
+                  and counters.get(f"ci-pr-{pr.number}") < MAX_CI_PR_ATTEMPTS)
+            claimed = f"branch/{pr.number}" in live_foreign
+            push_cand("fix-ci", Candidate("fix-ci", "checks failing" if ok and not claimed
+                                          else "budget spent" if not ok else "claimed by peer", pr=pr),
+                      ok and not claimed)
+            continue
+
+        if pr.build == "failed":
+            # Foreign PR with red checks: not ours to fix, and never reviewable
+            # until green (the jury judges code, not CI archaeology).
+            if pr.node:
+                push_cand("review", Candidate("review", "checks failing — author must green them first",
+                                              pr=pr, node=pr.node), False)
+            continue
+
+        if pr.build == "pending":
+            push_cand("review", Candidate("review", "checks still running", pr=pr), False)
+            continue
+
+        # Build green from here on.
+        meta = None
+        comments: list[dict] = []
+        if pr.node:  # only autoform PRs (target-marked) enter review/fix flows
+            if not allow_foreign_review and not trusted(pr.author):
+                # Reviewing means checking out and BUILDING the head — running
+                # a stranger's code on this machine. Off by default; opt in
+                # with --review-foreign after reading the PR yourself.
+                push_cand("review", Candidate(
+                    "review", "author is not a collaborator — reviewing runs their code "
+                              "(--review-foreign to opt in)", pr=pr, node=pr.node), False)
+                continue
+            comments = host.pr_comments(canonical, pr.number)
+            meta = scoreboard.parse_meta(comments, trusted=trusted, require_head=pr.head_oid or None)
+
+            reviewed_at_head = meta is not None
+            if not reviewed_at_head:
+                busy = scoreboard.active_inprogress(comments, pr.head_oid, trusted=trusted)
+                ok = counters.get(f"review-err-{pr.number}") < MAX_REVIEW_ERRORS
+                push_cand("review", Candidate(
+                    "review",
+                    "head not yet scoreboarded" if ok and not busy
+                    else "peer review in flight" if busy else "review error budget spent",
+                    pr=pr, node=pr.node,
+                ), ok and not busy)
+                continue
+
+            if tended and meta and meta.get("verdict") in {"flagged", "rejected"}:
+                ok = counters.get(f"fix-{pr.number}-{head12}") < MAX_FIX_ATTEMPTS
+                claimed = f"branch/{pr.number}" in live_foreign
+                push_cand("fix", Candidate("fix", f"verdict {meta.get('verdict')} at head"
+                                           if ok and not claimed else "budget spent" if not ok
+                                           else "claimed by peer", pr=pr, node=pr.node),
+                          ok and not claimed)
+                continue
+
+            if meta and meta.get("verdict") == "clean":
+                # The auto-merge gate. Humans steer through the dashboards: a
+                # human rejected/flagged verdict in the sidecar blocks the gate,
+                # as does any hold label; toolchain/CI/tooling paths always
+                # wait for a human.
+                cand = Candidate("merge", "clean verdict at head + green CI", pr=pr, node=pr.node)
+                holds = sorted(HOLD_LABELS.intersection(pr.labels))
+                human_block = _human_verdict(sidecar, pr.node)
+                if pr.build != "success" and not allow_unchecked_merge:
+                    # An empty check rollup is not a green build. Without CI the
+                    # only thing standing between a proof and `main` would be the
+                    # jury's opinion, so the gate stays shut until the repo
+                    # actually verifies its heads (see templates/github/
+                    # autoform-verify.yml) or the operator opts out explicitly.
+                    cand.reason = ("no CI checks ran on this head — install a verify workflow "
+                                   "or pass --merge-without-ci")
+                    push_cand("merge", cand, False)
+                elif not survey.can_push:
+                    cand.reason = "no merge permission on canonical"
+                    push_cand("merge", cand, False)
+                elif holds:
+                    cand.reason = f"hold label: {', '.join(holds)}"
+                    push_cand("merge", cand, False)
+                elif human_block:
+                    cand.reason = f"human verdict {human_block} blocks the gate"
+                    push_cand("merge", cand, False)
+                elif not merge_paths_allowed(pr.files):
+                    cand.reason = "touches non-roadmap paths — needs a human"
+                    push_cand("merge", cand, False)
+                elif counters.get(f"merge-{pr.number}") >= MAX_MERGE_ATTEMPTS:
+                    cand.reason = "merge attempt budget spent"
+                    push_cand("merge", cand, False)
+                else:
+                    push_cand("merge", cand, True)
+
+    # --- progress -----------------------------------------------------------
+    folded = _load_folded(cfg.folded_path)
+    merged = [PRInfo.from_gh(raw) for raw in host.pr_list(canonical, state="merged", limit=50)]
+    unfolded = [pr for pr in merged if pr.node and pr.number not in folded]
+    if unfolded:
+        cand = Candidate("progress", f"{len(unfolded)} merged scoreboard(s) to fold")
+        if survey.can_push:
+            claimed = "progress" in live_foreign
+            push_cand("progress", cand if not claimed else Candidate("progress", "claimed by peer"),
+                      not claimed)
+        else:
+            cand.reason += " — no push access, skipping"
+            push_cand("progress", cand, False)
+
+    # --- agent roles (planner / mathcheck / counterexample / … from the registry) ---
+    from .agent_work import agent_candidates  # noqa: PLC0415 — avoids an import cycle
+    from .registry import Registry  # noqa: PLC0415
+
+    registry = Registry(cfg.plugin_root, cfg.project)
+    ready, held = agent_candidates(cfg, registry, counters, live_foreign)
+    survey.stages["agents"].extend(ready)
+    survey.suppressed["agents"].extend(held)
+
+    # --- prove --------------------------------------------------------------
+    open_pr_nodes = {pr.node for pr in prs if pr.node}
+    intentions = _intention_avoid_list(host, canonical) if survey.issues_enabled else set()
+    eligible = eligible_prove_nodes(cfg)
+    rng = random.Random(cfg.worker_id)
+    rng.shuffle(eligible)
+    for node_id, _node, reason in eligible:
+        if node_id in open_pr_nodes:
+            push_cand("prove", Candidate("prove", "open PR already targets it", node=node_id), False)
+            continue
+        if author_claim_key(node_id) in live_foreign:
+            push_cand("prove", Candidate("prove", "claimed by peer", node=node_id), False)
+            continue
+        if node_id in intentions:
+            push_cand("prove", Candidate("prove", "human intention registered", node=node_id), False)
+            continue
+        if counters.get(f"prove-{node_id}") >= MAX_PROVE_ATTEMPTS:
+            push_cand("prove", Candidate("prove", "attempt budget spent", node=node_id), False)
+            continue
+        push_cand("prove", Candidate("prove", reason, node=node_id), True)
+
+    # Local staleness check: prove eligibility above was read from the LOCAL
+    # checkout; if the local default branch is behind the remote, the operator
+    # should sync before trusting the prove bucket.
+    try:
+        remote_default = gitutil.remote_ref_oid(gitutil.slug_url(canonical),
+                                                f"refs/heads/{default_branch}")
+        local = gitutil.run_git(["rev-parse", "--quiet", "--verify",
+                                 f"refs/heads/{default_branch}"], cwd=cfg.lean_root, check=False)
+        local_default = local.stdout.strip() if local.returncode == 0 else None
+        if remote_default and local_default and remote_default != local_default:
+            survey.notes.append(
+                f"local {default_branch} ({local_default[:8]}) differs from remote "
+                f"({remote_default[:8]}) — run `git pull` / `autoform sync` before trusting prove eligibility"
+            )
+    except Exception:
+        pass  # a staleness hint must never break the survey
+
+    return survey
+
+
+def _human_verdict(sidecar: dict, node_id: str | None) -> str | None:
+    """A human's own verdict on this node when it blocks the merge gate.
+
+    Humans steer through the dashboards, so a ``flagged``/``rejected`` verdict
+    recorded there is a hold — the jury cannot overrule it (the human slot is
+    immutable to machines by contract).
+    """
+    if not node_id:
+        return None
+    record = (sidecar.get("reviews") or {}).get(node_id) or {}
+    human = record.get("human") or {}
+    verdict = human.get("verdict")
+    return verdict if verdict in {"flagged", "rejected"} else None
+
+
+def _load_folded(path: Path) -> set[int]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {int(n) for n in data.get("prs", [])} if isinstance(data, dict) else set()
+    except (OSError, json.JSONDecodeError, ValueError):
+        return set()
+
+
+def _intention_avoid_list(host: GitHost, canonical: str) -> set[str]:
+    """Node ids humans have claimed via assigned ``autoform:intention`` issues.
+
+    Fail-open: an API error yields an empty set rather than blocking the round.
+    """
+    from .constants import LABEL_INTENTION
+
+    avoid: set[str] = set()
+    try:
+        for issue in host.issue_list(canonical, LABEL_INTENTION):
+            if not issue.get("assignees"):
+                continue  # unassigned intention — informational, not a claim
+            title = str(issue.get("title", ""))
+            if ":" in title:
+                node = title.split(":", 1)[1].strip()
+                if node:
+                    avoid.add(node)
+    except Exception:
+        return set()
+    return avoid

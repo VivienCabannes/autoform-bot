@@ -182,18 +182,29 @@ dashboard is a deterministic, read-only snapshot built only from committed graph
 theorem, review, proof-status, and kernel-evidence inputs. Setup fails closed on
 unclear repository visibility and never enables publication without approval.
 
+**The distributed worker** (`./autoform`, TauCetiWorker-style): many machines
+advancing one shared roadmap through GitHub. One round = one work unit from the
+cascade `rebase → fix-ci → fix → review → progress → prove`; proofs land as
+marker-tagged PRs, jury verdicts land as scoreboard comments, and merged
+verdicts fold deterministically back into `review_status.json`. Coordination is
+cooperative git-ref leases (`refs/autoform-claims/*`) over compare-and-swap
+branch pushes — no server-side setup, no Issues requirement, safe under any
+race. Orchestrate drives it in distributed mode; `docs/worker-cli.md` is the
+design contract.
+
 ## Repository layout
 
 ```
-skills/       exactly three user workflows: setup, orchestrate, set-backend
-internal/     non-discoverable runbooks, reference material, and jury rubrics
-agents/       worker, reader, planning crew, review jury
-servers/      stateful MCP servers plus shared prover/search implementation code
-scripts/      plan/graph tooling, dispatch engine, review UI, formalization.py
-hooks/        Claude SessionStart context (skills are the workflow surface)
-docs/         pipeline architecture, usage guide, backend handoff notes
-examples/     reference implementations for the remaining stubs
-tests/        deterministic suite; optional local-Lean and loopback-HTTP smoke tests
+skills/          exactly three user workflows: setup, orchestrate, set-backend
+internal/        non-discoverable runbooks, reference material, and jury rubrics
+agents/          worker, reader, planning crew, review jury
+servers/         stateful MCP servers plus shared prover/search implementation code
+scripts/         plan/graph tooling, dispatch engine, review UI, formalization.py
+autoform_worker/ the distributed worker CLI (rounds, claims, scoreboards, PRs)
+hooks/           Claude SessionStart context (skills are the workflow surface)
+docs/            pipeline architecture, usage guide, backend handoff notes
+examples/        reference implementations for the remaining stubs
+tests/           deterministic suite; optional local-Lean and loopback-HTTP smoke tests
 ```
 
 ## Development

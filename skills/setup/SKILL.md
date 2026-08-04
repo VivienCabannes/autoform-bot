@@ -226,9 +226,40 @@ when they occur.
    `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/github-pages.md` for the commands and
    failure rules.
 
-10. Report the local dashboard URL, GitHub publication readiness, tier-1 and
+10. When the user wants multiple machines or teammates advancing this project
+   (a shared GitHub roadmap), prepare distributed mode:
+
+   - audit the machine: `uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python -m
+     autoform_worker doctor --json` — surface every failing check;
+   - the project needs a GitHub repository with an `origin` remote. Autoform
+     never creates, pushes, or configures a repository on its own: state what
+     is missing, and let the user create and push it (or run the commands only
+     with their explicit approval, immediately before each one);
+   - check whether the repository verifies its pull-request heads. Autonomous
+     merging requires at least one real check: with no workflows, the
+     auto-merge gate stays shut by design. When the user wants autonomous
+     merging and the repo has no build check, offer to copy
+     `<AUTOFORM_PLUGIN_ROOT>/templates/github/autoform-verify.yml` into
+     `.github/workflows/` (substituting `__DEFAULT_BRANCH__`) — it builds the
+     project, rejects surviving `sorry`/`admit`, and audits axioms, mirroring
+     the local prover gate on neutral hardware. Adding the file is a local
+     edit; committing and pushing it needs separate explicit approval;
+   - ensure the Lean repo's `.gitignore` keeps per-machine state local while
+     durable state stays committed. Local-only: `task_queue.json`,
+     `agents_status.json`, `dispatch.log`, `worker.log`, `.autoform/`.
+     Committed: `graph.json`, `informal_content/`, `kernel/`,
+     `review_status.json`, the Lean sources;
+   - if the user wants cross-machine escalation visibility, note whether
+     Issues are enabled on the canonical repo (forks disable them by default;
+     enabling is a repo-settings action the user performs).
+
+   Distributed operation itself (rounds, claims, PRs) belongs to Orchestrate;
+   Setup only makes the machine ready.
+
+11. Report the local dashboard URL, GitHub publication readiness, tier-1 and
    tier-2 counts, native role-agent install
-   status, and the next step: run Orchestrate.
+   status, distributed-mode readiness when configured, and the next step: run
+   Orchestrate.
 
 ## Resume semantics
 

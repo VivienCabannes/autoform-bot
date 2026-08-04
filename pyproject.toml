@@ -23,8 +23,11 @@ dev = [
     "ruff>=0.4",
 ]
 
+[project.scripts]
+autoform = "autoform_worker.cli:cli_main"
+
 [tool.hatch.build.targets.wheel]
-packages = ["servers"]
+packages = ["servers", "autoform_worker"]
 
 [tool.ruff]
 line-length = 120
