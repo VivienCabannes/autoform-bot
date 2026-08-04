@@ -1,0 +1,2 @@
+#print axioms WorkedExample.isEven_mul_left
+'WorkedExample.isEven_mul_left' depends on axioms: []

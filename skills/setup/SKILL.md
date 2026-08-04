@@ -150,7 +150,18 @@ when they occur.
    the graph (`--reset-plan`) belongs to the Roadmap workflow.
 
 6. Start the dashboard so the (initially empty) graph is visible and later
-   Roadmap/Orchestrate activity appears live. Use a free
+   Roadmap/Orchestrate activity appears live. For a fresh repository, or when
+   its intended durable/local-state layout is unclear, read
+   `<AUTOFORM_PLUGIN_ROOT>/skills/setup/references/worked-repository.md`.
+   It explains the small worked asset under
+   `skills/setup/assets/worked-formalization-project/`. Treat that asset as a
+   teaching example, not a scaffold to copy wholesale: preserve the target
+   repository's toolchain and conventions, and adapt only the
+   durable/local-state boundaries.
+
+   Roadmap owns source inspection and graph construction.
+
+   Use a free
    loopback port unless the user supplied one. Reuse a service already serving
    this exact project.
 

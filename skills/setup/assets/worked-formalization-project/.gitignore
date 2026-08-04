@@ -1,0 +1,7 @@
+.autoform/
+.lake/
+task_queue.json
+agents_status.json
+dispatch.log
+worker.log
+*.lock
