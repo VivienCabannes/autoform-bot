@@ -322,3 +322,44 @@ def test_do_merge_keeps_the_counter_when_github_refuses(tmp_path, monkeypatch):
     assert not result.progressed and "GitHub refused the merge" in result.summary
     assert len(runner.merges()) == 1
     assert counters.get(f"merge-{PR_NUMBER}") == 1  # NOT cleared — refusals must burn budget
+
+
+# -- the no-CI hole ----------------------------------------------------------
+
+def _no_ci_survey(cfg, **kw):
+    """collect() over a PR whose head has an EMPTY check rollup."""
+    pr = pr_raw()
+    pr["statusCheckRollup"] = []
+    runner = make_runner(open_prs=[pr], comments={PR_NUMBER: [sb_comment()]})
+    return survey.collect(cfg, GitHost(runner=runner), None, Counters(cfg.counters_path),
+                          "o/r", "main", **kw)
+
+
+def test_no_ci_checks_blocks_the_merge_gate(tmp_path, monkeypatch):
+    """A head with an empty check rollup must never auto-merge.
+
+    Bring-your-own-repo projects often have no CI at all. If an empty rollup
+    counted as green, the jury verdict would be the only thing standing between
+    a proof and the default branch.
+    """
+    cfg = make_cfg(tmp_path, monkeypatch)
+    ready, held = buckets(_no_ci_survey(cfg))
+    assert ready == []
+    assert any("no CI checks ran on this head" in reason for reason in held), held
+
+
+def test_merge_without_ci_opt_out_reopens_the_gate(tmp_path, monkeypatch):
+    """--merge-without-ci is an explicit, documented downgrade, not the default."""
+    cfg = make_cfg(tmp_path, monkeypatch)
+    ready, _held = buckets(_no_ci_survey(cfg, allow_unchecked_merge=True))
+    assert ready == ["clean verdict at head + green CI"]
+
+
+def test_no_ci_still_allows_review(tmp_path, monkeypatch):
+    """Only merging needs real CI — the jury judges code, not check history."""
+    cfg = make_cfg(tmp_path, monkeypatch)
+    pr = pr_raw()
+    pr["statusCheckRollup"] = []
+    runner = make_runner(open_prs=[pr], comments={PR_NUMBER: []})
+    s = survey.collect(cfg, GitHost(runner=runner), None, Counters(cfg.counters_path), "o/r", "main")
+    assert [c.pr.number for c in s.actionable("review")] == [PR_NUMBER]

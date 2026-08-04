@@ -188,6 +188,7 @@ def collect(
     default_branch: str,
     extra_identities: list[str] | None = None,
     allow_foreign_review: bool = False,
+    allow_unchecked_merge: bool = False,
 ) -> Survey:
     me = host.me()
     survey = Survey(canonical=canonical, default_branch=default_branch, me=me,
@@ -315,7 +316,16 @@ def collect(
                 cand = Candidate("merge", "clean verdict at head + green CI", pr=pr, node=pr.node)
                 holds = sorted(HOLD_LABELS.intersection(pr.labels))
                 human_block = _human_verdict(sidecar, pr.node)
-                if not survey.can_push:
+                if pr.build != "success" and not allow_unchecked_merge:
+                    # An empty check rollup is not a green build. Without CI the
+                    # only thing standing between a proof and `main` would be the
+                    # jury's opinion, so the gate stays shut until the repo
+                    # actually verifies its heads (see templates/github/
+                    # autoform-verify.yml) or the operator opts out explicitly.
+                    cand.reason = ("no CI checks ran on this head — install a verify workflow "
+                                   "or pass --merge-without-ci")
+                    push_cand("merge", cand, False)
+                elif not survey.can_push:
                     cand.reason = "no merge permission on canonical"
                     push_cand("merge", cand, False)
                 elif holds:

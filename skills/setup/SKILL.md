@@ -231,6 +231,19 @@ when they occur.
 
    - audit the machine: `uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python -m
      autoform_worker doctor --json` — surface every failing check;
+   - the project needs a GitHub repository with an `origin` remote. Autoform
+     never creates, pushes, or configures a repository on its own: state what
+     is missing, and let the user create and push it (or run the commands only
+     with their explicit approval, immediately before each one);
+   - check whether the repository verifies its pull-request heads. Autonomous
+     merging requires at least one real check: with no workflows, the
+     auto-merge gate stays shut by design. When the user wants autonomous
+     merging and the repo has no build check, offer to copy
+     `<AUTOFORM_PLUGIN_ROOT>/templates/github/autoform-verify.yml` into
+     `.github/workflows/` (substituting `__DEFAULT_BRANCH__`) — it builds the
+     project, rejects surviving `sorry`/`admit`, and audits axioms, mirroring
+     the local prover gate on neutral hardware. Adding the file is a local
+     edit; committing and pushing it needs separate explicit approval;
    - ensure the Lean repo's `.gitignore` keeps per-machine state local while
      durable state stays committed. Local-only: `task_queue.json`,
      `agents_status.json`, `dispatch.log`, `worker.log`, `.autoform/`.

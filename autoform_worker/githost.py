@@ -217,12 +217,18 @@ class GitHost:
 
 
 def build_state_of(pr: dict) -> str:
-    """Derive one build state from ``statusCheckRollup``: failed | pending | success.
+    """Derive one build state from ``statusCheckRollup``.
 
-    No checks at all counts as ``success`` (small projects without CI still work).
+    ``failed | pending | success | none``. ``none`` — no checks ran at all — is
+    deliberately NOT ``success``: an empty rollup means nothing verified this
+    head, and the auto-merge gate must not read absence of evidence as evidence.
+    Review still proceeds on ``none`` (the jury judges code, not CI), but the
+    merge gate requires a genuine ``success`` unless explicitly overridden.
     ``CANCELLED``/``ACTION_REQUIRED`` count as failed — neither is a green head.
     """
     rollup = pr.get("statusCheckRollup") or []
+    if not rollup:
+        return "none"
     saw_pending = False
     for check in rollup:
         conclusion = (check.get("conclusion") or "").upper()

@@ -133,8 +133,10 @@ def prove_map(s, actionable=True):
 # -- build_state_of ----------------------------------------------------------
 
 def test_build_state_of_matrix():
-    assert build_state_of({}) == "success"
-    assert build_state_of({"statusCheckRollup": []}) == "success"
+    # An empty rollup is "none", NOT "success": nothing verified this head, and
+    # the merge gate must not read absence of evidence as evidence.
+    assert build_state_of({}) == "none"
+    assert build_state_of({"statusCheckRollup": []}) == "none"
     assert build_state_of({"statusCheckRollup": list(GREEN)}) == "success"
     assert build_state_of({"statusCheckRollup": [{"conclusion": "FAILURE"}]}) == "failed"
     assert build_state_of({"statusCheckRollup": [{"state": "ERROR"}]}) == "failed"

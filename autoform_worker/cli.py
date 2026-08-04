@@ -50,6 +50,9 @@ def _add_round_flags(parser: argparse.ArgumentParser) -> None:
                         help="skip the cooperative claim board entirely (CAS safety still applies)")
     parser.add_argument("--extra-identities", default="",
                         help="comma-separated extra GitHub logins whose PRs count as yours")
+    parser.add_argument("--merge-without-ci", action="store_true",
+                        help="allow auto-merge on heads with no CI checks (unsafe: the jury "
+                             "verdict becomes the only gate)")
     parser.add_argument("--review-foreign", action="store_true",
                         help="also review PRs from non-collaborators (reviewing BUILDS their code locally)")
     parser.add_argument("--dry-run", action="store_true", help="survey + report; execute nothing")
@@ -100,6 +103,7 @@ def _round_opts(args) -> round_mod.RoundOpts:
         dry_run=args.dry_run,
         extra_identities=tuple(s for s in args.extra_identities.split(",") if s.strip()),
         review_foreign=args.review_foreign,
+        merge_without_ci=args.merge_without_ci,
     )
 
 
@@ -131,6 +135,8 @@ def _round_passthrough(args) -> list[str]:
         out += ["--extra-identities", args.extra_identities]
     if args.review_foreign:
         out.append("--review-foreign")
+    if args.merge_without_ci:
+        out.append("--merge-without-ci")
     return out
 
 

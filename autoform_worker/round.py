@@ -35,6 +35,7 @@ class RoundOpts:
     extra_identities: tuple = ()
     push_progress: bool = True
     review_foreign: bool = False
+    merge_without_ci: bool = False
 
     def stages(self) -> list[str]:
         stages = [s for s in STAGES if not self.only or s in self.only]
@@ -114,7 +115,8 @@ def build_survey(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps):
     counters = Counters(cfg.counters_path)
     picture = survey_mod.collect(cfg, host, board, counters, canonical, default_branch,
                                  extra_identities=list(opts.extra_identities),
-                                 allow_foreign_review=opts.review_foreign)
+                                 allow_foreign_review=opts.review_foreign,
+                                 allow_unchecked_merge=opts.merge_without_ci)
     return picture, host, board, counters
 
 

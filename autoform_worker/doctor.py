@@ -15,6 +15,24 @@ from .githost import GitHost
 from .gitutil import is_git_repo, origin_url, parse_slug, slug_url
 
 
+def _ci_check(cfg: WorkerConfig, canonical: str) -> tuple[str, bool, str]:
+    """Whether the project repo actually verifies its PR heads.
+
+    This is what gives the auto-merge gate teeth: with no workflows, every PR
+    head has an empty check rollup, the gate refuses to merge, and the loop
+    silently stops short of merging anything.
+    """
+    workflows = cfg.lean_root / ".github" / "workflows"
+    present = sorted(p.name for p in workflows.glob("*.yml")) + \
+        sorted(p.name for p in workflows.glob("*.yaml"))
+    if present:
+        return ("project CI", True, f"{len(present)} workflow(s): {', '.join(present[:4])}")
+    return ("project CI", False,
+            f"no workflows in {workflows} — heads have no checks, so auto-merge stays shut. "
+            "Install templates/github/autoform-verify.yml (or pass --merge-without-ci to "
+            "merge on the jury verdict alone)")
+
+
 def _tool(name: str) -> tuple[str, bool, str]:
     path = shutil.which(name)
     return (name, path is not None, path or "not on PATH")
@@ -60,6 +78,7 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
         checks.append(("issues enabled", True,
                        "yes — escalation/intention sync active" if issues
                        else "no (default on forks) — escalation issue sync degrades to local-only"))
+        checks.append(_ci_check(cfg, canonical))
         board = ClaimBoard(slug_url(canonical), cfg.worker_id, cfg.claims_scratch)
         try:
             board.list()
