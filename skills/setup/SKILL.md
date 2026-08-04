@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Create, initialize, repair, inspect, or visualize an Autoform Lean project; use for installation, project creation, graph initialization, and dashboard setup.
+description: Create, inspect, repair, or visualize an Autoform Markdown blueprint in a Lean project.
 ---
 
-Inspect before mutating, ask for source files and scope before a new plan, preserve durable state unless reset is explicit, and use the helpers under `scripts/` to initialize the project and graph. Build graph state through native subagents and `scripts/merge_node.py`, keeping all dashboard and blueprint work under `visualization/`.
+Keep the committed graph at `blueprint/nodes/**/*.md`: one H1-titled node per file, optional `kind`/`status`/`lean` frontmatter, and dependency links only under `## Depends on`. Ask for sources and scope before a new blueprint, preserve existing nodes, and use the bundled graph checker and static exporter after edits.

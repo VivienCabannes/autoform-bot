@@ -1,36 +1,23 @@
 {
   "name": "autoform",
-  "description": "Lean 4 formalization agent: Mathlib conventions, proof strategies, review, statement extraction, and textbook-to-blueprint formalization planning.",
+  "description": "Plan Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
   "version": "0.4.4+codex.local-20260804-121435",
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"
   },
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start\"",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  },
   "mcpServers": {
-    "autoform-repl": {
-      "command": "uv",
-      "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--extra", "repl", "python", "-m", "servers.repl.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "description": "Persistent Lean REPL pools selected by required per-call project_dir"
-    },
     "autoform-lsp": {
       "command": "uv",
       "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "servers.lsp.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "description": "Persistent Lean language servers selected by required per-call project_dir"
+      "description": "Lean diagnostics and hover; each call requires project_dir"
+    },
+    "autoform-repl": {
+      "command": "uv",
+      "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--extra", "repl", "python", "-m", "servers.repl.server"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "description": "Persistent Lean snippet execution; each call requires project_dir"
     }
   }
 }

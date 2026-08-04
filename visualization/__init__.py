@@ -1,1 +1,1 @@
-"""Autoform's blueprint export and local review dashboard."""
+"""Static visualization for an Autoform Markdown graph."""

@@ -1,4 +1,4 @@
-"""Protocol and lifecycle regression tests for the promoted Lean LSP server."""
+"""Protocol and lifecycle regression tests for the Lean server's LSP backend."""
 
 from __future__ import annotations
 

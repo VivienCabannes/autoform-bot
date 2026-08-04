@@ -1,10 +1,4 @@
-"""Smoke tests for Autoform's two stateful MCP servers.
-
-Each test class verifies that the server module imports cleanly and that
-the ``create_*_server()`` factory produces a valid FastMCP instance.
-
-Both factories must import cleanly and expose a FastMCP instance.
-"""
+"""Contracts for Autoform's domain-oriented server boundary."""
 
 from __future__ import annotations
 
@@ -85,22 +79,18 @@ class TestProjectResolution:
 
 
 class TestReplServer:
-    """Tests for the REPL server module."""
+    """Contracts for the persistent Lean REPL server."""
 
     def test_import_server(self):
-        """The REPL server module should import without error."""
         from servers.repl import server  # noqa: F401
 
     def test_import_core(self):
-        """The REPL core module should import without error."""
         from servers.repl import core  # noqa: F401
 
     def test_import_pool(self):
-        """The REPL pool module should import without error."""
         from servers.repl import pool  # noqa: F401
 
     def test_create_server(self):
-        """create_repl_server should return a FastMCP instance."""
         from servers.repl.server import create_repl_server
 
         server = create_repl_server(object())
@@ -113,9 +103,10 @@ class TestReplServer:
         required = required_tool_parameters(create_repl_server(object()))
         assert required["run_lean_code"] == {"project_dir", "code"}
         assert required["get_repl_status"] == {"project_dir"}
+        assert set(required) == {"run_lean_code", "get_repl_status"}
 
     def test_project_router_reuses_and_separates_pools(self, tmp_path):
-        from servers.repl.server import LeanReplProjects
+        from servers.repl.projects import LeanReplProjects
 
         class FakePool:
             def __init__(self, root):
@@ -145,19 +136,17 @@ class TestReplServer:
 
 
 # ---------------------------------------------------------------------------
-# LSP server
+# LSP backend
 # ---------------------------------------------------------------------------
 
 
 class TestLspServer:
-    """Tests for the LSP diagnostics server."""
+    """Contracts for the Lean language-server service."""
 
     def test_import_server(self):
-        """The LSP server module should import without error."""
         from servers.lsp import server  # noqa: F401
 
     def test_create_server(self):
-        """create_lsp_server should return a FastMCP instance."""
         from servers.lsp.server import create_lsp_server
 
         server = create_lsp_server(object())
@@ -170,6 +159,7 @@ class TestLspServer:
         required = required_tool_parameters(create_lsp_server(object()))
         assert required["lean_diagnostic_messages"] == {"project_dir", "file_path"}
         assert required["lean_hover"] == {"project_dir", "file_path", "line", "character"}
+        assert set(required) == {"lean_diagnostic_messages", "lean_hover"}
 
     def test_project_router_reuses_and_separates_sessions(self, tmp_path):
         from servers.lsp.server import LeanLspProjects

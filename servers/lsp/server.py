@@ -1,7 +1,7 @@
-"""Lean LSP MCP server — diagnostics and type information via Language Server Protocol.
+"""Lean execution backend for diagnostics and type information over LSP.
 
 Wraps Lean 4 language server processes and provides file diagnostics and hover
-information without requiring the REPL pool.
+information independently from the REPL pool.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ class LeanLspSession:
         self._request_id = 0
         self._lock = threading.Lock()
         # A session has one stdout stream. Serialize the complete document
-        # lifecycle so concurrent FastMCP calls cannot race two readers against
+        # lifecycle so concurrent MCP calls cannot race two readers against
         # that stream or consume one another's diagnostics/responses.
         self._operation_lock = threading.Lock()
 
@@ -386,47 +386,46 @@ class LeanLspProjects:
 
 
 def create_lsp_server(projects: LeanLspProjects) -> FastMCP:
-    """Create a FastMCP server routing calls to explicit Lean projects."""
+    """Create the LSP MCP server for explicit Lean projects."""
     server = FastMCP(name="autoform-lsp")
 
     @server.tool
     def lean_diagnostic_messages(project_dir: str, file_path: str) -> str:
-        """Get compilation diagnostics for a Lean file.
-
-        Returns errors, warnings, and info messages from the Lean language server.
+        """Return Lean diagnostics for an in-project file.
 
         Args:
-            project_dir: Absolute path to the file's Lake project root.
-            file_path: Absolute path, or a path relative to project_dir, to the .lean file.
+            project_dir: Absolute path to the Lake project root.
+            file_path: Absolute path, or a path relative to project_dir, to a Lean file.
         """
         root, path = resolve_lean_file(project_dir, file_path)
         diagnostics = projects.get(str(root)).get_diagnostics(str(path))
         if not diagnostics:
             return "No diagnostics — file compiles cleanly."
 
-        lines = []
-        for d in diagnostics:
-            severity = {1: "error", 2: "warning", 3: "info", 4: "hint"}.get(d.get("severity", 0), "unknown")
-            pos = d.get("range", {}).get("start", {})
-            line = pos.get("line", 0) + 1
-            col = pos.get("character", 0)
-            msg = d.get("message", "")
-            lines.append(f"{line}:{col}: {severity}: {msg}")
+        lines: list[str] = []
+        for diagnostic in diagnostics:
+            severity = {1: "error", 2: "warning", 3: "info", 4: "hint"}.get(
+                diagnostic.get("severity", 0), "unknown"
+            )
+            position = diagnostic.get("range", {}).get("start", {})
+            line = position.get("line", 0) + 1
+            column = position.get("character", 0)
+            message = diagnostic.get("message", "")
+            lines.append(f"{line}:{column}: {severity}: {message}")
 
-        errors = sum(1 for d in diagnostics if d.get("severity") == 1)
-        warnings = sum(1 for d in diagnostics if d.get("severity") == 2)
-        header = f"Diagnostics: {errors} error(s), {warnings} warning(s)"
-        return header + "\n" + "\n".join(lines)
+        errors = sum(item.get("severity") == 1 for item in diagnostics)
+        warnings = sum(item.get("severity") == 2 for item in diagnostics)
+        return f"Diagnostics: {errors} error(s), {warnings} warning(s)\n" + "\n".join(lines)
 
     @server.tool
     def lean_hover(project_dir: str, file_path: str, line: int, character: int) -> str:
-        """Get type information at a position in a Lean file.
+        """Return Lean hover information at a zero-indexed position.
 
         Args:
-            project_dir: Absolute path to the file's Lake project root.
-            file_path: Absolute path, or a path relative to project_dir, to the .lean file.
-            line: 0-indexed line number.
-            character: 0-indexed character position.
+            project_dir: Absolute path to the Lake project root.
+            file_path: Absolute path, or a path relative to project_dir, to a Lean file.
+            line: Zero-indexed line number.
+            character: Zero-indexed character position.
         """
         root, path = resolve_lean_file(project_dir, file_path)
         result = projects.get(str(root)).hover(str(path), line, character)
@@ -435,11 +434,13 @@ def create_lsp_server(projects: LeanLspProjects) -> FastMCP:
     return server
 
 
-if __name__ == "__main__":
+def main() -> None:
     projects = LeanLspProjects()
-
     try:
-        server = create_lsp_server(projects)
-        server.run(transport="stdio")
+        create_lsp_server(projects).run(transport="stdio")
     finally:
         projects.close()
+
+
+if __name__ == "__main__":
+    main()

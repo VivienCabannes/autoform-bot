@@ -1,4 +1,4 @@
-"""Lean REPL — single session managing a ``lake exe repl`` subprocess.
+"""Lean REPL backend: one session managing a ``lake exe repl`` subprocess.
 
 Provides LeanRepl with non-blocking I/O, a preloaded import environment,
 memory monitoring, automatic restart, and multi-snippet chaining.

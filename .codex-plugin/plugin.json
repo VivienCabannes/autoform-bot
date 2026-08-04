@@ -1,7 +1,7 @@
 {
   "name": "autoform",
-  "version": "0.4.4+codex.local-20260804-121435",
-  "description": "Turn any AI coding assistant into a Lean 4 formalization agent.",
+  "version": "0.4.4+codex.20260804125133",
+  "description": "Plan Lean formalizations as Markdown graphs with Lean LSP and REPL tools.",
   "author": {
     "name": "Vivien Cabannes"
   },
@@ -10,15 +10,17 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "AutoForm Bot",
-    "shortDescription": "Lean 4 autoformalization workflows for coding agents",
-    "longDescription": "AutoForm Bot packages three expert formalization workflows, native role agents, and persistent Lean LSP/REPL tools.",
+    "shortDescription": "Markdown plans with Lean LSP and REPL",
+    "longDescription": "AutoForm keeps a Lean formalization plan as a linked Markdown wiki and checks the work through dedicated Lean LSP and REPL servers.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
-    "capabilities": ["Read", "Write"],
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
     "defaultPrompt": [
-      "Set up an Autoform Lean formalization project from my sources.",
-      "Run or resume the Autoform orchestration workflow.",
-      "Help me formalize this theorem in Lean 4."
+      "Create an Autoform Markdown blueprint from my sources.",
+      "Work through the ready nodes in my Autoform blueprint."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/autoform-small.svg",

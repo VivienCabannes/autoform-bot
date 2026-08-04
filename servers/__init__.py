@@ -1,11 +1,7 @@
-"""Autoform MCP servers — standalone Lean 4 tooling.
+"""Shared path validation for Autoform's LSP and REPL servers.
 
-Each stateful server is independent and can be started separately via uv:
-    uv run --extra repl python -m servers.repl.server  # Lean REPL pool
-    uv run python -m servers.lsp.server                # Lean LSP diagnostics
-
-The process may run from the plugin directory, but each tool call names the
-absolute Lake project it should use.  Never infer a Lean root from server cwd.
+Lean tools always name an absolute Lake project and never infer one from the
+server process's working directory.
 """
 
 from __future__ import annotations

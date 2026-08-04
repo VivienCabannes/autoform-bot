@@ -1,4 +1,4 @@
-"""Lean REPL pool — thread pool of REPL instances with queue-based load balancing."""
+"""Pooled Lean REPL instances with load balancing."""
 
 from __future__ import annotations
 
