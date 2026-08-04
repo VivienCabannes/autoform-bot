@@ -64,7 +64,7 @@ the local graph/sidecar + the claim board.
 | Stage | Candidate | Execution |
 |---|---|---|
 | `merge` | PR with green CI + a trusted `clean` scoreboard at the exact head, allowlisted paths, no hold label, no human flag | deterministic: `gh pr merge --squash --match-head-commit` (merge-time CAS) |
-| `agents` | any queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, escalation, …) | spawns the host CLI with that role's own Markdown body; curation is committed and CAS-pushed to the default branch |
+| `agents` | a machine-local queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, escalation, …) | spawns the host CLI with that role's own Markdown body; declared write paths are enforced before curation is CAS-pushed to the default branch |
 | `rebase` | own open PR with `mergeable == CONFLICTING` | host agent (claude/codex) with `prompts/rebase.md`; pushes via CAS |
 | `fix-ci` | own open PR with failing checks | host agent with `prompts/fix-ci.md` |
 | `fix` | own open PR whose scoreboard (at head) has a blocking verdict | host agent with `prompts/fix.md` |
@@ -92,8 +92,9 @@ human wants to *say* to the system is said there:
 - recording a `flagged`/`rejected` verdict on a node **holds the merge gate**
   for its PR — the human slot is immutable to machines, so the jury can never
   overrule it;
-- dropping a role onto a node in the dashboard queues that role for whichever
-  machine picks it up next;
+- dropping a role onto a node in the local dashboard queues that role for a
+  worker on the same machine; cross-machine work is coordinated through durable
+  graph state, PRs, scoreboards, claims, and escalation issues, not the local queue;
 - a `hold`/`human`/`wip` label on a PR takes it out of the gate entirely.
 
 Merging is otherwise automatic: green CI, a trusted `clean` jury verdict at the
@@ -165,8 +166,9 @@ input is authenticated:
 
 ## Review flow
 
-`review` checks out the PR head **in the operator's own clone** (incremental
-`.lake` reuse; a fresh worktree would mean a cold Mathlib build), announces an
+`review` checks out the PR head in a disposable Git worktree, leaving the
+operator's branch and uncommitted edits untouched. The worktree reuses only the
+shared `.lake/packages` dependency cache and keeps project build outputs isolated. It announces an
 in-progress marker comment (`<!--autoform-review-in-progress {...}-->`, TTL) so
 peer reviewers skip that head, runs the same jury the local engine runs
 (`judge_runtime.run_judge` × faithfulness / proof_integrity / code_quality),
@@ -192,7 +194,7 @@ autoform status [--json]            # survey + claims + quota-free state snapsho
 autoform claim  acquire|renew|release|holds|read|list|gc [key] [--ttl N] [--steal]
 autoform push   <ref> [--expect OID] [--remote URL]     # CAS push (git-safe-push)
 autoform pr-create ... --body-file F                    # marker+lease-gated gh pr create
-autoform sync   [--json]            # fetch + fold merged scoreboards locally (no push)
+autoform sync   [--json]            # fast-forward local default branch to canonical state
 autoform issues sync [--dry-run]    # escalations <-> GitHub issues
 autoform dashboard export|serve     # thin wrappers over the existing scripts
 autoform doctor [--json]            # environment + auth + repo capability audit
@@ -213,8 +215,9 @@ enforced by process-group kill.
 - `scripts/backend_config` — backend selection; unknown backends still fail closed.
 - `scripts/export_github_dashboard` + `configure_github_pages` — publication,
   still gated on committed inputs and explicit approval.
-- `scripts/dispatch_queue` — the local queue/feed; worker rounds surface
-  themselves in the live dashboard feed via `agent-start`/`agent-done`.
+- `scripts/dispatch_queue` — the machine-local queue/feed; worker rounds surface
+  themselves in the live dashboard feed via `agent-start`/`agent-done`. It is
+  deliberately not a cross-machine transport.
 - API egress consent: the CLI forwards `--allow-api-egress` per provider per
   process, exactly like the dispatcher; it never persists or infers consent.
 
@@ -238,6 +241,6 @@ the same. A claims `author/alpha` (ref CAS — B's later acquire of `alpha` retu
 target markers. B's next round picks stage `review` for A's PR (green CI, no
 scoreboard), runs the jury, posts the scoreboard: `clean`. A human (or auto-merge
 policy, later) merges. Either machine's next `progress` round folds the merged
-scoreboard into `review_status.json`, re-exports the static dashboard, pushes —
-the other machine's `sync` fast-forwards. The graph advanced by two nodes with
+scoreboard into `review_status.json`, re-exports the static dashboard, pushes.
+The other machine's `sync` fast-forwards to that committed state. The graph advanced by two nodes with
 zero human coordination beyond the merge click.

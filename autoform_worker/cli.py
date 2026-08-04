@@ -17,16 +17,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, doctor as doctor_mod, loop as loop_mod, round as round_mod
+from . import __version__, doctor as doctor_mod, gitutil, loop as loop_mod, round as round_mod
 from .config import WorkerConfig, plugin_root, resolve_config, scripts_modules
 from .constants import CLAIM_TTL_S, STAGES, TARGET_MARK_RE
 from .errors import EX_ERROR, EX_NOPROGRESS, EX_OK, ClaimTransportError, Die, NoProgress
 from .githost import GitHost
-from .gitutil import clean_tree, run_git, safe_push
+from .gitutil import safe_push
 from .scoreboard import parse_target
-from .survey import PRInfo
-from .work_units import _fold_metas
-from . import scoreboard as scoreboard_mod
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -298,52 +295,23 @@ def cmd_pr_create(args, gh_args: list[str]) -> int:
 
 
 def cmd_sync(args) -> int:
-    """Fold merged PRs' scoreboards into the LOCAL sidecar (no push, no claim).
-
-    Idempotent — safe to run any time; keeps local dashboards converged with
-    what actually merged. Does not mark PRs folded, so a later `progress` round
-    still pushes the shared fold.
-    """
+    """Fast-forward the local default branch to committed canonical state."""
     cfg = _config(args)
     host = GitHost()
-    canonical, _default = round_mod.resolve_repo(cfg, host)
-    mods = scripts_modules()
-
-    from .work_units import _inside, _trusted_login_predicate
-    from .survey import Survey
-
-    stub = Survey(canonical=canonical, default_branch=_default, me=host.me())
-    trusted = _trusted_login_predicate(cfg, host, stub)
-    metas: dict[int, dict] = {}
-    for raw in host.pr_list(canonical, state="merged", limit=50):
-        pr = PRInfo.from_gh(raw)
-        if not pr.node:
-            continue
-        meta = scoreboard_mod.parse_meta(host.pr_comments(canonical, pr.number),
-                                         trusted=trusted, require_head=pr.head_oid or None)
-        if meta and meta.get("node") == pr.node:
-            metas[pr.number] = meta
-
-    sidecar_path = cfg.project / "review_status.json"
-    in_repo = _inside(cfg.lean_root, sidecar_path)
-    was_clean = in_repo and clean_tree(cfg.lean_root)
-    changed = _fold_metas(mods, sidecar_path, metas)
-    committed = False
-    if changed and in_repo:
-        if was_clean:
-            # A committed sidecar must not be left dirty — the clean-tree gate
-            # would refuse every subsequent round.
-            run_git(["add", str(sidecar_path)], cwd=cfg.lean_root)
-            run_git(["commit", "--quiet", "-m", "autoform sync: fold merged scoreboards"],
-                    cwd=cfg.lean_root, check=False)
-            committed = clean_tree(cfg.lean_root)
-        else:
-            print("warning: tree was already dirty — the folded sidecar is uncommitted; "
-                  "commit it before running `autoform work`", file=sys.stderr)
-    result = {"merged_scoreboards": len(metas), "sidecar_changed": changed, "committed": committed}
+    canonical, default_branch = round_mod.resolve_repo(cfg, host)
+    if gitutil.current_branch(cfg.lean_root) != default_branch:
+        raise Die(f"sync requires the local {default_branch!r} branch")
+    if not gitutil.clean_tree(cfg.lean_root):
+        raise Die("sync requires a clean working tree")
+    before = gitutil.head_oid(cfg.lean_root)
+    gitutil.fetch(cfg.lean_root, gitutil.slug_url(canonical), default_branch)
+    proc = gitutil.run_git(["merge", "--ff-only", "FETCH_HEAD"], cwd=cfg.lean_root, check=False)
+    if proc.returncode != 0:
+        raise Die(f"local {default_branch} has diverged from {canonical}; resolve it manually")
+    after = gitutil.head_oid(cfg.lean_root)
+    result = {"branch": default_branch, "before": before, "after": after, "changed": before != after}
     print(json.dumps(result) if args.json else
-          f"folded {len(metas)} merged scoreboard(s); sidecar "
-          f"{'updated' + (' + committed' if committed else '') if changed else 'already current'}")
+          f"{default_branch} {'fast-forwarded to ' + after[:12] if before != after else 'already current'}")
     return EX_OK
 
 

@@ -230,6 +230,7 @@ def build_state_of(pr: dict) -> str:
     if not rollup:
         return "none"
     saw_pending = False
+    saw_success = False
     for check in rollup:
         conclusion = (check.get("conclusion") or "").upper()
         status = (check.get("status") or check.get("state") or "").upper()
@@ -238,4 +239,8 @@ def build_state_of(pr: dict) -> str:
             return "failed"
         if conclusion in {"", "NEUTRAL"} and status in {"QUEUED", "IN_PROGRESS", "PENDING", "EXPECTED", "WAITING"}:
             saw_pending = True
-    return "pending" if saw_pending else "success"
+        if conclusion == "SUCCESS" or status == "SUCCESS":
+            saw_success = True
+    if saw_pending:
+        return "pending"
+    return "success" if saw_success else "none"

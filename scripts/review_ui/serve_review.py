@@ -71,36 +71,8 @@ _ASSETS_DIR = _REPO_ROOT / "assets" / "review"
 # we inject that fragment verbatim — never regenerating the informalization.
 _THM_OPEN = '<div class="thm"'
 
-# Whole-word match for an incompleteness marker in Lean: `sorry`, `admit`, or the
-# raw `sorryAx`. `\b` anchors keep it from firing inside an identifier (e.g.
-# `sorryHandler`, `my_admit`); the line scanner below first strips `--` comments so a
-# `-- sorry` note never counts. This is the live "not implemented yet" detector.
-# The ``(?!-)`` tail rejects the hyphenated word form (``sorry-free``, ``admit-…``):
-# a real ``sorry``/``admit`` token in code is never followed by ``-``.
-_SORRY_RE = re.compile(r"\b(?:sorry|admit|sorryAx)\b(?!-)")
-# Block comments /- … -/ (incl. /-! … -/ module docstrings) are stripped before the
-# line scan so prose like "inspection-verified sorry-free" or "we admit …" inside a
-# docstring never trips the detector. Non-greedy; nested blocks are best-effort.
-_BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
-
-
 def _lean_has_sorry(text: str) -> bool:
-    """Best-effort: does this Lean source contain a real ``sorry``/``admit``/
-    ``sorryAx``?
-
-    Strips block comments (``/- … -/``) and each line's ``--`` trailing comment
-    before matching, and the whole-word regex rejects identifiers (``sorryHandler``,
-    ``my_admit``) and the hyphenated prose form (``sorry-free``). A false negative
-    here only means a node is *not* flagged violet, never that a real gap is hidden
-    where it matters for trust — the detector lights up incomplete modules, it is not
-    a Lean parser.
-    """
-    text = _BLOCK_COMMENT_RE.sub(" ", text)
-    for line in text.splitlines():
-        code = line.split("--", 1)[0]
-        if _SORRY_RE.search(code):
-            return True
-    return False
+    return rm.lean_has_incomplete_proof(text)
 
 
 # ---------------------------------------------------------------------------

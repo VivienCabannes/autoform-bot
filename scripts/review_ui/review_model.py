@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -55,6 +56,18 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import export_blueprint as eb  # noqa: E402  (sys.path adjusted above)
+
+_INCOMPLETE_PROOF_RE = re.compile(r"\b(?:sorry|admit|sorryAx)\b(?!-)")
+_LEAN_BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
+
+
+def lean_has_incomplete_proof(text: str) -> bool:
+    """Best-effort detection shared by the dashboard and worker scheduler."""
+    text = _LEAN_BLOCK_COMMENT_RE.sub(" ", text)
+    return any(
+        _INCOMPLETE_PROOF_RE.search(line.split("--", 1)[0])
+        for line in text.splitlines()
+    )
 
 # ---------------------------------------------------------------------------
 # Palette — verdict -> (DOT border color, fill color). These are the

@@ -34,8 +34,9 @@ from .work_units import (
     _cooperative_claim,
     _feed_done,
     _feed_start,
+    _inside,
+    _isolated_worktree,
     _lease_ok,
-    _worktree_round_trip,
 )
 
 AGENT_TIMEOUT_S = 3600
@@ -43,6 +44,32 @@ AGENT_TIMEOUT_S = 3600
 #: Triage first, then structure, then breadth — the orchestrate skill's order.
 KIND_PRIORITY = ("escalation", "planner", "mathcheck", "graphreview",
                  "contentreview", "counterexample", "priorart", "holistic")
+
+
+def _changed_paths(repo, base_ref: str = "HEAD") -> set[str]:
+    tracked = gitutil.run_git(["diff", "--name-only", "-z", base_ref], cwd=repo).stdout
+    untracked = gitutil.run_git(
+        ["ls-files", "--others", "--exclude-standard", "-z"], cwd=repo
+    ).stdout
+    return {path for path in (tracked + untracked).split("\0") if path}
+
+
+def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) -> bool:
+    """Enforce the role's durable write contract before any commit or push."""
+    if not paths:
+        return True
+    try:
+        project_rel = cfg.project.resolve().relative_to(cfg.lean_root.resolve())
+    except ValueError:
+        return False
+    prefix = "" if str(project_rel) == "." else f"{project_rel.as_posix()}/"
+    content_prefix = f"{prefix}informal_content/"
+    content = all(path.startswith(content_prefix) for path in paths)
+    if role.writes == "content":
+        return content
+    if role.writes == "graph":
+        return all(path == f"{prefix}graph.json" or path.startswith(content_prefix) for path in paths)
+    return role.writes == "none" and not paths
 
 
 @dataclass
@@ -153,17 +180,21 @@ def do_agent_task(
     dq = scripts_modules()["dispatch_queue"]
     counter_key = f"agent-{task.kind}-{task.node}"
 
+    if not _inside(cfg.lean_root, cfg.project):
+        return UnitResult(False, f"{task.kind} {task.node}: dispatch project is outside the Git repository")
+    if role.writes != "none" and not survey.can_push:
+        return UnitResult(False, f"{task.kind} {task.node}: no canonical push access; task remains queued")
+
     claim_key = f"task/{task.kind}/{task.task_id.replace(':', '-')}"
     notes: list[str] = []
     with _cooperative_claim(board, cfg.respect_claims, claim_key, notes) as (acquired, hb):
         if not acquired:
             return UnitResult(False, f"{task.kind} {task.node}: claimed by a live peer")
 
-        with _worktree_round_trip(cfg.lean_root):
-            url = gitutil.slug_url(survey.canonical)
-            gitutil.fetch(cfg.lean_root, url, survey.default_branch)
-            base_oid = gitutil.run_git(["rev-parse", "FETCH_HEAD"], cwd=cfg.lean_root).stdout.strip()
-            gitutil.run_git(["checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=cfg.lean_root)
+        url = gitutil.slug_url(survey.canonical)
+        gitutil.fetch(cfg.lean_root, url, survey.default_branch)
+        base_oid = gitutil.run_git(["rev-parse", "FETCH_HEAD"], cwd=cfg.lean_root).stdout.strip()
+        with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
 
             counters.bump(counter_key)
             dq.main([str(cfg.project), "claim", task.task_id, "--detail",
@@ -171,8 +202,8 @@ def do_agent_task(
             feed_name = f"worker-cli:{task.kind}:{task.node}"
             _feed_start(cfg, task.kind, feed_name, task.node)
             try:
-                prompt = build_prompt(role, task, cfg, survey)
-                rc, log_path = runner(provider, cfg.project, prompt, cfg.log_dir, agent_timeout)
+                prompt = build_prompt(role, task, work_cfg, survey)
+                rc, log_path = runner(provider, work_cfg.project, prompt, cfg.log_dir, agent_timeout)
             finally:
                 _feed_done(cfg, feed_name)
 
@@ -187,23 +218,27 @@ def do_agent_task(
                 return UnitResult(False, f"{task.kind} {task.node}: agent failed rc={rc}")
 
             pushed = False
-            if not gitutil.clean_tree(cfg.lean_root):
-                gitutil.run_git(["add", "-A"], cwd=cfg.lean_root)
-                gitutil.run_git(["commit", "--quiet", "-m",
-                                 f"{role.name}: {task.node}\n\nRoadmap curation by autoform worker "
-                                 f"{cfg.worker_id} ({role.kind})."], cwd=cfg.lean_root)
+            changed = _changed_paths(work_cfg.lean_root, base_oid)
+            if not _agent_paths_allowed(role, work_cfg, changed):
+                paths = ", ".join(sorted(changed)[:8]) or "(none)"
+                dq.main([str(cfg.project), "fail", task.task_id, "--reason",
+                         f"role write contract rejected: {paths}"])
+                return UnitResult(False, f"{task.kind} {task.node}: rejected out-of-contract paths: {paths}")
+            if changed:
+                if not gitutil.clean_tree(work_cfg.lean_root):
+                    gitutil.run_git(["add", "-A"], cwd=work_cfg.lean_root)
+                    gitutil.run_git(["commit", "--quiet", "-m",
+                                     f"{role.name}: {task.node}\n\nRoadmap curation by autoform worker "
+                                     f"{cfg.worker_id} ({role.kind})."], cwd=work_cfg.lean_root)
                 if not _lease_ok(hb):
                     dq.main([str(cfg.project), "fail", task.task_id, "--reason", "lease lost before push"])
                     return UnitResult(False, f"{task.kind} {task.node}: lease lost — refusing to push")
-                if survey.can_push:
-                    pushed = gitutil.safe_push(cfg.lean_root, survey.default_branch,
-                                               remote=url, expect=base_oid)
-                    if not pushed:
-                        dq.main([str(cfg.project), "fail", task.task_id, "--reason",
-                                 "CAS lost — base moved; will retry"])
-                        return UnitResult(False, f"{task.kind} {task.node}: CAS lost, retry next round")
-                else:
-                    notes.append("no push access — curation committed locally only")
+                pushed = gitutil.safe_push(work_cfg.lean_root, survey.default_branch,
+                                           remote=url, expect=base_oid)
+                if not pushed:
+                    dq.main([str(cfg.project), "fail", task.task_id, "--reason",
+                             "CAS lost — base moved; will retry"])
+                    return UnitResult(False, f"{task.kind} {task.node}: CAS lost, retry next round")
 
             dq.main([str(cfg.project), "done", task.task_id, "--result",
                      f"{role.name} completed" + (" (pushed)" if pushed else "")])
@@ -214,7 +249,7 @@ def do_agent_task(
 
 
 def agent_candidates(cfg: WorkerConfig, registry: Registry, counters: Counters,
-                     live_foreign: dict) -> tuple[list[Candidate], list[Candidate]]:
+                     live_foreign: dict, *, can_push: bool = True) -> tuple[list[Candidate], list[Candidate]]:
     """(actionable, suppressed) candidates for every queued role task."""
     ready: list[Candidate] = []
     held: list[Candidate] = []
@@ -228,8 +263,15 @@ def agent_candidates(cfg: WorkerConfig, registry: Registry, counters: Counters,
         elif counters.get(f"agent-{task.kind}-{task.node}") >= MAX_AGENT_ATTEMPTS:
             cand.reason = "attempt budget spent"
             held.append(cand)
+        elif role := registry.get(task.kind):
+            if role.writes != "none" and not can_push:
+                cand.reason = "no canonical push access"
+                held.append(cand)
+            else:
+                ready.append(cand)
         else:
-            ready.append(cand)
+            cand.reason = "role disappeared"
+            held.append(cand)
     return ready, held
 
 

@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
 from autoform_worker import scoreboard, survey, work_units
 from autoform_worker.config import resolve_config
 from autoform_worker.constants import HOLD_LABELS, MAX_MERGE_ATTEMPTS, merge_paths_allowed
@@ -242,15 +244,18 @@ def test_collect_untrusted_scoreboard_author_does_not_enable_merge(tmp_path, mon
 class MergeRunner:
     """Canned gh for do_merge: records argv, serves one `pr list`, answers `pr merge`."""
 
-    def __init__(self, open_prs=(), merge_rc=0):
+    def __init__(self, open_prs=(), merge_rc=0, comments=None):
         self.calls: list[list[str]] = []
         self.open_prs = list(open_prs)
         self.merge_rc = merge_rc
+        self.comments = [sb_comment()] if comments is None else list(comments)
 
     def __call__(self, args, input_text=None):
         self.calls.append(list(args))
         if args[:2] == ["pr", "list"]:
             return done(json.dumps(self.open_prs))
+        if args[0] == "api" and "--paginate" in args:
+            return done(json.dumps(self.comments))
         if args[:2] == ["pr", "merge"]:
             return subprocess.CompletedProcess(
                 args=[], returncode=self.merge_rc, stdout="",
@@ -297,7 +302,7 @@ def test_do_merge_refuses_when_head_moved_since_review(tmp_path, monkeypatch):
                                  merge_candidate())
     assert not result.progressed and "head moved since review" in result.summary
     assert runner.merges() == []  # never even attempted
-    assert counters.get(f"merge-{PR_NUMBER}") == 1  # attempt burned, not cleared
+    assert counters.get(f"merge-{PR_NUMBER}") == 0  # preflight rejection does not burn an attempt
 
 
 def test_do_merge_no_progress_when_pr_vanished(tmp_path, monkeypatch):
@@ -309,7 +314,7 @@ def test_do_merge_no_progress_when_pr_vanished(tmp_path, monkeypatch):
                                  merge_candidate())
     assert not result.progressed and "vanished" in result.summary
     assert runner.merges() == []
-    assert counters.get(f"merge-{PR_NUMBER}") == 1
+    assert counters.get(f"merge-{PR_NUMBER}") == 0
 
 
 def test_do_merge_keeps_the_counter_when_github_refuses(tmp_path, monkeypatch):
@@ -322,6 +327,45 @@ def test_do_merge_keeps_the_counter_when_github_refuses(tmp_path, monkeypatch):
     assert not result.progressed and "GitHub refused the merge" in result.summary
     assert len(runner.merges()) == 1
     assert counters.get(f"merge-{PR_NUMBER}") == 1  # NOT cleared — refusals must burn budget
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (lambda pr: pr.update(labels=[{"name": "autoform"}, {"name": "hold"}]), "hold label"),
+        (lambda pr: pr.update(statusCheckRollup=[{"conclusion": "SKIPPED", "status": "COMPLETED"}]),
+         "no successful CI check"),
+        (lambda pr: pr.update(files=[{"path": "lean-toolchain"}]), "non-roadmap paths"),
+    ],
+)
+def test_do_merge_rechecks_mutable_gate_inputs(tmp_path, monkeypatch, mutate, reason):
+    cfg = make_cfg(tmp_path, monkeypatch)
+    fresh = pr_raw()
+    mutate(fresh)
+    runner = MergeRunner(open_prs=[fresh])
+
+    result = work_units.do_merge(
+        cfg, GitHost(runner=runner), Counters(cfg.counters_path), a_survey(), merge_candidate()
+    )
+    assert not result.progressed and reason in result.summary
+    assert runner.merges() == []
+
+
+def test_do_merge_rechecks_scoreboard_and_human_verdict(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, monkeypatch, human_verdict="rejected")
+    runner = MergeRunner(open_prs=[pr_raw()], comments=[])
+    result = work_units.do_merge(
+        cfg, GitHost(runner=runner), Counters(cfg.counters_path), a_survey(), merge_candidate()
+    )
+    assert not result.progressed and "scoreboard no longer present" in result.summary
+    assert runner.merges() == []
+
+    runner = MergeRunner(open_prs=[pr_raw()])
+    result = work_units.do_merge(
+        cfg, GitHost(runner=runner), Counters(cfg.counters_path), a_survey(), merge_candidate()
+    )
+    assert not result.progressed and "human verdict rejected" in result.summary
+    assert runner.merges() == []
 
 
 # -- the no-CI hole ----------------------------------------------------------
@@ -345,7 +389,7 @@ def test_no_ci_checks_blocks_the_merge_gate(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, monkeypatch)
     ready, held = buckets(_no_ci_survey(cfg))
     assert ready == []
-    assert any("no CI checks ran on this head" in reason for reason in held), held
+    assert any("no successful CI check ran on this head" in reason for reason in held), held
 
 
 def test_merge_without_ci_opt_out_reopens_the_gate(tmp_path, monkeypatch):

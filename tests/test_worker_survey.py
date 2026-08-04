@@ -141,6 +141,12 @@ def test_build_state_of_matrix():
     assert build_state_of({"statusCheckRollup": [{"conclusion": "FAILURE"}]}) == "failed"
     assert build_state_of({"statusCheckRollup": [{"state": "ERROR"}]}) == "failed"
     assert build_state_of({"statusCheckRollup": list(RUNNING)}) == "pending"
+    assert build_state_of({"statusCheckRollup": [{"conclusion": "SKIPPED", "status": "COMPLETED"}]}) == "none"
+    assert build_state_of({"statusCheckRollup": [{"conclusion": "NEUTRAL", "status": "COMPLETED"}]}) == "none"
+    assert build_state_of({"statusCheckRollup": [
+        {"conclusion": "SUCCESS", "status": "COMPLETED"},
+        {"conclusion": "SKIPPED", "status": "COMPLETED"},
+    ]}) == "success"
     mixed_fail = [{"conclusion": "SUCCESS"}, {"conclusion": "", "status": "QUEUED"},
                   {"conclusion": "TIMED_OUT"}]
     assert build_state_of({"statusCheckRollup": mixed_fail}) == "failed"
@@ -162,6 +168,16 @@ def test_eligible_prove_nodes(tmp_path, monkeypatch):
     # clean verdict + clean Lean, untrusted prerequisite, and in-Mathlib are all out.
     assert "clean" not in reasons and "blocked" not in reasons and "reused" not in reasons
     assert [nid for nid, _n, _r in out] == sorted(reasons)
+
+
+def test_eligible_prove_nodes_uses_comment_aware_incomplete_scanner(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, monkeypatch)
+    path = cfg.lean_root / "Sorried.lean"
+    path.write_text("/- sorry -/\n-- admit\ntheorem s : True := trivial\n", encoding="utf-8")
+    assert "sorried" not in {nid for nid, _node, _reason in survey.eligible_prove_nodes(cfg)}
+
+    path.write_text("theorem s : True := by admit\n", encoding="utf-8")
+    assert "sorried" in {nid for nid, _node, _reason in survey.eligible_prove_nodes(cfg)}
 
 
 # -- collect: PR tending -----------------------------------------------------

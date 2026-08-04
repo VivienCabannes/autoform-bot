@@ -93,6 +93,7 @@ class Survey:
     claims: list = field(default_factory=list)
     can_push: bool = False
     issues_enabled: bool = False
+    allow_unchecked_merge: bool = False
     extra_identities: tuple = ()
 
     def actionable(self, stage: str) -> list:
@@ -162,7 +163,9 @@ def eligible_prove_nodes(cfg: WorkerConfig) -> list[tuple[str, dict, str]]:
             except ValueError:
                 lean_path = None
         has_lean = lean_path is not None and lean_path.exists()
-        sorried = has_lean and ("sorry" in lean_path.read_text(encoding="utf-8", errors="replace"))
+        sorried = has_lean and rm.lean_has_incomplete_proof(
+            lean_path.read_text(encoding="utf-8", errors="replace")
+        )
         if verdict == "rejected":
             reason = "verdict rejected — needs repair"
         elif not has_lean:
@@ -192,6 +195,7 @@ def collect(
 ) -> Survey:
     me = host.me()
     survey = Survey(canonical=canonical, default_branch=default_branch, me=me,
+                    allow_unchecked_merge=allow_unchecked_merge,
                     extra_identities=tuple(extra_identities or ()))
     survey.can_push = host.can_push(canonical)
     survey.issues_enabled = host.has_issues(canonical)
@@ -314,28 +318,12 @@ def collect(
                 # as does any hold label; toolchain/CI/tooling paths always
                 # wait for a human.
                 cand = Candidate("merge", "clean verdict at head + green CI", pr=pr, node=pr.node)
-                holds = sorted(HOLD_LABELS.intersection(pr.labels))
-                human_block = _human_verdict(sidecar, pr.node)
-                if pr.build != "success" and not allow_unchecked_merge:
-                    # An empty check rollup is not a green build. Without CI the
-                    # only thing standing between a proof and `main` would be the
-                    # jury's opinion, so the gate stays shut until the repo
-                    # actually verifies its heads (see templates/github/
-                    # autoform-verify.yml) or the operator opts out explicitly.
-                    cand.reason = ("no CI checks ran on this head — install a verify workflow "
-                                   "or pass --merge-without-ci")
-                    push_cand("merge", cand, False)
-                elif not survey.can_push:
-                    cand.reason = "no merge permission on canonical"
-                    push_cand("merge", cand, False)
-                elif holds:
-                    cand.reason = f"hold label: {', '.join(holds)}"
-                    push_cand("merge", cand, False)
-                elif human_block:
-                    cand.reason = f"human verdict {human_block} blocks the gate"
-                    push_cand("merge", cand, False)
-                elif not merge_paths_allowed(pr.files):
-                    cand.reason = "touches non-roadmap paths — needs a human"
+                block = merge_block_reason(
+                    pr, sidecar, can_push=survey.can_push,
+                    allow_unchecked_merge=allow_unchecked_merge,
+                )
+                if block:
+                    cand.reason = block
                     push_cand("merge", cand, False)
                 elif counters.get(f"merge-{pr.number}") >= MAX_MERGE_ATTEMPTS:
                     cand.reason = "merge attempt budget spent"
@@ -362,7 +350,8 @@ def collect(
     from .registry import Registry  # noqa: PLC0415
 
     registry = Registry(cfg.plugin_root, cfg.project)
-    ready, held = agent_candidates(cfg, registry, counters, live_foreign)
+    ready, held = agent_candidates(cfg, registry, counters, live_foreign,
+                                   can_push=survey.can_push)
     survey.stages["agents"].extend(ready)
     survey.suppressed["agents"].extend(held)
 
@@ -420,6 +409,29 @@ def _human_verdict(sidecar: dict, node_id: str | None) -> str | None:
     human = record.get("human") or {}
     verdict = human.get("verdict")
     return verdict if verdict in {"flagged", "rejected"} else None
+
+
+def merge_block_reason(
+    pr: PRInfo,
+    sidecar: dict,
+    *,
+    can_push: bool,
+    allow_unchecked_merge: bool,
+) -> str | None:
+    """Return the reason this PR cannot pass the deterministic merge gate."""
+    if pr.build != "success" and not allow_unchecked_merge:
+        return "no successful CI check ran on this head — install a verify workflow or pass --merge-without-ci"
+    if not can_push:
+        return "no merge permission on canonical"
+    holds = sorted(HOLD_LABELS.intersection(pr.labels))
+    if holds:
+        return f"hold label: {', '.join(holds)}"
+    human_block = _human_verdict(sidecar, pr.node)
+    if human_block:
+        return f"human verdict {human_block} blocks the gate"
+    if not merge_paths_allowed(pr.files):
+        return "touches non-roadmap paths — needs a human"
+    return None
 
 
 def _load_folded(path: Path) -> set[int]:

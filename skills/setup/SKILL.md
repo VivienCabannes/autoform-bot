@@ -246,7 +246,8 @@ when they occur.
      edit; committing and pushing it needs separate explicit approval;
    - ensure the Lean repo's `.gitignore` keeps per-machine state local while
      durable state stays committed. Local-only: `task_queue.json`,
-     `agents_status.json`, `dispatch.log`, `worker.log`, `.autoform/`.
+     `agents_status.json`, their `*.lock` files, `dispatch.log`, `worker.log`,
+     `.autoform/`.
      Committed: `graph.json`, `informal_content/`, `kernel/`,
      `review_status.json`, the Lean sources;
    - if the user wants cross-machine escalation visibility, note whether

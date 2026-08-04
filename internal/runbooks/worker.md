@@ -30,7 +30,9 @@ python -m autoform_worker doctor --json
 
 Every failing check must either be fixed or explicitly accepted by the user
 (e.g. "issues disabled — escalation sync degrades to local"). Never start a
-loop on a failing `gh auth`, missing `origin`, or dirty working tree.
+loop on a failing `gh auth` or missing `origin`. Worker units use disposable
+worktrees, so uncommitted operator edits are left untouched; `autoform sync`
+still requires a clean default branch because it fast-forwards that branch.
 
 ## The round contract
 

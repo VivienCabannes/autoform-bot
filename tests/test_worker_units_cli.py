@@ -13,13 +13,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from autoform_worker import agents, cli, doctor, scoreboard, work_units
+from autoform_worker import agent_work, agents, cli, doctor, scoreboard, work_units
 from autoform_worker.claims import ClaimBoard
 from autoform_worker.config import plugin_root, resolve_config, scripts_modules
 from autoform_worker.counters import Counters
 from autoform_worker.errors import Die
 from autoform_worker.githost import GitHost
 from autoform_worker.gitutil import clean_tree, current_branch, remote_ref_oid
+from autoform_worker.registry import Registry
 from autoform_worker.survey import Candidate, PRInfo, Survey
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,13 +57,17 @@ def world(tmp_path, monkeypatch):
     for key, value in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(["config", key, value], lean_root)
     (lean_root / "lakefile.toml").write_text('name = "proj"\n', encoding="utf-8")
+    (lean_root / ".gitignore").write_text(
+        "plan/task_queue.json\nplan/agents_status.json\nplan/dispatch.log\nplan/*.lock\n",
+        encoding="utf-8",
+    )
     (lean_root / "Proj").mkdir()
     (lean_root / "Proj" / "Basic.lean").write_text("theorem base : True := trivial\n", encoding="utf-8")
     _git(["add", "-A"], lean_root)
     _git(["commit", "--quiet", "-m", "init"], lean_root)
     _git(["push", "--quiet", "origin", "main"], lean_root)
 
-    project = tmp_path / "project"
+    project = lean_root / "plan"
     (project / "informal_content").mkdir(parents=True)
     graph = {
         "metadata": {"lean_root": str(lean_root)},
@@ -70,6 +75,9 @@ def world(tmp_path, monkeypatch):
                              "description": "A test node", "depends_on": []}},
     }
     (project / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    _git(["add", "plan/graph.json"], lean_root)
+    _git(["commit", "--quiet", "-m", "add roadmap"], lean_root)
+    _git(["push", "--quiet", "origin", "main"], lean_root)
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(project))
 
     cfg = resolve_config(worker_id="tester")
@@ -163,13 +171,22 @@ def test_do_prove_failed_escalates_without_push(world):
     assert current_branch(world.lean_root) == "main" and clean_tree(world.lean_root)
 
 
-def test_do_prove_refuses_dirty_tree(world):
+def test_do_prove_preserves_dirty_operator_tree(world):
     (world.lean_root / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
-    with pytest.raises(Die, match="not clean"):
-        work_units.do_prove(world.cfg, GitHost(runner=RecordingRunner()), None, world.counters,
-                            _survey(), Candidate("prove", "r", node="node-a"),
-                            backend="max", judge_backend="claude",
-                            prover=lambda *a, **k: pytest.fail("prover must not run"))
+    prior_branch = current_branch(world.lean_root)
+
+    def prover(_node_id, _node, _project, _graph, lean_root, _steers, **_kw):
+        Path(lean_root, "Proj", "NodeA.lean").write_text("theorem node_a : True := trivial\n")
+        return ("proved", "verified", "")
+
+    result = work_units.do_prove(
+        world.cfg, GitHost(runner=RecordingRunner()), None, world.counters,
+        _survey(), Candidate("prove", "r", node="node-a"),
+        backend="max", judge_backend="claude", prover=prover,
+    )
+    assert result.progressed
+    assert current_branch(world.lean_root) == prior_branch
+    assert (world.lean_root / "scratch.txt").read_text() == "uncommitted\n"
 
 
 def test_do_prove_refuses_openai_without_egress_consent(world):
@@ -354,6 +371,29 @@ def test_build_parser_round_trip():
     assert args.allow_api_egress == []
 
 
+def test_cmd_sync_fast_forwards_without_creating_a_local_commit(world, monkeypatch):
+    other = world.cfg.state_dir.parent.parent / "other"
+    _git(["clone", "--quiet", str(world.bare), str(other)], other.parent)
+    _git(["config", "user.email", "t@t.t"], other)
+    _git(["config", "user.name", "t"], other)
+    (other / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(["add", "remote.txt"], other)
+    _git(["commit", "--quiet", "-m", "remote update"], other)
+    _git(["push", "--quiet", "origin", "main"], other)
+    remote_head = _git_out(["rev-parse", "HEAD"], other).strip()
+
+    monkeypatch.setattr(cli.round_mod, "resolve_repo", lambda _cfg, _host: ("org/proj", "main"))
+    assert cli.cmd_sync(argparse.Namespace(project=world.project, worker_id="tester", json=True)) == 0
+    assert _git_out(["rev-parse", "HEAD"], world.lean_root).strip() == remote_head
+    assert clean_tree(world.lean_root)
+
+
+def test_cli_version_matches_distribution_metadata():
+    from importlib.metadata import version
+
+    assert cli.__version__ == version("autoform") == "0.5.0"
+
+
 def test_resolve_config_env_and_sanitized_worker_id(world):
     cfg = resolve_config(worker_id="Jack Mac!")
     assert cfg.worker_id == "jack-mac"
@@ -412,6 +452,83 @@ def test_agents_pure_helpers(tmp_path):
     assert agents.classify_infra_failure(log) == "provider returned 529"
     log.write_text("the agent gave up on its own\n", encoding="utf-8")
     assert agents.classify_infra_failure(log) is None
+
+
+def _queued_agent_candidate(world, kind="contentreview"):
+    task_id = f"{kind}:node-a:1"
+    (world.project / "task_queue.json").write_text(json.dumps([{
+        "id": task_id,
+        "agent": kind,
+        "node": "node-a",
+        "node_label": "Node A",
+        "status": "queued",
+        "at": "2026-08-04T00:00:00Z",
+        "source": "test",
+    }]), encoding="utf-8")
+    task = agent_work.QueuedTask(task_id, kind, "node-a", "Node A")
+    candidate = Candidate(kind, "queued", node="node-a")
+    candidate.task = task
+    return candidate
+
+
+def test_agent_task_enforces_declared_paths_before_direct_push(world):
+    candidate = _queued_agent_candidate(world)
+
+    def runner(_provider, cwd, _prompt, _log_dir, _timeout):
+        (Path(cwd).parents[0] / "scripts").mkdir()
+        (Path(cwd).parents[0] / "scripts" / "evil.py").write_text("print('no')\n")
+        _git(["add", "-A"], Path(cwd).parents[0])
+        _git(["commit", "--quiet", "-m", "agent attempted out-of-contract commit"],
+             Path(cwd).parents[0])
+        return 0, world.cfg.log_dir / "agent.log"
+
+    result = agent_work.do_agent_task(
+        world.cfg, GitHost(runner=RecordingRunner()), None, world.counters, _survey(), candidate,
+        registry=Registry(REPO_ROOT, world.project), backend="max", runner=runner,
+    )
+    assert not result.progressed and "out-of-contract" in result.summary
+    missing = subprocess.run(
+        ["git", "show", "main:scripts/evil.py"], cwd=world.bare,
+        capture_output=True, text=True,
+    )
+    assert missing.returncode != 0
+    queue = json.loads((world.project / "task_queue.json").read_text())
+    assert queue[0]["status"] == "failed"
+
+
+def test_agent_task_pushes_only_declared_content(world):
+    candidate = _queued_agent_candidate(world)
+
+    def runner(_provider, cwd, _prompt, _log_dir, _timeout):
+        content = Path(cwd) / "informal_content" / "node-a.md"
+        content.parent.mkdir(parents=True, exist_ok=True)
+        content.write_text("# Node A\n", encoding="utf-8")
+        _git(["add", "-A"], Path(cwd).parents[0])
+        _git(["commit", "--quiet", "-m", "agent committed allowed content"],
+             Path(cwd).parents[0])
+        return 0, world.cfg.log_dir / "agent.log"
+
+    result = agent_work.do_agent_task(
+        world.cfg, GitHost(runner=RecordingRunner()), None, world.counters, _survey(), candidate,
+        registry=Registry(REPO_ROOT, world.project), backend="max", runner=runner,
+    )
+    assert result.progressed and "pushed" in result.summary
+    assert _git_out(["show", "main:plan/informal_content/node-a.md"], world.bare) == "# Node A\n"
+    queue = json.loads((world.project / "task_queue.json").read_text())
+    assert queue[0]["status"] == "done"
+
+
+def test_agent_task_without_push_access_stays_queued(world):
+    candidate = _queued_agent_candidate(world)
+    result = agent_work.do_agent_task(
+        world.cfg, GitHost(runner=RecordingRunner()), None, world.counters,
+        _survey(can_push=False), candidate,
+        registry=Registry(REPO_ROOT, world.project), backend="max",
+        runner=lambda *_args: pytest.fail("agent must not run without a durable landing path"),
+    )
+    assert not result.progressed and "remains queued" in result.summary
+    queue = json.loads((world.project / "task_queue.json").read_text())
+    assert queue[0]["status"] == "queued"
 
 
 # ---------------------------------------------------------------------------

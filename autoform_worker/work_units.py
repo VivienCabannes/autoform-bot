@@ -2,12 +2,12 @@
 
 Shared discipline (every unit):
 
-* start from a clean tree, remember the operator's branch, restore it on exit;
+* run mutations in a disposable worktree, never in the operator's checkout;
 * cooperative claim + heartbeat around the work ([COOP]);
 * every push is a CAS ``safe_push`` against the OID observed at survey time,
   re-checking the heartbeat first ([HARD] — never push on a lost lease);
-* return a :class:`UnitResult`; ``progressed`` is True only when a visible
-  GitHub mark landed (new head OID, new comment, new PR).
+* return a :class:`UnitResult`; mutating work progresses only when a visible
+  GitHub mark lands (new head OID, new comment, or new PR).
 
 Prove reuses the existing prover stack end-to-end via
 ``scripts/dispatch_runner.run_worker`` (spec building → adapter → driver →
@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,12 +34,11 @@ from .constants import (
     LABEL_ESCALATION,
     PROVE_BRANCH_PREFIX,
     REVIEW_INPROGRESS_TTL_S,
-    REVIEW_TMP_BRANCH_PREFIX,
 )
 from .counters import Counters
 from .errors import ClaimTransportError, Die
 from .githost import GitHost
-from .survey import Candidate, PRInfo, Survey, _load_folded
+from .survey import Candidate, PRInfo, Survey, _load_folded, merge_block_reason
 
 FIX_AGENT_TIMEOUT_S = 3600
 JUDGE_TIMEOUT_S = 600
@@ -65,141 +65,29 @@ def _slug(text: str, limit: int = 40) -> str:
 
 
 @contextlib.contextmanager
-def _worktree_round_trip(cfg: WorkerConfig):
-    """Exclusive, restorable occupancy of the operator's checkout.
-
-    * An flock on ``.git/autoform-worker.lock`` serializes units across ALL
-      processes sharing this clone — worker ids are identities, the worktree is
-      the mutually exclusive resource.
-    * An inflight marker (``.git/autoform-worker-inflight.json``) records the
-      operator's prior ref; a round killed mid-unit (timeout SIGKILL, crash) is
-      recovered by the NEXT round instead of wedging the loop on the
-      clean-tree gate forever.
-    * Requires a clean tree on entry. On exit, a dirty tree is salvaged before
-      restore: every dirty file's current bytes are copied into the worker
-      state dir, and human verdicts written into a committed
-      ``review_status.json`` by a concurrently running dashboard are merged
-      back into the restored sidecar (human slots are immutable by contract —
-      a branch switch must never destroy one).
-    """
-    repo = cfg.lean_root
-    git_dir = Path(gitutil.run_git(["rev-parse", "--git-dir"], cwd=repo).stdout.strip())
-    if not git_dir.is_absolute():
-        git_dir = repo / git_dir
-    marker_path = git_dir / "autoform-worker-inflight.json"
-    with open(git_dir / "autoform-worker.lock", "w") as lock_fh:
-        import fcntl
-
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            raise Die(f"{repo}: another autoform unit is mutating this checkout right now") from error
-        _recover_stale_round(cfg, marker_path)
-        if not gitutil.clean_tree(repo):
-            raise Die(f"{repo}: working tree not clean — commit or stash before running the worker")
-        prior = gitutil.current_branch(repo)
-        prior_ref = prior if prior != "HEAD" else gitutil.head_oid(repo)
-        marker_path.write_text(json.dumps({"prior_ref": prior_ref, "at": _now_iso()}), encoding="utf-8")
-        try:
-            yield
-        finally:
-            _restore_worktree(cfg, prior_ref)
-            with contextlib.suppress(OSError):
-                marker_path.unlink()
-
-
-def _restore_worktree(cfg: WorkerConfig, prior_ref: str) -> None:
-    repo = cfg.lean_root
-    with contextlib.suppress(Die):
-        if not gitutil.clean_tree(repo):
-            salvaged_sidecar = _salvage_dirty_files(cfg)
-            gitutil.run_git(["reset", "--hard", "--quiet"], cwd=repo, check=False)
-            gitutil.run_git(["clean", "-fd", "--quiet"], cwd=repo, check=False)
-            gitutil.run_git(["checkout", "--quiet", prior_ref], cwd=repo, check=False)
-            if salvaged_sidecar is not None:
-                _merge_salvaged_human_slots(cfg, salvaged_sidecar)
-            return
-        gitutil.run_git(["checkout", "--quiet", prior_ref], cwd=repo, check=False)
-
-
-def _recover_stale_round(cfg: WorkerConfig, marker_path: Path) -> None:
-    """A leftover inflight marker under the lock means OUR previous round died
-    mid-unit — the dirt is provably the worker's own, so restore and move on."""
-    if not marker_path.exists():
-        return
+def _isolated_worktree(cfg: WorkerConfig, start_ref: str):
+    """Yield a disposable checkout without touching the operator's worktree."""
+    parent = cfg.state_dir / "worktrees"
+    parent.mkdir(parents=True, exist_ok=True)
+    path = Path(tempfile.mkdtemp(prefix="round-", dir=parent))
+    path.rmdir()
+    gitutil.run_git(["worktree", "add", "--detach", "--quiet", str(path), start_ref],
+                    cwd=cfg.lean_root, timeout=600)
     try:
-        prior_ref = json.loads(marker_path.read_text(encoding="utf-8")).get("prior_ref")
-    except (OSError, json.JSONDecodeError):
-        prior_ref = None
-    if isinstance(prior_ref, str) and prior_ref:
-        _restore_worktree(cfg, prior_ref)
-    with contextlib.suppress(OSError):
-        marker_path.unlink()
-
-
-_SALVAGE_MAX_BYTES = 5 * 1024 * 1024
-
-
-def _salvage_dirty_files(cfg: WorkerConfig) -> bytes | None:
-    """Copy every dirty file's current bytes into the state dir before reset.
-
-    Returns the current bytes of a dirty committed ``review_status.json`` (the
-    one file whose concurrent writes we can safely re-merge), or None.
-    """
-    repo = cfg.lean_root
-    sidecar_path = cfg.project / "review_status.json"
-    salvage_dir = cfg.state_dir / "salvage" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    sidecar_bytes: bytes | None = None
-    proc = gitutil.run_git(["status", "--porcelain", "--untracked-files=all"], cwd=repo, check=False)
-    for line in proc.stdout.splitlines():
-        rel = line[3:].strip().strip('"')
-        if not rel:
-            continue
-        src = repo / rel
+        packages = cfg.lean_root / ".lake" / "packages"
+        if packages.is_dir():
+            (path / ".lake").mkdir(exist_ok=True)
+            (path / ".lake" / "packages").symlink_to(packages, target_is_directory=True)
         try:
-            if not src.is_file() or src.stat().st_size > _SALVAGE_MAX_BYTES:
-                continue
-            data = src.read_bytes()
-        except OSError:
-            continue
-        if src.resolve() == sidecar_path.resolve():
-            sidecar_bytes = data
-        dst = salvage_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            dst.write_bytes(data)
-    return sidecar_bytes
-
-
-def _merge_salvaged_human_slots(cfg: WorkerConfig, salvaged: bytes) -> None:
-    """Re-apply human verdicts from a salvaged sidecar onto the restored one.
-
-    Human slots are immutable and additive — merging them back is always safe;
-    everything else in the salvaged copy was derived from the wrong branch."""
-    try:
-        data = json.loads(salvaged.decode("utf-8"))
-        reviews = data.get("reviews") if isinstance(data, dict) else None
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return
-    if not isinstance(reviews, dict):
-        return
-    humans = {node: rec["human"] for node, rec in reviews.items()
-              if isinstance(rec, dict) and isinstance(rec.get("human"), dict)}
-    if not humans:
-        return
-    mods = scripts_modules()
-    rm, fslock = mods["review_model"], mods["fslock"]
-    sidecar_path = cfg.project / "review_status.json"
-    with fslock.locked(sidecar_path):
-        sidecar = rm.load_sidecar(sidecar_path)
-        changed = False
-        for node, human in humans.items():
-            slot = sidecar.setdefault("reviews", {}).setdefault(node, {})
-            if slot.get("human") != human:
-                slot["human"] = human
-                changed = True
-        if changed:
-            rm.save_sidecar(sidecar_path, sidecar)
+            project_rel = cfg.project.resolve().relative_to(cfg.lean_root.resolve())
+            project = path / project_rel
+        except ValueError:
+            project = cfg.project
+        yield replace(cfg, lean_root=path, project=project)
+    finally:
+        gitutil.run_git(["worktree", "remove", "--force", str(path)],
+                        cwd=cfg.lean_root, check=False, timeout=600)
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @contextlib.contextmanager
@@ -325,15 +213,14 @@ def do_prove(
     with _cooperative_claim(board, cfg.respect_claims, author_claim_key(node_id), notes) as (acquired, hb):
         if not acquired:
             return UnitResult(False, f"prove {node_id}: claimed by a live peer meanwhile")
-        with _worktree_round_trip(cfg):
-            gitutil.fetch(cfg.lean_root, gitutil.slug_url(survey.canonical), survey.default_branch)
-            gitutil.run_git(["checkout", "--quiet", "-B", branch, "FETCH_HEAD"], cwd=cfg.lean_root)
+        gitutil.fetch(cfg.lean_root, gitutil.slug_url(survey.canonical), survey.default_branch)
+        with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
 
             counters.bump(f"prove-{node_id}")
             _feed_start(cfg, "worker", feed_name, node_id)
             try:
                 status, reason, detail = prover(
-                    node_id, node, cfg.project, str(cfg.graph_path), str(cfg.lean_root),
+                    node_id, node, work_cfg.project, str(work_cfg.graph_path), str(work_cfg.lean_root),
                     PROVE_MAX_STEERS, backend=adapter, judge_backend=judge_backend,
                     worker_timeout=PROVE_TIMEOUT_S,
                 )
@@ -346,16 +233,16 @@ def do_prove(
                 return UnitResult(False, f"prove {node_id}: FAILED — {reason[:200]}",
                                   infra_failure="prover error" if "prover error" in (reason or "") else None)
 
-            gitutil.run_git(["add", "-A"], cwd=cfg.lean_root)
-            if gitutil.clean_tree(cfg.lean_root):
+            gitutil.run_git(["add", "-A"], cwd=work_cfg.lean_root)
+            if gitutil.clean_tree(work_cfg.lean_root):
                 return UnitResult(False, f"prove {node_id}: claimed proved but landed no changes")
             gitutil.run_git(["commit", "--quiet", "-m",
                              f"prove: {node_id} ({node.get('kind', 'statement')})\n\n{(reason or '')[:400]}"],
-                            cwd=cfg.lean_root)
+                            cwd=work_cfg.lean_root)
 
             if not _lease_ok(hb):
                 return UnitResult(False, f"prove {node_id}: author lease lost — refusing to push")
-            if not gitutil.safe_push(cfg.lean_root, branch, remote=push_url, expect=None):
+            if not gitutil.safe_push(work_cfg.lean_root, branch, remote=push_url, expect=None):
                 return UnitResult(False, f"prove {node_id}: create-only push refused (branch exists?)")
 
             body = _prove_pr_body(node_id, node, reason, backend, notes)
@@ -424,12 +311,10 @@ def do_review(
         counters.bump(f"review-err-{pr.number}")
         return UnitResult(False, f"review #{pr.number}: target node {pr.node!r} not in local graph — sync first")
 
-    tmp_branch = f"{REVIEW_TMP_BRANCH_PREFIX}{pr.number}"
     marker_comment_id: int | None = None
-    with _worktree_round_trip(cfg):
-        gitutil.fetch(cfg.lean_root, gitutil.slug_url(survey.canonical), f"pull/{pr.number}/head")
-        gitutil.run_git(["checkout", "--quiet", "-B", tmp_branch, "FETCH_HEAD"], cwd=cfg.lean_root)
-        head = gitutil.head_oid(cfg.lean_root)
+    gitutil.fetch(cfg.lean_root, gitutil.slug_url(survey.canonical), f"pull/{pr.number}/head")
+    with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
+        head = gitutil.head_oid(work_cfg.lean_root)
 
         marker_comment_id = _post_returning_id(
             host, survey.canonical, pr.number, scoreboard.format_inprogress(head, cfg.worker_id)
@@ -441,8 +326,8 @@ def do_review(
                 # graph fields are data, not paths we trust — never follow one
                 # outside the project (a poisoned graph must not read ~/.ssh
                 # into a judge prompt or a public comment).
-                content_path = (cfg.project / content_rel)
-                if _inside(cfg.project, content_path) and content_path.exists():
+                content_path = (work_cfg.project / content_rel)
+                if _inside(work_cfg.project, content_path) and content_path.exists():
                     content_text = content_path.read_text(encoding="utf-8")[:6000]
 
             rubrics = rm.load_rubrics()
@@ -450,7 +335,8 @@ def do_review(
             notes: dict = {}
             for axis in rm.AXES:
                 prompt = dispatch_runner.build_prompt(rubrics[axis], pr.node, node, content_text)
-                result = judge(axis, prompt, str(cfg.lean_root), None, judge_timeout, backend=judge_backend)
+                result = judge(axis, prompt, str(work_cfg.lean_root), None, judge_timeout,
+                               backend=judge_backend)
                 scores[axis] = result.get("score")
                 notes[axis] = result.get("reasoning", "")
             if all(score is None for score in scores.values()):
@@ -467,20 +353,12 @@ def do_review(
         finally:
             if marker_comment_id is not None:
                 host.delete_comment(survey.canonical, marker_comment_id)
-            _drop_tmp_branch(cfg.lean_root, tmp_branch)
 
 
 def _post_returning_id(host: GitHost, slug: str, number: int, body: str) -> int | None:
     data = host.gh_json(["api", "-X", "POST", f"/repos/{slug}/issues/{number}/comments",
                          "-f", f"body={body}"], check=False)
     return data.get("id") if isinstance(data, dict) else None
-
-
-def _drop_tmp_branch(repo: Path, branch: str) -> None:
-    """Delete a temporary work branch. HEAD may still be on it — detach first
-    (a plain ``branch -D`` of the current branch is a silent no-op)."""
-    gitutil.run_git(["checkout", "--quiet", "--detach"], cwd=repo, check=False)
-    gitutil.run_git(["branch", "-D", branch], cwd=repo, check=False)
 
 
 # ---------------------------------------------------------------------------
@@ -505,14 +383,35 @@ def do_merge(
     """
     pr = candidate.pr
     assert pr is not None
-    counters.bump(f"merge-{pr.number}")
     fresh = next((p for p in host.pr_list(survey.canonical) if int(p.get("number", 0)) == pr.number), None)
     if fresh is None:
         return UnitResult(False, f"merge #{pr.number}: PR vanished (already merged or closed)")
-    fresh_head = str(fresh.get("headRefOid", ""))
-    if fresh_head != pr.head_oid:
+    fresh_pr = PRInfo.from_gh(fresh)
+    if fresh_pr.head_oid != pr.head_oid:
         return UnitResult(False, f"merge #{pr.number}: head moved since review — re-review first")
+    if fresh_pr.node != pr.node:
+        return UnitResult(False, f"merge #{pr.number}: target marker changed since review")
 
+    trusted = _trusted_login_predicate(cfg, host, survey)
+    meta = scoreboard.parse_meta(
+        host.pr_comments(survey.canonical, pr.number),
+        trusted=trusted,
+        require_head=fresh_pr.head_oid,
+    )
+    if not meta or meta.get("node") != fresh_pr.node or meta.get("verdict") != "clean":
+        return UnitResult(False, f"merge #{pr.number}: clean scoreboard no longer present at head")
+
+    sidecar = scripts_modules()["review_model"].load_sidecar(cfg.project / "review_status.json")
+    block = merge_block_reason(
+        fresh_pr,
+        sidecar,
+        can_push=survey.can_push,
+        allow_unchecked_merge=survey.allow_unchecked_merge,
+    )
+    if block:
+        return UnitResult(False, f"merge #{pr.number}: gate changed: {block}")
+
+    counters.bump(f"merge-{pr.number}")
     if not host.merge_pr(survey.canonical, pr.number, pr.head_oid):
         return UnitResult(False, f"merge #{pr.number}: GitHub refused the merge "
                                  "(branch protection, conflict, or head moved)")
@@ -561,61 +460,53 @@ def do_fixlike(
     push_url = gitutil.slug_url(f"{head_owner}/{repo_name}")
 
     counter_key = _FIX_COUNTER[kind](pr)
-    tmp_branch = f"autoform-fix/{pr.number}"
     notes: list[str] = []
     with _cooperative_claim(board, cfg.respect_claims, f"branch/{pr.number}", notes) as (acquired, hb):
         if not acquired:
             return UnitResult(False, f"{kind} #{pr.number}: claimed by a live peer meanwhile")
-        with _worktree_round_trip(cfg):
-            # ONE ref on ONE connection is both the work base and the CAS
-            # expect. Mixing `refs/pull/N/head` (canonical, mirror-lagged) with
-            # `refs/heads/<branch>` (head repo) opens a lost-update window: the
-            # CAS could certify a base we never actually built on.
-            gitutil.fetch(cfg.lean_root, push_url, f"refs/heads/{pr.head_ref}")
-            observed = gitutil.run_git(["rev-parse", "FETCH_HEAD"], cwd=cfg.lean_root).stdout.strip()
-            gitutil.run_git(["checkout", "--quiet", "-B", tmp_branch, "FETCH_HEAD"], cwd=cfg.lean_root)
+        # ONE ref on ONE connection is both the work base and the CAS expect.
+        gitutil.fetch(cfg.lean_root, push_url, f"refs/heads/{pr.head_ref}")
+        observed = gitutil.run_git(["rev-parse", "FETCH_HEAD"], cwd=cfg.lean_root).stdout.strip()
+        with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
+            start_oid = gitutil.head_oid(work_cfg.lean_root)
+
+            counters.bump(counter_key)
+            if kind == "fix-ci":
+                counters.bump(f"ci-pr-{pr.number}")
+            prompt = agents.fill_prompt(
+                agents.prompts_dir() / _FIX_PROMPTS[kind],
+                pr=str(pr.number),
+                canonical=survey.canonical,
+                default_branch=survey.default_branch,
+                node=pr.node or "",
+                worker_id=cfg.worker_id,
+            )
+            feed_name = f"worker-cli:{kind}:#{pr.number}"
+            _feed_start(cfg, kind, feed_name, pr.node or f"#{pr.number}")
             try:
-                start_oid = gitutil.head_oid(cfg.lean_root)
-
-                counters.bump(counter_key)
-                if kind == "fix-ci":
-                    counters.bump(f"ci-pr-{pr.number}")
-                prompt = agents.fill_prompt(
-                    agents.prompts_dir() / _FIX_PROMPTS[kind],
-                    pr=str(pr.number),
-                    canonical=survey.canonical,
-                    default_branch=survey.default_branch,
-                    node=pr.node or "",
-                    worker_id=cfg.worker_id,
-                )
-                feed_name = f"worker-cli:{kind}:#{pr.number}"
-                _feed_start(cfg, kind, feed_name, pr.node or f"#{pr.number}")
-                try:
-                    rc, log_path = runner(provider, cfg.lean_root, prompt, cfg.log_dir, agent_timeout)
-                finally:
-                    _feed_done(cfg, feed_name)
-
-                if rc != 0:
-                    infra = agents.classify_infra_failure(log_path)
-                    if infra and counters.refund(counter_key):
-                        return UnitResult(False, f"{kind} #{pr.number}: {infra} (attempt refunded)",
-                                          infra_failure=infra)
-                    return UnitResult(False, f"{kind} #{pr.number}: agent failed rc={rc} (log: {log_path})")
-
-                if not gitutil.clean_tree(cfg.lean_root):
-                    gitutil.run_git(["add", "-A"], cwd=cfg.lean_root)
-                    gitutil.run_git(["commit", "--quiet", "-m", f"autoform {kind}: PR #{pr.number}"],
-                                    cwd=cfg.lean_root, check=False)
-                if gitutil.head_oid(cfg.lean_root) == start_oid:
-                    return UnitResult(False, f"{kind} #{pr.number}: agent finished but changed nothing")
-
-                if not _lease_ok(hb):
-                    return UnitResult(False, f"{kind} #{pr.number}: branch lease lost — refusing to push")
-                if not gitutil.safe_push(cfg.lean_root, pr.head_ref, remote=push_url, expect=observed):
-                    return UnitResult(False, f"{kind} #{pr.number}: CAS push lost (branch moved meanwhile)")
-                return UnitResult(True, f"{kind} #{pr.number}: pushed a new head")
+                rc, log_path = runner(provider, work_cfg.lean_root, prompt, cfg.log_dir, agent_timeout)
             finally:
-                _drop_tmp_branch(cfg.lean_root, tmp_branch)
+                _feed_done(cfg, feed_name)
+
+            if rc != 0:
+                infra = agents.classify_infra_failure(log_path)
+                if infra and counters.refund(counter_key):
+                    return UnitResult(False, f"{kind} #{pr.number}: {infra} (attempt refunded)",
+                                      infra_failure=infra)
+                return UnitResult(False, f"{kind} #{pr.number}: agent failed rc={rc} (log: {log_path})")
+
+            if not gitutil.clean_tree(work_cfg.lean_root):
+                gitutil.run_git(["add", "-A"], cwd=work_cfg.lean_root)
+                gitutil.run_git(["commit", "--quiet", "-m", f"autoform {kind}: PR #{pr.number}"],
+                                cwd=work_cfg.lean_root, check=False)
+            if gitutil.head_oid(work_cfg.lean_root) == start_oid:
+                return UnitResult(False, f"{kind} #{pr.number}: agent finished but changed nothing")
+
+            if not _lease_ok(hb):
+                return UnitResult(False, f"{kind} #{pr.number}: branch lease lost — refusing to push")
+            if not gitutil.safe_push(work_cfg.lean_root, pr.head_ref, remote=push_url, expect=observed):
+                return UnitResult(False, f"{kind} #{pr.number}: CAS push lost (branch moved meanwhile)")
+            return UnitResult(True, f"{kind} #{pr.number}: pushed a new head")
 
 
 # ---------------------------------------------------------------------------
@@ -677,22 +568,22 @@ def do_progress(
             # Fold on the FRESH remote base so we never clobber updates that
             # only exist remotely, then CAS-push the fold.
             url = gitutil.slug_url(survey.canonical)
-            with _worktree_round_trip(cfg):
-                gitutil.fetch(cfg.lean_root, url, survey.default_branch)
-                base_oid = gitutil.run_git(["rev-parse", "FETCH_HEAD"], cwd=cfg.lean_root).stdout.strip()
-                gitutil.run_git(["checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=cfg.lean_root)
-                changed = _fold_metas(mods, sidecar_path, metas)
+            gitutil.fetch(cfg.lean_root, url, survey.default_branch)
+            base_oid = gitutil.run_git(["rev-parse", "FETCH_HEAD"], cwd=cfg.lean_root).stdout.strip()
+            with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
+                work_sidecar = work_cfg.project / "review_status.json"
+                changed = _fold_metas(mods, work_sidecar, metas)
                 if changed:
-                    gitutil.run_git(["add", str(sidecar_path)], cwd=cfg.lean_root)
+                    gitutil.run_git(["add", str(work_sidecar)], cwd=work_cfg.lean_root)
                     pr_list_str = " ".join(f"#{n}" for n in sorted(metas))
                     gitutil.run_git(["commit", "--quiet", "-m",
                                      f"autoform progress: fold scoreboards from {pr_list_str}"],
-                                    cwd=cfg.lean_root)
+                                    cwd=work_cfg.lean_root)
                     if _lease_ok(hb):
-                        pushed = gitutil.safe_push(cfg.lean_root, survey.default_branch,
+                        pushed = gitutil.safe_push(work_cfg.lean_root, survey.default_branch,
                                                   remote=url, expect=base_oid)
                         if pushed:
-                            fold_oid = gitutil.head_oid(cfg.lean_root)
+                            fold_oid = gitutil.head_oid(work_cfg.lean_root)
                 else:
                     pushed = True  # fold already present remotely — converged
             if pushed:

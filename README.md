@@ -202,7 +202,7 @@ unclear repository visibility and never enables publication without approval.
 
 **The distributed worker** (`./autoform`, TauCetiWorker-style): many machines
 advancing one shared roadmap through GitHub. One round = one work unit from the
-cascade `rebase → fix-ci → fix → review → progress → prove`; proofs land as
+cascade `rebase → fix-ci → fix → review → merge → progress → agents → prove`; proofs land as
 marker-tagged PRs, jury verdicts land as scoreboard comments, and merged
 verdicts fold deterministically back into `review_status.json`. Coordination is
 cooperative git-ref leases (`refs/autoform-claims/*`) over compare-and-swap
