@@ -59,6 +59,20 @@ flowchart LR
   proof integrity 0.40, code quality 0.20); thresholds gate a
   clean / flagged / rejected verdict. Humans review packets or use the local
   dashboard; a human verdict is immutable and always wins over the AI's.
+- **Distribute** — with a shared GitHub repo, any number of machines run
+  `autoform work --loop`: git-ref leases keep them off each other's nodes,
+  proofs travel as PRs with jury scoreboards, clean PRs auto-merge behind a
+  machine-checked gate, and the roadmap site republishes from every merge.
+  Humans steer from the dashboards, not from merge buttons.
+
+```mermaid
+flowchart LR
+    W1["machine A<br/>work --loop"] -- "claim leases" --> GH["GitHub<br/>claims · PRs · scoreboards"]
+    W2["machine B<br/>work --loop"] -- "review + verdicts" --> GH
+    GH -- "auto-merge gate" --> RM["shared roadmap<br/>graph + sidecar + site"]
+    RM -- "next survey" --> W1
+    RM -- "next survey" --> W2
+```
 
 ## Quickstart
 
@@ -184,13 +198,18 @@ unclear repository visibility and never enables publication without approval.
 
 **The distributed worker** (`./autoform`, TauCetiWorker-style): many machines
 advancing one shared roadmap through GitHub. One round = one work unit from the
-cascade `rebase → fix-ci → fix → review → progress → prove`; proofs land as
-marker-tagged PRs, jury verdicts land as scoreboard comments, and merged
-verdicts fold deterministically back into `review_status.json`. Coordination is
-cooperative git-ref leases (`refs/autoform-claims/*`) over compare-and-swap
-branch pushes — no server-side setup, no Issues requirement, safe under any
-race. Orchestrate drives it in distributed mode; `docs/worker-cli.md` is the
-design contract.
+cascade `rebase → fix-ci → fix → review → merge → progress → agents → prove`;
+proofs land as marker-tagged PRs, jury verdicts land as scoreboard comments,
+clean PRs auto-merge behind a machine-checked gate (a human dashboard verdict
+always holds it), and merged verdicts fold deterministically back into
+`review_status.json`. The `agents` stage drains every role the registry
+discovers from `agents/*.md` — planner, mathlib-checker, counterexample hunter,
+prior-art scout, and any project-local role — so the loop advances the whole
+roadmap, not just proofs. Coordination is cooperative git-ref leases
+(`refs/autoform-claims/*`) over compare-and-swap branch pushes — no server-side
+setup, no Issues requirement, safe under any race. Orchestrate drives it in
+distributed mode; [docs/worker-cli.md](docs/worker-cli.md) is the design
+contract, with diagrams.
 
 ## Repository layout
 
