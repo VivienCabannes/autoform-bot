@@ -271,6 +271,10 @@ def main(argv=None) -> int:
     ap.add_argument("--target-label", default="", help="agent-start: display label for the target (defaults to --target)")
     ap.add_argument("--state", default="", help="orchestrator: state (working|idle|…; default working)")
     ap.add_argument("--phase", default="", help="orchestrator: phase label (e.g. 'Phase 2: splitting')")
+    ap.add_argument("--stage", default="", choices=["", "setup", "plan", "approve", "split",
+                                                    "prove", "publish"],
+                    help="orchestrator: pipeline position (fixed vocabulary — drives the "
+                         "dashboard stepper so users always know where they are)")
     a = ap.parse_args(argv)
 
     qp = a.project / "task_queue.json"
@@ -388,6 +392,8 @@ def main(argv=None) -> int:
                     orch["phase"] = a.phase
                 if a.detail:
                     orch["detail"] = a.detail
+                if a.stage:
+                    orch["stage"] = a.stage
                 feed["orchestrator"] = orch
                 msg = f"orchestrator -> {orch['state']}" + (f" · {a.phase}" if a.phase else "")
             elif a.cmd == "agent-start":

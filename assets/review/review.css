@@ -736,3 +736,18 @@ body.rv-drag-active .rv-graph .node { cursor: copy; }
   justify-content: center; text-align: center; padding: 32px;
   color: #8a8575; font-style: italic; font-size: 14px; pointer-events: none;
 }
+
+/* Pipeline stepper — where the run sits in setup ▸ plan ▸ approve ▸ split ▸
+   prove ▸ publish. Position must be legible at a glance, without parsing the
+   free-text phase line below it. */
+.rv-pipeline {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
+  margin: 8px 0 2px; font-size: 11px; letter-spacing: .02em;
+}
+.rv-pl-step { padding: 1px 7px; border-radius: 9px; }
+.rv-pl-done { color: var(--clean); }
+.rv-pl-now {
+  color: #fff; background: var(--accent); font-weight: 600;
+}
+.rv-pl-todo { color: #b3ac9d; }
+.rv-pl-sep { color: #d3cdbf; font-size: 9px; }

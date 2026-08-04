@@ -42,6 +42,16 @@ Before reading sources or spawning any subagent, tell the user:
 Do not make the user infer whether subagents have started or which files they
 may touch. Report those transitions when they occur.
 
+Publish pipeline position to the dashboard feed at every transition —
+``dispatch_queue.py <project> orchestrator --state working --stage <s> --phase
+"<label>" --detail "<one line>"`` — with ``--stage plan`` during coarse
+planning and review waves, ``--stage approve`` while waiting at the
+coarse-roadmap checkpoint, and ``--stage split`` during detailed splitting.
+The stage drives the dashboard's position stepper; the phase/detail lines are
+free text and should stay in plain language a user can read without knowing
+the pipeline's internals (say "fixing 2 major findings from the big-picture
+reviewers", not internal shorthand).
+
 ## Procedure
 
 1. Resolve the project. `DISPATCH_PROJECT` is the directory owning

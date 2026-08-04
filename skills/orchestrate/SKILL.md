@@ -235,6 +235,13 @@ For a tier-1 cluster:
 6. Enqueue jury review for the new nodes.
 7. Mark the planner task done only after all earlier steps have durable output.
 
+## Pipeline position
+
+Publish ``--stage prove`` (via ``dispatch_queue.py <project> orchestrator``)
+while the engine/worker rounds run, and ``--stage publish`` during progress
+folds and site publication, so the dashboard stepper tracks the run. Keep
+``--phase``/``--detail`` in plain language.
+
 ## Autonomy loop
 
 Unless manual/drop-only mode was requested:

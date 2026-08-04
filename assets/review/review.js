@@ -1029,6 +1029,33 @@
       + "<span class='rv-pill-dot'></span>" + escapeHtml(ostate) + "</span>"
       + "</div>";
 
+    // --- pipeline stepper: WHERE the run is in the overall flow. Prefers the
+    //     structured `stage` the skills publish; falls back to a heuristic on
+    //     the free-text phase so older sessions still get positioned. ---
+    var STAGES = ["setup", "plan", "approve", "split", "prove", "publish"];
+    var STAGE_LABEL = { setup: "setup", plan: "plan", approve: "approve",
+                        split: "split", prove: "prove", publish: "publish" };
+    var stage = orch.stage || "";
+    if (!stage && ostate !== "idle") {
+      var ph = String(orch.phase || "").toLowerCase();
+      if (/approv|checkpoint/.test(ph)) stage = "approve";
+      else if (/phase 2|splitt|tier-2|tier 2/.test(ph)) stage = "split";
+      else if (/phase 1|coarse|extract|holistic|review wave|mathlib check|correction|convergence/.test(ph)) stage = "plan";
+      else if (/prov|worker|dispatch|orchestr|jury|escalat/.test(ph)) stage = "prove";
+      else if (/publish|pages|progress|fold/.test(ph)) stage = "publish";
+      else if (/setup|install|environment|repository/.test(ph)) stage = "setup";
+    }
+    if (stage) {
+      var idx = STAGES.indexOf(stage);
+      html += "<div class='rv-pipeline' title='pipeline position'>";
+      STAGES.forEach(function (s, i) {
+        var cls = i < idx ? "rv-pl-done" : (i === idx ? "rv-pl-now" : "rv-pl-todo");
+        if (i) html += "<span class='rv-pl-sep'>▸</span>";
+        html += "<span class='rv-pl-step " + cls + "'>" + STAGE_LABEL[s] + "</span>";
+      });
+      html += "</div>";
+    }
+
     // --- orchestrator phase/detail — DIRECTLY under the pill, never below the
     //     palette fold: a "working" badge with no visible reason reads as a
     //     hang. This is the instant-feedback line ("Phase 1: coarse
