@@ -117,6 +117,25 @@ they never synthesize a passing score.
 Ask Orchestrate for a text review packet or the local dashboard. Human
 verdicts are immutable and override AI verdicts.
 
+## 6. Publish a read-only snapshot
+
+The local dashboard remains the only operational surface. GitHub Pages is an
+optional snapshot of committed graph structure, theorem content, proof status,
+review verdicts, and kernel evidence. It excludes agent activity, queues, logs,
+backend/provider settings, credentials, reviewer notes and identities, and local
+paths.
+
+Run `setup` and explicitly request GitHub Pages publication. Setup first inspects
+the Git remote and repository visibility, then shows the exact publication
+contract. It writes `.autoform/pages.json` and
+`.github/workflows/autoform-pages.yml` only after approval. Private or internal
+repositories require separate verification that the account or enterprise plan
+provides the intended Pages access control.
+
+The generated workflow pins GitHub actions and the Autoform exporter to commit
+hashes. It deploys only after durable dashboard inputs are committed and pushed;
+no local Python server or plugin cache is required by the exported site.
+
 ## Provider environment
 
 Custom API (OpenAI-compatible) settings:

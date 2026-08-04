@@ -99,6 +99,24 @@ These artifacts are provider- and host-neutral:
 Every writer must use the existing lock and atomic-replace discipline. No host
 may persist a private verdict format.
 
+### Dashboard publication boundary
+
+Autoform has two dashboard surfaces over different trust boundaries:
+
+- The loopback dashboard is operational. It reads live agent and queue state and
+  may enqueue work, select a backend, cancel queued work, and record human
+  verdicts.
+- The optional GitHub Pages dashboard is a deterministic read-only export of
+  committed graph structure, theorem content, proof status, review verdicts, and
+  kernel evidence. It contains no queue, agent, log, provider, credential,
+  reviewer-identity, or local-path data.
+
+`scripts/export_github_dashboard.py` constructs the public snapshot from an
+explicit allowlist and writes a self-contained site. The generated Pages
+workflow pins both its official actions and the Autoform exporter revision.
+Publication configuration is opt-in and fails closed when repository visibility
+or private Pages access control is unclear.
+
 ### 2. Native interactive host layer
 
 Agent Skills are the canonical workflow surface. Claude Code now treats legacy

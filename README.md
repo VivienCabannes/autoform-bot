@@ -176,6 +176,12 @@ code actions, and proof attempts) and `autoform-prover` (the unified
 Mathlib and Zulip search are stateless: agents use Loogle, LeanExplore, the
 local Mathlib search CLI, and the Zulip API on demand.
 
+**Dashboards**: the loopback dashboard owns live agents, queues, backend
+selection, cancellation, and human verdict entry. The optional GitHub Pages
+dashboard is a deterministic, read-only snapshot built only from committed graph,
+theorem, review, proof-status, and kernel-evidence inputs. Setup fails closed on
+unclear repository visibility and never enables publication without approval.
+
 ## Repository layout
 
 ```

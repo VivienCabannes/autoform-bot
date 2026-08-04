@@ -24,6 +24,26 @@ contain both `scripts/merge_node.py` and `internal/runbooks/planning.md`.
 In every command below, replace `<AUTOFORM_PLUGIN_ROOT>` with that quoted
 absolute path; do not depend on a variable exported by a previous shell call.
 
+## Start with a run brief
+
+Before installing, creating, or planning anything, tell the user what this run
+will do in a compact brief:
+
+- the resolved Lean repository and plan/roadmap directory;
+- whether this is a fresh plan, a resume, or inspection only;
+- the confirmed source files and exact chapter/section scope, or the specific
+  missing information you need before planning;
+- the artifacts Autoform will create or update (`graph.json`, prose, worker
+  queue/status, and the lightweight dashboard);
+- that Lean source remains editable in the user's IDE and code review remains
+  ordinary GitHub branches, PRs, and CI; Autoform does not replace either;
+- the next checkpoint the user should expect (coarse roadmap approval before
+  detailed splitting, then explicit worker/prover dispatch).
+
+Do not make the user infer whether agents have started, which files they may
+touch, or whether a backend is already spending tokens. Report those transitions
+when they occur.
+
 ## Procedure
 
 1. Check or repair the environment when this is a first run, when the user asks
@@ -157,12 +177,57 @@ absolute path; do not depend on a variable exported by a previous shell call.
    canonical roles (`splitter`, `mathlib-checker`, and reviewers), and route all
    graph edits through `scripts/merge_node.py`.
 
-8. Read and follow
-   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to export and
-   build and durably serve the blueprint. Visualization is part of Setup, not a
-   separate command.
+8. The lightweight dashboard from step 6 is the default visualization. Do not
+   check for Graphviz, install blueprint Python packages, export leanblueprint,
+   or build its web output during ordinary Setup. Those dependencies are not
+   prerequisites for Autoform planning or orchestration.
 
-9. Report the dashboard URL, tier-1 and tier-2 counts, native role-agent install
+   Only when the user explicitly requests the publication-style mathematical
+   blueprint, read and follow
+   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to export, build,
+   and serve it. A blueprint toolchain failure must not turn an otherwise
+   successful Setup run into a failure; report it as an optional visualization
+   limitation and keep the graph and lightweight dashboard available.
+
+9. Inspect GitHub publication readiness without changing remote or repository
+   state:
+
+   ```bash
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/configure_github_pages.py" \
+     --repo-root "$PROJECT_DIR" inspect
+   ```
+
+   The local dashboard remains the default. Do not add GitHub Pages merely
+   because a Git remote exists. When the user asks for publication, show the
+   inspection result and the exact contract before requesting approval:
+
+   - files to add: `.autoform/pages.json` and
+     `.github/workflows/autoform-pages.yml`;
+   - published: graph structure, theorem content, proof status, review verdicts,
+     and kernel evidence;
+   - excluded: agent activity, task queues, dispatcher logs, backend settings,
+     credentials, and local filesystem paths.
+
+   Refuse automatic publication when the GitHub repository or its visibility is
+   unclear. For a private or internal repository, require the user to verify
+   that their GitHub plan or enterprise configuration provides the intended
+   Pages access control before continuing. After explicit publication approval,
+   run `configure_github_pages.py install --approve-publication` with the graph
+   and site paths relative to the Git repository. Add
+   `--private-pages-verified` only after that verification.
+
+   Approval to add configuration does not authorize creating a repository,
+   pushing commits, enabling Pages, or opening the deployed URL. Obtain separate
+   explicit approval immediately before each requested outward-facing action.
+   GitHub Pages is a committed-state snapshot: the exporter refuses dirty
+   durable inputs, and updates occur only after those inputs are committed and
+   pushed. Read and follow
+   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/github-pages.md` for the commands and
+   failure rules.
+
+10. Report the local dashboard URL, GitHub publication readiness, tier-1 and
+   tier-2 counts, native role-agent install
    status, and the next step: run Orchestrate.
 
 ## Resume semantics

@@ -58,6 +58,7 @@ MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
     "internal/runbooks/evaluation.md",
+    "internal/runbooks/github-pages.md",
     "internal/runbooks/lean-install.md",
     "internal/runbooks/mathlib-style.md",
     "internal/runbooks/planning.md",

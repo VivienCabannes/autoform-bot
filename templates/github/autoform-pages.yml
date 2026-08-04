@@ -1,0 +1,53 @@
+name: Autoform Pages
+
+on:
+  push:
+    branches: [__DEFAULT_BRANCH__]
+    paths:
+__WATCH_PATHS__
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out project
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check out pinned Autoform exporter
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: __AUTOFORM_REPOSITORY__
+          ref: __AUTOFORM_REVISION__
+          path: .autoform-tooling
+
+      - name: Export read-only dashboard
+        run: >-
+          python .autoform-tooling/scripts/export_github_dashboard.py
+          --repo-root "$GITHUB_WORKSPACE"
+          --graph __GRAPH_PATH__
+          --output __SITE_PATH__
+
+      - name: Configure Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
+        with:
+          path: __SITE_PATH__
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
