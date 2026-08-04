@@ -519,25 +519,34 @@
     var k = Number(ANCHOR.radius) || 1;
     // "‹ back" drops the anchor → the flat tier-N view (no anchor/radius).
     var back = "/?tier=" + encodeURIComponent(TIER);
-    var canExpand = k < NB_MAX_RADIUS;
-    var nextK = Math.min(k + 1, NB_MAX_RADIUS);
-    var expandHref = "/?tier=" + encodeURIComponent(TIER)
-      + "&anchor=" + encodeURIComponent(id) + "&radius=" + nextK;
+    var anchorHref = function (radius) {
+      return "/?tier=" + encodeURIComponent(TIER)
+        + "&anchor=" + encodeURIComponent(id) + "&radius=" + radius;
+    };
 
+    // Symmetric radius controls: "+1 hop" grows the ball, "−1 hop" shrinks it
+    // back (the old label said "±1 hop" but only ever grew — the ± belongs to
+    // the NEIGHBORHOOD, which walks deps and dependents both ways, not to the
+    // control). "‹ back" stays the exit to the flat tier view.
     var html =
       "<span class='rv-fb-ico'>⊚</span>"
       + "<span class='rv-fb-text'>Neighborhood of <strong>" + escapeHtml(id)
       + "</strong> <span class='rv-fb-count'>(±" + k + " hop"
       + (k === 1 ? "" : "s") + ")</span></span>"
       + "<span class='rv-nb-controls'>";
-    if (canExpand) {
-      html += "<a class='rv-nb-expand' href='" + expandHref + "' "
-        + "title='widen to ±" + nextK + " hops (more neighbors, still bounded)'>"
-        + "expand ±1 hop ▸</a>";
+    if (k > 1) {
+      html += "<a class='rv-nb-expand rv-nb-shrink' href='" + anchorHref(k - 1) + "' "
+        + "title='narrow to ±" + (k - 1) + " hop" + (k - 1 === 1 ? "" : "s")
+        + " (closest neighbors only)'>◂ −1 hop</a>";
+    }
+    if (k < NB_MAX_RADIUS) {
+      html += "<a class='rv-nb-expand' href='" + anchorHref(k + 1) + "' "
+        + "title='widen to ±" + (k + 1) + " hops (more neighbors, still bounded)'>"
+        + "+1 hop ▸</a>";
     } else {
       html += "<span class='rv-nb-expand rv-nb-maxed' "
         + "title='already at the maximum radius (±" + NB_MAX_RADIUS + ")'>"
-        + "max radius (±" + NB_MAX_RADIUS + ")</span>";
+        + "max ±" + NB_MAX_RADIUS + "</span>";
     }
     html += "</span>"
       + "<a class='rv-fb-back' href='" + back + "'>‹ back</a>";
