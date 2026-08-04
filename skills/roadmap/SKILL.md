@@ -115,12 +115,19 @@ may touch. Report those transitions when they occur.
    ```
 
    A structural failure is this run's to fix, not the next workflow's. Other
-   clauses may legitimately have offenders mid-planning; report the counts. Add
-   `--enqueue` only when the user wants the gaps turned into queued role tasks
-   for Orchestrate/worker rounds to drain, and `--verify-decls
-   --stamp-verified` near a Mathlib checkout to check and stamp claimed
-   declarations (an unverified in-Mathlib claim silently poisons the trust
-   frontier).
+   clauses may legitimately have offenders mid-planning; report the counts.
+
+   When a Mathlib checkout is present (`$PROJECT_DIR/.lake/packages/mathlib`,
+   or `MATHLIB_PATH`), ALWAYS add `--verify-decls --stamp-verified` — never
+   leave in-Mathlib claims unverified. The trust frontier believes an
+   `in-mathlib` status by construction, so a single hallucinated declaration
+   among unstamped claims poisons everything built on it, and the check is a
+   deterministic grep (seconds, no model tokens). Run it as soon as the
+   mathlib-check wave has merged its statuses, not only at the end. Skip it
+   only when no checkout exists — and say so in the report.
+
+   Add `--enqueue` only when the user wants the remaining gaps turned into
+   queued role tasks for Orchestrate/worker rounds to drain.
 
 8. The lightweight dashboard is the default visualization. Only when the user
    explicitly requests the publication-style mathematical blueprint, read and
