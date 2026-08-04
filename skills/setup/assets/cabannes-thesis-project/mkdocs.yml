@@ -1,4 +1,4 @@
-site_name: Autoform example
+site_name: Cabannes thesis formalization
 docs_dir: blueprint
 site_dir: site
 use_directory_urls: false

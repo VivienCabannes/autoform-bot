@@ -27,9 +27,10 @@ blueprint/
 Open `blueprint/` directly as an Obsidian vault: standard relative links power
 its backlinks and graph view, while `.obsidian/` remains ignored. The same
 Markdown can be rendered by MkDocs and deployed by GitHub Pages. See the
-repo-shaped [`examples/`](examples/README.md) directory for the complete vault,
-site configuration, and workflow. Roadmap and coverage organization remains
-project policy; Autoform deliberately enforces only the fine-grained node DAG.
+setup skill's concise [Cabannes thesis example](skills/setup/references/thesis-blueprint.md)
+for a complete vault, site configuration, and workflow. Roadmap and coverage
+organization remains project policy; Autoform deliberately enforces only the
+fine-grained node DAG.
 
 Every Markdown file below `blueprint/nodes/` is one node. Its relative path
 without `.md` is its stable ID. The H1 is its human title; optional frontmatter
@@ -82,7 +83,7 @@ uv run pytest -q
 
 The visualization is self-contained and works directly from `file://`; clicking
 a node opens its Markdown file. The HTML-link mode is intended for static-site
-builders configured to emit `.html` pages, as in the bundled MkDocs example.
+builders configured to emit `.html` pages, as in the setup skill's MkDocs asset.
 
 ## Plugin surface
 
@@ -136,7 +137,7 @@ when unusually large worker pools need more than the default 15 minutes to warm.
 ```text
 .claude-plugin/  Claude Code manifest
 .codex-plugin/   Codex manifest
-skills/         three short expert nudges with on-demand review rubrics
+skills/         expert workflows, references, and a compact thesis project asset
 autoform_cli/   blueprint validation and visualization commands
 servers/        two public MCP adapters plus the shared Lean runtime
 tests/          graph, packaging, and server contracts

@@ -20,6 +20,7 @@ def test_plugin_surface_is_three_skills_and_two_servers(repo_root):
         "proof-integrity.md",
         "code-quality.md",
         "mathlib-style.md",
+        "thesis-review-case.md",
     }
     assert {path.name for path in (review_dir / "references").glob("*.md")} == references
     skill_text = (review_dir / "SKILL.md").read_text()
