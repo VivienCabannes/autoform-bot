@@ -56,14 +56,14 @@ Type these in the assistant. This is the complete user-visible surface:
 
 | Command | What it does |
 |---------|--------------|
-| `/autoform:setup` | Install or repair prerequisites, create or inspect a project, plan sources, build the blueprint, and open the dashboard |
-| `/autoform:orchestrate` | Prove, review, score, search prior art, handle escalations, and advance the plan |
-| `/autoform:set-backend` | Choose and explain the prover backend, authentication, billing, and data path |
+| `/autoform:setup` | Install or repair prerequisites, create or inspect a project, and open the dashboard |
+| `/autoform:roadmap` | Plan sources and build or review the blueprint |
+| `/autoform:orchestrate` | Choose a backend, prove, review, score, search prior art, handle escalations, and advance the plan |
 
 A good first move is `/autoform:setup`. Natural-language requests such as
-“inspect this workspace,” “show the graph,” or “install Lean” stay inside Setup
-instead of adding commands. Requests such as “review this node,” “prove this
-theorem,” or “search Zulip” stay inside Orchestrate.
+“inspect this workspace” or “install Lean” stay inside Setup; “show the graph”
+stays inside Roadmap. Requests such as “review this node,” “prove this theorem,”
+“choose a prover,” or “search Zulip” stay inside Orchestrate.
 
 ## 4. Optional unlocks
 

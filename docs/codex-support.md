@@ -14,7 +14,7 @@ work, and structured `codex exec` output.
 
 | Surface | Implemented and automated | Live release gate |
 |---|---|---|
-| Three-command workflow surface and MCP registration | Plugin/static validation enforces exactly `setup`, `orchestrate`, and `set-backend` | Install the built plugin in the target Codex surface and confirm only those three Autoform skills plus the MCP tools are discovered |
+| Three-command workflow surface and MCP registration | Plugin/static validation enforces exactly `setup`, `roadmap`, and `orchestrate` | Install the built plugin in the target Codex surface and confirm only those three Autoform skills plus the MCP tools are discovered |
 | Project Codex role agents | Idempotent generator, overwrite protection, and isolated-project tests | Start a new trusted project task and spawn at least one generated role |
 | Native interactive orchestration | Canonical role prompts and generic-subagent fallback | Complete setup/plan and one escalation or review delegation in the target Codex version; require child-thread evidence rather than a model self-report |
 | Headless Codex prover | CLI arguments, event normalization, timeout cleanup, steering, and fake-process tests | Passed on the 2026-07-27 disposable pilot; repeat on the final release SHA |
@@ -34,7 +34,7 @@ The dated evidence and remaining native-delegation blocker are recorded in
 Claude Code and Codex run the same three Autoform workflows against the same
 durable artifacts. Planning, visualization, review, workspace inspection,
 proof discipline, and Zulip guidance are non-discoverable runbooks reached
-through Setup or Orchestrate rather than additional commands.
+through Setup, Roadmap, or Orchestrate rather than additional commands.
 
 - `graph.json` and node prose;
 - `task_queue.json` and the activity feed;

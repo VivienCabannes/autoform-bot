@@ -1,8 +1,8 @@
 # Distributed worker runbook (the `autoform` CLI)
 
 Internal operating material for Orchestrate's distributed mode. Not a user
-command surface — the user-facing workflows remain setup / orchestrate /
-set-backend. Design contract: `docs/worker-cli.md`.
+command surface. The user-facing workflows remain setup / roadmap /
+orchestrate. Design contract: `docs/worker-cli.md`.
 
 ## When distributed mode applies
 
@@ -71,7 +71,7 @@ auto-merge.
   what would happen.
 - `--only`/`--skip` restrict stages (e.g. `--only review,progress` for a
   review-only machine).
-- `--backend` overrides the persisted set-backend choice for prove/fix work;
+- `--backend` overrides Orchestrate's persisted default for prove/fix work;
   unknown names fail closed exactly like the dispatcher.
 - API providers (`openai`/`avocado`) require the same per-process consent as
   the dispatcher: run `scripts/provider_check.py`, obtain explicit user

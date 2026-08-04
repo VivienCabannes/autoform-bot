@@ -20,8 +20,8 @@ Checks (all stdlib):
     skill entries in Muse's completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
-  - The user-visible skill set is exactly `setup`, `roadmap`, `orchestrate`,
-    and `set-backend`; supporting runbooks do not reappear as slash commands.
+  - The user-visible skill set is exactly `setup`, `roadmap`, and `orchestrate`;
+    supporting runbooks do not reappear as slash commands.
   - No legacy `commands/*` file adds an extra user-visible command.
   - Every `references/<file>` a SKILL.md cites exists in that skill's `references/`.
   - No surviving mention of an agent/skill in REMOVED_AGENTS / REMOVED_SKILLS
@@ -46,14 +46,14 @@ REPO_ROOT = SCRIPT.parents[1]            # root-level plugin: scripts/.. == repo
 # an HTML comment) is a regression — add the OLD name here when you rename so any
 # straggler reference is caught. Empty on the pristine niket/dev tree.
 REMOVED_AGENTS: tuple[str, ...] = ()
-REMOVED_SKILLS: tuple[str, ...] = ()
+REMOVED_SKILLS: tuple[str, ...] = ("set-backend",)
 EXPECTED_MCP_SERVERS = frozenset(
     {
         "lean-lsp-mcp",
         "autoform-prover",
     }
 )
-PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate", "set-backend"})
+PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate"})
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
@@ -430,13 +430,13 @@ def check_skills() -> int:
         checks += 1
         err(
             f"missing core workflow skill: skills/{name}/SKILL.md "
-            "(Setup, Orchestrate, and Set Backend must ship in every host)"
+            "(Setup, Roadmap, and Orchestrate must ship in every host)"
         )
     for name in sorted(found - PUBLIC_WORKFLOW_SKILLS):
         checks += 1
         err(
             f"unexpected user-facing skill: skills/{name}/SKILL.md "
-            "(Autoform exposes only Setup, Orchestrate, and Set Backend)"
+            "(Autoform exposes only Setup, Roadmap, and Orchestrate)"
         )
     expected_paths = {
         (REPO_ROOT / "skills" / name / "SKILL.md").resolve()

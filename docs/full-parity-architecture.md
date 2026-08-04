@@ -122,8 +122,8 @@ or private Pages access control is unclear.
 Agent Skills are the canonical workflow surface. Claude Code now treats legacy
 commands and skills as the same user-facing concept, Codex installs plugin
 commands as skills, and Muse registers native commands that load the same three
-canonical `SKILL.md` files. Autoform consequently ships `setup`, `orchestrate`,
-and `set-backend` without maintaining host-specific prompt copies.
+canonical `SKILL.md` files. Autoform consequently ships `setup`, `roadmap`, and
+`orchestrate` without maintaining host-specific prompt copies.
 
 Claude consumes plugin agents from `agents/*.md`. Codex project agents are
 materialized into namespaced `.codex/agents/autoform_*.toml` files by

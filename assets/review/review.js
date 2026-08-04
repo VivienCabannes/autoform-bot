@@ -995,7 +995,7 @@
       + "</div>";
 
     // --- backend selector: which prover backend the agents run on (shared with
-    //     /autoform:set-backend via ~/.autoform/config.json; also the billing path) ---
+    //     Orchestrate via ~/.autoform/config.json; also the billing path) ---
     var be = dispatch.backend;
     if (be && Array.isArray(be.options)) {
       var cur = be.current || "max";
@@ -1127,7 +1127,7 @@
   }
 
   // Wire the backend dropdown: on change, POST /api/backend {backend} → persist the
-  // choice (shared with /autoform:set-backend) and refetch so the billing hint + the
+  // choice shared with Orchestrate and refetch so the billing hint + the
   // selected option reflect the server's truth. Disables the select while in flight.
   function wireBackend(panel) {
     var sel = panel.querySelector(".rv-be-select");

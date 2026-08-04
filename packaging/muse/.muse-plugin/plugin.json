@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "autoform",
   "displayName": "AutoForm Bot",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Lean 4 autoformalization workflows for coding agents.",
   "compat": {
     "source": "native",
@@ -24,11 +24,6 @@
       {
         "id": "orchestrate",
         "path": "skills/orchestrate/SKILL.md",
-        "enabledDefault": true
-      },
-      {
-        "id": "set-backend",
-        "path": "skills/set-backend/SKILL.md",
         "enabledDefault": true
       }
     ],

@@ -7,8 +7,8 @@ queue transitions, and persisted verdicts.
 
 ## User command surface
 
-AutoformBot exposes exactly four user workflows: `setup`, `roadmap`, `orchestrate`, and
-`set-backend`. Supporting functions such as installation, workspace
+AutoformBot exposes exactly three user workflows: `setup`, `roadmap`, and
+`orchestrate`. Supporting functions such as installation, workspace
 inspection, planning, visualization, review, and Zulip search are internal to
 those workflows and do not appear as separate commands.
 
@@ -57,21 +57,25 @@ Autoform uses a generic native Codex subagent with the complete canonical
 `agents/<role>.md` prompt inlined. Open a new task rooted and trusted in the
 project to pick up installed roles naturally.
 
-## 3. Select a prover
+## 3. Select a prover in Orchestrate
 
-Run `set-backend` to inspect or persist one of:
+Ask `orchestrate` to inspect the available backends, select one for a run, or
+persist one as the default:
 
 | Selection | User-facing backend | Execution path | Billing/auth path |
 |---|---|---|---|
 | `max` | Claude Code (Max subscription) | Claude CLI | Claude Max login; API credentials disabled |
 | `codex` | Codex | Codex CLI | Codex/OpenAI login |
 | `aristotle` | Aristotle | Aristotle API | `ARISTOTLE_API_KEY` |
+| `muse` | Muse/TBH | TBH CLI | configured Meta provider/authentication |
 | `openai` | Custom API (OpenAI-compatible) | direct Chat Completions requests with Autoform's bounded tool loop | configured key variable |
 | `avocado` | Meta Avocado | explicitly configured Meta-compatible deployment | configured key variable |
 
-With no persisted selection, orchestration defaults to the current interactive
-host (`codex` in Codex, `max` in Claude). Persisted choices always win: selecting
-`max` while running Codex still requires a working Claude CLI.
+An explicit choice for the current run overrides the persisted default without
+changing it. With no explicit or persisted selection, orchestration defaults to
+the current interactive host (`codex` in Codex, `max` in Claude, `muse` in
+Muse). Selecting `max` while running another host still requires a working
+Claude CLI.
 
 The custom API backend is not Codex: it bypasses the Codex CLI and sends direct
 Chat Completions requests to the configured provider. OpenAI/Avocado URLs and

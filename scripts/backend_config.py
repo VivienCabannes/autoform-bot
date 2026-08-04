@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Persistent prover-backend selection — shared by ``/autoform:set-backend`` (writes),
-``/autoform:orchestrate`` (reads), and the DAG review dashboard's backend dropdown
-(reads/writes the same file). Deterministic, zero model tokens.
+"""Persistent prover-backend selection shared by Orchestrate and the DAG review
+dashboard. Both read and write the same file. Deterministic, zero model tokens.
 
 The chosen backend is the *swappable parameter* of the unified prover MCP
 (``servers/prover``, added by the prover PR): the orchestrator (the Claude Code

@@ -37,7 +37,7 @@ def _add_round_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--only", default="", help=f"comma-separated stages ({','.join(STAGES)})")
     parser.add_argument("--skip", default="", help="comma-separated stages to exclude")
     parser.add_argument("--backend", default=None,
-                        help="prover/agent backend (default: the persisted set-backend choice)")
+                        help="prover/agent backend (default: Orchestrate's persisted choice)")
     parser.add_argument("--judge-backend", default=None,
                         help="jury backend (default: $AUTOFORM_JUDGE_BACKEND, else claude/codex autodetect)")
     parser.add_argument("--allow-api-egress", action="append", default=[],

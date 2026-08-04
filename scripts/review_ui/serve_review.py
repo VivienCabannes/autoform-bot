@@ -135,8 +135,8 @@ if _DISCOVERED:
 _PALETTE_IDS = {a["id"] for a in AGENT_PALETTE}
 
 # ---------------------------------------------------------------------------
-# prover backend selection — shared with the /autoform:set-backend command via the
-# SAME config file (~/.autoform/config.json, override with $AUTOFORM_CONFIG). The
+# prover backend selection, shared with Orchestrate through the same config file
+# (~/.autoform/config.json, override with $AUTOFORM_CONFIG). The
 # dashboard reads it for the backend dropdown and writes it when the user flips it,
 # so the UI and the CLI stay in sync. Backend is also the billing path: max = the Max
 # subscription (no API tokens), aristotle = Harmonic, and the remaining options
@@ -1381,7 +1381,7 @@ def make_handler(proj: Project):
 
         def _post_backend(self):
             """POST /api/backend {backend} → persist the prover backend to the shared
-            config (~/.autoform/config.json — the same file /autoform:set-backend uses),
+            config (~/.autoform/config.json, the same file Orchestrate uses),
             so the UI dropdown and the CLI stay in sync. 400 unless the backend is known.
             Returns {ok:true, backend:{current, options}}."""
             posted = self._read_json_body()

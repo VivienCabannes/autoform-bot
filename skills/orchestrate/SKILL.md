@@ -5,8 +5,8 @@ description: >-
   deterministic jury/prover engine, drive native planning and review subagents,
   triage escalations, and advance the dependency graph to a clean trust
   frontier. Use when the user asks to orchestrate, run, resume, automate, prove,
-  review, score, search Lean Zulip for prior art, inspect progress, or finish an
-  Autoform plan.
+  review, score, choose or inspect a prover backend, search Lean Zulip for prior
+  art, inspect progress, or finish an Autoform plan.
 ---
 
 # Orchestrate Autoform
@@ -42,15 +42,36 @@ expecting another user command:
 
 Those runbooks and their references are implementation details of Orchestrate.
 
+Orchestrate also owns prover-backend selection. When the user asks which
+backends are available or which default is active, run:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/backend_config.py" list
+```
+
+When the user explicitly asks to change the persistent default, run:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/backend_config.py" set <backend>
+```
+
+Report the selected adapter, host authentication or credential variable,
+billing path, and whether project content may leave the machine. An explicit
+backend requested for the current run overrides the persisted default, but does
+not change it unless the user asks to persist the choice. Never infer an unknown
+backend as Claude; let validation fail closed.
+
 Resolve:
 
 - dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then a
   running dashboard's graph parent;
 - Lean project: `graph.json` metadata `lean_root`, otherwise the dispatch
   project's repository parent;
-- proof backend: explicit argument, otherwise run `backend_config.py get
+- proof backend: explicit choice for this run, otherwise run `backend_config.py get
   --fallback codex` on Codex, `--fallback max` on Claude, or `--fallback muse`
-  on Muse. A persisted choice still wins;
+  on Muse. A persisted choice wins over the host fallback;
 - judge backend: explicit argument, otherwise `AUTOFORM_JUDGE_BACKEND`, otherwise
   the host-native CLI (`claude` on Claude Code, `codex` on Codex, `muse` on Muse).
 
@@ -59,7 +80,7 @@ particular, a persisted `max` choice on Codex or Muse still requires `claude`;
 if it is not installed/authenticated, stop and ask the user to select another
 available backend or install Claude. The `muse` prover or judge requires the
 `tbh` CLI and its configured provider authentication. Never silently override a
-persisted choice.
+resolved choice.
 
 For every distinct API provider (`openai` or `avocado`) used by either prover or
 judge, run the local configuration check before launching:

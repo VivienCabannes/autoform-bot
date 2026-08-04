@@ -41,7 +41,6 @@ flowchart LR
     D -->|verified| E[3-judge review jury<br/>faithfulness · proof integrity · style]
     E --> F[review dashboard<br/>human sign-off]
     B -.-> G[interactive blueprint]
-    H["/autoform:set-backend"] -.-> C
 ```
 
 - **Plan** — a two-phase pipeline reads your sources and builds a tiered DAG:
@@ -128,19 +127,18 @@ then use:
 ```text
 /autoform:setup                 # prepare the Lean repository, dashboard, CI, and Pages
 /autoform:roadmap               # sources → reviewed dependency graph + blueprint
-/autoform:orchestrate           # launch the engine: prover workers + review jury
-/autoform:set-backend           # choose the prover backend and billing/data path
+/autoform:orchestrate           # choose backends and launch prover workers + review jury
 ```
 
 `/autoform:setup` walks you through creating a project (via the LeanProject
 template, with Mathlib cache), repairing prerequisites, inspecting an existing
 workspace, initializing durable state, and opening the review dashboard.
 `/autoform:roadmap` then scopes the sources, builds and reviews `graph.json`,
-and optionally renders the mathematical blueprint. `/autoform:set-backend` persists the default
-prover backend (`max` | `aristotle` | `codex` | `muse` | `openai` | `avocado`);
-`/autoform:orchestrate` then drives the
-formalization — autonomously, human-driven from the dashboard, or both, off one
-shared queue.
+and optionally renders the mathematical blueprint. `/autoform:orchestrate`
+selects the prover backend (`max` | `aristotle` | `codex` | `muse` | `openai` |
+`avocado`) and drives the formalization autonomously, from the dashboard, or
+both, off one shared queue. Ask Orchestrate to persist a backend as the default
+when needed.
 
 ## Prover backends
 
@@ -188,13 +186,11 @@ existing project with `python3 scripts/formalization.py init <project-dir>`.
 **The complete user command surface** — `/autoform:setup` (repository
 installation, inspection, services, CI, and publication setup),
 `/autoform:roadmap` (source scope, dependency planning, review, and visualization),
-`/autoform:orchestrate` (launch/drive the engine),
-`/autoform:set-backend` (persist the prover backend; shared with the
-dashboard).
+and `/autoform:orchestrate` (backend selection and launch/drive the engine).
 
 Mathlib conventions, proof discipline, environment repair, workspace
 inspection, jury rubrics, and Zulip search are internal runbooks or MCP
-capabilities invoked by the four workflows. They do not appear as extra slash
+capabilities invoked by the three workflows. They do not appear as extra slash
 commands.
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
@@ -232,7 +228,7 @@ contract, with diagrams.
 ## Repository layout
 
 ```
-skills/          four user workflows: setup, roadmap, orchestrate, set-backend
+skills/          three user workflows: setup, roadmap, orchestrate
 internal/        non-discoverable runbooks, reference material, and jury rubrics
 agents/          worker, reader, planning crew, review jury
 servers/         stateful MCP servers plus shared prover/search implementation code
