@@ -86,24 +86,44 @@ may touch. Report those transitions when they occur.
    `content-reviewer`, `holistic-reviewer`), and routes every graph edit
    through `scripts/merge_node.py` — it is the only writer of `graph.json`.
 
-6. Before reporting, check structure:
+6. When the user names a target theorem (a mission sink the fleet should reach),
+   record it as first-class graph state through the single writer:
+
+   ```bash
+   echo '{"metadata": {"targets": [{"node": "<target-node-id>"}]}}' | \
+     uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/merge_node.py" "$DISPATCH_PROJECT/graph.json"
+   ```
+
+   Targets drive the workers' prove ordering (critical path first) and the
+   audit's reachability clause; the status surfaces report distance to each.
+
+7. Before reporting, audit completeness — structure plus every roadmap clause
+   (status vocabulary, grounding, verified in-Mathlib claims, prose, provenance,
+   targets, Lean paths):
 
    ```bash
    uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-     "<AUTOFORM_PLUGIN_ROOT>/scripts/check_invariants.py" \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/roadmap_audit.py" \
      "$DISPATCH_PROJECT/graph.json"
    ```
 
-   A structural failure is this run's to fix, not the next workflow's.
+   A structural failure is this run's to fix, not the next workflow's. Other
+   clauses may legitimately have offenders mid-planning; report the counts. Add
+   `--enqueue` only when the user wants the gaps turned into queued role tasks
+   for Orchestrate/worker rounds to drain, and `--verify-decls
+   --stamp-verified` near a Mathlib checkout to check and stamp claimed
+   declarations (an unverified in-Mathlib claim silently poisons the trust
+   frontier).
 
-7. The lightweight dashboard is the default visualization. Only when the user
+8. The lightweight dashboard is the default visualization. Only when the user
    explicitly requests the publication-style mathematical blueprint, read and
    follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to
    export, build, and serve it. A blueprint toolchain failure must not turn an
    otherwise successful Roadmap run into a failure; report it as an optional
    visualization limitation.
 
-8. Report: tier-1 and tier-2 counts, Mathlib-status breakdown
+9. Report: tier-1 and tier-2 counts, Mathlib-status breakdown
    (in-mathlib / partial / missing), the dashboard URL, any unresolved gaps,
    and the next step: run Orchestrate.
 

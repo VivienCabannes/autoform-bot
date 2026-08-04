@@ -193,6 +193,10 @@ def cmd_status(args) -> int:
         for cand in held[:5]:
             target = cand.node or (f"#{cand.pr.number}" if cand.pr else "?")
             print(f"  ◦ {target}: {cand.reason}")
+    for tgt, m in (picture.targets or {}).items():
+        print(f"\ntarget {tgt}: cone {m['cone_size']} · unproved {m['unproved_mass']} · "
+              f"ready {m['ready']} · critical path {m['critical_path']}"
+              + (" · DONE" if m.get("done") else ""))
     if picture.claims:
         print("\nclaims:")
         for lease in picture.claims:
@@ -348,6 +352,19 @@ def cmd_dashboard(args) -> int:
     return proc.returncode
 
 
+def cmd_audit(args) -> int:
+    """Run the roadmap completeness audit (scripts/roadmap_audit.py)."""
+    cfg = _config(args)
+    root = plugin_root()
+    argv = [sys.executable, str(root / "scripts" / "roadmap_audit.py"), str(cfg.graph_path)]
+    for flag in ("json", "enqueue", "verify_decls", "stamp_verified"):
+        if getattr(args, flag):
+            argv.append("--" + flag.replace("_", "-"))
+    if args.mathlib:
+        argv += ["--mathlib", args.mathlib]
+    return subprocess.run(argv, cwd=str(root)).returncode
+
+
 def cmd_agents(args) -> int:
     """Show the role registry — what `work` can dispatch, and where each came from."""
     from .agent_work import role_summary
@@ -447,6 +464,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_agents)
     p_agents.add_argument("--json", action="store_true")
 
+    p_audit = sub.add_parser("audit", help="roadmap completeness audit (offenders → queued gap tasks)")
+    _add_common(p_audit)
+    p_audit.add_argument("--json", action="store_true")
+    p_audit.add_argument("--enqueue", action="store_true",
+                         help="queue one role task per auditable offender (deduplicated)")
+    p_audit.add_argument("--verify-decls", action="store_true",
+                         help="grep claimed declarations in the local Mathlib checkout")
+    p_audit.add_argument("--stamp-verified", action="store_true",
+                         help="stamp mathlib_verified on fully-resolving nodes (implies --verify-decls)")
+    p_audit.add_argument("--mathlib", default=None, help="explicit Mathlib checkout root")
+
     p_doc = sub.add_parser("doctor", help="environment/auth/repo capability audit")
     _add_common(p_doc)
     p_doc.add_argument("--json", action="store_true")
@@ -482,6 +510,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_dashboard(known)
     if known.cmd == "agents":
         return cmd_agents(known)
+    if known.cmd == "audit":
+        return cmd_audit(known)
     if known.cmd == "doctor":
         return cmd_doctor(known)
     raise Die(f"unknown command {known.cmd!r}")

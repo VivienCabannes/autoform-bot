@@ -101,6 +101,31 @@ VERDICT_DOT = {
 IN_MATHLIB_STATUSES = {"exists", "in-mathlib", "in_mathlib", "mathlib"}
 
 # ---------------------------------------------------------------------------
+# mathlib_status vocabulary — ONE normalizer for every consumer.
+#
+# History: this module tolerated several spellings while check_invariants.py
+# matched only the literal "in-mathlib", so the dashboard and the checker could
+# disagree about the same graph (a node written as "exists" rendered blue here
+# but failed root-reachability there). Every status comparison should go
+# through normalize_status; check_invariants mirrors this table and a contract
+# test asserts the two stay identical.
+# ---------------------------------------------------------------------------
+CANONICAL_STATUSES = ("in-mathlib", "partial", "missing")
+STATUS_ALIASES = {
+    "in-mathlib": "in-mathlib", "exists": "in-mathlib", "in_mathlib": "in-mathlib",
+    "mathlib": "in-mathlib",
+    "partial": "partial", "partially": "partial", "partial-in-mathlib": "partial",
+    "missing": "missing", "absent": "missing", "not-in-mathlib": "missing",
+}
+
+
+def normalize_status(raw) -> Optional[str]:
+    """The canonical ``mathlib_status`` for any tolerated spelling, else None."""
+    if not isinstance(raw, str):
+        return None
+    return STATUS_ALIASES.get(raw.strip().lower())
+
+# ---------------------------------------------------------------------------
 # Jury rubrics — SINGLE SOURCE OF TRUTH: internal/rubrics/*.json.
 # The axis set, weights, pass thresholds and gating roles are READ FROM THOSE FILES,
 # so the jury is modular: add a rubric file to add an axis, remove one to shrink the
@@ -865,6 +890,133 @@ def _closure(start: str, nodes: Dict[str, dict]) -> Set[str]:
                 seen.add(dep)
                 stack.append(dep)
     return seen
+
+
+# ---------------------------------------------------------------------------
+# targets — first-class mission sinks, and the distance metrics a fleet
+# steers by. All pure functions over (nodes, sidecar); no I/O.
+# ---------------------------------------------------------------------------
+
+def graph_targets(meta: dict) -> List[str]:
+    """Target node ids from graph metadata. Entries may be bare ids or
+    ``{"node": id, ...}`` records; unknown shapes are ignored."""
+    raw = (meta or {}).get("targets")
+    if not isinstance(raw, list):   # a stray string would iterate per character
+        return []
+    out: List[str] = []
+    for entry in raw:
+        if isinstance(entry, str) and entry:
+            out.append(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("node"), str) and entry["node"]:
+            out.append(entry["node"])
+    return out
+
+
+def dependency_cone(target_id: str, nodes: Dict[str, dict]) -> Set[str]:
+    """The target plus everything it transitively depends on — the sub-DAG a
+    fleet must clear to reach the target."""
+    return _closure(target_id, nodes) if target_id in nodes else set()
+
+
+def untrusted_depth(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    within: Optional[Set[str]] = None,
+    sorry_set: Optional[Set[str]] = None,
+) -> Dict[str, int]:
+    """Longest chain of UNTRUSTED nodes ending at each untrusted node.
+
+    ``depth(n) = 1 + max(depth(d))`` over n's untrusted deps (0 for trusted
+    nodes). The maximum over a target's cone is that target's critical-path
+    length. Only untrusted nodes appear in the result.
+    """
+    scope = within if within is not None else set(nodes)
+    memo: Dict[str, int] = {}
+
+    def depth(nid: str, seen: frozenset) -> int:
+        if nid in memo:
+            return memo[nid]
+        if nid in seen:                       # cycle guard; acyclicity checked elsewhere
+            return 0
+        if is_trusted(nid, nodes[nid], sidecar, sorry_set):
+            memo[nid] = 0
+            return 0
+        best = 0
+        for dep in nodes[nid].get("depends_on") or []:
+            if dep in nodes and dep in scope:
+                best = max(best, depth(dep, seen | {nid}))
+        memo[nid] = 1 + best
+        return memo[nid]
+
+    for nid in scope:
+        if nid in nodes:
+            depth(nid, frozenset())
+    return {k: v for k, v in memo.items() if v > 0}
+
+
+def target_metrics(
+    target_id: str,
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> dict:
+    """The fleet's speedometer for one target: how far, how much, what's next."""
+    cone = dependency_cone(target_id, nodes)
+    depths = untrusted_depth(nodes, sidecar, within=cone, sorry_set=sorry_set)
+    untrusted = set(depths)
+    ready = [nid for nid in untrusted
+             if all(dep not in untrusted for dep in nodes[nid].get("depends_on") or []
+                    if dep in nodes and dep in cone)]
+    return {
+        "cone_size": len(cone),
+        "unproved_mass": len(untrusted),
+        "ready": len(ready),
+        "critical_path": max(depths.values(), default=0),
+        "done": target_id in nodes and not depths,
+    }
+
+
+def prove_priority(
+    nodes: Dict[str, dict],
+    sidecar: dict,
+    meta: dict,
+    sorry_set: Optional[Set[str]] = None,
+) -> Dict[str, tuple]:
+    """Sort keys for prove candidates: in-cone before off-cone, tallest
+    untrusted chain ABOVE the node first (proving it unblocks that much of the
+    critical path), then stable by id. Lower tuples sort first.
+
+    With no targets declared this returns ``{}`` and callers keep their
+    existing ordering.
+    """
+    targets = graph_targets(meta)
+    if not targets:
+        return {}
+    cone_union: Set[str] = set()
+    over_depth: Dict[str, int] = {}
+    for target in targets:
+        cone = dependency_cone(target, nodes)
+        cone_union |= cone
+        depths = untrusted_depth(nodes, sidecar, within=cone, sorry_set=sorry_set)
+        dependents: Dict[str, List[str]] = {}
+        for nid in cone:
+            for dep in nodes.get(nid, {}).get("depends_on") or []:
+                if dep in cone:
+                    dependents.setdefault(dep, []).append(nid)
+
+        def above(nid: str, seen: frozenset) -> int:
+            if nid in seen:
+                return 0
+            best = 0
+            for parent in dependents.get(nid, []):
+                if parent in depths:
+                    best = max(best, 1 + above(parent, seen | {nid}))
+            return best
+
+        for nid in cone:
+            over_depth[nid] = max(over_depth.get(nid, 0), above(nid, frozenset()))
+    return {nid: (0 if nid in cone_union else 1, -over_depth.get(nid, 0), nid)
+            for nid in nodes}
 
 
 # ---------------------------------------------------------------------------
