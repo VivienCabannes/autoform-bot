@@ -21,6 +21,6 @@ early and handle it correctly — a false target is a planning problem, not a pr
 - **Never weaken a hypothesis** to make a lemma provable if the call sites cannot supply the
   stronger hypothesis — trace the full call chain first. A locally convenient weakening that
   breaks every downstream user is not progress.
-- A statement that is false as written is an **escalation**: report the precise reason it is
-  false (see `task-management.md`). If the statement came from a node, that node's *statement*
-  needs to change — a worker does not silently restate the target.
+- A statement that is false as written enters **proof recovery**: report the
+  precise counterexample and park the target until its intended statement is
+  established. A worker does not silently restate the target.

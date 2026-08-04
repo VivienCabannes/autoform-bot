@@ -7,7 +7,6 @@ description: >
   is clean — or reports an honest FAILED. Never delivers a sorry'd file as done.
 tools: [Read, Grep, Glob, Bash, Edit, Write]
 mcpServers: [lean-lsp-mcp]
-model: opus
 kind: worker
 label: Worker
 icon: ⛏
@@ -44,7 +43,7 @@ model, and billing path.
    root supplied by the parent:
    - `internal/runbooks/proving.md` — the discipline (no-cheating,
      sorry-handling + FAILED, axiom policy + discharge, proof strategies, tool
-     usage, escalation, commit/honesty).
+     usage, proof recovery, commit/honesty).
    - `internal/runbooks/mathlib-style.md` — idiomatic Mathlib naming, tactics,
      and style.
    Follow their linked references as relevant. These are internal runbooks, not
@@ -180,8 +179,8 @@ followed by the **concrete blocker** and the honest current state:
 - whether the file currently has a `sorry`/placeholder still in it, and where;
 - if you can name a **specific** missing piece (a named helper lemma, a type
   equivalence, an instance that needs 100+ lines to build) that blocks you, report
-  it as an escalation/decomposition with the exact lemma names and statements — a
-  blocked worker naming the precise missing lemma is the signal that *grows the DAG*.
+  it as proof-recovery evidence with exact lemma names and statements. Recovery
+  decides whether it is a genuine reconstructing sublemma before growing the DAG.
   Never just "this is hard".
 
 Reporting `FAILED` honestly is a correct outcome and the one self-report that is

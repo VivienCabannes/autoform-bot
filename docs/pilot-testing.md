@@ -62,7 +62,7 @@ subagent delegation needs a registered parent thread. Judge the probe from the
 JSONL event stream, not from the model's final self-report. Success requires an
 actual spawned child id, a non-empty receiver set while waiting, and a terminal
 child result. A missing/failed spawn followed by a plausible statement such as
-`"used_agent": "autoform_reader"` is a failed pilot, not evidence of delegation.
+`"used_agent": "autoform_source_searcher"` is a failed pilot, not evidence of delegation.
 
 ## 3. API-provider preflight
 

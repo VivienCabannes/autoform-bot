@@ -187,8 +187,8 @@ inspection, jury rubrics, and Zulip search are internal runbooks or MCP
 capabilities invoked by the four workflows. They do not appear as extra slash
 commands.
 
-**Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
-crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
+**Agents** — a prover `autoform-worker`; the planning crew (`splitter`,
+`mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 `holistic-reviewer`, `source-searcher`). The review jury is generated directly
 from the rubric files under `internal/rubrics/`, not separate agent prompts.
 

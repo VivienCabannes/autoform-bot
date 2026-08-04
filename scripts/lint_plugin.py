@@ -46,7 +46,7 @@ REPO_ROOT = SCRIPT.parents[1]            # root-level plugin: scripts/.. == repo
 # Agents / skills removed or renamed by a later PR. A surviving mention (outside
 # an HTML comment) is a regression — add the OLD name here when you rename so any
 # straggler reference is caught. Empty on the pristine niket/dev tree.
-REMOVED_AGENTS: tuple[str, ...] = ()
+REMOVED_AGENTS: tuple[str, ...] = ("autoform-reader",)
 REMOVED_SKILLS: tuple[str, ...] = ("set-backend",)
 EXPECTED_MCP_SERVERS = frozenset(
     {
@@ -57,17 +57,14 @@ EXPECTED_MCP_SERVERS = frozenset(
 PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate", "evaluate"})
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
-    "internal/runbooks/environment.md",
     "internal/runbooks/evaluation.md",
     "internal/runbooks/github-pages.md",
-    "internal/runbooks/lean-install.md",
     "internal/runbooks/mathlib-style.md",
     "internal/runbooks/planning.md",
     "internal/runbooks/proving.md",
     "internal/runbooks/review.md",
     "internal/runbooks/visualization.md",
     "internal/runbooks/worker.md",
-    "internal/runbooks/workspace.md",
     "internal/runbooks/zulip.md",
     "internal/references/plan-json-schema.md",
     "internal/references/reviewer-packet.md",
@@ -82,7 +79,6 @@ REQUIRED_INTERNAL_ASSETS = (
     "internal/references/proving/false-statements.md",
     "internal/references/proving/proof-strategies.md",
     "internal/references/proving/sorry-handling.md",
-    "internal/references/proving/task-management.md",
     "internal/references/proving/tool-usage.md",
     "internal/rubrics/code_quality.json",
     "internal/rubrics/faithfulness.json",
@@ -373,6 +369,12 @@ def check_agents() -> int:
                 err(f"{rel(path)}: agent frontmatter missing `{key}`")
         if fm.get("name") and fm["name"] != path.stem:
             err(f"{rel(path)}: agent `name: {fm['name']}` != filename `{path.stem}`")
+        checks += 1
+        if "model" in fm:
+            err(
+                f"{rel(path)}: agent frontmatter must not pin `model`; "
+                "roles inherit the host-selected model"
+            )
     return count
 
 

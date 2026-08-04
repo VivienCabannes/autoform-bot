@@ -6,7 +6,6 @@ description: >
   CLI (name/grep/read) to classify a concept as in-mathlib, partial, or missing.
 tools: [Read, Bash]
 mcpServers: []
-model: sonnet
 kind: mathcheck
 label: Mathlib check
 icon: 🔎

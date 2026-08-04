@@ -46,7 +46,7 @@ ENGINE_KINDS = ("reviewer", "worker")
 #: Roles that exist as prompts but are invoked *inside* another role's pipeline
 #: rather than dropped on the queue themselves.
 _NON_QUEUE_ROLES = frozenset({
-    "splitter", "autoform-reader", "autoform-worker", "source-searcher",
+    "splitter", "autoform-worker", "source-searcher",
     "proof-strategy-researcher",
 })
 

@@ -333,7 +333,6 @@ def test_shipped_sub_roles_are_not_queue_kinds():
     roles = registry.discover(REPO_ROOT)
     assert "splitter" not in roles
     assert "source-searcher" not in roles
-    assert "autoform-reader" not in roles
     assert "proof-strategy-researcher" not in roles
 
 

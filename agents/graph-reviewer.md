@@ -9,7 +9,6 @@ description: >
   responsibility. References the sources when uncertain.
 tools: [Read, Bash]
 mcpServers: []
-model: opus
 kind: graphreview
 label: Graph reviewer
 icon: 🔗

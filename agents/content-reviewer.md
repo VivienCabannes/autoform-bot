@@ -8,7 +8,6 @@ description: >
   for the graph-reviewers and orchestrator.
 tools: [Read, Write]
 mcpServers: []
-model: opus
 kind: contentreview
 label: Content reviewer
 icon: 📝

@@ -41,5 +41,7 @@ The worker's job is search → write → iterate-to-compile. It does **not** cer
 A worker that hands back a file with a hidden `sorry`, an `axiom` standing in for the real
 proof, a `decide`/`native_decide` masking an unfinished case, or a `False.elim` on a goal that
 is not actually false, has cheated — even if the file compiles. The correct move when the proof
-won't close is **FAILED + the named missing lemma** (see `task-management.md`), which feeds the
-DAG a new node. An honest failure is useful; a disguised one poisons everything downstream.
+won't close is **FAILED + the exact blocker**, which opens ordered proof
+recovery. A missing lemma becomes a DAG node only after recovery verifies that
+it is useful, strictly simpler, and reconstructs the target. An honest failure
+is useful; a disguised one poisons everything downstream.

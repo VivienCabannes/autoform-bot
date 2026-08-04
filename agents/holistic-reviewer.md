@@ -6,7 +6,6 @@ description: >
   consistent granularity by significance, Mathlib root validity, and coverage —
   the forest-level issues that per-edge and per-node reviewers miss.
 tools: [Read]
-model: opus
 kind: holistic
 label: Holistic review
 icon: 🔭

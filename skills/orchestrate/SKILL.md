@@ -189,7 +189,6 @@ task.
 
 Use the host's native parallel subagent interface and these canonical roles:
 
-- `autoform_reader`
 - `autoform_splitter`
 - `autoform_mathlib_checker`
 - `autoform_graph_reviewer`
