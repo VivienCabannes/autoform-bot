@@ -83,8 +83,51 @@ _SKIP_DIRS = {".lake", ".git", "build", "lakefile", ".autoform"}
 
 def strip_code(src: str) -> str:
     """Source with comments and string literals blanked — prose that merely
-    mentions ``sorry`` must never be read as an incomplete proof."""
-    return _STRING_RE.sub('""', _LINE_COMMENT_RE.sub("", _BLOCK_COMMENT_RE.sub("", src)))
+    mentions ``sorry`` must never be read as an incomplete proof.
+
+    Deliberately a single left-to-right pass rather than three chained regex
+    substitutions: run separately, a line-comment pattern matches the ``--``
+    *inside* a string literal, truncating it so its closing quote then pairs
+    with the next literal's opening quote and everything between is blanked.
+    A file containing ``"pass -- to lake"`` lost every declaration after it.
+    Lengths are preserved so byte offsets stay usable by the caller.
+    """
+    out: list[str] = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch == '"':                                   # string literal
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.append('""'.ljust(j - i))
+            i = j
+        elif src.startswith("/-", i):                   # block comment (nesting)
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/-", j):
+                    depth, j = depth + 1, j + 2
+                elif src.startswith("-/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append("".join(c if c == "\n" else " " for c in src[i:j]))
+            i = j
+        elif src.startswith("--", i):                   # line comment
+            j = src.find("\n", i)
+            j = n if j == -1 else j
+            out.append(" " * (j - i))
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 @dataclass
@@ -103,17 +146,37 @@ def module_of(path: Path, root: Path) -> str:
 
 def _namespace_at(stripped: str, offset: int) -> str:
     """The namespace stack open at ``offset`` — so declaration ids match the
-    names Lean actually resolves, not the bare local head."""
-    stack: list[str] = []
-    for match in re.finditer(r"^\s*(namespace|end)\b\s*([A-Za-z_][A-Za-z0-9_.']*)?",
+    names Lean actually resolves, not the bare local head.
+
+    ``section`` must push a sentinel even though it contributes no name: a
+    bare ``end`` closing a section would otherwise pop the enclosing
+    *namespace*, and since sections are ubiquitous in real Lean the ids would
+    drift from what Lean resolves — mis-resolving `depends_on` and even
+    colliding a declaration id with a module cluster id.
+    """
+    stack: list[str | None] = []
+    for match in re.finditer(r"^\s*(namespace|section|end)\b[ \t]*([A-Za-z_][A-Za-z0-9_.']*)?",
                              stripped[:offset], re.MULTILINE):
-        if match.group(1) == "namespace" and match.group(2):
-            stack.append(match.group(2))
-        elif match.group(1) == "end":
-            name = match.group(2)
-            if stack and (name is None or stack[-1] == name):
-                stack.pop()
-    return ".".join(stack)
+        head, name = match.group(1), match.group(2)
+        if head == "namespace":
+            if name:
+                stack.append(name)
+        elif head == "section":
+            stack.append(None)                  # anonymous or named: contributes no id
+        elif stack:
+            if name is None:
+                stack.pop()                     # closes the innermost open scope
+            else:
+                # `end Foo` closes back through Foo when it is open; a named
+                # section end is otherwise just the innermost scope.
+                if name in [s for s in stack if s]:
+                    while stack:
+                        top = stack.pop()
+                        if top == name:
+                            break
+                else:
+                    stack.pop()
+    return ".".join(s for s in stack if s)
 
 
 def parse_file(path: Path, root: Path) -> list[Decl]:
