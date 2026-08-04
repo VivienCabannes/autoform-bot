@@ -213,11 +213,34 @@ def _open_escalations(tasks: list) -> list:
 
 # The queue has two consumers. The deterministic engine drains exactly these:
 _ENGINE_KINDS = ("reviewer", "worker")
-# ...and the orchestrator (/autoform:orchestrate) owns ALL the rest — each via the same
-# lifecycle: claim -> run its Task subagent(s)/pipeline -> done (or fail). The engine
-# NEVER closes an orchestrator-owned task, so one left queued sits forever until the
-# orchestrator clears it. (Escalation was just the first symptom of this whole class.)
-_ORCH_KINDS = ("escalation", "planner", "graphreview", "contentreview", "holistic", "mathcheck")
+
+
+def _orch_kinds() -> tuple:
+    """Kinds the orchestrator (or the worker CLI's agent stage) owns.
+
+    Derived from the agent-role REGISTRY — every ``agents/<role>.md`` (and any
+    project-local ``.autoform/agents/<role>.md``) that declares an agent-drained
+    kind is accepted here, so adding a role file is all it takes to add a queue
+    kind. Falls back to the historical built-in set if the registry is
+    unavailable (e.g. a partial checkout).
+    """
+    try:
+        sys.path.insert(0, str(_HERE.parent))
+        from autoform_worker.registry import agent_kinds  # noqa: PLC0415
+
+        discovered = agent_kinds(_HERE.parent)
+        if discovered:
+            return discovered
+    except Exception:
+        pass
+    return ("escalation", "planner", "graphreview", "contentreview", "holistic", "mathcheck")
+
+
+# ...and the orchestrator owns ALL the rest — each via the same lifecycle:
+# claim -> run its Task subagent(s)/pipeline -> done (or fail). The engine NEVER
+# closes an orchestrator-owned task, so one left queued sits forever until the
+# orchestrator clears it. (Escalation was just the first symptom of this class.)
+_ORCH_KINDS = _orch_kinds()
 
 
 def _open_orchestrator_tasks(tasks: list) -> list:

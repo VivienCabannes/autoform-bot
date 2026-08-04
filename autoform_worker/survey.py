@@ -21,13 +21,16 @@ from . import gitutil, scoreboard
 from .claims import ClaimBoard, author_claim_key
 from .config import WorkerConfig, scripts_modules
 from .constants import (
+    HOLD_LABELS,
     MAX_CI_ATTEMPTS,
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
+    MAX_MERGE_ATTEMPTS,
     MAX_PROVE_ATTEMPTS,
     MAX_REBASE_ATTEMPTS,
     MAX_REVIEW_ERRORS,
     STAGES,
+    merge_paths_allowed,
 )
 from .counters import Counters
 from .errors import ClaimTransportError
@@ -48,6 +51,7 @@ class PRInfo:
     labels: list[str]
     node: str | None    # from the body's target marker
     updated_at: str = ""
+    files: tuple = ()   # changed paths (the merge gate's path allowlist input)
 
     @classmethod
     def from_gh(cls, raw: dict) -> "PRInfo":
@@ -64,6 +68,7 @@ class PRInfo:
             labels=[label.get("name", "") for label in (raw.get("labels") or [])],
             node=scoreboard.parse_target(raw.get("body")),
             updated_at=str(raw.get("updatedAt", "")),
+            files=tuple(f.get("path", "") for f in (raw.get("files") or [])),
         )
 
 
@@ -73,6 +78,7 @@ class Candidate:
     reason: str
     pr: PRInfo | None = None
     node: str | None = None
+    task: object = None      # QueuedTask for agent-stage candidates
 
 
 @dataclass
@@ -204,6 +210,11 @@ def collect(
     prs = [PRInfo.from_gh(raw) for raw in host.pr_list(canonical)]
     survey.prs = prs
 
+    # The local sidecar is the human's channel into the merge gate: a verdict
+    # recorded in the review dashboard outranks the jury and holds the PR.
+    rm = scripts_modules()["review_model"]
+    sidecar = rm.load_sidecar(cfg.project / "review_status.json")
+
     claims: list[dict] = []
     if board is not None and cfg.respect_claims:
         try:
@@ -294,6 +305,33 @@ def collect(
                                            if ok and not claimed else "budget spent" if not ok
                                            else "claimed by peer", pr=pr, node=pr.node),
                           ok and not claimed)
+                continue
+
+            if meta and meta.get("verdict") == "clean":
+                # The auto-merge gate. Humans steer through the dashboards: a
+                # human rejected/flagged verdict in the sidecar blocks the gate,
+                # as does any hold label; toolchain/CI/tooling paths always
+                # wait for a human.
+                cand = Candidate("merge", "clean verdict at head + green CI", pr=pr, node=pr.node)
+                holds = sorted(HOLD_LABELS.intersection(pr.labels))
+                human_block = _human_verdict(sidecar, pr.node)
+                if not survey.can_push:
+                    cand.reason = "no merge permission on canonical"
+                    push_cand("merge", cand, False)
+                elif holds:
+                    cand.reason = f"hold label: {', '.join(holds)}"
+                    push_cand("merge", cand, False)
+                elif human_block:
+                    cand.reason = f"human verdict {human_block} blocks the gate"
+                    push_cand("merge", cand, False)
+                elif not merge_paths_allowed(pr.files):
+                    cand.reason = "touches non-roadmap paths — needs a human"
+                    push_cand("merge", cand, False)
+                elif counters.get(f"merge-{pr.number}") >= MAX_MERGE_ATTEMPTS:
+                    cand.reason = "merge attempt budget spent"
+                    push_cand("merge", cand, False)
+                else:
+                    push_cand("merge", cand, True)
 
     # --- progress -----------------------------------------------------------
     folded = _load_folded(cfg.folded_path)
@@ -308,6 +346,15 @@ def collect(
         else:
             cand.reason += " — no push access, skipping"
             push_cand("progress", cand, False)
+
+    # --- agent roles (planner / mathcheck / counterexample / … from the registry) ---
+    from .agent_work import agent_candidates  # noqa: PLC0415 — avoids an import cycle
+    from .registry import Registry  # noqa: PLC0415
+
+    registry = Registry(cfg.plugin_root, cfg.project)
+    ready, held = agent_candidates(cfg, registry, counters, live_foreign)
+    survey.stages["agents"].extend(ready)
+    survey.suppressed["agents"].extend(held)
 
     # --- prove --------------------------------------------------------------
     open_pr_nodes = {pr.node for pr in prs if pr.node}
@@ -348,6 +395,21 @@ def collect(
         pass  # a staleness hint must never break the survey
 
     return survey
+
+
+def _human_verdict(sidecar: dict, node_id: str | None) -> str | None:
+    """A human's own verdict on this node when it blocks the merge gate.
+
+    Humans steer through the dashboards, so a ``flagged``/``rejected`` verdict
+    recorded there is a hold — the jury cannot overrule it (the human slot is
+    immutable to machines by contract).
+    """
+    if not node_id:
+        return None
+    record = (sidecar.get("reviews") or {}).get(node_id) or {}
+    human = record.get("human") or {}
+    verdict = human.get("verdict")
+    return verdict if verdict in {"flagged", "rejected"} else None
 
 
 def _load_folded(path: Path) -> set[int]:

@@ -35,8 +35,35 @@ loop on a failing `gh auth`, missing `origin`, or dirty working tree.
 ## The round contract
 
 `work` runs ONE unit: survey → first actionable stage → execute → one visible
-GitHub mark. Stage cascade (fixed): `rebase → fix-ci → fix → review → progress
-→ prove`. Exit 0 = progressed, 75 = nothing actionable (normal), 1 = error.
+GitHub mark. Stage cascade (fixed): `rebase → fix-ci → fix → review → merge →
+progress → agents → prove`. Exit 0 = progressed, 75 = nothing actionable
+(normal), 1 = error.
+
+`agents` is not a single role — it drains **every** queue kind the role
+registry knows (planner, mathcheck, graphreview, contentreview, counterexample,
+priorart, holistic, escalation, plus any project-local role), spawning the host
+CLI with that role's own Markdown body. It sits before `prove` so a cluster is
+planned, Mathlib-checked, and refutation-tested before compute goes into
+proving it. Run `python -m autoform_worker agents` to see what is registered.
+
+## Roles are files
+
+A role is `agents/<kind>.md` (plugin) or `<project>/.autoform/agents/<kind>.md`
+(project-local override or addition), with optional frontmatter keys `kind`,
+`label`, `icon`, `blurb`, `applies`, `drained_by`, `writes`. The registry
+derives the dashboard palette, the queue's accepted kinds, and this stage list
+from those files — never add an agent type by editing Python. When a user asks
+for a new kind of agent, write the role file; that is the whole change.
+
+## Merging
+
+The worker auto-merges a PR when CI is green, a **trusted** `clean` scoreboard
+exists at the exact head, the changed paths are roadmap content, no
+`hold`/`human`/`wip` label is set, and no human `flagged`/`rejected` verdict
+exists for the node. `gh pr merge --match-head-commit` makes the merge itself a
+CAS. Humans intervene through the dashboards — recording a verdict holds the
+gate — not by clicking merge. Toolchain, CI, and tooling paths never
+auto-merge.
 
 - `--dry-run` surveys and reports without executing — use it to show the user
   what would happen.

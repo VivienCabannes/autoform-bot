@@ -134,7 +134,7 @@ class GitHost:
     # -- PRs ----------------------------------------------------------------
 
     PR_FIELDS = ("number,title,author,headRefName,headRefOid,headRepositoryOwner,"
-                 "isDraft,mergeable,labels,body,statusCheckRollup,updatedAt")
+                 "isDraft,mergeable,labels,body,statusCheckRollup,updatedAt,files")
 
     def pr_list(self, slug: str, state: str = "open", limit: int = 100, fields: str | None = None) -> list[dict]:
         data = self.gh_json([
@@ -170,6 +170,14 @@ class GitHost:
                 self.gh(["pr", "edit", number, "--repo", slug,
                          *[a for label in labels for a in ("--add-label", label)]], check=False)
         return url
+
+    def merge_pr(self, slug: str, number: int, expect_head: str) -> bool:
+        """Squash-merge a PR iff its head is still exactly ``expect_head`` —
+        the merge-time CAS (``--match-head-commit``). False when the head moved
+        or GitHub refuses (branch protection, conflicts); Die on transport."""
+        proc = self.gh(["pr", "merge", str(number), "--repo", slug, "--squash",
+                        "--match-head-commit", expect_head], check=False)
+        return proc.returncode == 0
 
     # -- issues (escalation/intention sync; degrade when Issues are off) ----
 

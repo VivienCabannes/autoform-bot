@@ -374,6 +374,28 @@ def cmd_dashboard(args) -> int:
     return proc.returncode
 
 
+def cmd_agents(args) -> int:
+    """Show the role registry — what `work` can dispatch, and where each came from."""
+    from .agent_work import role_summary
+    from .registry import Registry
+
+    try:
+        cfg = _config(args)
+        registry = Registry(cfg.plugin_root, cfg.project)
+    except Die:
+        registry = Registry(plugin_root())      # no project — plugin roles only
+    if args.json:
+        print(json.dumps(registry.palette(), indent=2, ensure_ascii=False))
+        return EX_OK
+    print(f"{len(registry.roles)} role(s) discovered "
+          f"({len(registry.agent_kinds())} drained by the worker's agent stage):\n")
+    for line in role_summary(registry):
+        print(line)
+    print("\nAdd a role by dropping agents/<kind>.md (or <project>/.autoform/agents/<kind>.md) "
+          "with `kind:` and `drained_by: agent` in its frontmatter.")
+    return EX_OK
+
+
 def cmd_doctor(args) -> int:
     cfg = None
     try:
@@ -447,6 +469,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p_dash)
     p_dash.add_argument("dashboard_cmd", choices=["export", "serve"])
 
+    p_agents = sub.add_parser("agents", help="list discovered agent roles (agents/*.md)")
+    _add_common(p_agents)
+    p_agents.add_argument("--json", action="store_true")
+
     p_doc = sub.add_parser("doctor", help="environment/auth/repo capability audit")
     _add_common(p_doc)
     p_doc.add_argument("--json", action="store_true")
@@ -480,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_issues_sync(known)
     if known.cmd == "dashboard":
         return cmd_dashboard(known)
+    if known.cmd == "agents":
+        return cmd_agents(known)
     if known.cmd == "doctor":
         return cmd_doctor(known)
     raise Die(f"unknown command {known.cmd!r}")

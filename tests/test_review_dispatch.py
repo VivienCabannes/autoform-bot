@@ -164,13 +164,26 @@ def test_write_task_queue_does_not_touch_graph_or_sidecar(tmp_path):
 # palette constant
 # ---------------------------------------------------------------------------
 
-_ALL_KINDS = {"reviewer", "worker", "planner", "graphreview",
-              "contentreview", "holistic", "mathcheck", "escalation"}
+def _registry_kinds() -> set:
+    """The kinds the agent-role registry discovers from ``agents/*.md``.
+
+    Derived, not hardcoded: roles are the extension point, so adding a role file
+    must not require editing this test. The historical set is the floor — those
+    kinds must always survive.
+    """
+    from autoform_worker.registry import Registry
+
+    return set(Registry(Path(__file__).resolve().parents[1]).roles)
+
+
+_BASELINE_KINDS = {"reviewer", "worker", "planner", "graphreview",
+                   "contentreview", "holistic", "mathcheck", "escalation"}
 
 
 def test_palette_covers_every_dispatch_kind():
     ids = [a["id"] for a in sv.AGENT_PALETTE]
-    assert set(ids) == _ALL_KINDS
+    assert set(ids) == _registry_kinds()
+    assert _BASELINE_KINDS <= set(ids)          # no historical kind may vanish
     assert len(ids) == len(set(ids))                      # no duplicates
     for a in sv.AGENT_PALETTE:
         assert set(a) >= {"id", "label", "icon", "blurb", "applies"}
@@ -269,7 +282,7 @@ def test_api_dispatch_shape(tmp_path):
         code, body = srv.get("/api/dispatch")
         assert code == 200
         assert set(body) == {"palette", "queue", "live", "backend"}
-        assert {a["id"] for a in body["palette"]} == _ALL_KINDS
+        assert {a["id"] for a in body["palette"]} == _registry_kinds()
         assert body["queue"] == []
         # live is the existing agents feed payload (idle when nothing runs)
         assert body["live"]["orchestrator"]["state"] == "idle"

@@ -12,7 +12,54 @@ import re
 # an actionable candidate wins. Tending existing PRs always precedes generating
 # new work (`prove` last — it is the expensive, work-creating stage).
 # ---------------------------------------------------------------------------
-STAGES = ("rebase", "fix-ci", "fix", "review", "progress", "prove")
+#: ``agents`` drains every registry-discovered role kind (planner, mathcheck,
+#: graphreview, contentreview, counterexample, priorart, holistic, escalation,
+#: plus anything a project adds as a role file). It sits before ``prove`` so the
+#: roadmap is planned, checked, and refuted-against before compute is spent
+#: proving it — and after the PR-tending stages so open work always drains first.
+STAGES = ("rebase", "fix-ci", "fix", "review", "merge", "progress", "agents", "prove")
+
+MAX_AGENT_ATTEMPTS = 3
+
+# ---------------------------------------------------------------------------
+# Auto-merge gate. Humans are in the loop through the dashboards (the static
+# roadmap site + the local review dashboard), not through merge buttons: a PR
+# merges automatically when CI is green, a TRUSTED scoreboard says `clean` at
+# the exact head, it touches only roadmap-content paths, no hold label is set,
+# and no human verdict blocks the node. A human `rejected`/`flagged` verdict in
+# the sidecar (recorded via the local dashboard) always blocks the gate.
+# ---------------------------------------------------------------------------
+HOLD_LABELS = frozenset({"hold", "human", "wip", "keep", "do-not-close"})
+MAX_MERGE_ATTEMPTS = 3
+
+_MERGE_PATH_ALLOW = (
+    r"^[^/]+\.lean$",            # top-level lean (rare)
+    r"^[A-Za-z0-9_./-]+\.lean$",  # library lean files
+    r"^kernel/",                  # kernel evidence
+    r"^informal_content/",        # node prose
+    r"^review_status\.json$",     # sidecar folds
+)
+_MERGE_PATH_DENY = (
+    r"^\.github/", r"^\.claude", r"^\.codex", r"^\.autoform/",
+    r"^lakefile\.", r"^lake-manifest\.json$", r"^lean-toolchain$",
+    r"^scripts/", r"^hooks/",
+)
+
+
+def merge_paths_allowed(paths) -> bool:
+    """Whether every changed path is roadmap content the gate may merge.
+
+    Deny wins over allow; anything matching neither list is denied — toolchain,
+    CI, and tooling changes always wait for a human.
+    """
+    allow = [re.compile(p) for p in _MERGE_PATH_ALLOW]
+    deny = [re.compile(p) for p in _MERGE_PATH_DENY]
+    for path in paths:
+        if any(rx.search(path) for rx in deny):
+            return False
+        if not any(rx.search(path) for rx in allow):
+            return False
+    return bool(list(paths))
 
 # ---------------------------------------------------------------------------
 # Claims (git-ref leases). Cooperative only — safety is CAS pushes.

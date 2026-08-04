@@ -11,8 +11,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import agent_work
 from . import survey as survey_mod
 from . import work_units
+from .registry import Registry
 from .claims import ClaimBoard
 from .config import WorkerConfig
 from .constants import GH_MIN_BUDGET, STAGES
@@ -148,10 +150,20 @@ def _execute(stage, cfg, host, board, counters, picture, candidate, opts) -> wor
     if stage == "review":
         return work_units.do_review(cfg, host, counters, picture, candidate,
                                     judge_backend=opts.judge_backend)
+    if stage == "merge":
+        return work_units.do_merge(cfg, host, counters, picture, candidate)
     if stage == "progress":
         return work_units.do_progress(cfg, host, board, counters, picture,
                                       push=opts.push_progress)
+    if stage == "agents":
+        return agent_work.do_agent_task(cfg, host, board, counters, picture, candidate,
+                                        registry=registry_for(cfg), backend=opts.backend)
     if stage in ("fix", "fix-ci", "rebase"):
         return work_units.do_fixlike(stage, cfg, host, board, counters, picture, candidate,
                                      backend=opts.backend)
     raise Die(f"unknown stage {stage!r}")
+
+
+def registry_for(cfg: WorkerConfig) -> Registry:
+    """The role registry for this project (plugin roles + project-local roles)."""
+    return Registry(cfg.plugin_root, cfg.project)

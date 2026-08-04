@@ -63,6 +63,8 @@ the local graph/sidecar + the claim board.
 
 | Stage | Candidate | Execution |
 |---|---|---|
+| `merge` | PR with green CI + a trusted `clean` scoreboard at the exact head, allowlisted paths, no hold label, no human flag | deterministic: `gh pr merge --squash --match-head-commit` (merge-time CAS) |
+| `agents` | any queued task whose kind the role registry knows (planner, mathcheck, graphreview, contentreview, counterexample, priorart, holistic, escalation, …) | spawns the host CLI with that role's own Markdown body; curation is committed and CAS-pushed to the default branch |
 | `rebase` | own open PR with `mergeable == CONFLICTING` | host agent (claude/codex) with `prompts/rebase.md`; pushes via CAS |
 | `fix-ci` | own open PR with failing checks | host agent with `prompts/fix-ci.md` |
 | `fix` | own open PR whose scoreboard (at head) has a blocking verdict | host agent with `prompts/fix.md` |
@@ -78,6 +80,51 @@ one exits `75` (no-progress), TauCeti's guard against silent burn.
 Attempt budgets (per PR / per node, persisted in worker state): fix 3, fix-ci 3
 per head + 5 per PR, rebase 3, review errors 3, prove 3 per node. Provider-infra
 failures (5xx/429/transport) refund the attempt rather than burning it.
+
+## Where humans sit in the loop
+
+Not on a merge button. The two human surfaces are the **static roadmap site**
+(published from committed state — graph structure, theorem content, proof
+status, review verdicts, kernel evidence) and the **local review dashboard**
+(live agents, queues, node packets, and human verdict entry). Everything a
+human wants to *say* to the system is said there:
+
+- recording a `flagged`/`rejected` verdict on a node **holds the merge gate**
+  for its PR — the human slot is immutable to machines, so the jury can never
+  overrule it;
+- dropping a role onto a node in the dashboard queues that role for whichever
+  machine picks it up next;
+- a `hold`/`human`/`wip` label on a PR takes it out of the gate entirely.
+
+Merging is otherwise automatic: green CI, a trusted `clean` jury verdict at the
+exact head, and an allowlisted path set. Anything touching the toolchain, CI,
+or tooling is never auto-merged — those wait for a person by construction.
+
+## Roles are files, not code
+
+Every dispatchable role is a Markdown file with frontmatter. `agents/<kind>.md`
+ships with the plugin; `<project>/.autoform/agents/<kind>.md` adds or overrides
+roles per project (and `AUTOFORM_AGENT_PATH` adds more directories). The
+registry (`autoform_worker/registry.py`) discovers them and *derives* three
+things that used to be hardcoded: the dashboard's drag palette, the queue's
+accepted kinds, and the worker's `agents` stage. Adding an agent type means
+adding a file — no Python edit anywhere.
+
+```yaml
+---
+name: counterexample-hunter
+description: Tries to REFUTE a node's statement before compute is spent proving it.
+kind: counterexample      # queue kind (default: file stem)
+label: Counterexample     # palette label
+icon: ⚂
+blurb: try to refute this statement before proving it
+applies: any              # any | tier1 | tier2
+drained_by: agent         # agent (host CLI) | engine (dispatch_runner) | none
+writes: content           # none | content | graph
+---
+```
+
+`autoform agents` lists what is registered and where each role came from.
 
 ## PR conventions
 

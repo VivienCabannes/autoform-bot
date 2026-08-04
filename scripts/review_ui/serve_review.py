@@ -135,6 +135,30 @@ AGENT_PALETTE = [
      "blurb": "a worker hit a wall here — the orchestrator triages (grow the DAG / fix / surface)", "applies": "any"},
 ]
 
+def _registry_palette() -> list | None:
+    """The palette derived from the agent-role registry, or None if unavailable.
+
+    Every ``agents/<role>.md`` — including project-local roles under
+    ``.autoform/agents/`` — becomes a draggable palette entry, so extending the
+    system means adding a file, not editing this list. The static
+    ``AGENT_PALETTE`` above remains the fallback for partial checkouts.
+    """
+    try:
+        root = Path(__file__).resolve().parents[2]
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        from autoform_worker.registry import Registry  # noqa: PLC0415
+
+        entries = Registry(root).palette()
+        return entries or None
+    except Exception:
+        return None
+
+
+_DISCOVERED = _registry_palette()
+if _DISCOVERED:
+    AGENT_PALETTE = _DISCOVERED
+
 # Set of valid agent ids (membership test for /api/request validation).
 _PALETTE_IDS = {a["id"] for a in AGENT_PALETTE}
 

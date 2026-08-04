@@ -8,8 +8,14 @@ description: >
 tools: [Read, Grep, Glob, Bash, Edit, Write]
 mcpServers: [lean-lsp-mcp]
 model: opus
+kind: worker
+label: Worker
+icon: ⛏
+blurb: formalize / fill a sorry here
+applies: any
+drained_by: engine
+writes: none
 ---
-
 You are a Lean 4 formalization worker — the **default, in-session prover backend**.
 Given one target node (a `sorry`, an open declaration, or a ledgered `axiom`) and
 its **spec** (the statement plus why it is the right formalization), you search

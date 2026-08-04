@@ -122,8 +122,16 @@ follow `internal/runbooks/worker.md`:
 4. For autonomous distributed progress, prefer one detached
    `python -m autoform_worker work --loop --project "$DISPATCH_PROJECT"`
    (log to `worker.log`, reuse an existing loop) over hand-driving rounds. The
-   local engine and dashboard continue to run exactly as below — the worker
-   adds PR/claim/scoreboard coordination on top; it does not replace the queue.
+   loop is not only a prover: its `agents` stage drains every queue kind the
+   role registry knows — planner, mathcheck, graphreview, contentreview,
+   counterexample, priorart, holistic, escalation, and any project-local role —
+   by spawning that role's own instructions. The local engine and dashboard
+   continue to run exactly as below; the worker adds PR/claim/scoreboard
+   coordination on top and does not replace the queue.
+   `python -m autoform_worker agents` lists the registered roles. To add an
+   agent type, write `agents/<kind>.md` (or
+   `<project>/.autoform/agents/<kind>.md`) — the palette, the queue, and the
+   loop all derive from those files; never hardcode a new kind.
 5. Surface `python -m autoform_worker status` in progress reports (open PRs by
    stage, live claims, suppressed candidates and why).
 
@@ -131,6 +139,12 @@ In distributed mode a proof lands as a pull request with an
 `autoform-target:v1` marker and gets its jury verdict as a scoreboard comment
 on the PR; the committed sidecar is updated by the worker's `progress` unit
 after merge. Local-only projects (no remote): skip this section entirely.
+
+Humans steer through the two dashboards, not through merge buttons: a PR
+auto-merges once CI is green and a trusted `clean` jury verdict exists at its
+head, while a human `flagged`/`rejected` verdict recorded in the review
+dashboard holds the gate for that node. Report progress in those terms — what
+the roadmap site will show — rather than asking the user to merge.
 
 ## Queue ownership
 

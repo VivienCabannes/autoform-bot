@@ -484,6 +484,43 @@ def _drop_tmp_branch(repo: Path, branch: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# merge — the auto-merge gate
+# ---------------------------------------------------------------------------
+
+def do_merge(
+    cfg: WorkerConfig,
+    host: GitHost,
+    counters: Counters,
+    survey: Survey,
+    candidate: Candidate,
+) -> UnitResult:
+    """Merge a PR whose machine checks all pass.
+
+    Humans are in the loop through the dashboards, not a merge button: the
+    survey already established green CI, a trusted `clean` scoreboard at this
+    exact head, an allowlisted path set, no hold label, and no human
+    flagged/rejected verdict. This unit re-confirms the head at merge time —
+    `--match-head-commit` is the merge-time CAS, so a push landing between
+    survey and merge cancels the merge instead of merging unreviewed code.
+    """
+    pr = candidate.pr
+    assert pr is not None
+    counters.bump(f"merge-{pr.number}")
+    fresh = next((p for p in host.pr_list(survey.canonical) if int(p.get("number", 0)) == pr.number), None)
+    if fresh is None:
+        return UnitResult(False, f"merge #{pr.number}: PR vanished (already merged or closed)")
+    fresh_head = str(fresh.get("headRefOid", ""))
+    if fresh_head != pr.head_oid:
+        return UnitResult(False, f"merge #{pr.number}: head moved since review — re-review first")
+
+    if not host.merge_pr(survey.canonical, pr.number, pr.head_oid):
+        return UnitResult(False, f"merge #{pr.number}: GitHub refused the merge "
+                                 "(branch protection, conflict, or head moved)")
+    counters.clear(f"merge-{pr.number}")
+    return UnitResult(True, f"merge #{pr.number} ({pr.node}): auto-merged on a clean jury verdict")
+
+
+# ---------------------------------------------------------------------------
 # fix-like (fix / fix-ci / rebase)
 # ---------------------------------------------------------------------------
 
