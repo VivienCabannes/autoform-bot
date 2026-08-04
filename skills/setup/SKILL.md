@@ -99,6 +99,20 @@ when they occur.
    specifically about code search, declarations, or target status. Treat this
    inspection as the resume source of truth.
 
+   Then ensure the project actually builds — a broken build silently blocks
+   every downstream stage (the prover's verification gate, CI, and the
+   auto-merge gate all depend on `lake build` succeeding):
+
+   ```bash
+   cd "$PROJECT_DIR" && lake exe cache get && lake build
+   ```
+
+   `lake exe cache get` is cheap when the cache is already local and may be
+   skipped for projects without a Mathlib dependency. A build failure is a
+   Setup failure to surface and fix now (toolchain mismatch, stale manifest,
+   broken import), never something to defer to Roadmap or Orchestrate. Report
+   how long the first build is likely to take when the cache is cold.
+
 4. On Codex, install the canonical role agents into the project:
 
    ```bash
@@ -206,10 +220,16 @@ when they occur.
 
    - audit the machine: `uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python -m
      autoform_worker doctor --json` — surface every failing check;
-   - the project needs a GitHub repository with an `origin` remote. Autoform
-     never creates, pushes, or configures a repository on its own: state what
-     is missing, and let the user create and push it (or run the commands only
-     with their explicit approval, immediately before each one);
+   - the project needs a GitHub repository with an `origin` remote. When one
+     is missing, DRIVE the creation rather than handing the user commands: ask
+     one concrete question ("create private `<owner>/<name>` on GitHub and
+     push this project? [yes/no]" — default to private, name it after the
+     project directory), and on yes run `git init` + commit + `gh repo create
+     <owner>/<name> --private --source . --push` yourself, then continue
+     without further ceremony. The consent boundary is the question, not the
+     typing: AutoformBot still never creates, pushes, or configures a
+     repository silently, and approval for this repo does not carry over to
+     any later outward-facing action (Pages, CI enablement, publication);
    - check whether the repository verifies its pull-request heads. Autonomous
      merging requires at least one real check: with no workflows, the
      auto-merge gate stays shut by design. When the user wants autonomous
