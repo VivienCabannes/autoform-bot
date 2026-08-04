@@ -8,7 +8,7 @@ from pathlib import Path
 from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 
 
-EXPECTED_COMMANDS = {"setup", "orchestrate", "set-backend"}
+EXPECTED_COMMANDS = {"setup", "roadmap", "orchestrate", "set-backend"}
 EXPECTED_MCP_SERVERS = {
     "lean-lsp-mcp",
     "autoform-prover",
@@ -150,4 +150,4 @@ def test_session_start_context_names_muse_as_a_supported_host():
     payload = json.loads(completed.stdout)
     context = payload["hookSpecificOutput"]["additionalContext"]
     assert "Muse" in context
-    assert "setup, orchestrate, and set-backend" in context
+    assert "setup, roadmap, orchestrate, and set-backend" in context

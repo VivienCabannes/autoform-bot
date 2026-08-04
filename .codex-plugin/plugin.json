@@ -1,6 +1,6 @@
 {
   "name": "autoform",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Turn any AI coding assistant into a Lean 4 formalization agent.",
   "author": {
     "name": "Vivien Cabannes"
@@ -14,7 +14,10 @@
     "longDescription": "AutoForm Bot packages a host-neutral formalization workflow as Agent Skills, native Codex role agents, and MCP tool servers for Lean 4 and Mathlib projects.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
-    "capabilities": ["Read", "Write"],
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
     "defaultPrompt": [
       "Set up an Autoform Lean formalization project from my sources.",
       "Run or resume the Autoform orchestration workflow.",

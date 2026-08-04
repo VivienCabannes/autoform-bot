@@ -7,7 +7,7 @@ queue transitions, and persisted verdicts.
 
 ## User command surface
 
-Autoform exposes exactly three user workflows: `setup`, `orchestrate`, and
+AutoformBot exposes exactly four user workflows: `setup`, `roadmap`, `orchestrate`, and
 `set-backend`. Supporting functions such as installation, workspace
 inspection, planning, visualization, review, and Zulip search are internal to
 those workflows and do not appear as separate commands.
@@ -28,21 +28,27 @@ python3 scripts/lint_plugin.py
 
 ## 2. Create or resume a project
 
-Run `setup` with the source material, desired chapters, Lean project
-path, and—if separate—the directory that should own `graph.json`.
+Run `setup` with the Lean project path and—if separate—the directory that
+should own `graph.json`.
 
 Setup:
 
 - creates a Lean/Mathlib project when needed;
-- records `metadata.lean_root` in `graph.json`;
+- initializes empty durable state and records `metadata.lean_root` in
+  `graph.json`;
 - installs namespaced Codex role TOMLs into `.codex/agents/`;
-- builds or resumes the source-grounded dependency graph;
-- exports the blueprint; and
-- starts the loopback-only review dashboard.
+- starts the loopback-only review dashboard; and
+- prepares GitHub readiness (CI, Pages, distributed mode) with explicit
+  approval for each outward-facing action.
 
-Setup never discards an existing plan. “Rebuild” means re-render and resume.
-Reset requires an explicit, separately confirmed `--reset-plan`; Autoform first
-snapshots the graph, prose, queue, reviews, and activity under
+Then run `roadmap` with the source material and desired chapters. Roadmap
+confirms sources and scope, builds or resumes the source-grounded dependency
+graph (coarse clusters → user approval → detailed split/check/review waves),
+and renders the blueprint on request.
+
+Roadmap never discards an existing plan. “Rebuild” means re-render and resume.
+Reset requires an explicit, separately confirmed `--reset-plan`; AutoformBot
+first snapshots the graph, prose, queue, reviews, and activity under
 `.autoform/snapshots/`.
 
 Codex discovers project custom agents when a project-rooted task starts. If the

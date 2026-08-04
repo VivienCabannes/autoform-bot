@@ -1,0 +1,114 @@
+---
+name: roadmap
+description: >-
+  Build, resume, review, reset, or visualize the informal formalization roadmap
+  — the tiered dependency DAG (graph.json + per-node prose) an AutoformBot
+  fleet proves against. Use for plan a formalization, build or grow the
+  roadmap/DAG, scope sources or chapters, split clusters, re-plan, reset the
+  plan, view the graph, or render the mathematical blueprint. Repository and
+  environment readiness belong to Setup; proving belongs to Orchestrate.
+---
+
+# Build the formalization roadmap
+
+Turn confirmed informal sources into the durable, reviewed dependency graph
+that provers and reviewers drain. Roadmap owns the *plan*: sources and scope,
+the tiered DAG, per-node prose, Mathlib status, and graph visualization. It
+assumes a Setup-ready project (Lean repository, durable state, dashboard) and
+never proves anything — proving and reviewing are Orchestrate's.
+
+## Resolve the plugin root
+
+Resolve one absolute plugin root. Prefer a valid `AUTOFORM_PLUGIN_ROOT`,
+`MUSE_PLUGIN_ROOT`, `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
+`Path(<this loaded SKILL.md>).resolve().parents[2]`. The result must contain
+`scripts/merge_node.py` and `internal/runbooks/planning.md`; stop if it does
+not. In every command below, replace `<AUTOFORM_PLUGIN_ROOT>` with that quoted
+absolute path; do not depend on a variable exported by a previous shell call.
+
+## Start with a run brief
+
+Before reading sources or spawning any subagent, tell the user:
+
+- the resolved Lean repository and plan/roadmap directory;
+- whether this is a fresh plan, a resume of a partial graph, or a re-plan;
+- the confirmed source files and exact chapter/section scope, or the specific
+  missing information you need before planning;
+- the artifacts this run will create or update (`graph.json`,
+  `informal_content/`, and the live dashboard view);
+- the checkpoints: coarse roadmap approval before detailed splitting, and that
+  no prover is dispatched from this workflow.
+
+Do not make the user infer whether subagents have started or which files they
+may touch. Report those transitions when they occur.
+
+## Procedure
+
+1. Resolve the project. `DISPATCH_PROJECT` is the directory owning
+   `graph.json`; `PROJECT_DIR` is the Lean repository (from `graph.json`
+   metadata when present). If there is no Lean project or the environment is
+   broken, run Setup first — Roadmap does not install or create repositories.
+   If only the durable state is missing, initialize it non-destructively:
+
+   ```bash
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/init_plan.py" \
+     --project "$DISPATCH_PROJECT" --lean-root "$PROJECT_DIR"
+   ```
+
+2. A request to "rebuild" or "re-plan" does not authorize deletion: resume the
+   graph and refine it. Only an explicit user-confirmed plan reset authorizes
+   adding `--reset-plan`. Before executing it, state that graph, prose, queue,
+   reviews, and activity will be reset and that a timestamped snapshot will be
+   retained under `<dispatch-project>/.autoform/snapshots/`.
+
+3. Confirm source files and scope with the user before planning. Do not invent
+   a source, silently widen the requested chapters, or substitute training
+   knowledge for a missing text. If sources are named but absent from the
+   machine, say exactly what is missing and stop.
+
+4. Ensure the dashboard is visible so the DAG appears while it grows: reuse a
+   service already serving this project, otherwise start it exactly as Setup
+   does (`scripts/service_control.py start review …`). A dashboard failure
+   never blocks planning; report it and continue.
+
+5. Read and follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`,
+   including its schema at
+   `<AUTOFORM_PLUGIN_ROOT>/internal/references/plan-json-schema.md`. Planning
+   is incomplete when the graph is absent or empty, a tier-1 cluster has no
+   tier-2 children, or a node has null content. Preserve every durable node
+   already merged.
+
+   Phase 1 (coarse clusters) ends at a user checkpoint: present the tier-1
+   roadmap and get approval before detailed splitting. Phase 2 runs the
+   split/check/review waves per cluster with native subagents for the
+   canonical roles (`splitter`, `mathlib-checker`, `graph-reviewer`,
+   `content-reviewer`, `holistic-reviewer`), and routes every graph edit
+   through `scripts/merge_node.py` — it is the only writer of `graph.json`.
+
+6. Before reporting, check structure:
+
+   ```bash
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/check_invariants.py" \
+     "$DISPATCH_PROJECT/graph.json"
+   ```
+
+   A structural failure is this run's to fix, not the next workflow's.
+
+7. The lightweight dashboard is the default visualization. Only when the user
+   explicitly requests the publication-style mathematical blueprint, read and
+   follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to
+   export, build, and serve it. A blueprint toolchain failure must not turn an
+   otherwise successful Roadmap run into a failure; report it as an optional
+   visualization limitation.
+
+8. Report: tier-1 and tier-2 counts, Mathlib-status breakdown
+   (in-mathlib / partial / missing), the dashboard URL, any unresolved gaps,
+   and the next step: run Orchestrate.
+
+## Resume semantics
+
+Derive readiness from `graph.json`; do not rely on chat history. A crash loses
+only in-flight subagent work. Completed merges, queue entries, verdicts, and
+content files remain authoritative.

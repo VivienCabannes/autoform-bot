@@ -79,11 +79,12 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
         path.parent.name
         for path in (ROOT / "skills").glob("*/SKILL.md")
     }
-    assert public == {"setup", "orchestrate", "set-backend"}
+    assert public == {"setup", "roadmap", "orchestrate", "set-backend"}
 
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
+    roadmap = (ROOT / "skills" / "roadmap" / "SKILL.md").read_text()
     orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
-    assert "internal/runbooks/planning.md" in setup
+    assert "internal/runbooks/planning.md" in roadmap
     assert "scripts/workspace_inspector.py" in setup
     assert "internal/runbooks/proving.md" in orchestrate
     assert "internal/runbooks/review.md" in orchestrate

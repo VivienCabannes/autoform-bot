@@ -391,7 +391,7 @@ def test_cmd_sync_fast_forwards_without_creating_a_local_commit(world, monkeypat
 def test_cli_version_matches_distribution_metadata():
     from importlib.metadata import version
 
-    assert cli.__version__ == version("autoform") == "0.5.0"
+    assert cli.__version__ == version("autoform")
 
 
 def test_resolve_config_env_and_sanitized_worker_id(world):
