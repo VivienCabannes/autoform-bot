@@ -3,14 +3,14 @@
 ``/autoform:orchestrate`` (reads), and the DAG review dashboard's backend dropdown
 (reads/writes the same file). Deterministic, zero model tokens.
 
-The chosen backend is the *swappable parameter* of the unified prover MCP
-(``servers/prover``, added by the prover PR): the orchestrator (the Claude Code
-session) stays the brain; only the backend that *proves a node* changes. **Backend is
+The chosen backend is the *swappable parameter* of the unified prover runtime
+(``autoform/prover``): the orchestrator stays the brain; only the backend that
+*proves a node* changes. **Backend is
 also the billing path** — ``max`` runs on the Max subscription, ``aristotle`` on
 Harmonic's key, ``codex`` on its own auth, or an explicitly configured
 OpenAI-compatible endpoint.
 
-Each user-facing backend maps to the ``prove_node(node, backend=...)`` adapter id via
+Each user-facing backend maps to the dispatcher adapter id via
 its ``prover`` field (``max -> "claude"``, ``aristotle -> "aristotle"``), so the
 dispatch command never hard-codes the mapping.
 
@@ -33,8 +33,8 @@ import json
 import os
 from pathlib import Path
 
-# Known backends. ``available`` = an adapter exists in servers/prover today; ``prover``
-# = the id passed to the prove_node MCP tool.
+# Known backends. ``available`` means an adapter exists in autoform/prover;
+# ``prover`` is the id passed to the dispatcher runtime.
 BACKENDS: dict[str, dict] = {
     "max": {"label": "Claude Code (Max subscription)", "available": True,
             "prover": "claude",

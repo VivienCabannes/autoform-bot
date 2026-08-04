@@ -47,7 +47,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import fslock  # noqa: E402  — the SHARED cross-process lock (dashboard + engine)
+if __package__:
+    from . import fslock
+else:  # Direct CLI execution: ``python scripts/dispatch_queue.py ...``.
+    import fslock
 
 
 def _now() -> str:

@@ -51,15 +51,43 @@ class LeanReplPool:
         self._idle: queue.Queue[LeanRepl] = queue.Queue()
         self._lock = threading.Lock()
 
-        for i in range(self.capacity):
-            if i > 0:
-                import time
+        try:
+            for i in range(self.capacity):
+                if i > 0:
+                    import time
 
-                time.sleep(config.startup_stagger)
-            repl = LeanRepl(config)
-            repl.start()
-            self._workers.append(repl)
-            self._idle.put(repl)
+                    time.sleep(config.startup_stagger)
+                repl = LeanRepl(config)
+                try:
+                    repl.start()
+                except BaseException:
+                    # LeanRepl.start() currently cleans up its own process, but
+                    # keep the pool transaction safe for alternate/test workers
+                    # and future implementations too.
+                    try:
+                        repl.close()
+                    except Exception:
+                        logger.exception("failed to close REPL after startup error")
+                    raise
+                self._workers.append(repl)
+                self._idle.put(repl)
+        except BaseException:
+            self._close_workers()
+            raise
+
+    def _close_workers(self) -> None:
+        """Close every constructed worker, preserving cleanup after one failure."""
+        for worker in reversed(self._workers):
+            try:
+                worker.close()
+            except Exception:
+                logger.exception("failed to close REPL worker")
+        self._workers.clear()
+        while True:
+            try:
+                self._idle.get_nowait()
+            except queue.Empty:
+                break
 
     def run(self, code: str, **kwargs: Any) -> dict[str, Any]:
         """Run code on an idle REPL, retrying once on restart."""
@@ -80,6 +108,4 @@ class LeanReplPool:
     def shutdown(self) -> None:
         """Shut down all REPL instances."""
         self._shutdown = True
-        for worker in self._workers:
-            worker.close()
-        self._workers.clear()
+        self._close_workers()

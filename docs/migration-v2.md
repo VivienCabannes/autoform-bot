@@ -32,7 +32,7 @@ but its runtime artifacts are not automatically convertible back to v1.
 | `python -m autoform.eval` dataset evaluation | Removed | Use the node-level three-axis jury and review dashboard. Dataset metrics and historical evaluator outputs have no v2 importer. |
 | `python -m autoform.visualizer.app` run/trace dashboard | Removed | Use the DAG review dashboard for current plans. Historical v1 traces remain viewable only with a v1 checkout. |
 | `core.inference` and `InferenceProtocol` | Removed | Implement a v2 `ProverAdapter`, or configure the bounded OpenAI-compatible adapter. Gemini, Ollama, and vLLM do not have v2 adapters today. |
-| Generic `core.mcp` and `tools/` packages | Removed | Use the plugin's registered MCP servers. The production REPL and LSP servers are not yet ported; the repository currently ships stubs and reference implementations. |
+| Generic `core.mcp` and `tools/` packages | Removed | Use the plugin's stateful REPL and LSP servers; stateless operations remain native workflow steps. |
 | `autoform/data/<book>` run layout | Removed | Keep sources and the generated graph/review artifacts with the target Lean project. Existing run directories are not modified by v2. |
 | Imports from `autoform`, `core`, or `tools` | Incompatible | Pin a v1 checkout for dependent Python code. Version 2 packages the plugin server surface, not the former application libraries. |
 

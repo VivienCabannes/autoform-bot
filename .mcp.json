@@ -2,12 +2,12 @@
   "mcpServers": {
     "autoform-repl": {
       "command": "uv",
-      "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],
+      "args": ["run", "--project", ".", "--extra", "repl", "python", "-m", "servers.repl.server"],
       "cwd": "."
     },
     "autoform-lsp": {
       "command": "uv",
-      "args": ["run", "python", "-m", "servers.lsp.server"],
+      "args": ["run", "--project", ".", "python", "-m", "servers.lsp.server"],
       "cwd": "."
     }
   }

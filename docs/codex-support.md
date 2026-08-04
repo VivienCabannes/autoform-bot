@@ -33,7 +33,7 @@ The dated evidence and remaining native-delegation blocker are recorded in
 
 Claude Code and Codex run the same three Autoform workflows against the same
 durable artifacts. Planning, visualization, review, workspace inspection,
-proof discipline, and Zulip guidance are non-discoverable runbooks reached
+proof discipline, and prior-art guidance are non-discoverable operations reached
 through Setup or Orchestrate rather than additional commands.
 
 - `graph.json` and node prose;

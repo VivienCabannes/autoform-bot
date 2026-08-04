@@ -10,9 +10,10 @@ Work incrementally. Prototype before editing. Search before proving.
 
 ## Prototyping in the REPL
 
-- Use `run_lean_code` (the `autoform-repl` MCP) to test proof fragments **before** editing large
-  files. A large file can take 120+ seconds to rebuild — testing a fragment in isolation is far
-  faster.
+- Use `run_lean_code(project_dir, code, timeout?)` (the `autoform-repl` MCP),
+  with the absolute Lake root, to test proof fragments **before** editing large
+  files. A large file can take 120+ seconds to rebuild — testing a fragment in
+  isolation is far faster.
 - Build the proof up incrementally in the REPL; only write to the file once the fragment is
   known to compile. Note the REPL environment only has `import Mathlib`, so for fragments that
   reference custom project definitions you must paste those defs into the snippet (see
@@ -20,8 +21,9 @@ Work incrementally. Prototype before editing. Search before proving.
 
 ## Search first
 
-- Search Mathlib before writing a proof from scratch: `mathlib_grep` / `mathlib_find_name` (the
-  mathlib MCP), or `exact?` / `apply?` / `rw?` inside a `run_lean_code` snippet.
+- Search Mathlib before writing a proof from scratch: use `rg` over the local
+  Mathlib checkout or host-native search, and use `exact?` / `apply?` / `rw?`
+  inside a `run_lean_code` snippet.
 - Many standard results already exist — finding the right lemma name is faster, and far more
   robust, than reproving a known fact. See **autoform** for naming patterns that make
   the search land.

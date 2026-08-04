@@ -21,14 +21,13 @@ rather than silently creating a second orchestration stack.
 | Claude canonical agents | `agents/*.md` | Implemented |
 | Generated Codex agents | `scripts/install_host_agents.py` | Implemented |
 | Durable plan/queue/review control plane | `scripts/` | Implemented |
-| Unified prover and verification gate | `servers/prover/` | Implemented |
-| Mathlib and Zulip MCP servers | `servers/mathlib/`, `servers/zulip/` | Implemented |
-| Aristotle MCP/server adapter | `servers/aristotle/` | Implemented, optional dependency |
-| REPL and LSP MCP servers | `servers/repl/`, `servers/lsp/` | Stubs; reference implementations are under `examples/servers/` |
+| Unified prover and verification gate | `autoform/prover/` | Implemented |
+| Visualization and local dashboard | `visualization/` | Implemented |
+| REPL and LSP MCP servers | `servers/repl/`, `servers/lsp/` | Implemented |
 | Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json`, `hooks/hooks.json` | Implemented |
 
-Useful next contributions include production REPL/LSP implementations, an
-OpenAI Responses transport beside Chat Completions, live opt-in provider
+Useful next contributions include an OpenAI Responses transport beside Chat
+Completions, live opt-in provider
 contract tests, and additional adversarial verification fixtures.
 
 ## Compatibility rules
@@ -51,11 +50,11 @@ contract tests, and additional adversarial verification fixtures.
 - Preserve the independent Lean build, forbidden-execution scan, and axiom
   audit for every proved claim.
 
-## Adding or changing an MCP server
+## Changing an MCP server
 
-Keep pure logic in `core.py` and the thin FastMCP wrapper in `server.py`. Optional
-SDK imports must remain lazy so plugin discovery works without every extra
-installed.
+The MCP boundary is reserved for the stateful Lean LSP and REPL services; keep
+stateless search and API operations in skills, native host tools, or the local
+runtime. Keep pure logic separate from the thin FastMCP wrapper.
 
 Register a shared server consistently in:
 
@@ -70,7 +69,7 @@ network access or paid credentials.
 ## Adding a provider
 
 Implement `ProverAdapter`, normalize events and usage, declare the correct
-`SteeringCapability`, and let `servers/prover/driver.py` apply the common
+`SteeringCapability`, and let `autoform/prover/driver.py` apply the common
 verification gate. Add exact backend validation, configuration-only preflight,
 explicit data-egress consent where network project data is involved, and
 transport-injected tests.
@@ -80,11 +79,9 @@ flag. Never make a credentialed or billable request in the default suite.
 
 ## Adding or changing a skill
 
-Make the skill independently executable from its loaded `SKILL.md`: resolve the
-plugin root explicitly, use absolute paths in commands, define durable resume
-semantics, and name the native-agent fallback when a host lacks role selection.
-Do not rely on shell state from an earlier command or duplicate the workflow in
-legacy `commands/`.
+Keep each skill to one or two expert-facing sentences that identify its owner,
+durable state, and decisive helper scripts. Put detailed implementation guidance
+in code or internal references rather than expanding the skill prompt.
 
 Validate every skill:
 
@@ -97,7 +94,7 @@ uv run python /path/to/skill-creator/scripts/quick_validate.py skills/<name>
 From the repository root:
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra repl
 uv run python -m pytest -q
 python3 scripts/lint_plugin.py
 claude plugin validate .

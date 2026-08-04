@@ -4,13 +4,11 @@ Aristotle is **not** a chat LLM. It is an autonomous formal-reasoning agent that
 takes a prompt (and optionally a whole Lean project directory), runs its own
 internal tools (proof search, ``lake`` builds, file edits), and returns finished
 Lean files plus a natural-language ``output_summary``. We map that job-based API
-onto two surfaces:
+onto the local prover runtime:
 
 * :class:`AristotleManager` — a thin, stateful wrapper over one
   ``aristotlelib.Project`` per ``session_id``: submit / poll / wait / steer /
-  events / list. This is what the MCP tools call. Ported from the proven
-  integration in ``core/inference/sdk/aristotle.py`` and
-  ``examples/servers/aristotle/server.py``.
+  events / list.
 
 * :func:`delegate_to_node` — the **prover-backend entry**. It is the C-side
   implementation of the one swappable interface the design pins down:
@@ -132,10 +130,10 @@ class AristotleManager:
                 raise RuntimeError(
                     f"aristotlelib {ver} has an incompatible API — this client needs the "
                     ">=2.0 API (Project.create_from_directory / ask / get_tasks). You are "
-                    "likely running outside the plugin's locked env. Run the Aristotle "
-                    "backend via the prover MCP server (`uv run --extra aristotle python -m "
-                    "Autoform dispatcher) or `uv sync --extra aristotle` (the pyproject "
-                    "pins aristotlelib>=2.0), not a stray global install."
+                    "likely running outside the plugin's locked env. Run "
+                    "`uv sync --extra aristotle`, then launch the Autoform dispatcher from "
+                    "that environment (the pyproject pins aristotlelib>=2.0), rather than "
+                    "using a stray global install."
                 )
             self._lib = aristotlelib
         return self._lib

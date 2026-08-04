@@ -1,7 +1,7 @@
 """Lean LSP MCP server — diagnostics and type information via Language Server Protocol.
 
-Wraps a Lean 4 language server process. Provides file diagnostics,
-hover info, and go-to-definition without requiring the full REPL pool.
+Wraps Lean 4 language server processes and provides file diagnostics and hover
+information without requiring the REPL pool.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging import getLogger
 from pathlib import Path
@@ -18,9 +19,15 @@ from typing import Any
 
 from fastmcp.server import FastMCP
 
+from servers import resolve_lean_file, resolve_lean_project_dir
+
 logger = getLogger(__name__)
 
 DEFAULT_LSP_TIMEOUT = 60
+
+
+class LspProtocolError(RuntimeError):
+    """The Lean language server returned or emitted invalid JSON-RPC state."""
 
 
 @dataclass
@@ -40,6 +47,10 @@ class LeanLspSession:
         self.process: subprocess.Popen | None = None
         self._request_id = 0
         self._lock = threading.Lock()
+        # A session has one stdout stream. Serialize the complete document
+        # lifecycle so concurrent FastMCP calls cannot race two readers against
+        # that stream or consume one another's diagnostics/responses.
+        self._operation_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the language server process."""
@@ -55,15 +66,37 @@ class LeanLspSession:
             env=env,
         )
 
-        # Send initialize request
-        self._send_request("initialize", {
-            "processId": os.getpid(),
-            "capabilities": {},
-            "rootUri": f"file://{Path(self.config.cwd).resolve()}",
-        })
+        try:
+            # An initialize response must be an InitializeResult object. A
+            # timeout, JSON-RPC error, or malformed result means the backing
+            # Lean server is unusable, so do not expose an apparently healthy
+            # MCP server on top of it.
+            result = self._send_request("initialize", {
+                "processId": os.getpid(),
+                "capabilities": {},
+                "rootUri": Path(self.config.cwd).resolve().as_uri(),
+            })
+            if not isinstance(result, dict):
+                raise LspProtocolError(
+                    "LSP initialize returned a non-object result: "
+                    f"{result!r}"
+                )
 
-        # Send initialized notification
-        self._send_notification("initialized", {})
+            self._send_notification("initialized", {})
+        except BaseException:
+            self._abort_process()
+            raise
+
+    def _abort_process(self) -> None:
+        """Force-close the backing process without attempting more JSON-RPC."""
+        process, self.process = self.process, None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except Exception:
+            pass
 
     def close(self) -> None:
         """Shut down the language server."""
@@ -73,23 +106,23 @@ class LeanLspSession:
                 self._send_notification("exit", {})
                 self.process.wait(timeout=5)
             except Exception:
-                try:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-                except Exception:
-                    pass
+                self._abort_process()
         self.process = None
 
     def get_diagnostics(self, file_path: str) -> list[dict]:
         """Open a file and collect diagnostics from the language server."""
-        uri = f"file://{Path(file_path).resolve()}"
+        with self._operation_lock:
+            return self._get_diagnostics(file_path)
+
+    def _get_diagnostics(self, file_path: str) -> list[dict]:
+        path = Path(file_path).resolve()
+        uri = path.as_uri()
 
         try:
-            content = Path(file_path).read_text()
+            content = path.read_text()
         except Exception as e:
             return [{"severity": "error", "message": f"Cannot read file: {e}"}]
 
-        # Open the document
         self._send_notification("textDocument/didOpen", {
             "textDocument": {
                 "uri": uri,
@@ -99,23 +132,48 @@ class LeanLspSession:
             }
         })
 
-        # Wait for diagnostics (they arrive as notifications)
-        diagnostics = self._collect_diagnostics(uri, timeout=self.config.timeout)
-
-        # Close the document
-        self._send_notification("textDocument/didClose", {
-            "textDocument": {"uri": uri}
-        })
-
-        return diagnostics
+        try:
+            # An empty published diagnostic list means the file is clean. No
+            # publication at all is a timeout/error and must never be conflated
+            # with that valid empty result.
+            return self._collect_diagnostics(uri, timeout=self.config.timeout)
+        finally:
+            try:
+                self._send_notification("textDocument/didClose", {
+                    "textDocument": {"uri": uri}
+                })
+            except Exception:
+                logger.warning("failed to close LSP document %s", uri, exc_info=True)
 
     def hover(self, file_path: str, line: int, character: int) -> str | None:
         """Get hover information at a position."""
-        uri = f"file://{Path(file_path).resolve()}"
-        result = self._send_request("textDocument/hover", {
-            "textDocument": {"uri": uri},
-            "position": {"line": line, "character": character},
+        with self._operation_lock:
+            return self._hover(file_path, line, character)
+
+    def _hover(self, file_path: str, line: int, character: int) -> str | None:
+        path = Path(file_path).resolve()
+        content = path.read_text()
+        uri = path.as_uri()
+        self._send_notification("textDocument/didOpen", {
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lean4",
+                "version": 1,
+                "text": content,
+            }
         })
+        try:
+            result = self._send_request("textDocument/hover", {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+            })
+        finally:
+            try:
+                self._send_notification("textDocument/didClose", {
+                    "textDocument": {"uri": uri}
+                })
+            except Exception:
+                logger.warning("failed to close LSP document %s", uri, exc_info=True)
         if result and "contents" in result:
             contents = result["contents"]
             if isinstance(contents, dict):
@@ -157,11 +215,34 @@ class LeanLspSession:
     def _read_response(self, request_id: int, timeout: float = 30) -> Any:
         """Read JSON-RPC messages until we get the response for request_id."""
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            msg = self._read_message(timeout=deadline - time.monotonic())
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            msg = self._read_message(timeout=remaining)
             if msg and msg.get("id") == request_id:
-                return msg.get("result")
-        return None
+                if "error" in msg:
+                    error = msg["error"]
+                    if isinstance(error, dict):
+                        code = error.get("code", "unknown")
+                        message = error.get("message", "unspecified protocol error")
+                        data = error.get("data")
+                        detail = f" ({data!r})" if data is not None else ""
+                        raise LspProtocolError(
+                            f"LSP request {request_id} failed [{code}]: "
+                            f"{message}{detail}"
+                        )
+                    raise LspProtocolError(
+                        f"LSP request {request_id} returned malformed error: {error!r}"
+                    )
+                if "result" not in msg:
+                    raise LspProtocolError(
+                        f"LSP response {request_id} has neither result nor error"
+                    )
+                return msg["result"]
+        raise TimeoutError(
+            f"timed out after {timeout:g}s waiting for LSP response {request_id}"
+        )
 
     def _read_message(self, timeout: float = 5) -> dict | None:
         """Read one JSON-RPC message from stdout."""
@@ -180,66 +261,146 @@ class LeanLspSession:
         while b"\r\n\r\n" not in header:
             chunk = os.read(stdout_fd, 1)
             if not chunk:
-                return None
+                raise LspProtocolError("LSP process closed stdout mid-header")
             header += chunk
 
-        length_line = header.decode("ascii").strip()
-        length = int(length_line.split(":")[1].strip())
+        try:
+            header_lines = header[:-4].decode("ascii").split("\r\n")
+        except UnicodeDecodeError as error:
+            raise LspProtocolError("LSP emitted a non-ASCII header") from error
+        content_lengths = [
+            value.strip()
+            for line in header_lines
+            if ":" in line
+            for name, value in [line.split(":", 1)]
+            if name.strip().lower() == "content-length"
+        ]
+        if len(content_lengths) != 1:
+            raise LspProtocolError(
+                f"LSP message has {len(content_lengths)} Content-Length headers"
+            )
+        try:
+            length = int(content_lengths[0])
+        except ValueError as error:
+            raise LspProtocolError(
+                f"invalid LSP Content-Length: {content_lengths[0]!r}"
+            ) from error
+        if length < 0:
+            raise LspProtocolError(f"invalid negative LSP Content-Length: {length}")
 
         # Read body
         body = b""
         while len(body) < length:
             chunk = os.read(stdout_fd, length - len(body))
             if not chunk:
-                return None
+                raise LspProtocolError("LSP process closed stdout mid-message")
             body += chunk
 
-        return json.loads(body.decode("utf-8"))
+        try:
+            message = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise LspProtocolError("LSP emitted an invalid JSON body") from error
+        if not isinstance(message, dict):
+            raise LspProtocolError("LSP JSON-RPC message is not an object")
+        return message
 
     def _collect_diagnostics(self, uri: str, timeout: float) -> list[dict]:
         """Collect diagnostic notifications for a URI."""
         diagnostics: list[dict] = []
         deadline = time.monotonic() + timeout
+        received = False
 
-        while time.monotonic() < deadline:
-            msg = self._read_message(timeout=min(2, deadline - time.monotonic()))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if received:
+                    return diagnostics
+                raise TimeoutError(
+                    f"timed out after {timeout:g}s waiting for diagnostics for {uri}"
+                )
+
+            # Before the first publication, keep waiting all the way to the
+            # configured deadline. After one arrives, a one-second quiet period
+            # is enough to treat the latest publication as final, while still
+            # respecting the same total deadline.
+            read_timeout = min(1 if received else 2, remaining)
+            msg = self._read_message(timeout=read_timeout)
             if msg is None:
-                break
+                if received:
+                    return diagnostics
+                continue
             if msg.get("method") == "textDocument/publishDiagnostics":
                 params = msg.get("params", {})
+                if not isinstance(params, dict):
+                    raise LspProtocolError(
+                        "publishDiagnostics params must be an object"
+                    )
+                published = params.get("diagnostics")
+                if not isinstance(published, list):
+                    raise LspProtocolError(
+                        "publishDiagnostics diagnostics must be a list"
+                    )
                 if params.get("uri") == uri:
-                    diagnostics = params.get("diagnostics", [])
-                    # Wait a bit for final diagnostics
-                    time.sleep(0.5)
-                    # Check for updated diagnostics
-                    while True:
-                        update = self._read_message(timeout=1)
-                        if update is None:
-                            break
-                        if (
-                            update.get("method") == "textDocument/publishDiagnostics"
-                            and update.get("params", {}).get("uri") == uri
-                        ):
-                            diagnostics = update["params"].get("diagnostics", [])
-                    break
-
-        return diagnostics
+                    received = True
+                    diagnostics = published
 
 
-def create_lsp_server(session: LeanLspSession) -> FastMCP:
-    """Create a FastMCP server wrapping a LeanLspSession."""
+class LeanLspProjects:
+    """Lazily keep one language-server session per explicit Lean project."""
+
+    def __init__(
+        self,
+        session_factory: Callable[[Path], LeanLspSession] | None = None,
+    ) -> None:
+        self._session_factory = session_factory or self._start_session
+        self._sessions: dict[Path, LeanLspSession] = {}
+        self._lock = threading.Lock()
+        self._closed = False
+
+    @staticmethod
+    def _start_session(project_dir: Path) -> LeanLspSession:
+        session = LeanLspSession(LspConfig(cwd=str(project_dir)))
+        session.start()
+        return session
+
+    def get(self, project_dir: str) -> LeanLspSession:
+        """Return the session for a validated absolute Lake project."""
+        root = resolve_lean_project_dir(project_dir)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Lean LSP project router is closed")
+            session = self._sessions.get(root)
+            if session is None:
+                session = self._session_factory(root)
+                self._sessions[root] = session
+            return session
+
+    def close(self) -> None:
+        """Close all sessions created by this router."""
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+            self._closed = True
+        for session in sessions:
+            session.close()
+
+
+def create_lsp_server(projects: LeanLspProjects) -> FastMCP:
+    """Create a FastMCP server routing calls to explicit Lean projects."""
     server = FastMCP(name="autoform-lsp")
 
     @server.tool
-    def lean_diagnostic_messages(file_path: str) -> str:
+    def lean_diagnostic_messages(project_dir: str, file_path: str) -> str:
         """Get compilation diagnostics for a Lean file.
 
         Returns errors, warnings, and info messages from the Lean language server.
 
         Args:
-            file_path: Absolute path to the .lean file.
+            project_dir: Absolute path to the file's Lake project root.
+            file_path: Absolute path, or a path relative to project_dir, to the .lean file.
         """
-        diagnostics = session.get_diagnostics(file_path)
+        root, path = resolve_lean_file(project_dir, file_path)
+        diagnostics = projects.get(str(root)).get_diagnostics(str(path))
         if not diagnostics:
             return "No diagnostics — file compiles cleanly."
 
@@ -258,28 +419,27 @@ def create_lsp_server(session: LeanLspSession) -> FastMCP:
         return header + "\n" + "\n".join(lines)
 
     @server.tool
-    def lean_hover(file_path: str, line: int, character: int) -> str:
+    def lean_hover(project_dir: str, file_path: str, line: int, character: int) -> str:
         """Get type information at a position in a Lean file.
 
         Args:
-            file_path: Absolute path to the .lean file.
+            project_dir: Absolute path to the file's Lake project root.
+            file_path: Absolute path, or a path relative to project_dir, to the .lean file.
             line: 0-indexed line number.
             character: 0-indexed character position.
         """
-        result = session.hover(file_path, line, character)
+        root, path = resolve_lean_file(project_dir, file_path)
+        result = projects.get(str(root)).hover(str(path), line, character)
         return result or "No hover information at this position."
 
     return server
 
 
 if __name__ == "__main__":
-    cwd = os.environ.get("LEAN_PROJECT_DIR", ".")
-    config = LspConfig(cwd=cwd)
-    session = LeanLspSession(config)
-    session.start()
+    projects = LeanLspProjects()
 
     try:
-        server = create_lsp_server(session)
+        server = create_lsp_server(projects)
         server.run(transport="stdio")
     finally:
-        session.close()
+        projects.close()

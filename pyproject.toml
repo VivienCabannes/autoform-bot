@@ -26,7 +26,8 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["autoform", "servers", "visualization"]
+packages = ["autoform", "servers", "visualization", "scripts"]
+exclude = ["scripts/.lake", "scripts/.lake/**"]
 
 [tool.ruff]
 line-length = 120

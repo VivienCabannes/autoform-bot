@@ -1,7 +1,7 @@
 {
   "name": "autoform",
   "description": "Lean 4 formalization agent: Mathlib conventions, proof strategies, review, statement extraction, and textbook-to-blueprint formalization planning.",
-  "version": "0.4.4",
+  "version": "0.4.4+codex.local-20260804-121435",
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"
@@ -22,21 +22,15 @@
   "mcpServers": {
     "autoform-repl": {
       "command": "uv",
-      "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],
+      "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--extra", "repl", "python", "-m", "servers.repl.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Persistent Lean REPL pool for fast compilation feedback"
+      "description": "Persistent Lean REPL pools selected by required per-call project_dir"
     },
     "autoform-lsp": {
       "command": "uv",
-      "args": ["run", "python", "-m", "servers.lsp.server"],
+      "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "python", "-m", "servers.lsp.server"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Persistent Lean language server for diagnostics and hover information"
+      "description": "Persistent Lean language servers selected by required per-call project_dir"
     }
   }
 }

@@ -101,7 +101,7 @@ if [ -z "$PYTHON" ]; then
   # Without a Python we cannot run any of the import checks below.
   printf "\n%sSummary:%s %s%d check(s) failed%s — see fixes above.\n" \
     "$BOLD" "$RESET" "$RED" "$FAILURES" "$RESET"
-  printf "After installing, re-run this script and consult SETUP.md.\n"
+  printf "After installing, re-run this script and consult visualization/SETUP.md.\n"
   exit 1
 fi
 
@@ -134,7 +134,7 @@ brew install graphviz && \\
 CFLAGS="-I\$(brew --prefix graphviz)/include" \\
 LDFLAGS="-L\$(brew --prefix graphviz)/lib" \\
   $PIP install pygraphviz
-       (on nonstandard/system Python add '-undefined dynamic_lookup' to LDFLAGS; a venv from a standard Python avoids it — see SETUP.md)
+       (on nonstandard/system Python add '-undefined dynamic_lookup' to LDFLAGS; a venv from a standard Python avoids it — see visualization/SETUP.md)
 EOF
   else
     printf '%s\n' "install graphviz dev headers (e.g. 'sudo apt-get install graphviz graphviz-dev'), then: $PIP install pygraphviz"
@@ -177,6 +177,6 @@ if [ "$FAILURES" -eq 0 ]; then
 else
   printf "%sSummary:%s %s%d check(s) failed%s — apply the fixes above.\n" \
     "$BOLD" "$RESET" "$RED" "$FAILURES" "$RESET"
-  printf "See SETUP.md for the full recipe and the recommended venv path.\n"
+  printf "See visualization/SETUP.md for the full recipe and the recommended venv path.\n"
   exit 1
 fi

@@ -1,15 +1,17 @@
 # Archival crew-orchestration runbook
 
-Autoform-crew orchestrates multiple subagents for parallel formalization. The main thread plans and coordinates; subagents do the proving, reviewing, and reading.
+This example shows the current crew pattern: the main thread plans and
+coordinates, native subagents handle reading and graph work, and the
+deterministic dispatcher owns queued proving and review.
 
 ## Agents
 
 | Agent | Model | Role | MCP servers |
 |-------|-------|------|-------------|
-| `autoform-worker` | opus | Formalize: read source, search Mathlib, write proofs | repl, mathlib, trace |
-| `faithfulness-reviewer` | opus | Judge: statement captures the source at full strength | lsp, zulip |
-| `proof-integrity-reviewer` | opus | Judge: proof chain is genuine work on sound foundations | lsp, zulip |
-| `code-quality-reviewer` | opus | Judge: Mathlib conventions and idiomatic Lean 4 style | lsp, mathlib |
+| `autoform-worker` | opus | Formalize: read source, search Mathlib, write proofs | autoform-repl, autoform-lsp |
+| `faithfulness-reviewer` | opus | Judge: statement captures the source at full strength | autoform-lsp |
+| `proof-integrity-reviewer` | opus | Judge: proof chain is genuine work on sound foundations | autoform-lsp |
+| `code-quality-reviewer` | opus | Judge: Mathlib conventions and idiomatic Lean 4 style | autoform-lsp |
 | `autoform-reader` | haiku | Read: summarize large files cheaply | none |
 
 The three reviewer judges are blind single-axis jurors sharing the
@@ -17,64 +19,29 @@ The three reviewer judges are blind single-axis jurors sharing the
 returns a 0–5 score for its own rubric, and the verdict (clean / flagged / rejected) is gated
 downstream.
 
-## Aristotle delegation
+Only `autoform-repl` and `autoform-lsp` are MCP services. Mathlib and community
+prior-art search use the local checkout and host-native tools. Proving backends
+run through the dispatcher, not through backend-specific MCP tools.
 
-**Aristotle** (Harmonic) is an autonomous formal-reasoning agent — not a subagent you spawn, but a tool you call. It runs its own Lean builds, proof search, and file edits on Harmonic's servers, then returns finished files.
+## Backend dispatcher
 
-Use Aristotle when:
-- The theorem is self-contained (no dependencies on your in-progress code)
-- You want to offload a hard proof entirely — Aristotle is built for multi-hour proving sessions
-- You're parallelizing aggressively and want to mix local workers with Aristotle tasks
+Inspect or persist the proof-worker backend with the shared configuration
+helper:
 
-Don't use Aristotle when:
-- The proof depends on definitions you've written (Aristotle can't see your workspace unless you pass `project_dir`)
-- You need fine-grained control over the proof approach
-- The task is a quick definition or trivial lemma (Aristotle overhead isn't worth it)
-
-### Aristotle tools
-
-| Tool | What it does |
-|------|-------------|
-| `aristotle_submit` | Submit a task — creates a project or continues an existing session |
-| `aristotle_wait` | Block until the task completes (up to max_wait_seconds) |
-| `aristotle_poll` | Non-blocking status check |
-| `aristotle_steer` | Redirect a running task with new instructions |
-| `aristotle_events` | Inspect what Aristotle is doing (proof attempts, builds, edits) |
-| `aristotle_sessions` | List all active sessions |
-
-### Aristotle + local workers pattern
-
-The most powerful pattern combines local workers for quick tasks with Aristotle for hard proofs:
-
-```
-Chapter 5 targets:
-  Quick (local autoform-worker):
-    - def-5.1, def-5.2, def-5.3 (definitions, likely in Mathlib)
-    - lem-5.4 (simple lemma)
-
-  Hard (delegate to Aristotle):
-    - thm-5.5 (complex, self-contained, 100+ line proof expected)
-    - thm-5.6 (deep Mathlib search needed)
-
-Plan:
-1. Spawn local workers for def-5.1, def-5.2, def-5.3, lem-5.4 in parallel
-2. aristotle_submit("thm-5-5", "Prove Theorem 5.5: ...", project_dir=".")
-3. aristotle_submit("thm-5-6", "Prove Theorem 5.6: ...")
-4. While Aristotle works, review local workers' output
-5. aristotle_wait("thm-5-5") — collect results
-6. aristotle_wait("thm-5-6") — collect results
-7. Review Aristotle's output with the review jury (faithfulness-reviewer + proof-integrity-reviewer + code-quality-reviewer)
+```bash
+python3 scripts/backend_config.py list
+python3 scripts/backend_config.py set <max|aristotle|codex|openai|avocado>
 ```
 
-### Steering Aristotle
+Then drain worker and reviewer tasks through the same queue:
 
-If you see (via `aristotle_events`) that Aristotle is going down the wrong path:
-
-```
-aristotle_steer("thm-5-5", "Don't use manual induction — use Finset.sum_le_sum from Mathlib instead")
+```bash
+python3 scripts/dispatch_runner.py <project-dir> --workers --watch
 ```
 
-This injects the instruction into Aristotle's running session without restarting.
+Use `--backend` for a run-local override. Direct API backends require the
+matching `--allow-api-egress` flag after the provider, billing path, endpoint,
+and project-data scope have been shown to and approved by the user.
 
 ## When to use crew vs main thread
 
@@ -161,7 +128,7 @@ Start wave 1: spawn autoform-worker for def-5.1, def-5.2, def-5.3 in parallel.
 ```
 Formalized: <target name>
 File: <path>
-Status: proved | sorry (<count>) | unproved (<count>)
+Status: proved | FAILED
 Summary: <1-2 sentences on approach>
 ```
 

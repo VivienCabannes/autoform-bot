@@ -86,14 +86,13 @@ LDFLAGS="-L$(brew --prefix graphviz)/lib" \
 pip install "leanblueprint==0.0.20" "plastexdepgraph==0.0.5" "plastexshowmore==0.0.2" "plasTeX==3.1" fastmcp
 ```
 
-Then point the plugin at this interpreter:
+Then point the visualization toolchain checker at this interpreter:
 
 ```bash
 export LEAN_PLANNER_PYTHON="$HOME/.venvs/lean-blueprint/bin/python"
 ```
 
-(`LEAN_PLANNER_PYTHON` is honored by both `check_toolchain.sh` and the MCP server
-launcher.)
+`LEAN_PLANNER_PYTHON` is honored by `visualization/check_toolchain.sh`.
 
 On Debian/Ubuntu, install the graphviz **dev headers** instead of using `CFLAGS`/`LDFLAGS`:
 

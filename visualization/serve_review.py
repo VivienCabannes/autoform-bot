@@ -54,6 +54,9 @@ from typing import Dict, List, Optional
 
 _HERE = Path(__file__).resolve().parent
 _PLUGIN_ROOT = _HERE.parent
+# The documented direct-file launch puts ``visualization/`` rather than the
+# plugin root on sys.path.  Add the root before importing sibling packages;
+# this is also harmless for a normally installed wheel.
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 

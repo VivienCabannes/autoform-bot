@@ -181,8 +181,8 @@ class ProverAdapter(abc.ABC):
     a plain loop with no event-loop assumptions.
     """
 
-    #: ``"claude"`` / ``"aristotle"`` / ``"codex"`` — the value the MCP tool's ``backend`` arg
-    #: selects on.
+    #: ``"claude"`` / ``"aristotle"`` / ``"codex"`` — the backend id selected by
+    #: the dispatcher/runtime.
     name: str = "abstract"
 
     #: The granularity at which this backend's :meth:`steer` lands (see

@@ -111,19 +111,13 @@ def _record_usage(project_dir: str, node_id: str, backend: str, result: ProofRes
     Best-effort by design: accounting must never break a proof result. The
     ledger is the source of truth (append-only JSONL); the yaml refresh is a
     derived view and a no-op when the project never opted into the manifest.
-    The formalization module lives in the plugin's ``scripts/`` (a standalone
-    CLI, not a package member), so it is loaded by path.
+    The formalization module is shared with the standalone CLI through the
+    packaged ``scripts`` namespace.
     """
     try:
-        import importlib.util
         import time as _time
 
-        mod_path = Path(__file__).resolve().parents[2] / "scripts" / "formalization.py"
-        spec = importlib.util.spec_from_file_location("autoform_formalization", mod_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load {mod_path}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        from scripts import formalization as mod
 
         meta = result.meta or {}
         usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}

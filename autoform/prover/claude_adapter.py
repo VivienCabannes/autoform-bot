@@ -105,8 +105,8 @@ def _default_autonomy_args() -> list[str]:
 def _default_mcp_config() -> str | None:
     """Auto-discover the MCP config for the headless worker.
 
-    The worker can use ``autoform-repl`` / ``autoform-lsp`` MCP tools when those
-    optional servers are implemented, so the child receives a ``--mcp-config``.
+    The worker can use the ``autoform-repl`` / ``autoform-lsp`` MCP tools, so the
+    child receives a ``--mcp-config`` when one is available.
     Direct ``lake``/``lean`` verification remains authoritative. Resolution order:
 
     1. ``AUTOFORM_MCP_CONFIG`` env var (explicit override), else

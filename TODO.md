@@ -12,8 +12,7 @@
 ## Before a project
 - [ ] Setup a Lean project repo
     - Tentatively use the one at https://github.com/leanprover-community/LeanProject
-- [ ] Find relevant content on Zulip
-    - [ ] Debug the Zulip MCP, how to make sure "zulip Python" library is installed
+- [ ] Find relevant Lean community prior art with native search tools
 - [Charles] Map a curriculum of results
 - [ ] Find relevant Mathlib infra to map what is missing and create a blueprint
 

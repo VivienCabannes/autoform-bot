@@ -1,7 +1,7 @@
 # Mathlib and Lean 4 style runbook
 
 Authoritative conventions for writing Mathlib-compatible Lean 4 code, distilled from community
-Mathlib review practice (PR review comments and Zulip discussion). The full convention set lives
+Mathlib review practice (PR review comments and community discussion). The full convention set lives
 in `internal/references/mathlib/mathlib-conventions.md` — read it before writing
 non-trivial Lean. The topic guides
 below load on demand, so depth costs nothing while idle. This is the yardstick the code-quality
@@ -12,13 +12,15 @@ reviewer scores against and the style reference the worker writes to.
 Detect what's available and adapt:
 
 - **Search before proving.** Use `exact?`, `apply?`, `rw?` in a temporary Lean
-  snippet or a working REPL, or the `mathlib` MCP search tools (`mathlib_grep`,
-  `mathlib_find_name`) to find existing Mathlib lemmas before reproving anything.
+  snippet or a working REPL, and use `rg` over the project's local Mathlib
+  checkout to find existing lemmas before reproving anything. Host-native Lean
+  or community search is also useful when available.
 - **Build incrementally.** Type-check often with `lake env lean <file>` and use
   `lake build <target>` for the final check. Real LSP/REPL tools may accelerate
-  feedback when available; optional compatibility stubs must not block progress.
-- **Do not read Mathlib source by absolute path.** Use the project's mathlib search tooling
-  (`mathlib_grep` / `mathlib_read_file` via MCP, else `grep` over the mathlib checkout).
+  feedback when available; optional LSP/REPL services must not block progress.
+- **Verify source, not memory.** Resolve the project's local Mathlib checkout,
+  search it with `rg`, and read the matching Lean source before relying on a
+  declaration.
 
 ## The conventions, in brief
 

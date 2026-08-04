@@ -10,7 +10,7 @@ their configured provider.
 From the Autoform repository root:
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra repl
 LC_ALL=C LANG=C uv run python -m pytest -q
 uv run ruff check scripts servers tests
 python3 scripts/lint_plugin.py

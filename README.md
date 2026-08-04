@@ -64,7 +64,7 @@ flowchart LR
 
 Prereqs: [Claude Code](https://claude.com/claude-code) or
 [Codex](https://developers.openai.com/codex/), Python ≥ 3.10, and
-[uv](https://docs.astral.sh/uv/) (the MCP servers launch via `uv run` and
+[uv](https://docs.astral.sh/uv/) (the LSP and REPL servers launch via `uv run` and
 resolve their own deps on first start).
 
 Claude Code:
@@ -108,10 +108,9 @@ shared queue.
 
 ## Prover backends
 
-One MCP tool proves a node — `prove_node(graph_path, node_id, project_dir,
-backend=...)` — and the driver, steerer, and honesty gate are identical for
-every backend; only the adapter differs. Direct OpenAI/Avocado calls also
-require `allow_api_egress=true` after explicit approval for that project/run.
+The deterministic dispatcher drives every backend through the same runtime,
+steerer, and honesty gate; only the adapter differs. Direct OpenAI/Avocado calls
+require explicit approval for that project and run.
 
 | backend | what it is | auth / env | steering |
 |---|---|---|---|
@@ -149,21 +148,17 @@ inspection, planning, visualization, and project setup),
 dashboard).
 
 Planning, visualization, review, Mathlib conventions, proof discipline,
-environment repair, workspace inspection, jury rubrics, and Zulip search are
-internal runbooks or MCP capabilities invoked by Setup and Orchestrate. They do
-not appear as extra slash commands.
+environment repair, workspace inspection, jury rubrics, and prior-art search
+are internal operations of Setup and Orchestrate, not extra slash commands.
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
 crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 `holistic-reviewer`, `source-searcher`); and the review jury
 (`faithfulness-reviewer`, `proof-integrity-reviewer`, `code-quality-reviewer`).
 
-**MCP servers** — `autoform-prover` (the unified `prove_node`),
-`autoform-aristotle` (session-level Aristotle access),
-`lean-informal-planner-mathlib` (ripgrep-backed Mathlib search),
-`autoform-zulip` (Zulip search; needs a `.zuliprc`), and `autoform-repl` /
-`autoform-lsp` (**stubs today** — reference implementations live in
-`examples/servers/`; a real pooled REPL is landing separately).
+**MCP servers** — only the stateful `autoform-repl` and `autoform-lsp` services.
+Mathlib and community search use the host's native tools; proving runs through
+the local dispatcher rather than an MCP wrapper.
 
 ## Repository layout
 
@@ -171,21 +166,23 @@ crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
 skills/       exactly three user workflows: setup, orchestrate, set-backend
 internal/     non-discoverable runbooks, reference material, and jury rubrics
 agents/       worker, reader, planning crew, review jury
-servers/      MCP servers (prover, aristotle, mathlib, zulip; repl/lsp stubs)
-scripts/      plan/graph tooling, dispatch engine, review UI, formalization.py
+servers/      the two stateful MCP services: Lean LSP and REPL
+autoform/     non-MCP prover runtime, adapters, steering, and verification
+scripts/      plan/graph tooling, dispatch engine, and formalization helpers
+visualization/ blueprint exporter, templates, assets, dashboard, and service control
 hooks/        Claude SessionStart context (skills are the workflow surface)
 docs/         pipeline architecture, usage guide, backend handoff notes
-examples/     reference implementations for the remaining stubs
+examples/     demo project and archival prompt/runbook examples
 tests/        deterministic suite; optional local-Lean and loopback-HTTP smoke tests
 ```
 
 ## Development
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra repl
 uv run python -m pytest -q               # full suite
 python3 scripts/lint_plugin.py           # plugin-surface lint (CI runs this)
-uv run ruff check scripts servers tests skills
+uv run ruff check autoform scripts servers visualization tests
 make demo PYTHON="uv run python"
 ```
 

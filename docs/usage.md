@@ -9,19 +9,19 @@ queue transitions, and persisted verdicts.
 
 Autoform exposes exactly three user workflows: `setup`, `orchestrate`, and
 `set-backend`. Supporting functions such as installation, workspace
-inspection, planning, visualization, review, and Zulip search are internal to
+inspection, planning, visualization, review, and prior-art search are internal to
 those workflows and do not appear as separate commands.
 
 ## 1. Install prerequisites
 
 Install the plugin through the host, then run `setup`. It checks `uv`, Python
-dependencies, Lean/Mathlib, and optional Zulip access before creating or
+dependencies and Lean/Mathlib before creating or
 resuming a project.
 
 For repository development:
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra repl
 uv run python -m pytest -q
 python3 scripts/lint_plugin.py
 ```
@@ -50,6 +50,11 @@ current task predates installation or its spawn tool has no role selector,
 Autoform uses a generic native Codex subagent with the complete canonical
 `agents/<role>.md` prompt inlined. Open a new task rooted and trusted in the
 project to pick up installed roles naturally.
+
+The two MCP services launch from the Autoform plugin directory, independently
+of the Lean workspace. Every LSP/REPL tool call requires an absolute
+`project_dir`; relative paths are rejected, and state is kept separately for
+each validated Lake project.
 
 ## 3. Select a prover
 
@@ -139,7 +144,6 @@ LEAN_PROJECT_DIR
 AUTOFORM_CONFIG
 AUTOFORM_JUDGE_BACKEND
 ARISTOTLE_API_KEY
-ZULIPRC
 ```
 
 `AUTOFORM_UNSAFE_FULL_ACCESS=1` is an explicit escape hatch for dangerous host

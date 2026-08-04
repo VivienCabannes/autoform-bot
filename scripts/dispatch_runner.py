@@ -330,9 +330,8 @@ def run_worker(
                      steerer=steer_judge,
                      expected_files=([node["lean_file"]] if node.get("lean_file") else None),
                      expected_declarations=(node.get("lean_declarations") or None))
-        # The MCP prover records usage itself, but the deterministic dispatcher
-        # calls the shared driver directly. Keep both entry points on the same
-        # append-only ledger contract.
+        # The deterministic dispatcher calls the shared driver directly and
+        # records every result on the append-only usage ledger.
         from autoform.prover.runtime import _record_usage
         _record_usage(repo, node_id, backend, res)
         return res.status, (res.reason or ""), (res.proof_text or "")

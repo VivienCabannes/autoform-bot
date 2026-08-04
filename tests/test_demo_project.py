@@ -70,7 +70,7 @@ def test_project_bootstrap_commands_use_a_portable_locale():
 def test_project_creation_is_internal_to_setup():
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     assert not (ROOT / "skills" / "make-project" / "SKILL.md").exists()
-    assert "scripts/make_project.sh" in setup
+    assert "project creation" in setup
     assert (ROOT / "scripts" / "make_project.sh").is_file()
 
 
@@ -81,12 +81,19 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
     }
     assert public == {"setup", "orchestrate", "set-backend"}
 
-    setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
-    orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
-    assert "internal/runbooks/planning.md" in setup
-    assert "scripts/workspace_inspector.py" in setup
-    assert "internal/runbooks/proving.md" in orchestrate
-    assert "internal/runbooks/review.md" in orchestrate
+    bodies = {}
+    for name in public:
+        text = (ROOT / "skills" / name / "SKILL.md").read_text()
+        body = text.split("---", 2)[2].strip()
+        bodies[name] = body
+        assert len(body.split()) <= 80
+        assert "\n#" not in body
+
+    assert "scripts/merge_node.py" in bodies["setup"]
+    assert "visualization/" in bodies["setup"]
+    assert "scripts/dispatch_runner.py" in bodies["orchestrate"]
+    assert "scripts/check_completion.py" in bodies["orchestrate"]
+    assert "scripts/backend_config.py" in bodies["set-backend"]
 
     for path in (ROOT / "internal" / "runbooks").glob("*.md"):
         assert not path.read_text().lstrip().startswith("---")

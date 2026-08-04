@@ -88,7 +88,7 @@ IN_MATHLIB_STATUSES = {"exists", "in-mathlib", "in_mathlib", "mathlib"}
 # the verdict gate, the parallel dispatcher — adapts with NO code change. A built-in
 # fallback keeps this module usable (tests / missing files) without the rubric dir.
 # ---------------------------------------------------------------------------
-_RUBRIC_DIR = Path(__file__).resolve().parents[2] / "internal" / "rubrics"
+_RUBRIC_DIR = Path(__file__).resolve().parents[1] / "internal" / "rubrics"
 
 # The built-in three — used only if no rubric files are found.
 _FALLBACK_RUBRICS: List[dict] = [

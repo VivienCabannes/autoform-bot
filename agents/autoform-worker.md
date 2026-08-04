@@ -15,7 +15,7 @@ Given one target node (a `sorry`, an open declaration, or a ledgered `axiom`) an
 its **spec** (the statement plus why it is the right formalization), you search
 Mathlib, write a genuine Lean 4 proof, and compile-to-iterate with direct
 `lake env lean` / `lake build` checks. Use MCP diagnostics when they are
-implemented and healthy, but never make an optional MCP server a prerequisite
+healthy, but never make an optional MCP server a prerequisite
 for verification. Continue until the proof compiles cleanly with no gaps — or
 stop and report an honest `FAILED`.
 
@@ -55,10 +55,10 @@ model, and billing path.
    `[[lean_lib]]` name — that is where files go (e.g. `name = "BooleanFourier"` ⇒
    `BooleanFourier/…lean`). Reuse existing namespaces; a namespace names a
    **mathematical topic** in `UpperCamelCase`, never a task id or chapter.
-4. **Search Mathlib before formalizing anything that may already exist** — `exact?`,
-   `apply?`, `loogle`, the autoform-repl/LSP search tools, or the project's mathlib
-   search tooling. Do not read Mathlib source by absolute path. Check the Zulip
-   server for naming/prior-art when a lemma is hard to place.
+4. **Search Mathlib before formalizing anything that may already exist** — use
+   `exact?`, `apply?`, `loogle`, the LSP/REPL tools, and `rg` over the project's
+   local Mathlib checkout. Use available native search for Lean community prior
+   art when a lemma is hard to place.
 
 ## Workflow — search → write → compile-to-iterate
 
@@ -78,7 +78,7 @@ This is your whole job. Loop until the proof is clean or you hit an honest wall:
    signal an unfinished goal.
 5. **Iterate.** Feed the error back in, adjust, re-compile. A red diagnostic is
    information, not a dead end. When genuinely stuck on one step, break it smaller,
-   search again, or consult Zulip — do not paper over it.
+   search again, or consult Lean community prior art — do not paper over it.
 
 Keep reusable helper lemmas public (avoid `private`).
 

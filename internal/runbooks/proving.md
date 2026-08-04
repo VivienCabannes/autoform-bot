@@ -9,9 +9,10 @@ and points there.
 
 ## Core workflow
 
-1. **Search first.** Look for the lemma in Mathlib (`mathlib_grep`, `mathlib_find_name`, or
-   `exact?`/`apply?`/`rw?` in the REPL) before reproving anything — many standard results already
-   exist. See `internal/references/proving/proof-strategies.md`.
+1. **Search first.** Use `rg` over the project's local Mathlib checkout, host-native
+   search when available, or `exact?`/`apply?`/`rw?` in the REPL before
+   reproving anything — many standard results already exist. See
+   `internal/references/proving/proof-strategies.md`.
 2. **Prototype and compile incrementally.** Test fragments with a working
    REPL/LSP when one is available, otherwise use a temporary Lean file and
    `lake env lean <file>`. Check the actual project file after each landed
@@ -69,7 +70,7 @@ delivered as "done." See
 | Guide | When |
 |---|---|
 | `internal/references/proving/proof-strategies.md` | Incremental approach, REPL prototyping, search-first |
-| `internal/references/proving/tool-usage.md` | REPL / LSP / mathlib MCP usage and the build-timeout playbook |
+| `internal/references/proving/tool-usage.md` | REPL / LSP / local Mathlib search and the build-timeout playbook |
 | `internal/references/proving/sorry-handling.md` | Net-reduction rules, spec-phase sorrys, the FAILED rule |
 | `internal/references/proving/axiom-policy.md` | Kernel-axiom policy + audited-ledger discharge protocol |
 | `internal/references/proving/false-statements.md` | Detecting and reporting false / unprovable statements |

@@ -26,7 +26,7 @@ fail() { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; exit 1; }
 skip() { printf '\033[0;37m  - %s\033[0m\n' "$*"; }
 
 # =========================================================================
-# 1. uv (required — all MCP servers depend on it)
+# 1. uv (required — both MCP servers depend on it)
 # =========================================================================
 log "Checking uv"
 
@@ -43,7 +43,7 @@ log "Checking Python dependencies"
 
 all_ok=true
 
-# Core (fastmcp — needed by every MCP server)
+# Core (fastmcp — needed by both MCP servers)
 if uv run --project "$AUTOFORM_RESOLVED_ROOT" python -c "import fastmcp; print(f'fastmcp {fastmcp.__version__}')" 2>/dev/null; then
   ok "fastmcp (core)"
 else

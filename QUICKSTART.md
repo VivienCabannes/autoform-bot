@@ -2,7 +2,7 @@
 
 Autoform turns your AI coding assistant into a **Lean 4 formalization agent**.
 It exposes three workflow commands backed by role agents, internal runbooks,
-and MCP servers for Lean and Mathlib.
+and persistent Lean LSP/REPL servers.
 
 > For the full formalization workflow and command reference, see [docs/usage.md](docs/usage.md).
 > For what's implemented vs. stubbed, see the status table in [README.md](README.md).
@@ -41,11 +41,17 @@ Codex and npx installs (Cursor/Windsurf/Copilot/Cline) are in [README.md](README
 
 ## 2. Point it at your Lean project
 
-Set `LEAN_PROJECT_DIR` so the skills and servers know which project to work on, then launch:
+Launch the host from the Lean project. `LEAN_PROJECT_DIR` is also useful to the
+workflow scripts:
 
 ```bash
-LEAN_PROJECT_DIR=/path/to/your/lean-project claude --plugin-dir /path/to/autoform-bot
+cd /path/to/your/lean-project
+LEAN_PROJECT_DIR="$PWD" claude --plugin-dir /path/to/autoform-bot
 ```
+
+The MCP processes themselves start from the plugin directory. Their LSP/REPL
+tools require the project's absolute path as `project_dir`, so they never
+mistake the plugin checkout for the Lean project.
 
 No Lean project yet? Setup creates one from the LeanProject template, or you
 can try Autoform against the bundled sample at `examples/demo-project/`.
@@ -66,7 +72,7 @@ user-visible surface:
 A good first move is `/autoform:setup`. Natural-language requests such as
 “inspect this workspace,” “show the graph,” or “install Lean” stay inside Setup
 instead of adding commands. Requests such as “review this node,” “prove this
-theorem,” or “search Zulip” stay inside Orchestrate.
+theorem,” or “search for Lean prior art” stay inside Orchestrate.
 
 For a repository that already has a roadmap, one Codex prompt can cover both
 skills:
@@ -80,22 +86,6 @@ the confirmed scope is complete or a concrete blocker genuinely needs me.
 
 Autoform records the confirmed roadmap ids, exact Lean targets, proof and review
 fingerprints, and durable queue state before it can report completion.
-
-## 4. Optional unlocks
-
-**Zulip search** — create `~/.zuliprc` (API key from
-<https://leanprover.zulipchat.com/#settings/account>):
-
-```ini
-[api]
-email=YOUR_ZULIP_EMAIL
-key=YOUR_API_KEY
-site=https://leanprover.zulipchat.com
-```
-
-Then `chmod 600 ~/.zuliprc`. Setup verifies connectivity.
-
----
 
 ## Developing the plugin
 

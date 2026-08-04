@@ -20,7 +20,7 @@ You review a single tier at a time, over whatever scope the orchestrator hands y
 
 The orchestrator gives you a **list of node ids you are responsible for** — your partition. This bounds what you *edit*, not what you *read*.
 
-- **Read as much as you need.** You have full read access to everything: `graph.json` (your index — no precurated list is supplied, so read the file itself), the `informal_content/<id>.md` prose, the `sources/` textbooks, and Mathlib via the MCP tools. Read the context that bears on your subset — the neighbours of your nodes, the prose an edge's faithfulness is checked against, the source passages — with "as needed" the governor: read what is relevant to your nodes, not the whole graph by default.
+- **Read as much as you need.** You have full read access to everything: `graph.json` (your index — no precurated list is supplied, so read the file itself), the `informal_content/<id>.md` prose, the `sources/` textbooks, and the project's local Mathlib checkout. Read the context that bears on your subset — the neighbours of your nodes, the prose an edge's faithfulness is checked against, the source passages — with "as needed" the governor: read what is relevant to your nodes, not the whole graph by default.
 - **Edit only your own nodes' records** — and therefore only those nodes' outgoing `depends_on` edges. An edge `A → B` is yours to add or remove exactly when `A` is one of your nodes.
 - **Flag anything outside your responsibility.** A duplicate of one of your nodes that lives elsewhere, a node elsewhere that should depend on one of your nodes (an incoming edge), a merge that spans the partition boundary — surface these in your report for the orchestrator rather than editing them.
 

@@ -1,6 +1,6 @@
 {
   "name": "autoform",
-  "version": "0.4.4",
+  "version": "0.4.4+codex.local-20260804-121435",
   "description": "Turn any AI coding assistant into a Lean 4 formalization agent.",
   "author": {
     "name": "Vivien Cabannes"

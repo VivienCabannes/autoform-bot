@@ -136,8 +136,9 @@ The selected jury provider also handles the rare model-judged live-steering
 signal for an in-flight prover. Deterministic trigger corrections and
 verification-gate folds remain model-free. This prevents Aristotle under Codex
 or an API deployment from acquiring a hidden Claude dependency.
-The standalone `prove_node` MCP defaults model-judged live steering off for the
-same reason; orchestration supplies the selected provider explicitly.
+
+The importable `run_prove_node` runtime defaults model-judged live steering off
+for the same reason; orchestration supplies the selected provider explicitly.
 
 ### 4. OpenAI-compatible tool loop
 
@@ -214,8 +215,8 @@ explicit approval. If prover and judge use different API providers, each is
 checked and approved independently. The dispatcher requires a matching
 repeatable `--allow-api-egress` flag, making consent an ephemeral process
 capability rather than a side effect of global backend configuration. A direct
-`prove_node` MCP call likewise requires `allow_api_egress=true`; its caller must
-obtain the same approval first.
+`run_prove_node` call likewise requires `allow_api_egress=True`; its
+caller must obtain the same approval first.
 
 ### Permissions
 

@@ -2,40 +2,40 @@
 
 Use the right tool for the job, and know each tool's limits. Direct
 `lake env lean` checks are the portable baseline across Claude, Codex, and
-headless workers. The bundled REPL/LSP servers are compatibility stubs today;
-use a host-provided real Lean LSP/REPL when available, and otherwise use the
-direct commands below.
+headless workers. The bundled REPL/LSP servers are optional accelerators; use
+them when healthy and otherwise use the direct commands below.
 
 ## `autoform-repl` MCP — `run_lean_code`, `get_repl_status`
 
-- A production `run_lean_code(code, timeout?)` sends a snippet to a pooled Lean REPL and returns formatted
+- Always pass the absolute Lake root as `project_dir`; it is required and is
+  never inferred from the MCP process directory.
+- `run_lean_code(project_dir, code, timeout?)` sends a snippet to a pooled Lean REPL and returns formatted
   diagnostics (status, errors, `sorry` goals, warnings). Imports are cached, so repeated calls
   with the same imports reuse the environment and stay fast.
 - The REPL environment has **only `import Mathlib`** — it cannot see your project's custom
   definitions. For a fragment that references custom defs, paste those defs into the snippet, or
   check the actual file with the LSP instead.
-- When implemented, use it to prototype: test fragments, inspect types with `#check`, probe for lemmas
+- Use it to prototype: test fragments, inspect types with `#check`, probe for lemmas
   with `exact?` / `apply?` / `rw?`, and build a proof up incrementally — only write to the file
   once a fragment compiles.
-- `get_repl_status()` reports pool capacity, memory, and shutdown state when a
-  production pool is installed. A “Not yet implemented” response means to fall
-  back immediately; it is not a proof failure.
+- `get_repl_status(project_dir)` reports pool capacity, memory, and shutdown state.
 
 ## `autoform-lsp` MCP — `lean_diagnostic_messages`, `lean_hover`
 
-- A production `lean_diagnostic_messages(file_path)` returns the language server's errors/warnings/info for a
+- `lean_diagnostic_messages(project_dir, file_path)` returns the language server's errors/warnings/info for a
   real `.lean` file in the project — this is how you check a file that uses custom definitions
   the REPL can't see.
-- `lean_hover(file_path, line, character)` (0-indexed) gives the type/info at a position when a
-  real LSP is installed — use it
-  to confirm what an expression elaborates to.
+- `lean_hover(project_dir, file_path, line, character)` (0-indexed) gives the
+  type/info at a position; use it to confirm what an expression elaborates to.
 
-## `mathlib` MCP — search before proving
+## Local Mathlib search — search before proving
 
-- `mathlib_grep` / `mathlib_find_name` / `mathlib_read_file` search the Mathlib checkout. Use
-  them to find an existing lemma before reproving it, and to read the exact signature.
-- **Do not read Mathlib source by absolute path** — go through these tools (or `grep` over the
-  checkout if MCP is unavailable).
+- Resolve the project's real Mathlib checkout, usually
+  `.lake/packages/mathlib`, and search it with `rg` before reproving a result.
+  Read promising Lean source and validate the exact declaration with `#check`
+  or a small compiling example.
+- Host-native Lean or community search may supplement the local checkout, but
+  do not claim a declaration exists until its source or Lean has confirmed it.
 
 ## `lean_diagnostic_messages` / a single file vs full `lake build`
 
