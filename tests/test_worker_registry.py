@@ -165,12 +165,12 @@ def test_discover_excludes_non_queue_subroles(tmp_path):
 def test_discover_includes_subrole_when_it_declares_kind_or_drained_by(tmp_path):
     agents_dir = tmp_path / "plugin" / "agents"
     write_role(agents_dir, "splitter.md", "name: splitter\ndescription: splits\nkind: split")
-    write_role(agents_dir, "faithfulness-reviewer.md",
-               "name: faithfulness-reviewer\ndescription: judges faithfulness\ndrained_by: agent")
+    write_role(agents_dir, "source-searcher.md",
+               "name: source-searcher\ndescription: searches sources\ndrained_by: agent")
     roles = registry.discover(tmp_path / "plugin")
     assert "split" in roles and roles["split"].name == "splitter"
-    assert "faithfulness-reviewer" in roles
-    assert roles["faithfulness-reviewer"].drained_by == "agent"
+    assert "source-searcher" in roles
+    assert roles["source-searcher"].drained_by == "agent"
 
 
 def test_engine_kinds_exist_with_empty_agents_dir(tmp_path):
@@ -331,9 +331,6 @@ def test_every_shipped_role_declaring_a_kind_has_a_body():
 
 def test_shipped_sub_roles_are_not_queue_kinds():
     roles = registry.discover(REPO_ROOT)
-    assert "faithfulness-reviewer" not in roles
-    assert "proof-integrity-reviewer" not in roles
-    assert "code-quality-reviewer" not in roles
     assert "splitter" not in roles
     assert "source-searcher" not in roles
     assert "autoform-reader" not in roles

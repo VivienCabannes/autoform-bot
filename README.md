@@ -198,8 +198,8 @@ commands.
 
 **Agents** — a prover `autoform-worker` and an `autoform-reader`; the planning
 crew (`splitter`, `mathlib-checker`, `graph-reviewer`, `content-reviewer`,
-`holistic-reviewer`, `source-searcher`); and the review jury
-(`faithfulness-reviewer`, `proof-integrity-reviewer`, `code-quality-reviewer`).
+`holistic-reviewer`, `source-searcher`). The review jury is generated directly
+from the rubric files under `internal/rubrics/`, not separate agent prompts.
 
 **MCP servers**: `lean-lsp-mcp` (stateful proof goals, diagnostics, hover,
 code actions, and proof attempts) and `autoform-prover` (the unified

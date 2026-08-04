@@ -13,11 +13,14 @@ the user's project, so plugin-relative paths do not resolve).
 
 ## The jury rubrics
 
-| Rubric | Weight | Pass ≥ | Reviewer agent | Judges whether… |
+| Rubric | Weight | Pass ≥ | Reviewer label | Judges whether… |
 |---|---|---|---|---|
 | **faithfulness** | 0.40 | 4/5 | `faithfulness-reviewer` | the Lean **statement** captures the source statement *at full strength* (no weakening, no vacuity) |
 | **proof_integrity** | 0.40 | 3/5 | `proof-integrity-reviewer` | the **proof** chain is genuine work on sound foundations (axioms clean, no disguised `sorry`/cheats) |
 | **code_quality** | 0.20 | 3/5 | `code-quality-reviewer` | the code follows Mathlib conventions and idiomatic Lean 4 (yardstick = `internal/runbooks/mathlib-style.md`) |
+
+The reviewer labels are audit metadata. The dispatcher executes each rubric's
+`prompt_template` directly; there are no separate jury agent files.
 
 The jury is **whatever rubric files live in `internal/rubrics/`** — currently
 these three. The
@@ -34,7 +37,7 @@ gating roles from them at load time (`review_model.rubric_specs()`), so the revi
 changed by editing JSON, never code:
 
 - **Add an axis** — drop a new `<axis>.json` (`name`, `weight`, `pass_threshold`, `reviewer`,
-  `criteria`, `prompt_template`) plus its judge agent; the jury, the parallel fan-out, and the
+  `criteria`, `prompt_template`); the jury, the parallel fan-out, and the
   weighted score pick it up automatically.
 - **Shrink to a single reviewer** — leave one rubric file; the verdict gate works with one axis.
 - **Tune the gate per axis, in data** — `reject_at_or_below` sets the score that forces *rejected*
@@ -105,8 +108,8 @@ present, else `ai`.
 ## The spec-gate
 
 The **faithfulness** rubric, run on the DAG's target/sink nodes, *is* the spec-gate — a faithfulness
-check on the project's main results against the source's actual main theorems. Same rubric, same
-`faithfulness-reviewer`, filtered to the roots. No separate machinery.
+check on the project's main results against the source's actual main theorems. It uses the same
+dispatcher judge, filtered to the roots. No separate machinery.
 
 ## Related
 

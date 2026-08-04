@@ -62,5 +62,5 @@ Keeping `lake build` fast is covered by
 
 Pairs with `internal/runbooks/proving.md` (axioms / `sorry` / commit
 discipline) and `internal/runbooks/evaluation.md` (how this code is graded). It
-is the yardstick the `code-quality-reviewer` scores against, and the style
+is the yardstick the `code_quality` rubric scores against, and the style
 reference the `autoform-worker` writes to.
