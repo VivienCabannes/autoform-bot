@@ -1,7 +1,7 @@
 {
   "name": "autoform",
   "description": "Lean 4 formalization agent: Mathlib conventions, proof strategies, review, statement extraction, and textbook-to-blueprint formalization planning.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": {
     "name": "Vivien Cabannes",
     "url": "https://github.com/facebookresearch/autoform-bot"
@@ -22,12 +22,20 @@
   "mcpServers": {
     "lean-lsp-mcp": {
       "command": "lean-lsp-mcp",
-      "args": ["--disable-tools", "lean_leansearch,lean_loogle,lean_leanfinder"],
+      "args": [
+        "--disable-tools",
+        "lean_leansearch,lean_loogle,lean_leanfinder"
+      ],
       "description": "Stateful Lean language server for goals, diagnostics, hover, code actions, and proof attempts"
     },
     "autoform-prover": {
       "command": "uv",
-      "args": ["run", "python", "-m", "servers.prover.server"],
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "servers.prover.server"
+      ],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "UV_PROJECT_ENVIRONMENT": ".venv-autoform-prover"

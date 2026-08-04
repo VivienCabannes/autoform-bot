@@ -15,14 +15,14 @@ Checks (all stdlib):
     `<source>/.claude-plugin/plugin.json`.
   - `.claude-plugin/plugin.json` is valid JSON with `name`/`version`/`description`
     and a semver-shaped `version`.
-  - The native Muse manifest exposes exactly the three native slash commands,
+  - The native Muse manifest exposes exactly the public native slash commands,
     one SessionStart hook, and the portable MCP server set without duplicate
     skill entries in Muse's completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
-  - The user-visible skill set is exactly `setup`, `orchestrate`, and
-    `set-backend`; supporting runbooks do not reappear as slash commands.
-  - No legacy `commands/*` file adds a fourth user-visible command.
+  - The user-visible skill set is exactly `setup`, `roadmap`, `orchestrate`,
+    and `set-backend`; supporting runbooks do not reappear as slash commands.
+  - No legacy `commands/*` file adds an extra user-visible command.
   - Every `references/<file>` a SKILL.md cites exists in that skill's `references/`.
   - No surviving mention of an agent/skill in REMOVED_AGENTS / REMOVED_SKILLS
     (the rename-regression guard; HTML/`<!-- -->` comments are stripped first so
@@ -53,7 +53,7 @@ EXPECTED_MCP_SERVERS = frozenset(
         "autoform-prover",
     }
 )
-PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
+PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate", "set-backend"})
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
@@ -458,7 +458,7 @@ def check_skills() -> int:
 
 
 def check_internal_assets() -> None:
-    """The three workflows retain their supporting implementation material."""
+    """The public workflows retain their supporting implementation material."""
     global checks
     for path in REQUIRED_INTERNAL_ASSETS:
         checks += 1
@@ -477,7 +477,7 @@ def check_commands() -> None:
             checks += 1
             err(
                 f"legacy user-facing command is not allowed: {rel(path)} "
-                "(use one of the three workflow skills)"
+                "(use one of the public workflow skills)"
             )
 
 

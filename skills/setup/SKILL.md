@@ -1,11 +1,13 @@
 ---
 name: setup
 description: >-
-  Set up, repair, inspect, plan, visualize, or resume an Autoform Lean
-  formalization project. Handles Autoform and Lean prerequisites, Lean/Mathlib
-  project creation, workspace status, the durable DAG, blueprint, dashboard,
-  and host roles. Use for setup, install, initialize, resume, reset, inspect
-  workspace, plan a formalization, or view its graph.
+  Set up, repair, or inspect an AutoformBot Lean formalization project's
+  repository and environment. Handles Autoform and Lean prerequisites,
+  Lean/Mathlib project creation, workspace status, durable-state
+  initialization, the review dashboard, host roles, CI, GitHub Pages, and
+  distributed-mode readiness. Use for setup, install, initialize, repair,
+  inspect workspace, or prepare GitHub. Building the roadmap DAG itself
+  belongs to the Roadmap workflow.
 ---
 
 # Set up an Autoform project
@@ -30,15 +32,14 @@ Before installing, creating, or planning anything, tell the user what this run
 will do in a compact brief:
 
 - the resolved Lean repository and plan/roadmap directory;
-- whether this is a fresh plan, a resume, or inspection only;
-- the confirmed source files and exact chapter/section scope, or the specific
-  missing information you need before planning;
-- the artifacts Autoform will create or update (`graph.json`, prose, worker
-  queue/status, and the lightweight dashboard);
+- whether this is a fresh install, a repair, or inspection only;
+- the artifacts Setup will create or update (the Lean project, empty durable
+  state, the lightweight dashboard, and — only with approval — CI, Pages, and
+  gitignore entries);
 - that Lean source remains editable in the user's IDE and code review remains
   ordinary GitHub branches, PRs, and CI; Autoform does not replace either;
-- the next checkpoint the user should expect (coarse roadmap approval before
-  detailed splitting, then explicit worker/prover dispatch).
+- the next step after readiness: run Roadmap to build the dependency graph
+  (Setup never reads sources or spawns planning subagents).
 
 Do not make the user infer whether agents have started, which files they may
 touch, or whether a backend is already spending tokens. Report those transitions
@@ -131,13 +132,11 @@ when they occur.
    Lean project or be a dedicated plan directory. The helper records the
    absolute Lean root in graph metadata.
 
-   A request to "rebuild" does not authorize deletion: re-render the blueprint
-   and resume the graph. Only an explicit user-confirmed plan reset authorizes
-   adding `--reset-plan`. Before executing it, state that graph, prose, queue,
-   reviews, and activity will be reset and that a timestamped snapshot will be
-   retained under `<dispatch-project>/.autoform/snapshots/`.
+   Setup only initializes durable state; growing, re-planning, or resetting
+   the graph (`--reset-plan`) belongs to the Roadmap workflow.
 
-6. Start the dashboard before planning so graph changes appear live. Use a free
+6. Start the dashboard so the (initially empty) graph is visible and later
+   Roadmap/Orchestrate activity appears live. Use a free
    loopback port unless the user supplied one. Reuse a service already serving
    this exact project.
 
@@ -165,31 +164,7 @@ when they occur.
    ends. In every case, verify the loopback port is listening before reporting
    the URL.
 
-7. Read and follow
-   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`, including its schema
-   at `<AUTOFORM_PLUGIN_ROOT>/internal/references/plan-json-schema.md`. Planning
-   is incomplete when the graph is
-   absent or empty, a tier-1 cluster has no tier-2 children, or a node has null
-   content. Preserve every durable node already merged.
-
-   Confirm source files and scope with the user before planning. Do not invent a
-   source or silently widen the requested chapters. Use native subagents for the
-   canonical roles (`splitter`, `mathlib-checker`, and reviewers), and route all
-   graph edits through `scripts/merge_node.py`.
-
-8. The lightweight dashboard from step 6 is the default visualization. Do not
-   check for Graphviz, install blueprint Python packages, export leanblueprint,
-   or build its web output during ordinary Setup. Those dependencies are not
-   prerequisites for Autoform planning or orchestration.
-
-   Only when the user explicitly requests the publication-style mathematical
-   blueprint, read and follow
-   `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to export, build,
-   and serve it. A blueprint toolchain failure must not turn an otherwise
-   successful Setup run into a failure; report it as an optional visualization
-   limitation and keep the graph and lightweight dashboard available.
-
-9. Inspect GitHub publication readiness without changing remote or repository
+7. Inspect GitHub publication readiness without changing remote or repository
    state:
 
    ```bash
@@ -226,7 +201,7 @@ when they occur.
    `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/github-pages.md` for the commands and
    failure rules.
 
-10. When the user wants multiple machines or teammates advancing this project
+8. When the user wants multiple machines or teammates advancing this project
    (a shared GitHub roadmap), prepare distributed mode:
 
    - audit the machine: `uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python -m
@@ -257,10 +232,9 @@ when they occur.
    Distributed operation itself (rounds, claims, PRs) belongs to Orchestrate;
    Setup only makes the machine ready.
 
-11. Report the local dashboard URL, GitHub publication readiness, tier-1 and
-   tier-2 counts, native role-agent install
-   status, distributed-mode readiness when configured, and the next step: run
-   Orchestrate.
+9. Report the local dashboard URL, GitHub publication readiness, native
+   role-agent install status, distributed-mode readiness when configured, and
+   the next step: run Roadmap when the graph is empty, otherwise Orchestrate.
 
 ## Resume semantics
 
