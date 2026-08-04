@@ -187,14 +187,12 @@ def check_plugin_json() -> None:
     checks += 1
     if not re.match(r"^\d+\.\d+\.\d+", str(version)):
         err(f"plugin.json version is not semver-shaped: {version!r}")
-    servers = data.get("mcpServers")
+    mcp_reference = data.get("mcpServers")
     checks += 1
-    if not isinstance(servers, dict):
-        err(".claude-plugin/plugin.json: mcpServers must be an object")
-    elif set(servers) != EXPECTED_MCP_SERVERS:
+    if mcp_reference != "./.mcp.json":
         err(
-            ".claude-plugin/plugin.json: MCP server set differs from the "
-            f"portable contract (got {', '.join(sorted(servers))})"
+            ".claude-plugin/plugin.json: mcpServers must reference "
+            "the shared './.mcp.json' configuration"
         )
     root_mcp = load_json(REPO_ROOT / ".mcp.json")
     if root_mcp is not None:
