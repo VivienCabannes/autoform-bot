@@ -99,7 +99,31 @@ reviewers", not internal shorthand).
    does (`scripts/service_control.py start review …`). A dashboard failure
    never blocks planning; report it and continue.
 
-5. Read and follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`,
+5. When the project ALREADY contains a Lean formalization and the graph is
+   empty, bootstrap from the code before planning from sources — otherwise the
+   dashboard, blueprint, and workers all see nothing while a real
+   formalization sits in the repo:
+
+   ```bash
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/import_lean_repo.py" "$PROJECT_DIR" \
+     --project "$DISPATCH_PROJECT" --dry-run
+   ```
+
+   Show the user the dry-run counts, then re-run without `--dry-run` to import.
+   Each Lean module becomes a tier-1 cluster and each declaration a tier-2 node
+   carrying `lean_file`, so incomplete proofs are immediately prove-eligible and
+   complete ones are review-eligible.
+
+   Say plainly what this is: a DRAFT with the shape of the code, not of the
+   mathematics. Modules are not always concepts and the imported `depends_on`
+   edges are textual. Follow an import with the graph-reviewer and
+   content-reviewer roles, and attach real sources when the user has them —
+   imported nodes are `origin: background` until then, and no imported node
+   ever claims `in-mathlib` (that status is trusted by construction and must be
+   earned by a verified check).
+
+6. Read and follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`,
    including its schema at
    `<AUTOFORM_PLUGIN_ROOT>/internal/references/plan-json-schema.md`. Planning
    is incomplete when the graph is absent or empty, a tier-1 cluster has no
@@ -113,7 +137,7 @@ reviewers", not internal shorthand).
    `content-reviewer`, `holistic-reviewer`), and routes every graph edit
    through `scripts/merge_node.py` — it is the only writer of `graph.json`.
 
-6. When the user names a target theorem (a mission sink the fleet should reach),
+7. When the user names a target theorem (a mission sink the fleet should reach),
    record it as first-class graph state through the single writer:
 
    ```bash
@@ -125,7 +149,7 @@ reviewers", not internal shorthand).
    Targets drive the workers' prove ordering (critical path first) and the
    audit's reachability clause; the status surfaces report distance to each.
 
-7. Before reporting, audit completeness — structure plus every roadmap clause
+8. Before reporting, audit completeness — structure plus every roadmap clause
    (status vocabulary, grounding, verified in-Mathlib claims, prose, provenance,
    targets, Lean paths):
 
@@ -150,14 +174,14 @@ reviewers", not internal shorthand).
    Add `--enqueue` only when the user wants the remaining gaps turned into
    queued role tasks for Orchestrate/worker rounds to drain.
 
-8. The lightweight dashboard is the default visualization. Only when the user
+9. The lightweight dashboard is the default visualization. Only when the user
    explicitly requests the publication-style mathematical blueprint, read and
    follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to
    export, build, and serve it. A blueprint toolchain failure must not turn an
    otherwise successful Roadmap run into a failure; report it as an optional
    visualization limitation.
 
-9. Report: tier-1 and tier-2 counts, Mathlib-status breakdown
+10. Report: tier-1 and tier-2 counts, Mathlib-status breakdown
    (in-mathlib / partial / missing), the dashboard URL, any unresolved gaps,
    and the next step: run Orchestrate.
 

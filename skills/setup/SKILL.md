@@ -157,6 +157,11 @@ made to resemble a template.
    cd "$PROJECT_DIR" && lake exe cache get && lake build
    ```
 
+   When the inspection reports existing declarations and the project has no
+   roadmap yet, say so and name the next step: Roadmap can bootstrap a draft
+   graph directly from that Lean (`scripts/import_lean_repo.py`), so an
+   existing formalization is not left invisible to the dashboard and workers.
+
    `lake exe cache get` is cheap when the cache is already local and may be
    skipped for projects without a Mathlib dependency. A build failure is a
    Setup failure to surface and fix now (toolchain mismatch, stale manifest,

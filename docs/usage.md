@@ -41,6 +41,14 @@ Setup:
 - prepares GitHub readiness (CI, Pages, distributed mode) with explicit
   approval for each outward-facing action.
 
+If the project already contains a Lean formalization but no roadmap, `roadmap`
+can bootstrap a draft graph from the code itself
+(`scripts/import_lean_repo.py`): every Lean module becomes a tier-1 cluster and
+every declaration a tier-2 node carrying `lean_file`, so incomplete proofs are
+immediately prove-eligible and complete ones review-eligible. The result has
+the shape of the code, not of the mathematics — run the graph/content reviewers
+over it and attach sources before treating its structure as authoritative.
+
 Then run `roadmap` with the source material and desired chapters. Roadmap
 confirms sources and scope, builds or resumes the source-grounded dependency
 graph (coarse clusters → user approval → detailed split/check/review waves),
