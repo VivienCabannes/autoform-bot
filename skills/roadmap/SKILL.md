@@ -72,10 +72,21 @@ reviewers", not internal shorthand).
    reviews, and activity will be reset and that a timestamped snapshot will be
    retained under `<dispatch-project>/.autoform/snapshots/`.
 
-3. Confirm source files and scope with the user before planning. Do not invent
-   a source, silently widen the requested chapters, or substitute training
-   knowledge for a missing text. If sources are named but absent from the
-   machine, say exactly what is missing and stop.
+3. Confirm source files and scope with the user before planning. If sources
+   the user named are absent from the machine, say exactly what is missing
+   before proceeding.
+
+   The roadmap is a UNIFIED ARGUMENT you author, in the leanblueprint sense —
+   not a transcription of any one source. Cited material anchors it, but real
+   papers have gaps, and bridging them with your own mathematical knowledge is
+   part of the job: write the connective statements, mark them `origin:
+   bridged`, and let the adversarial reviewers (counterexample, faithfulness,
+   content) hold them to the same standard as everything else. Standard
+   textbook material may enter as `origin: background`. Two provenance rules
+   are absolute: never fabricate a citation (a `cited` node's `source_refs`
+   must genuinely support its statement), and never leave a node's origin
+   ambiguous — the blueprint must always know which mathematics is recovered
+   from the corpus and which is authored.
 
    Map the whole requested source at roadmap and coverage granularity before
    decomposing theorem nodes, then build the detailed DAG only for the approved

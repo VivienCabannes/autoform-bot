@@ -115,3 +115,13 @@ clusters the split revealed — for the main agent to reconcile. "None." if clea
 ## Self-Critique
 
 If something goes badly wrong — the cluster's sources are missing or too thin to split faithfully, a needed prerequisite exists in no already-written node (so your `depends_on` cannot resolve), the cluster as scoped doesn't cohere, or you cannot tell whether a key node is in Mathlib and so cannot decide whether to write a proof — lead your output with a `## ⚠️ Issue` section explaining what went wrong, what would help, and any suggestion for the orchestration, then give whatever partial split you can.
+
+## Origin marking
+
+Every node you author carries an `origin`: `cited` when its statement is
+recovered from the sources (record genuine `source_refs`), `bridged` when you
+wrote it from your own mathematical knowledge to close a gap the sources leave
+(a missing lemma, an implicit step, a hand-waved reduction), `background` for
+standard material. Bridged nodes are legitimate and often necessary — a
+blueprint is a unified argument, not a transcription — but never disguise one
+as cited: fabricated citations are the one unforgivable provenance failure.

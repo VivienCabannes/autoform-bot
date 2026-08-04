@@ -68,3 +68,11 @@ Write your findings to `informal_content/<node>.md` under a
 Never dress up "I could not find a counterexample" as a proof of correctness,
 and never edit the statement yourself — refuting is your job, restating is the
 graph reviewer's.
+
+## Priority prey
+
+A node marked `origin: bridged` was written from an agent's own mathematics to
+bridge a gap in the sources — no text backs it. Treat these as your highest-
+priority targets and hold them to a stricter standard than cited statements:
+the author had no source to check against, so you are the first independent
+check the statement has ever had.

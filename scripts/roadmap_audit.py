@@ -211,12 +211,38 @@ def audit_content(nodes: dict, project: Path) -> list[dict]:
     return out
 
 
+_ORIGINS = ("cited", "bridged", "background")
+
+
 def audit_provenance(nodes: dict) -> list[dict]:
-    return [_offender(nid, "no source_refs — statement has no provenance to review against")
-            for nid, node in nodes.items()
-            if eb.node_tier(node) == 2
-            and rm.normalize_status(node.get("mathlib_status")) != "in-mathlib"
-            and not (node.get("source_refs") or [])]
+    """Provenance = declared ORIGIN, not mandatory citations.
+
+    The blueprint is a unified argument its agents AUTHOR (leanblueprint-style):
+    gap-bridging and standard background written from the agent's own
+    mathematical knowledge are legitimate — what is never legitimate is
+    ambiguity about which kind a statement is, or a citation that doesn't
+    resolve. ``origin``: ``cited`` (from the corpus — needs ``source_refs``),
+    ``bridged`` (agent-authored connective mathematics — gets extra adversarial
+    review), ``background`` (standard material). A node with ``source_refs``
+    and no explicit origin is treated as ``cited``.
+    """
+    out = []
+    for nid, node in nodes.items():
+        if eb.node_tier(node) != 2 or rm.normalize_status(node.get("mathlib_status")) == "in-mathlib":
+            continue
+        origin = node.get("origin")
+        refs = node.get("source_refs") or []
+        if origin is None:
+            origin = "cited" if refs else None
+        if origin is None:
+            out.append(_offender(
+                nid, "no origin declared and no source_refs — say whether this is cited, "
+                     "bridged (agent-authored), or background"))
+        elif origin not in _ORIGINS:
+            out.append(_offender(nid, f"unknown origin {origin!r} (cited|bridged|background)"))
+        elif origin == "cited" and not refs:
+            out.append(_offender(nid, "origin 'cited' but no source_refs — cite it or mark it bridged"))
+    return out
 
 
 def audit_slugs(nodes: dict) -> list[dict]:
