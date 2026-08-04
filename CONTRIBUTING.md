@@ -97,7 +97,7 @@ uv run python /path/to/skill-creator/scripts/quick_validate.py skills/<name>
 From the repository root:
 
 ```bash
-uv sync --extra dev --extra repl --extra zulip
+uv sync --extra dev --extra zulip
 uv run python -m pytest -q
 python3 scripts/lint_plugin.py
 claude plugin validate .
