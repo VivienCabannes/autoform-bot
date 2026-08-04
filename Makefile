@@ -7,7 +7,7 @@ test:
 	uv run pytest -q
 
 lint:
-	uv run ruff check autoform servers visualization tests
+	uv run ruff check autoform_cli servers tests
 
 check-example:
 	uv run autoform check examples/blueprint

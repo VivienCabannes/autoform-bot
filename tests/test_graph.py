@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from autoform.graph import GraphValidationError, load_graph
+from autoform_cli.graph import GraphValidationError, load_graph
 
 
 def _node(blueprint: Path, relative: str, body: str) -> Path:
@@ -150,7 +150,7 @@ def test_check_cli(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _node(blueprint, "base.md", "# Base\n")
     result = subprocess.run(
-        [sys.executable, "-m", "autoform", "check", str(blueprint)],
+        [sys.executable, "-m", "autoform_cli", "check", str(blueprint)],
         check=False,
         capture_output=True,
         text=True,
@@ -164,7 +164,7 @@ def test_check_cli_reports_validation_errors(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _node(blueprint, "bad.md", "no heading\n")
     result = subprocess.run(
-        [sys.executable, "-m", "autoform", "check", str(blueprint)],
+        [sys.executable, "-m", "autoform_cli", "check", str(blueprint)],
         check=False,
         capture_output=True,
         text=True,

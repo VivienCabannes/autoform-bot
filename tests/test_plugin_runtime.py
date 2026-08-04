@@ -67,17 +67,17 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         assert {
-            "autoform/__main__.py",
-            "autoform/graph.py",
+            "autoform_cli/__main__.py",
+            "autoform_cli/graph.py",
+            "autoform_cli/visualize.py",
             "servers/lean_client.py",
             "servers/lean_runtime.py",
             "servers/lsp/server.py",
             "servers/repl/core.py",
             "servers/repl/server.py",
-            "visualization/export_graph.py",
         } <= names
         assert not any(
-            name.startswith(("scripts/", "autoform/prover/", "servers/lean/", "servers/search/"))
+            name.startswith(("scripts/", "autoform/", "visualization/", "servers/lean/", "servers/search/"))
             for name in names
         )
         entry_points = archive.read(
@@ -101,11 +101,10 @@ import sys
 from pathlib import Path
 site = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(site))
-from autoform import graph
+from autoform_cli import graph, visualize
 from servers import lean_client, lean_runtime
 from servers.lsp import server as lsp_server
 from servers.repl import server as repl_server
-from visualization import export_graph
 assert Path(graph.__file__).resolve().is_relative_to(site)
 assert Path(lean_client.__file__).resolve().is_relative_to(site)
 assert Path(lean_runtime.__file__).resolve().is_relative_to(site)
@@ -117,6 +116,8 @@ try:
     assert client.ensure_running()["install_id"] == lean_client.INSTALL_ID
 finally:
     client.stop()
+assert Path(lsp_server.__file__).resolve().is_relative_to(site)
+assert Path(repl_server.__file__).resolve().is_relative_to(site)
 """,
             str(site),
             str(tmp_path / "wheel-runtime.sock"),

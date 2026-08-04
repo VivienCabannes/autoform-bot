@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from visualization.export_graph import export_graph, main
+from autoform_cli.visualize import export_graph, main
 
 
 def _write_node(path: Path, title: str, dependencies: list[tuple[str, str]] | None = None) -> None:

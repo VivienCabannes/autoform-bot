@@ -121,8 +121,7 @@ when unusually large worker pools need more than the default 15 minutes to warm.
 .claude-plugin/  Claude Code manifest
 .codex-plugin/   Codex manifest
 skills/         three short expert nudges with on-demand review rubrics
-autoform/       Markdown graph parser and validator
-servers/        two public MCP adapters plus the shared Lean runtime
-visualization/  static HTML graph exporter
+autoform_cli/   blueprint validation and visualization commands
+servers/        exactly two stateful servers: Lean LSP and REPL
 tests/          graph, packaging, and server contracts
 ```

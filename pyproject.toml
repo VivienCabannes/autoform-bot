@@ -15,8 +15,8 @@ dependencies = [
 ]
 
 [project.scripts]
-autoform = "autoform.__main__:main"
-autoform-visualize = "visualization.export_graph:main"
+autoform = "autoform_cli.__main__:main"
+autoform-visualize = "autoform_cli.visualize:main"
 autoform-lean-runtime = "servers.lean_runtime:main"
 
 [project.optional-dependencies]
@@ -28,7 +28,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["autoform", "servers", "visualization"]
+packages = ["autoform_cli", "servers"]
 
 [tool.ruff]
 line-length = 120

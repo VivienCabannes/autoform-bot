@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 from urllib.parse import quote
 
-from autoform.graph import GraphValidationError, load_graph
+from .graph import GraphValidationError, load_graph
 
 if TYPE_CHECKING:
-    from autoform.graph import Graph, Node
+    from .graph import Graph, Node
 
 
 BOX_WIDTH = 240

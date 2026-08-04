@@ -1,4 +1,4 @@
-"""Command-line entry point for Autoform's small project utilities."""
+"""Command-line entry point for Autoform's project utilities."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .graph import GraphValidationError, load_graph
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m autoform")
+    parser = argparse.ArgumentParser(prog="autoform")
     subparsers = parser.add_subparsers(dest="command", required=True)
     check = subparsers.add_parser("check", help="validate a Markdown blueprint")
     check.add_argument("blueprint_dir")
