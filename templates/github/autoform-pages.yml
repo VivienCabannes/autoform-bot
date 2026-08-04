@@ -33,23 +33,18 @@ jobs:
           ref: __AUTOFORM_REVISION__
           path: .autoform-tooling
 
-      # The blueprint is the shared informal argument. Building it needs a LaTeX
-      # toolchain, so it is opt-in: create blueprint/ in the project (Roadmap's
-      # leanblueprint export) and this step publishes it under /blueprint/.
-      # Delete this step to publish the dashboard alone.
-      - name: Build the informal blueprint (optional)
+      # Blueprint output is published only when it is already committed. This
+      # keeps deployment deterministic and avoids downloading a floating TeX and
+      # Python toolchain during publication.
+      - name: Detect committed informal blueprint (optional)
         id: blueprint
         run: |
           set -euo pipefail
-          if [ ! -f blueprint/web.tex ] && [ ! -f blueprint/src/web.tex ]; then
+          if [ ! -f blueprint/web/index.html ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "no blueprint/ in the project — publishing the dashboard alone"
+            echo "no committed blueprint/web/index.html; publishing the dashboard alone"
             exit 0
           fi
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends texlive-full graphviz
-          python -m pip install --quiet leanblueprint plastexdepgraph
-          ( cd blueprint && leanblueprint web )
           echo "present=true" >> "$GITHUB_OUTPUT"
 
       - name: Export read-only dashboard

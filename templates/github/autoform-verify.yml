@@ -1,11 +1,12 @@
 # This workflow gives the auto-merge gate something real to check. Without at
 # least one successful check on a PR head the worker refuses to merge (an empty
 # check rollup is `none`, not `success`), so a project that wants autonomous
-# merging needs this — or an equivalent build check of its own.
+# merging needs this, or an equivalent build check of its own.
 #
-# It verifies on neutral hardware exactly what the local prover gate verifies:
-# the project builds, no `sorry`/`admit` survives, and no unexpected axiom was
-# introduced. Actions are pinned by full SHA.
+# It verifies on neutral hardware that the project builds and a change does not
+# add proof holes, raw axioms, or unsafe elaboration. The local prover gate still
+# performs the authoritative kernel and axiom-ledger checks for proved nodes.
+# Actions and the elan installer are pinned by immutable digests.
 
 name: autoform verify
 
@@ -29,92 +30,158 @@ jobs:
     steps:
       - name: Check out the PR head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Install elan
         run: |
           set -euo pipefail
-          curl -sSfL https://github.com/leanprover/elan/releases/download/v4.1.2/elan-x86_64-unknown-linux-gnu.tar.gz \
-            | tar xz
+          archive="$RUNNER_TEMP/elan.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.1.2/elan-x86_64-unknown-linux-gnu.tar.gz
+          echo "f81c2e48c1588d4612cd2c8851947898a45ac8d72748a07dff3a5694f1cf589b  $archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"
           ./elan-init -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       - name: Fetch the Mathlib build cache
-        run: lake exe cache get || echo "no cache available — building from source"
+        run: lake exe cache get || echo "no cache available; building from source"
 
       - name: Build
         run: lake build
 
-      - name: Reject sorry, admit, and unsafe elaboration
+      - name: Reject new proof holes, raw axioms, and unsafe elaboration
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
-          # Comments and strings are stripped before scanning so prose that
-          # merely mentions `sorry` does not fail the build.
           python3 - <<'PY'
-          import pathlib, re, sys
+          import os
+          import re
+          import subprocess
+          import sys
 
-          BLOCK = re.compile(r"/-.*?-/", re.DOTALL)
-          LINE = re.compile(r"--.*?$", re.MULTILINE)
-          STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.DOTALL)
-          FORBIDDEN = re.compile(r"\b(sorry|admit|sorryAx)\b|\bset_option\s+\S*(unsafe|skipKernelTC)\S*\s+true")
+          ZERO_SHA = "0" * 40
+          CHECKS = {
+              "proof hole": re.compile(r"\b(?:sorry|admit|sorryAx)\b(?!-)"),
+              "unsafe elaboration": re.compile(
+                  r"\b(?:run_cmd|initialize|elab|foreign|extern|syntax|macro|"
+                  r"macro_rules|native_decide|run_tac|include_str|include_bytes)\b|"
+                  r"#(?:eval|reduce|run)\b|"
+                  r"\bunsafe\s+(?:def|abbrev|theorem|instance)\b"
+              ),
+              "unsafe option": re.compile(
+                  r"\bset_option\s+\S*(?:unsafe|skipKernelTC)\S*\s+true"
+              ),
+              "raw axiom": re.compile(
+                  r"(?m)^\s*(?:@\[[^\]]*\]\s*)*"
+                  r"(?:(?:private|protected|noncomputable|scoped|local)\s+)*axiom\b"
+              ),
+          }
 
-          bad = []
-          for path in pathlib.Path(".").rglob("*.lean"):
-              if ".lake" in path.parts:
+          def git(*args, check=True):
+              return subprocess.run(
+                  ["git", *args], check=check, capture_output=True, text=False
+              )
+
+          def strip_comments(source):
+              """Blank Lean line and nested block comments, preserving layout."""
+              out = []
+              index = 0
+              block_depth = 0
+              in_string = False
+              escaped = False
+              while index < len(source):
+                  pair = source[index:index + 2]
+                  char = source[index]
+                  if block_depth:
+                      if pair == "/-":
+                          block_depth += 1
+                          out.extend("  ")
+                          index += 2
+                      elif pair == "-/":
+                          block_depth -= 1
+                          out.extend("  ")
+                          index += 2
+                      else:
+                          out.append("\n" if char == "\n" else " ")
+                          index += 1
+                      continue
+                  if in_string:
+                      out.append(char)
+                      if escaped:
+                          escaped = False
+                      elif char == "\\":
+                          escaped = True
+                      elif char == '"':
+                          in_string = False
+                      index += 1
+                      continue
+                  if pair == "--":
+                      while index < len(source) and source[index] != "\n":
+                          out.append(" ")
+                          index += 1
+                      continue
+                  if pair == "/-":
+                      block_depth = 1
+                      out.extend("  ")
+                      index += 2
+                      continue
+                  out.append(char)
+                  if char == '"':
+                      in_string = True
+                  index += 1
+              return "".join(out)
+
+          def revision_text(revision, path):
+              if not revision or not path:
+                  return ""
+              result = git("show", f"{revision}:{path}", check=False)
+              return result.stdout.decode("utf-8", errors="replace") if result.returncode == 0 else ""
+
+          base = os.environ.get("BASE_SHA", "")
+          if base == ZERO_SHA or git("cat-file", "-e", f"{base}^{{commit}}", check=False).returncode:
+              base = git("hash-object", "-t", "tree", "/dev/null").stdout.decode().strip()
+
+          fields = git(
+              "diff", "--name-status", "-z", "--find-renames", base, "HEAD", "--", "*.lean"
+          ).stdout.split(b"\0")
+          changes = []
+          index = 0
+          while index < len(fields) and fields[index]:
+              status = fields[index].decode("ascii", errors="replace")
+              index += 1
+              old_path = fields[index].decode("utf-8", errors="surrogateescape")
+              index += 1
+              if status[0] in "RC":
+                  new_path = fields[index].decode("utf-8", errors="surrogateescape")
+                  index += 1
+              elif status[0] == "D":
                   continue
-              src = path.read_text(encoding="utf-8", errors="replace")
-              stripped = STRING.sub('""', LINE.sub("", BLOCK.sub("", src)))
-              for match in FORBIDDEN.finditer(stripped):
-                  line = stripped[: match.start()].count("\n") + 1
-                  bad.append(f"{path}:{line}: {match.group(0)}")
-          if bad:
-              print("Incomplete or unsafe Lean found:", file=sys.stderr)
-              print("\n".join(bad), file=sys.stderr)
+              else:
+                  new_path = old_path
+                  if status[0] == "A":
+                      old_path = None
+              changes.append((old_path, new_path))
+
+          failures = []
+          for old_path, new_path in changes:
+              before = strip_comments(revision_text(base, old_path))
+              after = strip_comments(revision_text("HEAD", new_path))
+              for label, pattern in CHECKS.items():
+                  old_count = len(pattern.findall(before))
+                  new_count = len(pattern.findall(after))
+                  if new_count > old_count:
+                      failures.append(
+                          f"{new_path}: adds {new_count - old_count} {label} occurrence(s)"
+                      )
+
+          if failures:
+              print("New forbidden Lean constructs found:", file=sys.stderr)
+              print("\n".join(failures), file=sys.stderr)
               sys.exit(1)
-          print("no sorry/admit/unsafe elaboration found")
-          PY
-
-      - name: Audit axioms
-        run: |
-          set -euo pipefail
-          # Any axiom beyond Lean's three classical foundations is a soundness
-          # signal: it means something was assumed rather than proved.
-          python3 - <<'PY'
-          import pathlib, re, subprocess, sys
-
-          ALLOWED = {"propext", "Classical.choice", "Quot.sound"}
-          DECL = re.compile(r"^\s*(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+)*"
-                            r"(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_.']*)", re.MULTILINE)
-
-          modules, names = [], []
-          for path in sorted(pathlib.Path(".").rglob("*.lean")):
-              if ".lake" in path.parts or path.name.startswith("lakefile"):
-                  continue
-              src = path.read_text(encoding="utf-8", errors="replace")
-              found = DECL.findall(src)
-              if not found:
-                  continue
-              modules.append(".".join(path.with_suffix("").parts))
-              names.extend(found)
-          if not names:
-              print("no theorems to audit")
-              sys.exit(0)
-
-          probe = "\n".join(f"import {m}" for m in dict.fromkeys(modules))
-          probe += "\n" + "\n".join(f"#print axioms {n}" for n in dict.fromkeys(names)) + "\n"
-          pathlib.Path("autoform_axiom_probe.lean").write_text(probe, encoding="utf-8")
-
-          out = subprocess.run(["lake", "env", "lean", "autoform_axiom_probe.lean"],
-                               capture_output=True, text=True)
-          print(out.stdout)
-          if out.returncode != 0:
-              print(out.stderr, file=sys.stderr)
-              sys.exit("axiom probe failed to elaborate")
-
-          seen = set()
-          for match in re.finditer(r"depends on axioms: \[([^\]]*)\]", out.stdout):
-              seen.update(a.strip() for a in match.group(1).split(",") if a.strip())
-          extra = sorted(seen - ALLOWED)
-          if extra:
-              sys.exit(f"unexpected axioms introduced: {', '.join(extra)}")
-          print(f"axioms clean ({len(seen)} standard axiom(s) in use)")
+          print(f"checked {len(changes)} changed Lean file(s); no forbidden constructs added")
           PY

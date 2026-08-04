@@ -166,7 +166,7 @@ made to resemble a template.
    skipped for projects without a Mathlib dependency. A build failure is a
    Setup failure to surface and fix now (toolchain mismatch, stale manifest,
    broken import), never something to defer to Roadmap or Orchestrate. Report
-   how long the first build is likely to take when the cache is cold.
+   whether the cache was available and whether the build completed.
 
 4. On Codex, install the canonical role agents into the project:
 
@@ -290,10 +290,11 @@ made to resemble a template.
      auto-merge gate stays shut by design. When the user wants autonomous
      merging and the repo has no build check, offer to copy
      `<AUTOFORM_PLUGIN_ROOT>/templates/github/autoform-verify.yml` into
-     `.github/workflows/` (substituting `__DEFAULT_BRANCH__`) — it builds the
-     project, rejects surviving `sorry`/`admit`, and audits axioms, mirroring
-     the local prover gate on neutral hardware. Adding the file is a local
-     edit; committing and pushing it needs separate explicit approval;
+     `.github/workflows/` (substituting `__DEFAULT_BRANCH__`). It builds the
+     project and rejects newly introduced proof holes, raw axioms, and unsafe
+     elaboration. The local prover gate remains authoritative for kernel and
+     axiom-ledger checks. Adding the file is a local edit; committing and
+     pushing it needs separate explicit approval;
    - ensure the Lean repo's `.gitignore` keeps per-machine state local while
      durable state stays committed. Local-only: `task_queue.json`,
      `agents_status.json`, their `*.lock` files, `dispatch.log`, `worker.log`,

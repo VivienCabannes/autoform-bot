@@ -253,10 +253,13 @@ it means proof recovery. Claim the task and run these waves in order:
    mathematical methods and sources. Record checked routes so later recovery
    work does not repeat them.
 
-Write the selected route, counterexample, or reconstruction into the node's
-`## Proof recovery` ledger. Mark the recovery `done` and enqueue a worker only
-after a durable input or strategy change. If a complete wave finds no defensible
-next route, use `dispatch_queue.py <project> park <task-id> --reason <evidence>`.
+Child research agents return findings without editing project files. The recovery
+coordinator records the selected route, counterexample, or reconstruction in one
+structured graph `recovery` field through `scripts/merge_node.py`; operational
+search logs never enter published theorem prose. Mark the recovery `done` and
+enqueue a worker only after a durable input or strategy change. If a complete
+wave finds no defensible next route, use
+`dispatch_queue.py <project> park <task-id> --reason <evidence>`.
 A parked recovery stays visible and can be resumed with `resume <task-id>` when
 new evidence appears. It is not a request for human proof work.
 

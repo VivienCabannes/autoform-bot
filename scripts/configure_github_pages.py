@@ -198,6 +198,7 @@ def _workflow(
         graph_dir / "informal_content/**",
         graph_dir / "kernel/**",
         graph_dir / "review_status.json",
+        Path("blueprint/web/**"),
         Path("**/*.lean"),
         CONFIG_PATH,
         WORKFLOW_PATH,

@@ -50,6 +50,12 @@ The generated workflow pins every GitHub action and the Autoform exporter to
 full commit hashes. It checks out the project, exports the site, uploads only the
 site directory, and deploys with the official Pages actions.
 
+The workflow publishes an informal blueprint only when a built
+`blueprint/web/index.html` and its assets are already committed. Build and review
+that directory before committing it. Deployment never installs TeX or floating
+Python packages; when the committed build is absent, it publishes the dashboard
+without a blueprint.
+
 Do not create a GitHub repository, commit or push files, enable Pages, or open a
 browser under the approval above. Each is a separate outward-facing action and
 requires explicit approval at that point.

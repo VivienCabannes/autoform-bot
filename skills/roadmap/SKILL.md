@@ -90,9 +90,10 @@ reviewers", not internal shorthand).
 
    Map the whole requested source at roadmap and coverage granularity before
    decomposing theorem nodes, then build the detailed DAG only for the approved
-   milestone. Every detailed node must retain a stable `source_refs` anchor.
-   The cited source remains authoritative for statement recovery and
-   faithfulness review.
+   milestone. Every `origin: cited` detailed node must retain a stable
+   `source_refs` anchor. Bridged and background nodes carry explicit origin
+   without fabricated citations. The cited source remains authoritative for
+   statement recovery and faithfulness review.
 
 4. Ensure the dashboard is visible so the DAG appears while it grows: reuse a
    service already serving this project, otherwise start it exactly as Setup

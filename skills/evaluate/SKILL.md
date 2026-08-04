@@ -56,8 +56,9 @@ uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
   --project-root "$PROJECT_DIR" --output "$OUTPUT/audit.json"
 ```
 
-Add `--compile` to check each statement with `lake env lean`. Static checks and
-compilation do not invoke a model.
+Compilation executes the target project's Lake/Lean environment. Only after the
+user explicitly approves that local code-execution boundary, add both `--compile`
+and `--allow-project-code-execution`. Compilation does not invoke a model.
 
 When the user explicitly approves model use, add
 `--judge-backend <claude|codex|muse|openai|avocado> --confirm-model-use`.

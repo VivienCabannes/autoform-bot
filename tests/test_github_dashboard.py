@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -259,10 +260,88 @@ def test_pages_configuration_fails_closed_and_generates_pinned_workflow(tmp_path
     assert "facebookresearch/autoform-bot" in workflow
     assert "a" * 40 in workflow
     assert "export_github_dashboard.py" in workflow
+    assert "blueprint/web/**" in workflow
+    assert "blueprint/web/index.html" in workflow
+    assert "apt-get" not in workflow
+    assert "pip install" not in workflow
+    assert "leanblueprint web" not in workflow
+    assert "texlive-full" not in workflow
     assert "__" not in workflow
     action_refs = re.findall(r"uses:\s+actions/[^@\s]+@([^\s]+)", workflow)
     assert len(action_refs) == 5
     assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+
+
+def test_verify_workflow_is_incremental_and_pins_elan_installer():
+    workflow = (
+        Path(__file__).parents[1] / "templates/github/autoform-verify.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "fetch-depth: 0" in workflow
+    assert "f81c2e48c1588d4612cd2c8851947898a45ac8d72748a07dff3a5694f1cf589b" in workflow
+    assert "sha256sum --check --strict" in workflow
+    assert "BASE_SHA:" in workflow
+    assert '"diff", "--name-status", "-z", "--find-renames"' in workflow
+    assert "New forbidden Lean constructs found" in workflow
+    assert ".rglob(\"*.lean\")" not in workflow
+    assert "Audit axioms" not in workflow
+    assert not re.search(r"curl[^\n]*\|\s*tar", workflow)
+
+    action_refs = re.findall(r"uses:\s+actions/[^@\s]+@([^\s]+)", workflow)
+    assert action_refs
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+
+
+def test_incremental_verify_script_handles_existing_debt_renames_and_comments(tmp_path):
+    workflow = (
+        Path(__file__).parents[1] / "templates/github/autoform-verify.yml"
+    ).read_text(encoding="utf-8")
+    script = workflow.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+    script = "\n".join(line.removeprefix("          ") for line in script.splitlines())
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Autoform Test"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "autoform@example.invalid"], cwd=tmp_path, check=True
+    )
+    old = tmp_path / "Old.lean"
+    old.write_text("theorem old : True := by sorry\n", encoding="utf-8")
+    subprocess.run(["git", "add", "Old.lean"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "existing debt"], cwd=tmp_path, check=True)
+    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True).strip()
+
+    subprocess.run(["git", "mv", "Old.lean", "Renamed.lean"], cwd=tmp_path, check=True)
+    (tmp_path / "Safe.lean").write_text(
+        "/- outer /- nested sorry -/ axiom hidden : Prop -/\n"
+        "theorem safe : True := by trivial\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "safe changes"], cwd=tmp_path, check=True)
+    result = subprocess.run(
+        ["python3", "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "BASE_SHA": base},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    safe_head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True
+    ).strip()
+    (tmp_path / "Unsafe.lean").write_text("private axiom shortcut : Prop\n", encoding="utf-8")
+    subprocess.run(["git", "add", "Unsafe.lean"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "unsafe change"], cwd=tmp_path, check=True)
+    result = subprocess.run(
+        ["python3", "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "BASE_SHA": safe_head},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "Unsafe.lean: adds 1 raw axiom occurrence(s)" in result.stderr
 
 
 def test_private_pages_install_requires_and_records_verification(tmp_path):
