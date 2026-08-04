@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import json
 
-from servers.prover.base import EventKind
-from servers.prover.codex_adapter import (
+from autoform.prover.base import EventKind
+from autoform.prover.codex_adapter import (
     CODEX_SYSTEM_PROMPT,
     CodexAdapter,
     _classify_codex_event,
 )
-from servers.prover.driver import prove
+from autoform.prover.driver import prove
 
 
 def _lines(*objs: dict) -> list[str]:
@@ -167,8 +167,8 @@ def test_codex_system_prompt_forbids_cheating():
 
 
 def test_codex_adapter_timeout_is_terminal_failed_with_sub_status():
-    from servers.prover._cli_common import ProverTimeout
-    from servers.prover.base import EventKind
+    from autoform.prover._cli_common import ProverTimeout
+    from autoform.prover.base import EventKind
 
     def hung_runner(args, env, cwd, deadline=None):
         yield json.dumps({"type": "thread.started", "thread_id": "sess-t"})

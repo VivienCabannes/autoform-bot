@@ -139,7 +139,7 @@ Throughout, apply high-confidence corrections and note each change; surface unce
 ### 1d. Export and view
 
 Confirm full grounding with `check_invariants.py --require-grounding`, then follow
-`internal/runbooks/visualization.md` to export and open the blueprint for the
+`visualization/RUNBOOK.md` to export and open the blueprint for the
 user to review. Phase 1 ends here, with a user-approved coarse map. Confirm the
 user is happy with the scope before moving on — correcting a cluster now is far
 cheaper than after it has been split.
@@ -206,7 +206,7 @@ With tier-2 final — after both review waves — rebuild tier-1 from it: tier-2
 - **Curated.** A cluster's metadata is *not* mechanically derived — re-curate it to match the new membership: name any new cluster, update descriptions, roll up `mathlib_status`, and merge or split clusters whose composition no longer coheres. Run `graph-reviewer` and `holistic-reviewer` over the re-projected tier-1 so it stays a meaningful coarse map rather than decaying into a bare rollup.
 
 Confirm full grounding with `check_invariants.py --require-grounding`, then
-follow `internal/runbooks/visualization.md` to export and open the full tiered
+follow `visualization/RUNBOOK.md` to export and open the full tiered
 blueprint, where the tier toggle reveals the coarse map and the fine graph with
 content.
 

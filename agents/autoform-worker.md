@@ -6,7 +6,7 @@ description: >
   genuine Lean 4 proof, and compiles-to-iterate with Lean until it
   is clean — or reports an honest FAILED. Never delivers a sorry'd file as done.
 tools: [Read, Grep, Glob, Bash, Edit, Write]
-mcpServers: [autoform-repl, autoform-zulip]
+mcpServers: [autoform-repl, autoform-lsp]
 model: opus
 ---
 

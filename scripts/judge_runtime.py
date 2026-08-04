@@ -10,8 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from servers.prover.api_tools import ProjectTools, run_tool_loop
-from servers.prover.openai_adapter import _PRESETS, _env, _urllib_transport
+from autoform.prover.api_tools import ProjectTools, run_tool_loop
+from autoform.prover.openai_adapter import _PRESETS, _env, _urllib_transport
 
 SCORE_SCHEMA: dict[str, Any] = {
     "type": "object",

@@ -16,10 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from servers.prover.base import EventKind, SteeringCapability
-from servers.prover.driver import prove
-from servers.prover.openai_adapter import OpenAICompatAdapter
-from servers.prover.verify import VerifyResult
+from autoform.prover.base import EventKind, SteeringCapability
+from autoform.prover.driver import prove
+from autoform.prover.openai_adapter import OpenAICompatAdapter
+from autoform.prover.verify import VerifyResult
 
 from tests.test_steering_phase_a import _FakeSteerer, _FakeVerifier
 
@@ -328,8 +328,8 @@ def test_backup_tracks_the_file_that_actually_lands(tmp_path, keyed):
 def test_restore_leaves_unreadable_prior_untouched(tmp_path):
     """existed=True but prior=None (unreadable at land time): the driver must NOT
     delete the file (that would also lose data) and reports landed_restored=False."""
-    from servers.prover.base import ProofResult
-    from servers.prover.driver import _restore_landed
+    from autoform.prover.base import ProofResult
+    from autoform.prover.driver import _restore_landed
 
     f = tmp_path / "T.lean"
     f.write_text("rejected candidate on disk\n", encoding="utf-8")
@@ -344,7 +344,7 @@ def test_restore_leaves_unreadable_prior_untouched(tmp_path):
 
 
 def test_make_adapter_knows_openai_and_avocado(monkeypatch):
-    from servers.prover.server import _make_adapter
+    from autoform.prover.runtime import _make_adapter
 
     monkeypatch.setenv("AUTOFORM_OPENAI_MODEL", "m")
     monkeypatch.setenv("AUTOFORM_AVOCADO_BASE_URL", "https://meta.example.test/v1")

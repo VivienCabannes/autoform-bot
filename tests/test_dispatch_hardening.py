@@ -27,12 +27,12 @@ from pathlib import Path
 import pytest
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent / "scripts" / "review_ui"))
+sys.path.insert(0, str(_HERE.parent / "visualization"))
 sys.path.insert(0, str(_HERE.parent / "scripts"))
 
 import dispatch_runner as dr  # noqa: E402
-from servers.prover.base import ProofResult  # noqa: E402
-from servers.prover.verify import VerifyResult  # noqa: E402
+from autoform.prover.base import ProofResult  # noqa: E402
+from autoform.prover.verify import VerifyResult  # noqa: E402
 
 
 GRAPH = {

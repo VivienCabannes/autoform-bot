@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 
-from servers.prover.base import (
+from autoform.prover.base import (
     Event,
     EventKind,
     ProofResult,
@@ -24,9 +24,9 @@ from servers.prover.base import (
     Run,
     SteeringCapability,
 )
-from servers.prover.claude_adapter import ClaudeAdapter
-from servers.prover.driver import _live_judge_enabled, prove
-from servers.prover.verify import VerifyResult
+from autoform.prover.claude_adapter import ClaudeAdapter
+from autoform.prover.driver import _live_judge_enabled, prove
+from autoform.prover.verify import VerifyResult
 
 
 def _ev(kind: EventKind, content: str = "x") -> Event:
@@ -120,8 +120,8 @@ def _proved(**meta) -> ProofResult:
 
 
 def test_capability_declarations():
-    from servers.prover.aristotle_adapter import AristotleAdapter
-    from servers.prover.codex_adapter import CodexAdapter
+    from autoform.prover.aristotle_adapter import AristotleAdapter
+    from autoform.prover.codex_adapter import CodexAdapter
 
     assert ClaudeAdapter.steering is SteeringCapability.BETWEEN_TURNS
     assert CodexAdapter.steering is SteeringCapability.BETWEEN_TURNS

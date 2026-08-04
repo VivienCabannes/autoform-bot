@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from servers.prover.api_tools import (
+from autoform.prover.api_tools import (
     MAX_ASSISTANT_CONTENT_BYTES,
     MAX_TOOL_CALLS_PER_TURN,
     ProjectTools,
@@ -63,7 +63,7 @@ def test_search_text_has_a_bounded_fallback_without_ripgrep(
         encoding="utf-8",
     )
     (tmp_path / "Notes.txt").write_text("theorem outside glob\n", encoding="utf-8")
-    monkeypatch.setattr("servers.prover.api_tools.shutil.which", lambda _: None)
+    monkeypatch.setattr("autoform.prover.api_tools.shutil.which", lambda _: None)
 
     searched = ProjectTools(tmp_path).execute(
         "search_text", {"query": "theorem", "glob": "*.lean"}

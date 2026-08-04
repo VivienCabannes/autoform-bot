@@ -20,14 +20,6 @@
     ]
   },
   "mcpServers": {
-    "lean-informal-planner-mathlib": {
-      "command": "bash",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/servers/run-mathlib-server.sh"],
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-${CLAUDE_PROJECT_DIR}}"
-      },
-      "description": "Mathlib search for the formalization planner"
-    },
     "autoform-repl": {
       "command": "uv",
       "args": ["run", "--extra", "repl", "python", "-m", "servers.repl.server"],
@@ -35,7 +27,7 @@
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       },
-      "description": "Lean REPL compatibility stub; use direct lake/lean checks until the production pool lands"
+      "description": "Persistent Lean REPL pool for fast compilation feedback"
     },
     "autoform-lsp": {
       "command": "uv",
@@ -44,31 +36,7 @@
       "env": {
         "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
       },
-      "description": "Lean LSP compatibility stub; use direct lake/lean checks until the production server lands"
-    },
-    "autoform-aristotle": {
-      "command": "uv",
-      "args": ["run", "--extra", "aristotle", "python", "-m", "servers.aristotle.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "ARISTOTLE_DOWNLOAD_DIR": "${ARISTOTLE_DOWNLOAD_DIR:-./aristotle-output}"
-      },
-      "description": "Aristotle (Harmonic) — delegate formalization to an autonomous prover"
-    },
-    "autoform-prover": {
-      "command": "uv",
-      "args": ["run", "python", "-m", "servers.prover.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "description": "Unified kernel-gated prover across Claude, Codex, Aristotle, OpenAI, and Avocado"
-    },
-    "autoform-zulip": {
-      "command": "uv",
-      "args": ["run", "--extra", "zulip", "python", "-m", "servers.zulip.server"],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}",
-      "env": {
-        "LEAN_PROJECT_DIR": "${LEAN_PROJECT_DIR:-.}"
-      },
-      "description": "Zulip search — find community discussions about naming, proofs, and prior art"
+      "description": "Persistent Lean language server for diagnostics and hover information"
     }
   }
 }

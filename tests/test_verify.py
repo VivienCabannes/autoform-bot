@@ -10,9 +10,9 @@ import subprocess
 
 import pytest
 
-from servers.prover.base import ProofResult, ProverAdapter, Run
-from servers.prover.driver import prove
-from servers.prover.verify import (
+from autoform.prover.base import ProofResult, ProverAdapter, Run
+from autoform.prover.driver import prove
+from autoform.prover.verify import (
     VerifyResult,
     _decls_of,
     _module_of,
@@ -265,7 +265,7 @@ def test_build_probe_enumerates_from_environment():
     environment (authoritative) — not a source regex — so anonymous/generated decls are
     covered. It imports the modules, walks env.constants by module, collects axioms,
     and ends with a completion sentinel."""
-    from servers.prover.verify import _build_probe
+    from autoform.prover.verify import _build_probe
     probe, mods = _build_probe(["Foo/Bar.lean", "Foo/Bar.lean"], "/proj")
     assert mods == ["Foo.Bar"]
     assert "import Lean" in probe and "import Foo.Bar" in probe
@@ -274,7 +274,7 @@ def test_build_probe_enumerates_from_environment():
 
 
 def test_probe_has_compatibility_axiom_collector_for_older_lean():
-    from servers.prover.verify import _build_probe
+    from autoform.prover.verify import _build_probe
 
     probe, mods = _build_probe(["Foo/Bar.lean"], "/proj", compat_axioms=True)
     assert mods == ["Foo.Bar"]
@@ -283,7 +283,7 @@ def test_probe_has_compatibility_axiom_collector_for_older_lean():
 
 
 def test_whole_module_probe_checks_exact_declaration_owner():
-    from servers.prover.verify import _build_probe
+    from autoform.prover.verify import _build_probe
 
     probe, modules = _build_probe(
         ["Project/Target.lean"],
@@ -300,7 +300,7 @@ def test_whole_module_probe_checks_exact_declaration_owner():
 
 
 def test_expected_declaration_marker_handles_apostrophe_names():
-    from servers.prover.verify import _declarations_in_report
+    from autoform.prover.verify import _declarations_in_report
 
     assert _declarations_in_report("AUTOFORM_EXPECTED_DECL_OK Project.target'") == {
         "Project.target'"
@@ -415,7 +415,7 @@ def test_ledger_whitelists_project_axioms(tmp_path):
 
 
 def test_ledger_parser_is_forgiving_but_not_greedy():
-    from servers.prover.verify import parse_axiom_ledger
+    from autoform.prover.verify import parse_axiom_ledger
 
     text = (
         "# Ledger\n"

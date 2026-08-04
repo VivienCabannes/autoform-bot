@@ -47,9 +47,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_HERE = Path(__file__).resolve().parent
-if str(_HERE / "review_ui") not in sys.path:
-    sys.path.insert(0, str(_HERE / "review_ui"))
 import fslock  # noqa: E402  — the SHARED cross-process lock (dashboard + engine)
 
 

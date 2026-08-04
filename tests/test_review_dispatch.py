@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent / "scripts" / "review_ui"))
+sys.path.insert(0, str(_HERE.parent / "visualization"))
 sys.path.insert(0, str(_HERE.parent / "scripts"))
 
 import serve_review as sv   # noqa: E402
@@ -199,7 +199,7 @@ def test_dashboard_backend_registry_covers_every_available_prover():
 def test_activity_panel_links_only_targets_that_are_graph_nodes():
     """Document-range/native workflow targets must not become broken node links."""
     javascript = (
-        _HERE.parent / "assets" / "review" / "review.js"
+        _HERE.parent / "visualization" / "assets" / "review.js"
     ).read_text(encoding="utf-8")
     assert (
         "Object.prototype.hasOwnProperty.call(home.kinds || {}, id)"

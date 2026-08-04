@@ -69,7 +69,7 @@ recorded human verdict freezes the node: re-running the jury rewrites only the
   end-to-end.
 
 All of these are pure functions of (`graph.json`, `review_status.json`) implemented
-in `<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/review_model.py` (`verdict_of`,
+in `<AUTOFORM_PLUGIN_ROOT>/visualization/review_model.py` (`verdict_of`,
 `tainted_set`, `cluster_rollup`, `coverage`, `trust_frontier`, `recolor_dot`).
 
 ## The dial (spec-generation level)
@@ -124,7 +124,7 @@ This default is text-only and writes nothing. It is the CI/agent path.
 
    ```bash
    uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-       "<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/serve_review.py" \
+       "<AUTOFORM_PLUGIN_ROOT>/visualization/serve_review.py" \
        --graph <path/to/graph.json> [--lean-root <path/to/Lean/sources>] \
        [--port 8765] [--open]
    ```

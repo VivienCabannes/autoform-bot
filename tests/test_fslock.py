@@ -1,4 +1,4 @@
-"""Tests for the shared cross-process lock (scripts/review_ui/fslock.py).
+"""Tests for the shared cross-process lock (scripts/fslock.py).
 
 The dashboard and the dispatch engine both load-mutate-save ``task_queue.json``
 and ``review_status.json``; every such cycle must run under ``fslock.locked``.
@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent / "scripts" / "review_ui"))
+sys.path.insert(0, str(_HERE.parent / "visualization"))
 sys.path.insert(0, str(_HERE.parent / "scripts"))
 
 import fslock  # noqa: E402

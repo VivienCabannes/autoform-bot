@@ -229,8 +229,8 @@ def test_sorry_counts_flow_into_status(tmp_path):
 
 
 def test_server_record_usage_appends_ledger_and_refreshes_yaml(tmp_path):
-    from servers.prover.base import ProofResult
-    from servers.prover.server import _record_usage
+    from autoform.prover.base import ProofResult
+    from autoform.prover.runtime import _record_usage
 
     fz.init_formalization(tmp_path, name="X")
     result = ProofResult(status="proved", backend="claude", meta={
@@ -254,8 +254,8 @@ def test_server_record_usage_appends_ledger_and_refreshes_yaml(tmp_path):
 
 
 def test_server_record_usage_never_raises(tmp_path):
-    from servers.prover.base import ProofResult
-    from servers.prover.server import _record_usage
+    from autoform.prover.base import ProofResult
+    from autoform.prover.runtime import _record_usage
 
     # A nonexistent project dir must not break the proof result path.
     _record_usage(str(tmp_path / "nope" / "deeper"), "N", "claude",

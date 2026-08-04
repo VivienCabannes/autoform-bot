@@ -60,7 +60,7 @@ def test_demo_workspace_scanner_reports_the_intended_gaps():
 
 def test_project_bootstrap_commands_use_a_portable_locale():
     bootstrap = (ROOT / "scripts" / "make_project.sh").read_text()
-    exporter = (ROOT / "scripts" / "export_blueprint.py").read_text()
+    exporter = (ROOT / "visualization" / "export_blueprint.py").read_text()
     assert "LC_ALL=C LANG=C lake exe cache get" in bootstrap
     assert "LC_ALL=C LANG=C lake build" in bootstrap
     assert "LC_ALL=C LANG=C $(LAKE) update" in exporter

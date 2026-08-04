@@ -8,7 +8,7 @@ description: >
   reject. Returns a 0–5 score as strict JSON; the deterministic dispatcher persists it to the
   node's `ai` slot in review_status.json.
 tools: [Read, Grep, Glob, Bash]
-mcpServers: [autoform-lsp, lean-informal-planner-mathlib]
+mcpServers: [autoform-lsp]
 model: opus
 ---
 

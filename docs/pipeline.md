@@ -19,7 +19,7 @@ A plan lives in the user's project directory (next to `lakefile.toml`):
 - **`informal_content/<id>.md`** — the prose. One Markdown file per node (statement, plus proof when the concept is not in Mathlib).
 - **`sources/`** — the textbooks. The orchestrator moves received books here; `metadata.sources` records their paths.
 
-Three helper scripts under the resolved Autoform plugin root's `scripts/` directory: **`merge_node.py`** (the locked writer for `graph.json`), **`check_invariants.py`** (structural checker), **`export_blueprint.py`** (renders the plan to an interactive web view). Full data model: [`internal/references/plan-json-schema.md`](../internal/references/plan-json-schema.md).
+Two state helpers under `scripts/`—**`merge_node.py`** and **`check_invariants.py`**—plus **`visualization/export_blueprint.py`** for the interactive web view. Full data model: [`internal/references/plan-json-schema.md`](../internal/references/plan-json-schema.md).
 
 ### Two design decisions in the data model
 

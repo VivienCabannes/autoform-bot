@@ -14,8 +14,8 @@ from typing import Any
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from servers.prover.api_tools import ProjectTools, run_tool_loop  # noqa: E402
-from servers.prover.openai_adapter import (  # noqa: E402
+from autoform.prover.api_tools import ProjectTools, run_tool_loop  # noqa: E402
+from autoform.prover.openai_adapter import (  # noqa: E402
     _PRESETS,
     _env,
     _urllib_transport,

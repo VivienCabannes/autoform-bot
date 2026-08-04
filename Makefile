@@ -65,7 +65,7 @@ test: ## Run the test suite
 
 .PHONY: lint
 lint: ## Lint the Python sources (ruff)
-	uv run --with ruff ruff check scripts/ servers/ tests/
+	uv run --with ruff ruff check autoform/ scripts/ servers/ visualization/ tests/
 
 .PHONY: clean
 clean: ## Remove .venv and caches

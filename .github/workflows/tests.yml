@@ -19,7 +19,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Install test environment
-        run: uv sync --extra dev --extra repl --extra zulip
+        run: uv sync --extra dev --extra repl
       - name: Run unit tests
         run: uv run python -m pytest -q
       - name: Run bundled demo
@@ -35,11 +35,11 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - name: Install quality environment
-        run: uv sync --extra dev --extra repl --extra zulip
+        run: uv sync --extra dev --extra repl
       - name: Lint Python surfaces
         run: |
           make lint
-          uv run ruff check scripts tests
+          uv run ruff check autoform scripts servers visualization tests
       - name: Lint plugin surfaces
         run: python3 scripts/lint_plugin.py
       - name: Reject whitespace errors

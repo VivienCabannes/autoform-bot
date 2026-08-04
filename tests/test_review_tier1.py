@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent / "scripts" / "review_ui"))
+sys.path.insert(0, str(_HERE.parent / "visualization"))
 sys.path.insert(0, str(_HERE.parent / "scripts"))
 
 import review_model as rm        # noqa: E402

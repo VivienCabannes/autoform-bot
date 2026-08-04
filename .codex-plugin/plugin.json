@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "AutoForm Bot",
     "shortDescription": "Lean 4 autoformalization workflows for coding agents",
-    "longDescription": "AutoForm Bot packages a host-neutral formalization workflow as Agent Skills, native Codex role agents, and MCP tool servers for Lean 4 and Mathlib projects.",
+    "longDescription": "AutoForm Bot packages three expert formalization workflows, native role agents, and persistent Lean LSP/REPL tools.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
     "capabilities": ["Read", "Write"],

@@ -44,16 +44,7 @@ REPO_ROOT = SCRIPT.parents[1]            # root-level plugin: scripts/.. == repo
 # straggler reference is caught. Empty on the pristine niket/dev tree.
 REMOVED_AGENTS: tuple[str, ...] = ()
 REMOVED_SKILLS: tuple[str, ...] = ()
-EXPECTED_MCP_SERVERS = frozenset(
-    {
-        "lean-informal-planner-mathlib",
-        "autoform-repl",
-        "autoform-lsp",
-        "autoform-aristotle",
-        "autoform-prover",
-        "autoform-zulip",
-    }
-)
+EXPECTED_MCP_SERVERS = frozenset({"autoform-lsp", "autoform-repl"})
 PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "orchestrate", "set-backend"})
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/environment.md",
@@ -63,12 +54,9 @@ REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/planning.md",
     "internal/runbooks/proving.md",
     "internal/runbooks/review.md",
-    "internal/runbooks/visualization.md",
     "internal/runbooks/workspace.md",
-    "internal/runbooks/zulip.md",
     "internal/references/plan-json-schema.md",
     "internal/references/reviewer-packet.md",
-    "internal/references/zulip-configuration.md",
     "internal/references/mathlib/lean4-syntax.md",
     "internal/references/mathlib/mathlib-conventions.md",
     "internal/references/mathlib/proof-patterns.md",
@@ -87,8 +75,19 @@ REQUIRED_INTERNAL_ASSETS = (
     "scripts/install_autoform.sh",
     "scripts/install_lean.sh",
     "scripts/make_project.sh",
-    "scripts/service_control.py",
+    "scripts/fslock.py",
     "scripts/workspace_inspector.py",
+    "visualization/RUNBOOK.md",
+    "visualization/SETUP.md",
+    "visualization/check_toolchain.sh",
+    "visualization/export_blueprint.py",
+    "visualization/review_model.py",
+    "visualization/serve_review.py",
+    "visualization/service_control.py",
+    "visualization/assets/dep_graph_core.js",
+    "visualization/assets/review.css",
+    "visualization/assets/review.js",
+    "visualization/templates/dep_graph.html",
 )
 
 errors: list[str] = []

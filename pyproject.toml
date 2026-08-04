@@ -20,16 +20,13 @@ repl = [
 aristotle = [
     "aristotlelib>=2.0",
 ]
-zulip = [
-    "zulip>=0.9.0",
-]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["servers"]
+packages = ["autoform", "servers", "visualization"]
 
 [tool.ruff]
 line-length = 120

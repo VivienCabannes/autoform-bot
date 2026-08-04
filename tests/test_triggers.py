@@ -10,9 +10,9 @@ into the result meta.
 
 from __future__ import annotations
 
-from servers.prover.base import Event, EventKind, SteeringCapability
-from servers.prover.driver import prove
-from servers.prover.triggers import (
+from autoform.prover.base import Event, EventKind, SteeringCapability
+from autoform.prover.driver import prove
+from autoform.prover.triggers import (
     SIGNAL_FORBIDDEN,
     SIGNAL_OFF_GOAL,
     SIGNAL_REPEATED_ERROR,
@@ -319,7 +319,7 @@ def test_trigger_steers_respect_max_steers_budget():
 
 
 def test_injected_engine_and_steerer_call_counter():
-    from servers.prover.steerer import Steerer
+    from autoform.prover.steerer import Steerer
 
     s = Steerer(min_gap_s=0.0, judge=lambda p: '{"steer": false, "prompt": ""}')
     s.off_course("g", [Event(EventKind.EDIT, "e")])
@@ -332,7 +332,7 @@ def test_injected_engine_and_steerer_call_counter():
 
 
 def test_claude_edit_events_carry_path_and_payload():
-    from servers.prover.claude_adapter import _classify_stream_event
+    from autoform.prover.claude_adapter import _classify_stream_event
 
     ev = _classify_stream_event({"type": "assistant", "message": {"content": [
         {"type": "tool_use", "name": "Edit",
@@ -359,7 +359,7 @@ def test_claude_edit_events_carry_path_and_payload():
 
 
 def test_codex_edit_events_carry_path_and_payload():
-    from servers.prover.codex_adapter import _classify_codex_event
+    from autoform.prover.codex_adapter import _classify_codex_event
 
     ev, _, _ = _classify_codex_event(
         {"type": "item.completed",
@@ -370,7 +370,7 @@ def test_codex_edit_events_carry_path_and_payload():
 
 
 def test_aristotle_edit_events_carry_path():
-    from servers.prover.aristotle_adapter import _normalize
+    from autoform.prover.aristotle_adapter import _normalize
 
     class _Raw:
         class event_type:

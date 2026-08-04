@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Set up the full autoform environment.
-# Checks uv, Python deps, Lean 4, and optional Zulip access.
+# Checks uv, Python dependencies, and Lean 4.
 #
 # Usage: bash install-autoform.sh
 # Safe to re-run — skips steps that are already done.
@@ -56,12 +56,11 @@ else
 fi
 
 # Optional extras
-for extra in repl zulip aristotle; do
+for extra in repl aristotle; do
   pkg="$extra"
   # Map extra name to import name
   case "$extra" in
     repl)      pkg="psutil" ;;
-    zulip)     pkg="zulip" ;;
     aristotle) pkg="aristotlelib" ;;
   esac
 
@@ -72,7 +71,7 @@ for extra in repl zulip aristotle; do
     if uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra "$extra" python -c "import $pkg" 2>/dev/null; then
       ok "$extra ($pkg) installed"
     else
-      warn "Failed to install $extra extra — $extra server will not work"; all_ok=false
+      warn "Failed to install $extra extra — $extra integration will not work"; all_ok=false
     fi
   fi
 done
@@ -131,76 +130,7 @@ else
 fi
 
 # =========================================================================
-# 5. Zulip credentials (optional)
-# =========================================================================
-log "Checking Zulip (optional)"
-
-ZULIPRC_FILE=""
-for candidate in \
-  "${ZULIPRC:-}" \
-  "${LEAN_PROJECT_DIR:-.}/.zuliprc" \
-  "$HOME/.zuliprc" \
-  "$HOME/.config/.zuliprc" \
-  "$HOME/.config/zulip/.zuliprc" \
-  "$HOME/.config/zuliprc"; do
-  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-    ZULIPRC_FILE="$candidate"
-    break
-  fi
-done
-
-if [ -z "$ZULIPRC_FILE" ]; then
-  skip "No .zuliprc found — Zulip search will not work"
-  echo ""
-  echo "  To enable Zulip search:"
-  echo ""
-  echo "  1. Go to https://leanprover.zulipchat.com/#settings/account"
-  echo "  2. Scroll to 'API key' and click 'Get API key'"
-  echo "  3. Run:"
-  echo ""
-  echo "     cat > ~/.zuliprc << 'EOF'"
-  echo "     [api]"
-  echo "     email=YOUR_ZULIP_EMAIL"
-  echo "     key=YOUR_API_KEY"
-  echo "     site=https://leanprover.zulipchat.com"
-  echo "     EOF"
-  echo "     chmod 600 ~/.zuliprc"
-  echo ""
-else
-  ok "Found $ZULIPRC_FILE"
-
-  # Check permissions
-  perms="$(stat -c '%a' "$ZULIPRC_FILE" 2>/dev/null || /usr/bin/stat -f '%Lp' "$ZULIPRC_FILE" 2>/dev/null || echo "unknown")"
-  if [ "$perms" = "600" ]; then
-    ok "File permissions: 600"
-  elif [ "$perms" != "unknown" ]; then
-    warn "File permissions: $perms (recommend 600 — run: chmod 600 $ZULIPRC_FILE)"
-  fi
-
-  # Test connectivity
-  result="$(uv run --project "$AUTOFORM_RESOLVED_ROOT" --extra zulip python -c "
-import zulip, json
-client = zulip.Client(config_file='$ZULIPRC_FILE')
-r = client.get_server_settings()
-if r.get('result') == 'success':
-    print(json.dumps({'ok': True, 'version': r.get('zulip_version', '?')}))
-else:
-    print(json.dumps({'ok': False, 'error': r.get('msg', 'unknown')}))
-" 2>/dev/null)" || result='{"ok": false, "error": "Failed to run connectivity test"}'
-
-  is_ok="$(printf '%s' "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")"
-
-  if [ "$is_ok" = "True" ]; then
-    version="$(printf '%s' "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version', '?'))" 2>/dev/null || echo "?")"
-    ok "Connected to Zulip (server version $version)"
-  else
-    error="$(printf '%s' "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error', 'unknown'))" 2>/dev/null || echo "unknown")"
-    warn "Cannot connect to Zulip: $error — check your .zuliprc credentials"
-  fi
-fi
-
-# =========================================================================
-# 6. Lean Explore API key (optional)
+# 5. Lean Explore API key (optional)
 # =========================================================================
 log "Checking Lean Explore (optional)"
 

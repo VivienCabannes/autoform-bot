@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from servers.aristotle.core import (
+from autoform.prover.aristotle import (
     AristotleManager,
     DEFAULT_DELEGATE_SYSTEM,
     build_node_spec,
@@ -239,7 +239,7 @@ def test_default_system_prompt_forbids_cheating():
 def test_overlay_lands_only_lean_files_and_protects_build_config(tmp_path):
     """Aristotle's returned lakefile/toolchain (and any non-.lean file) must never
     overwrite the user's project — only .lean files are overlaid."""
-    from servers.aristotle.core import _overlay_project
+    from autoform.prover.aristotle import _overlay_project
 
     project = tmp_path / "project"
     project.mkdir()

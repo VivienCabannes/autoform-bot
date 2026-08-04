@@ -10,7 +10,6 @@ against FAKE adapters and a FAKE steer-judge — **no live network, no live
 
 from __future__ import annotations
 
-import asyncio
 import io
 import json
 import tarfile
@@ -18,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from servers.prover.base import (
+from autoform.prover.base import (
     Event,
     EventKind,
     ProofResult,
@@ -26,9 +25,9 @@ from servers.prover.base import (
     Run,
     SteeringCapability,
 )
-from servers.prover.claude_adapter import ClaudeAdapter, _classify_stream_event, _looks_failed
-from servers.prover.driver import prove
-from servers.prover.steerer import Steerer
+from autoform.prover.claude_adapter import ClaudeAdapter, _classify_stream_event, _looks_failed
+from autoform.prover.driver import prove
+from autoform.prover.steerer import Steerer
 
 
 # ===========================================================================
@@ -259,7 +258,7 @@ def test_steerer_fences_untrusted_events_in_judge_prompt():
 
 def test_steer_judge_cli_scrubs_auth_token(monkeypatch):
     """The default judge must not leak ANTHROPIC_API_KEY/AUTH_TOKEN to claude."""
-    from servers.prover import steerer as steerer_mod
+    from autoform.prover import steerer as steerer_mod
 
     captured = {}
 
@@ -406,7 +405,7 @@ def test_looks_failed_heuristic():
 
 
 def test_claude_system_prompt_forbids_cheating():
-    from servers.prover.claude_adapter import WORKER_SYSTEM_PROMPT
+    from autoform.prover.claude_adapter import WORKER_SYSTEM_PROMPT
     for token in ("sorry", "admit", "axiom", "native_decide", "ANTHROPIC_API_KEY", "FAILED"):
         assert token in WORKER_SYSTEM_PROMPT
 
@@ -505,7 +504,7 @@ def test_claude_adapter_threads_deadline_to_runner():
 def test_claude_adapter_timeout_is_terminal_failed_with_sub_status():
     """A hung worker (runner raises ProverTimeout) ends the run: terminal error
     event, status=failed, reason mentions the timeout, meta sub_status=timeout."""
-    from servers.prover._cli_common import ProverTimeout
+    from autoform.prover._cli_common import ProverTimeout
 
     def hung_runner(args, env, cwd, deadline=None):
         yield json.dumps({"type": "system", "subtype": "init", "session_id": "sess-t"})
@@ -523,7 +522,7 @@ def test_claude_adapter_timeout_is_terminal_failed_with_sub_status():
 
 
 def test_make_adapter_threads_extra_args_and_mcp_config():
-    from servers.prover.server import _make_adapter
+    from autoform.prover.runtime import _make_adapter
 
     a = _make_adapter("claude", "g.json", 60, extra_args=["--foo"], mcp_config="/x/mcp.json")
     assert a._extra_args == ["--foo"]
@@ -635,8 +634,8 @@ def _write_plan(tmp_path: Path) -> Path:
 
 def test_aristotle_adapter_drives_via_shared_driver(tmp_path):
     """The Aristotle adapter runs under the SAME driver, lands files, reports proved."""
-    from servers.aristotle.core import AristotleManager
-    from servers.prover.aristotle_adapter import AristotleAdapter
+    from autoform.prover.aristotle import AristotleManager
+    from autoform.prover.aristotle_adapter import AristotleAdapter
 
     gp = _write_plan(tmp_path)
     mgr = AristotleManager(download_dir=str(tmp_path / ".cache"),
@@ -657,8 +656,8 @@ def test_aristotle_adapter_drives_via_shared_driver(tmp_path):
 
 def test_aristotle_complete_with_errors_is_failed_continuable(tmp_path):
     """COMPLETE_WITH_ERRORS is not a proved-claim: failed + sub-status continuable."""
-    from servers.aristotle.core import AristotleManager
-    from servers.prover.aristotle_adapter import AristotleAdapter
+    from autoform.prover.aristotle import AristotleManager
+    from autoform.prover.aristotle_adapter import AristotleAdapter
 
     gp = _write_plan(tmp_path)
     mgr = AristotleManager(download_dir=str(tmp_path / ".cache"),
@@ -676,8 +675,8 @@ def test_aristotle_complete_with_errors_is_failed_continuable(tmp_path):
 
 
 def test_aristotle_adapter_closes_private_loop_after_result(tmp_path):
-    from servers.aristotle.core import AristotleManager
-    from servers.prover.aristotle_adapter import AristotleAdapter
+    from autoform.prover.aristotle import AristotleManager
+    from autoform.prover.aristotle_adapter import AristotleAdapter
 
     gp = _write_plan(tmp_path)
     mgr = AristotleManager(download_dir=str(tmp_path / ".cache"),
@@ -690,8 +689,8 @@ def test_aristotle_adapter_closes_private_loop_after_result(tmp_path):
 
 
 def test_aristotle_adapter_events_normalized(tmp_path):
-    from servers.aristotle.core import AristotleManager
-    from servers.prover.aristotle_adapter import AristotleAdapter
+    from autoform.prover.aristotle import AristotleManager
+    from autoform.prover.aristotle_adapter import AristotleAdapter
 
     gp = _write_plan(tmp_path)
     mgr = AristotleManager(download_dir=str(tmp_path / ".cache"),
@@ -705,7 +704,7 @@ def test_aristotle_adapter_events_normalized(tmp_path):
 
 
 # ===========================================================================
-# Server / import-hygiene
+# Runtime import hygiene
 # ===========================================================================
 
 
@@ -714,11 +713,11 @@ def test_prover_package_imports_without_aristotlelib():
     import importlib
 
     for mod in (
-        "servers.prover.base",
-        "servers.prover.steerer",
-        "servers.prover.driver",
-        "servers.prover.claude_adapter",
-        "servers.prover.server",
+        "autoform.prover.base",
+        "autoform.prover.steerer",
+        "autoform.prover.driver",
+        "autoform.prover.claude_adapter",
+        "autoform.prover.runtime",
     ):
         importlib.import_module(mod)
     # aristotlelib must not have been imported as a side effect.
@@ -726,26 +725,8 @@ def test_prover_package_imports_without_aristotlelib():
     assert "aristotlelib" not in sys.modules
 
 
-def test_prover_server_exposes_single_prove_node_tool():
-    from servers.prover.server import create_prover_server
-
-    server = create_prover_server()
-    assert server.name == "autoform-prover"
-    names = {getattr(t, "name", t) for t in asyncio.run(server.list_tools())}
-    assert names == {"prove_node"}
-
-
-def test_prover_mcp_entry_has_no_aristotle_extra(repo_root):
-    """The claude-only default path must not pay a launch-time aristotlelib
-    dependency: the lazy import handles absence, erroring at selection time."""
-    cfg = json.loads((repo_root / ".mcp.json").read_text(encoding="utf-8"))
-    entry = cfg["mcpServers"]["autoform-prover"]
-    assert "--extra" not in entry["args"]
-    assert "ARISTOTLE_DOWNLOAD_DIR" not in entry.get("env", {})  # dead env removed
-
-
 def test_aristotle_adapter_honors_download_dir_env(tmp_path, monkeypatch):
-    from servers.prover.aristotle_adapter import AristotleAdapter
+    from autoform.prover.aristotle_adapter import AristotleAdapter
 
     monkeypatch.setenv("ARISTOTLE_DOWNLOAD_DIR", str(tmp_path / "dl"))
     adapter = AristotleAdapter(graph_path="g.json")
@@ -759,7 +740,7 @@ def test_aristotle_adapter_honors_download_dir_env(tmp_path, monkeypatch):
 
 
 def test_prove_node_unknown_backend_fails_gracefully(tmp_path):
-    from servers.prover.server import run_prove_node
+    from autoform.prover.runtime import run_prove_node
 
     gp = _write_plan(tmp_path)
     with pytest.raises(ValueError):
@@ -767,7 +748,7 @@ def test_prove_node_unknown_backend_fails_gracefully(tmp_path):
 
 
 def test_prove_node_api_backend_requires_explicit_egress_consent(tmp_path):
-    from servers.prover.server import run_prove_node
+    from autoform.prover.runtime import run_prove_node
 
     gp = _write_plan(tmp_path)
     with pytest.raises(ValueError, match="egress consent"):
@@ -782,7 +763,7 @@ def test_prove_node_api_backend_requires_explicit_egress_consent(tmp_path):
 def test_shared_steerer_usage_is_stamped_per_run_not_cumulative():
     """One Steerer injected across two prove() calls must not double-count the
     first run's judge usage in the second run's ledger stamp."""
-    from servers.prover.steerer import Steerer
+    from autoform.prover.steerer import Steerer
 
     s = Steerer(min_gap_s=0.0,
                 judge=lambda p: ('{"steer": false, "prompt": ""}',
@@ -804,7 +785,7 @@ def test_unknown_judge_policy_fails_closed():
 
 def test_cli_judge_tolerates_json_scalar_stdout(monkeypatch):
     """A JSON-scalar stdout ("null") must decline to steer, not crash prove()."""
-    from servers.prover import steerer as steerer_mod
+    from autoform.prover import steerer as steerer_mod
 
     def fake_run(args, capture_output, text, env, timeout):
         class P:

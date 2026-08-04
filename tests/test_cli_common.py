@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from servers.prover._cli_common import (
+from autoform.prover._cli_common import (
     ProverTimeout,
     _build_spec_prompt,
     _failure_reason,
@@ -20,8 +20,8 @@ from servers.prover._cli_common import (
     _subprocess_line_runner,
     build_worker_prompt,
 )
-from servers.prover.claude_adapter import WORKER_SYSTEM_PROMPT
-from servers.prover.codex_adapter import CODEX_SYSTEM_PROMPT
+from autoform.prover.claude_adapter import WORKER_SYSTEM_PROMPT
+from autoform.prover.codex_adapter import CODEX_SYSTEM_PROMPT
 
 # The claude-backend prompt parameters, pinned here so the lock-test below catches
 # any silent change to the shared skeleton OR these deltas.
@@ -52,7 +52,7 @@ def test_scrubbed_env_drops_anthropic_key(monkeypatch):
 
 
 def test_verify_scrubbed_env_drops_auth_token(monkeypatch):
-    from servers.prover.verify import _scrubbed_env as verify_scrub
+    from autoform.prover.verify import _scrubbed_env as verify_scrub
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-secret")

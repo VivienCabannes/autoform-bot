@@ -8,7 +8,7 @@ description: >
   score as strict JSON; the deterministic dispatcher persists it to the node's `ai` slot in
   review_status.json. Blind to the proof and to code style.
 tools: [Read, Grep, Glob, Bash]
-mcpServers: [autoform-lsp, autoform-zulip]
+mcpServers: [autoform-lsp]
 model: opus
 ---
 

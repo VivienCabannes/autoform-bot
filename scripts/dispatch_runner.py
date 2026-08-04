@@ -36,23 +36,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE / "review_ui"))
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))   # plugin root, for prover/runtime imports
 import fslock  # noqa: E402  # cross-process lock shared with serve_review
-import review_model as rm  # noqa: E402  # load_sidecar / save_sidecar / jury_verdict
+from visualization import review_model as rm  # noqa: E402  # sidecar / jury verdict
 import dispatch_queue as dq  # noqa: E402  # _save / _feed_for / _now
 import backend_config  # noqa: E402  # user-facing backend selection
 import judge_runtime  # noqa: E402  # structured jury across CLI/API providers
 import merge_node  # noqa: E402  # locked graph writer
 import target_state  # noqa: E402  # proof/review freshness fingerprints
 try:
-    from servers.prover.driver import prove as _prove
-    from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
-    from servers.prover.steerer import Steerer as _Steerer
-    from servers.prover.verify import verify_proof as _verify_existing_proof
+    from autoform.prover.driver import prove as _prove
+    from autoform.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
+    from autoform.prover.steerer import Steerer as _Steerer
+    from autoform.prover.verify import verify_proof as _verify_existing_proof
     try:
-        from servers.aristotle.core import build_node_spec as _build_node_spec
+        from autoform.prover.aristotle import build_node_spec as _build_node_spec
     except Exception:
         _build_node_spec = None
     _PROVER_OK, _PROVER_ERR = True, ""
@@ -241,16 +240,16 @@ def _worker_adapter(
     Every backend is explicit and imported lazily so the engine starts without
     optional provider dependencies."""
     if backend == "aristotle":
-        from servers.prover.aristotle_adapter import AristotleAdapter
+        from autoform.prover.aristotle_adapter import AristotleAdapter
         return AristotleAdapter(
             graph_path=graph_path,
             max_wait_seconds=max_wait_seconds,
         )
     if backend == "codex":
-        from servers.prover.codex_adapter import CodexAdapter
+        from autoform.prover.codex_adapter import CodexAdapter
         return CodexAdapter(max_wait_seconds=max_wait_seconds)
     if backend in {"openai", "avocado"}:
-        from servers.prover.openai_adapter import OpenAICompatAdapter
+        from autoform.prover.openai_adapter import OpenAICompatAdapter
         return OpenAICompatAdapter(
             graph_path=graph_path,
             preset=backend,
@@ -334,7 +333,7 @@ def run_worker(
         # The MCP prover records usage itself, but the deterministic dispatcher
         # calls the shared driver directly. Keep both entry points on the same
         # append-only ledger contract.
-        from servers.prover.server import _record_usage
+        from autoform.prover.runtime import _record_usage
         _record_usage(repo, node_id, backend, res)
         return res.status, (res.reason or ""), (res.proof_text or "")
     except Exception as e:

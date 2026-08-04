@@ -8,7 +8,7 @@ description: >
   scripts/merge_node.py for the nodes it owns, and flags everything outside its
   responsibility. References the sources when uncertain.
 tools: [Read, Bash]
-mcpServers: [lean-informal-planner-mathlib]
+mcpServers: []
 model: opus
 ---
 
@@ -31,7 +31,7 @@ You receive:
 - The path to `graph.json` and the project directory (for `informal_content/` and `sources/`), and the path to the `merge_node.py` writer.
 - The tier and phase you are reviewing.
 
-**Searching Mathlib.** Use the Bash CLI `python3 <plugin>/scripts/mathlib_search.py {name|grep|read|path} ...` to search the real local checkout — the orchestrator gives you the plugin root path. The MCP `mathlib_*` tools reach only the main orchestrator, not subagents like you, so the CLI is your search path (it resolves the same checkout). If `... path` errors, Mathlib isn't reachable; say so rather than asserting a grounding from memory.
+**Searching Mathlib.** Search the project's local Mathlib checkout with `rg`, and validate candidate declarations in Lean before relying on them. If Mathlib is unavailable, say so rather than asserting a grounding from memory.
 
 For tier-2 review, an edge's faithfulness is checked against the node's `informal_content/<id>.md` statement and proof, so read those for your nodes and their prerequisites.
 
@@ -79,7 +79,7 @@ This remit applies in **both phases**. Look for places where the jump between tw
 
 When the gap is between two of your nodes, fill it: create the intermediate node and re-point edges as described under **How you edit** (an intermediate is created `content: null` — a tier-1 cluster holds no prose, and a Phase-2 intermediate awaits the content step). When filling it would require editing a node you don't own, flag the gap with the concrete intermediate you propose. If you can see a gap but the provided sources don't cover the intermediate material, flag that a reference covering it is needed.
 
-**Grounding gaps in Mathlib.** The point of filling a gap is to bring a `missing` concept closer to a green (`in-mathlib`) root. When a prerequisite is ordinary Mathlib material, ground it in a green node at roughly the granularity of a coherent topic folder (e.g. `Analysis/Calculus/Gradient`) — a guide rather than a rule, so merge thin folders and split sprawling ones as judgment dictates. Create such a node only when the prerequisite has actually been found in Mathlib (verifiable with `mathlib_search.py grep`/`name`), identified by the common subfolder of the hits and backed by real declarations. Ground a root only when concrete declarations back it; when you're unsure Mathlib covers something, leave it `missing` and say so.
+**Grounding gaps in Mathlib.** The point of filling a gap is to bring a `missing` concept closer to a green (`in-mathlib`) root. When a prerequisite is ordinary Mathlib material, ground it in a green node at roughly the granularity of a coherent topic folder (e.g. `Analysis/Calculus/Gradient`) — a guide rather than a rule, so merge thin folders and split sprawling ones as judgment dictates. Create such a node only when it has been found in the local Mathlib source with `rg`, identified by the common subfolder of the hits, and backed by real declarations. Ground a root only when concrete declarations back it; when you're unsure Mathlib covers something, leave it `missing` and say so.
 
 ## Guidelines
 
@@ -87,7 +87,7 @@ When the gap is between two of your nodes, fill it: create the intermediate node
 - **Think capability, not tier label.** Judge each edge and each gap by what the concept genuinely needs to be defined or proved, at whatever tier and scope you were handed. The same questions apply to a coarse cluster graph and to the fine edges inside one cluster.
 - **Be conservative with removals and merges.** Remove an edge only when you are confident the dependency is not real; an edge that looks unnecessary may reflect a non-obvious proof step. Merge only nodes that are genuinely one concept.
 - **Be liberal with additions.** When a missing dependency or intermediate is plausible, add it (or flag it); a false positive is cheaper to drop later than a real dependency is to discover mid-formalization. For Phase-2 intermediates, match granularity to the existing nodes.
-- **Hold edges into Mathlib roots to a higher standard.** An edge claiming a concept rests on a green (`in-mathlib`) node — especially a broad one like "Linear algebra" or "Basic probability" — is the easiest to assert and the hardest to catch when wrong, since a bad one quietly makes a `missing` concept look grounded. Confirm it with `mathlib_search.py` rather than on the strength of the root's name: check that the specific prerequisite really lives in that area and that the node's `mathlib_declarations` cover it. If nothing concrete backs the edge, or the root is broad enough to absorb almost anything, return the prerequisite to `missing` (or, if it's not your node, flag it) and pin to specific declarations where you can.
+- **Hold edges into Mathlib roots to a higher standard.** An edge claiming a concept rests on a green (`in-mathlib`) node — especially a broad one like "Linear algebra" or "Basic probability" — is the easiest to assert and the hardest to catch when wrong, since a bad one quietly makes a `missing` concept look grounded. Confirm it in the local Mathlib source rather than on the strength of the root's name: check that the specific prerequisite really lives in that area and that the node's `mathlib_declarations` cover it. If nothing concrete backs the edge, or the root is broad enough to absorb almost anything, return the prerequisite to `missing` (or, if it's not your node, flag it) and pin to specific declarations where you can.
 - **Justify every change.** For each edit and each flag, say why, and cite the source location or the passage of the node's content that supports it — the orchestrator keeps a bounded global view from your report and may revert any change it rejects.
 
 ## Output format

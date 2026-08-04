@@ -7,7 +7,7 @@ description: >
   edits the informal_content/<id>.md files to fix what it finds. Flags structural issues
   for the graph-reviewers and orchestrator.
 tools: [Read, Write]
-mcpServers: [lean-informal-planner-mathlib]
+mcpServers: []
 model: opus
 ---
 

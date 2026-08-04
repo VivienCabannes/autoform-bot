@@ -132,7 +132,7 @@ The run is complete only when:
 
 Run these only on disposable copies:
 
-- On macOS, start both project services with `scripts/service_control.py`,
+- On macOS, start both project services with `visualization/service_control.py`,
   terminate each named launchd job once, and require a new PID plus a responding
   loopback port. End the assistant task and confirm both URLs still respond from
   a new task;

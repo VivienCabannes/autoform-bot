@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts import service_control as sc
+from visualization import service_control as sc
 
 
 def _review_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> sc.ServiceSpec:
@@ -14,7 +14,7 @@ def _review_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> sc.Servi
     plugin = tmp_path / "plugin"
     graph = project / "graph.json"
     lean_root = tmp_path / "lean"
-    server = plugin / "scripts" / "review_ui" / "serve_review.py"
+    server = plugin / "visualization" / "serve_review.py"
     project.mkdir()
     lean_root.mkdir()
     server.parent.mkdir(parents=True)

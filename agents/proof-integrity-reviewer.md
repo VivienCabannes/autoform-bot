@@ -9,7 +9,7 @@ description: >
   the node's `ai` slot in review_status.json. Blind to the statement's faithfulness and to code
   style.
 tools: [Read, Grep, Glob, Bash]
-mcpServers: [autoform-lsp, autoform-zulip]
+mcpServers: [autoform-lsp]
 model: opus
 ---
 
