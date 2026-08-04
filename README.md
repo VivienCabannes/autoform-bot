@@ -68,17 +68,6 @@ uv run pytest -q
 The visualization is self-contained and works directly from `file://`; clicking
 a node opens its Markdown file.
 
-## Muse/TBH
-
-Muse can use the repository directly through `.muse-plugin/plugin.json`, beside
-the native Claude and Codex manifests:
-
-```bash
-tbh plugins validate . --json
-tbh plugins install .
-tbh plugins enable autoform
-```
-
 ## Plugin surface
 
 - `setup` creates or repairs the Markdown blueprint after confirming sources and scope.
@@ -96,7 +85,6 @@ search stays outside the server surface and uses host-native tools when useful.
 ```text
 .claude-plugin/  Claude Code manifest
 .codex-plugin/   Codex manifest
-.muse-plugin/    Muse/TBH source manifest
 skills/         three short expert nudges with on-demand review rubrics
 autoform/       Markdown graph parser and validator
 servers/        exactly two stateful servers: Lean LSP and REPL

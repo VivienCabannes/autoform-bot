@@ -106,7 +106,7 @@ repl = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = ">=0.4" },
+    { name = "fastmcp", specifier = ">=3.0,<4" },
     { name = "psutil", marker = "extra == 'repl'", specifier = ">=5.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },

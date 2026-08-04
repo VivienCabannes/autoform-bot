@@ -1,15 +1,16 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "autoform"
 version = "0.4.4"
 description = "Markdown-wiki planning with Lean LSP and REPL servers"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=0.4",
+    "fastmcp>=3.0,<4",
 ]
 
 [project.scripts]
