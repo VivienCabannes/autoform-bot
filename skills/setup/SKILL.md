@@ -45,6 +45,54 @@ Do not make the user infer whether agents have started, which files they may
 touch, or whether a backend is already spending tokens. Report those transitions
 when they occur.
 
+## Ideal repository shape
+
+Do not copy a bundled example or replace an existing repository layout. Inspect
+the project first, preserve its toolchain, module names, source organization,
+CI, and documentation, then add only the missing Autoform-owned state. For a
+new project where the Lean root also owns the roadmap, converge on this shape:
+
+```text
+<project>/
+  lakefile.toml or lakefile.lean
+  lean-toolchain
+  <Project>.lean
+  <Project>/                 # ordinary Lean modules
+  formalization.yaml
+  sources/                   # optional approved source corpus
+  graph.json
+  informal_content/
+  kernel/
+  review_status.json
+  .codex/agents/             # generated host integration on Codex
+  .autoform/                 # runtime state; pages.json is the exception below
+  .github/workflows/         # existing CI plus approved Autoform workflows
+```
+
+The boundaries matter more than the exact directory tree:
+
+- Commit the Lean project and its toolchain pins, `formalization.yaml`,
+  `graph.json`, `informal_content/`, reviewed `kernel/` evidence, and
+  `review_status.json`. Keep source material in a stable `sources/` location
+  only when its license and confidentiality permit committing it.
+- Keep queues, agent presence, locks, logs, snapshots, generated sites, usage
+  ledgers, backend settings, credentials, and other machine-specific artifacts
+  local.
+- Treat `.autoform/pages.json` and approved workflows under
+  `.github/workflows/` as optional committed configuration. Do not ignore
+  `.autoform/` wholesale after Pages is enabled; ignore its runtime children
+  explicitly.
+- When `DISPATCH_PROJECT` differs from `PROJECT_DIR`, put `graph.json`,
+  `informal_content/`, `kernel/`, and review/operational sidecars under the
+  dispatch project. Do not duplicate or relocate the Lean source tree.
+- Node content, Lean, source, and evidence paths must be relative and remain
+  inside their owning project. Let `init_plan.py` manage `metadata.lean_root`;
+  do not publish that machine-specific value.
+
+This is a target state and state-ownership contract, not a scaffold. Existing
+repositories may use different module, source, or CI layouts without being
+made to resemble a template.
+
 ## Procedure
 
 1. Check or repair the environment when this is a first run, when the user asks
@@ -97,7 +145,9 @@ when they occur.
 
    Use `--search`, `--declarations`, or `--targets` when the request is
    specifically about code search, declarations, or target status. Treat this
-   inspection as the resume source of truth.
+   inspection as the resume source of truth. Compare it with the ideal shape
+   above and add only missing Autoform-owned files; do not rename or reorganize
+   user-owned Lean, source, documentation, or CI files merely to match it.
 
    Then ensure the project actually builds — a broken build silently blocks
    every downstream stage (the prover's verification gate, CI, and the
@@ -242,9 +292,11 @@ when they occur.
    - ensure the Lean repo's `.gitignore` keeps per-machine state local while
      durable state stays committed. Local-only: `task_queue.json`,
      `agents_status.json`, their `*.lock` files, `dispatch.log`, `worker.log`,
-     `.autoform/`.
-     Committed: `graph.json`, `informal_content/`, `kernel/`,
-     `review_status.json`, the Lean sources;
+     `.autoform/logs/`, `.autoform/snapshots/`, `.autoform/site/`, and
+     `.autoform/usage.jsonl`. Committed: `graph.json`, `informal_content/`,
+     `kernel/`, `review_status.json`, the Lean sources, and, when Pages is
+     enabled, `.autoform/pages.json`. Do not ignore `.autoform/` wholesale when
+     it contains committed configuration;
    - if the user wants cross-machine escalation visibility, note whether
      Issues are enabled on the canonical repo (forks disable them by default;
      enabling is a repo-settings action the user performs).
@@ -252,9 +304,10 @@ when they occur.
    Distributed operation itself (rounds, claims, PRs) belongs to Orchestrate;
    Setup only makes the machine ready.
 
-9. Report the local dashboard URL, GitHub publication readiness, native
-   role-agent install status, distributed-mode readiness when configured, and
-   the next step: run Roadmap when the graph is empty, otherwise Orchestrate.
+9. Report any material deviation from the ideal repository shape, the local
+   dashboard URL, GitHub publication readiness, native role-agent install
+   status, distributed-mode readiness when configured, and the next step: run
+   Roadmap when the graph is empty, otherwise Orchestrate.
 
 ## Resume semantics
 
