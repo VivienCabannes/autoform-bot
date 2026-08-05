@@ -61,7 +61,11 @@ new project where the Lean root also owns the roadmap, converge on this shape:
   formalization.yaml
   sources/                   # optional approved source corpus
   graph.json
-  informal_content/
+  wiki/
+    nodes/                   # canonical informal statements and proofs
+    sources/ papers/         # source maps and paper notes
+    concepts/ audits/ decisions/
+    _generated/              # deterministic, never hand-edited
   kernel/
   review_status.json
   .codex/agents/             # generated host integration on Codex
@@ -72,7 +76,7 @@ new project where the Lean root also owns the roadmap, converge on this shape:
 The boundaries matter more than the exact directory tree:
 
 - Commit the Lean project and its toolchain pins, `formalization.yaml`,
-  `graph.json`, `informal_content/`, reviewed `kernel/` evidence, and
+  `graph.json`, authored `wiki/` pages, reviewed `kernel/` evidence, and
   `review_status.json`. Keep source material in a stable `sources/` location
   only when its license and confidentiality permit committing it.
 - Keep queues, agent presence, locks, logs, snapshots, generated sites, usage
@@ -83,7 +87,7 @@ The boundaries matter more than the exact directory tree:
   `.autoform/` wholesale after Pages is enabled; ignore its runtime children
   explicitly.
 - When `DISPATCH_PROJECT` differs from `PROJECT_DIR`, put `graph.json`,
-  `informal_content/`, `kernel/`, and review/operational sidecars under the
+  `wiki/`, `kernel/`, and review/operational sidecars under the
   dispatch project. Do not duplicate or relocate the Lean source tree.
 - Node content, Lean, source, and evidence paths must be relative and remain
   inside their owning project. Let `init_plan.py` manage `metadata.lean_root`;
@@ -199,7 +203,25 @@ made to resemble a template.
 
    `DISPATCH_PROJECT` is the directory that owns `graph.json`; it may equal the
    Lean project or be a dedicated plan directory. The helper records the
-   absolute Lean root in graph metadata.
+   absolute Lean root in graph metadata and creates missing authored `wiki/`
+   sections. It does not silently rewrite an existing schema-v2 graph.
+
+   If inspection finds `version: 2`, linked `informal_content/`, or a
+   Markdown-first `blueprint/roadmap/`, explain the v3 migration before running
+   it: `graph.json` remains authoritative, prose moves to `wiki/nodes/`, source
+   maps move to `wiki/sources/`, Markdown dependencies become typed graph edges,
+   and a full snapshot is retained under `.autoform/snapshots/`. Obtain explicit
+   approval for that file move, then run:
+
+   ```bash
+   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+     "<AUTOFORM_PLUGIN_ROOT>/scripts/wiki_blueprint.py" \
+     "$DISPATCH_PROJECT" migrate
+   ```
+
+   Rebuild deterministic navigation after migration with the same command and
+   the `build` subcommand. Never infer live proof or review status from legacy
+   Markdown frontmatter.
 
    Setup only initializes durable state; growing, re-planning, or resetting
    the graph (`--reset-plan`) belongs to the Roadmap workflow.
@@ -299,7 +321,7 @@ made to resemble a template.
      durable state stays committed. Local-only: `task_queue.json`,
      `agents_status.json`, their `*.lock` files, `dispatch.log`, `worker.log`,
      `.autoform/logs/`, `.autoform/snapshots/`, `.autoform/site/`, and
-     `.autoform/usage.jsonl`. Committed: `graph.json`, `informal_content/`,
+     `.autoform/usage.jsonl`. Committed: `graph.json`, `wiki/nodes/`,
      `kernel/`, `review_status.json`, the Lean sources, and, when Pages is
      enabled, `.autoform/pages.json`. Do not ignore `.autoform/` wholesale when
      it contains committed configuration;

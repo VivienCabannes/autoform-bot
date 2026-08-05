@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts.wiki_blueprint import WikiError, build, ensure_layout, migrate, render
+
+
+def write_graph(project: Path, graph: dict) -> None:
+    (project / "graph.json").write_text(json.dumps(graph, indent=2), encoding="utf-8")
+
+
+def v3_graph(project: Path) -> dict:
+    return {
+        "version": 3,
+        "metadata": {
+            "lean_root": str(project / "machine-specific-lean"),
+            "created_at": "2026-01-01T00:00:00Z",
+            "targets": ["goal"],
+            "sources": [
+                {
+                    "id": "paper",
+                    "title": "A useful paper",
+                    "url": "https://example.test/paper",
+                    "wiki": "wiki/sources/paper.md",
+                }
+            ],
+        },
+        "nodes": {
+            "base": {
+                "id": "base",
+                "name": "Base lemma",
+                "tier": 2,
+                "parent": None,
+                "kind": "lemma",
+                "statement_depends_on": [],
+                "proof_depends_on": [],
+                "depends_on": [],
+                "related": ["goal"],
+                "mathlib_status": "in-mathlib",
+                "content": "wiki/nodes/base.md",
+                "source_refs": [],
+            },
+            "goal": {
+                "id": "goal",
+                "name": "Main theorem",
+                "tier": 2,
+                "parent": None,
+                "kind": "theorem",
+                "statement_depends_on": ["base"],
+                "proof_depends_on": [],
+                "depends_on": ["base"],
+                "related": [],
+                "mathlib_status": "missing",
+                "content": "wiki/nodes/goal.md",
+                "source_refs": [{"source": "paper", "locator": "Theorem 4.2", "role": "statement"}],
+            },
+        },
+    }
+
+
+def test_layout_is_non_destructive(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    wiki = ensure_layout(project)
+    custom = wiki / "README.md"
+    custom.write_text("custom\n", encoding="utf-8")
+    ensure_layout(project)
+    assert custom.read_text(encoding="utf-8") == "custom\n"
+    assert all(
+        (wiki / name / "README.md").is_file()
+        for name in ("nodes", "sources", "papers", "concepts", "audits", "decisions")
+    )
+
+
+def test_migrate_v2_moves_prose_and_types_edges_and_sources(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    prose = project / "informal_content"
+    prose.mkdir()
+    (prose / "goal.md").write_text("# Goal\n\nStatement.\n", encoding="utf-8")
+    write_graph(
+        project,
+        {
+            "version": 2,
+            "metadata": {"sources": [{"file": "sources/paper.pdf", "title": "Paper"}]},
+            "nodes": {
+                "base": {"id": "base", "tier": 2, "parent": None, "depends_on": []},
+                "goal": {
+                    "id": "goal",
+                    "tier": 2,
+                    "parent": None,
+                    "depends_on": ["base"],
+                    "content": "informal_content/goal.md",
+                    "source_refs": [{"file": "sources/paper.pdf", "location": "p. 7"}],
+                },
+            },
+        },
+    )
+
+    result = migrate(project)
+    graph = json.loads((project / "graph.json").read_text(encoding="utf-8"))
+    goal = graph["nodes"]["goal"]
+    assert result == {"nodes": 2, "moved": 1, "imported": 0, "sources": 0}
+    assert graph["version"] == 3
+    assert graph["metadata"]["sources"][0]["id"] == "paper"
+    assert goal["statement_depends_on"] == []
+    assert goal["proof_depends_on"] == ["base"]
+    assert goal["depends_on"] == ["base"]
+    assert goal["source_refs"][0]["source"] == "paper"
+    assert goal["source_refs"][0]["locator"] == "p. 7"
+    assert goal["content"] == "wiki/nodes/goal.md"
+    assert (project / goal["content"]).is_file()
+
+
+def test_migrate_imports_markdown_first_blueprint(tmp_path: Path):
+    project = tmp_path / "project"
+    source_dir = project / "blueprint" / "sources"
+    source_dir.mkdir(parents=True)
+    (source_dir / "thesis.md").write_text(
+        "---\nkind: source\n---\n\n# Thesis\n\nStable record: [arXiv](https://arxiv.org/abs/1234.5678).\n",
+        encoding="utf-8",
+    )
+    node_dir = project / "blueprint" / "roadmap" / "chapter" / "theorems"
+    node_dir.mkdir(parents=True)
+    (node_dir / "base.md").write_text(
+        "---\nkind: node\ndeclaration: lemma\n---\n\n# Base\n",
+        encoding="utf-8",
+    )
+    (node_dir / "goal.md").write_text(
+        "---\nkind: node\ndeclaration: theorem\n---\n\n# Goal\n\n"
+        "## Sources\n\n- [Thesis: Theorem 2](../../../sources/thesis.md)\n\n"
+        "## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    write_graph(project, {"version": 2, "metadata": {"sources": []}, "nodes": {}})
+
+    result = migrate(project)
+    graph = json.loads((project / "graph.json").read_text(encoding="utf-8"))
+    goal = graph["nodes"]["chapter/theorems/goal"]
+    assert result["imported"] == 3
+    assert result["sources"] == 1
+    assert "cluster:chapter" in graph["nodes"]
+    assert goal["parent"] == "cluster:chapter"
+    assert goal["statement_depends_on"] == ["chapter/theorems/base"]
+    assert goal["depends_on"] == ["chapter/theorems/base"]
+    assert goal["source_refs"] == [{"source": "thesis", "locator": "Thesis: Theorem 2", "role": "statement"}]
+    assert graph["metadata"]["sources"][0]["url"] == "https://arxiv.org/abs/1234.5678"
+    assert (project / goal["content"]).read_text(encoding="utf-8").startswith("# Goal")
+    assert (project / "wiki" / "sources" / "thesis.md").is_file()
+
+
+def test_render_is_deterministic_and_excludes_machine_paths(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    ensure_layout(project)
+    (project / "wiki" / "nodes" / "base.md").write_text("# Base lemma\n", encoding="utf-8")
+    (project / "wiki" / "nodes" / "goal.md").write_text("# Main theorem\n", encoding="utf-8")
+    (project / "wiki" / "sources" / "paper.md").write_text("# Paper notes\n", encoding="utf-8")
+    graph = v3_graph(project)
+    write_graph(project, graph)
+
+    first = render(project)
+    graph["metadata"]["lean_root"] = "/another/machine/path"
+    graph["metadata"]["created_at"] = "2099-12-31T00:00:00Z"
+    write_graph(project, graph)
+    second = render(project)
+
+    assert first == second
+    joined = "".join(first.values())
+    assert str(project) not in joined
+    assert "/another/machine/path" not in joined
+    assert "Theorem 4.2" in first["nodes/goal.md"]
+    assert "https://example.test/paper" in first["nodes/goal.md"]
+    assert "../../../wiki/nodes/goal.md" in first["nodes/goal.md"]
+    assert "Base lemma" in first["targets/goal.md"]
+    assert "Main theorem" in first["targets/goal.md"]
+
+
+def test_build_check_detects_stale_generated_wiki(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    ensure_layout(project)
+    (project / "wiki" / "nodes" / "base.md").write_text("# Base\n", encoding="utf-8")
+    (project / "wiki" / "nodes" / "goal.md").write_text("# Goal\n", encoding="utf-8")
+    write_graph(project, v3_graph(project))
+    assert build(project)
+    assert build(project, check=True)
+    (project / "wiki" / "_generated" / "index.md").write_text("stale\n", encoding="utf-8")
+    assert not build(project, check=True)
+
+
+def test_migration_rejects_content_path_traversal(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        {
+            "version": 2,
+            "metadata": {"sources": []},
+            "nodes": {"n": {"id": "n", "depends_on": [], "content": "../secret.md"}},
+        },
+    )
+    with pytest.raises(WikiError, match="escapes the project"):
+        migrate(project)

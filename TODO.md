@@ -1,5 +1,18 @@
 # TODO
 
+## Branch integration: Deicyde/main + Vivien main
+
+- [x] Unify durable state: keep `graph.json` as the control plane and add an
+  authored `wiki/` knowledge base with deterministic generated navigation.
+- [ ] Reconcile setup around one inspected ideal repository shape, without a
+  bundled worked-example repository.
+- [ ] Reconcile roadmap planning, graph review, and source-coverage behavior.
+- [ ] Reconcile orchestration, proof escalation, jury review, and backend choice.
+- [ ] Reconcile local dashboard and read-only GitHub Pages publication.
+- [ ] Reconcile worker/distributed execution and GitHub collaboration contracts.
+- [ ] Finish Claude, Codex, and Muse parity checks and plugin lint coverage.
+- [ ] Remove superseded compatibility code after active projects migrate to v3.
+
 - Test installation instruction for Claude Code, Codex and others
 - Extend the skills and commands
 

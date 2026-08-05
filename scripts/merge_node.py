@@ -19,14 +19,15 @@ Payload (JSON, from --payload FILE or stdin):
 A node record is a structural node object as described in
 internal/references/plan-json-schema.md. An upserted record's "id" must match
 its key (it is filled in from the key when omitted). Deleting a node strips it
-from every other node's ``depends_on`` and sets its children's ``parent`` to
-null. New unresolved references are rejected atomically instead of being
+from every dependency/relationship field and sets its children's ``parent``
+to null. New unresolved references are rejected atomically instead of being
 silently discarded; the caller can retry after the prerequisite lands.
 
 Usage:
     merge_node.py <graph.json> [--payload payload.json]
     splitter | merge_node.py <graph.json>          # payload on stdin
 """
+
 from __future__ import annotations
 
 import argparse
@@ -105,13 +106,33 @@ def _atomic_write(path: str, data: dict) -> None:
         raise
 
 
+_TYPED_DEPENDENCIES = ("statement_depends_on", "proof_depends_on")
+
+
+def _normalize_dependencies(nid: str, record: dict) -> list[str]:
+    """Validate typed edges and maintain ``depends_on`` as their scheduler union."""
+    legacy = record.get("depends_on") or []
+    if not isinstance(legacy, list) or not all(isinstance(dep, str) for dep in legacy):
+        raise ValueError(f"node {nid!r} depends_on must be a list of strings")
+    if not any(field in record for field in _TYPED_DEPENDENCIES):
+        record["depends_on"] = list(dict.fromkeys(legacy))
+        return record["depends_on"]
+    union: list[str] = []
+    for field in _TYPED_DEPENDENCIES:
+        values = record.get(field) or []
+        if not isinstance(values, list) or not all(isinstance(dep, str) for dep in values):
+            raise ValueError(f"node {nid!r} {field} must be a list of strings")
+        record[field] = list(dict.fromkeys(values))
+        union.extend(record[field])
+    record["depends_on"] = list(dict.fromkeys(union))
+    return record["depends_on"]
+
+
 def merge(graph_path: str, payload: dict) -> dict:
     """Apply upserts and deletes to graph.json. Caller holds the lock."""
     upserts = _normalize_upsert(payload.get("upsert"))
     raw_deletes = payload.get("delete", [])
-    if not isinstance(raw_deletes, list) or not all(
-        isinstance(node_id, str) and node_id for node_id in raw_deletes
-    ):
+    if not isinstance(raw_deletes, list) or not all(isinstance(node_id, str) and node_id for node_id in raw_deletes):
         raise ValueError("'delete' must be a list of non-empty node-id strings")
     if len(raw_deletes) != len(set(raw_deletes)):
         raise ValueError("'delete' contains duplicate node ids")
@@ -144,14 +165,9 @@ def merge(graph_path: str, payload: dict) -> dict:
                 orphaned.append((nid, parent))
             else:
                 raise ValueError(
-                    f"node {nid!r} references absent parent {parent!r}; "
-                    "merge the parent in the same payload or first"
+                    f"node {nid!r} references absent parent {parent!r}; merge the parent in the same payload or first"
                 )
-        deps = rec.get("depends_on")
-        if not deps:
-            continue
-        if not isinstance(deps, list) or not all(isinstance(dep, str) for dep in deps):
-            raise ValueError(f"node {nid!r} depends_on must be a list of strings")
+        deps = _normalize_dependencies(nid, rec)
         missing = [dep for dep in deps if dep not in nodes]
         unresolved = [dep for dep in missing if dep not in deleted]
         if unresolved:
@@ -162,6 +178,21 @@ def merge(graph_path: str, payload: dict) -> dict:
         if missing:
             stripped.extend((nid, dep) for dep in missing)
             rec["depends_on"] = [dep for dep in deps if dep in nodes]
+            for field in _TYPED_DEPENDENCIES:
+                if field in rec:
+                    rec[field] = [dep for dep in rec[field] if dep in nodes]
+        related = rec.get("related") or []
+        if not isinstance(related, list) or not all(isinstance(item, str) for item in related):
+            raise ValueError(f"node {nid!r} related must be a list of strings")
+        missing_related = [item for item in related if item not in nodes]
+        unresolved_related = [item for item in missing_related if item not in deleted]
+        if unresolved_related:
+            raise ValueError(
+                f"node {nid!r} references absent related nodes {unresolved_related!r}; "
+                "merge related nodes in the same payload or first"
+            )
+        if missing_related:
+            rec["related"] = [item for item in related if item in nodes]
 
     # Optional metadata merge — currently ONLY the mission targets. Targets are
     # first-class graph state (the fleet's prove ordering and the audit's
@@ -189,8 +220,7 @@ def merge(graph_path: str, payload: dict) -> dict:
     if not isinstance(raw_targets, list):
         raise ValueError("'metadata.targets' must be a list")
     for entry in raw_targets:
-        node_id = entry if isinstance(entry, str) else (
-            entry.get("node") if isinstance(entry, dict) else None)
+        node_id = entry if isinstance(entry, str) else (entry.get("node") if isinstance(entry, dict) else None)
         if not isinstance(node_id, str) or not node_id:
             raise ValueError(f"invalid targets entry {entry!r}")
         if node_id not in nodes:
@@ -212,9 +242,7 @@ def merge(graph_path: str, payload: dict) -> dict:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
-        description="Single-writer incremental merge into a plan's graph.json"
-    )
+    ap = argparse.ArgumentParser(description="Single-writer incremental merge into a plan's graph.json")
     ap.add_argument("graph", help="path to graph.json")
     ap.add_argument("--payload", help="path to a JSON payload file (default: read stdin)")
     args = ap.parse_args(argv)
@@ -248,21 +276,13 @@ def main(argv=None) -> int:
             if fcntl is not None:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    msg = (
-        f"merged: +{result['upserted']} upsert, -{result['deleted']} delete, "
-        f"{result['total_nodes']} nodes total"
-    )
+    msg = f"merged: +{result['upserted']} upsert, -{result['deleted']} delete, {result['total_nodes']} nodes total"
     if result["stripped_edges"]:
         edges = ", ".join(f"{a} -> {b}" for a, b in result["stripped_edges"])
         msg += f"; stripped {len(result['stripped_edges'])} dangling edge(s): {edges}"
     if result["orphaned_children"]:
-        children = ", ".join(
-            f"{child} -/-> {parent}"
-            for child, parent in result["orphaned_children"]
-        )
-        msg += (
-            f"; orphaned {len(result['orphaned_children'])} child(ren): {children}"
-        )
+        children = ", ".join(f"{child} -/-> {parent}" for child, parent in result["orphaned_children"])
+        msg += f"; orphaned {len(result['orphaned_children'])} child(ren): {children}"
     print(msg)
     return 0
 

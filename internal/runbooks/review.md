@@ -21,7 +21,7 @@ Both read the same sidecar, `review_status.json` — the single source of truth 
 verdicts. The headless packet writes nothing; the review server writes exactly
 **two** files — the sidecar and `task_queue.json` (the dispatch queue that
 drag-and-drop / `POST /api/request` enqueues into for the orchestrate engine).
-`graph.json` and `informal_content/` stay pristine.
+`graph.json` and `wiki/nodes/` stay pristine.
 
 The packet's structure, trust-class taxonomy, and the rules that make it honest live
 in `<AUTOFORM_PLUGIN_ROOT>/internal/references/reviewer-packet.md` — read it
@@ -140,7 +140,7 @@ This default is text-only and writes nothing. It is the CI/agent path.
      card + the jury scorecard; the bottom **verdict panel** writes the `human` slot
      via `POST /api/verdict/<id>` and the home graph re-taints live.
 
-   The server reads `graph.json`, `informal_content/`, the built blueprint, an
+   The server reads `graph.json`, `wiki/nodes/`, the built blueprint, an
    optional `kernel/<id>.txt`, and `review_status.json`; it **writes only**
    `review_status.json` (verdicts) and `task_queue.json` (dispatch requests).
 
@@ -165,6 +165,6 @@ status, no new infrastructure — it reuses the same jury + sidecar + packet.
 - Never claim "compiles" / "axiom-clean" without the command output in the packet.
 - A packet with an unexplained `AXIOM`/`SORRY` row is a **failed** packet — say so.
 - The surface writes **only** `review_status.json` and `task_queue.json`. Never
-  edit `graph.json`, `informal_content/`, or the built blueprint from the review
+  edit `graph.json`, `wiki/nodes/`, or the built blueprint from the review
   path.
 - Human verdicts are immutable — re-running the jury never overrides a human slot.

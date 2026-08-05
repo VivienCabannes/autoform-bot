@@ -21,6 +21,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from .wiki_blueprint import SCHEMA_VERSION, ensure_layout
+except ImportError:  # direct script execution
+    from wiki_blueprint import SCHEMA_VERSION, ensure_layout
+
 _SIDECARS = ("task_queue.json", "review_status.json", "agents_status.json")
 
 
@@ -69,9 +74,10 @@ def _snapshot(project: Path) -> Path:
         source = project / name
         if source.is_file():
             shutil.copy2(source, snapshot / name)
-    content = project / "informal_content"
-    if content.is_dir():
-        shutil.copytree(content, snapshot / "informal_content", symlinks=True)
+    for directory in ("wiki", "informal_content"):
+        content = project / directory
+        if content.is_dir():
+            shutil.copytree(content, snapshot / directory, symlinks=True)
     return snapshot
 
 
@@ -86,29 +92,32 @@ def initialize(project: Path, lean_root: Path, *, reset: bool = False) -> tuple[
     graph_path = project / "graph.json"
     snapshot: Path | None = None
     if reset:
-        content = project / "informal_content"
-        for managed in (graph_path, content, *(project / name for name in _SIDECARS)):
+        content_dirs = (project / "wiki", project / "informal_content")
+        for managed in (graph_path, *content_dirs, *(project / name for name in _SIDECARS)):
             if managed.is_symlink():
                 raise ValueError(f"refusing to reset symlinked plan state: {managed}")
-        if content.exists() and not content.is_dir():
-            raise ValueError(f"expected directory at {content}")
+        for content in content_dirs:
+            if content.exists() and not content.is_dir():
+                raise ValueError(f"expected directory at {content}")
         for name in _SIDECARS:
             path = project / name
             if path.exists() and not path.is_file():
                 raise ValueError(f"expected file at {path}")
         snapshot = _snapshot(project)
-        if content.exists():
-            shutil.rmtree(content)
+        for content in content_dirs:
+            if content.exists():
+                shutil.rmtree(content)
         for name in _SIDECARS:
             path = project / name
             if path.exists():
                 path.unlink()
         data = {
-            "version": 2,
+            "version": SCHEMA_VERSION,
             "metadata": {"sources": [], "lean_root": str(lean_root)},
             "nodes": {},
         }
         _write_json_atomic(graph_path, data)
+        ensure_layout(project)
         return "reset", snapshot
 
     if graph_path.exists():
@@ -125,17 +134,20 @@ def initialize(project: Path, lean_root: Path, *, reset: bool = False) -> tuple[
                     "graph metadata.lean_root points elsewhere: "
                     f"{existing_path} (requested {lean_root})"
                 )
+            ensure_layout(project)
             return "unchanged", None
         data["metadata"]["lean_root"] = str(lean_root)
         _write_json_atomic(graph_path, data)
+        ensure_layout(project)
         return "updated", None
 
     data = {
-        "version": 2,
+        "version": SCHEMA_VERSION,
         "metadata": {"sources": [], "lean_root": str(lean_root)},
         "nodes": {},
     }
     _write_json_atomic(graph_path, data)
+    ensure_layout(project)
     return "created", None
 
 

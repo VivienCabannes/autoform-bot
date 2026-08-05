@@ -34,11 +34,12 @@ only sequences the work.
    `partial`, or `missing`, with the declaration names and file when found. Do
    not guess: an unverified `in-mathlib` claim poisons the trust frontier,
    because in-Mathlib nodes are trusted without proof.
-3. **Wire the edges.** Set `depends_on` to the *same-tier* nodes a proof would
-   actually cite — no more, no less. Every `missing` node must reach an
+3. **Wire the edges.** Put same-tier prerequisites needed by the statement in
+   `statement_depends_on` and additional proof facts in `proof_depends_on`.
+   The merge writer maintains their `depends_on` scheduler union. Every `missing` node must reach an
    `in-mathlib` root through the dependency graph, or it is unprovable by
-   construction. Keep each tier acyclic.
-4. **Write the prose.** One `informal_content/<node>.md` per node: the statement
+   construction. Keep each tier acyclic; use `related` only for non-blocking context.
+4. **Write the prose.** One `wiki/nodes/<node>.md` per node: the statement
    in universal mathematical voice and the hypotheses in full. Record the source
    reference only in the node's `source_refs` field. This is what a prover reads, so an ambiguity here becomes a wrong
    formalization later.

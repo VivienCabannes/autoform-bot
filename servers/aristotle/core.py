@@ -411,7 +411,7 @@ DEFAULT_DELEGATE_SYSTEM = (
 
 
 def _slugify(node_id: str) -> str:
-    """Mirror the exporter's slug rule for ``informal_content/<slug>.md``."""
+    """Mirror the exporter's slug rule for ``wiki/nodes/<slug>.md``."""
     slug = re.sub(r"[^a-z0-9]+", "-", node_id.lower()).strip("-")
     return slug or "node"
 
@@ -446,7 +446,7 @@ def build_node_spec(
     """Assemble the *spec prompt* Aristotle is given for a target node.
 
     The spec is read off the node itself (the design's "the node IS the informal
-    statement"): the prose statement from ``informal_content/<id>.md`` plus the
+    statement"): the prose statement from the node's linked wiki page plus the
     structural hints a prover needs — kind, ``source_refs`` (faithfulness
     anchor), ``mathlib_declarations`` (the decl to realize), ``mathlib_file``,
     and the in-tier ``depends_on`` it may rely on.
@@ -540,7 +540,7 @@ def _record_proof_in_prose(
 
     Returns the node's relative ``content`` path. Does not write ``graph.json``.
     """
-    content_rel = node.get("content") or f"informal_content/{_slugify(node_id)}.md"
+    content_rel = node.get("content") or f"wiki/nodes/{_slugify(node_id)}.md"
     prose_path = _safe_prose_path(project_dir, content_rel)
     prose_path.parent.mkdir(parents=True, exist_ok=True)
 

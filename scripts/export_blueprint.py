@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Export a leanblueprint project from a v2 graph.json + informal_content/*.md.
+"""Export a leanblueprint project from graph.json and its linked wiki prose.
 
-Given a ``graph.json`` (schema in internal/references/plan-json-schema.md) and an ``informal_content/``
+Given a ``graph.json`` (schema in internal/references/plan-json-schema.md) and linked ``wiki/nodes/``
 directory of ``<id>.md`` files, this generates a complete, ready-to-build blueprint
 project under an output directory, following the standard leanblueprint project
 layout (matching the statmech project convention):
@@ -28,7 +28,7 @@ Usage:
         [--template <dep_graph.html>] [--title "..."]
 
 Defaults:
-    --content : <graph.json dir>/informal_content
+    --content : <graph.json dir>/wiki/nodes
     --out     : <graph.json dir>/blueprint_export
     --template: <repo>/templates/dep_graph.html  (sibling of scripts/)
 
@@ -49,7 +49,7 @@ graph.json schema (see internal/references/plan-json-schema.md), the fields we r
         mathlib_status  : in-mathlib | partial | missing  (default: missing)
         mathlib_declarations : list[str]
         content         : path to the .md file (optional; we fall back to
-                          informal_content/<id>.md and then to <slug>.md)
+                          wiki/nodes/<id>.md and then to <slug>.md)
     A missing node's "readiness" is computed from its dependencies, not stored: it
     is ready when every prerequisite already has a formalized statement (in-mathlib
     or partial). This matches the design mapping:
@@ -336,7 +336,7 @@ def read_content(node: dict, content_dir: Path, slug: str, project_root: Path) -
     file is missing so the project still builds.
 
     Lookup order: node['content'] resolved relative to the project root (the
-    schema-canonical form, e.g. "informal_content/foo.md"), then relative to
+    schema-canonical form, e.g. "wiki/nodes/foo.md"), then relative to
     content_dir, then content_dir/<id>.md, then content_dir/<slug>.md.
     """
     candidates: List[Path] = []
@@ -1152,7 +1152,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Export a leanblueprint project from graph.json")
     parser.add_argument("graph", type=Path, help="path to graph.json")
     parser.add_argument("--content", type=Path, default=None,
-                        help="prose dir of <id>.md files (default: <graph dir>/informal_content)")
+                        help="prose dir (default: wiki/nodes, then legacy informal_content)")
     parser.add_argument("--out", type=Path, default=None,
                         help="output dir (default: <graph dir>/blueprint_export)")
     parser.add_argument("--template", type=Path, default=None,
@@ -1161,7 +1161,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     graph_path = args.graph.resolve()
-    content_dir = (args.content or graph_path.parent / "informal_content").resolve()
+    default_content = graph_path.parent / "wiki" / "nodes"
+    if not default_content.is_dir():
+        default_content = graph_path.parent / "informal_content"
+    content_dir = (args.content or default_content).resolve()
     out_dir = (args.out or graph_path.parent / "blueprint_export").resolve()
 
     # Default template lives at <repo>/templates/dep_graph.html (sibling of scripts/).

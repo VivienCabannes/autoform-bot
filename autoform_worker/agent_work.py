@@ -10,7 +10,7 @@ Two write paths, matching what the artifact is:
 
 * **Lean proofs** (the ``prove`` unit) go through a PR, get a jury scoreboard,
   and auto-merge — code deserves review.
-* **Roadmap curation** (graph.json, ``informal_content/``) is committed and
+* **Roadmap curation** (graph.json and authored ``wiki/`` pages) is committed and
   CAS-pushed straight to the default branch under a claim. It is frequent,
   conflict-rare, and humans watch it on the dashboards rather than in PRs;
   a lost CAS simply retries next round.
@@ -44,7 +44,7 @@ AGENT_TIMEOUT_S = 3600
 
 #: Triage first, then structure, then breadth — the orchestrate skill's order.
 KIND_PRIORITY = ("escalation", "planner", "mathcheck", "graphreview",
-                 "contentreview", "counterexample", "priorart", "holistic")
+                 "contentreview", "wikicurator", "counterexample", "priorart", "holistic")
 
 
 def _recovery_outcome(log_path) -> str | None:
@@ -77,12 +77,21 @@ def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) ->
     except ValueError:
         return False
     prefix = "" if str(project_rel) == "." else f"{project_rel.as_posix()}/"
-    content_prefix = f"{prefix}informal_content/"
-    content = all(path.startswith(content_prefix) for path in paths)
+    authored_wiki = tuple(
+        f"{prefix}wiki/{section}/"
+        for section in ("nodes", "sources", "papers", "concepts", "audits", "decisions")
+    )
+    legacy_prefix = f"{prefix}informal_content/"
+    content = all(path.startswith(authored_wiki) or path.startswith(legacy_prefix) for path in paths)
     if role.writes == "content":
         return content
     if role.writes == "graph":
-        return all(path == f"{prefix}graph.json" or path.startswith(content_prefix) for path in paths)
+        return all(
+            path == f"{prefix}graph.json"
+            or path.startswith(authored_wiki)
+            or path.startswith(legacy_prefix)
+            for path in paths
+        )
     return role.writes == "none" and not paths
 
 
@@ -148,7 +157,8 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
         f"- dispatch project: {cfg.project}",
         f"- graph: {graph_path}",
         f"- Lean project: {cfg.lean_root}",
-        f"- node prose lives in: {cfg.project / 'informal_content'}/<node>.md",
+        f"- node prose lives in: {cfg.project / 'wiki' / 'nodes'}/<slug>.md",
+        f"- generated navigation lives in: {cfg.project / 'wiki' / '_generated'} (never edit it)",
     ]
     if sources:
         context += ["- sources:", sources]
@@ -162,7 +172,8 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
         "- Make every graph edit through "
         f"`python {cfg.plugin_root}/scripts/merge_node.py {graph_path} --payload <file>` — "
         "it is the only writer of graph.json.",
-        "- Write node prose directly to `informal_content/<node>.md`.",
+        "- Write node prose and durable source notes only under the authored `wiki/` sections.",
+        "- Never edit `wiki/_generated/`; the deterministic wiki builder owns it.",
         "- Do NOT run `git push` and do NOT open PRs; the worker harness commits and "
         "pushes what you leave in the tree, under a lease.",
         "- Do not edit `lean-toolchain`, `lakefile.*`, CI workflows, or anything under "

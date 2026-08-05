@@ -195,6 +195,7 @@ def _workflow(
     graph_dir = graph.parent
     watch = (
         graph,
+        graph_dir / "wiki/**",
         graph_dir / "informal_content/**",
         graph_dir / "kernel/**",
         graph_dir / "review_status.json",

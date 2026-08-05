@@ -134,6 +134,7 @@ def _safe_node_file(project_root: Path, node_id: str, node: dict, kind: str) -> 
         candidates: list[Path | str] = []
         if isinstance(node.get("content"), str):
             candidates.append(node["content"])
+        candidates.append(Path("wiki") / "nodes" / f"{node_id}.md")
         candidates.append(Path("informal_content") / f"{node_id}.md")
     else:
         candidates = [Path("kernel") / f"{node_id}.txt"]
@@ -646,6 +647,7 @@ def _require_committed(repo_root: Path, graph_path: Path) -> None:
     relative = graph_path.relative_to(repo_root.resolve())
     paths = {
         relative,
+        relative.parent / "wiki",
         relative.parent / "informal_content",
         relative.parent / "kernel",
         relative.parent / "review_status.json",

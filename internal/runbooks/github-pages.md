@@ -9,7 +9,8 @@ and human verdict entry.
 The Pages artifact may contain only:
 
 - graph structure;
-- theorem content from committed `informal_content` files;
+- theorem content from committed authored `wiki/nodes` files (with legacy
+  `informal_content` read support during migration);
 - proof status;
 - review verdicts and rubric scores;
 - committed kernel evidence.
@@ -77,7 +78,7 @@ Do not open the deployed URL without another explicit approval.
 
 ## Durable update boundary
 
-The exporter refuses publication when `graph.json`, `informal_content/`,
+The exporter refuses publication when `graph.json`, `wiki/nodes/`,
 `kernel/`, or `review_status.json` is dirty. Operational files are neither read
 nor placed in the artifact. A dashboard update therefore follows this sequence:
 

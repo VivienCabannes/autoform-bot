@@ -43,7 +43,7 @@ helpers so the reviewer can audit the bucketing itself.
    lines; the other 700 are kernel-checked proof bodies").
 
    The node carries the link: its `mathlib_declarations` name the Lean decl(s), its
-   `source_refs` give the verbatim source citation, and `informal_content/<id>.md`
+   `source_refs` give the verbatim source citation, and `wiki/nodes/<id>.md`
    (or the built blueprint env) gives the paraphrased meaning. The node **is** the
    informal statement — do not re-derive the node↔decl link.
 

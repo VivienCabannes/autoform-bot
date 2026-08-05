@@ -135,6 +135,8 @@ def test_merge_paths_allowed_accepts_roadmap_content():
     assert merge_paths_allowed(["Top.lean"])
     assert merge_paths_allowed(["Proj/Sub/Deep_Name-2.lean"])
     assert merge_paths_allowed(["informal_content/node-a.md"])
+    assert merge_paths_allowed(["wiki/nodes/node-a.md"])
+    assert merge_paths_allowed(["wiki/sources/paper.md", "wiki/concepts/compactness.md"])
     assert merge_paths_allowed(["kernel/node-a/evidence.json"])
     assert merge_paths_allowed(["review_status.json"])
     assert merge_paths_allowed(["Proj/A.lean", "informal_content/a.md", "kernel/a.json",
@@ -159,6 +161,7 @@ def test_merge_paths_allowed_denies_unknown_and_empty():
 def test_merge_paths_allowed_is_all_or_nothing():
     assert not merge_paths_allowed(["Proj/Basic.lean", "lean-toolchain"])
     assert not merge_paths_allowed(["informal_content/a.md", ".github/workflows/ci.yml"])
+    assert not merge_paths_allowed(["wiki/_generated/index.md"])
     # deny wins over allow even when the denied path would otherwise match the allowlist
     assert not merge_paths_allowed([".claude/agents/Evil.lean"])
 

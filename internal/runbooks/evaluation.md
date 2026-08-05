@@ -70,7 +70,7 @@ all three pass, the verdict is clean; otherwise flagged.
 ## How to grade (per reviewer)
 
 1. Read the **source** statement (named by the node's `source_refs`; the informal statement is in
-   `informal_content/<id>.md`) and the **Lean declaration** the node claims (`mathlib_declarations`).
+   `wiki/nodes/<id>.md`) and the **Lean declaration** the node claims (`mathlib_declarations`).
 2. Verify foundations independently for the proof_integrity axis: run `#print axioms <decl>` (via
    `lake env lean` or the LSP) and check only `propext`, `Classical.choice`, `Quot.sound` appear;
    flag `sorryAx`.

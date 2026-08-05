@@ -16,14 +16,14 @@ The pipeline runs in two phases, each ending in review, all driven by one top-le
 A plan lives in the user's project directory (next to `lakefile.toml`):
 
 - **`graph.json`** — the structure. One JSON object: metadata plus a map of nodes keyed by `id` (the concept's full English name). Each node holds only *structural* fields: its tier, its container (`parent`), its within-tier dependency edges (`depends_on`), its Mathlib correspondence, and a pointer to its prose file. Derived data is never stored here (see below).
-- **`informal_content/<id>.md`** — the prose. One Markdown file per node (statement, plus proof when the concept is not in Mathlib).
+- **`wiki/nodes/<id>.md`** — the prose. One Markdown file per node (statement, plus proof when the concept is not in Mathlib).
 - **`sources/`** — the textbooks. The orchestrator moves received books here; `metadata.sources` records their paths.
 
 Three helper scripts under the resolved Autoform plugin root's `scripts/` directory: **`merge_node.py`** (the locked writer for `graph.json`), **`check_invariants.py`** (structural checker), **`export_blueprint.py`** (renders the plan to an interactive web view). Full data model: [`internal/references/plan-json-schema.md`](../internal/references/plan-json-schema.md).
 
 ### Two design decisions in the data model
 
-- **Structure and prose are separate files.** `graph.json` stays small, readable, and diffable; the bulky prose lives one-file-per-node in `informal_content/`. Subagents writing prose touch only their own files; all writes to the structure go through one locked path (`merge_node.py`).
+- **Structure and prose are separate files.** `graph.json` stays small, readable, and diffable; the bulky prose lives one-file-per-node in `wiki/nodes/`. Subagents writing prose touch only their own files; all writes to the structure go through one locked path (`merge_node.py`).
 - **Coarser tiers are derived, not stored.** The only authored hierarchy link is each node's `parent`. A cluster's membership is read off the `parent` pointers, and a tier-1 edge A→B exists exactly when some tier-2 node in A depends on one in B (the *quotient* rule). The finest built tier is the source of truth; coarser tiers are recomputed from it, so they cannot drift — and many subagents can build the fine graph in parallel while the coarse graph stays consistent by construction.
 
 The tiers: **tier 1** = coarse concept clusters (the scoping map), **tier 2** = fine definitions/statements with content, **tier 3** = Lean statements (planned, not built).
@@ -34,7 +34,7 @@ The tiers: **tier 1** = coarse concept clusters (the scoping map), **tier 2** = 
 
 The top-level agent — **the orchestrator** (a.k.a. the main agent) — runs the whole pipeline: it dispatches subagents, threads results between them, merges splitter output into the graph, applies holistic fixes, reverts rejected changes, and talks to the user.
 
-`graph.json` has a **single write *path*, not a single writer**: every structural change goes through `merge_node.py`, which is file-locked and atomic. Both the orchestrator and the editing `graph-reviewer`s call it, and the lock serializes their concurrent writes, so changes never race or corrupt the file. Prose is separate — each `splitter` and `content-reviewer` writes its own `informal_content/` files directly, and since those are disjoint they need no shared writer.
+`graph.json` has a **single write *path*, not a single writer**: every structural change goes through `merge_node.py`, which is file-locked and atomic. Both the orchestrator and the editing `graph-reviewer`s call it, and the lock serializes their concurrent writes, so changes never race or corrupt the file. Prose is separate — each `splitter` and `content-reviewer` writes its own `wiki/nodes/` files directly, and since those are disjoint they need no shared writer.
 
 ---
 
@@ -55,7 +55,7 @@ A cheap, user-reviewable scoping map that also hands Phase 2 its starting partit
 
 The tier-1 graph is now a *scaffold*; tier-2 is built and becomes the source of truth.
 
-1. **Split** (a continuous pool, §4). The orchestrator hands each cluster to a `splitter` once its prerequisites are split, threading the prerequisite clusters' node ids into the splitter's prompt. The splitter writes its nodes' prose (`informal_content/`) itself and returns their *structure* to the orchestrator.
+1. **Split** (a continuous pool, §4). The orchestrator hands each cluster to a `splitter` once its prerequisites are split, threading the prerequisite clusters' node ids into the splitter's prompt. The splitter writes its nodes' prose (`wiki/nodes/`) itself and returns their *structure* to the orchestrator.
 2. **Persist.** The orchestrator merges each splitter's returned structure into `graph.json` (via `merge_node.py`) as it lands, and runs a `mathlib-checker` on any fresh status guess.
 3. **Review — Wave A** (§5). Per-cluster `content-reviewer`s edit the prose; `graph-reviewer`s edit the structure; both loop to convergence.
 4. **Review — Wave B** (§5). At least three `holistic-reviewer`s judge the whole graph and flag for the orchestrator to apply.
@@ -86,7 +86,7 @@ Both phases review in **two waves** — an editing wave that fixes the graph in 
 
 **Wave A — editing reviewer-correctors:**
 - **`graph-reviewer`** (both phases) owns the dependency *structure* (edges, redundant nodes, missing intermediates). It **edits `graph.json` directly** through `merge_node.py` for the nodes it owns, runs partitioned when the graph is large, and flags anything outside its responsibility.
-- **`content-reviewer`** (Phase 2), one per cluster, owns the *prose*. It **edits the `informal_content/<id>.md` files directly** and flags structural problems for the graph-reviewers. Clusters are disjoint, so these run concurrently.
+- **`content-reviewer`** (Phase 2), one per cluster, owns the *prose*. It **edits the `wiki/nodes/<id>.md` files directly** and flags structural problems for the graph-reviewers. Clusters are disjoint, so these run concurrently.
 
 **Wave B — holistic reviewers (flag-only):** at least three `holistic-reviewer`s run independently in parallel over the entire graph. They **do not edit**; they surface corrections to the orchestrator, which applies small fixes directly and dispatches a targeted `graph-reviewer` for larger structural ones.
 
@@ -99,9 +99,9 @@ Both phases review in **two waves** — an editing wave that fixes the graph in 
 | Subagent | Phase | Role | Edits or flags |
 |---|---|---|---|
 | **`mathlib-checker`** | both | Classifies one concept against local Mathlib. | Returns data (orchestrator merges) |
-| **`splitter`** | 2 | Splits one cluster into tier-2 nodes; writes their prose. | **Edits** `informal_content/`; returns structure |
+| **`splitter`** | 2 | Splits one cluster into tier-2 nodes; writes their prose. | **Edits** `wiki/nodes/`; returns structure |
 | **`graph-reviewer`** | both | Reviews/corrects dependency structure over its partition. | **Edits** `graph.json` (via `merge_node.py`); flags the rest |
-| **`content-reviewer`** | 2 | Reviews/corrects one cluster's prose. | **Edits** `informal_content/`; flags structural issues |
+| **`content-reviewer`** | 2 | Reviews/corrects one cluster's prose. | **Edits** `wiki/nodes/`; flags structural issues |
 | **`holistic-reviewer`** | both | Whole-graph quality; ≥3 run in parallel. | **Flags only** |
 | **`source-searcher`** | both | Fetches a specific result from a book, so whole books stay out of the orchestrator's context. | Returns extract |
 | **orchestrator** | both | Drives phases; dispatches and threads subagents; merges structure; applies/reverts; talks to the user. | Writes `graph.json` via `merge_node.py` |
@@ -116,4 +116,4 @@ In short: **splitter**, **graph-reviewer**, and **content-reviewer** change the 
 - **Structural check.** After each review wave, `check_invariants.py` verifies the global properties a partitioned reviewer cannot see. **Structural integrity** (reference integrity, tier discipline, per-tier acyclicity) must always hold; **grounding completeness** (every `missing` node reaching an `in-mathlib` root) is a phase-end goal (`--require-grounding`), so mid-build the ungrounded nodes are reported as the remaining worklist rather than a failure.
 - **Snapshots and revert.** A pre-wave file copy allows whole-wave rollback; per-change reports let the orchestrator reverse any individual edit.
 - **Derived-not-stored.** Membership and coarse edges are recomputed from the fine graph, so the tiers cannot drift.
-- **Context discipline.** Reviewers read on demand rather than holding the whole graph; the orchestrator delegates book searches to `source-searcher`; structure (`graph.json`) and bulky prose (`informal_content/`) are kept apart.
+- **Context discipline.** Reviewers read on demand rather than holding the whole graph; the orchestrator delegates book searches to `source-searcher`; structure (`graph.json`) and bulky prose (`wiki/nodes/`) are kept apart.

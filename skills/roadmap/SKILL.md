@@ -35,7 +35,7 @@ Before reading sources or spawning any subagent, tell the user:
 - the confirmed source files and exact chapter/section scope, or the specific
   missing information you need before planning;
 - the artifacts this run will create or update (`graph.json`,
-  `informal_content/`, and the live dashboard view);
+  authored `wiki/` pages, generated wiki navigation, and the live dashboard view);
 - the checkpoints: coarse roadmap approval before detailed splitting, and that
   no prover is dispatched from this workflow.
 
@@ -137,6 +137,13 @@ reviewers", not internal shorthand).
    canonical roles (`splitter`, `mathlib-checker`, `graph-reviewer`,
    `content-reviewer`, `holistic-reviewer`), and routes every graph edit
    through `scripts/merge_node.py` — it is the only writer of `graph.json`.
+
+   Record statement prerequisites in `statement_depends_on` and extra proof
+   prerequisites in `proof_depends_on`; `merge_node.py` maintains their
+   `depends_on` scheduler union. Use `related` only for non-blocking conceptual
+   navigation. After accepted graph/content/source changes, dispatch the
+   `wiki-curator` over the affected neighborhood, then rebuild deterministic
+   navigation with `scripts/wiki_blueprint.py "$DISPATCH_PROJECT" build`.
 
 7. When the user names a target theorem (a mission sink the fleet should reach),
    record it as first-class graph state through the single writer:

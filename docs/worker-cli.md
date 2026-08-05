@@ -11,7 +11,7 @@ implementation lives in `autoform_worker/`.
 Autoform's local dispatcher is intentionally single-machine: `fslock` advisory
 locks, one `dispatcher.lock` lease per project, and a local `task_queue.json`.
 Multiple people running against the *same* formalization project (a shared GitHub repo
-holding `graph.json`, `informal_content/`, `kernel/`, `review_status.json`, and the
+holding `graph.json`, `wiki/nodes/`, `kernel/`, `review_status.json`, and the
 Lean sources) would collide: two machines proving the same node, review state
 diverging per clone, no shared progress view.
 

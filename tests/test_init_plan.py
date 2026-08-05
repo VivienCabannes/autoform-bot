@@ -17,8 +17,10 @@ def test_initialize_creates_graph_with_lean_root(tmp_path: Path):
     graph = json.loads((plan / "graph.json").read_text(encoding="utf-8"))
     assert action == "created"
     assert snapshot is None
+    assert graph["version"] == 3
     assert graph["metadata"]["lean_root"] == str(lean.resolve())
     assert graph["nodes"] == {}
+    assert (plan / "wiki" / "nodes" / "README.md").is_file()
 
 
 def test_initialize_preserves_existing_graph(tmp_path: Path):
@@ -57,6 +59,8 @@ def test_reset_snapshots_and_clears_durable_plan_state(tmp_path: Path):
     lean.mkdir()
     (plan / "informal_content").mkdir()
     (plan / "informal_content" / "n.md").write_text("proof prose", encoding="utf-8")
+    (plan / "wiki" / "nodes").mkdir(parents=True)
+    (plan / "wiki" / "nodes" / "modern.md").write_text("modern prose", encoding="utf-8")
     (plan / "graph.json").write_text(
         json.dumps({"version": 2, "metadata": {}, "nodes": {"n": {}}}),
         encoding="utf-8",
@@ -68,10 +72,14 @@ def test_reset_snapshots_and_clears_durable_plan_state(tmp_path: Path):
     assert snapshot is not None
     assert (snapshot / "graph.json").exists()
     assert (snapshot / "informal_content" / "n.md").read_text() == "proof prose"
+    assert (snapshot / "wiki" / "nodes" / "modern.md").read_text() == "modern prose"
     assert (snapshot / "task_queue.json").exists()
     assert not (plan / "task_queue.json").exists()
     assert not (plan / "informal_content").exists()
-    assert json.loads((plan / "graph.json").read_text())["nodes"] == {}
+    reset_graph = json.loads((plan / "graph.json").read_text())
+    assert reset_graph["version"] == 3
+    assert reset_graph["nodes"] == {}
+    assert (plan / "wiki" / "nodes" / "README.md").is_file()
 
 
 def test_reset_refuses_symlinked_plan_state(tmp_path: Path):

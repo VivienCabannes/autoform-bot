@@ -17,7 +17,7 @@ Clauses (each yields offenders ``{node, detail}``):
                  frontier (``is_trusted`` believes it by construction)
   content        tier-2 nodes have prose on disk (and no orphaned prose files)
   provenance     non-in-mathlib nodes cite at least one source_ref
-  slugs          no two node ids collide onto one informal_content path
+  slugs          no two node ids collide onto one canonical wiki path
   targets        metadata.targets resolve to tier-2 nodes with grounded cones
   leanpaths      lean_file stays inside the Lean repo and exists once claimed
 
@@ -37,6 +37,7 @@ Usage:
     roadmap_audit.py <graph.json> [--json] [--enqueue] [--verify-decls]
                      [--stamp-verified] [--mathlib PATH]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -83,6 +84,7 @@ def _offender(node: str, detail: str) -> dict:
 # clauses
 # ---------------------------------------------------------------------------
 
+
 def audit_structural(graph_path: Path) -> list[dict]:
     """check_invariants' structural gates, captured instead of printed."""
     buffer = io.StringIO()
@@ -92,7 +94,8 @@ def audit_structural(graph_path: Path) -> list[dict]:
         return []
     lines = [ln.strip() for ln in buffer.getvalue().splitlines() if ln.strip().startswith("✗")]
     return [_offender("(graph)", line) for line in lines] or [
-        _offender("(graph)", "structural check failed — run check_invariants.py for detail")]
+        _offender("(graph)", "structural check failed — run check_invariants.py for detail")
+    ]
 
 
 def audit_status(nodes: dict) -> list[dict]:
@@ -121,20 +124,22 @@ def audit_grounding(nodes: dict) -> list[dict]:
         if rm.normalize_status(node.get("mathlib_status")) == "in-mathlib":
             grounded[nid] = True
             return True
-        result = any(dep in nodes and grounds(dep, seen | {nid})
-                     for dep in node.get("depends_on") or [])
+        result = any(dep in nodes and grounds(dep, seen | {nid}) for dep in node.get("depends_on") or [])
         grounded[nid] = result
         return result
 
-    return [_offender(nid, "missing node with no in-mathlib root in its dependency closure")
-            for nid, node in nodes.items()
-            if eb.node_tier(node) == 2
-            and rm.normalize_status(node.get("mathlib_status")) == "missing"
-            and not grounds(nid, frozenset())]
+    return [
+        _offender(nid, "missing node with no in-mathlib root in its dependency closure")
+        for nid, node in nodes.items()
+        if eb.node_tier(node) == 2
+        and rm.normalize_status(node.get("mathlib_status")) == "missing"
+        and not grounds(nid, frozenset())
+    ]
 
 
-def audit_verified(nodes: dict, lean_root: Path | None, verify_decls: bool,
-                   mathlib_override: str | None) -> tuple[list[dict], dict[str, dict]]:
+def audit_verified(
+    nodes: dict, lean_root: Path | None, verify_decls: bool, mathlib_override: str | None
+) -> tuple[list[dict], dict[str, dict]]:
     """In-mathlib claims must be evidence-backed. Returns (offenders, stampable)."""
     offenders: list[dict] = []
     stampable: dict[str, dict] = {}
@@ -159,8 +164,11 @@ def audit_verified(nodes: dict, lean_root: Path | None, verify_decls: bool,
         if node.get("mathlib_verified"):
             continue
         if searcher is None:
-            offenders.append(_offender(nid, "in-mathlib but never verified (no stamp; "
-                                            "run with --verify-decls near a Mathlib checkout)"))
+            offenders.append(
+                _offender(
+                    nid, "in-mathlib but never verified (no stamp; run with --verify-decls near a Mathlib checkout)"
+                )
+            )
             continue
         core, root = searcher
         missing = [d for d in decls if not _decl_found(core, root, d)]
@@ -199,22 +207,30 @@ def audit_content(nodes: dict, project: Path) -> list[dict]:
             out.append(_offender(nid, "tier-2 node with null content — no prose for provers/reviewers"))
             continue
         referenced.add(content)
-        path = project / content
+        path = (project / content).resolve(strict=False)
+        try:
+            path.relative_to(project.resolve())
+        except ValueError:
+            out.append(_offender(nid, f"content path escapes project: {content}"))
+            continue
         if not path.exists() or not path.read_text(encoding="utf-8", errors="replace").strip():
             out.append(_offender(nid, f"content file missing or empty: {content}"))
-    prose_dir = project / "informal_content"
-    if prose_dir.is_dir():
-        for orphan in sorted(prose_dir.glob("*.md")):
-            rel = f"informal_content/{orphan.name}"
-            if rel not in referenced:
-                out.append(_offender("(orphan)", f"prose file no node references: {rel}"))
+    for relative_dir in (Path("wiki/nodes"), Path("informal_content")):
+        prose_dir = project / relative_dir
+        if prose_dir.is_dir():
+            for orphan in sorted(prose_dir.glob("*.md")):
+                if orphan.name == "README.md":
+                    continue
+                rel = (relative_dir / orphan.name).as_posix()
+                if rel not in referenced:
+                    out.append(_offender("(orphan)", f"prose file no node references: {rel}"))
     return out
 
 
 _ORIGINS = ("cited", "bridged", "background")
 
 
-def audit_provenance(nodes: dict) -> list[dict]:
+def audit_provenance(nodes: dict, metadata: dict | None = None) -> list[dict]:
     """Provenance = declared ORIGIN, not mandatory citations.
 
     The blueprint is a unified argument its agents AUTHOR (leanblueprint-style):
@@ -227,6 +243,14 @@ def audit_provenance(nodes: dict) -> list[dict]:
     and no explicit origin is treated as ``cited``.
     """
     out = []
+    sources = metadata.get("sources", []) if isinstance(metadata, dict) else []
+    registered = {
+        value
+        for source in sources
+        if isinstance(source, dict)
+        for value in (source.get("id"), source.get("file"), source.get("citation_key"))
+        if isinstance(value, str) and value
+    }
     for nid, node in nodes.items():
         if eb.node_tier(node) != 2 or rm.normalize_status(node.get("mathlib_status")) == "in-mathlib":
             continue
@@ -235,13 +259,21 @@ def audit_provenance(nodes: dict) -> list[dict]:
         if origin is None:
             origin = "cited" if refs else None
         if origin is None:
-            out.append(_offender(
-                nid, "no origin declared and no source_refs — say whether this is cited, "
-                     "bridged (agent-authored), or background"))
+            out.append(
+                _offender(
+                    nid,
+                    "no origin declared and no source_refs — say whether this is cited, "
+                    "bridged (agent-authored), or background",
+                )
+            )
         elif origin not in _ORIGINS:
             out.append(_offender(nid, f"unknown origin {origin!r} (cited|bridged|background)"))
         elif origin == "cited" and not refs:
             out.append(_offender(nid, "origin 'cited' but no source_refs — cite it or mark it bridged"))
+        for ref in refs:
+            if isinstance(ref, dict) and isinstance(ref.get("source"), str):
+                if ref["source"] not in registered:
+                    out.append(_offender(nid, f"source_ref names unregistered source {ref['source']!r}"))
     return out
 
 
@@ -252,8 +284,11 @@ def audit_slugs(nodes: dict) -> list[dict]:
     by_slug: dict[str, list[str]] = {}
     for nid in nodes:
         by_slug.setdefault(eb.make_slug(nid), []).append(nid)
-    return [_offender(" / ".join(sorted(ids)), f"slug collision on {slug!r} — prose files overwrite each other")
-            for slug, ids in sorted(by_slug.items()) if len(ids) > 1]
+    return [
+        _offender(" / ".join(sorted(ids)), f"slug collision on {slug!r} — prose files overwrite each other")
+        for slug, ids in sorted(by_slug.items())
+        if len(ids) > 1
+    ]
 
 
 def audit_targets(nodes: dict, meta: dict) -> list[dict]:
@@ -267,10 +302,15 @@ def audit_targets(nodes: dict, meta: dict) -> list[dict]:
             out.append(_offender(target, "target must be a tier-2 statement node"))
             continue
         cone = rm.dependency_cone(target, nodes)
-        ungrounded = [nid for nid in cone
-                      if rm.normalize_status(nodes[nid].get("mathlib_status")) == "missing"
-                      and not any(rm.normalize_status(nodes[d].get("mathlib_status")) == "in-mathlib"
-                                  for d in rm.dependency_cone(nid, nodes))]
+        ungrounded = [
+            nid
+            for nid in cone
+            if rm.normalize_status(nodes[nid].get("mathlib_status")) == "missing"
+            and not any(
+                rm.normalize_status(nodes[d].get("mathlib_status")) == "in-mathlib"
+                for d in rm.dependency_cone(nid, nodes)
+            )
+        ]
         for nid in sorted(ungrounded):
             out.append(_offender(nid, f"in target {target!r}'s cone but reaches no in-mathlib root"))
     return out
@@ -282,7 +322,7 @@ def audit_leanpaths(nodes: dict, lean_root: Path | None) -> list[dict]:
         lean_file = node.get("lean_file")
         if not lean_file or lean_root is None:
             continue
-        path = (lean_root / lean_file)
+        path = lean_root / lean_file
         try:
             path.resolve().relative_to(lean_root.resolve())
         except ValueError:
@@ -297,8 +337,8 @@ def audit_leanpaths(nodes: dict, lean_root: Path | None) -> list[dict]:
 # assembly / enqueue / stamp
 # ---------------------------------------------------------------------------
 
-def run_audit(graph_path: Path, verify_decls: bool = False,
-              mathlib_override: str | None = None) -> tuple[dict, dict]:
+
+def run_audit(graph_path: Path, verify_decls: bool = False, mathlib_override: str | None = None) -> tuple[dict, dict]:
     nodes, meta = rm.load_graph(graph_path)
     project = graph_path.parent
     lean_root = None
@@ -313,7 +353,7 @@ def run_audit(graph_path: Path, verify_decls: bool = False,
         "grounding": audit_grounding(nodes),
         "verified": verified,
         "content": audit_content(nodes, project),
-        "provenance": audit_provenance(nodes),
+        "provenance": audit_provenance(nodes, meta or {}),
         "slugs": audit_slugs(nodes),
         "targets": audit_targets(nodes, meta or {}),
         "leanpaths": audit_leanpaths(nodes, lean_root),
@@ -323,8 +363,11 @@ def run_audit(graph_path: Path, verify_decls: bool = False,
         "at": _now(),
         "clauses": clauses,
         "summary": {name: len(offs) for name, offs in clauses.items()},
-        "targets": {t: rm.target_metrics(t, nodes, rm.load_sidecar(project / "review_status.json"))
-                    for t in rm.graph_targets(meta or {}) if t in nodes},
+        "targets": {
+            t: rm.target_metrics(t, nodes, rm.load_sidecar(project / "review_status.json"))
+            for t in rm.graph_targets(meta or {})
+            if t in nodes
+        },
         "ok": not any(clauses.values()),
     }
     return report, stampable
@@ -342,8 +385,20 @@ def enqueue_offenders(project: Path, clauses: dict) -> int:
             node = off["node"]
             if node.startswith("("):
                 continue
-            rc = dq.main([str(project), "enqueue", "--agent", kind, "--node", node,
-                          "--note", f"audit:{clause} — {off['detail']}", "--source", "engine"])
+            rc = dq.main(
+                [
+                    str(project),
+                    "enqueue",
+                    "--agent",
+                    kind,
+                    "--node",
+                    node,
+                    "--note",
+                    f"audit:{clause} — {off['detail']}",
+                    "--source",
+                    "engine",
+                ]
+            )
             if rc == 0:
                 added += 1
     return added
@@ -354,8 +409,7 @@ def stamp_verified(graph_path: Path, nodes: dict, stampable: dict) -> int:
         return 0
     import merge_node  # noqa: PLC0415
 
-    payload = {"upsert": {nid: {**nodes[nid], "mathlib_verified": stamp}
-                          for nid, stamp in stampable.items()}}
+    payload = {"upsert": {nid: {**nodes[nid], "mathlib_verified": stamp} for nid, stamp in stampable.items()}}
     merge_node.merge(str(graph_path), payload)
     return len(stampable)
 
@@ -364,20 +418,24 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Audit roadmap completeness; optionally queue the gaps.")
     ap.add_argument("graph", type=Path)
     ap.add_argument("--json", action="store_true", help="machine-readable report")
-    ap.add_argument("--enqueue", action="store_true",
-                    help="queue one role task per auditable offender (deduplicated)")
-    ap.add_argument("--verify-decls", action="store_true",
-                    help="grep claimed declarations in the local Mathlib checkout")
-    ap.add_argument("--stamp-verified", action="store_true",
-                    help="write mathlib_verified stamps for fully-resolving nodes (implies --verify-decls)")
+    ap.add_argument("--enqueue", action="store_true", help="queue one role task per auditable offender (deduplicated)")
+    ap.add_argument(
+        "--verify-decls", action="store_true", help="grep claimed declarations in the local Mathlib checkout"
+    )
+    ap.add_argument(
+        "--stamp-verified",
+        action="store_true",
+        help="write mathlib_verified stamps for fully-resolving nodes (implies --verify-decls)",
+    )
     ap.add_argument("--mathlib", default=None, help="explicit Mathlib checkout root")
     args = ap.parse_args(argv)
 
     if not args.graph.exists():
         print(f"no graph at {args.graph}", file=sys.stderr)
         return 2
-    report, stampable = run_audit(args.graph, verify_decls=args.verify_decls or args.stamp_verified,
-                                  mathlib_override=args.mathlib)
+    report, stampable = run_audit(
+        args.graph, verify_decls=args.verify_decls or args.stamp_verified, mathlib_override=args.mathlib
+    )
 
     if args.stamp_verified and stampable:
         nodes, _meta = rm.load_graph(args.graph)
@@ -397,9 +455,11 @@ def main(argv=None) -> int:
             if len(offenders) > 8:
                 print(f"      … {len(offenders) - 8} more")
         for target, metrics in (report.get("targets") or {}).items():
-            print(f"  ◎ target {target}: cone {metrics['cone_size']}, "
-                  f"unproved {metrics['unproved_mass']}, ready {metrics['ready']}, "
-                  f"critical path {metrics['critical_path']}")
+            print(
+                f"  ◎ target {target}: cone {metrics['cone_size']}, "
+                f"unproved {metrics['unproved_mass']}, ready {metrics['ready']}, "
+                f"critical path {metrics['critical_path']}"
+            )
         if "stamped" in report:
             print(f"  stamped {report['stamped']} verified in-mathlib node(s)")
         if "enqueued" in report:

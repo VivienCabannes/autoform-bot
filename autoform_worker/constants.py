@@ -36,6 +36,7 @@ _MERGE_PATH_ALLOW = (
     r"^[^/]+\.lean$",            # top-level lean (rare)
     r"^[A-Za-z0-9_./-]+\.lean$",  # library lean files
     r"^kernel/",                  # kernel evidence
+    r"^wiki/(?:nodes|sources|papers|concepts|audits|decisions)/",  # authored wiki
     r"^informal_content/",        # node prose
     r"^review_status\.json$",     # sidecar folds
 )

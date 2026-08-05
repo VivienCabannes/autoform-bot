@@ -89,7 +89,7 @@ proposals; `scripts/merge_node.py` remains the only graph writer.
 
 These artifacts are provider- and host-neutral:
 
-- `graph.json` and `informal_content/`
+- `graph.json` and `wiki/nodes/`
 - `task_queue.json` and `agents_status.json`
 - `review_status.json`
 - `formalization.yaml` and the append-only usage ledger

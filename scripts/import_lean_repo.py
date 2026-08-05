@@ -246,7 +246,10 @@ def build_payload(decls: list[Decl], limit: int = 0) -> dict:
             "description": (f"Declarations in the Lean module `{module}` "
                             f"({len(members)} imported)."),
             "provisional_members": [d.name for d in members],
+            "statement_depends_on": [],
+            "proof_depends_on": [],
             "depends_on": [],
+            "related": [],
             "mathlib_status": "missing" if any(d.incomplete for d in members) else "partial",
             "origin": "background",
             "content": None,
@@ -266,7 +269,14 @@ def build_payload(decls: list[Decl], limit: int = 0) -> dict:
             "description": (f"{decl.kind.capitalize()} `{decl.name}` imported from "
                             f"`{decl.lean_file}`."
                             + (" Its proof is incomplete (sorry/admit)." if decl.incomplete else "")),
+            # The lightweight lexer sees a declaration as one span and cannot
+            # soundly separate type mentions from proof-body mentions. Preserve
+            # scheduling by classifying imported edges as proof dependencies;
+            # the graph-review wave reclassifies statement-level edges.
+            "statement_depends_on": [],
+            "proof_depends_on": sorted(deps),
             "depends_on": sorted(deps),
+            "related": [],
             # An imported proof is real work, but nobody has reviewed it and it
             # is not Mathlib: `partial` when it compiles-as-written, `missing`
             # when a sorry remains. Never `in-mathlib` — that status is trusted

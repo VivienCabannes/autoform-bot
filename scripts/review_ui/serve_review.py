@@ -27,7 +27,7 @@ API:
                                   delta (new effective verdicts + tainted set).
   * ``GET  /assets/*``          — review.css / review.js (+ any static asset).
 
-Inputs (read-only): ``graph.json``, ``informal_content/<id>.md``, the built
+Inputs (read-only): ``graph.json``, linked ``wiki/nodes/<id>.md`` prose, the built
 blueprint (``dep_graph_document.html`` for the ``div.thm#<slug>`` fragments), an
 optional ``kernel/<id>.txt`` (``#print axioms`` dump), and the sidecar.
 
@@ -318,7 +318,8 @@ class Project:
     def __init__(self, graph_path: Path):
         self.graph_path = graph_path.resolve()
         self.root = self.graph_path.parent
-        self.content_dir = self.root / "informal_content"
+        self.content_dir = self.root / "wiki" / "nodes"
+        self.legacy_content_dir = self.root / "informal_content"
         self.kernel_dir = self.root / "kernel"
         self.sidecar_path = self.root / "review_status.json"
         # Live activity feed, read-only, sitting next to graph.json. The orchestrator
@@ -449,12 +450,13 @@ class Project:
             idx = tag_end + 1
 
     def informal_md(self, node_id: str, node: dict) -> Optional[str]:
-        """Raw informal_content markdown for a node (fallback when no blueprint)."""
+        """Raw authored node Markdown (fallback when no blueprint)."""
         cand = []
         cpath = node.get("content")
         if isinstance(cpath, str):
             cand.append(self.root / cpath)
         cand.append(self.content_dir / f"{node_id}.md")
+        cand.append(self.legacy_content_dir / f"{node_id}.md")
         for c in cand:
             try:
                 resolved = c.resolve()

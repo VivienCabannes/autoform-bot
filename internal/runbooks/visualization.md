@@ -6,7 +6,7 @@ Resolve the absolute plugin root from a valid host variable or
 
 Build and open the interactive tiered dependency graph for a formalization plan.
 The view is a `leanblueprint` web project, generated from the plan's `graph.json`
-and its `informal_content/*.md` files and laid out in the browser. It has a **Tier
+and its `wiki/nodes/*.md` files and laid out in the browser. It has a **Tier
 dropdown** that switches granularity between the coarse tier-1 cluster map and the
 fine tier-2 statement graph.
 
@@ -46,7 +46,7 @@ uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
 ```
 
 `<graph.json>` is the plan's structure file. `--content` is the directory of
-`<id>.md` prose files (default: `informal_content/` next to `graph.json`), and
+`<id>.md` prose files (default: `wiki/nodes/` next to `graph.json`), and
 `--out` is where the project is written (default: `blueprint_export/` next to
 `graph.json`).
 
@@ -143,7 +143,7 @@ statement; clicking a tier-1 cluster shows its description and member list.
 
 - After creating or updating a formalization plan, to see the result.
 - When the user asks to view the current state of the graph at either tier.
-- After manual edits to `graph.json` or `informal_content/*.md` — rerun the export
+- After manual edits to `graph.json` or `wiki/nodes/*.md` — rerun the export
   and `make web` to refresh the view.
 
 ## What the visualization shows

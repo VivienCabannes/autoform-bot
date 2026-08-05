@@ -52,7 +52,8 @@ def proof_fingerprint(
     project = graph_path.parent
     content = node.get("content") if isinstance(node.get("content"), str) else None
     if content is None:
-        content = f"informal_content/{node_id}.md"
+        modern = project / "wiki" / "nodes" / f"{node_id}.md"
+        content = f"wiki/nodes/{node_id}.md" if modern.is_file() else f"informal_content/{node_id}.md"
     lean_file = node.get("lean_file") if isinstance(node.get("lean_file"), str) else None
 
     digest = hashlib.sha256()

@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: The kinds the shipped plugin must expose today (8 role files + 2 engine kinds).
 SHIPPED_KINDS = (
     "reviewer", "worker", "planner", "mathcheck", "graphreview",
-    "contentreview", "holistic", "escalation", "counterexample", "priorart",
+    "contentreview", "wikicurator", "holistic", "escalation", "counterexample", "priorart",
 )
 
 
@@ -478,7 +478,8 @@ def test_build_prompt_carries_role_body_and_context(tmp_path, monkeypatch):
     assert "`n1` (Node one)" in prompt
     assert str(cfg.graph_path) in prompt
     assert str(cfg.lean_root) in prompt
-    assert str(cfg.project / "informal_content") in prompt
+    assert str(cfg.project / "wiki" / "nodes") in prompt
+    assert "Never edit `wiki/_generated/`" in prompt
     assert "- sources:" in prompt and "book.pdf" in prompt
 
 

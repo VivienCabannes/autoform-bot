@@ -1,233 +1,228 @@
 ---
 name: plan-json-schema
-description: Full schema reference for the v2 tiered plan — graph.json (structure) plus per-node informal_content/<id>.md (prose)
+description: Schema v3 contract for graph.json, authored wiki pages, evidence, and generated blueprint navigation
 ---
 
-# Plan Data Model Reference (v2)
+# Autoform Wiki/Blueprint Contract (v3)
 
-A formalization plan is a **tiered dependency graph**: coarse concept clusters at tier 1, fine definitions/statements at tier 2, and (in the future) Lean statements at tier 3. The model is deliberately generic across tiers — nothing in the schema hard-codes "three"; a node simply names its tier and points at its container one tier up. Everything coarser is *computed*, not stored.
+An Autoform project has four deliberately separate layers:
 
-The plan lives in the user's project directory (alongside `lakefile.toml`) and is split across two kinds of file: one global structure file and one prose file per node.
+1. `graph.json` is the canonical machine control plane. It owns stable node
+   identities, hierarchy, typed dependencies, targets, source registration,
+   Mathlib mapping, and Lean mapping.
+2. `wiki/` is the canonical authored mathematical knowledge base. It owns
+   informal statements, proof narratives, source maps, concept synthesis,
+   audits, and modeling decisions.
+3. `kernel/` and `review_status.json` hold proof and review evidence. Status is
+   derived from these artifacts and the graph; it is never authored in wiki
+   frontmatter.
+4. `wiki/_generated/`, the local dashboard, and GitHub Pages are projections.
+   They may be deleted and rebuilt without losing mathematical knowledge.
 
-## The two-file encoding
+This division combines a strict dependency DAG with a human-readable internal
+wiki. Markdown links aid exploration, but they never create graph edges or
+change proof state.
 
-Structure and content are kept apart, because they have different owners, different change patterns, and different readers.
+## Repository shape
 
-- **`graph.json`** — a single JSON object: top-level metadata plus a map of nodes keyed by `id`. Each node carries only *structural* fields (tier, parent, edges, Mathlib correspondence, bookkeeping). All writes go through a **single locked merge step** (`merge_node.py`): each change is folded in incrementally, which serializes concurrent writers and keeps the file valid throughout, so a long run stays durable and persisting a node costs nothing as the graph grows. The derived (quotient) edges are a function of the whole graph, recomputed at re-projection and at export rather than on each merge.
-- **`informal_content/<id>.md`** — one Markdown file per node, holding that node's mathematical prose: the paraphrased universal-voice statement, and its proof when the node is not in Mathlib. Subagents write these. The filename is a slug derived from the node's `id`, and a node's `content` field records the path. Keeping prose out of `graph.json` keeps the structure file readable and diffable, and maps each node directly onto a blueprint environment at export time.
-
-The two files are linked only by `id`: a node in `graph.json` names its prose file via `content`, and that field is `null` until the prose has been written.
-
-## Top-level structure of `graph.json`
-
-```jsonc
-{
-  "version": 2,
-  "metadata": { ... },
-  "nodes": {
-    "Markov's inequality": { ... },
-    "Sub-Gaussian variables": { ... }
-  }
-}
+```text
+graph.json
+wiki/
+  README.md
+  nodes/          # one canonical informal statement/proof page per linked node
+  sources/        # adopted-source maps and exact locators
+  papers/         # paper-level notes keyed by stable citation identifiers
+  concepts/       # cross-node synthesis and notation
+  audits/         # durable mathematical review findings
+  decisions/      # accepted modeling decisions and rationale
+  _generated/     # deterministic indexes; never hand-edited
+kernel/            # checked proof evidence
+review_status.json # review evidence (local by default; publish only allowlisted fields)
+.autoform/         # local queues, leases, logs, provider state, and caches
 ```
 
-`nodes` is a **map keyed by `id`**, not an array — lookups by id are the dominant operation (resolving `parent` and `depends_on`, recomputing quotient edges), and keying by id makes the uniqueness invariant structural rather than something to police.
+Operational files such as `agents_status.json`, `task_queue.json`, provider
+configuration, dispatcher logs, credentials, and machine-specific paths never
+belong in the wiki or public site.
 
-### `version` (integer, required)
-
-Schema version. Currently `2`. Increment on breaking changes.
-
-### `metadata` (object, required)
+## Top-level graph
 
 ```json
 {
-  "created_at": "2026-06-10T14:30:00Z",
-  "last_updated": "2026-06-10T15:45:00Z",
-  "sources": [
-    {"file": "sources/high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
-  ]
+  "version": 3,
+  "metadata": {
+    "lean_root": "/local/path/not-for-publication",
+    "sources": [],
+    "targets": []
+  },
+  "nodes": {}
 }
 ```
 
-`created_at` and `last_updated` are ISO 8601 timestamps. `sources` lists the textbooks the plan is built from; each entry has `file` (the book's path in the plan's `sources/` subfolder), `title`, and `format` (one of `"latex"`, `"markdown"`, `"pdf"`).
+`nodes` is a map keyed by stable ID. The key and each record's `id` must agree.
+IDs survive title, file, and declaration renames. `metadata.targets` contains
+node IDs or objects with a `node` field and identifies the mission sinks used
+for prioritization and progress metrics.
 
-## Node (structural) fields
+## Node record
 
-Every node — whatever its tier — has the same shape. The fields below are *structural* and live in `graph.json`; the mathematical prose lives in the linked `informal_content/<id>.md`.
+Every node uses the same record shape. Required fields should be present even
+when their arrays are empty.
 
 | Field | Type | Meaning |
-|-------|------|---------|
-| `id` | string | Unique identifier — the concept's ordinary English name, written out in full and verbatim (e.g. `Markov's inequality`, `Sub-Gaussian variables`). Apostrophes, spaces, and capitals are fine; the exporter generates a slug-safe label for rendering and escapes the name for display. Book numbering (e.g. "Theorem 1.6") belongs in `source_refs`, never in the id. |
-| `tier` | integer | The node's tier: `1` (coarse concept cluster), `2` (fine definition/statement), or `3` (Lean statement, future). |
-| `parent` | string or null | The `id` of this node's container exactly one tier up — its cluster, for a tier-2 node. `null` for tier-1 nodes (which have no container), and also permitted *transiently* for a finer node that fits no existing container while a tier is being built — an orphan the re-projection step then assigns or gives a new container. **This is the only authored hierarchy link** (see below). |
-| `kind` | string | One of `"definition"`, `"theorem"`, `"proposition"`, `"lemma"`, `"corollary"`, `"example"`. |
-| `description` | string | A brief informal summary of the node's mathematical content — a sentence or two, enough for a reviewer to grasp the concept without opening the source. This is the structural one-liner; the full paraphrased statement/proof lives in `informal_content/<id>.md`. |
-| `provisional_members` | array of strings | **Tier-1 only, Phase-1 scratch.** The names of the statements a cluster is expected to contain, recorded during coarse extraction to guide Phase-2 splitting. Distinct from the derived `members` (below): this is an authored planning hint, not the live child list. The splitter treats it as a guide, not a contract, and it is ignored once the cluster has been split. |
-| `depends_on` | array of strings | The `id`s this node depends on **within its own tier** — the prerequisites needed to define or prove it. Cross-tier dependencies are never written here; they are recovered by the quotient rule. |
-| `mathlib_status` | string | One of `"in-mathlib"`, `"partial"`, `"missing"` (see table below). |
-| `mathlib_declarations` | array of strings | Mathlib declaration names corresponding to this node, e.g. `["ProbabilityTheory.measure_ge_le_exp_mul_mgf"]`. Empty or absent when the node is `missing`. |
-| `mathlib_file` | string | Path to the primary Mathlib source file, e.g. `"Mathlib/Probability/Moments/Basic.lean"`. Absent when `missing`. |
-| `mathlib_notes` | string | Free text on the Mathlib correspondence: generality or naming differences, how to import it, why the match is partial. |
-| `source_refs` | array | **Internal provenance only — never rendered** in the published content. Records where the concept appears in the sources, for faithfulness-checking. Each entry has `file` and `location` (free text: chapter, section, page). |
-| `origin` | string | Where the mathematics comes from: `cited` (recovered from the source corpus — `source_refs` required), `bridged` (agent-authored connective mathematics filling a gap the sources leave — legitimate and expected, but flagged for extra adversarial review), or `background` (standard material any textbook covers). Absent + `source_refs` present ⇒ treated as `cited`. The blueprint is a UNIFIED argument the agents author, leanblueprint-style; sources are its bibliography, not its boundary. Fabricating a citation is the one unforgivable provenance failure. |
-| `content` | string or null | Path to this node's prose file, e.g. `"informal_content/markovs-inequality.md"`. `null` until the prose has been written. |
-| `lean_file` | string (optional) | Repo-relative path of the Lean file holding this node's statement/proof once one lands. Load-bearing for prove-eligibility (a sorry scan runs on it) and the static dashboard's proof-status; must stay inside the Lean repo (the audit's `leanpaths` clause enforces this). |
-| `mathlib_verified` | object (optional) | Verification stamp for an `in-mathlib` claim, written by `roadmap_audit.py --stamp-verified` (`{"at", "method", "declarations"}`). An in-Mathlib status without declarations *and* a stamp is flagged by the audit's `verified` clause — unverified claims silently poison the trust frontier, because `is_trusted` believes them by construction. |
+| --- | --- | --- |
+| `id` | string | Stable identity, equal to the map key. |
+| `name` | string | Human-readable title. Defaults to the ID in presentation code. |
+| `tier` | integer | `1` cluster, `2` theorem-sized mathematical node, `3` Lean-level refinement when used. |
+| `parent` | string or null | The only authored hierarchy edge; it resolves exactly one tier upward. |
+| `kind` | string | `definition`, `lemma`, `theorem`, `construction`, `section`, or another precise mathematical kind. |
+| `description` | string | Short structural summary, not a replacement for the linked wiki page. |
+| `statement_depends_on` | string array | Nodes needed to state or type this node. |
+| `proof_depends_on` | string array | Additional nodes needed only by its proof or construction. |
+| `depends_on` | string array | Ordered de-duplicated union of the two typed arrays. Compatibility field consumed by the current scheduler; maintained by `merge_node.py`. |
+| `related` | string array | Non-blocking conceptual links. They resolve but do not affect readiness or trust. |
+| `mathlib_status` | string | Exactly `in-mathlib`, `partial`, or `missing`. |
+| `mathlib_declarations` | string array | Concrete declarations supporting the Mathlib classification. |
+| `mathlib_file` | string or null | Mathlib location when useful. |
+| `mathlib_verified` | object or null | Verification evidence for an `in-mathlib` claim. |
+| `origin` | string | `cited`, `bridged`, or `background`. |
+| `source_refs` | object array | Typed links into `metadata.sources`, described below. |
+| `content` | string or null | Repo-relative canonical authored page, normally `wiki/nodes/<slug>.md`. |
+| `lean_file` | string or null | Repo-relative Lean file associated with the node. |
+| `lean_declaration` | string or null | Compiled declaration name when one has landed. |
 
-### Metadata: `targets`
+Legacy schema-v2 nodes without typed arrays remain readable. Migration treats
+their old `depends_on` edges as proof dependencies because that preserves the
+existing scheduler semantics without claiming they are statement-level.
 
-`metadata.targets` (optional) lists the mission sinks — the tier-2 statements
-the project exists to reach. Entries are node ids or `{"node": id, ...}`
-records, written only through `merge_node.py` (payload key `"metadata"`), which
-validates each entry resolves to an existing node. Targets drive the workers'
-prove ordering (critical-path first), the audit's target-reachability clause,
-and the distance metrics (`cone`, `unproved mass`, `ready`, `critical path`)
-reported by `autoform status` and the audit.
+## Dependency semantics
 
-### What is *not* a field
+Use `statement_depends_on` when the prerequisite occurs in the statement's
+types, definitions, hypotheses, or conclusion. Use `proof_depends_on` only for
+additional facts used to establish the statement. A node becomes schedulable
+only after the union is ready, so splitting the edge types improves agent
+context without weakening execution ordering.
 
-A node never stores its live children, and never stores cross-tier edges. Specifically, `members` (the actual list of a node's children) and the coarser-tier edges are **derived**, not recorded — they are recomputed on demand from the `parent` pointers and the fine `depends_on` edges. Storing them would invite drift; leaving them out makes the structure self-consistent by construction. (The tier-1 `provisional_members` field above is a different thing: an authored Phase-1 *hint* about what a cluster will contain, not the live child list — it is never used to derive anything.)
+`related` is navigation, not dependency. It may cross tiers, is excluded from
+acyclicity and readiness calculations, and must never be used to make an
+unsupported node look grounded.
 
-### `mathlib_status` values
+All dependency IDs resolve within the same tier. Dependency graphs are acyclic
+within each tier. `parent` resolves exactly one tier upward. Children and
+coarser projections are derived from `parent` and the finest built dependency
+graph; they are not stored as duplicate member arrays.
 
-| Value | Meaning |
-|-------|---------|
-| `"in-mathlib"` | The concept exists in Mathlib, possibly under a different name or in greater generality. These are the **green roots** that ground the graph. |
-| `"partial"` | Key components exist but the exact statement needs assembly, or the match is uncertain. A whole tier-1 cluster is usually `partial`. |
-| `"missing"` | The concept is not in Mathlib. A `missing` node needs prose (statement **and** proof) and must trace down to green roots. |
+## Source registry and references
 
-## The hierarchy invariant (the spine)
+`metadata.sources` is a registry of adopted source artifacts:
 
-The tiers are kept in sync by a single rule: **`parent` is the only authored hierarchy link, and everything coarser is a projection of the finer tier** — except a coarse node's own descriptive metadata, which is curated to match.
+```json
+{
+  "id": "BCIKS20",
+  "title": "Canonical source title",
+  "citation_key": "BCIKS20",
+  "url": "https://example.org/stable-record",
+  "file": "sources/local-copy.pdf",
+  "wiki": "wiki/papers/BCIKS20.md"
+}
+```
 
-- **Members (children) are derived.** A node's children are exactly the nodes whose `parent` points back at it. The list is never stored; it is read off the `parent` pointers when needed.
-- **The coarser node set is derived.** The tier-1 nodes are exactly the distinct `parent` values of the tier-2 nodes: an empty cluster is pruned, and a finer node pointing at a new parent materialises a new coarse node.
-- **Coarser-tier edges are the quotient of the finer tier's edges.** A tier-1 cluster A has an edge to a tier-1 cluster B (with A ≠ B) **iff some tier-2 node inside A depends on some tier-2 node inside B**. The same rule relates tier-2 to tier-3 once tier 3 exists.
-- **A coarse node's metadata is curated, not derived.** Its name, description, and `mathlib_status` rollup are judgments about the grouping, re-curated to match whatever membership the finer tier dictates.
+`id` is required and unique in v3. `url` should identify a stable public record;
+`file` is an optional repo-relative artifact; `wiki` points to durable project
+notes. A node cites it with a typed locator:
 
-Because the coarse graph is a function of the fine graph, the two can never drift out of sync. This is what makes parallel construction safe: all writes serialize through the locked merge step, subagents author only fine `parent`/`depends_on` edges, and the orchestrator re-projects the coarse tier from the whole graph.
+```json
+{
+  "source": "BCIKS20",
+  "locator": "Theorem 4.2, pp. 17-18",
+  "role": "statement",
+  "note": "Notation translated to the project's convention"
+}
+```
 
-The finest built tier is authoritative. During Phase 1 there is no tier 2 yet, so tier 1 is authored directly — but only as a **scaffold**. Phase 2 builds the authoritative tier-2 graph (free to add, drop, and re-parent nodes), after which tier 1 is **re-projected** from it: node set and edges recomputed mechanically, metadata re-curated. When tier 3 arrives it is built from tier 2 the same way, and tiers 2 and 1 re-projected from it.
+`role` is normally `statement`, `proof`, `definition`, `motivation`, or
+`counterexample`. A cited node needs at least one real reference. Bridged and
+background nodes must declare their origin but must not invent citations.
+Source pages may link to informal sources, arXiv records, DOI pages, Zulip
+threads, Mathlib documentation, and Lean declarations. They should summarize
+what each source contributes rather than copy its prose.
+
+## Authored wiki pages
+
+`wiki/nodes/` pages contain the canonical informal mathematics. A theorem page
+normally has one H1, its statement, a proof or proof strategy when not already
+in Mathlib, and links to relevant source/concept pages. The graph owns the
+formal dependency lists, so prose links are explanatory and may not silently
+change topology.
+
+Keep node prose in a consistent Mathlib-aligned notation and the project's own
+voice. Cite precise source locations in source maps rather than copying long
+passages. Lean docstrings may use compact citation keys and link back to the
+corresponding wiki page.
+
+The other authored sections serve different retrieval needs:
+
+- `sources/` and `papers/` answer where a claim came from;
+- `concepts/` answer how recurring ideas and notation fit together;
+- `audits/` preserve accepted reviewer findings worth retaining;
+- `decisions/` explain why a modeling choice was made.
+
+Do not duplicate proof status in those pages. The engine derives it from Lean,
+kernel evidence, reviews, and dependency state.
+
+## Generated wiki
+
+Run:
+
+```bash
+python scripts/wiki_blueprint.py <project> build
+python scripts/wiki_blueprint.py <project> check
+```
+
+The generated projection includes a graph revision, mission targets, tier
+indexes, per-node neighborhoods, separate statement/proof prerequisites,
+dependents, children, source links, review summaries, kernel-evidence presence,
+and links back to authored pages. It excludes timestamps and absolute Lean
+paths from its revision hash. Identical durable inputs produce identical files.
+
+`wiki/_generated/manifest.json` records the schema, graph revision, Git commit
+when available, and generated file list. Agents never edit this directory.
 
 ## Invariants
 
-1. **Ids are unique.** Since `nodes` is keyed by `id`, the map enforces this; no two nodes share an id.
-2. **Every `parent` resolves.** A non-null `parent` names an existing node exactly one tier up (a tier-2 node's parent is a tier-1 node). Tier-1 nodes have `parent: null`. Equivalently: every tier-2 node has a tier-1 parent.
-3. **Every `depends_on` target resolves and stays within the tier.** Each id in a node's `depends_on` names an existing node of the *same* tier.
-4. **The dependency graph is a DAG within each tier.** No cycles among same-tier `depends_on` edges. (The derived coarse graph is then also acyclic.)
-5. **Every `missing` node reaches a green root.** Following `depends_on` from any `missing` node leads, within finitely many steps, to an `in-mathlib` node. No `missing` node is left unsupported; roots of the graph (nodes with empty `depends_on`) are `in-mathlib`.
-6. **`content` matches reality.** `content` is `null` exactly when no prose file exists for the node; otherwise it points at the existing `informal_content/<id>.md`.
-7. **`source_refs` is never rendered.** It is internal bookkeeping only and must not leak into the published prose.
+1. Node IDs and source IDs are stable and unique.
+2. Every `parent`, typed dependency, compatibility dependency, `related` entry,
+   target, and typed source reference resolves.
+3. `depends_on` equals the ordered de-duplicated union of
+   `statement_depends_on` and `proof_depends_on` for v3 nodes.
+4. Dependency edges stay within a tier and form a DAG; parents sit exactly one
+   tier above their children.
+5. Every missing node reaches verified Mathlib grounding through dependencies
+   by the end of a roadmap phase.
+6. Every non-null `content` path stays inside the project and names a nonempty
+   authored file. Authored node files are referenced by exactly one graph node.
+7. An `in-mathlib` claim names real declarations and carries verification
+   evidence before it enters the trust frontier.
+8. A cited node resolves to registered sources with precise locators. Bridged
+   and background nodes declare their origin explicitly.
+9. Proof/review status is derived from evidence and never authored in Markdown.
+10. Public exports use an explicit allowlist and contain no operational state,
+    credentials, provider settings, logs, or machine paths.
 
-## Worked example
+## Migration
 
-A small two-tier graph: two tier-1 clusters (`Concentration inequalities` depending on `Moment methods`) and three tier-2 nodes distributed across them.
+Migration is explicit and non-destructive with respect to authored content:
 
-### `graph.json`
-
-```jsonc
-{
-  "version": 2,
-  "metadata": {
-    "created_at": "2026-06-10T14:30:00Z",
-    "last_updated": "2026-06-10T15:45:00Z",
-    "sources": [
-      {"file": "sources/high_dim_stats.pdf", "title": "High-Dimensional Statistics", "format": "pdf"}
-    ]
-  },
-  "nodes": {
-    "Moment methods": {
-      "id": "Moment methods",
-      "tier": 1,
-      "parent": null,
-      "kind": "definition",
-      "depends_on": [],
-      "mathlib_status": "partial",
-      "mathlib_declarations": [],
-      "mathlib_file": "Mathlib/Probability/Moments/Basic.lean",
-      "mathlib_notes": "Moment generating functions present; cluster assembled from several files.",
-      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, §1.2"}],
-      "content": null
-    },
-    "Concentration inequalities": {
-      "id": "Concentration inequalities",
-      "tier": 1,
-      "parent": null,
-      "kind": "theorem",
-      "depends_on": ["Moment methods"],
-      "mathlib_status": "partial",
-      "mathlib_declarations": [],
-      "mathlib_file": "Mathlib/Probability/Moments/SubGaussian.lean",
-      "mathlib_notes": "Markov/Chernoff present; sub-Gaussian theory partially formalized.",
-      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, §1.3"}],
-      "content": null
-    },
-
-    "Moment generating function": {
-      "id": "Moment generating function",
-      "tier": 2,
-      "parent": "Moment methods",
-      "kind": "definition",
-      "depends_on": [],
-      "mathlib_status": "in-mathlib",
-      "mathlib_declarations": ["ProbabilityTheory.mgf"],
-      "mathlib_file": "Mathlib/Probability/Moments/Basic.lean",
-      "mathlib_notes": "Defined as the expectation of exp(t·X).",
-      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, Def 1.2"}],
-      "content": "informal_content/moment-generating-function.md"
-    },
-    "Markov's inequality": {
-      "id": "Markov's inequality",
-      "tier": 2,
-      "parent": "Concentration inequalities",
-      "kind": "theorem",
-      "depends_on": [],
-      "mathlib_status": "in-mathlib",
-      "mathlib_declarations": ["MeasureTheory.mul_meas_ge_le_lintegral"],
-      "mathlib_file": "Mathlib/MeasureTheory/Integral/Lebesgue.lean",
-      "mathlib_notes": "Markov's inequality for nonnegative measurable functions.",
-      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, Thm 1.5"}],
-      "content": "informal_content/markovs-inequality.md"
-    },
-    "Chernoff bound": {
-      "id": "Chernoff bound",
-      "tier": 2,
-      "parent": "Concentration inequalities",
-      "kind": "theorem",
-      "depends_on": ["Markov's inequality", "Moment generating function"],
-      "mathlib_status": "partial",
-      "mathlib_declarations": ["ProbabilityTheory.measure_ge_le_exp_mul_mgf"],
-      "mathlib_file": "Mathlib/Probability/Moments/Basic.lean",
-      "mathlib_notes": "Generic exponential-Markov bound present; the optimized form is assembled.",
-      "source_refs": [{"file": "sources/high_dim_stats.pdf", "location": "Ch 1, Thm 1.6"}],
-      "content": "informal_content/chernoff-bound.md"
-    }
-  }
-}
+```bash
+python scripts/wiki_blueprint.py <project> migrate
 ```
 
-Notice what is **absent**: neither tier-1 cluster lists its members, and the tier-1 edge `Concentration inequalities → Moment methods` is shown here only as a Phase-1 authored scaffold edge. Once tier 2 exists, that edge is *derived*: the tier-2 node `Chernoff bound` (in `Concentration inequalities`) depends on `Moment generating function` (in `Moment methods`), so the quotient yields exactly that coarse edge. The `Markov's inequality → Chernoff bound` part of the graph is internal to the `Concentration inequalities` cluster and contributes no coarse edge.
+For schema v2 it moves linked `informal_content/*.md` pages into `wiki/nodes/`,
+normalizes source IDs/references, adds typed edges, and writes schema v3. For a
+Markdown-first `blueprint/roadmap/`, it imports `kind: node` pages, converts
+`## Depends on` and `## Proof depends on` links into typed edges, and retains
+the Markdown body as authored node content. It refuses path traversal,
+symlinked wiki sections, duplicate source IDs, and authored-file overwrites.
 
-### `informal_content/chernoff-bound.md`
-
-Because `Chernoff bound` is `partial` rather than fully `in-mathlib`, its prose carries both a statement and a proof, reorganized around *our* prerequisite nodes (not the book's lemma numbers), in one consistent Mathlib-aligned notation and an uncited universal voice:
-
-```markdown
-# Chernoff bound
-
-Let $X$ be a real random variable whose moment generating function
-$M_X(t) = \mathbb{E}[e^{tX}]$ is finite for $t$ in a neighborhood of $0$.
-Then for every $a \in \mathbb{R}$,
-$$ \mathbb{P}(X \ge a) \le \inf_{t > 0} e^{-ta} M_X(t). $$
-
-## Proof
-
-Fix $t > 0$. The event $\{X \ge a\}$ coincides with $\{e^{tX} \ge e^{ta}\}$,
-since $x \mapsto e^{tx}$ is strictly increasing. Applying Markov's inequality
-to the nonnegative random variable $e^{tX}$ gives
-$$ \mathbb{P}(X \ge a) = \mathbb{P}(e^{tX} \ge e^{ta})
-   \le e^{-ta}\,\mathbb{E}[e^{tX}] = e^{-ta} M_X(t). $$
-As this holds for every $t > 0$, taking the infimum over $t > 0$ yields the claim.
-```
-
-An `in-mathlib` node such as `Markov's inequality` would instead carry only a statement and a pointer to its Mathlib declaration — no paraphrased proof, since Mathlib already has one.
+Existing v2 graphs remain readable until migration. New projects initialize at
+v3. Keep compatibility fallbacks until every active project has migrated.

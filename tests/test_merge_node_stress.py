@@ -50,10 +50,7 @@ def test_cross_process_merge_stress_has_no_lost_nodes(tmp_path: Path):
         payloads.append(payload)
 
     ctx = multiprocessing.get_context("fork")
-    processes = [
-        ctx.Process(target=_merge_process, args=(str(graph), str(payload)))
-        for payload in payloads
-    ]
+    processes = [ctx.Process(target=_merge_process, args=(str(graph), str(payload))) for payload in payloads]
     for process in processes:
         process.start()
     for process in processes:
@@ -120,6 +117,49 @@ def test_delete_strips_dependencies_and_explicitly_orphans_children(tmp_path: Pa
     assert result["stripped_edges"] == [("dependent", "parent")]
 
 
+def test_typed_dependencies_drive_compatibility_union(tmp_path: Path):
+    graph = _graph(tmp_path)
+    mn.merge(
+        str(graph),
+        {
+            "upsert": {
+                "statement": _node("statement"),
+                "proof": _node("proof"),
+                "goal": {
+                    **_node("goal", depends_on=["ignored-legacy-value"]),
+                    "statement_depends_on": ["statement"],
+                    "proof_depends_on": ["proof", "statement"],
+                    "related": [],
+                },
+            }
+        },
+    )
+    goal = json.loads(graph.read_text())["nodes"]["goal"]
+    assert goal["statement_depends_on"] == ["statement"]
+    assert goal["proof_depends_on"] == ["proof", "statement"]
+    assert goal["depends_on"] == ["statement", "proof"]
+
+
+def test_delete_strips_typed_dependencies_and_related_edges(tmp_path: Path):
+    graph = _graph(
+        tmp_path,
+        {
+            "base": _node("base"),
+            "goal": {
+                **_node("goal", depends_on=["base"]),
+                "statement_depends_on": ["base"],
+                "proof_depends_on": [],
+                "related": ["base"],
+            },
+        },
+    )
+    mn.merge(str(graph), {"delete": ["base"]})
+    goal = json.loads(graph.read_text())["nodes"]["goal"]
+    assert goal["statement_depends_on"] == []
+    assert goal["depends_on"] == []
+    assert goal["related"] == []
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
@@ -129,9 +169,7 @@ def test_delete_strips_dependencies_and_explicitly_orphans_children(tmp_path: Pa
         ({"delete": ["x", "x"]}, "duplicate"),
     ],
 )
-def test_malformed_payload_is_rejected_without_write(
-    tmp_path: Path, payload: dict, message: str
-):
+def test_malformed_payload_is_rejected_without_write(tmp_path: Path, payload: dict, message: str):
     graph = _graph(tmp_path)
     before = graph.read_bytes()
     with pytest.raises(ValueError, match=message):
@@ -142,11 +180,7 @@ def test_malformed_payload_is_rejected_without_write(
 def test_cli_reports_rejection_without_traceback_or_write(tmp_path: Path, capsys):
     graph = _graph(tmp_path)
     payload = tmp_path / "payload.json"
-    payload.write_text(
-        json.dumps(
-            {"upsert": {"dependent": _node("dependent", depends_on=["missing"])}}
-        )
-    )
+    payload.write_text(json.dumps({"upsert": {"dependent": _node("dependent", depends_on=["missing"])}}))
     before = graph.read_bytes()
     assert mn.main([str(graph), "--payload", str(payload)]) == 2
     assert "merge rejected" in capsys.readouterr().err
