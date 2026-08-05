@@ -304,6 +304,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     ):
         assert required in develop_plugin
     assert re.search(r"consumer\s+scenario", develop_plugin)
+    assert "Agents can infer routine details" in develop_plugin
+    assert len(develop_plugin.split()) <= 220
     assert "$setup" in setup_metadata
     assert "$roadmap" in roadmap_metadata
     assert "$develop-plugin" in develop_plugin_metadata
