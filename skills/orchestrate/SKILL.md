@@ -3,7 +3,14 @@ name: orchestrate
 description: Work through an Autoform Markdown blueprint with native agents and Lean tools.
 ---
 
-Treat the links in `blueprint/nodes/**/*.md` as the source of truth, work ready nodes with native subagents plus the Lean LSP and REPL servers, and record the resulting status and Lean declaration in each node's frontmatter. Search local Mathlib or community prior art with host-native tools when useful, then verify every candidate with Lean before reporting completion.
+Treat `kind: node` pages under `blueprint/roadmap/**/*.md` and their dependency
+links as the source of truth. Work ready nodes with native subagents plus the
+Lean LSP and REPL servers. Record only what compiled: `statement: formalized`,
+`proof: formalized`, and the exact declaration name in `lean`; ready and
+fully-proved are derived by `autoform check`, so never write them by hand.
+Search local Mathlib or community prior art
+with host-native tools when useful, then verify every candidate with Lean before
+reporting completion.
 
 Roadmap owns initial source decomposition and deliberate DAG revisions. Do not
 scan for undecomposed chapters or construct the initial plan here; hand a
@@ -24,8 +31,8 @@ gh run view "$run" --log-failed
 ```
 
 Treat a red run as evidence about the node rather than about the workflow: fix
-the Lean or the frontmatter and push again, and never record `status: proved`
-while a node's pull request is failing. Opening pull requests and pushing are
+the Lean or the frontmatter and push again, and never record
+`proof: formalized` while a node's pull request is failing. Opening pull requests and pushing are
 outward-facing actions; take them only when asked, and report the commands
 instead when `gh` is missing or unauthenticated.
 

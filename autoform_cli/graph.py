@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -13,7 +14,28 @@ _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
-_FRONTMATTER_KEYS = frozenset({"kind", "status", "lean"})
+_FRONTMATTER_KEYS = frozenset(
+    {
+        "kind",
+        "declaration",
+        "lean",
+        "statement",
+        "proof",
+        "mathlib",
+        "not_ready",
+        "discussion",
+        "status",
+    }
+)
+_FORMALIZED = "formalized"
+_TRUE = frozenset({"true", "yes"})
+_FALSE = frozenset({"false", "no"})
+
+#: ``## Depends on`` carries the prerequisites needed to *state* a node;
+#: ``## Proof depends on`` carries the extra prerequisites its *proof* needs.
+#: Both are graph edges, mirroring where leanblueprint places ``\uses``.
+_STATEMENT_SECTION = "depends on"
+_PROOF_SECTION = "proof depends on"
 
 
 class GraphValidationError(ValueError):
@@ -24,17 +46,38 @@ class GraphValidationError(ValueError):
         super().__init__("; ".join(self.issues))
 
 
+class LegacyNodesDirectoryWarning(UserWarning):
+    """A blueprint still uses the deprecated top-level ``nodes/`` directory."""
+
+
+class LegacyStatusWarning(UserWarning):
+    """A node still asserts the deprecated flat ``status`` field."""
+
+
 @dataclass(frozen=True, slots=True)
 class Node:
-    """One Markdown node in a blueprint."""
+    """One Markdown node in a blueprint.
+
+    Only the ``statement``/``proof``/``mathlib``/``not_ready`` assertions are
+    recorded here. Everything a reader thinks of as progress -- ready to state,
+    ready to prove, fully proved -- is derived from the graph by
+    :mod:`autoform_cli.status`, so it can never go stale.
+    """
 
     id: str
     title: str
     path: Path
     dependencies: tuple[str, ...]
-    kind: str | None = None
-    status: str | None = None
+    statement_dependencies: tuple[str, ...] = ()
+    proof_dependencies: tuple[str, ...] = ()
+    kind: str = "node"
     lean: str | None = None
+    declaration: str | None = None
+    statement_formalized: bool = False
+    proof_formalized: bool = False
+    mathlib: bool = False
+    not_ready: bool = False
+    discussion: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,44 +97,69 @@ class _ParsedNode:
     id: str
     title: str
     path: Path
-    targets: tuple[str, ...]
+    statement_targets: tuple[str, ...]
+    proof_targets: tuple[str, ...]
     metadata: dict[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class _NodeSource:
+    id: str
+    path: Path
+    text: str
+    legacy: bool = False
+
+
 def load_graph(blueprint_dir: str | Path) -> Graph:
-    """Load and validate ``blueprint/nodes/**/*.md`` beneath *blueprint_dir*."""
+    """Load and validate Markdown nodes beneath *blueprint_dir*."""
 
     blueprint = Path(blueprint_dir).expanduser().resolve()
     if not blueprint.is_dir():
         raise GraphValidationError([f"blueprint directory does not exist: {blueprint}"])
 
-    nodes_root = blueprint / "nodes"
-    if not nodes_root.is_dir():
-        raise GraphValidationError([f"nodes directory does not exist: {nodes_root}"])
-    nodes_root = nodes_root.resolve()
-
     issues: list[str] = []
     parsed: list[_ParsedNode] = []
     canonical_ids: dict[Path, str] = {}
-    for path in sorted(nodes_root.rglob("*.md")):
-        relative = path.relative_to(nodes_root)
-        node_id = relative.with_suffix("").as_posix()
-        canonical = path.resolve()
-        if not _is_within(canonical, nodes_root):
-            issues.append(f"{node_id}: node file escapes the nodes directory")
-            continue
+    node_ids: dict[str, Path] = {}
+    sources, discovery_issues, uses_legacy_nodes = _discover_nodes(blueprint)
+    issues.extend(discovery_issues)
+    if uses_legacy_nodes:
+        warnings.warn(
+            "blueprint/nodes/ is deprecated; move node files under blueprint/roadmap/ and set kind: node",
+            LegacyNodesDirectoryWarning,
+            stacklevel=2,
+        )
+
+    for source in sources:
+        canonical = source.path.resolve()
         if canonical in canonical_ids:
-            issues.append(f"{node_id}: duplicates node {canonical_ids[canonical]!r}")
+            issues.append(f"{source.id}: duplicates node {canonical_ids[canonical]!r}")
             continue
-        canonical_ids[canonical] = node_id
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            issues.append(f"{node_id}: cannot read node: {exc}")
+        if source.id in node_ids:
+            issues.append(f"{source.id}: duplicate node id also used by {node_ids[source.id]}")
             continue
-        node, node_issues = _parse_node(node_id, canonical, text)
+        canonical_ids[canonical] = source.id
+        node_ids[source.id] = canonical
+        node, node_issues = _parse_node(source.id, canonical, source.text)
         issues.extend(node_issues)
         if node is not None:
+            if source.legacy:
+                legacy_declaration = node.metadata.get("kind")
+                explicit_declaration = node.metadata.get("declaration")
+                if legacy_declaration in {None, "node"}:
+                    legacy_declaration = None
+                if (
+                    legacy_declaration is not None
+                    and explicit_declaration is not None
+                    and legacy_declaration != explicit_declaration
+                ):
+                    issues.append(
+                        f"{source.id}: conflicting legacy kind {legacy_declaration!r} "
+                        f"and declaration {explicit_declaration!r}"
+                    )
+                elif legacy_declaration is not None:
+                    node.metadata["declaration"] = legacy_declaration
+                node.metadata["kind"] = "node"
             parsed.append(node)
 
     if issues:
@@ -99,23 +167,41 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
 
     nodes: dict[str, Node] = {}
     for parsed_node in parsed:
-        dependencies: list[str] = []
-        for target in parsed_node.targets:
-            dependency, issue = _resolve_target(parsed_node, target, nodes_root, canonical_ids)
-            if issue:
-                issues.append(issue)
-            elif dependency == parsed_node.id:
-                issues.append(f"{parsed_node.id}: dependency on itself")
-            elif dependency not in dependencies:
-                dependencies.append(dependency)
+
+        def resolve(targets: tuple[str, ...], node: _ParsedNode = parsed_node) -> list[str]:
+            resolved: list[str] = []
+            for target in targets:
+                dependency, issue = _resolve_target(node, target, blueprint, canonical_ids)
+                if issue:
+                    issues.append(issue)
+                elif dependency == node.id:
+                    issues.append(f"{node.id}: dependency on itself")
+                elif dependency not in resolved:
+                    resolved.append(dependency)
+            return resolved
+
+        statement_dependencies = resolve(parsed_node.statement_targets)
+        proof_dependencies = resolve(parsed_node.proof_targets)
+        dependencies = list(statement_dependencies)
+        dependencies.extend(
+            dependency for dependency in proof_dependencies if dependency not in dependencies
+        )
+        metadata = parsed_node.metadata
         nodes[parsed_node.id] = Node(
             id=parsed_node.id,
             title=parsed_node.title,
             path=parsed_node.path,
             dependencies=tuple(dependencies),
-            kind=parsed_node.metadata.get("kind"),
-            status=parsed_node.metadata.get("status"),
-            lean=parsed_node.metadata.get("lean"),
+            statement_dependencies=tuple(statement_dependencies),
+            proof_dependencies=tuple(proof_dependencies),
+            kind="node",
+            declaration=metadata.get("declaration"),
+            lean=metadata.get("lean"),
+            statement_formalized=metadata.get("statement") == _FORMALIZED,
+            proof_formalized=metadata.get("proof") == _FORMALIZED,
+            mathlib=metadata.get("mathlib") in _TRUE,
+            not_ready=metadata.get("not_ready") in _TRUE,
+            discussion=metadata.get("discussion"),
         )
 
     if not issues:
@@ -125,13 +211,75 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     return Graph(blueprint_dir=blueprint, nodes=nodes)
 
 
+def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str], bool]:
+    roadmap_root = blueprint / "roadmap"
+    legacy_root = blueprint / "nodes"
+    if not roadmap_root.is_dir() and not legacy_root.is_dir():
+        return [], [f"roadmap directory does not exist: {roadmap_root}"], False
+
+    issues: list[str] = []
+    sources: list[_NodeSource] = []
+    if roadmap_root.is_dir():
+        roadmap_root = roadmap_root.resolve()
+        for path in sorted(roadmap_root.rglob("*.md")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                relative = path.relative_to(roadmap_root).as_posix()
+                issues.append(f"{relative}: cannot read roadmap page: {exc}")
+                continue
+            if not _declares_node(text):
+                continue
+            node_id = path.relative_to(roadmap_root).with_suffix("").as_posix()
+            canonical = path.resolve()
+            if not _is_within(canonical, roadmap_root):
+                issues.append(f"{node_id}: node file escapes the roadmap directory")
+                continue
+            sources.append(_NodeSource(node_id, canonical, text))
+
+    uses_legacy_nodes = False
+    if legacy_root.is_dir():
+        legacy_root = legacy_root.resolve()
+        for path in sorted(legacy_root.rglob("*.md")):
+            uses_legacy_nodes = True
+            node_id = path.relative_to(legacy_root).with_suffix("").as_posix()
+            canonical = path.resolve()
+            if not _is_within(canonical, legacy_root):
+                issues.append(f"{node_id}: node file escapes the legacy nodes directory")
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                issues.append(f"{node_id}: cannot read node: {exc}")
+                continue
+            sources.append(_NodeSource(node_id, canonical, text, legacy=True))
+
+    return sources, issues, uses_legacy_nodes
+
+
+def _declares_node(text: str) -> bool:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return False
+    for raw in lines[1:]:
+        stripped = raw.strip()
+        if stripped == "---":
+            break
+        if ":" not in stripped:
+            continue
+        key, value = (part.strip() for part in stripped.split(":", 1))
+        if key == "kind" and _unquote_scalar(value) == "node":
+            return True
+    return False
+
+
 def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None, list[str]]:
     lines = text.splitlines()
     metadata, body_start, issues = _parse_frontmatter(node_id, lines)
     title: str | None = None
     title_count = 0
-    targets: list[str] = []
-    in_dependencies = False
+    targets: dict[str, list[str]] = {_STATEMENT_SECTION: [], _PROOF_SECTION: []}
+    section: str | None = None
     fence: tuple[str, int] | None = None
     body = _HTML_COMMENT.sub("", "\n".join(lines[body_start:]))
 
@@ -157,14 +305,15 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
                 if title is None:
                     title = heading_text
             if level <= 2:
-                in_dependencies = level == 2 and heading_text.casefold() == "depends on"
+                heading_key = heading_text.casefold()
+                section = heading_key if level == 2 and heading_key in targets else None
             continue
-        if in_dependencies:
+        if section is not None:
             for match in _LINK.finditer(_INLINE_CODE.sub("", line)):
                 target = match.group(1)
                 if target.startswith("<") and target.endswith(">"):
                     target = target[1:-1]
-                targets.append(target)
+                targets[section].append(target)
 
     if title is None:
         issues.append(f"{node_id}: missing H1 title")
@@ -172,7 +321,15 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
         issues.append(f"{node_id}: multiple H1 titles")
     if issues:
         return None, issues
-    return _ParsedNode(node_id, title, path, tuple(targets), metadata), []
+    parsed = _ParsedNode(
+        node_id,
+        title,
+        path,
+        tuple(targets[_STATEMENT_SECTION]),
+        tuple(targets[_PROOF_SECTION]),
+        metadata,
+    )
+    return parsed, []
 
 
 def _parse_frontmatter(node_id: str, lines: list[str]) -> tuple[dict[str, str], int, list[str]]:
@@ -200,19 +357,68 @@ def _parse_frontmatter(node_id: str, lines: list[str]) -> tuple[dict[str, str], 
         if key in metadata:
             issues.append(f"{node_id}:{line_number}: duplicate frontmatter key {key!r}")
             continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
+        value = _unquote_scalar(value)
         if not value:
             issues.append(f"{node_id}:{line_number}: empty frontmatter value for {key!r}")
             continue
+        value, issue = _normalize_value(node_id, line_number, key, value)
+        if issue:
+            issues.append(issue)
+            continue
         metadata[key] = value
+
+    _absorb_legacy_status(node_id, metadata)
     return metadata, end + 1, issues
+
+
+def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tuple[str, str | None]:
+    """Canonicalize an assertion value, or explain why it is not one."""
+    location = f"{node_id}:{line_number}"
+    folded = value.casefold()
+    if key in {"statement", "proof"}:
+        if folded != _FORMALIZED:
+            return value, f"{location}: {key!r} accepts only {_FORMALIZED!r}; omit the key otherwise"
+        return folded, None
+    if key in {"mathlib", "not_ready"}:
+        if folded not in _TRUE | _FALSE:
+            return value, f"{location}: {key!r} accepts only true or false"
+        return folded, None
+    return value, None
+
+
+def _absorb_legacy_status(node_id: str, metadata: dict[str, str]) -> None:
+    """Map the deprecated flat ``status`` field onto explicit assertions.
+
+    ``ready`` and ``planned`` carry no information the graph cannot derive, so
+    they are simply dropped.
+    """
+    status = metadata.pop("status", None)
+    if status is None:
+        return
+    warnings.warn(
+        f"{node_id}: 'status' is deprecated; assert 'statement: formalized', "
+        "'proof: formalized', 'mathlib: true', or 'not_ready: true' instead",
+        LegacyStatusWarning,
+        stacklevel=2,
+    )
+    folded = status.casefold()
+    if folded == "proved":
+        metadata.setdefault("statement", _FORMALIZED)
+        metadata.setdefault("proof", _FORMALIZED)
+    elif folded == "blocked":
+        metadata.setdefault("not_ready", "true")
+
+
+def _unquote_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
 
 
 def _resolve_target(
     node: _ParsedNode,
     target: str,
-    nodes_root: Path,
+    blueprint: Path,
     canonical_ids: dict[Path, str],
 ) -> tuple[str | None, str | None]:
     split = urlsplit(target)
@@ -226,8 +432,8 @@ def _resolve_target(
         return None, f"{node.id}: dependency target must be a relative .md file: {target!r}"
 
     resolved = (node.path.parent / relative).resolve()
-    if not _is_within(resolved, nodes_root):
-        return None, f"{node.id}: dependency target escapes the nodes directory: {target!r}"
+    if not _is_within(resolved, blueprint):
+        return None, f"{node.id}: dependency target escapes the blueprint directory: {target!r}"
     if not resolved.is_file():
         return None, f"{node.id}: dependency target does not exist: {target!r}"
     dependency = canonical_ids.get(resolved)
@@ -270,4 +476,11 @@ def _is_within(path: Path, directory: Path) -> bool:
     return True
 
 
-__all__ = ["Graph", "GraphValidationError", "Node", "load_graph"]
+__all__ = [
+    "Graph",
+    "GraphValidationError",
+    "LegacyNodesDirectoryWarning",
+    "LegacyStatusWarning",
+    "Node",
+    "load_graph",
+]

@@ -12,15 +12,12 @@ slice.
 - [Roadmap](roadmap/README.md)
 - [Coverage](coverage/README.md)
 - [Thesis source map](sources/thesis.md)
-- [Dependency graph](dependencies.html) (generated locally and on GitHub Pages)
+- [Dependency graph](dependencies.md) (generated locally and on GitHub Pages)
 
-## Infimum Loss nodes
+## Current formalization slice
 
-- [Eligibility](nodes/definitions/eligibility.md)
-- [Non-ambiguity](nodes/definitions/non-ambiguity.md)
-- [Infimum loss](nodes/theorems/infimum-loss.md)
-- [Non-ambiguity determinism](nodes/theorems/non-ambiguity-determinism.md)
-- [Supervision recovery](nodes/theorems/supervision-recovery.md)
+The [Infimum Loss milestone](roadmap/infimum-loss/README.md) keeps its five DAG
+nodes beside the roadmap narrative.
 
 Only links under a node's `## Depends on` heading are Autoform DAG edges. The
 other links remain ordinary navigation for Obsidian and the rendered site.

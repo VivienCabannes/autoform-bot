@@ -4,23 +4,31 @@ from pathlib import Path
 
 import pytest
 
+from autoform_cli.graph import load_graph
+from autoform_cli.status import derive
 from autoform_cli.visualize import export_graph, main
 
 
-def _write_node(path: Path, title: str, dependencies: list[tuple[str, str]] | None = None) -> None:
+def _write_node(
+    path: Path,
+    title: str,
+    dependencies: list[tuple[str, str]] | None = None,
+    **metadata: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"# {title}"]
+    properties = ["kind: node", *(f"{key}: {value}" for key, value in metadata.items())]
+    lines = ["---", *properties, "---", "", f"# {title}"]
     if dependencies:
         lines.extend(["", "## Depends on", ""])
         lines.extend(f"- [{label}]({target})" for label, target in dependencies)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def test_export_is_self_contained_and_links_to_markdown(tmp_path: Path) -> None:
+def test_export_writes_a_mermaid_page_linking_to_markdown(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
-    _write_node(blueprint / "nodes" / "foundations" / "base lemma.md", "Base lemma")
+    _write_node(blueprint / "roadmap" / "foundations" / "base lemma.md", "Base lemma")
     _write_node(
-        blueprint / "nodes" / "main.md",
+        blueprint / "roadmap" / "main.md",
         "Main <result>",
         [("Base lemma", "foundations/base%20lemma.md#statement")],
     )
@@ -28,56 +36,96 @@ def test_export_is_self_contained_and_links_to_markdown(tmp_path: Path) -> None:
     output = export_graph(blueprint)
     document = output.read_text(encoding="utf-8")
 
-    assert output == (blueprint / "graph.html").resolve()
-    assert 'href="nodes/foundations/base%20lemma.md"' in document
-    assert 'href="nodes/main.md"' in document
-    assert 'data-prerequisite="foundations/base lemma" data-dependent="main"' in document
-    assert "Main &lt;result&gt;" in document
-    assert "arrows point from prerequisite to dependent" in document
-    assert "<script" not in document
-    assert "https://" not in document
+    assert output == (blueprint / "dependencies.md").resolve()
+    assert "```mermaid" in document
+    assert "graph LR" in document
+    assert 'click n0 "roadmap/foundations/base lemma.md"' in document
+    assert 'click n1 "roadmap/main.md"' in document
+    assert "  n0 --> n1" in document
+    assert "Main <result>" in document
+
+
+def test_diagram_colours_and_shapes_follow_derived_status(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(
+        blueprint / "roadmap" / "base.md",
+        "Base",
+        declaration="def",
+        statement="formalized",
+    )
+    _write_node(
+        blueprint / "roadmap" / "top.md",
+        "Top",
+        [("Base", "base.md")],
+        declaration="theorem",
+        statement="formalized",
+        proof="formalized",
+    )
+
+    document = export_graph(blueprint).read_text(encoding="utf-8")
+
+    # Definitions are rectangles, propositions are rounded.
+    assert 'n0["Base"]:::fully_proved' in document
+    assert 'n1("Top"):::fully_proved' in document
+    assert "classDef fully_proved fill:#1CAC78" in document
+    assert "| fully proved | 2 |" in document
+
+
+def test_proof_only_dependencies_are_dashed(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "tool.md", "Tool")
+    (blueprint / "roadmap" / "result.md").write_text(
+        "---\nkind: node\n---\n\n# Result\n\n## Proof depends on\n\n- [Tool](tool.md)\n",
+        encoding="utf-8",
+    )
+
+    document = export_graph(blueprint).read_text(encoding="utf-8")
+
+    assert "  n1 -.-> n0" in document
+    assert "  n1 --> n0" not in document
+
+
+def test_green_stops_at_an_unproved_prerequisite(tmp_path: Path) -> None:
+    """The distinction a flat status field cannot express."""
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "gap.md", "Gap", declaration="theorem")
+    _write_node(
+        blueprint / "roadmap" / "top.md",
+        "Top",
+        [("Gap", "gap.md")],
+        declaration="theorem",
+        statement="formalized",
+        proof="formalized",
+    )
+
+    statuses = derive(load_graph(blueprint))
+
+    assert statuses["top"].proved
+    assert not statuses["top"].fully_proved
+    assert statuses["top"].key == "proved"
 
 
 def test_cli_writes_an_explicit_destination(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     blueprint = tmp_path / "blueprint"
-    _write_node(blueprint / "nodes" / "only.md", "Only node")
-    output = tmp_path / "site" / "dependencies.html"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+    output = tmp_path / "docs" / "dependencies.md"
 
     assert main([str(blueprint), "-o", str(output)]) == 0
 
     assert output.is_file()
     assert str(output.resolve()) in capsys.readouterr().out
-    assert 'href="../blueprint/nodes/only.md"' in output.read_text(encoding="utf-8")
-
-
-def test_static_site_links_use_html_and_show_status(tmp_path: Path) -> None:
-    blueprint = tmp_path / "blueprint"
-    node = blueprint / "nodes" / "foundations" / "base lemma.md"
-    node.parent.mkdir(parents=True)
-    node.write_text(
-        "---\nkind: lemma\nstatus: proved\nlean: Example.baseLemma\n---\n\n# Base lemma\n",
-        encoding="utf-8",
-    )
-    output = blueprint / "dependencies.html"
-
-    export_graph(blueprint, output, link_extension=".html")
-
-    document = output.read_text(encoding="utf-8")
-    assert 'href="nodes/foundations/base%20lemma.html"' in document
-    assert 'class="node status-proved"' in document
-    assert 'data-status="proved"' in document
-    assert "1 proved" in document
+    assert 'click n0 "../blueprint/roadmap/only.md"' in output.read_text(encoding="utf-8")
 
 
 def test_cli_accepts_html_link_extension(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     blueprint = tmp_path / "blueprint"
-    _write_node(blueprint / "nodes" / "only.md", "Only node")
-    output = blueprint / "dependencies.html"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+    output = blueprint / "dependencies.md"
 
     assert main([str(blueprint), "--output", str(output), "--link-extension", ".html"]) == 0
 
     assert str(output.resolve()) in capsys.readouterr().out
-    assert 'href="nodes/only.html"' in output.read_text(encoding="utf-8")
+    assert 'click n0 "roadmap/only.html"' in output.read_text(encoding="utf-8")
 
 
 def test_cli_reports_invalid_blueprint(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

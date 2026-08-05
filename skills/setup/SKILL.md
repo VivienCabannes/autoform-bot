@@ -33,15 +33,17 @@ For a new or incomplete repository:
 
 - create or repair a buildable Lean project with matching `lean-toolchain` and
   Mathlib revisions;
-- create `blueprint/` with a landing page plus `roadmap/`, `coverage/`,
-  `sources/`, and `nodes/`, keeping personal `.obsidian/`, `.trash/`, generated
+- create `blueprint/` with a landing page plus `roadmap/`, `coverage/`, and
+  `sources/`; later Roadmap work places `kind: node` pages beside their
+  milestones under `roadmap/`. Keep personal `.obsidian/`, `.trash/`, generated
   graphs, and site output ignored;
-- configure `mkdocs.yml` so the same relative-link Markdown works locally in
-  Obsidian and on the generated site;
+- configure `mkdocs.yml` to build the `autoform render` output, not the vault
+  itself: `docs_dir: site-src`, `md_in_html`, a `pymdownx.superfences` mermaid
+  fence, and the generated stylesheet and mermaid init;
 - adapt `autoform-verify.yml` to validate the Markdown DAG, build Lean, reject
   unfinished or unsafe proofs, and audit theorem axioms on pull requests; and
-- adapt `blueprint-pages.yml` to validate, render the dependency graph, build
-  MkDocs, and deploy GitHub Pages from committed content.
+- adapt `blueprint-pages.yml` to validate the DAG and its `lean:` declarations,
+  render the blueprint, build MkDocs, and deploy GitHub Pages.
 
 Adding workflow files is a local repository edit. Creating a remote, pushing,
 or enabling Pages are separate outward-facing actions; perform them only when
@@ -55,11 +57,15 @@ from; substitute its absolute path:
 ```bash
 lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint \
-  --output blueprint/dependencies.html --link-extension .html
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
+  --output site-src --lean-root . --require-declarations
 uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
+
+`render` writes a derived tree; the vault stays the source of truth. Ignore
+`site-src/`, `site/`, and `blueprint/dependencies.md`.
 
 Publication is opt-in because files under `blueprint/` become public site
 content. Confirm the exact repository and visibility, default to private, and

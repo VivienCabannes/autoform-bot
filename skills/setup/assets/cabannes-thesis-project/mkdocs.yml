@@ -1,5 +1,8 @@
 site_name: Cabannes thesis formalization
-docs_dir: blueprint
+
+# `autoform render` writes this directory from blueprint/. The vault stays the
+# source of truth; everything here is regenerated.
+docs_dir: site-src
 site_dir: site
 use_directory_urls: false
 
@@ -7,11 +10,22 @@ theme:
   name: mkdocs
 
 markdown_extensions:
-  - fenced_code
+  - attr_list
+  - md_in_html          # lets the generated statement boxes contain Markdown
   - tables
   - pymdownx.arithmatex:
       generic: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_div_format
+
+extra_css:
+  - stylesheets/blueprint.css
 
 extra_javascript:
   - javascripts/mathjax.js
   - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js
+  - https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js
+  - javascripts/blueprint-mermaid.js

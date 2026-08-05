@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - "blueprint/**"
+      - "**.lean"
       - "mkdocs.yml"
       - ".github/workflows/blueprint-pages.yml"
   pull_request:
     paths:
       - "blueprint/**"
+      - "**.lean"
       - "mkdocs.yml"
       - ".github/workflows/blueprint-pages.yml"
   workflow_dispatch:
@@ -33,17 +35,22 @@ jobs:
         with:
           version: "0.12.1"
 
-      - name: Validate the theorem DAG
+      # Rejects cycles and dangling links, and fails when a node names a Lean
+      # declaration that is not in the sources.
+      - name: Validate the theorem DAG and its declarations
         run: >-
           uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
-          autoform check blueprint
+          autoform check blueprint --lean-root .
 
-      - name: Generate the dependency graph
+      # Writes site-src/: statement boxes, derived statuses, the Mermaid graph,
+      # and permalinks into the Lean code at this exact commit.
+      - name: Render the blueprint
         run: >-
           uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
-          autoform-visualize blueprint
-          --output blueprint/dependencies.html
-          --link-extension .html
+          autoform render blueprint
+          --output site-src
+          --lean-root .
+          --require-declarations
 
       - name: Build the Markdown site
         run: >-
