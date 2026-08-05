@@ -58,36 +58,67 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert (out / "dependencies.md").is_file()
     assert (out / "stylesheets/blueprint.css").is_file()
     assert (out / "javascripts/blueprint-mermaid.js").is_file()
+    # Nodes are absorbed into their chapter, not published one page each.
+    assert not (out / "roadmap/base.md").exists()
+    assert not (out / "roadmap/top.md").exists()
     # The source vault keeps no generated files.
     assert not (project / "blueprint" / "dependencies.md").exists()
     assert "## Depends on" in (project / "blueprint/roadmap/top.md").read_text(encoding="utf-8")
 
 
-def test_node_pages_become_numbered_statement_boxes(tmp_path: Path) -> None:
+def test_a_chapter_carries_every_statement_in_dependency_order(tmp_path: Path) -> None:
     _render(tmp_path)
-    page = (tmp_path / "out/roadmap/top.md").read_text(encoding="utf-8")
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
 
-    assert "title: Theorem 1 (Top)" in page
-    assert '<div class="bp-node bp-fully_proved" markdown="1">' in page
-    assert '<p class="bp-chip">fully proved</p>' in page
-    assert "# Theorem 1 (Top)" in page
+    assert page.index('id="base"') < page.index('id="top"')
+    assert '<div class="bp-thmwrapper theorem-style-definition bp-fully_proved" id="base"' in page
+    assert '<div class="bp-thmwrapper theorem-style-plain bp-fully_proved" id="top"' in page
+    assert '<span class="bp-thmcaption">Definition</span><span class="bp-thmlabel">1</span>' in page
+    assert '<span class="bp-thmtitle">Top</span>' in page
     assert "The main result." in page
-    # Unrelated sections survive; the DAG moves into the footer.
-    assert "## Sources" in page
+    # A node's own subheadings must not compete with the chapter's structure.
+    assert "###### Sources" in page
+    assert "\n## Sources" not in page
     assert "## Depends on" not in page
 
 
-def test_the_footer_links_code_prerequisites_and_dependents(tmp_path: Path) -> None:
+def test_cross_references_point_at_anchors_on_the_chapter(tmp_path: Path) -> None:
     _render(tmp_path)
-    top = (tmp_path / "out/roadmap/top.md").read_text(encoding="utf-8")
-    base = (tmp_path / "out/roadmap/base.md").read_text(encoding="utf-8")
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
 
-    assert "https://github.com/owner/repo/blob/cafe1234/Project/Basic.lean#L5" in top
-    assert '<span class="bp-key">Uses</span>' in top
-    assert 'href="base.html">Definition 1 (Base)' in top
-    assert 'href="https://github.com/owner/repo/issues/42">#42' in top
-    assert '<span class="bp-key">Used by</span>' in base
-    assert 'href="top.html">Theorem 1 (Top)' in base
+    assert "https://github.com/owner/repo/blob/cafe1234/Project/Basic.lean#L5" in page
+    assert '<span class="bp-key">Uses</span>' in page
+    assert 'href="#base">Definition 1 (Base)' in page
+    assert 'href="#top">Theorem 1 (Top)' in page
+    assert 'href="https://github.com/owner/repo/issues/42">#42' in page
+
+
+def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/README.md").write_text(
+        "---\nkind: blueprint\n---\n\n# Overview\n\n- [Top](roadmap/top.md)\n", encoding="utf-8"
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    assert "[Top](roadmap/README.md#top)" in overview
+
+
+def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
+    """The body moves up a directory, so its relative links must move with it."""
+    project = _project(tmp_path)
+    (project / "blueprint/sources.md").write_text("# Paper\n", encoding="utf-8")
+    nested = project / "blueprint/roadmap/chapter/deep.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(
+        "---\nkind: node\ndeclaration: theorem\n---\n\n# Deep\n\nBody.\n\n"
+        "## Sources\n\n- [Paper](../../sources.md)\n",
+        encoding="utf-8",
+    )
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    chapter = (tmp_path / "out/roadmap/chapter/README.md").read_text(encoding="utf-8")
+    assert "[Paper](../../sources.md)" in chapter
 
 
 def test_unresolved_declarations_are_reported_not_linked(tmp_path: Path) -> None:
@@ -100,7 +131,7 @@ def test_unresolved_declarations_are_reported_not_linked(tmp_path: Path) -> None
     report = render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
     assert report.unresolved == ["top: Project.absent"]
-    page = (tmp_path / "out/roadmap/top.md").read_text(encoding="utf-8")
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
     assert "not found in the Lean sources" in page
 
 

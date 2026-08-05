@@ -92,22 +92,31 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert report.unresolved == []
     graph = load_graph(example / "blueprint")
 
-    # Every node page is a statement box whose cross-references resolve inside
-    # the published tree.
-    for node_id, node in graph.nodes.items():
-        page = site / node.path.relative_to((example / "blueprint").resolve())
-        document = page.read_text(encoding="utf-8")
-        assert '<div class="bp-node bp-' in document, node_id
-        for href in _HREF.findall(document):
-            if href.startswith("http"):
-                continue
-            assert (page.parent / href).with_suffix(".md").resolve().is_file(), href
+    # Statements are published as environments on their milestone chapter,
+    # each anchored so every cross-reference still lands on the statement.
+    chapter_path = site / "roadmap/infimum-loss/README.md"
+    chapter = chapter_path.read_text(encoding="utf-8")
+    for node_id in graph.nodes:
+        anchor = node_id.split("/", 1)[1].replace("/", "-")
+        assert f'id="{anchor}"' in chapter, node_id
+    assert not (site / "roadmap/infimum-loss/theorems").exists()
+
+    # Both amsthm styles appear, and the status marks are derived.
+    assert 'class="bp-thmwrapper theorem-style-definition bp-fully_proved"' in chapter
+    assert 'class="bp-thmwrapper theorem-style-plain bp-proved"' in chapter
+
+    for href in _HREF.findall(chapter):
+        if href.startswith(("http", "#")):
+            continue
+        assert (chapter_path.parent / href.split("#")[0]).resolve().is_file(), href
 
     graph_page = (site / "dependencies.md").read_text(encoding="utf-8")
     assert "```mermaid" in graph_page
-    for node in graph.nodes.values():
-        target = node.path.relative_to((example / "blueprint").resolve()).with_suffix(".html")
-        assert f'"{target.as_posix()}"' in graph_page
+    for node_id in graph.nodes:
+        anchor = node_id.split("/", 1)[1].replace("/", "-")
+        # MkDocs publishes README.md as index.html, and a Mermaid fence is
+        # never rewritten for us, so the click target must say so itself.
+        assert f'"roadmap/infimum-loss/index.html#{anchor}"' in graph_page
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs

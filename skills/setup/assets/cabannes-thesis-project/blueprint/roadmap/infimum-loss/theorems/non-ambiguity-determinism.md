@@ -11,12 +11,6 @@ lean: CabannesThesis.nonAmbiguous_determinism
 Formalize the proposition that the minimum-variability solution is pointwise
 deterministic under non-ambiguity.
 
-## Roadmap and coverage
-
-- [Infimum Loss milestone](../README.md)
-- [Thesis roadmap](../../README.md)
-- [Thesis coverage](../../../coverage/README.md)
-
 ## Sources
 
 - [Thesis source map: `il:thm:ambiguity`](../../../sources/thesis.md)

@@ -14,13 +14,16 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from . import mermaid, status
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
+from .status import is_definition
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
 _DEPENDENCY_SECTIONS = frozenset({"depends on", "proof depends on"})
 _SKIPPED_DIRECTORIES = frozenset({".obsidian", ".trash", ".git"})
 #: Derived views this command rewrites; stale copies must not leak into the site.
@@ -96,11 +99,23 @@ def render_site(
 
     report = RenderReport(output_dir=destination)
     node_paths = {node.path.resolve(): node for node in graph.nodes.values()}
-    # Where each node will live in the output tree, so cross-references resolve
-    # against the published site rather than the vault they were copied from.
-    rendered_paths = {
-        node_id: destination / node.path.resolve().relative_to(blueprint)
-        for node_id, node in graph.nodes.items()
+    # Nodes are published as environments on their milestone page, the way a
+    # blueprint chapter carries many statements in sequence. Each keeps an
+    # anchor so every cross-reference still lands on the statement itself.
+    groups = _group_nodes(graph)
+    anchors = {
+        node_id: _anchor(node_id, group)
+        for group, node_ids in groups.items()
+        for node_id in node_ids
+    }
+    group_pages = {group: destination / _group_page(group) for group in groups}
+    targets = {
+        node_id: (group_pages[group], anchors[node_id])
+        for group, node_ids in groups.items()
+        for node_id in node_ids
+    }
+    node_sources = {
+        node.path.resolve(): node_id for node_id, node in graph.nodes.items()
     }
 
     for source in sorted(blueprint.rglob("*")):
@@ -110,29 +125,52 @@ def render_site(
         if relative.name in _GENERATED_FILES:
             continue
         target = destination / relative
+        # Directories are created on demand below, so a directory holding
+        # nothing but absorbed nodes leaves no empty shell behind.
         if source.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
+            continue
+        # A node file no longer becomes a page of its own.
+        if source.resolve() in node_paths:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        node = node_paths.get(source.resolve())
-        if node is None:
+        if source.suffix.lower() == ".md":
+            rewritten = _rewrite_links(
+                source.read_text(encoding="utf-8"),
+                source_dir=source.parent,
+                page=target,
+                blueprint=blueprint,
+                destination=destination,
+                node_sources=node_sources,
+                targets=targets,
+            )
+            target.write_text(rewritten, encoding="utf-8")
+        else:
             shutil.copy2(source, target)
-            report.pages += 1
-            continue
-        page, linked, unresolved = _render_node_page(
-            node,
+        report.pages += 1
+
+    for group, node_ids in groups.items():
+        page = group_pages[group]
+        page.parent.mkdir(parents=True, exist_ok=True)
+        narrative = page.read_text(encoding="utf-8") if page.is_file() else None
+        chapter, linked, unresolved = _render_chapter(
+            group,
+            node_ids,
             graph=graph,
             statuses=statuses,
             numbers=numbers,
             used_by=used_by,
             linker=linker,
-            source=source,
-            target=target,
-            rendered_paths=rendered_paths,
+            page=page,
+            targets=targets,
+            narrative=narrative,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
         )
-        target.write_text(page, encoding="utf-8")
-        report.pages += 1
-        report.nodes += 1
+        page.write_text(chapter, encoding="utf-8")
+        if narrative is None:  # a milestone with no narrative page of its own
+            report.pages += 1
+        report.nodes += len(node_ids)
         report.linked += linked
         report.unresolved.extend(unresolved)
 
@@ -142,7 +180,7 @@ def render_site(
             graph,
             statuses,
             graph_page,
-            links=_links_from(rendered_paths, graph_page),
+            links=_anchored_links(targets, graph_page),
         ),
         encoding="utf-8",
     )
@@ -155,12 +193,131 @@ def render_site(
     return report
 
 
-def _links_from(rendered_paths: dict[str, Path], page: Path) -> dict[str, str]:
-    """Link every node to its published page, relative to *page*."""
-    return {
-        node_id: mermaid.relative_link(path, page, ".html")
-        for node_id, path in rendered_paths.items()
-    }
+def _group_nodes(graph: Graph) -> dict[str, list[str]]:
+    """Group nodes by milestone, keeping each group in dependency order.
+
+    A node's milestone is the first path segment of its id, so
+    ``infimum-loss/theorems/supervision-recovery`` publishes under
+    ``infimum-loss``. Nodes sitting directly in ``roadmap/`` share the roadmap
+    index page.
+    """
+    groups: dict[str, list[str]] = {}
+    for node_id in status.topological_order(graph):
+        head, separator, _ = node_id.partition("/")
+        groups.setdefault(head if separator else "", []).append(node_id)
+    return groups
+
+
+def _group_page(group: str) -> Path:
+    """Where a milestone's consolidated chapter lives in the output tree."""
+    return Path("roadmap") / group / "README.md" if group else Path("roadmap/README.md")
+
+
+def _anchor(node_id: str, group: str) -> str:
+    """A stable in-page anchor for a node, unique within its chapter."""
+    remainder = node_id[len(group) + 1 :] if group else node_id
+    return remainder.replace("/", "-")
+
+
+def _anchored_links(
+    targets: dict[str, tuple[Path, str]],
+    page: Path,
+    *,
+    extension: str = ".html",
+) -> dict[str, str]:
+    """Link every node to its statement on the published chapter page.
+
+    Use ``.md`` for links MkDocs will parse -- it validates and rewrites those
+    itself -- and ``.html`` for raw HTML and Mermaid, which it never sees. A
+    statement on the current page is just a fragment.
+    """
+    resolved_page = page.resolve()
+    links: dict[str, str] = {}
+    for node_id, (target, anchor) in targets.items():
+        if target.resolve() == resolved_page:
+            links[node_id] = f"#{anchor}"
+        else:
+            href = mermaid.relative_link(target, page, extension)
+            if extension == ".html":
+                href = _as_published(href)
+            links[node_id] = f"{href}#{anchor}"
+    return links
+
+
+def _as_published(href: str) -> str:
+    """MkDocs serves ``README.md`` as ``index.html``.
+
+    Links it parses are rewritten for us, but raw HTML and Mermaid fences never
+    reach it, so those have to name the published file themselves.
+    """
+    path = Path(href)
+    if path.name.lower() in {"readme.html", "index.html"}:
+        return (path.parent / "index.html").as_posix()
+    return href
+
+
+def _rewrite_links(
+    text: str,
+    *,
+    source_dir: Path,
+    page: Path,
+    blueprint: Path,
+    destination: Path,
+    node_sources: dict[Path, str],
+    targets: dict[str, tuple[Path, str]],
+) -> str:
+    """Resolve a page's relative links against where it is being published.
+
+    Two things move. Node files stop being pages once their chapter absorbs
+    them, so a link naming one becomes an anchor. And a node's body is hoisted
+    out of its own directory onto the chapter page, so its remaining relative
+    links have to be recomputed from there.
+    """
+    anchored = _anchored_links(targets, page, extension=".md")
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group("target")
+        bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
+        path, separator, fragment = bare.partition("#")
+        if not path or urlsplit(path).scheme or path.startswith("/"):
+            return match.group(0)
+        candidate = (source_dir / unquote(path)).resolve()
+        node_id = node_sources.get(candidate)
+        if node_id is not None:
+            return f"[{match.group('label')}]({anchored[node_id]})"
+        if not _is_within(candidate, blueprint):
+            return match.group(0)
+        published = destination / candidate.relative_to(blueprint)
+        moved = mermaid.relative_link(published, page, candidate.suffix)
+        return f"[{match.group('label')}]({moved}{separator}{fragment})"
+
+    return _outside_fences(text, lambda line: _MARKDOWN_LINK.sub(replace, line))
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def _outside_fences(text: str, transform) -> str:
+    """Apply *transform* to every line that is not inside a code fence."""
+    fence: tuple[str, int] | None = None
+    out: list[str] = []
+    for line in text.splitlines():
+        match = _FENCE.match(line)
+        if match:
+            marker = match.group(1)
+            if fence is None:
+                fence = (marker[0], len(marker))
+            elif marker[0] == fence[0] and len(marker) >= fence[1]:
+                fence = None
+            out.append(line)
+            continue
+        out.append(line if fence is not None else transform(line))
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
 def _number_nodes(graph: Graph) -> dict[str, str]:
@@ -186,21 +343,89 @@ def _reverse_edges(graph: Graph) -> dict[str, list[str]]:
     return {key: sorted(value) for key, value in used_by.items()}
 
 
-def _render_node_page(
-    node: Node,
+def _render_chapter(
+    group: str,
+    node_ids: list[str],
     *,
     graph: Graph,
     statuses: dict[str, status.NodeStatus],
     numbers: dict[str, str],
     used_by: dict[str, list[str]],
     linker: SourceLinker,
-    source: Path,
-    target: Path,
-    rendered_paths: dict[str, Path],
+    page: Path,
+    targets: dict[str, tuple[Path, str]],
+    narrative: str | None,
+    blueprint: Path,
+    destination: Path,
+    node_sources: dict[Path, str],
+) -> tuple[str, int, list[str]]:
+    """Render one milestone as a chapter: its prose, then every statement."""
+    links = _anchored_links(targets, page)
+    sections: list[str] = []
+    linked = 0
+    unresolved: list[str] = []
+
+    if narrative is not None:
+        sections.append(narrative.rstrip())
+    else:
+        title = group.replace("-", " ").capitalize() if group else "Roadmap"
+        sections.extend(["---", f"kind: roadmap\ntitle: {title}", "---", "", f"# {title}"])
+
+    for node_id in node_ids:
+        environment, node_linked, node_unresolved = _render_environment(
+            graph.nodes[node_id],
+            anchor=targets[node_id][1],
+            graph=graph,
+            statuses=statuses,
+            numbers=numbers,
+            used_by=used_by,
+            linker=linker,
+            links=links,
+            page=page,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
+            targets=targets,
+        )
+        sections.append(environment)
+        linked += node_linked
+        unresolved.extend(node_unresolved)
+    return "\n\n".join(sections) + "\n", linked, unresolved
+
+
+def _render_environment(
+    node: Node,
+    *,
+    anchor: str,
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    numbers: dict[str, str],
+    used_by: dict[str, list[str]],
+    linker: SourceLinker,
+    links: dict[str, str],
+    page: Path,
+    blueprint: Path,
+    destination: Path,
+    node_sources: dict[Path, str],
+    targets: dict[str, tuple[Path, str]],
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
-    heading = f"{numbers[node.id]} ({node.title})"
-    body = _body_without_dependencies(source.read_text(encoding="utf-8"))
+    caption, _, number = numbers[node.id].rpartition(" ")
+    statement, remainder = _split_body(node.path.read_text(encoding="utf-8"))
+    # The body is leaving its own directory for the chapter page, so its
+    # relative links have to be recomputed from the chapter's location.
+    statement, remainder = (
+        _rewrite_links(
+            part,
+            source_dir=node.path.parent,
+            page=page,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
+            targets=targets,
+        )
+        for part in (statement, remainder)
+    )
 
     meta, linked, unresolved = _meta_rows(
         node,
@@ -209,31 +434,37 @@ def _render_node_page(
         numbers=numbers,
         used_by=used_by,
         linker=linker,
-        links=_links_from(rendered_paths, target),
+        links=links,
     )
 
-    return (
-        "\n".join(
-            [
-                "---",
-                f"title: {heading}",
-                "---",
-                "",
-                f'<div class="bp-node bp-{node_status.key}" markdown="1">',
-                f'<p class="bp-chip">{html.escape(node_status.label)}</p>',
-                "",
-                f"# {heading}",
-                "",
-                body.strip(),
-                "",
-                meta,
-                "</div>",
-                "",
-            ]
-        ),
-        linked,
-        unresolved,
-    )
+    # amsthm distinguishes the two: a proposition is set in italics, a
+    # definition upright. leanblueprint keeps that distinction on the web.
+    style = "theorem-style-definition" if is_definition(node) else "theorem-style-plain"
+    mark = "✓" if node_status.key in {"fully_proved", "mathlib"} else "●"
+
+    lines = [
+        f'<div class="bp-thmwrapper {style} bp-{node_status.key}" '
+        f'id="{html.escape(anchor, quote=True)}" markdown="1">',
+        '<div class="bp-thmheading">',
+        f'<span class="bp-thmcaption">{html.escape(caption)}</span>'
+        f'<span class="bp-thmlabel">{html.escape(number)}</span>'
+        f'<span class="bp-thmtitle">{html.escape(node.title)}</span>'
+        f'<a class="bp-permalink" href="#{html.escape(anchor, quote=True)}">#</a>'
+        f'<span class="bp-mark" title="{html.escape(node_status.label, quote=True)}">'
+        f'{mark}<span class="bp-mark-label">{html.escape(node_status.label)}</span></span>',
+        "</div>",
+        '<div class="bp-thmcontent" markdown="1">',
+        "",
+        statement,
+        "",
+        "</div>",
+    ]
+    if remainder:
+        lines.extend(['<div class="bp-thmnotes" markdown="1">', "", remainder, "", "</div>"])
+    if meta:
+        lines.append(meta)
+    lines.append("</div>")
+    return "\n".join(lines), linked, unresolved
 
 
 def _meta_rows(
@@ -313,11 +544,49 @@ def _discussion_link(discussion: str, linker: SourceLinker) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
 
 
+def _split_body(text: str) -> tuple[str, str]:
+    """Return the node's statement and whatever trailing sections follow it.
+
+    Only the statement belongs inside the theorem environment; ``## Sources``
+    and friends are page material that sits after it, the way a blueprint sets
+    a statement apart from the prose around it.
+    """
+    body = _body_without_dependencies(text)
+    lines = body.splitlines()
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        fence_match = _FENCE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence is None:
+                fence = (marker[0], len(marker))
+            elif marker[0] == fence[0] and len(marker) >= fence[1]:
+                fence = None
+            continue
+        if fence is None and _HEADING.match(line):
+            statement = "\n".join(lines[:index]).strip()
+            # Many statements now share one chapter page, so a node's own
+            # subheadings must not compete with the chapter's structure.
+            return statement, _demote_headings("\n".join(lines[index:]).strip())
+    return body.strip(), ""
+
+
+def _demote_headings(text: str) -> str:
+    def demote(line: str) -> str:
+        heading = _HEADING.match(line)
+        if heading is None:
+            return line
+        level = min(len(heading.group(1)) + 4, 6)
+        return f"{'#' * level} {heading.group(2)}"
+
+    return _outside_fences(text, demote)
+
+
 def _body_without_dependencies(text: str) -> str:
     """Drop the frontmatter, the H1, and the dependency sections.
 
-    The DAG is re-presented in the statement box footer, so repeating the raw
-    link lists on the page would only duplicate it.
+    The DAG is re-presented in the metadata line, so repeating the raw link
+    lists on the page would only duplicate it.
     """
     lines = text.splitlines()
     start = 0
@@ -366,55 +635,94 @@ def _body_without_dependencies(text: str) -> str:
 
 
 def _stylesheet() -> str:
-    """Statement-box styling, in the spirit of a plasTeX blueprint."""
+    """amsthm-style environments, following leanblueprint's rendered blueprint.
+
+    No cards and no dark mode: a plasTeX blueprint is a white document with a
+    bold run-in heading and an indented body, italic for propositions and
+    upright for definitions. Only the status mark and the content rule carry
+    colour.
+    """
     rules = "\n".join(
-        f".bp-{state.key} {{ --bp-fill: {state.fill}; --bp-stroke: {state.stroke}; }}\n"
+        f".bp-{state.key} .bp-mark {{ color: {state.stroke}; }}\n"
+        f".bp-{state.key} .bp-thmcontent {{ border-left-color: {state.fill}; }}\n"
         f".bp-ref-{state.key}::before {{ background: {state.fill}; border-color: {state.stroke}; }}"
         for state in status.STATES
     )
+    serif = 'Georgia, "Times New Roman", Times, serif'
+    sans = '"Lucida Grande", Arial, Helvetica, sans-serif'
     return f"""/* Generated by autoform render. Edits are overwritten. */
-.bp-node {{
-  --bp-fill: #ffffff;
-  --bp-stroke: #9aa3b2;
-  border: 1px solid #d8dee9;
-  border-left: 6px solid var(--bp-stroke);
-  border-radius: 6px;
-  padding: 1rem 1.25rem 0.25rem;
-  margin: 1rem 0 2rem;
-  background: #fff;
+.bp-thmwrapper {{ margin: 1.5rem 0 2rem; }}
+
+.bp-thmheading {{
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-family: {sans};
+  font-weight: 700;
+  line-height: 150%;
+  color: #24292e;
 }}
-.bp-node h1 {{
-  font-family: Georgia, "Times New Roman", serif;
-  font-size: 1.35rem;
-  margin: 0.15rem 0 0.75rem;
+.bp-thmlabel {{ margin-left: 0.4rem; margin-right: 0.5rem; }}
+.bp-thmtitle::before {{ content: "("; }}
+.bp-thmtitle::after {{ content: ")"; }}
+
+.bp-permalink {{
+  margin-left: 0.5rem;
+  font-weight: 400;
+  text-decoration: none;
+  color: #d1d5da;
+  opacity: 0;
+  transition: opacity 0.1s ease;
 }}
-.bp-node > p, .bp-node > ul, .bp-node > ol {{
-  font-family: Georgia, "Times New Roman", serif;
-  line-height: 1.6;
-}}
-.bp-chip {{
-  display: inline-block;
-  margin: 0;
-  padding: 0.1rem 0.6rem;
-  border: 1px solid var(--bp-stroke);
-  border-radius: 999px;
-  background: var(--bp-fill);
-  font: 600 0.75rem/1.6 ui-sans-serif, system-ui, sans-serif;
+.bp-thmwrapper:hover .bp-permalink {{ opacity: 1; }}
+.bp-permalink:hover {{ color: #6a737d; }}
+
+.bp-mark {{ margin-left: auto; font-weight: 400; padding-left: 1rem; }}
+.bp-mark-label {{
+  margin-left: 0.3rem;
+  font-family: {sans};
+  font-size: 0.78rem;
   letter-spacing: 0.02em;
-  text-transform: lowercase;
-  color: #0f172a;
+  color: #6a737d;
 }}
+
+.bp-thmcontent {{
+  font-family: {serif};
+  font-weight: 400;
+  line-height: 1.6;
+  margin-left: 1rem;
+  padding: 0.15rem 0 0.15rem 1rem;
+  border-left: 3px solid #e1e4e8;
+}}
+.theorem-style-plain > .bp-thmcontent {{ font-style: italic; }}
+.theorem-style-definition > .bp-thmcontent {{ font-style: normal; }}
+.bp-thmcontent > p:first-child {{ margin-top: 0; }}
+.bp-thmcontent > p:last-child {{ margin-bottom: 0; }}
+
+.bp-thmnotes {{
+  font: 0.85rem/1.7 {sans};
+  margin: 0.6rem 0 0 2rem;
+  color: #4a5560;
+}}
+.bp-thmnotes h6 {{
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6a737d;
+  margin: 0.5rem 0 0.15rem;
+}}
+.bp-thmnotes ul {{ margin: 0; padding-left: 1.1rem; }}
+
 .bp-meta {{
-  border-top: 1px solid #e6eaf0;
-  margin-top: 1.25rem;
-  padding-top: 0.5rem;
-  font: 0.85rem/1.7 ui-sans-serif, system-ui, sans-serif;
+  font: 0.85rem/1.8 {sans};
+  margin: 0.6rem 0 0 2rem;
 }}
-.bp-row {{ display: flex; gap: 0.75rem; padding: 0.15rem 0; }}
-.bp-key {{ flex: 0 0 6.5rem; color: #64748b; font-weight: 600; }}
+.bp-row {{ display: flex; gap: 0.75rem; }}
+.bp-key {{ flex: 0 0 6rem; color: #6a737d; }}
 .bp-value {{ flex: 1; }}
 .bp-lean {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-.bp-where {{ color: #64748b; }}
+.bp-where {{ color: #6a737d; }}
 .bp-missing {{ color: #b91c1c; }}
 .bp-ref::before {{
   content: "";
@@ -424,7 +732,6 @@ def _stylesheet() -> str:
   margin-right: 0.35rem;
   border: 1px solid #9aa3b2;
   border-radius: 2px;
-  vertical-align: baseline;
 }}
 .bp-swatch {{
   display: inline-block;
@@ -435,13 +742,6 @@ def _stylesheet() -> str:
   vertical-align: middle;
 }}
 {rules}
-
-@media (prefers-color-scheme: dark) {{
-  .bp-node {{ background: #0f172a; border-color: #26334a; }}
-  .bp-chip {{ color: #0f172a; }}
-  .bp-meta {{ border-top-color: #26334a; }}
-  .bp-key, .bp-where {{ color: #94a3b8; }}
-}}
 """
 
 
