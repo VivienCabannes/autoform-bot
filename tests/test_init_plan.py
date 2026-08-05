@@ -17,9 +17,10 @@ def test_initialize_creates_graph_with_lean_root(tmp_path: Path):
     graph = json.loads((plan / "graph.json").read_text(encoding="utf-8"))
     assert action == "created"
     assert snapshot is None
-    assert graph["version"] == 3
+    assert graph["version"] == 4
     assert graph["metadata"]["lean_root"] == str(lean.resolve())
     assert graph["nodes"] == {}
+    assert graph["edges"] == []
     assert (plan / "wiki" / "nodes" / "README.md").is_file()
 
 
@@ -77,8 +78,9 @@ def test_reset_snapshots_and_clears_durable_plan_state(tmp_path: Path):
     assert not (plan / "task_queue.json").exists()
     assert not (plan / "informal_content").exists()
     reset_graph = json.loads((plan / "graph.json").read_text())
-    assert reset_graph["version"] == 3
+    assert reset_graph["version"] == 4
     assert reset_graph["nodes"] == {}
+    assert reset_graph["edges"] == []
     assert (plan / "wiki" / "nodes" / "README.md").is_file()
 
 

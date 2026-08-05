@@ -38,9 +38,10 @@ deterministic wiki builder owns generated navigation.
 
 ## Procedure
 
-1. Read the assigned node or cluster, its immediate prerequisites and
-   dependents, its source references, and the accepted review or proof change
-   that triggered this task. Do not rewrite the entire wiki for a local change.
+1. Resolve the assigned cell or supercell and retrieve its immediate locality
+   with `scripts/wiki_blueprint.py <project> neighborhood <id-or-alias> --depth 1`.
+   Read its source references and the accepted review or proof change that
+   triggered this task. Do not rewrite the entire wiki for a local change.
 2. Repair broken or stale authored links and ensure every cited result points to
    a registered source plus a precise locator. Link to the canonical external
    source and, when available, the corresponding Lean module or declaration.

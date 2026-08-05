@@ -29,9 +29,25 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-SCHEMA_VERSION = 3
+try:
+    from .graph_contract import (
+        SCHEMA_VERSION,
+        alias_index,
+        migrate_graph,
+        normalize_edges,
+        resolve_alias,
+    )
+except ImportError:  # direct script execution
+    from graph_contract import (
+        SCHEMA_VERSION,
+        alias_index,
+        migrate_graph,
+        normalize_edges,
+        resolve_alias,
+    )
+
 AUTHORED_DIRS = ("nodes", "sources", "papers", "concepts", "audits", "decisions")
-EDGE_FIELDS = ("statement_depends_on", "proof_depends_on")
+DEPENDENCY_FIELDS = ("statement_depends_on", "proof_depends_on")
 
 _ROOT_README = """# Autoform Wiki
 
@@ -42,10 +58,10 @@ This is the durable mathematical knowledge base for the formalization.
 - [Concepts](concepts/README.md) synthesize recurring mathematical ideas.
 - [Audits](audits/README.md) preserve durable mathematical review findings.
 - [Decisions](decisions/README.md) explain important modeling choices.
-- [_generated](_generated/index.md) is rebuilt from `graph.json` and the authored wiki.
+- [_generated](_generated/index.md) is the rebuildable cell/supercell view of the DAG.
 
-`graph.json` owns node identity, hierarchy, dependencies, targets, and machine
-state. Authored Markdown owns mathematical exposition. Do not hand-edit files
+`graph.json` owns cell identity, hierarchy, evidence-bearing edges, targets,
+and machine state. Authored Markdown is each cell's mathematical body. Do not hand-edit files
 under `_generated/`, and do not record queues, agent logs, credentials, local
 paths, or provider configuration anywhere in this wiki.
 """
@@ -153,7 +169,7 @@ def _snapshot_migration(project: Path) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     root = project / ".autoform" / "snapshots"
     root.mkdir(parents=True, exist_ok=True)
-    snapshot = root / f"wiki-v3-{stamp}-{os.getpid()}"
+    snapshot = root / f"wiki-v4-{stamp}-{os.getpid()}"
     snapshot.mkdir()
     shutil.copy2(project / "graph.json", snapshot / "graph.json")
     for name in ("wiki", "informal_content"):
@@ -386,10 +402,10 @@ def _normalize_edges(node: dict) -> None:
     legacy = node.get("depends_on") or []
     if not isinstance(legacy, list) or not all(isinstance(item, str) for item in legacy):
         raise WikiError(f"node {node.get('id')!r} depends_on must be a list of strings")
-    if not any(field in node for field in EDGE_FIELDS):
+    if not any(field in node for field in DEPENDENCY_FIELDS):
         node["statement_depends_on"] = []
         node["proof_depends_on"] = list(legacy)
-    for field in EDGE_FIELDS:
+    for field in DEPENDENCY_FIELDS:
         values = node.setdefault(field, [])
         if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
             raise WikiError(f"node {node.get('id')!r} {field} must be a list of strings")
@@ -451,7 +467,7 @@ def migrate(project: Path, *, import_blueprint: bool = True) -> dict[str, int]:
     informal = project / "informal_content"
     if informal.is_dir() and not any(informal.iterdir()):
         informal.rmdir()
-    graph["version"] = SCHEMA_VERSION
+    migrate_graph(graph)
     _write_json_atomic(graph_path, graph)
     return {"nodes": len(nodes), "moved": moved, "imported": imported, "sources": source_pages}
 
@@ -468,11 +484,47 @@ def _source_map(metadata: dict) -> dict[str, dict]:
     }
 
 
-def _link(target: str, labels: dict[str, str], names: dict[str, str], *, prefix: str = "") -> str:
+def _link(
+    target: str,
+    labels: dict[str, str],
+    names: dict[str, str],
+    *,
+    prefix: str = "",
+    folder: str = "cells",
+) -> str:
     label = _md_label(names.get(target, target))
     if target not in labels:
         return f"`{label}` (unresolved)"
-    return f"[{label}]({prefix}nodes/{labels[target]}.md)"
+    return f"[{label}]({prefix}{folder}/{labels[target]}.md)"
+
+
+def _edge_annotation(edge: dict[str, Any]) -> str:
+    confidence = edge.get("confidence", "unknown")
+    provenance = edge.get("provenance") or {}
+    origin = provenance.get("source") or provenance.get("kind")
+    locator = provenance.get("locator")
+    details = [f"confidence: {confidence}"]
+    if origin:
+        details.append(f"provenance: {origin}")
+    if locator:
+        details.append(f"locator: {locator}")
+    if edge.get("evidence"):
+        details.append("evidence attached")
+    return "; ".join(_md_label(item) for item in details)
+
+
+def _authored_mathematics(project: Path, node_id: str, node: dict[str, Any]) -> str | None:
+    content = node.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    path = _safe_path(project, content, label=f"node {node_id!r} content")
+    if not path.is_file() or path.is_symlink():
+        return None
+    body = path.read_text(encoding="utf-8").strip()
+    # The cell page already owns the H1. Preserve the authored body without a
+    # duplicate top-level title while retaining all lower-level structure.
+    body = re.sub(r"^#\s+[^\n]+\n*", "", body, count=1).strip()
+    return body or None
 
 
 def _review_summary(project: Path, node_id: str) -> str:
@@ -527,14 +579,19 @@ def render(project: Path) -> dict[str, str]:
     project = project.resolve()
     graph = _load_graph(project / "graph.json")
     nodes: dict[str, dict] = graph["nodes"]
+    edges = normalize_edges(
+        graph, migrate=graph.get("version", 0) < SCHEMA_VERSION and "edges" not in graph
+    )
     labels = _slug_map(list(nodes))
     names = {node_id: str(node.get("name") or node.get("title") or node_id) for node_id, node in nodes.items()}
     dependents: dict[str, list[str]] = {node_id: [] for node_id in nodes}
     children: dict[str, list[str]] = {node_id: [] for node_id in nodes}
+    outgoing: dict[str, list[dict[str, Any]]] = {node_id: [] for node_id in nodes}
+    for edge in edges:
+        outgoing[edge["source"]].append(edge)
+        if edge["kind"] in ("statement-requires", "proof-requires"):
+            dependents[edge["target"]].append(edge["source"])
     for node_id, node in nodes.items():
-        for dependency in node.get("depends_on") or []:
-            if dependency in dependents:
-                dependents[dependency].append(node_id)
         parent = node.get("parent")
         if parent in children:
             children[parent].append(node_id)
@@ -545,13 +602,13 @@ def render(project: Path) -> dict[str, str]:
     target_ids = [entry if isinstance(entry, str) else entry.get("node") for entry in targets]
     target_ids = [item for item in target_ids if isinstance(item, str)]
     index = [
-        "# Generated Blueprint",
+        "# Generated Cell Blueprint",
         "",
         "> Generated from `graph.json` and authored wiki pages. Do not edit this directory.",
         "",
         f"Graph revision: `{revision}`",
         "",
-        f"Nodes: **{len(nodes)}**",
+        f"Cells: **{len(nodes)}**",
         "",
         "## Mission targets",
         "",
@@ -572,7 +629,8 @@ def render(project: Path) -> dict[str, str]:
             (item for item, node in nodes.items() if node.get("tier") == tier),
             key=lambda item: (names[item].lower(), item),
         ):
-            index.append(f"- {_link(node_id, labels, names)}")
+            folder = "supercells" if tier == 1 else "cells"
+            index.append(f"- {_link(node_id, labels, names, folder=folder)}")
         index.append("")
     files["index.md"] = "\n".join(index).rstrip() + "\n"
 
@@ -592,21 +650,29 @@ def render(project: Path) -> dict[str, str]:
         ]
         parent = node.get("parent")
         if isinstance(parent, str):
-            page += ["## Parent", "", f"- {_link(parent, labels, names, prefix='../')}", ""]
+            folder = "supercells" if nodes.get(parent, {}).get("tier") == 1 else "cells"
+            page += [
+                "## Parent",
+                "",
+                f"- {_link(parent, labels, names, prefix='../', folder=folder)}",
+                "",
+            ]
         for title, field in (
             ("Statement prerequisites", "statement_depends_on"),
             ("Proof prerequisites", "proof_depends_on"),
         ):
-            values = node.get(field)
-            if values is None:
-                values = node.get("depends_on", []) if field == "proof_depends_on" else []
             page += [f"## {title}", ""]
-            page.extend(f"- {_link(item, labels, names, prefix='../')}" for item in values)
-            if not values:
+            kind = "statement-requires" if field == "statement_depends_on" else "proof-requires"
+            typed_edges = [edge for edge in outgoing[node_id] if edge["kind"] == kind]
+            page.extend(
+                f"- {_link(edge['target'], labels, names, prefix='../')} ({_edge_annotation(edge)})"
+                for edge in typed_edges
+            )
+            if not typed_edges:
                 page.append("- None")
             page.append("")
         page += ["## Dependents", ""]
-        page.extend(f"- {_link(item, labels, names, prefix='../')}" for item in sorted(dependents[node_id]))
+        page.extend(f"- {_link(item, labels, names, prefix='../')}" for item in sorted(set(dependents[node_id])))
         if not dependents[node_id]:
             page.append("- None")
         page += ["", "## Children", ""]
@@ -629,11 +695,36 @@ def render(project: Path) -> dict[str, str]:
             page.append(f"- {rendered}" + (f" ({suffix})" if suffix else ""))
         if not refs:
             page.append("- None")
+        page += ["", "## Attached organs", ""]
         content = node.get("content")
         if isinstance(content, str):
-            authored = PurePosixPath(content)
-            page += ["", "## Authored mathematics", "", f"[{authored.name}](../../../{authored.as_posix()})"]
-        files[f"nodes/{labels[node_id]}.md"] = "\n".join(page).rstrip() + "\n"
+            page.append(f"- Wiki body: `{_md_label(content)}`")
+        if node.get("lean_declaration"):
+            page.append(f"- Project Lean declaration: `{_md_label(node['lean_declaration'])}`")
+        for declaration in node.get("mathlib_declarations") or []:
+            page.append(f"- Mathlib declaration: `{_md_label(declaration)}`")
+        if (project / "kernel" / f"{node_id}.txt").is_file():
+            page.append(f"- Kernel evidence: `kernel/{_md_label(node_id)}.txt`")
+        if len(page) >= 2 and page[-2:] == ["## Attached organs", ""]:
+            page.append("- None")
+        aliases = node.get("aliases") or []
+        page += ["", "## Aliases", ""]
+        page.extend(f"- `{_md_label(alias)}`" for alias in aliases)
+        if not aliases:
+            page.append("- None")
+        soft_edges = [edge for edge in outgoing[node_id] if edge["kind"] not in ("statement-requires", "proof-requires")]
+        page += ["", "## Related cells", ""]
+        page.extend(
+            f"- `{edge['kind']}`: {_link(edge['target'], labels, names, prefix='../')} "
+            f"({_edge_annotation(edge)})"
+            for edge in soft_edges
+        )
+        if not soft_edges:
+            page.append("- None")
+        authored = _authored_mathematics(project, node_id, node)
+        page += ["", "---", "", "## Authored mathematics", ""]
+        page.append(authored or "_No authored mathematical body is attached._")
+        files[f"cells/{labels[node_id]}.md"] = "\n".join(page).rstrip() + "\n"
 
     for cluster_id in sorted(
         (node_id for node_id, node in nodes.items() if node.get("tier") == 1),
@@ -657,7 +748,7 @@ def render(project: Path) -> dict[str, str]:
         page.extend(f"- {_link(item, labels, names, prefix='../')}" for item in dependencies)
         if not dependencies:
             page.append("- None")
-        files[f"clusters/{labels[cluster_id]}.md"] = "\n".join(page).rstrip() + "\n"
+        files[f"supercells/{labels[cluster_id]}.md"] = "\n".join(page).rstrip() + "\n"
 
     def dependency_cone(target: str) -> set[str]:
         seen: set[str] = set()
@@ -700,14 +791,109 @@ def render(project: Path) -> dict[str, str]:
     if not sources:
         source_index.append("- None registered")
     files["sources.md"] = "\n".join(source_index) + "\n"
+    files["aliases.json"] = json.dumps(
+        {"schema": "autoform-aliases/v1", "aliases": alias_index(nodes)},
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
     manifest = {
-        "schema": "autoform-wiki/v1",
+        "schema": "autoform-wiki/v2",
         "graph_revision": revision,
         "git_commit": _git_commit(project),
         "generated_files": sorted([*files, "manifest.json"]),
     }
     files["manifest.json"] = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     return files
+
+
+def _cell_organs(project: Path, node_id: str, node: dict[str, Any]) -> list[dict[str, Any]]:
+    organs: list[dict[str, Any]] = []
+    if isinstance(node.get("content"), str):
+        organs.append({"kind": "wiki", "ref": node["content"]})
+    for ref in node.get("source_refs") or []:
+        if isinstance(ref, dict):
+            organs.append({"kind": "source", **ref})
+    if node.get("lean_declaration"):
+        organ = {"kind": "lean", "ref": node["lean_declaration"]}
+        if node.get("lean_file"):
+            organ["path"] = node["lean_file"]
+        organs.append(organ)
+    for declaration in node.get("mathlib_declarations") or []:
+        organs.append({"kind": "mathlib", "ref": declaration})
+    kernel = project / "kernel" / f"{node_id}.txt"
+    if kernel.is_file():
+        organs.append({"kind": "kernel", "ref": f"kernel/{node_id}.txt"})
+    review_path = project / "review_status.json"
+    if review_path.is_file():
+        try:
+            reviews = json.loads(review_path.read_text(encoding="utf-8")).get("reviews", {})
+        except (OSError, json.JSONDecodeError, AttributeError):
+            reviews = {}
+        if isinstance(reviews, dict) and reviews.get(node_id):
+            organs.append({"kind": "review", "ref": f"review_status.json#reviews.{node_id}"})
+    return organs
+
+
+def query_cell(project: Path, key: str, *, depth: int = 0) -> dict[str, Any]:
+    """Return one cell and an optional local graph neighborhood as JSON data."""
+    project = project.resolve()
+    graph = _load_graph(project / "graph.json")
+    nodes: dict[str, dict] = graph["nodes"]
+    edges = normalize_edges(
+        graph, migrate=graph.get("version", 0) < SCHEMA_VERSION and "edges" not in graph
+    )
+    node_id = resolve_alias(nodes, key)
+    selected = {node_id}
+    frontier = {node_id}
+    for _ in range(max(depth, 0)):
+        adjacent = {
+            endpoint
+            for edge in edges
+            if edge["source"] in frontier or edge["target"] in frontier
+            for endpoint in (edge["source"], edge["target"])
+        }
+        for candidate, node in nodes.items():
+            if candidate in frontier and isinstance(node.get("parent"), str):
+                adjacent.add(node["parent"])
+            if node.get("parent") in frontier:
+                adjacent.add(candidate)
+        frontier = adjacent - selected
+        selected.update(adjacent)
+    cells = {}
+    for selected_id in sorted(selected):
+        node = dict(nodes[selected_id])
+        node["organs"] = _cell_organs(project, selected_id, node)
+        cells[selected_id] = node
+    return {
+        "schema": "autoform-cell-query/v1",
+        "focus": node_id,
+        "cells": cells,
+        "edges": [
+            edge for edge in edges if edge["source"] in selected and edge["target"] in selected
+        ],
+    }
+
+
+def search_cells(project: Path, text: str) -> list[dict[str, Any]]:
+    graph = _load_graph(project.resolve() / "graph.json")
+    needle = text.casefold()
+    matched: set[str] = set()
+    for alias, node_ids in alias_index(graph["nodes"]).items():
+        if needle in alias.casefold():
+            matched.update(node_ids)
+    for node_id, node in graph["nodes"].items():
+        values = [node.get("description")]
+        haystack = "\n".join(value for value in values if isinstance(value, str)).casefold()
+        if needle in haystack:
+            matched.add(node_id)
+    results = [
+        {
+            "id": node_id,
+            "name": graph["nodes"][node_id].get("name") or graph["nodes"][node_id].get("title") or node_id,
+        }
+        for node_id in matched
+    ]
+    return sorted(results, key=lambda result: (str(result["name"]).casefold(), result["id"]))
 
 
 def build(project: Path, *, check: bool = False) -> bool:
@@ -750,6 +936,13 @@ def main(argv: list[str] | None = None) -> int:
     migrate_parser.add_argument("--no-blueprint-import", action="store_true")
     subparsers.add_parser("build", help="rebuild wiki/_generated")
     subparsers.add_parser("check", help="verify wiki/_generated is current")
+    cell_parser = subparsers.add_parser("cell", help="resolve a cell id or alias and print JSON")
+    cell_parser.add_argument("key")
+    neighborhood_parser = subparsers.add_parser("neighborhood", help="print a cell and its local DAG neighborhood")
+    neighborhood_parser.add_argument("key")
+    neighborhood_parser.add_argument("--depth", type=int, default=1)
+    search_parser = subparsers.add_parser("search", help="search cell ids, names, descriptions, and aliases")
+    search_parser.add_argument("text")
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -764,10 +957,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "build":
             build(args.project)
             print(f"wiki generated: {(args.project / 'wiki' / '_generated').resolve()}")
+        elif args.command == "cell":
+            print(json.dumps(query_cell(args.project, args.key), indent=2, sort_keys=True))
+        elif args.command == "neighborhood":
+            print(json.dumps(query_cell(args.project, args.key, depth=args.depth), indent=2, sort_keys=True))
+        elif args.command == "search":
+            print(json.dumps(search_cells(args.project, args.text), indent=2, sort_keys=True))
         elif not build(args.project, check=True):
             print("wiki is stale; run the build command", file=sys.stderr)
             return 1
-    except (OSError, WikiError) as error:
+    except (OSError, ValueError, WikiError) as error:
         print(f"wiki operation failed: {error}", file=sys.stderr)
         return 2
     return 0

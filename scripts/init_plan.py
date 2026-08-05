@@ -22,9 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from .wiki_blueprint import SCHEMA_VERSION, ensure_layout
+    from .graph_contract import SCHEMA_VERSION
+    from .wiki_blueprint import ensure_layout
 except ImportError:  # direct script execution
-    from wiki_blueprint import SCHEMA_VERSION, ensure_layout
+    from graph_contract import SCHEMA_VERSION
+    from wiki_blueprint import ensure_layout
 
 _SIDECARS = ("task_queue.json", "review_status.json", "agents_status.json")
 
@@ -115,6 +117,7 @@ def initialize(project: Path, lean_root: Path, *, reset: bool = False) -> tuple[
             "version": SCHEMA_VERSION,
             "metadata": {"sources": [], "lean_root": str(lean_root)},
             "nodes": {},
+            "edges": [],
         }
         _write_json_atomic(graph_path, data)
         ensure_layout(project)
@@ -145,6 +148,7 @@ def initialize(project: Path, lean_root: Path, *, reset: bool = False) -> tuple[
         "version": SCHEMA_VERSION,
         "metadata": {"sources": [], "lean_root": str(lean_root)},
         "nodes": {},
+        "edges": [],
     }
     _write_json_atomic(graph_path, data)
     ensure_layout(project)

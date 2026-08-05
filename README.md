@@ -35,10 +35,10 @@ flowchart LR
 ```
 
 - **Plan** — a two-phase pipeline reads your sources and builds a tiered DAG:
-  coarse concept clusters first, then fine per-statement nodes with their own
-  paraphrased prose and source maps, each mapped against Mathlib (in-mathlib /
-  partial / missing). `graph.json` remains the control plane while `wiki/`
-  provides durable mathematical navigation and deterministic generated views.
+  coarse supercell clusters first, then theorem-sized cells with authored
+  mathematics, source maps, and Lean/Mathlib attachments. Canonical graph edges
+  retain provenance and confidence; each generated cell page embeds the prose
+  and its local DAG neighborhood as one durable retrieval unit.
 - **Prove** — a deterministic dispatch engine drains a shared task queue:
   prover workers write real Lean, iterating against build feedback. Backends
   are thin adapters behind one driver; a steering judge watches live-steerable

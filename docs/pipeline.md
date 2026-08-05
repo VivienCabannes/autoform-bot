@@ -15,18 +15,18 @@ The pipeline runs in two phases, each ending in review, all driven by one top-le
 
 A plan lives in the user's project directory (next to `lakefile.toml`):
 
-- **`graph.json`** — the structure. One JSON object: metadata plus a map of nodes keyed by `id` (the concept's full English name). Each node holds only *structural* fields: its tier, its container (`parent`), its within-tier dependency edges (`depends_on`), its Mathlib correspondence, and a pointer to its prose file. Derived data is never stored here (see below).
-- **`wiki/nodes/<id>.md`** — the prose. One Markdown file per node (statement, plus proof when the concept is not in Mathlib).
+- **`graph.json`** — the structure. Stable cells live in the `nodes` map; canonical evidence-bearing relations live in the top-level `edges` table. Each cell records its tier, container (`parent`), aliases, Mathlib/Lean attachments, and authored-body pointer. The node-local dependency arrays are a compatibility projection maintained for the scheduler.
+- **`wiki/nodes/<id>.md`** — the authored mathematical body of a cell (statement, plus proof when the concept is not in Mathlib). The generated cell page combines this body with its DAG neighborhood, sources, declarations, reviews, and kernel evidence.
 - **`sources/`** — the textbooks. The orchestrator moves received books here; `metadata.sources` records their paths.
 
 Three helper scripts under the resolved Autoform plugin root's `scripts/` directory: **`merge_node.py`** (the locked writer for `graph.json`), **`check_invariants.py`** (structural checker), **`export_blueprint.py`** (renders the plan to an interactive web view). Full data model: [`internal/references/plan-json-schema.md`](../internal/references/plan-json-schema.md).
 
 ### Two design decisions in the data model
 
-- **Structure and prose are separate files.** `graph.json` stays small, readable, and diffable; the bulky prose lives one-file-per-node in `wiki/nodes/`. Subagents writing prose touch only their own files; all writes to the structure go through one locked path (`merge_node.py`).
+- **One conceptual cell, separate storage layers.** `graph.json` stays small, readable, and diffable; the bulky authored body lives one-file-per-cell in `wiki/nodes/`. The generated wiki joins them for readers and agents. Subagents writing prose touch only their own files; all writes to the structure go through one locked path (`merge_node.py`).
 - **Coarser tiers are derived, not stored.** The only authored hierarchy link is each node's `parent`. A cluster's membership is read off the `parent` pointers, and a tier-1 edge A→B exists exactly when some tier-2 node in A depends on one in B (the *quotient* rule). The finest built tier is the source of truth; coarser tiers are recomputed from it, so they cannot drift — and many subagents can build the fine graph in parallel while the coarse graph stays consistent by construction.
 
-The tiers: **tier 1** = coarse concept clusters (the scoping map), **tier 2** = fine definitions/statements with content, **tier 3** = Lean statements (planned, not built).
+The tiers: **tier 1** = coarse supercell clusters (the scoping map), **tier 2** = theorem-sized cells with content, **tier 3** = optional independently scheduled Lean obligations. A Lean declaration that merely implements a tier-2 cell is an attachment, not automatically a tier-3 node.
 
 ---
 

@@ -13,6 +13,8 @@ Payload (JSON, from --payload FILE or stdin):
     {
       "upsert": {"<id>": {<node record>}, ...},   # or a list of node records
       "delete": ["<id>", ...],                     # optional
+      "upsert_edges": [{<edge record>}, ...],       # schema v4, optional
+      "delete_edges": ["<edge-id>", ...],          # schema v4, optional
       "metadata": {"targets": ["<id>", ...]}      # optional
     }
 
@@ -36,6 +38,11 @@ import os
 import sys
 import tempfile
 from datetime import datetime, timezone
+
+try:
+    from .graph_contract import SCHEMA_VERSION, edge_id, normalize_edge, normalize_edges, project_edges
+except ImportError:  # direct script execution
+    from graph_contract import SCHEMA_VERSION, edge_id, normalize_edge, normalize_edges, project_edges
 
 try:
     import fcntl  # POSIX advisory file locking
@@ -149,6 +156,13 @@ def merge(graph_path: str, payload: dict) -> dict:
     for nid, rec in upserts.items():
         nodes[nid] = rec
 
+    canonical_edges = graph.get("version", 0) >= SCHEMA_VERSION or "edges" in graph
+    has_edge_payload = "upsert_edges" in payload or "delete_edges" in payload
+    if graph.get("version", 0) >= SCHEMA_VERSION and "edges" not in graph:
+        raise ValueError("schema-v4 graph must contain an edges list")
+    if has_edge_payload and not canonical_edges:
+        raise ValueError("edge payload requires a schema-v4 graph; run wiki_blueprint.py migrate first")
+
     # Deletion cleanup is explicit. Any OTHER missing reference is rejected:
     # silently dropping a new edge when concurrently merged prerequisites land
     # in the opposite order loses mathematical meaning.
@@ -167,6 +181,8 @@ def merge(graph_path: str, payload: dict) -> dict:
                 raise ValueError(
                     f"node {nid!r} references absent parent {parent!r}; merge the parent in the same payload or first"
                 )
+        if canonical_edges:
+            continue
         deps = _normalize_dependencies(nid, rec)
         missing = [dep for dep in deps if dep not in nodes]
         unresolved = [dep for dep in missing if dep not in deleted]
@@ -193,6 +209,90 @@ def merge(graph_path: str, payload: dict) -> dict:
             )
         if missing_related:
             rec["related"] = [item for item in related if item in nodes]
+
+    edges_upserted = 0
+    edges_deleted = 0
+    if canonical_edges:
+        raw_edges = graph.get("edges", [])
+        if not isinstance(raw_edges, list):
+            raise ValueError("graph.json edges must be a list")
+        # Removing a cell removes all of its incident synapses. Normalize only
+        # after this filter so an intentional cell deletion cannot look like a
+        # dangling-reference error.
+        kept_raw_edges = [
+            edge
+            for edge in raw_edges
+            if isinstance(edge, dict)
+            and edge.get("source") not in deleted
+            and edge.get("target") not in deleted
+        ]
+        graph["edges"] = kept_raw_edges
+        existing = {edge["id"]: edge for edge in normalize_edges(graph)}
+        edges_deleted += len(raw_edges) - len(kept_raw_edges)
+
+        # A node-field upsert remains supported for splitters. It is translated
+        # into canonical outgoing edges, while unchanged edge evidence survives.
+        for nid, record in upserts.items():
+            requested: dict[str, list[str]] = {}
+            if any(field in record for field in _TYPED_DEPENDENCIES):
+                for field in _TYPED_DEPENDENCIES:
+                    values = record.get(field) or []
+                    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                        raise ValueError(f"node {nid!r} {field} must be a list of strings")
+                    kind = "statement-requires" if field == "statement_depends_on" else "proof-requires"
+                    requested[kind] = list(dict.fromkeys(values))
+            elif "depends_on" in record:
+                values = record.get("depends_on") or []
+                if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                    raise ValueError(f"node {nid!r} depends_on must be a list of strings")
+                requested["proof-requires"] = list(dict.fromkeys(values))
+                requested["statement-requires"] = []
+            if "related" in record:
+                values = record.get("related") or []
+                if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                    raise ValueError(f"node {nid!r} related must be a list of strings")
+                requested["related"] = list(dict.fromkeys(values))
+            for kind, targets in requested.items():
+                old_ids = {
+                    eid
+                    for eid, edge in existing.items()
+                    if edge["source"] == nid and edge["kind"] == kind
+                }
+                wanted_ids = {edge_id(nid, target, kind) for target in targets}
+                for stale in old_ids - wanted_ids:
+                    existing.pop(stale)
+                    edges_deleted += 1
+                for target in targets:
+                    eid = edge_id(nid, target, kind)
+                    if eid not in existing:
+                        existing[eid] = normalize_edge(
+                            {
+                                "source": nid,
+                                "target": target,
+                                "kind": kind,
+                                "confidence": "unknown",
+                                "provenance": {"kind": "node-field-merge"},
+                            },
+                            nodes,
+                        )
+                        edges_upserted += 1
+
+        raw_edge_upserts = payload.get("upsert_edges", [])
+        if not isinstance(raw_edge_upserts, list):
+            raise ValueError("'upsert_edges' must be a list")
+        for raw in raw_edge_upserts:
+            edge = normalize_edge(raw, nodes)
+            existing[edge["id"]] = edge
+            edges_upserted += 1
+        raw_edge_deletes = payload.get("delete_edges", [])
+        if not isinstance(raw_edge_deletes, list) or not all(
+            isinstance(eid, str) and eid for eid in raw_edge_deletes
+        ):
+            raise ValueError("'delete_edges' must be a list of non-empty edge ids")
+        for eid in raw_edge_deletes:
+            if existing.pop(eid, None) is not None:
+                edges_deleted += 1
+        project_edges(graph, list(existing.values()))
 
     # Optional metadata merge — currently ONLY the mission targets. Targets are
     # first-class graph state (the fleet's prove ordering and the audit's
@@ -235,6 +335,8 @@ def merge(graph_path: str, payload: dict) -> dict:
         "stripped_edges": stripped,
         "orphaned_children": orphaned,
         "total_nodes": len(nodes),
+        "edges_upserted": edges_upserted,
+        "edges_deleted": edges_deleted,
     }
     if targets_set is not None:
         result["targets_set"] = targets_set
@@ -256,7 +358,7 @@ def main(argv=None) -> int:
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         print(f"merge rejected: {error}", file=sys.stderr)
         return 2
-    if not payload.get("upsert") and not payload.get("delete") and "metadata" not in payload:
+    if not any(payload.get(key) for key in ("upsert", "delete", "upsert_edges", "delete_edges")) and "metadata" not in payload:
         print("nothing to merge (empty payload)", file=sys.stderr)
         return 0
 
@@ -283,6 +385,8 @@ def main(argv=None) -> int:
     if result["orphaned_children"]:
         children = ", ".join(f"{child} -/-> {parent}" for child, parent in result["orphaned_children"])
         msg += f"; orphaned {len(result['orphaned_children'])} child(ren): {children}"
+    if result["edges_upserted"] or result["edges_deleted"]:
+        msg += f"; edges +{result['edges_upserted']}/-{result['edges_deleted']}"
     print(msg)
     return 0
 

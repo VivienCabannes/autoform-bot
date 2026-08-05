@@ -11,7 +11,7 @@
 - [ ] Reconcile local dashboard and read-only GitHub Pages publication.
 - [ ] Reconcile worker/distributed execution and GitHub collaboration contracts.
 - [ ] Finish Claude, Codex, and Muse parity checks and plugin lint coverage.
-- [ ] Remove superseded compatibility code after active projects migrate to v3.
+- [ ] Remove superseded compatibility code after active projects migrate to v4.
 
 - Test installation instruction for Claude Code, Codex and others
 - Extend the skills and commands

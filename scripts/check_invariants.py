@@ -32,18 +32,24 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
 
+try:
+    from .graph_contract import HARD_EDGE_KINDS, SCHEMA_VERSION, normalize_edges, project_edges
+except ImportError:  # direct script execution
+    from graph_contract import HARD_EDGE_KINDS, SCHEMA_VERSION, normalize_edges, project_edges
 
-def _load_nodes(graph_path: str) -> dict:
+
+def _load_graph(graph_path: str) -> dict:
     with open(graph_path, encoding="utf-8") as f:
         graph = json.load(f)
     nodes = graph.get("nodes")
     if not isinstance(nodes, dict):
         raise ValueError("graph.json has no 'nodes' map")
-    return nodes
+    return graph
 
 
 def _report(name: str, offenders: list[str], detail: str = "") -> bool:
@@ -64,7 +70,7 @@ def _dependencies(record: dict) -> list[str]:
     return record.get("depends_on") or []
 
 
-def check_references(nodes: dict) -> bool:
+def check_references(nodes: dict, edges: list[dict] | None = None) -> bool:
     """Every structural reference names an existing node."""
     offenders = []
     for nid, rec in nodes.items():
@@ -77,12 +83,21 @@ def check_references(nodes: dict) -> bool:
         for related in rec.get("related") or []:
             if related not in nodes:
                 offenders.append(f"{nid} -> related {related!r} (absent)")
+    for edge in edges or []:
+        for endpoint in ("source", "target"):
+            if edge.get(endpoint) not in nodes:
+                offenders.append(f"{edge.get('id', '<edge>')} -> {endpoint} {edge.get(endpoint)!r} (absent)")
     return _report("reference integrity", offenders)
 
 
-def check_edge_consistency(nodes: dict) -> bool:
+def check_edge_consistency(nodes: dict, edges: list[dict] | None = None, *, canonical: bool = False) -> bool:
     """Typed dependencies are well-formed and agree with the scheduler union."""
     offenders = []
+    expected_nodes = None
+    if canonical:
+        expected_graph = {"version": SCHEMA_VERSION, "nodes": copy.deepcopy(nodes), "edges": copy.deepcopy(edges or [])}
+        project_edges(expected_graph, expected_graph["edges"])
+        expected_nodes = expected_graph["nodes"]
     for nid, rec in nodes.items():
         legacy = rec.get("depends_on") or []
         if not isinstance(legacy, list) or not all(isinstance(dep, str) for dep in legacy):
@@ -101,10 +116,17 @@ def check_edge_consistency(nodes: dict) -> bool:
                 union.extend(values)
         if valid and list(dict.fromkeys(union)) != legacy:
             offenders.append(f"{nid}: depends_on does not equal typed dependency union")
+        if expected_nodes is not None:
+            for field in (*_TYPED_DEPENDENCIES, "depends_on", "related"):
+                if rec.get(field, []) != expected_nodes[nid].get(field, []):
+                    offenders.append(f"{nid}: {field} does not match canonical edges")
+            aliases = rec.get("aliases", [])
+            if not isinstance(aliases, list) or not all(isinstance(alias, str) and alias for alias in aliases):
+                offenders.append(f"{nid}: aliases is not a non-empty string list")
     return _report("typed edge consistency", offenders)
 
 
-def check_tiers(nodes: dict) -> bool:
+def check_tiers(nodes: dict, edges: list[dict] | None = None) -> bool:
     """depends_on stays within a tier; parent sits exactly one tier above its child."""
     offenders = []
     for nid, rec in nodes.items():
@@ -119,6 +141,16 @@ def check_tiers(nodes: dict) -> bool:
                 dtier = nodes[dep].get("tier")
                 if dtier != tier:
                     offenders.append(f"{nid} (tier {tier}) -> depends_on {dep!r} (tier {dtier})")
+    if edges is not None:
+        for edge in edges:
+            if edge.get("kind") not in HARD_EDGE_KINDS:
+                continue
+            source, target = edge["source"], edge["target"]
+            if source in nodes and target in nodes and nodes[source].get("tier") != nodes[target].get("tier"):
+                offenders.append(
+                    f"{source} (tier {nodes[source].get('tier')}) -> {edge['kind']} "
+                    f"{target!r} (tier {nodes[target].get('tier')})"
+                )
     return _report("tier discipline", offenders)
 
 
@@ -235,13 +267,16 @@ def check_reachability(nodes: dict) -> bool:
 def check(graph_path: str) -> tuple[bool, bool]:
     """Run all checks; return (structural_ok, grounded_ok). The caller decides
     which of the two gates the exit code."""
-    nodes = _load_nodes(graph_path)
+    graph = _load_graph(graph_path)
+    nodes = graph["nodes"]
+    canonical = graph.get("version", 0) >= SCHEMA_VERSION or "edges" in graph
+    edges = normalize_edges(graph, migrate=not canonical)
     print("Structural integrity (must hold at every stage):")
     structural = all(
         [
-            check_references(nodes),
-            check_edge_consistency(nodes),
-            check_tiers(nodes),
+            check_references(nodes, edges),
+            check_edge_consistency(nodes, edges, canonical=canonical),
+            check_tiers(nodes, edges),
             check_acyclic(nodes),
         ]
     )
@@ -265,7 +300,11 @@ def main(argv=None) -> int:
         print(f"error: {args.graph} does not exist", file=sys.stderr)
         return 2
 
-    structural, grounded = check(args.graph)
+    try:
+        structural, grounded = check(args.graph)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(f"error: invalid graph: {error}", file=sys.stderr)
+        return 2
     if not structural:
         print("\nFAILED: structural integrity violated — fix or roll back before continuing.")
         return 1

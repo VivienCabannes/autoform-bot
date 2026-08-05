@@ -1,27 +1,35 @@
 ---
 name: plan-json-schema
-description: Schema v3 contract for graph.json, authored wiki pages, evidence, and generated blueprint navigation
+description: Schema v4 contract for unified DAG cells, authored wiki bodies, edge evidence, and generated navigation
 ---
 
-# Autoform Wiki/Blueprint Contract (v3)
+# Autoform Cell Blueprint Contract (v4)
 
 An Autoform project has four deliberately separate layers:
 
-1. `graph.json` is the canonical machine control plane. It owns stable node
-   identities, hierarchy, typed dependencies, targets, source registration,
-   Mathlib mapping, and Lean mapping.
-2. `wiki/` is the canonical authored mathematical knowledge base. It owns
-   informal statements, proof narratives, source maps, concept synthesis,
-   audits, and modeling decisions.
+1. Each theorem-sized **cell** is simultaneously a DAG node and a wiki topic.
+   `graph.json` owns its stable identity, hierarchy, evidence-bearing edges,
+   targets, aliases, source registration, Mathlib mapping, and Lean mapping.
+2. `wiki/` supplies the authored mathematical body and supporting knowledge
+   attached to those cells: informal statements, proof narratives, source
+   maps, concept synthesis, audits, and modeling decisions.
 3. `kernel/` and `review_status.json` hold proof and review evidence. Status is
    derived from these artifacts and the graph; it is never authored in wiki
    frontmatter.
 4. `wiki/_generated/`, the local dashboard, and GitHub Pages are projections.
    They may be deleted and rebuilt without losing mathematical knowledge.
 
-This division combines a strict dependency DAG with a human-readable internal
-wiki. Markdown links aid exploration, but they never create graph edges or
-change proof state.
+The generated cell page joins these layers into one retrieval unit. Markdown
+links aid exploration, but they never create graph edges or change proof state.
+
+The vocabulary follows WikiLean Brain where it improves retrieval without
+changing Autoform's scheduling semantics:
+
+- a tier-2 theorem node is a **cell**;
+- its wiki body, sources, Lean/Mathlib declarations, reviews, and kernel
+  evidence are **organs** attached to that cell;
+- a tier-1 cluster is a **supercell**;
+- a typed graph edge is a **synapse**, retaining provenance and evidence.
 
 ## Repository shape
 
@@ -35,7 +43,7 @@ wiki/
   concepts/       # cross-node synthesis and notation
   audits/         # durable mathematical review findings
   decisions/      # accepted modeling decisions and rationale
-  _generated/     # deterministic indexes; never hand-edited
+  _generated/     # deterministic cells, supercells, aliases; never hand-edited
 kernel/            # checked proof evidence
 review_status.json # review evidence (local by default; publish only allowlisted fields)
 .autoform/         # local queues, leases, logs, provider state, and caches
@@ -49,13 +57,14 @@ belong in the wiki or public site.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "metadata": {
     "lean_root": "/local/path/not-for-publication",
     "sources": [],
     "targets": []
   },
-  "nodes": {}
+  "nodes": {},
+  "edges": []
 }
 ```
 
@@ -81,6 +90,7 @@ when their arrays are empty.
 | `proof_depends_on` | string array | Additional nodes needed only by its proof or construction. |
 | `depends_on` | string array | Ordered de-duplicated union of the two typed arrays. Compatibility field consumed by the current scheduler; maintained by `merge_node.py`. |
 | `related` | string array | Non-blocking conceptual links. They resolve but do not affect readiness or trust. |
+| `aliases` | string array | Stable lookup handles such as legacy names or domain terminology. Titles and Lean/Mathlib declarations are indexed automatically. |
 | `mathlib_status` | string | Exactly `in-mathlib`, `partial`, or `missing`. |
 | `mathlib_declarations` | string array | Concrete declarations supporting the Mathlib classification. |
 | `mathlib_file` | string or null | Mathlib location when useful. |
@@ -90,6 +100,11 @@ when their arrays are empty.
 | `content` | string or null | Repo-relative canonical authored page, normally `wiki/nodes/<slug>.md`. |
 | `lean_file` | string or null | Repo-relative Lean file associated with the node. |
 | `lean_declaration` | string or null | Compiled declaration name when one has landed. |
+
+The dependency and `related` arrays are materialized compatibility views of
+the canonical top-level `edges` table. `merge_node.py` maintains them for the
+scheduler and older tools; callers must not edit both representations
+independently.
 
 Legacy schema-v2 nodes without typed arrays remain readable. Migration treats
 their old `depends_on` edges as proof dependencies because that preserves the
@@ -112,6 +127,34 @@ within each tier. `parent` resolves exactly one tier upward. Children and
 coarser projections are derived from `parent` and the finest built dependency
 graph; they are not stored as duplicate member arrays.
 
+## Canonical edges
+
+Every cell-to-cell relation is one aggregate edge in the top-level `edges`
+array. Dependency direction is **dependent to prerequisite**, matching
+`depends_on`:
+
+```json
+{
+  "id": "edge:<deterministic-hash>",
+  "source": "main-theorem",
+  "target": "supporting-lemma",
+  "kind": "proof-requires",
+  "confidence": "high",
+  "provenance": {
+    "source": "BCIKS20",
+    "locator": "Proof of Theorem 4.2"
+  },
+  "evidence": "wiki/audits/dependency-review.md"
+}
+```
+
+Hard kinds are `statement-requires` and `proof-requires`; they remain directed,
+within-tier, and acyclic. Soft kinds are `related`, `generalizes`, and
+`special-case`; they may be cyclic and never affect readiness. `traces` may
+retain multiple supporting observations behind an aggregate edge. Confidence
+is `high`, `medium`, `low`, or `unknown`. Migrated edges use `unknown` and a
+`legacy-node-field` provenance marker rather than inventing evidence.
+
 ## Source registry and references
 
 `metadata.sources` is a registry of adopted source artifacts:
@@ -127,7 +170,7 @@ graph; they are not stored as duplicate member arrays.
 }
 ```
 
-`id` is required and unique in v3. `url` should identify a stable public record;
+`id` is required and unique in v4. `url` should identify a stable public record;
 `file` is an optional repo-relative artifact; `wiki` points to durable project
 notes. A node cites it with a typed locator:
 
@@ -180,10 +223,20 @@ python scripts/wiki_blueprint.py <project> check
 ```
 
 The generated projection includes a graph revision, mission targets, tier
-indexes, per-node neighborhoods, separate statement/proof prerequisites,
-dependents, children, source links, review summaries, kernel-evidence presence,
-and links back to authored pages. It excludes timestamps and absolute Lean
-paths from its revision hash. Identical durable inputs produce identical files.
+indexes, full cell pages under `_generated/cells/`, supercells, typed
+neighborhoods with edge evidence, aliases, dependents, children, source links,
+review summaries, and kernel-evidence presence. Each cell page embeds its
+authored Markdown body; it does not merely link to a parallel page. It excludes
+timestamps and absolute Lean paths from its revision hash. Identical durable
+inputs produce identical files.
+
+Agents can retrieve bounded local context without loading the whole graph:
+
+```bash
+python scripts/wiki_blueprint.py <project> cell "<id-or-alias>"
+python scripts/wiki_blueprint.py <project> neighborhood "<id-or-alias>" --depth 1
+python scripts/wiki_blueprint.py <project> search "<text>"
+```
 
 `wiki/_generated/manifest.json` records the schema, graph revision, Git commit
 when available, and generated file list. Agents never edit this directory.
@@ -191,10 +244,10 @@ when available, and generated file list. Agents never edit this directory.
 ## Invariants
 
 1. Node IDs and source IDs are stable and unique.
-2. Every `parent`, typed dependency, compatibility dependency, `related` entry,
-   target, and typed source reference resolves.
-3. `depends_on` equals the ordered de-duplicated union of
-   `statement_depends_on` and `proof_depends_on` for v3 nodes.
+2. Every edge endpoint, `parent`, compatibility edge, target, and typed source
+   reference resolves.
+3. Node-local edge arrays equal the deterministic projection of canonical
+   edges.
 4. Dependency edges stay within a tier and form a DAG; parents sit exactly one
    tier above their children.
 5. Every missing node reaches verified Mathlib grounding through dependencies
@@ -218,11 +271,12 @@ python scripts/wiki_blueprint.py <project> migrate
 ```
 
 For schema v2 it moves linked `informal_content/*.md` pages into `wiki/nodes/`,
-normalizes source IDs/references, adds typed edges, and writes schema v3. For a
+normalizes source IDs/references, adds typed edges, and writes schema v4. For a
 Markdown-first `blueprint/roadmap/`, it imports `kind: node` pages, converts
 `## Depends on` and `## Proof depends on` links into typed edges, and retains
-the Markdown body as authored node content. It refuses path traversal,
+the Markdown body as authored cell content. Schema-v3 node arrays are lifted
+into evidence-bearing edges without changing scheduler order. It refuses path traversal,
 symlinked wiki sections, duplicate source IDs, and authored-file overwrites.
 
-Existing v2 graphs remain readable until migration. New projects initialize at
-v3. Keep compatibility fallbacks until every active project has migrated.
+Existing v2/v3 graphs remain readable until migration. New projects initialize
+at v4. Keep compatibility fallbacks until every active project has migrated.

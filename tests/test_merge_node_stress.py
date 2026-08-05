@@ -160,6 +160,62 @@ def test_delete_strips_typed_dependencies_and_related_edges(tmp_path: Path):
     assert goal["related"] == []
 
 
+def test_v4_merge_materializes_evidence_edges_for_scheduler(tmp_path: Path):
+    graph = tmp_path / "graph.json"
+    graph.write_text(json.dumps({"version": 4, "metadata": {}, "nodes": {}, "edges": []}))
+    mn.merge(
+        str(graph),
+        {
+            "upsert": {
+                "base": _node("base", aliases=["foundation"]),
+                "goal": _node("goal", statement_depends_on=["base"], proof_depends_on=[]),
+            },
+            "upsert_edges": [
+                {
+                    "source": "goal",
+                    "target": "base",
+                    "kind": "statement-requires",
+                    "confidence": "high",
+                    "provenance": {"source": "paper", "locator": "Theorem 1"},
+                }
+            ],
+        },
+    )
+    data = json.loads(graph.read_text())
+    assert data["nodes"]["goal"]["depends_on"] == ["base"]
+    assert data["nodes"]["goal"]["statement_depends_on"] == ["base"]
+    assert data["nodes"]["base"]["aliases"] == ["foundation"]
+    assert data["edges"][0]["confidence"] == "high"
+    assert data["edges"][0]["provenance"]["locator"] == "Theorem 1"
+
+
+def test_v4_delete_cell_removes_incident_edges(tmp_path: Path):
+    graph = tmp_path / "graph.json"
+    graph.write_text(json.dumps({"version": 4, "metadata": {}, "nodes": {}, "edges": []}))
+    mn.merge(
+        str(graph),
+        {"upsert": {"base": _node("base"), "goal": _node("goal", depends_on=["base"])}},
+    )
+    result = mn.merge(str(graph), {"delete": ["base"]})
+    data = json.loads(graph.read_text())
+    assert data["nodes"]["goal"]["depends_on"] == []
+    assert data["edges"] == []
+    assert result["edges_deleted"] == 1
+
+
+def test_edge_payload_requires_explicit_schema_migration(tmp_path: Path):
+    graph = _graph(tmp_path, {"base": _node("base"), "goal": _node("goal")})
+    with pytest.raises(ValueError, match="requires a schema-v4 graph"):
+        mn.merge(
+            str(graph),
+            {
+                "upsert_edges": [
+                    {"source": "goal", "target": "base", "kind": "proof-requires"}
+                ]
+            },
+        )
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [

@@ -40,6 +40,12 @@ For every node you create, decide:
   - *Inside this cluster:* a node may depend on other nodes you are creating in the same split (a theorem on the lemmas it rests on, a corollary on its parent theorem). Same-tier only, and acyclic — the dependency graph within the cluster is a DAG.
   - *Outside this cluster:* a node may depend on already-written nodes from prerequisite clusters or on green Mathlib roots. Reference these by their exact existing ids.
   An edge means genuine use: the statement or proof of this node actually invokes the prerequisite. Do not add an edge merely because two results sit in the same chapter. Never write a cross-tier edge — dependence on a coarse cluster is recovered later by the quotient rule, not authored.
+- **edge evidence** — for each typed dependency, return a canonical edge record
+  with the dependent as `source`, the prerequisite as `target`, kind
+  `statement-requires` or `proof-requires`, an honest confidence, and
+  provenance naming the source ID and exact locator when the source establishes
+  the dependency. Use `provenance: {kind: "mathematical-bridge"}` for a bridged
+  dependency rather than inventing a citation.
 - **`mathlib_status`** — your best guess of `in-mathlib`, `partial`, or `missing`, from your knowledge of Mathlib and a quick confirming search (below). This is a guess the main agent will have verified by a dedicated `mathlib-checker` pass; aim it well but don't agonize. When you do find a match, record the declaration name(s) and file so the checker and the content step can reuse them.
 
 Use the Mathlib search CLI to confirm a status when it matters — chiefly to settle whether a node is `in-mathlib` (which decides whether you write a proof) and to capture the declaration a node points at:
@@ -105,6 +111,15 @@ For each node created:
   origin: [cited | bridged | background]
   source_refs: [{source, locator, role}]   (registered source id plus exact locator)
   content: [wiki/nodes/<slug>.md — the file you wrote]
+
+### Canonical edges
+
+- source: [dependent cell id]
+  target: [prerequisite cell id]
+  kind: [statement-requires | proof-requires | related]
+  confidence: [high | medium | low | unknown]
+  provenance: [{source, locator} or {kind: mathematical-bridge}]
+  evidence: [optional durable wiki/audits reference]
 
 ### Split rationale
 [For any theorem you broke into sub-statements: name the pieces and state how they

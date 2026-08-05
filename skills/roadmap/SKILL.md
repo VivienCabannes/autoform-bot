@@ -140,8 +140,10 @@ reviewers", not internal shorthand).
 
    Record statement prerequisites in `statement_depends_on` and extra proof
    prerequisites in `proof_depends_on`; `merge_node.py` maintains their
-   `depends_on` scheduler union. Use `related` only for non-blocking conceptual
-   navigation. After accepted graph/content/source changes, dispatch the
+   `depends_on` scheduler union. For every accepted edge, also submit its
+   canonical `upsert_edges` record with provenance, confidence, and evidence
+   when available; the top-level edge table is authoritative. Use `related`
+   only for non-blocking conceptual navigation. After accepted graph/content/source changes, dispatch the
    `wiki-curator` over the affected neighborhood, then rebuild deterministic
    navigation with `scripts/wiki_blueprint.py "$DISPATCH_PROJECT" build`.
 
