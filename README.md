@@ -31,6 +31,30 @@ claude plugin marketplace add "$(pwd)"
 claude plugin install autoform@autoform
 ```
 
+To install AutoformBot directly from GitHub in Codex:
+
+```bash
+codex plugin marketplace add facebookresearch/autoform-bot
+codex plugin add autoform@autoform
+```
+
+To install a local checkout in Codex instead, add the local marketplace
+containing the checkout and install AutoformBot from it:
+
+```bash
+codex plugin marketplace add /path/to/marketplace-root
+codex plugin add autoform@autoform-local
+```
+
+The marketplace should expose the checkout as `plugins/autoform` and identify
+it as `autoform-local`. After changing the plugin during development, refresh
+its cache version and reinstall it:
+
+```bash
+python3 /path/to/plugin-creator/scripts/update_plugin_cachebuster.py "$(pwd)"
+codex plugin add autoform@autoform-local
+```
+
 Start a new agent session after installing or updating the plugin so its skills
 and MCP servers are reloaded. The installed package and commands retain the
 `autoform` identifier; AutoformBot is the project name.
