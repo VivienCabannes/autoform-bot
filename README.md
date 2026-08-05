@@ -37,12 +37,14 @@ and MCP servers are reloaded. The installed package and commands retain the
 ## Plugin surface
 
 Invoke a skill from your coding agent with `/autoform:setup`,
-`/autoform:roadmap`, `/autoform:orchestrate`, or `/autoform:review`.
+`/autoform:roadmap`, `/autoform:orchestrate`, `/autoform:review`, or
+`/autoform:develop-plugin`.
 
 - `setup` creates or repairs the Lean repository, Markdown blueprint, CI, and Pages infrastructure.
 - `roadmap` confirms sources and scope, then builds roadmap, coverage, and theorem DAG notes.
 - `orchestrate` works ready nodes with native subagents and Lean tools.
 - `review` independently checks faithfulness, proof integrity, and Mathlib code quality.
+- `develop-plugin` maintains Autoform itself through its executable formalization example.
 
 The plugin also gives coding agents execution and inspection tools through a
 Lean REPL and LSP. Loogle and semantic search integrations are planned but not
@@ -117,6 +119,11 @@ Markdown stays the source of truth. Generated graphs and sites are derived
 views and can be rebuilt at any time.
 
 ## Development
+
+Invoke `/autoform:develop-plugin` when changing this plugin. It treats the bundled
+Cabannes thesis repository as a representative consumer and validates changes
+against the results an installed plugin must produce in independent
+formalization projects.
 
 Clone the repository and install its development dependencies:
 

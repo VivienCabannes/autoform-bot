@@ -10,9 +10,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-def test_plugin_surface_is_four_skills_and_two_servers(repo_root):
+def test_plugin_surface_is_five_skills_and_two_servers(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
-    assert skills == {"setup", "roadmap", "orchestrate", "review"}
+    assert skills == {"setup", "roadmap", "orchestrate", "review", "develop-plugin"}
 
     review_dir = repo_root / "skills" / "review"
     references = {
@@ -42,13 +42,14 @@ def test_plugin_surface_is_four_skills_and_two_servers(repo_root):
             assert config["mcpServers"][name]["args"][-2:] == ["-m", module]
 
     codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
-    assert len(codex_manifest["interface"]["defaultPrompt"]) == 4
+    assert len(codex_manifest["interface"]["defaultPrompt"]) == 5
     muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
     assert [command["id"] for command in muse["capabilities"]["commands"]] == [
         "setup",
         "roadmap",
         "orchestrate",
         "review",
+        "develop-plugin",
     ]
     for command in muse["capabilities"]["commands"]:
         assert (repo_root / command["path"]).is_file()

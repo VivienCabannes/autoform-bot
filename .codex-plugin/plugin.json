@@ -1,6 +1,6 @@
 {
   "name": "autoform",
-  "version": "0.5.0+codex.20260805133358",
+  "version": "0.5.0+codex.20260805134416",
   "description": "Set up Lean repositories, build source-grounded Markdown roadmaps, prove ready nodes, and review formalizations.",
   "author": {
     "name": "Vivien Cabannes"
@@ -22,7 +22,8 @@
       "Set up this Lean repository with an Autoform vault, verification CI, and GitHub Pages without planning the mathematics.",
       "Build or refine an Autoform roadmap from my mathematical sources.",
       "Work through the ready nodes in my Autoform blueprint.",
-      "Review this Lean formalization against its source and proof chain."
+      "Review this Lean formalization against its source and proof chain.",
+      "Develop Autoform itself through its executable formalization example."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/autoform-small.svg",

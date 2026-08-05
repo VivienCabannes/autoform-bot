@@ -263,6 +263,10 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     roadmap_metadata = (repo_root / "skills/roadmap/agents/openai.yaml").read_text(encoding="utf-8")
     orchestrate = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
     review = (repo_root / "skills/review/SKILL.md").read_text(encoding="utf-8")
+    develop_plugin = (repo_root / "skills/develop-plugin/SKILL.md").read_text(encoding="utf-8")
+    develop_plugin_metadata = (repo_root / "skills/develop-plugin/agents/openai.yaml").read_text(
+        encoding="utf-8"
+    )
 
     for required in (
         "assets/cabannes-thesis-project/README.md",
@@ -290,10 +294,22 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert "renders them only at the bottom of\n  book pages" in setup
     assert "references/thesis-worked-node.md" in orchestrate
     assert "references/thesis-review-case.md" in review
+    for required in (
+        "example-based plugin",
+        "independent formalization",
+        "Cabannes-specific",
+        "make check-example",
+        "plugin-creator",
+        "new thread",
+    ):
+        assert required in develop_plugin
+    assert re.search(r"consumer\s+scenario", develop_plugin)
     assert "$setup" in setup_metadata
     assert "$roadmap" in roadmap_metadata
+    assert "$develop-plugin" in develop_plugin_metadata
     assert "stops before\nmathematical planning" in setup
     assert "Do not\nscan for undecomposed chapters" in orchestrate
+    assert "When developing or adapting" not in roadmap
     assert (repo_root / "skills/roadmap/references/cabannes-thesis-roadmap.md").is_file()
     assert (repo_root / "skills/orchestrate/references/thesis-worked-node.md").is_file()
     assert (repo_root / "skills/review/references/thesis-review-case.md").is_file()

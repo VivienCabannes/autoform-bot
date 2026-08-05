@@ -30,6 +30,11 @@
         "id": "review",
         "path": "skills/review/SKILL.md",
         "enabledDefault": true
+      },
+      {
+        "id": "develop-plugin",
+        "path": "skills/develop-plugin/SKILL.md",
+        "enabledDefault": true
       }
     ],
     "hooks": [],

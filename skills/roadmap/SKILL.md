@@ -58,12 +58,6 @@ mathematics.
    a prerequisite the proof needs but the statement does not. Keep roadmap,
    coverage, and source links under other headings.
 
-When developing or adapting the example-based plugin structure, exercise it
-with at least two mathematically meaningful chapters and a genuine
-cross-chapter dependency. This keeps book order, chapter progress, source-code
-links, and graph projections testable without copying the example's
-mathematics into another project.
-
 Assert only what is checked: `statement: formalized`, `proof: formalized`,
 `mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
 blocked, and fully-proved are derived from the DAG — never hand-write them, and
