@@ -59,7 +59,8 @@ status.
 
 ## Validate and report
 
-Resolve the plugin root from the loaded skill and run:
+`<AUTOFORM_PLUGIN_ROOT>` is the AutoformBot checkout this skill was loaded
+from; substitute its absolute path and run:
 
 ```bash
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check "<PROJECT>/blueprint"

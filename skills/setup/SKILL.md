@@ -66,7 +66,9 @@ or enabling Pages are separate outward-facing actions; perform them only when
 the user requests them. Pin third-party Actions and the Autoform CLI source to
 immutable commits.
 
-Validate the prepared repository with the corresponding local commands:
+Validate the prepared repository with the corresponding local commands.
+`<AUTOFORM_PLUGIN_ROOT>` is the AutoformBot checkout this skill was loaded
+from; substitute its absolute path:
 
 ```bash
 lake exe cache get   # skip only when the project has no Mathlib dependency
@@ -76,6 +78,15 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint \
   --output blueprint/dependencies.html --link-extension .html
 uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
+
+Publication makes the vault world-readable, so say what that means before
+asking. MkDocs renders the vault alone, so `docs_dir` keeps Lean sources off the
+site and dot-prefixed entries such as `.obsidian/` and `.trash/` are skipped.
+Every other file under `blueprint/` is published: Markdown becomes HTML,
+binaries are copied verbatim, and page text is indexed into
+`site/search/search_index.json`. An unlinked file is still reachable through
+that index, so presence in the vault — not being linked from a page — is what
+makes something public.
 
 Publication is opt-in and interactive-only. Ask one concrete question naming
 the exact repository — create private `<owner>/<name>` and push? — defaulting
@@ -96,6 +107,21 @@ blueprint of unpublished results is a decision for the user, not a default.
 Treat `gh` as optional: when it is missing, unauthenticated, or the project
 lives on another host, report the equivalent commands instead of running them.
 
+When the sequence above cannot run, hand the user the steps only a repository
+owner can perform, and say plainly that CI builds the site but the deploy job
+fails until the first one is done:
+
+1. Set **Settings → Pages → Source** to **GitHub Actions**.
+2. Make the repository public, or keep it private on a plan that includes Pages
+   for private repositories.
+3. Push to the default branch. Pull requests validate and build the site but
+   never deploy it.
+
+Declining is safe and reversible: the committed workflow stays inert until Pages
+is configured, so nothing is published by accident and publication remains
+available in a later run without further setup.
+
 Report the Lean toolchain, vault path, CI and Pages files, validation results,
-and any one-time GitHub setting. State explicitly that no sources were scoped,
-roadmap nodes created, or proofs started, then hand the repository to Roadmap.
+the publication decision, and any one-time GitHub setting the user must still
+apply. State explicitly that no sources were scoped, roadmap nodes created, or
+proofs started, then hand the repository to Roadmap.
