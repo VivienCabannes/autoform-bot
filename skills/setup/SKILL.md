@@ -11,34 +11,16 @@ description: >-
 
 # Set up an Autoform repository
 
-State the contract before touching anything: Setup prepares a Lean repository
-and an empty blueprint shell — toolchain, vault, ignore rules, MkDocs, CI, and,
-on request, publication. It does not read sources, choose theorems, or write
-roadmap nodes. Say so in the opening message and name Roadmap as the next step,
-so the user knows which skill owns the mathematics.
+Setup prepares the Lean toolchain, an empty blueprint vault, ignore rules,
+MkDocs, CI, and optionally publication. It does not scope sources, choose
+theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
-Then ask how the user wants to work, because that answer gates every later
-question:
-
-- interactive — confirm each decision, including publication, as it arises;
-- autonomous — take the safe defaults, perform no outward-facing action, and
-  list every assumption in the closing report.
-
-In autonomous mode ask nothing further: work locally, create nothing remote,
-and leave publication to a later interactive run.
-
-When an interactive run starts without arguments, ask one consolidated question
-rather than a sequence — whether this is a new project, a repair of an existing
-one, or inspection only; the Lean package name in UpperCamelCase and its target
-directory; and whether to publish once the repository is ready.
-
-Ask what the project will formalize only far enough to name that package, as in
-`RudinCh3`, `ConvexBodies`, or `CabannesThesis`. Record nothing about sources,
-chapters, or theorems, and do not let the answer grow into scoping: confirming
-the corpus and decomposing it is Roadmap's first task, not Setup's last.
-
-Inspect the target repository before writing and preserve existing Lean,
-Markdown, workflow, and ignore files. Setup prepares the shell and stops before
+Inspect before writing and preserve existing Lean, Markdown, workflow, and
+ignore files. Infer safe local defaults from the request and repository. If a
+material choice is missing, ask once for the run type (new, repair, or inspect),
+UpperCamelCase package name, target directory, and whether publication is
+wanted. Without explicit publication approval, make no remote changes. Setup
+prepares the shell and stops before
 mathematical planning.
 
 Read the repo-shaped [Cabannes thesis project](assets/cabannes-thesis-project/README.md)
@@ -79,47 +61,12 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint \
 uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
 
-Publication makes the vault world-readable, so say what that means before
-asking. MkDocs renders the vault alone, so `docs_dir` keeps Lean sources off the
-site and dot-prefixed entries such as `.obsidian/` and `.trash/` are skipped.
-Every other file under `blueprint/` is published: Markdown becomes HTML,
-binaries are copied verbatim, and page text is indexed into
-`site/search/search_index.json`. An unlinked file is still reachable through
-that index, so presence in the vault — not being linked from a page — is what
-makes something public.
-
-Publication is opt-in and interactive-only. Ask one concrete question naming
-the exact repository — create private `<owner>/<name>` and push? — defaulting
-the name to the project directory and the visibility to private, then run the
-sequence rather than handing the user commands to type. Enable Pages before the
-first push so the initial `blueprint-pages.yml` run deploys instead of failing:
-
-```bash
-gh repo create <owner>/<name> --private --source=. --remote=origin
-gh api -X POST repos/{owner}/{repo}/pages -f build_type=workflow
-git push -u origin "$(git branch --show-current)"
-```
-
-That answer approves this repository only; committing CI, enabling Pages on an
-existing remote, or any later outward-facing action needs its own question.
-Pages on a private repository requires a paid GitHub plan, so publishing a
-blueprint of unpublished results is a decision for the user, not a default.
-Treat `gh` as optional: when it is missing, unauthenticated, or the project
-lives on another host, report the equivalent commands instead of running them.
-
-When the sequence above cannot run, hand the user the steps only a repository
-owner can perform, and say plainly that CI builds the site but the deploy job
-fails until the first one is done:
-
-1. Set **Settings → Pages → Source** to **GitHub Actions**.
-2. Make the repository public, or keep it private on a plan that includes Pages
-   for private repositories.
-3. Push to the default branch. Pull requests validate and build the site but
-   never deploy it.
-
-Declining is safe and reversible: the committed workflow stays inert until Pages
-is configured, so nothing is published by accident and publication remains
-available in a later run without further setup.
+Publication is opt-in because files under `blueprint/` become public site
+content. Confirm the exact repository and visibility, default to private, and
+warn that private Pages may require a paid GitHub plan. When approved, prepare
+the commit, remote, Pages source, and push; otherwise leave the workflow inert.
+If credentials, hosting, or repository settings block publication, report the
+minimal owner action required.
 
 Report the Lean toolchain, vault path, CI and Pages files, validation results,
 the publication decision, and any one-time GitHub setting the user must still
