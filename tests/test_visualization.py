@@ -4,9 +4,14 @@ from pathlib import Path
 
 import pytest
 
+from autoform_cli import mermaid
 from autoform_cli.graph import load_graph
-from autoform_cli.status import derive
+from autoform_cli.status import STATES, derive
 from autoform_cli.visualize import export_graph, main
+
+
+def _state(key: str):
+    return next(state for state in STATES if state.key == key)
 
 
 def _write_node(
@@ -67,8 +72,25 @@ def test_diagram_colours_and_shapes_follow_derived_status(tmp_path: Path) -> Non
     # Definitions are rectangles, propositions are rounded.
     assert 'n0["Base"]:::fully_proved' in document
     assert 'n1("Top"):::fully_proved' in document
-    assert "classDef fully_proved fill:#1CAC78" in document
+    # The vault copy carries its palette inline; Obsidian has no init script.
+    assert f"classDef fully_proved fill:{_state('fully_proved').fill}" in document
+    assert '<span class="bp-swatch bp-swatch-fully_proved">' in document
     assert "| fully proved | 2 |" in document
+
+
+def test_the_published_graph_defers_its_palette_to_the_theme(tmp_path: Path) -> None:
+    """Mermaid scopes its styles to the SVG id, so dark mode must re-render."""
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only", declaration="theorem")
+    graph = load_graph(blueprint)
+    output = tmp_path / "dependencies.md"
+
+    published = mermaid.render_page(
+        graph, derive(graph), output, links={"only": "x.html#only"}, include_classdefs=False
+    )
+
+    assert ":::can_state" in published
+    assert "classDef" not in published
 
 
 def test_proof_only_dependencies_are_dashed(tmp_path: Path) -> None:

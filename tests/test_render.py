@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from autoform_cli.lean import _normalize_remote
 from autoform_cli.render import render_site
+from autoform_cli.status import STATES
 
 
 def _project(tmp_path: Path) -> Path:
@@ -142,6 +145,48 @@ def test_stale_generated_files_are_not_republished(tmp_path: Path) -> None:
 
     assert not (tmp_path / "out/dependencies.html").exists()
     assert (tmp_path / "out/dependencies.md").is_file()
+
+
+def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
+    _render(tmp_path)
+    css = (tmp_path / "out/stylesheets/blueprint.css").read_text(encoding="utf-8")
+    script = (tmp_path / "out/javascripts/blueprint-mermaid.js").read_text(encoding="utf-8")
+
+    # Light follows the Lean community blog; dark is a terminal palette, and
+    # both hang off the theme's own data-bs-theme toggle.
+    assert "Merriweather" in css and "Open Sans" in css and "Source Code Pro" in css
+    assert "hsl(210, 100%, 30%)" in css
+    assert "[data-bs-theme=dark]" in css
+    for state in STATES:
+        assert f".bp-{state.key} .bp-mark {{ color: {state.stroke}; }}" in css
+        assert f"[data-bs-theme=dark] .bp-{state.key} .bp-mark" in css
+
+    # The theme's banner is a solid Bootstrap bar and must be driven from the
+    # palette, or it stays blue in both schemes.
+    assert "background-color: var(--bp-surface) !important" in css
+    assert ".navbar {" in css
+
+    # A rendered diagram cannot be restyled, so the script owns both palettes
+    # and redraws when the scheme changes.
+    assert '"light"' in script and '"dark"' in script
+    assert "data-bs-theme" in script
+    assert "MutationObserver" in script
+    assert "bindFunctions" in script
+    for state in STATES:
+        assert f"classDef {state.key} fill:{state.fill}," in script
+        assert f"classDef {state.key} fill:{state.dark_fill}," in script
+
+
+def test_the_generated_script_is_valid_javascript(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not available")
+    _render(tmp_path)
+    script = tmp_path / "out/javascripts/blueprint-mermaid.js"
+
+    result = subprocess.run([node, "--check", str(script)], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_refuses_to_render_over_the_vault(tmp_path: Path) -> None:

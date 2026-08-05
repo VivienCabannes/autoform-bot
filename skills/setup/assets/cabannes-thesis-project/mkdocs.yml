@@ -8,6 +8,11 @@ use_directory_urls: false
 
 theme:
   name: mkdocs
+  # Without this the banner is Bootstrap's primary blue; the blog's is quiet.
+  nav_style: light
+  # Drives the data-bs-theme attribute the generated stylesheet keys off.
+  color_mode: auto
+  user_color_mode_toggle: true
 
 markdown_extensions:
   - attr_list
@@ -22,6 +27,8 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_div_format
 
 extra_css:
+  # Same faces as the Lean community blog.
+  - https://fonts.googleapis.com/css2?family=Merriweather:wght@400;500;700&family=Open+Sans:wght@400;600&family=Source+Code+Pro:wght@400;600&display=swap
   - stylesheets/blueprint.css
 
 extra_javascript:

@@ -125,6 +125,9 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "pymdownx.superfences" in mkdocs
     assert "stylesheets/blueprint.css" in mkdocs
     assert "javascripts/blueprint-mermaid.js" in mkdocs
+    # A blue Bootstrap banner and no dark-mode toggle are both theme defaults.
+    assert "nav_style: light" in mkdocs
+    assert "user_color_mode_toggle: true" in mkdocs
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow

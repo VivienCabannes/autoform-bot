@@ -50,11 +50,18 @@ def render_diagram(
     *,
     link_extension: str = ".md",
     links: dict[str, str] | None = None,
+    include_classdefs: bool = True,
 ) -> str:
     """Return the ```mermaid fenced block for *graph*.
 
     *links* maps node ids to hrefs; without it, nodes link to their own
     Markdown files relative to *output*.
+
+    Set *include_classdefs* to ``False`` for the published site, where the
+    init script supplies the palette so it can be swapped for dark mode.
+    Mermaid scopes its own styles to the SVG id with ``!important``, so a
+    stylesheet cannot recolour a rendered diagram; only re-rendering works.
+    Obsidian has no such script, so the vault copy keeps its colours inline.
     """
     ordered = sorted(graph.nodes.values(), key=lambda node: node.id)
     if not ordered:
@@ -84,13 +91,21 @@ def render_diagram(
         tooltip = _escape(f"{node.title} — {statuses[node.id].label}")
         lines.append(f'  click {handles[node.id]} "{links[node.id]}" "{tooltip}"')
 
-    for state in STATES:
-        lines.append(
-            f"  classDef {state.key} fill:{state.fill},stroke:{state.stroke},"
-            f"color:{state.text},stroke-width:2px"
-        )
+    if include_classdefs:
+        lines.extend(f"  {line}" for line in classdef_lines())
     lines.append("```")
     return "\n".join(lines)
+
+
+def classdef_lines(*, dark: bool = False) -> list[str]:
+    """Mermaid ``classDef`` declarations for every state, in one palette."""
+    return [
+        f"classDef {state.key} "
+        f"fill:{state.dark_fill if dark else state.fill},"
+        f"stroke:{state.dark_stroke if dark else state.stroke},"
+        f"color:{state.dark_text if dark else state.text},stroke-width:2px"
+        for state in STATES
+    ]
 
 
 def render_legend(statuses: dict[str, NodeStatus]) -> str:
@@ -104,10 +119,8 @@ def render_legend(statuses: dict[str, NodeStatus]) -> str:
         counts[status.key] += 1
     lines = ["| | State | Nodes | Meaning |", "| --- | --- | --- | --- |"]
     for state in rows:
-        swatch = (
-            f'<span class="bp-swatch" style="background:{state.fill};'
-            f'border-color:{state.stroke}"></span>'
-        )
+        # Colour comes from the stylesheet, so the legend follows the theme.
+        swatch = f'<span class="bp-swatch bp-swatch-{state.key}"></span>'
         lines.append(f"| {swatch} | {state.label} | {counts[state.key]} | {_MEANINGS[state.key]} |")
     return "\n".join(lines)
 
@@ -133,11 +146,17 @@ def render_page(
     link_extension: str = ".md",
     title: str = "Dependency graph",
     links: dict[str, str] | None = None,
+    include_classdefs: bool = True,
 ) -> str:
     """Return a complete Markdown page holding the diagram and its legend."""
     counts = f"{len(graph.nodes)} nodes · {graph.edge_count} dependencies"
     diagram = render_diagram(
-        graph, statuses, output, link_extension=link_extension, links=links
+        graph,
+        statuses,
+        output,
+        link_extension=link_extension,
+        links=links,
+        include_classdefs=include_classdefs,
     )
     legend = render_legend(statuses)
     sections = [

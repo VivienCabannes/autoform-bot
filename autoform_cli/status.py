@@ -29,26 +29,44 @@ DEFINITION_DECLARATIONS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class State:
-    """How one derived state is named and drawn."""
+    """How one derived state is named and drawn, in each colour scheme."""
 
     key: str
     label: str
     fill: str
     stroke: str
-    text: str = "#0F172A"
+    text: str
+    dark_fill: str
+    dark_stroke: str
+    dark_text: str
 
 
 #: Ordered most complete first; this is also the legend order.
+#:
+#: Only finished work is filled in; everything in progress is an outline, which
+#: keeps the page quiet in the manner of the Lean community blog. Green tracks
+#: proof progress and amber marks work that cannot start. The dark scheme is a
+#: terminal palette -- dark panels with a bright foreground -- rather than the
+#: light one dimmed.
 STATES: tuple[State, ...] = (
-    State("mathlib", "in mathlib", "#006400", "#003200", "#FFFFFF"),
-    State("fully_proved", "fully proved", "#1CAC78", "#0B6B4A", "#FFFFFF"),
-    State("proved", "proved", "#9CEC8B", "#2E7D32"),
-    State("defined", "defined", "#B0ECA3", "#2E7D32"),
-    State("can_prove", "ready to prove", "#A3D6FF", "#2E7D32"),
-    State("stated", "statement formalized", "#FFFFFF", "#2E7D32"),
-    State("can_state", "ready to state", "#FFFFFF", "#2563EB"),
-    State("not_ready", "not ready", "#FFAA33", "#B26B00"),
-    State("planned", "planned", "#FFFFFF", "#9AA3B2"),
+    State("mathlib", "in mathlib", "#0B5C2E", "#084423", "#FFFFFF",
+          "#0B2F16", "#238636", "#7EE787"),
+    State("fully_proved", "fully proved", "#1A7F37", "#12622A", "#FFFFFF",
+          "#16341F", "#3FB950", "#7EE787"),
+    State("proved", "proved", "#7FC98F", "#2C6E34", "#10240F",
+          "#12261A", "#2EA043", "#56D364"),
+    State("defined", "defined", "#B7E4C7", "#2C6E34", "#10240F",
+          "#12261A", "#238636", "#56D364"),
+    State("can_prove", "ready to prove", "#FFFFFF", "#0052CC", "#0052CC",
+          "#10202B", "#39C5CF", "#56D4DD"),
+    State("stated", "statement formalized", "#FFFFFF", "#1A7F37", "#12622A",
+          "#0D1117", "#2EA043", "#C9D1D9"),
+    State("can_state", "ready to state", "#FFFFFF", "#8B95A1", "#444444",
+          "#0D1117", "#39C5CF", "#C9D1D9"),
+    State("not_ready", "not ready", "#FFF3CD", "#B8860B", "#5C4405",
+          "#2B1D00", "#D29922", "#E3B341"),
+    State("planned", "planned", "#FFFFFF", "#CCCCCC", "#444444",
+          "#0D1117", "#484F58", "#8B949E"),
 )
 
 _BY_KEY = {state.key: state for state in STATES}
