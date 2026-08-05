@@ -1,4 +1,5 @@
 .DS_Store
+.claude/
 .zuliprc
 .venv/
 .pytest_cache/
