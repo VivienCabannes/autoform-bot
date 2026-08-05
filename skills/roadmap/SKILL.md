@@ -4,7 +4,8 @@ description: >-
   Build, inspect, refine, or visualize the mathematical roadmap and theorem
   dependency DAG in an existing Autoform Markdown blueprint. Use for confirming
   source scope, writing roadmap and coverage notes, decomposing mathematics
-  into blueprint/nodes/**/*.md, setting planning statuses, or checking roadmap
+  into kind: node Markdown pages under blueprint/roadmap/, setting planning
+  statuses, or checking roadmap
   completeness; do not install repository infrastructure or prove Lean
   declarations.
 ---
@@ -43,19 +44,21 @@ mathematics.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
 5. After approval, create one file per formalization-sized definition or
-   statement under `blueprint/nodes/**/*.md`. Its relative path without `.md`
-   is its stable ID. Give it exactly one H1, optional scalar `kind`, `status`,
-   and `lean` properties, a source-grounded statement or proof sketch, and a
-   `## Depends on` section.
+   statement beside its milestone under `blueprint/roadmap/**/*.md`. Set
+   `kind: node`; its path relative to `roadmap/`, without `.md`, is its stable
+   ID. Give it exactly one H1, a `declaration` naming the intended Lean
+   artifact, a source-grounded statement or proof sketch, and a
+   `## Depends on` section. Never overload `kind` with the declaration.
 6. Put only genuine prerequisite links under `## Depends on`; those relative
-   Markdown links are the machine-read DAG edges. Keep roadmap, coverage, and
-   source links under other headings.
+   Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
+   a prerequisite the proof needs but the statement does not. Keep roadmap,
+   coverage, and source links under other headings.
 
-Use node status consistently: `planned` for an accepted future node, `ready`
-when every linked prerequisite is `proved`, `blocked` with the blocker
-explained, and `proved` only for an already compiled declaration whose exact
-name is in `lean`. Roadmap does not start proof workers merely to advance a
-status.
+Assert only what is checked: `statement: formalized`, `proof: formalized`,
+`mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
+blocked, and fully-proved are derived from the DAG — never hand-write them, and
+never start proof workers merely to advance a state. The
+[blueprint format reference](../../autoform_cli/README.md) has the full table.
 
 ## Validate and report
 
@@ -63,13 +66,13 @@ status.
 from; substitute its absolute path and run:
 
 ```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check "<PROJECT>/blueprint"
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize \
-  "<PROJECT>/blueprint" --output "<PROJECT>/blueprint/dependencies.html"
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check "<PROJECT>/blueprint" \
+  --lean-root "<PROJECT>"
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize "<PROJECT>/blueprint"
 ```
 
-Fix missing targets, escaping links, self-dependencies, and cycles before
-handoff. Report roadmap and coverage status, node and edge counts, ready and
-blocked nodes, unresolved source questions, and the vault/graph paths. Hand
-accepted ready nodes to Orchestrate; hand CI, Pages, Lean-project, or vault
-infrastructure changes back to Setup.
+Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
+`lean:` names before handoff. Report roadmap and coverage status, node and edge
+counts, the derived state summary, unresolved source questions, and the
+vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
+hand CI, Pages, Lean-project, or vault infrastructure changes back to Setup.

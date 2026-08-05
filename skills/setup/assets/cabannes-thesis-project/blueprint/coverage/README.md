@@ -12,7 +12,7 @@ The labels below are project policy, not Autoform parser states.
 | --- | --- | --- |
 | Fast Rates for Structured Prediction | `MAPPED` | Listed in the roadmap; source audit pending |
 | Exponential Convergence Rates for SVM | `MAPPED` | Listed in the roadmap; source audit pending |
-| Infimum Loss | `PARTIAL` | [Five-node formalization slice](../README.md#infimum-loss-nodes) |
+| Infimum Loss | `PARTIAL` | [Five-node formalization slice](../roadmap/infimum-loss/README.md) |
 | Disambiguation Framework | `MAPPED` | Listed in the roadmap; source audit pending |
 | Laplacian Regularization | `MAPPED` | Listed in the roadmap; source audit pending |
 | Streaming Stochastic Gradients | `MAPPED` | Listed in the roadmap; source audit pending |

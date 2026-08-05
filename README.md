@@ -57,22 +57,24 @@ generated database:
 ```text
 blueprint/
 ├── README.md                 project landing page
-├── roadmap/                  high-level direction and milestones
+├── roadmap/                  milestones and formalization-sized DAG nodes
+│   ├── README.md             high-level direction
+│   └── convexity/
+│       ├── README.md         milestone narrative
+│       ├── convex.md         kind: node
+│       └── separating-hyperplane.md
 ├── coverage/                 project-defined completion targets
-├── sources/                  optional mathematical source notes
-└── nodes/                    theorem-sized executable DAG
-    ├── definitions/
-    │   └── convex.md
-    └── theorems/
-        └── separating-hyperplane.md
+└── sources/                  optional mathematical source notes
 ```
 
-Files under `blueprint/nodes/` form a dependency graph through standard relative
-links. The Markdown remains the source of truth and can be browsed with tools
-such as Obsidian, rendered with MkDocs, or published with GitHub Pages. See the
-[blueprint format and validation reference](autoform_cli/README.md), the
-[repository example](skills/setup/assets/cabannes-thesis-project/README.md), or
-the [roadmap example](skills/roadmap/references/cabannes-thesis-roadmap.md).
+Markdown pages under `blueprint/roadmap/` with `kind: node` form a dependency
+graph through standard relative links. Optional `declaration` metadata records
+the intended Lean artifact without overloading the page kind. The Markdown
+remains the source of truth and can be browsed with tools such as Obsidian,
+rendered with MkDocs, or published with GitHub Pages. See the [blueprint format
+and validation reference](autoform_cli/README.md), the [repository
+example](skills/setup/assets/cabannes-thesis-project/README.md), or the [roadmap
+example](skills/roadmap/references/cabannes-thesis-roadmap.md).
 
 ## CLI commands
 
@@ -80,29 +82,38 @@ Autoform ships command-line tools with the plugin package. From this
 repository, run them through `uv`; if the package is installed in the active
 environment, omit `uv run`.
 
-Validate the structure and dependencies of a blueprint:
+Validate the structure and dependencies of a blueprint, and check that every
+declaration a node claims really exists in the Lean sources:
 
 ```bash
-uv run autoform check blueprint
+uv run autoform check blueprint --lean-root .
 ```
 
-Generate a self-contained HTML visualization whose nodes link to their Markdown
-files:
+Write the Mermaid dependency graph into the vault, where Obsidian renders it
+inline:
 
 ```bash
 uv run autoform-visualize blueprint
 ```
 
-For MkDocs or GitHub Pages, generate `.html` links instead:
+Build the publishable blueprint — numbered statement boxes, statuses derived
+from the DAG, permalinks into the Lean code, and the dependency graph:
 
 ```bash
-uv run autoform-visualize blueprint \
-  --output blueprint/dependencies.html \
-  --link-extension .html
+uv run autoform render blueprint \
+  --output site-src --lean-root . --require-declarations
 ```
 
-The local visualization works directly from `file://`. Generated graphs are
-derived views and can be rebuilt at any time.
+`render` never writes into the vault; point `mkdocs.yml` at its output.
+
+Node status is asserted only where it was checked — statement formalized, proof
+formalized, upstreamed, not ready — and everything else is derived from the
+graph on every run. A theorem whose own proof compiles but which rests on an
+unproved lemma is coloured `proved`, not `fully proved`. The state names and
+palette follow [leanblueprint](https://pypi.org/project/leanblueprint/), so the
+published site reads like the Lean community's LaTeX blueprints while the
+Markdown stays the source of truth. Generated graphs and sites are derived
+views and can be rebuilt at any time.
 
 ## Development
 

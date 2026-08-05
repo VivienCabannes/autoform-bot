@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import re
-import shutil
 from pathlib import Path
-from urllib.parse import unquote
 
 try:
     import tomllib
@@ -11,7 +9,9 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 from autoform_cli.graph import load_graph
-from autoform_cli.visualize import export_graph
+from autoform_cli.lean import build_linker, declaration_names
+from autoform_cli.render import render_site
+from autoform_cli.status import derive
 
 
 _HREF = re.compile(r'href="([^"]+)"')
@@ -24,18 +24,34 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     graph = load_graph(blueprint)
 
     assert set(graph.nodes) == {
-        "definitions/eligibility",
-        "definitions/non-ambiguity",
-        "theorems/infimum-loss",
-        "theorems/non-ambiguity-determinism",
-        "theorems/supervision-recovery",
+        "infimum-loss/definitions/eligibility",
+        "infimum-loss/definitions/non-ambiguity",
+        "infimum-loss/theorems/infimum-loss",
+        "infimum-loss/theorems/non-ambiguity-determinism",
+        "infimum-loss/theorems/supervision-recovery",
     }
-    assert graph.edge_count == 4
-    assert graph.nodes["definitions/eligibility"].status == "ready"
-    assert graph.nodes["theorems/supervision-recovery"].dependencies == (
-        "theorems/infimum-loss",
-        "theorems/non-ambiguity-determinism",
-    )
+    assert graph.edge_count == 5
+    eligibility = graph.nodes["infimum-loss/definitions/eligibility"]
+    assert eligibility.declaration == "def"
+    assert eligibility.statement_formalized
+    assert eligibility.lean == "CabannesThesis.Eligible"
+    recovery = graph.nodes["infimum-loss/theorems/supervision-recovery"]
+    assert recovery.statement_dependencies == ("infimum-loss/theorems/infimum-loss",)
+    assert recovery.proof_dependencies == ("infimum-loss/theorems/non-ambiguity-determinism",)
+
+    # The example is a live demonstration of the distinction a flat status
+    # field cannot make: supervision recovery is proved, but it rests on an
+    # unproved node, so only its prerequisites earn the fully-proved colour.
+    statuses = derive(graph)
+    assert statuses["infimum-loss/theorems/supervision-recovery"].key == "proved"
+    assert statuses["infimum-loss/theorems/infimum-loss"].key == "can_state"
+    assert statuses["infimum-loss/definitions/eligibility"].key == "fully_proved"
+
+    # Every declaration a node claims must exist in the project's Lean sources.
+    linker = build_linker(example)
+    for node in graph.nodes.values():
+        for name in declaration_names(node.lean or ""):
+            assert linker.location(name) is not None, f"{node.id}: {name}"
 
     assert (blueprint / "roadmap" / "README.md").is_file()
     assert (blueprint / "coverage" / "README.md").is_file()
@@ -63,32 +79,51 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
 
 def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> None:
     example = repo_root / _EXAMPLE
-    blueprint = tmp_path / "blueprint"
-    shutil.copytree(example / "blueprint", blueprint)
-    output = blueprint / "dependencies.html"
+    site = tmp_path / "site-src"
 
-    export_graph(blueprint, output, link_extension=".html")
-    document = output.read_text(encoding="utf-8")
+    report = render_site(
+        example / "blueprint",
+        site,
+        lean_root=example,
+        repository_url="https://github.com/owner/repo",
+        ref="0" * 40,
+    )
 
-    node_hrefs = [unquote(href) for href in _HREF.findall(document) if href.endswith(".html")]
-    assert len(node_hrefs) == len(load_graph(blueprint).nodes)
-    for href in node_hrefs:
-        linked_source = (output.parent / href).with_suffix(".md").resolve()
-        linked_source.relative_to(blueprint.resolve())
-        assert linked_source.is_file()
+    assert report.unresolved == []
+    graph = load_graph(example / "blueprint")
+
+    # Every node page is a statement box whose cross-references resolve inside
+    # the published tree.
+    for node_id, node in graph.nodes.items():
+        page = site / node.path.relative_to((example / "blueprint").resolve())
+        document = page.read_text(encoding="utf-8")
+        assert '<div class="bp-node bp-' in document, node_id
+        for href in _HREF.findall(document):
+            if href.startswith("http"):
+                continue
+            assert (page.parent / href).with_suffix(".md").resolve().is_file(), href
+
+    graph_page = (site / "dependencies.md").read_text(encoding="utf-8")
+    assert "```mermaid" in graph_page
+    for node in graph.nodes.values():
+        target = node.path.relative_to((example / "blueprint").resolve()).with_suffix(".html")
+        assert f'"{target.as_posix()}"' in graph_page
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
-    assert "docs_dir: blueprint" in mkdocs
+    assert "docs_dir: site-src" in mkdocs
     assert "use_directory_urls: false" in mkdocs
+    assert "md_in_html" in mkdocs
+    assert "pymdownx.superfences" in mkdocs
+    assert "stylesheets/blueprint.css" in mkdocs
+    assert "javascripts/blueprint-mermaid.js" in mkdocs
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
-    assert "autoform check blueprint" in workflow
-    assert "--link-extension .html" in workflow
+    assert "autoform check blueprint --lean-root ." in workflow
+    assert "autoform render blueprint" in workflow
+    assert "--require-declarations" in workflow
     assert "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128" in workflow
     assert "@main" not in workflow
 
-    verify = (example / ".github/workflows/autoform-verify.yml").read_text(
-        encoding="utf-8"
-    )
+    verify = (example / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint" in verify
     assert "lake build" in verify
     assert "Reject kernel-check bypass options" in verify
@@ -114,9 +149,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
     setup_metadata = (repo_root / "skills/setup/agents/openai.yaml").read_text(encoding="utf-8")
     roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
-    roadmap_metadata = (repo_root / "skills/roadmap/agents/openai.yaml").read_text(
-        encoding="utf-8"
-    )
+    roadmap_metadata = (repo_root / "skills/roadmap/agents/openai.yaml").read_text(encoding="utf-8")
     orchestrate = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
     review = (repo_root / "skills/review/SKILL.md").read_text(encoding="utf-8")
 
@@ -132,7 +165,9 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "references/cabannes-thesis-roadmap.md",
         "blueprint/roadmap/",
         "blueprint/coverage/",
-        "blueprint/nodes/**/*.md",
+        "kind: node",
+        "blueprint/roadmap/**/*.md",
+        "declaration",
         "coarse roadmap",
         "## Depends on",
     ):

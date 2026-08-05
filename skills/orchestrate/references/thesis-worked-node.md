@@ -12,8 +12,10 @@ For one ready node:
 2. Search the target Lean project and Mathlib before choosing an API.
 3. Develop and compile the declaration with the Lean tools.
 4. Ask an independent reviewer to compare it with the cited source.
-5. Only then set `status: proved` and add the actual compiled declaration under
-   `lean:`; never guess that name from the Markdown title.
+5. Only then set `statement: formalized` and `proof: formalized`, and add the
+   actual compiled declaration under `lean:`; never guess that name from the
+   Markdown title. `autoform check --lean-root` rejects a name that is not in
+   the sources.
 
 Recheck the DAG after the edit. A newly unblocked node is the next work item;
 source order alone is not a scheduling rule.
