@@ -36,7 +36,11 @@ mathematics.
 2. Write the high-level direction and milestones under `blueprint/roadmap/`.
    Begin each planning page with simple YAML scalar properties such as
    `kind: roadmap` and `status: active` so Obsidian and people can see its
-   state immediately.
+   state immediately. Treat `blueprint/README.md` and the roadmap pages it
+   links as an ordered mathematical book: link meaningful chapter pages in
+   their intended reading order. The renderer derives bottom-of-page previous
+   and next chapter links from this Markdown structure, so do not maintain a
+   second navigation manifest.
 3. Define project-specific coverage targets and completion rules under
    `blueprint/coverage/`. Distinguish material that is merely mapped from
    material decomposed into nodes; never report whole-source completion from a
@@ -53,6 +57,12 @@ mathematics.
    Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
    a prerequisite the proof needs but the statement does not. Keep roadmap,
    coverage, and source links under other headings.
+
+When developing or adapting the example-based plugin structure, exercise it
+with at least two mathematically meaningful chapters and a genuine
+cross-chapter dependency. This keeps book order, chapter progress, source-code
+links, and graph projections testable without copying the example's
+mathematics into another project.
 
 Assert only what is checked: `statement: formalized`, `proof: formalized`,
 `mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,

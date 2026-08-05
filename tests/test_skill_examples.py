@@ -29,23 +29,34 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
         "infimum-loss/theorems/infimum-loss",
         "infimum-loss/theorems/non-ambiguity-determinism",
         "infimum-loss/theorems/supervision-recovery",
+        "full-supervision/definitions/full-supervision",
+        "full-supervision/theorems/supervision-non-ambiguous",
     }
-    assert graph.edge_count == 5
+    assert graph.edge_count == 9
     eligibility = graph.nodes["infimum-loss/definitions/eligibility"]
     assert eligibility.declaration == "def"
     assert eligibility.statement_formalized
     assert eligibility.lean == "CabannesThesis.Eligible"
     recovery = graph.nodes["infimum-loss/theorems/supervision-recovery"]
-    assert recovery.statement_dependencies == ("infimum-loss/theorems/infimum-loss",)
-    assert recovery.proof_dependencies == ("infimum-loss/theorems/non-ambiguity-determinism",)
+    assert recovery.statement_dependencies == (
+        "infimum-loss/theorems/infimum-loss",
+        "full-supervision/definitions/full-supervision",
+    )
+    assert recovery.proof_dependencies == (
+        "infimum-loss/theorems/non-ambiguity-determinism",
+        "full-supervision/theorems/supervision-non-ambiguous",
+    )
 
-    # The example is a live demonstration of the distinction a flat status
-    # field cannot make: supervision recovery is proved, but it rests on an
-    # unproved node, so only its prerequisites earn the fully-proved colour.
+    # The example exercises two real book chapters and an honest cross-chapter
+    # boundary: the reusable support result is proved, while the stronger
+    # source theorem remains planned and the infimum result is ready to state.
     statuses = derive(graph)
-    assert statuses["infimum-loss/theorems/supervision-recovery"].key == "proved"
+    assert statuses["infimum-loss/theorems/supervision-recovery"].key == "planned"
     assert statuses["infimum-loss/theorems/infimum-loss"].key == "can_state"
     assert statuses["infimum-loss/definitions/eligibility"].key == "fully_proved"
+    assert statuses["full-supervision/theorems/supervision-non-ambiguous"].key == (
+        "fully_proved"
+    )
 
     # Every declaration a node claims must exist in the project's Lean sources.
     linker = build_linker(example)
@@ -54,6 +65,7 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
             assert linker.location(name) is not None, f"{node.id}: {name}"
 
     assert (blueprint / "roadmap" / "README.md").is_file()
+    assert (blueprint / "roadmap" / "full-supervision" / "README.md").is_file()
     assert (blueprint / "coverage" / "README.md").is_file()
     source = (blueprint / "sources" / "thesis.md").read_text(encoding="utf-8")
     assert "arXiv:2209.11629" in source
@@ -97,14 +109,17 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     # each anchored so every cross-reference still lands on the statement.
     chapter_path = site / "roadmap/infimum-loss/README.md"
     chapter = chapter_path.read_text(encoding="utf-8")
-    for node_id in graph.nodes:
+    infimum_nodes = [
+        node_id for node_id in graph.nodes if node_id.startswith("infimum-loss/")
+    ]
+    for node_id in infimum_nodes:
         anchor = node_id.split("/", 1)[1].replace("/", "-")
         assert f'id="{anchor}"' in chapter, node_id
     assert not (site / "roadmap/infimum-loss/theorems").exists()
 
     # Both amsthm styles appear, and the status marks are derived.
     assert 'class="bp-thmwrapper theorem-style-definition bp-fully_proved"' in chapter
-    assert 'class="bp-thmwrapper theorem-style-plain bp-proved"' in chapter
+    assert 'class="bp-thmwrapper theorem-style-plain bp-planned"' in chapter
     assert '<a class="bp-code-link"' in chapter
     assert '<svg class="bp-code-icon"' in chapter
     assert '<a class="bp-context-link"' in chapter
@@ -113,6 +128,26 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert 'href="../../progress.html"' in chapter
     assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in chapter
     assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
+    assert (
+        'class="bp-book-nav-link bp-book-nav-next" '
+        'href="../full-supervision/index.html"'
+    ) in chapter
+
+    support_path = site / "roadmap/full-supervision/README.md"
+    support = support_path.read_text(encoding="utf-8")
+    for node_id in graph.nodes:
+        if not node_id.startswith("full-supervision/"):
+            continue
+        anchor = node_id.split("/", 1)[1].replace("/", "-")
+        assert f'id="{anchor}"' in support, node_id
+    assert 'class="bp-thmwrapper theorem-style-definition bp-fully_proved"' in support
+    assert 'class="bp-thmwrapper theorem-style-plain bp-fully_proved"' in support
+    assert '<a class="bp-code-link"' in support
+    assert (
+        'class="bp-book-nav-link bp-book-nav-previous" '
+        'href="../infimum-loss/index.html"'
+    ) in support
+    assert 'bp-book-nav-next' not in support
 
     for href in _HREF.findall(chapter):
         if href.startswith(("http", "#")):
@@ -130,12 +165,21 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "```mermaid" in graph_page
     assert "graph_view: project" in graph_page
     assert '"dependencies/chapters/infimum-loss.html"' in graph_page
+    assert '"dependencies/chapters/full-supervision.html"' in graph_page
 
-    chapter_graph = (site / "dependencies/chapters/infimum-loss.md").read_text(encoding="utf-8")
+    chapter_graph = (site / "dependencies/chapters/infimum-loss.md").read_text(
+        encoding="utf-8"
+    )
+    support_graph = (site / "dependencies/chapters/full-supervision.md").read_text(
+        encoding="utf-8"
+    )
     assert "graph_view: chapter" in chapter_graph
+    assert "graph_view: chapter" in support_graph
     for node_id in graph.nodes:
         anchor = node_id.split("/", 1)[1].replace("/", "-")
-        assert f'"../../roadmap/infimum-loss/index.html#{anchor}"' in chapter_graph
+        group = node_id.split("/", 1)[0]
+        target_graph = chapter_graph if group == "infimum-loss" else support_graph
+        assert f'"../../roadmap/{group}/index.html#{anchor}"' in target_graph
         assert (site / "dependencies/nodes" / f"{node_id}.md").is_file()
 
     full_graph = (site / "dependencies/full.md").read_text(encoding="utf-8")
@@ -144,7 +188,7 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         site / "dependencies/nodes/infimum-loss/theorems/supervision-recovery.md"
     ).read_text(encoding="utf-8")
     assert "graph_view: focus" in focus_graph
-    assert "class n2 focus" in focus_graph
+    assert re.search(r"class n\d+ focus", focus_graph)
     assert "one dependency hop" in focus_graph
     assert (
         "[Open textbook statement](../../../../roadmap/infimum-loss/README.md#"
@@ -152,8 +196,11 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     ) in focus_graph
 
     progress = (site / "progress.md").read_text(encoding="utf-8")
-    assert "2 definitions · 3 results" in progress
-    assert "3 fully proved · 1 proved · 1 ready to state" in progress
+    assert "3 definitions · 4 results" in progress
+    assert "<strong>5</strong> fully proved" in progress
+    assert "<strong>1</strong> ready to state" in progress
+    assert "<strong>1</strong> planned" in progress
+    assert "Full Supervision" in progress
     assert "## Scope coverage" in progress
     assert "Experiments and narrative material" in progress
     assert "bp-book-nav" not in progress
@@ -236,8 +283,11 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "declaration",
         "coarse roadmap",
         "## Depends on",
+        "ordered mathematical book",
+        "reading order",
     ):
         assert required in roadmap
+    assert "renders them only at the bottom of\n  book pages" in setup
     assert "references/thesis-worked-node.md" in orchestrate
     assert "references/thesis-review-case.md" in review
     assert "$setup" in setup_metadata

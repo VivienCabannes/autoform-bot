@@ -4,7 +4,9 @@ In the [Cabannes thesis asset](../../setup/assets/cabannes-thesis-project/bluepr
 `eligibility` and `non-ambiguity` are dependency-free and may be assigned in
 parallel. `infimum-loss` must wait for `eligibility`, while
 `non-ambiguity-determinism` waits for `non-ambiguity`.
-`supervision-recovery` must wait for both branches.
+The Full Supervision support chapter can proceed alongside them, and
+`supervision-recovery` must wait for both source branches and its supporting
+definition and lemma.
 
 For one ready node:
 

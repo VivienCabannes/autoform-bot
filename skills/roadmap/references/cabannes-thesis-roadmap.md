@@ -9,9 +9,13 @@ source revision adopted by the project before relying on its paths or labels.
 The example stays intentionally small:
 
 - the roadmap maps all six mathematical chapters at coarse granularity;
+- two decomposed chapters make the book navigation and cross-chapter DAG
+  concrete: “Infimum Loss” contains the source targets, while “Full
+  Supervision” contains two supporting Lean declarations;
 - the coverage page distinguishes mapped, partial, and out-of-scope material;
 - the source page records stable labels from `infimum/core.tex`; and
-- five DAG nodes decompose one representative “Infimum Loss” slice.
+- seven DAG nodes decompose one representative “Infimum Loss” slice and its
+  supporting full-supervision construction.
 
 This asymmetry is deliberate. The six chapter entries are candidate roadmap
 clusters, while only one cluster has theorem-sized nodes. The example is not a
@@ -28,6 +32,11 @@ The detailed slice uses labels verified in `infimum/core.tex` from the public
 | Infimum loss | `il:thm:infimum-loss` | Eligibility |
 | Non-ambiguity determinism | `il:thm:ambiguity` | Non-ambiguity |
 | Supervision recovery | `il:thm:non-ambiguity` | Infimum loss; Non-ambiguity determinism |
+
+Two supporting nodes are kept in a separate formalization chapter: full
+supervision and the proof that it is non-ambiguous. They are grounded in the
+existing Lean declarations and feed the source-level supervision-recovery
+target without being presented as additional thesis statements.
 
 Use the pattern—whole-source map, explicit coverage contract, approved small
 slice, then dependency links—not the thesis mathematics. Validate the example

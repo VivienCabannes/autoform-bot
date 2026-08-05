@@ -17,6 +17,7 @@ for the remaining chapters.
    - Exponential Convergence Rates for SVM
 2. **Learning with Partial Supervision**
    - [Infimum Loss](infimum-loss/README.md) — initial node DAG
+   - [Full Supervision](full-supervision/README.md) — supporting Lean chapter
    - Disambiguation Framework
    - Laplacian Regularization
 3. **Active Labeling**
@@ -24,7 +25,8 @@ for the remaining chapters.
 
 ## Current milestone
 
-Formalize the definitions of eligibility and non-ambiguity, the two results
-that grow from them, and then supervision recovery. The
+Formalize the definitions of eligibility and non-ambiguity, the results that
+grow from them, and the supporting full-supervision construction before
+supervision recovery. The
 [coverage page](../coverage/README.md) records what the project does and does
 not yet claim.

@@ -12,7 +12,7 @@ The labels below are project policy, not Autoform parser states.
 | --- | --- | --- |
 | Fast Rates for Structured Prediction | `MAPPED` | Listed in the roadmap; source audit pending |
 | Exponential Convergence Rates for SVM | `MAPPED` | Listed in the roadmap; source audit pending |
-| Infimum Loss | `PARTIAL` | [Five-node formalization slice](../roadmap/infimum-loss/README.md) |
+| Infimum Loss | `PARTIAL` | [Five target nodes](../roadmap/infimum-loss/README.md) plus a [two-node supporting chapter](../roadmap/full-supervision/README.md) |
 | Disambiguation Framework | `MAPPED` | Listed in the roadmap; source audit pending |
 | Laplacian Regularization | `MAPPED` | Listed in the roadmap; source audit pending |
 | Streaming Stochastic Gradients | `MAPPED` | Listed in the roadmap; source audit pending |
@@ -20,6 +20,6 @@ The labels below are project policy, not Autoform parser states.
 
 ## Completion rule
 
-The current milestone is complete when the five decomposed nodes compile under
+The current milestone is complete when the seven decomposed nodes compile under
 their recorded Lean declarations and pass mathematical and code review. That
 does not mean the thesis-wide roadmap is complete.

@@ -22,3 +22,11 @@ the source revision adopted by the project:
 
 Labels locate the authoritative statements; the node summaries are planning
 notes and must not replace source inspection.
+
+## Supporting formalization
+
+The [Full Supervision chapter](../roadmap/full-supervision/README.md) separates
+the Lean definition `CabannesThesis.supervision` and its elementary
+non-ambiguity lemma from the stronger source-level supervision-recovery target.
+These are implementation support nodes, not additional claims about the thesis
+source.

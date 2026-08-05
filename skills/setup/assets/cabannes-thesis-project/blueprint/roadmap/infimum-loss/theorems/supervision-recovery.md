@@ -1,15 +1,12 @@
 ---
 kind: node
 declaration: theorem
-statement: formalized
-proof: formalized
-lean: CabannesThesis.supervision_nonAmbiguous
 ---
 
 # Supervision recovery
 
-For every label $y$, the fully supervised observation that admits exactly $y$
-is non-ambiguous.
+The formalization target is the source theorem identifying conditions under
+which the infimum-loss construction recovers the fully supervised objective.
 
 ## Sources
 
@@ -18,7 +15,9 @@ is non-ambiguous.
 ## Depends on
 
 - [Infimum loss](infimum-loss.md)
+- [Full supervision](../../full-supervision/definitions/full-supervision.md)
 
 ## Proof depends on
 
 - [Non-ambiguity determinism](non-ambiguity-determinism.md)
+- [Full supervision is non-ambiguous](../../full-supervision/theorems/supervision-non-ambiguous.md)

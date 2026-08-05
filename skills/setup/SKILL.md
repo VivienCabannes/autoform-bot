@@ -44,7 +44,11 @@ For a new or incomplete repository:
   itself: `docs_dir: site-src`, `md_in_html`, a `pymdownx.superfences` mermaid
   fence, and the generated stylesheet and mermaid init. Keep the
   project-independent primary navigation focused on the Blueprint book, its
-  generated Progress page, and Dependencies;
+  generated Progress page, and Dependencies. Point Blueprint at the rendered
+  `README.md` contents page. Use a small theme override to remove MkDocs'
+  global previous/next controls: Autoform derives those links from the
+  blueprint's Markdown reading order and renders them only at the bottom of
+  book pages, never on Progress or Dependencies;
 - adapt `autoform-verify.yml` to validate the Markdown DAG, build Lean, reject
   unfinished or unsafe proofs, and audit theorem axioms on pull requests; and
 - adapt `blueprint-pages.yml` to validate the DAG and its `lean:` declarations,
