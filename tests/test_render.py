@@ -166,7 +166,9 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     # The theme's banner is a solid Bootstrap bar and must be driven from the
     # palette, or it stays blue in both schemes.
     assert "background-color: var(--bp-surface) !important" in css
-    assert "[data-bs-theme=dark] .navbar" in css
+    assert "html[data-bs-theme=dark] body .navbar.navbar-light.bg-light" in css
+    assert "color: #f0f6fc !important" in css
+    assert "filter: invert(1) grayscale(100%) brightness(200%)" in css
     assert "--bs-navbar-active-color: var(--bp-link)" in css
     assert ".navbar {" in css
 

@@ -766,9 +766,21 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
   background-color: var(--bp-surface) !important;
   border-bottom: 1px solid var(--bp-rule);
 }}
-[data-bs-theme=dark] .navbar {{
-  background-color: #161b22 !important;
+html[data-bs-theme=dark] body .navbar.navbar-light.bg-light {{
+  background: #161b22 !important;
   border-bottom-color: #30363d;
+}}
+html[data-bs-theme=dark] body .navbar .navbar-brand,
+html[data-bs-theme=dark] body .navbar .nav-link {{
+  color: #f0f6fc !important;
+}}
+html[data-bs-theme=dark] body .navbar .nav-link.active,
+html[data-bs-theme=dark] body .navbar .nav-link:hover,
+html[data-bs-theme=dark] body .navbar .navbar-brand:hover {{
+  color: var(--bp-link-hover) !important;
+}}
+html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
+  filter: invert(1) grayscale(100%) brightness(200%);
 }}
 .navbar .navbar-brand {{
   font-family: {serif};
