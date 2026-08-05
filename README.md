@@ -96,8 +96,9 @@ inline:
 uv run autoform-visualize blueprint
 ```
 
-Build the publishable blueprint — numbered statement boxes, statuses derived
-from the DAG, permalinks into the Lean code, and the dependency graph:
+Build the publishable blueprint — a book-like overview, aggregate progress,
+numbered statement boxes, direct Lean source links, and dependency maps at
+project, chapter, theorem-neighborhood, and full-DAG scales:
 
 ```bash
 uv run autoform render blueprint \

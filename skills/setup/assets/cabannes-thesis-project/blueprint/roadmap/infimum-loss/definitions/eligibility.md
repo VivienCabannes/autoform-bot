@@ -7,8 +7,8 @@ lean: CabannesThesis.Eligible
 
 # Eligibility
 
-Formalize the eligibility condition used to relate a weak observation to its
-compatible labels.
+For a weak observation represented by a predicate $S : Y \to \mathrm{Prop}$,
+a label $y$ is **eligible** when $S(y)$ holds.
 
 ## Sources
 

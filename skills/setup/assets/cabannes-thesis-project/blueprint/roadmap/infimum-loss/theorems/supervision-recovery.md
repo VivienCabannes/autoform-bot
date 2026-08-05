@@ -8,8 +8,8 @@ lean: CabannesThesis.supervision_nonAmbiguous
 
 # Supervision recovery
 
-Formalize the theorem explaining when the infimum-loss construction recovers
-the supervised learning objective.
+For every label $y$, the fully supervised observation that admits exactly $y$
+is non-ambiguous.
 
 ## Sources
 

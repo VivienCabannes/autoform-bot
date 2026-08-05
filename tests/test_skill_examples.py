@@ -65,10 +65,11 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     overview = (blueprint / "README.md").read_text(encoding="utf-8")
     assert "kind: blueprint" in overview
     assert "status: active" in overview
-    assert "[Roadmap](roadmap/README.md)" in overview
-    assert "[Coverage](coverage/README.md)" in overview
+    assert "[Thesis roadmap](roadmap/README.md)" in overview
+    assert "[coverage notes](coverage/README.md)" in overview
 
-    assert (example / "README.md").is_file()
+    readme = (example / "README.md").read_text(encoding="utf-8")
+    assert "[Browse the formalization blueprint](blueprint/README.md)" in readme
     assert (example / "CabannesThesis.lean").is_file()
     assert (example / "CabannesThesis/Basic.lean").is_file()
     toolchain = (example / "lean-toolchain").read_text(encoding="utf-8").strip()
@@ -104,19 +105,53 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     # Both amsthm styles appear, and the status marks are derived.
     assert 'class="bp-thmwrapper theorem-style-definition bp-fully_proved"' in chapter
     assert 'class="bp-thmwrapper theorem-style-plain bp-proved"' in chapter
+    assert '<a class="bp-code-link"' in chapter
+    assert '<svg class="bp-code-icon"' in chapter
+    assert '<a class="bp-context-link"' in chapter
+    assert "dependencies/nodes/infimum-loss/theorems/supervision-recovery.html" in chapter
+    assert '<details class="bp-dependencies"><summary>Dependencies</summary>' in chapter
+    assert 'href="../../progress.html"' in chapter
 
     for href in _HREF.findall(chapter):
         if href.startswith(("http", "#")):
             continue
-        assert (chapter_path.parent / href.split("#")[0]).resolve().is_file(), href
+        linked = (chapter_path.parent / href.split("#")[0]).resolve()
+        # Raw HTML links already name the final MkDocs extension; the renderer
+        # tree still contains the Markdown source at this stage.
+        if not linked.is_file() and linked.suffix == ".html":
+            linked = linked.with_suffix(".md")
+        assert linked.is_file(), href
 
     graph_page = (site / "dependencies.md").read_text(encoding="utf-8")
     assert "```mermaid" in graph_page
+    assert "graph_view: project" in graph_page
+    assert '"dependencies/chapters/infimum-loss.html"' in graph_page
+
+    chapter_graph = (site / "dependencies/chapters/infimum-loss.md").read_text(encoding="utf-8")
+    assert "graph_view: chapter" in chapter_graph
     for node_id in graph.nodes:
         anchor = node_id.split("/", 1)[1].replace("/", "-")
-        # MkDocs publishes README.md as index.html, and a Mermaid fence is
-        # never rewritten for us, so the click target must say so itself.
-        assert f'"roadmap/infimum-loss/index.html#{anchor}"' in graph_page
+        assert f'"../../roadmap/infimum-loss/index.html#{anchor}"' in chapter_graph
+        assert (site / "dependencies/nodes" / f"{node_id}.md").is_file()
+
+    full_graph = (site / "dependencies/full.md").read_text(encoding="utf-8")
+    assert "graph_view: full" in full_graph
+    focus_graph = (
+        site / "dependencies/nodes/infimum-loss/theorems/supervision-recovery.md"
+    ).read_text(encoding="utf-8")
+    assert "graph_view: focus" in focus_graph
+    assert "class n2 focus" in focus_graph
+    assert "one dependency hop" in focus_graph
+    assert (
+        "[Open textbook statement](../../../../roadmap/infimum-loss/README.md#"
+        "theorems-supervision-recovery)"
+    ) in focus_graph
+
+    progress = (site / "progress.md").read_text(encoding="utf-8")
+    assert "2 definitions · 3 results" in progress
+    assert "3 fully proved · 1 proved · 1 ready to state" in progress
+    assert "## Scope coverage" in progress
+    assert "Experiments and narrative material" in progress
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs
@@ -128,17 +163,17 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     nav = mkdocs.split("\nnav:\n", 1)[1].split("\ntheme:\n", 1)[0]
     assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == [
         "Blueprint",
-        "Roadmap",
-        "Dependency graph",
+        "Progress",
+        "Dependencies",
     ]
-    assert "- Coverage: coverage/README.md" in nav
+    assert "- Blueprint: README.md" in nav
+    assert "roadmap/" not in nav
     assert "sources/" not in nav
     # A blue Bootstrap banner and no dark-mode toggle are both theme defaults.
     assert "nav_style: light" in mkdocs
     assert "user_color_mode_toggle: true" in mkdocs
-    assert "custom_dir: theme" in mkdocs
-    theme = (example / "theme" / "main.html").read_text(encoding="utf-8")
-    assert "{% block next_prev %}{% endblock %}" in theme
+    assert "custom_dir" not in mkdocs
+    assert not (example / "theme" / "main.html").exists()
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow
@@ -182,6 +217,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "autoform-verify.yml",
         "Obsidian",
         "GitHub Pages",
+        "root `README.md`",
+        "verified canonical URL",
     ):
         assert required in setup
     for required in (

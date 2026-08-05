@@ -58,7 +58,12 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert report.nodes == 2
     assert report.linked == 2
     assert report.unresolved == []
+    assert (out / "progress.md").is_file()
     assert (out / "dependencies.md").is_file()
+    assert (out / "dependencies/chapters/roadmap.md").is_file()
+    assert (out / "dependencies/nodes/base.md").is_file()
+    assert (out / "dependencies/nodes/top.md").is_file()
+    assert (out / "dependencies/full.md").is_file()
     assert (out / "stylesheets/blueprint.css").is_file()
     assert (out / "javascripts/blueprint-mermaid.js").is_file()
     # Nodes are absorbed into their chapter, not published one page each.
@@ -67,6 +72,10 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     # The source vault keeps no generated files.
     assert not (project / "blueprint" / "dependencies.md").exists()
     assert "## Depends on" in (project / "blueprint/roadmap/top.md").read_text(encoding="utf-8")
+
+    project_map = (out / "dependencies.md").read_text(encoding="utf-8")
+    assert "graph_view: project" in project_map
+    assert '"dependencies/chapters/roadmap.html"' in project_map
 
 
 def test_a_chapter_carries_every_statement_in_dependency_order(tmp_path: Path) -> None:
@@ -79,6 +88,8 @@ def test_a_chapter_carries_every_statement_in_dependency_order(tmp_path: Path) -
     assert '<span class="bp-thmcaption">Definition</span><span class="bp-thmlabel">1</span>' in page
     assert '<span class="bp-thmtitle">Top</span>' in page
     assert "The main result." in page
+    assert "1 definition · 1 result" in page
+    assert 'href="../progress.html"' in page
     # A node's own subheadings must not compete with the chapter's structure.
     assert "###### Sources" in page
     assert "\n## Sources" not in page
@@ -90,10 +101,30 @@ def test_cross_references_point_at_anchors_on_the_chapter(tmp_path: Path) -> Non
     page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
 
     assert "https://github.com/owner/repo/blob/cafe1234/Project/Basic.lean#L5" in page
-    assert '<span class="bp-key">Uses</span>' in page
+    assert '<a class="bp-code-link"' in page
+    assert 'aria-label="View Project.top in Lean source"' in page
+    assert '<svg class="bp-code-icon"' in page
+    assert '<a class="bp-context-link" href="../dependencies/nodes/top.html"' in page
+    assert 'aria-label="Open local dependency context for Top"' in page
+    assert '<details class="bp-dependencies"><summary>Dependencies</summary>' in page
+    assert '<span class="bp-key">Statement uses</span>' in page
     assert 'href="#base">Definition 1 (Base)' in page
     assert 'href="#top">Theorem 1 (Top)' in page
     assert 'href="https://github.com/owner/repo/issues/42">#42' in page
+
+
+def test_overview_and_progress_separate_dag_counts_from_source_coverage(tmp_path: Path) -> None:
+    _render(tmp_path)
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    progress = (tmp_path / "out/progress.md").read_text(encoding="utf-8")
+
+    assert overview.index("# Overview") < overview.index('class="bp-progress-overview"')
+    assert "1 definition · 1 result" in overview
+    assert 'href="progress.html"' in overview
+    assert "# Progress" in progress
+    assert "already decomposed in the blueprint" in progress
+    assert "| [Roadmap](roadmap/README.md) | 2 | 2 fully proved |" in progress
+    assert "No project-specific coverage contract has been recorded yet." in progress
 
 
 def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> None:
@@ -141,10 +172,12 @@ def test_unresolved_declarations_are_reported_not_linked(tmp_path: Path) -> None
 def test_stale_generated_files_are_not_republished(tmp_path: Path) -> None:
     project = _project(tmp_path)
     (project / "blueprint/dependencies.html").write_text("stale", encoding="utf-8")
+    (project / "blueprint/progress.md").write_text("stale", encoding="utf-8")
     render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
     assert not (tmp_path / "out/dependencies.html").exists()
     assert (tmp_path / "out/dependencies.md").is_file()
+    assert "# Progress" in (tmp_path / "out/progress.md").read_text(encoding="utf-8")
 
 
 def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
@@ -181,6 +214,10 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     for state in STATES:
         assert f"classDef {state.key} fill:{state.fill}," in script
         assert f"classDef {state.key} fill:{state.dark_fill}," in script
+    assert "classDef scope fill:#EEF6FF" in script
+    assert "classDef scope fill:#161B22" in script
+    assert "classDef boundary" in script
+    assert "classDef focus" in script
 
 
 def test_the_generated_script_is_valid_javascript(tmp_path: Path) -> None:

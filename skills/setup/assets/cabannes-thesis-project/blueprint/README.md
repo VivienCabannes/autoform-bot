@@ -5,19 +5,19 @@ status: active
 
 # Cabannes thesis formalization
 
-This vault maps Vivien Cabannes's thesis, *From Weakly Supervised Learning to
-Active Labeling*, while decomposing only one representative formalization
-slice.
+This blueprint follows Vivien Cabannes's thesis, *From Weakly Supervised
+Learning to Active Labeling*. It records the mathematical route through the
+thesis and the Lean formalization beside it.
 
-- [Roadmap](roadmap/README.md)
-- [Coverage](coverage/README.md)
-- [Thesis source map](sources/thesis.md)
-- [Dependency graph](dependencies.md) (generated locally and on GitHub Pages)
+The present formalization develops one representative chapter in detail. The
+[coverage notes](coverage/README.md) keep this local progress distinct from the
+wider thesis coverage.
 
-## Current formalization slice
+## Contents
 
-The [Infimum Loss milestone](roadmap/infimum-loss/README.md) keeps its five DAG
-nodes beside the roadmap narrative.
+- [Thesis roadmap](roadmap/README.md)
+- [Infimum Loss](roadmap/infimum-loss/README.md)
 
-Only links under a node's `## Depends on` heading are Autoform DAG edges. The
-other links remain ordinary navigation for Obsidian and the rendered site.
+The [thesis source map](sources/thesis.md) records the adopted references behind
+the statements. The [dependency view](dependencies.md) gives a structural view
+of the same mathematics.

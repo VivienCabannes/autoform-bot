@@ -37,9 +37,14 @@ For a new or incomplete repository:
   `sources/`; later Roadmap work places `kind: node` pages beside their
   milestones under `roadmap/`. Keep personal `.obsidian/`, `.trash/`, generated
   graphs, and site output ignored;
+- preserve or create the root `README.md` with a link to `blueprint/README.md`;
+  when a deployed site exists, also feature its verified canonical URL
+  prominently, never an inferred or pending URL;
 - configure `mkdocs.yml` to build the `autoform render` output, not the vault
   itself: `docs_dir: site-src`, `md_in_html`, a `pymdownx.superfences` mermaid
-  fence, and the generated stylesheet and mermaid init;
+  fence, and the generated stylesheet and mermaid init. Keep the
+  project-independent primary navigation focused on the Blueprint book, its
+  generated Progress page, and Dependencies;
 - adapt `autoform-verify.yml` to validate the Markdown DAG, build Lean, reject
   unfinished or unsafe proofs, and audit theorem axioms on pull requests; and
 - adapt `blueprint-pages.yml` to validate the DAG and its `lean:` declarations,
