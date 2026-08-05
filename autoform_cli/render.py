@@ -741,8 +741,8 @@ def _stylesheet() -> str:
   --bp-muted: #8b949e;
   --bp-rule: #30363d;
   --bp-surface: #161b22;
-  --bp-link: #7ee787;
-  --bp-link-hover: #a2f2b4;
+  --bp-link: #58a6ff;
+  --bp-link-hover: #79c0ff;
 }}
 
 body {{ font-family: {sans}; color: var(--bp-fg); }}
@@ -758,8 +758,17 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 /* The theme's banner is a solid Bootstrap bar. Drive it from the palette so it
    follows the toggle instead of staying blue. */
 .navbar {{
+  --bs-navbar-color: var(--bp-fg);
+  --bs-navbar-hover-color: var(--bp-link-hover);
+  --bs-navbar-active-color: var(--bp-link);
+  --bs-navbar-brand-color: var(--bp-fg);
+  --bs-navbar-brand-hover-color: var(--bp-link-hover);
   background-color: var(--bp-surface) !important;
   border-bottom: 1px solid var(--bp-rule);
+}}
+[data-bs-theme=dark] .navbar {{
+  background-color: #161b22 !important;
+  border-bottom-color: #30363d;
 }}
 .navbar .navbar-brand {{
   font-family: {serif};

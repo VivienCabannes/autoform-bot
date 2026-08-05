@@ -157,6 +157,8 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     assert "Merriweather" in css and "Open Sans" in css and "Source Code Pro" in css
     assert "hsl(210, 100%, 30%)" in css
     assert "[data-bs-theme=dark]" in css
+    assert "--bp-link: #58a6ff" in css
+    assert "--bp-link-hover: #79c0ff" in css
     for state in STATES:
         assert f".bp-{state.key} .bp-mark {{ color: {state.stroke}; }}" in css
         assert f"[data-bs-theme=dark] .bp-{state.key} .bp-mark" in css
@@ -164,6 +166,8 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     # The theme's banner is a solid Bootstrap bar and must be driven from the
     # palette, or it stays blue in both schemes.
     assert "background-color: var(--bp-surface) !important" in css
+    assert "[data-bs-theme=dark] .navbar" in css
+    assert "--bs-navbar-active-color: var(--bp-link)" in css
     assert ".navbar {" in css
 
     # A rendered diagram cannot be restyled, so the script owns both palettes
