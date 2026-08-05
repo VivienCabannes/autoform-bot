@@ -11,6 +11,32 @@ description: >-
 
 # Set up an Autoform repository
 
+State the contract before touching anything: Setup prepares a Lean repository
+and an empty blueprint shell — toolchain, vault, ignore rules, MkDocs, CI, and,
+on request, publication. It does not read sources, choose theorems, or write
+roadmap nodes. Say so in the opening message and name Roadmap as the next step,
+so the user knows which skill owns the mathematics.
+
+Then ask how the user wants to work, because that answer gates every later
+question:
+
+- interactive — confirm each decision, including publication, as it arises;
+- autonomous — take the safe defaults, perform no outward-facing action, and
+  list every assumption in the closing report.
+
+In autonomous mode ask nothing further: work locally, create nothing remote,
+and leave publication to a later interactive run.
+
+When an interactive run starts without arguments, ask one consolidated question
+rather than a sequence — whether this is a new project, a repair of an existing
+one, or inspection only; the Lean package name in UpperCamelCase and its target
+directory; and whether to publish once the repository is ready.
+
+Ask what the project will formalize only far enough to name that package, as in
+`RudinCh3`, `ConvexBodies`, or `CabannesThesis`. Record nothing about sources,
+chapters, or theorems, and do not let the answer grow into scoping: confirming
+the corpus and decomposing it is Roadmap's first task, not Setup's last.
+
 Inspect the target repository before writing and preserve existing Lean,
 Markdown, workflow, and ignore files. Setup prepares the shell and stops before
 mathematical planning.
@@ -43,12 +69,32 @@ immutable commits.
 Validate the prepared repository with the corresponding local commands:
 
 ```bash
+lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint \
   --output blueprint/dependencies.html --link-extension .html
 uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
+
+Publication is opt-in and interactive-only. Ask one concrete question naming
+the exact repository — create private `<owner>/<name>` and push? — defaulting
+the name to the project directory and the visibility to private, then run the
+sequence rather than handing the user commands to type. Enable Pages before the
+first push so the initial `blueprint-pages.yml` run deploys instead of failing:
+
+```bash
+gh repo create <owner>/<name> --private --source=. --remote=origin
+gh api -X POST repos/{owner}/{repo}/pages -f build_type=workflow
+git push -u origin "$(git branch --show-current)"
+```
+
+That answer approves this repository only; committing CI, enabling Pages on an
+existing remote, or any later outward-facing action needs its own question.
+Pages on a private repository requires a paid GitHub plan, so publishing a
+blueprint of unpublished results is a decision for the user, not a default.
+Treat `gh` as optional: when it is missing, unauthenticated, or the project
+lives on another host, report the equivalent commands instead of running them.
 
 Report the Lean toolchain, vault path, CI and Pages files, validation results,
 and any one-time GitHub setting. State explicitly that no sources were scoped,
