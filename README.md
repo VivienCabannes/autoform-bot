@@ -13,25 +13,14 @@ ready, blocked, or proved, and publish the blueprint with GitHub Pages.
 ## Install as a plugin
 
 Install AutoformBot in your favorite agent. The repository includes plugin
-manifests for Claude Code, Codex, and Muse Spark; the commands below use Claude
-Code as a concrete example, with similar marketplace and install commands
-available in Codex and Muse Spark.
+manifests for Claude Code, Codex, and Muse Spark. The commands below cover
+Claude Code and Codex.
 
 To install AutoformBot directly from GitHub in Claude Code:
 
 ```text
 /plugin marketplace add facebookresearch/autoform-bot
 /plugin install autoform@autoform
-```
-
-To install a local checkout instead, clone the repository and add its directory
-as a Claude Code marketplace:
-
-```bash
-git clone https://github.com/facebookresearch/autoform-bot.git
-cd autoform-bot
-claude plugin marketplace add "$(pwd)"
-claude plugin install autoform@autoform
 ```
 
 To install AutoformBot directly from GitHub in Codex:
@@ -41,32 +30,9 @@ codex plugin marketplace add facebookresearch/autoform-bot
 codex plugin add autoform@autoform
 ```
 
-To install a local checkout in Codex instead, add the local marketplace
-containing the checkout and install AutoformBot from it:
-
-```bash
-codex plugin marketplace add /path/to/marketplace-root
-codex plugin add autoform@autoform-local
-```
-
-The marketplace should expose the checkout as `plugins/autoform` and identify
-it as `autoform-local`. After changing the plugin during development, refresh
-its cache version and reinstall it:
-
-```bash
-python3 /path/to/plugin-creator/scripts/update_plugin_cachebuster.py "$(pwd)"
-codex plugin add autoform@autoform-local
-```
-
-Start a new agent session after installing or updating the plugin so its skills
+Start a new agent session after installing the plugin so its skills
 and MCP servers are reloaded. The installed package and commands retain the
 `autoform` identifier; AutoformBot is the project name.
-
-For development, install the repository's Python dependencies separately:
-
-```bash
-make setup
-```
 
 ## Plugin surface
 
@@ -140,11 +106,42 @@ derived views and can be rebuilt at any time.
 
 ## Development
 
-Install development dependencies and run the tests from a repository checkout:
+Clone the repository and install its development dependencies:
 
 ```bash
-uv sync --extra dev --extra repl
-uv run pytest -q
+git clone https://github.com/facebookresearch/autoform-bot.git
+cd autoform-bot
+make setup
+```
+
+Run the test suite with:
+
+```bash
+make test
+```
+
+To load the checkout in Claude Code, add the repository as a local marketplace:
+
+```bash
+claude plugin marketplace add "$(pwd)"
+claude plugin install autoform@autoform
+```
+
+For Codex, add the local marketplace containing the checkout and install the
+local plugin:
+
+```bash
+codex plugin marketplace add /path/to/marketplace-root
+codex plugin add autoform@autoform-local
+```
+
+The marketplace should expose the checkout as `plugins/autoform` and identify
+it as `autoform-local`. After changing the plugin, refresh its cache version,
+reinstall it, and start a new Codex session:
+
+```bash
+python3 /path/to/plugin-creator/scripts/update_plugin_cachebuster.py "$(pwd)"
+codex plugin add autoform@autoform-local
 ```
 
 Agent-facing Lean server architecture and runtime operations are documented in
