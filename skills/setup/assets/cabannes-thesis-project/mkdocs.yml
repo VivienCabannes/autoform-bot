@@ -16,6 +16,9 @@ nav:
 
 theme:
   name: mkdocs
+  # Global navigation stays identical on every page; Blueprint reading order
+  # is rendered at the bottom of book pages instead.
+  custom_dir: theme
   # Without this the banner is Bootstrap's primary blue; the blog's is quiet.
   nav_style: light
   # Drives the data-bs-theme attribute the generated stylesheet keys off.

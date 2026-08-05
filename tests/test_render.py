@@ -21,7 +21,8 @@ def _project(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (project / "blueprint" / "README.md").write_text(
-        "---\nkind: blueprint\n---\n\n# Overview\n", encoding="utf-8"
+        "---\nkind: blueprint\n---\n\n# Overview\n\n- [Roadmap](roadmap/README.md)\n",
+        encoding="utf-8",
     )
     (roadmap / "base.md").write_text(
         "---\nkind: node\ndeclaration: def\nstatement: formalized\nlean: Project.Base\n---\n\n"
@@ -125,6 +126,22 @@ def test_overview_and_progress_separate_dag_counts_from_source_coverage(tmp_path
     assert "already decomposed in the blueprint" in progress
     assert "| [Roadmap](roadmap/README.md) | 2 | 2 fully proved |" in progress
     assert "No project-specific coverage contract has been recorded yet." in progress
+
+
+def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp_path: Path) -> None:
+    _render(tmp_path)
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    progress = (tmp_path / "out/progress.md").read_text(encoding="utf-8")
+    dependencies = (tmp_path / "out/dependencies.md").read_text(encoding="utf-8")
+
+    assert overview.rstrip().endswith("</nav>")
+    assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in overview
+    assert 'class="bp-book-nav-link bp-book-nav-next" href="roadmap/index.html"' in overview
+    assert chapter.rstrip().endswith("</nav>")
+    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
+    assert "bp-book-nav" not in progress
+    assert "bp-book-nav" not in dependencies
 
 
 def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> None:

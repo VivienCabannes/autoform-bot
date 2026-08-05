@@ -111,6 +111,8 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "dependencies/nodes/infimum-loss/theorems/supervision-recovery.html" in chapter
     assert '<details class="bp-dependencies"><summary>Dependencies</summary>' in chapter
     assert 'href="../../progress.html"' in chapter
+    assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in chapter
+    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
 
     for href in _HREF.findall(chapter):
         if href.startswith(("http", "#")):
@@ -118,7 +120,9 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         linked = (chapter_path.parent / href.split("#")[0]).resolve()
         # Raw HTML links already name the final MkDocs extension; the renderer
         # tree still contains the Markdown source at this stage.
-        if not linked.is_file() and linked.suffix == ".html":
+        if not linked.is_file() and linked.name == "index.html":
+            linked = linked.with_name("README.md")
+        elif not linked.is_file() and linked.suffix == ".html":
             linked = linked.with_suffix(".md")
         assert linked.is_file(), href
 
@@ -152,6 +156,7 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "3 fully proved · 1 proved · 1 ready to state" in progress
     assert "## Scope coverage" in progress
     assert "Experiments and narrative material" in progress
+    assert "bp-book-nav" not in progress
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs
@@ -172,8 +177,9 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     # A blue Bootstrap banner and no dark-mode toggle are both theme defaults.
     assert "nav_style: light" in mkdocs
     assert "user_color_mode_toggle: true" in mkdocs
-    assert "custom_dir" not in mkdocs
-    assert not (example / "theme" / "main.html").exists()
+    assert "custom_dir: theme" in mkdocs
+    theme = (example / "theme" / "main.html").read_text(encoding="utf-8")
+    assert "{% block next_prev %}{% endblock %}" in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow

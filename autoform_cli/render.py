@@ -1203,6 +1203,32 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
 .bp-progress-state {{ display: inline-flex; align-items: center; gap: 0.35rem; }}
 .bp-progress-link {{ display: inline-block; margin-top: 0.65rem; font-size: 0.85rem; }}
 
+/* Reading order belongs to the book itself, not to MkDocs' global navbar. */
+.bp-book-nav {{
+  display: flex;
+  gap: 1.5rem;
+  margin: 3rem 0 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--bp-rule);
+}}
+.bp-book-nav-link {{
+  display: flex;
+  flex-direction: column;
+  max-width: 48%;
+  text-decoration: none;
+}}
+.bp-book-nav-link:hover {{ text-decoration: none; }}
+.bp-book-nav-next {{ margin-left: auto; text-align: right; }}
+.bp-book-nav-direction {{
+  font-family: {mono};
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--bp-muted);
+}}
+.bp-book-nav-title {{ margin-top: 0.15rem; font-family: {serif}; font-size: 1rem; }}
+
 /* Theorem environments, following leanblueprint's amsthm markup. */
 .bp-thmwrapper {{ margin: 1.6rem 0 2rem; }}
 
