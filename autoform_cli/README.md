@@ -100,16 +100,23 @@ Write the Mermaid dependency graph into the vault, where Obsidian renders it:
 autoform-visualize blueprint
 ```
 
-Build the publishable site source — statement boxes, derived statuses, the
-graph, and permalinks into the Lean code at the current commit:
+Build the publishable site source — a book overview, aggregate progress,
+statement boxes with collapsed dependency details, multi-scale dependency
+maps, and direct links to Lean declarations at the current commit:
 
 ```bash
 autoform render blueprint --output site-src --lean-root . --require-declarations
 ```
 
-`render` never writes into the vault. Point `mkdocs.yml` at `docs_dir: site-src`
-and enable `md_in_html` plus a `pymdownx.superfences` mermaid fence; see the
-[repository example](../skills/setup/assets/cabannes-thesis-project/mkdocs.yml).
+`render` never writes into the vault. It derives `progress.md`, injects a
+compact progress summary into the blueprint introduction, and shows a source
+icon when a `lean:` declaration resolves to a repository permalink. Its
+`dependencies.md` entry point collapses nodes by textbook chapter, with links
+to theorem-level chapter maps, one-hop local contexts, and the complete DAG.
+Every graph node returns to the numbered statement, and every statement links
+to its local context. Point `mkdocs.yml` at `docs_dir: site-src` and enable
+`md_in_html` plus a `pymdownx.superfences` mermaid fence; see the [repository
+example](../skills/setup/assets/cabannes-thesis-project/mkdocs.yml).
 
 ## Validation
 

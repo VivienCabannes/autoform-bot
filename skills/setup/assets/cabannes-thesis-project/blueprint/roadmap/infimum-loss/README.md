@@ -5,9 +5,10 @@ status: active
 
 # Infimum Loss milestone
 
-This milestone decomposes one representative thesis slice into five
-formalization-sized nodes. The Markdown files live beside this milestone page;
-`kind: node` identifies the pages that belong to the executable DAG.
+This chapter isolates the conditions under which weak observations still
+determine useful supervised information. It begins with eligibility and
+non-ambiguity, then follows their consequences through the infimum-loss and
+supervision-recovery results.
 
 ## Definitions
 
@@ -19,6 +20,3 @@ formalization-sized nodes. The Markdown files live beside this milestone page;
 - [Infimum loss](theorems/infimum-loss.md)
 - [Non-ambiguity determinism](theorems/non-ambiguity-determinism.md)
 - [Supervision recovery](theorems/supervision-recovery.md)
-
-Only links under a node's `## Depends on` heading are DAG edges. These index
-links are ordinary roadmap navigation.

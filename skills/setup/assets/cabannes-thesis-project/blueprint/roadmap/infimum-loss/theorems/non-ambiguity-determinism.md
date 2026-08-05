@@ -8,8 +8,8 @@ lean: CabannesThesis.nonAmbiguous_determinism
 
 # Non-ambiguity determinism
 
-Formalize the proposition that the minimum-variability solution is pointwise
-deterministic under non-ambiguity.
+If a weak observation $S$ is non-ambiguous and both $y$ and $z$ are eligible
+for $S$, then $y = z$.
 
 ## Sources
 

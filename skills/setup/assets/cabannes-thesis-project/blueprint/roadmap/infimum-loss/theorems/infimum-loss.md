@@ -5,8 +5,8 @@ declaration: theorem
 
 # Infimum loss
 
-State and prove the chapter's infimum-loss result with the same objects and
-hypotheses as the source.
+The next formalization target is the chapter's infimum-loss result, with the
+same objects and hypotheses as the source.
 
 ## Sources
 

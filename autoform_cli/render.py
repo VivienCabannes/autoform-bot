@@ -13,12 +13,14 @@ import html
 import json
 import re
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from . import mermaid, status
+from . import graph_pages, mermaid, status
 from .graph import Graph, Node, load_graph
+from .graph_views import group_nodes as graph_view_groups
 from .lean import SourceLinker, build_linker, declaration_names
 from .status import is_definition
 
@@ -28,7 +30,7 @@ _MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+
 _DEPENDENCY_SECTIONS = frozenset({"depends on", "proof depends on"})
 _SKIPPED_DIRECTORIES = frozenset({".obsidian", ".trash", ".git"})
 #: Derived views this command rewrites; stale copies must not leak into the site.
-_GENERATED_FILES = frozenset({"dependencies.md", "dependencies.html", "graph.html"})
+_GENERATED_FILES = frozenset({"dependencies.md", "dependencies.html", "graph.html", "progress.md"})
 
 #: How a ``declaration:`` value is announced in the statement box.
 DECLARATION_LABELS = {
@@ -204,6 +206,16 @@ def render_site(
             shutil.copy2(source, target)
         report.pages += 1
 
+    overview = destination / "README.md"
+    if overview.is_file():
+        overview.write_text(
+            _inject_after_title(
+                overview.read_text(encoding="utf-8"),
+                _render_overview_summary(graph, statuses),
+            ),
+            encoding="utf-8",
+        )
+
     for group, node_ids in groups.items():
         page = group_pages[group]
         page.parent.mkdir(parents=True, exist_ok=True)
@@ -230,18 +242,37 @@ def render_site(
         report.linked += linked
         report.unresolved.extend(unresolved)
 
-    graph_page = destination / "dependencies.md"
-    graph_page.write_text(
-        mermaid.render_page(
+    _append_book_navigation(
+        _book_page_order(
+            blueprint,
+            destination,
+        )
+    )
+
+    progress_page = destination / "progress.md"
+    progress_page.write_text(
+        _render_progress_page(
             graph,
             statuses,
-            graph_page,
-            links=_anchored_links(targets, graph_page),
-            include_classdefs=False,
+            groups=groups,
+            group_pages=group_pages,
+            page=progress_page,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
+            targets=targets,
         ),
         encoding="utf-8",
     )
     report.pages += 1
+
+    generated_graph_pages = graph_pages.write_graph_pages(
+        graph,
+        statuses,
+        destination,
+        node_links=lambda page: _anchored_links(targets, page),
+    )
+    report.pages += len(generated_graph_pages)
 
     for relative, contents in ((STYLESHEET, _stylesheet()), (MERMAID_SCRIPT, _mermaid_script())):
         asset = destination / relative
@@ -258,16 +289,302 @@ def _group_nodes(graph: Graph) -> dict[str, list[str]]:
     ``infimum-loss``. Nodes sitting directly in ``roadmap/`` share the roadmap
     index page.
     """
-    groups: dict[str, list[str]] = {}
-    for node_id in status.topological_order(graph):
-        head, separator, _ = node_id.partition("/")
-        groups.setdefault(head if separator else "", []).append(node_id)
-    return groups
+    return {group: list(node_ids) for group, node_ids in graph_view_groups(graph).items()}
 
 
 def _group_page(group: str) -> Path:
     """Where a milestone's consolidated chapter lives in the output tree."""
     return Path("roadmap") / group / "README.md" if group else Path("roadmap/README.md")
+
+
+def _book_page_order(blueprint: Path, destination: Path) -> list[Path]:
+    """Follow roadmap links from the introduction to recover the book's page order."""
+    ordered: list[Path] = []
+    seen_outputs: set[Path] = set()
+    visited_sources: set[Path] = set()
+
+    def visit(source: Path) -> None:
+        source = source.resolve()
+        try:
+            relative = source.relative_to(blueprint)
+        except ValueError:
+            return
+        output = (destination / relative).resolve()
+        if output.is_file() and output not in seen_outputs:
+            seen_outputs.add(output)
+            ordered.append(output)
+        if source in visited_sources or not source.is_file():
+            return
+        visited_sources.add(source)
+
+        def collect(line: str) -> str:
+            for match in _MARKDOWN_LINK.finditer(line):
+                raw = match.group("target")
+                bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
+                path = bare.partition("#")[0]
+                if not path or urlsplit(path).scheme or path.startswith("/"):
+                    continue
+                candidate = (source.parent / unquote(path)).resolve()
+                try:
+                    candidate_relative = candidate.relative_to(blueprint)
+                except ValueError:
+                    continue
+                if (
+                    not candidate_relative.parts
+                    or candidate_relative.parts[0] != "roadmap"
+                    or candidate.suffix.lower() != ".md"
+                ):
+                    continue
+                visit(candidate)
+            return line
+
+        _outside_fences(source.read_text(encoding="utf-8"), collect)
+
+    visit(blueprint / "README.md")
+    return ordered
+
+
+def _append_book_navigation(pages: list[Path]) -> None:
+    """Add previous/next links to the bottom of Blueprint pages, never global nav."""
+    if len(pages) < 2:
+        return
+    titles = [_first_h1(page.read_text(encoding="utf-8")) or page.stem for page in pages]
+    for index, page in enumerate(pages):
+        links: list[str] = []
+        if index:
+            links.append(
+                _book_navigation_link(
+                    pages[index - 1],
+                    page,
+                    titles[index - 1],
+                    direction="previous",
+                )
+            )
+        if index + 1 < len(pages):
+            links.append(
+                _book_navigation_link(
+                    pages[index + 1],
+                    page,
+                    titles[index + 1],
+                    direction="next",
+                )
+            )
+        navigation = (
+            '<nav class="bp-book-nav" aria-label="Blueprint chapters">'
+            + "".join(links)
+            + "</nav>"
+        )
+        page.write_text(
+            page.read_text(encoding="utf-8").rstrip() + "\n\n" + navigation + "\n",
+            encoding="utf-8",
+        )
+
+
+def _book_navigation_link(
+    target: Path,
+    page: Path,
+    title: str,
+    *,
+    direction: str,
+) -> str:
+    href = _as_published(mermaid.relative_link(target, page, ".html"))
+    label = "Previous" if direction == "previous" else "Next"
+    arrow = "←" if direction == "previous" else "→"
+    return (
+        f'<a class="bp-book-nav-link bp-book-nav-{direction}" '
+        f'href="{html.escape(href, quote=True)}">'
+        f'<span class="bp-book-nav-direction"><span aria-hidden="true">{arrow}</span> '
+        f"{label}</span>"
+        f'<span class="bp-book-nav-title">{html.escape(title)}</span>'
+        "</a>"
+    )
+
+
+def _inject_after_title(text: str, block: str) -> str:
+    """Place a generated overview immediately after the document's first H1."""
+    lines = text.splitlines()
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        fence_match = _FENCE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence is None:
+                fence = (marker[0], len(marker))
+            elif marker[0] == fence[0] and len(marker) >= fence[1]:
+                fence = None
+            continue
+        heading = _HEADING.match(line) if fence is None else None
+        if heading is not None and len(heading.group(1)) == 1:
+            merged = [*lines[: index + 1], "", block.rstrip(), "", *lines[index + 1 :]]
+            return "\n".join(merged) + ("\n" if text.endswith("\n") else "")
+    return text.rstrip() + "\n\n" + block.rstrip() + "\n"
+
+
+def _render_overview_summary(
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    *,
+    progress_href: str | None = "progress.html",
+    node_ids: list[str] | None = None,
+) -> str:
+    """Render the compact, honest progress strip shown at the start of the book."""
+    selected_ids = node_ids if node_ids is not None else list(graph.nodes)
+    definitions = sum(is_definition(graph.nodes[node_id]) for node_id in selected_ids)
+    results = len(selected_ids) - definitions
+    item_parts = []
+    if definitions:
+        item_parts.append(f"{definitions} definition{'s' if definitions != 1 else ''}")
+    if results:
+        item_parts.append(f"{results} result{'s' if results != 1 else ''}")
+    item_summary = " · ".join(item_parts) or "No decomposed definitions or results yet"
+
+    state_parts = []
+    selected_statuses = {node_id: statuses[node_id] for node_id in selected_ids}
+    for state, count in status.summarize(selected_statuses):
+        state_parts.append(
+            f'<span class="bp-progress-state"><span class="bp-swatch '
+            f'bp-swatch-{state.key}"></span><strong>{count}</strong> '
+            f"{html.escape(state.label)}</span>"
+        )
+    states = "".join(state_parts)
+    detail_link = (
+        f'<a class="bp-progress-link" href="{html.escape(progress_href, quote=True)}">'
+        'Detailed progress <span aria-hidden="true">→</span></a>'
+        if progress_href is not None
+        else ""
+    )
+    return (
+        '<div class="bp-progress-overview">'
+        '<div class="bp-progress-kicker">Formalization progress</div>'
+        f'<div class="bp-progress-total">{item_summary}</div>'
+        f'<div class="bp-progress-states">{states}</div>'
+        f"{detail_link}"
+        "</div>"
+    )
+
+
+def _render_progress_page(
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    *,
+    groups: dict[str, list[str]],
+    group_pages: dict[str, Path],
+    page: Path,
+    blueprint: Path,
+    destination: Path,
+    node_sources: dict[Path, str],
+    targets: dict[str, tuple[Path, str]],
+) -> str:
+    """Build the aggregate view while keeping source coverage distinct from DAG progress."""
+    sections = [
+        "---",
+        "kind: progress",
+        "---",
+        "",
+        "# Progress",
+        "",
+        _render_overview_summary(graph, statuses, progress_href=None),
+        "",
+        "The counts above cover the definitions and results already decomposed in the blueprint. "
+        "They do not claim completion of material that has not yet been decomposed.",
+        "",
+        "## Blueprint chapters",
+        "",
+    ]
+
+    if groups:
+        sections.extend(
+            [
+                "| Chapter | Blueprint items | Current state |",
+                "| --- | ---: | --- |",
+            ]
+        )
+        for group, node_ids in groups.items():
+            chapter_page = group_pages[group]
+            title = _first_h1(chapter_page.read_text(encoding="utf-8"))
+            if title is None:
+                title = group.replace("-", " ").title() if group else "Roadmap"
+            href = mermaid.relative_link(chapter_page, page, ".md")
+            summary = _status_phrase(statuses[node_id] for node_id in node_ids)
+            sections.append(
+                f"| [{_markdown_table_cell(title)}]({href}) | {len(node_ids)} | "
+                f"{_markdown_table_cell(summary)} |"
+            )
+    else:
+        sections.append("No formalization-sized definitions or results have been planned yet.")
+
+    legend = mermaid.render_legend(statuses)
+    if legend:
+        sections.extend(["", "## Status breakdown", "", legend])
+
+    sections.extend(["", "## Scope coverage", ""])
+    coverage_source = blueprint / "coverage" / "README.md"
+    if coverage_source.is_file():
+        coverage = _rewrite_links(
+            coverage_source.read_text(encoding="utf-8"),
+            source_dir=coverage_source.parent,
+            page=page,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
+            targets=targets,
+        )
+        coverage_body = _shift_headings(_document_body(coverage), 1)
+        sections.append(coverage_body)
+    else:
+        sections.append("No project-specific coverage contract has been recorded yet.")
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def _status_phrase(node_statuses: Iterable[status.NodeStatus]) -> str:
+    counts = {state.key: 0 for state in status.STATES}
+    for node_status in node_statuses:
+        counts[node_status.key] += 1
+    return " · ".join(f"{counts[state.key]} {state.label}" for state in status.STATES if counts[state.key])
+
+
+def _markdown_table_cell(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("[", "\\[").replace("]", "\\]")
+
+
+def _first_h1(text: str) -> str | None:
+    for line in text.splitlines():
+        heading = _HEADING.match(line)
+        if heading is not None and len(heading.group(1)) == 1:
+            return heading.group(2).strip()
+    return None
+
+
+def _document_body(text: str) -> str:
+    """Drop frontmatter and the first H1 while retaining the document's sections."""
+    lines = text.splitlines()
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                start = index + 1
+                break
+
+    kept: list[str] = []
+    dropped_title = False
+    for line in lines[start:]:
+        heading = _HEADING.match(line)
+        if heading is not None and len(heading.group(1)) == 1 and not dropped_title:
+            dropped_title = True
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _shift_headings(text: str, levels: int) -> str:
+    def shift(line: str) -> str:
+        heading = _HEADING.match(line)
+        if heading is None:
+            return line
+        level = min(len(heading.group(1)) + levels, 6)
+        return f"{'#' * level} {heading.group(2)}"
+
+    return _outside_fences(text, shift)
 
 
 def _anchor(node_id: str, group: str) -> str:
@@ -421,12 +738,21 @@ def _render_chapter(
     sections: list[str] = []
     linked = 0
     unresolved: list[str] = []
+    progress_href = mermaid.relative_link(destination / "progress.md", page, ".html")
+    chapter_summary = _render_overview_summary(
+        graph,
+        statuses,
+        progress_href=progress_href,
+        node_ids=node_ids,
+    )
 
     if narrative is not None:
-        sections.append(narrative.rstrip())
+        sections.append(_inject_after_title(narrative, chapter_summary).rstrip())
     else:
         title = group.replace("-", " ").capitalize() if group else "Roadmap"
-        sections.extend(["---", f"kind: roadmap\ntitle: {title}", "---", "", f"# {title}"])
+        sections.extend(
+            ["---", f"kind: roadmap\ntitle: {title}", "---", "", f"# {title}", "", chapter_summary]
+        )
 
     for node_id in node_ids:
         environment, node_linked, node_unresolved = _render_environment(
@@ -484,13 +810,18 @@ def _render_environment(
         for part in (statement, remainder)
     )
 
-    meta, linked, unresolved = _meta_rows(
+    code_links, implementation_rows, linked, unresolved = _lean_presentation(node, linker)
+    context_link = _graph_context_link(node, page=page, destination=destination)
+    meta_rows = implementation_rows
+    if node.discussion:
+        meta_rows.append(("Discussion", _discussion_link(node.discussion, linker)))
+    meta = _render_rows(meta_rows, css_class="bp-meta")
+    dependencies = _dependency_disclosure(
         node,
         graph=graph,
         statuses=statuses,
         numbers=numbers,
         used_by=used_by,
-        linker=linker,
         links=links,
     )
 
@@ -500,12 +831,13 @@ def _render_environment(
     mark = "✓" if node_status.key in {"fully_proved", "mathlib"} else "●"
 
     lines = [
-        f'<div class="bp-thmwrapper {style} bp-{node_status.key}" '
-        f'id="{html.escape(anchor, quote=True)}" markdown="1">',
+        f'<div class="bp-thmwrapper {style} bp-{node_status.key}" id="{html.escape(anchor, quote=True)}" markdown="1">',
         '<div class="bp-thmheading">',
         f'<span class="bp-thmcaption">{html.escape(caption)}</span>'
         f'<span class="bp-thmlabel">{html.escape(number)}</span>'
         f'<span class="bp-thmtitle">{html.escape(node.title)}</span>'
+        f"{code_links}"
+        f"{context_link}"
         f'<a class="bp-permalink" href="#{html.escape(anchor, quote=True)}">#</a>'
         f'<span class="bp-mark" title="{html.escape(node_status.label, quote=True)}">'
         f'{mark}<span class="bp-mark-label">{html.escape(node_status.label)}</span></span>',
@@ -520,40 +852,84 @@ def _render_environment(
         lines.extend(['<div class="bp-thmnotes" markdown="1">', "", remainder, "", "</div>"])
     if meta:
         lines.append(meta)
+    if dependencies:
+        lines.append(dependencies)
     lines.append("</div>")
     return "\n".join(lines), linked, unresolved
 
 
-def _meta_rows(
+def _lean_presentation(
+    node: Node,
+    linker: SourceLinker,
+) -> tuple[str, list[tuple[str, str]], int, list[str]]:
+    """Render direct source icons, falling back to quiet diagnostic metadata."""
+    icons: list[str] = []
+    fallback: list[str] = []
+    linked = 0
+    unresolved: list[str] = []
+    if not node.lean:
+        return "", [], linked, unresolved
+
+    for name in declaration_names(node.lean):
+        url = linker.url(name)
+        location = linker.location(name)
+        code = f"<code>{html.escape(name)}</code>"
+        if url:
+            label = html.escape(f"View {name} in Lean source", quote=True)
+            icons.append(
+                f'<a class="bp-code-link" href="{html.escape(url, quote=True)}" '
+                f'aria-label="{label}" title="{label}">{_code_icon()}</a>'
+            )
+            linked += 1
+        elif location is not None:
+            fallback.append(f'{code} <span class="bp-where">{html.escape(location.path.as_posix())}</span>')
+            linked += 1
+        else:
+            fallback.append(f'{code} <span class="bp-missing">not found in the Lean sources</span>')
+            unresolved.append(f"{node.id}: {name}")
+
+    code_links = f'<span class="bp-code-links">{"".join(icons)}</span>' if icons else ""
+    rows = [("Lean", " · ".join(fallback))] if fallback else []
+    return code_links, rows, linked, unresolved
+
+
+def _code_icon() -> str:
+    """A small dependency-free code icon suitable at theorem-heading size."""
+    return (
+        '<svg class="bp-code-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+        '<path d="m8 9-3 3 3 3M16 9l3 3-3 3M14 5l-4 14"/>'
+        "</svg>"
+    )
+
+
+def _graph_context_link(node: Node, *, page: Path, destination: Path) -> str:
+    """Link a textbook statement to its generated one-hop dependency view."""
+    target = graph_pages.focus_page_path(destination, node.id)
+    href = mermaid.relative_link(target, page, ".html")
+    label = html.escape(f"Open local dependency context for {node.title}", quote=True)
+    icon = (
+        '<svg class="bp-context-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+        '<circle cx="6" cy="12" r="2.25"/><circle cx="18" cy="6" r="2.25"/>'
+        '<circle cx="18" cy="18" r="2.25"/><path d="m8 11 7.8-4M8 13l7.8 4"/>'
+        "</svg>"
+    )
+    return (
+        f'<a class="bp-context-link" href="{html.escape(href, quote=True)}" '
+        f'aria-label="{label}" title="{label}">{icon}</a>'
+    )
+
+
+def _dependency_disclosure(
     node: Node,
     *,
     graph: Graph,
     statuses: dict[str, status.NodeStatus],
     numbers: dict[str, str],
     used_by: dict[str, list[str]],
-    linker: SourceLinker,
     links: dict[str, str],
-) -> tuple[str, int, list[str]]:
+) -> str:
+    """Hide DAG relations behind a native, keyboard-accessible disclosure."""
     rows: list[tuple[str, str]] = []
-    linked = 0
-    unresolved: list[str] = []
-
-    if node.lean:
-        parts: list[str] = []
-        for name in declaration_names(node.lean):
-            url = linker.url(name)
-            location = linker.location(name)
-            code = f"<code>{html.escape(name)}</code>"
-            if url:
-                parts.append(f'<a class="bp-lean" href="{html.escape(url, quote=True)}">{code}</a>')
-                linked += 1
-            elif location is not None:
-                parts.append(f'{code} <span class="bp-where">{html.escape(location.path.as_posix())}</span>')
-                linked += 1
-            else:
-                parts.append(f'{code} <span class="bp-missing">not found in the Lean sources</span>')
-                unresolved.append(f"{node.id}: {name}")
-        rows.append(("Lean", " · ".join(parts)))
 
     def references(node_ids: list[str] | tuple[str, ...]) -> str:
         rendered = []
@@ -567,25 +943,27 @@ def _meta_rows(
         return " · ".join(rendered)
 
     if node.statement_dependencies:
-        rows.append(("Uses", references(node.statement_dependencies)))
-    proof_only = [
-        other for other in node.proof_dependencies if other not in node.statement_dependencies
-    ]
+        rows.append(("Statement uses", references(node.statement_dependencies)))
+    proof_only = [other for other in node.proof_dependencies if other not in node.statement_dependencies]
     if proof_only:
         rows.append(("Proof uses", references(proof_only)))
     if used_by[node.id]:
         rows.append(("Used by", references(used_by[node.id])))
-    if node.discussion:
-        rows.append(("Discussion", _discussion_link(node.discussion, linker)))
-
     if not rows:
-        return "", linked, unresolved
+        return ""
+
+    body = _render_rows(rows, css_class="bp-dependency-body")
+    return f'<details class="bp-dependencies"><summary>Dependencies</summary>{body}</details>'
+
+
+def _render_rows(rows: list[tuple[str, str]], *, css_class: str) -> str:
+    if not rows:
+        return ""
     body = "".join(
-        f'<div class="bp-row"><span class="bp-key">{key}</span>'
-        f'<span class="bp-value">{value}</span></div>'
+        f'<div class="bp-row"><span class="bp-key">{key}</span><span class="bp-value">{value}</span></div>'
         for key, value in rows
     )
-    return f'<div class="bp-meta">{body}</div>', linked, unresolved
+    return f'<div class="{css_class}">{body}</div>'
 
 
 def _discussion_link(discussion: str, linker: SourceLinker) -> str:
@@ -797,6 +1175,60 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
 [data-bs-theme=dark] .dropdown-item {{ color: var(--bp-fg); }}
 [data-bs-theme=dark] footer, [data-bs-theme=dark] hr {{ border-color: var(--bp-rule); }}
 
+/* The book opens with a compact progress summary. It reports only decomposed
+   blueprint items, leaving source-wide coverage to the dedicated page. */
+.bp-progress-overview {{
+  margin: 1.25rem 0 1.75rem;
+  padding: 1rem 1.15rem;
+  border: 1px solid var(--bp-rule);
+  border-radius: 6px;
+  background: var(--bp-surface);
+}}
+.bp-progress-kicker {{
+  font-family: {mono};
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bp-muted);
+}}
+.bp-progress-total {{ margin-top: 0.2rem; font-family: {serif}; font-size: 1.05rem; }}
+.bp-progress-states {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin-top: 0.55rem;
+  font-size: 0.85rem;
+}}
+.bp-progress-state {{ display: inline-flex; align-items: center; gap: 0.35rem; }}
+.bp-progress-link {{ display: inline-block; margin-top: 0.65rem; font-size: 0.85rem; }}
+
+/* Reading order belongs to the book itself, not to MkDocs' global navbar. */
+.bp-book-nav {{
+  display: flex;
+  gap: 1.5rem;
+  margin: 3rem 0 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--bp-rule);
+}}
+.bp-book-nav-link {{
+  display: flex;
+  flex-direction: column;
+  max-width: 48%;
+  text-decoration: none;
+}}
+.bp-book-nav-link:hover {{ text-decoration: none; }}
+.bp-book-nav-next {{ margin-left: auto; text-align: right; }}
+.bp-book-nav-direction {{
+  font-family: {mono};
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--bp-muted);
+}}
+.bp-book-nav-title {{ margin-top: 0.15rem; font-family: {serif}; font-size: 1rem; }}
+
 /* Theorem environments, following leanblueprint's amsthm markup. */
 .bp-thmwrapper {{ margin: 1.6rem 0 2rem; }}
 
@@ -812,6 +1244,42 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
 .bp-thmlabel {{ margin-left: 0.4rem; margin-right: 0.5rem; }}
 .bp-thmtitle::before {{ content: "("; }}
 .bp-thmtitle::after {{ content: ")"; }}
+
+.bp-code-links {{ display: inline-flex; align-items: center; gap: 0.2rem; margin-left: 0.45rem; }}
+.bp-code-link {{
+  display: inline-flex;
+  align-items: center;
+  color: var(--bp-muted);
+  text-decoration: none;
+}}
+.bp-code-link:visited {{ color: var(--bp-muted); }}
+.bp-code-link:hover, .bp-code-link:visited:hover {{ color: var(--bp-link-hover); text-decoration: none; }}
+.bp-code-icon {{
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}}
+.bp-context-link {{
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.3rem;
+  color: var(--bp-muted);
+  text-decoration: none;
+}}
+.bp-context-link:visited {{ color: var(--bp-muted); }}
+.bp-context-link:hover, .bp-context-link:visited:hover {{ color: var(--bp-link-hover); text-decoration: none; }}
+.bp-context-icon {{
+  width: 1rem;
+  height: 1rem;
+  fill: var(--bp-surface);
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}}
 
 .bp-permalink {{
   margin-left: 0.5rem;
@@ -870,9 +1338,23 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
   line-height: 1.8;
   margin: 0.6rem 0 0 2rem;
 }}
+.bp-dependencies {{
+  margin: 0.65rem 0 0 2rem;
+  font-family: {sans};
+  font-size: 0.82rem;
+  color: var(--bp-muted);
+}}
+.bp-dependencies summary {{
+  width: fit-content;
+  cursor: pointer;
+  color: var(--bp-link);
+  user-select: none;
+}}
+.bp-dependencies summary:hover {{ color: var(--bp-link-hover); text-decoration: underline; }}
+.bp-dependency-body {{ margin-top: 0.35rem; color: var(--bp-fg); }}
 .bp-row {{ display: flex; gap: 0.75rem; }}
 .bp-key {{
-  flex: 0 0 6rem;
+  flex: 0 0 7.5rem;
   font-family: {mono};
   font-size: 0.78rem;
   text-transform: uppercase;

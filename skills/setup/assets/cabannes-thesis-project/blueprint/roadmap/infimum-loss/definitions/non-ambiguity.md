@@ -7,8 +7,9 @@ lean: CabannesThesis.NonAmbiguous
 
 # Non-ambiguity
 
-Formalize the non-ambiguity condition imposed on the weak supervision
-mechanism.
+A weak observation $S : Y \to \mathrm{Prop}$ is **non-ambiguous** when it
+admits at most one eligible label: if $y$ and $z$ are eligible for $S$, then
+$y = z$.
 
 ## Sources
 
