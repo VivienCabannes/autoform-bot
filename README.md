@@ -1,11 +1,14 @@
 # AutoformBot
 
-AutoformBot is a Lean 4 plugin that gives AI agents the minimal guidance
-experts typically provide to keep formalization on track. It combines
-orchestration and visualization with execution and search tools. Its
-human-editable Markdown roadmap and wiki capture the high-level direction and
-theorem-sized dependency nodes, so people can refine the plan while agents
-coordinate the work.
+AutoformBot is a Lean 4 plugin that helps AI agents create and maintain
+repositories for formalizing existing mathematics. Each repository combines
+checked Lean code with a human-readable blueprint: a roadmap, coverage goals,
+source notes, and a dependency graph of definitions and theorems.
+
+The plugin provides the minimal guidance experts typically give to keep a
+formalization on track, together with orchestration, visualization, execution,
+and search tools. People and agents can coordinate work, see what is planned,
+ready, blocked, or proved, and publish the blueprint with GitHub Pages.
 
 ## Install as a plugin
 
@@ -65,11 +68,25 @@ For development, install the repository's Python dependencies separately:
 make setup
 ```
 
+## Plugin surface
+
+Invoke a skill from your coding agent with `/autoform:setup`,
+`/autoform:roadmap`, `/autoform:orchestrate`, or `/autoform:review`.
+
+- `setup` creates or repairs the Lean repository, Markdown blueprint, CI, and Pages infrastructure.
+- `roadmap` confirms sources and scope, then builds roadmap, coverage, and theorem DAG notes.
+- `orchestrate` works ready nodes with native subagents and Lean tools.
+- `review` independently checks faithfulness, proof integrity, and Mathlib code quality.
+
+The plugin also gives coding agents execution and inspection tools through a
+Lean REPL and LSP. Loogle and semantic search integrations are planned but not
+yet implemented.
+
 ## The blueprint
 
 Each Lean project keeps its planning material beside its Lean source. The
-recommended layout is a portable Markdown vault rather than a generated
-database:
+recommended layout is a portable Markdown directory structure rather than a
+generated database:
 
 ```text
 blueprint/
@@ -84,123 +101,62 @@ blueprint/
         └── separating-hyperplane.md
 ```
 
-Open `blueprint/` directly as an Obsidian vault: standard relative links power
-its backlinks and graph view, while `.obsidian/` remains ignored. The same
-Markdown can be rendered by MkDocs and deployed by GitHub Pages. See the
-[Setup repository example](skills/setup/assets/cabannes-thesis-project/README.md)
-for the complete repository shell and the Roadmap skill's concise
-[Cabannes thesis example](skills/roadmap/references/cabannes-thesis-roadmap.md)
-for source-to-DAG planning. Roadmap and coverage organization remains project
-policy; AutoformBot deliberately enforces only the fine-grained node DAG.
+Files under `blueprint/nodes/` form a dependency graph through standard relative
+links. The Markdown remains the source of truth and can be browsed with tools
+such as Obsidian, rendered with MkDocs, or published with GitHub Pages. See the
+[blueprint format and validation reference](autoform_cli/README.md), the
+[repository example](skills/setup/assets/cabannes-thesis-project/README.md), or
+the [roadmap example](skills/roadmap/references/cabannes-thesis-roadmap.md).
 
-Every Markdown file below `blueprint/nodes/` is one node. Its relative path
-without `.md` is its stable ID. The H1 is its human title; optional frontmatter
-records lightweight metadata:
+## CLI commands
 
-```markdown
----
-kind: theorem
-status: ready
-lean: MyProject.separatingHyperplane
----
+Autoform ships command-line tools with the plugin package. From this
+repository, run them through `uv`; if the package is installed in the active
+environment, omit `uv run`.
 
-# Separating hyperplane theorem
-
-State the intended result and proof sketch here.
-
-## Depends on
-
-- [Convex set](../definitions/convex.md)
-
-## Sources
-
-- [Chapter 2](../../sources/convexity.md#separation)
-```
-
-Only links under `## Depends on` are graph edges. Other links are ordinary wiki
-navigation or citations. Dependency links are resolved relative to the current
-node and must point to another file inside `blueprint/nodes/`; cycles, missing
-targets, escaping paths, self-links, and missing H1 titles are rejected.
-
-`status` is deliberately lightweight: use `planned`, `ready`, `blocked`, or
-`proved`. A node is ready when all linked prerequisites are proved; a proved
-node should name its compiled declaration in `lean`. The checker validates graph
-structure but leaves mathematical and Lean correctness to the agent and Lean.
-
-The Markdown files are the sole source of truth. Generated graph and site files
-are derived, read-only views and may be regenerated at any time.
-
-## Commands
+Validate the structure and dependencies of a blueprint:
 
 ```bash
-uv sync --extra dev --extra repl
 uv run autoform check blueprint
+```
+
+Generate a self-contained HTML visualization whose nodes link to their Markdown
+files:
+
+```bash
 uv run autoform-visualize blueprint
+```
+
+For MkDocs or GitHub Pages, generate `.html` links instead:
+
+```bash
 uv run autoform-visualize blueprint \
   --output blueprint/dependencies.html \
   --link-extension .html
+```
+
+The local visualization works directly from `file://`. Generated graphs are
+derived views and can be rebuilt at any time.
+
+## Development
+
+Install development dependencies and run the tests from a repository checkout:
+
+```bash
+uv sync --extra dev --extra repl
 uv run pytest -q
 ```
 
-The visualization is self-contained and works directly from `file://`; clicking
-a node opens its Markdown file. The HTML-link mode is intended for static-site
-builders configured to emit `.html` pages, as in the setup skill's MkDocs asset.
-
-## Plugin surface
-
-- `setup` creates or repairs the Lean repository, Markdown vault, CI, and Pages infrastructure.
-- `roadmap` confirms sources and scope, then builds roadmap, coverage, and theorem DAG notes.
-- `orchestrate` works ready nodes with native subagents and Lean tools.
-- `review` independently checks faithfulness, proof integrity, and Mathlib code quality.
-- `autoform-lsp` provides Lean diagnostics and hover information.
-- `autoform-repl` executes snippets through a persistent Lean process.
-
-The four Lean tools require an absolute `project_dir`, so the plugin directory
-is never mistaken for the user's Lean project. Stateless Mathlib or community
-search stays outside the server surface and uses host-native tools when useful.
-
-### Shared Lean runtime
-
-Plugin hosts still start the two stdio MCP processes automatically. They are
-lightweight adapters: the first Lean tool call race-safely starts a detached
-runtime for the current AutoformBot installation, Unix user, and compute node.
-That runtime owns one resident REPL pool and LSP session per active Lean
-project, so sessions using that installation reuse the same warmed processes.
-Closing the session that happened to start it does not stop it; after a crash,
-the next tool call starts it again. Runtime sockets include a code fingerprint;
-after an in-place upgrade, the next call gracefully replaces the older build
-instead of silently reusing stale daemon code.
-
-REPL and LSP processes remain lazy. A cold tool call stays pending while Lean
-warms up, so no `/repl-start`, `/lsp-start`, or model-side sleep is needed. Idle
-project processes are closed after 30 minutes by default, while the small
-runtime remains available. Its lifecycle is also explicit:
-
-```bash
-uv run autoform-lean-runtime start
-uv run autoform-lean-runtime status
-uv run autoform-lean-runtime stop
-```
-
-`stop` is graceful: it waits for admitted tool calls and Lean children to
-finish shutting down before a subsequent `start` can replace the runtime.
-
-The private socket lives below `$XDG_RUNTIME_DIR/autoform`, falling back to a
-uid-specific directory in `/tmp`; the rotating runtime log is beside it.
-`AUTOFORM_RUNTIME_DIR` overrides that location. Node-wide limits are controlled
-by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
-`AUTOFORM_MAX_LEAN_PROJECTS`, and `AUTOFORM_LEAN_IDLE_SECONDS`. The first
-process to start the runtime supplies those settings until it is stopped.
-`AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` can raise the client/daemon response budget
-when unusually large worker pools need more than the default 15 minutes to warm.
+Agent-facing Lean server architecture and runtime operations are documented in
+[`servers/README.md`](servers/README.md).
 
 ## Repository layout
 
 ```text
 .claude-plugin/  Claude Code manifest
 .codex-plugin/   Codex manifest
-skills/         four expert workflows, references, and a compact thesis project asset
-autoform_cli/   blueprint validation and visualization commands
-servers/        two public MCP adapters plus the shared Lean runtime
-tests/          graph, packaging, and server contracts
+skills/          expert skills, references, and workflow examples
+autoform_cli/    command-line interface for blueprint validation and visualization
+servers/         public MCP adapters plus the shared Lean runtime
+tests/           plugin test cases
 ```
