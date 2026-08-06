@@ -289,6 +289,7 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
     assert first == files(outputs[1])
     manifest = json.loads(first[PUBLICATION_MANIFEST])
     assert manifest == {
+        "complete": True,
         "dependencies": 1,
         "git_ref": "a" * 40,
         "nodes": 2,
@@ -299,6 +300,47 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
     }
     assert re.fullmatch(r"[0-9a-f]{64}", manifest["source_revision"])
     assert str(tmp_path).encode() not in b"".join(first.values())
+
+
+def test_render_cleans_only_an_owned_publication(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    stale = output / "stale.txt"
+    stale.write_text("old generated output\n", encoding="utf-8")
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    assert not stale.exists()
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+
+
+def test_render_refuses_to_overwrite_an_unowned_directory(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("user data\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match="non-Autoform output directory"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert sentinel.read_text(encoding="utf-8") == "user data\n"
+
+
+def test_render_refuses_an_output_symlink(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    target = tmp_path / "target"
+    target.mkdir()
+    sentinel = target / "keep.txt"
+    sentinel.write_text("user data\n", encoding="utf-8")
+    output = tmp_path / "out"
+    output.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(PublicationError, match="symlink output directory"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert sentinel.read_text(encoding="utf-8") == "user data\n"
 
 
 def test_render_rejects_symlinks_before_cleaning_an_existing_site(tmp_path: Path) -> None:

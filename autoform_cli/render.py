@@ -167,7 +167,10 @@ def render_site(
     and never embeds timestamps or machine-specific paths.
     """
     blueprint = Path(blueprint_dir).expanduser().resolve()
-    destination = Path(output_dir).expanduser().resolve()
+    requested_destination = Path(output_dir).expanduser()
+    if requested_destination.is_symlink():
+        raise PublicationError(["refusing symlink output directory"])
+    destination = requested_destination.resolve()
     if _is_within(destination, blueprint) or _is_within(blueprint, destination):
         raise PublicationError(
             ["blueprint and output directories must be disjoint; refusing destructive render"]
@@ -184,9 +187,8 @@ def render_site(
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
 
-    if clean and destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True, exist_ok=True)
+    _prepare_destination(destination, clean=clean)
+    _write_publication_manifest(destination, blueprint, graph, linker, complete=False)
 
     report = RenderReport(output_dir=destination)
     node_paths = {node.path.resolve(): node for node in graph.nodes.values()}
@@ -311,8 +313,41 @@ def render_site(
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
-    _write_publication_manifest(destination, blueprint, graph, linker)
+    _write_publication_manifest(destination, blueprint, graph, linker, complete=True)
     return report
+
+
+def _prepare_destination(destination: Path, *, clean: bool) -> None:
+    """Create an output directory without overwriting unrelated user data."""
+    if not destination.exists():
+        destination.mkdir(parents=True)
+        return
+    if not destination.is_dir():
+        raise PublicationError(["output path exists and is not a directory"])
+    if not any(destination.iterdir()):
+        return
+
+    manifest = destination / PUBLICATION_MANIFEST
+    publication = None
+    if not manifest.is_symlink() and manifest.is_file():
+        try:
+            publication = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    if (
+        manifest.is_symlink()
+        or not isinstance(publication, dict)
+        or publication.get("schema") != "autoform-publication/v1"
+    ):
+        raise PublicationError(
+            [
+                "refusing to overwrite a non-Autoform output directory; "
+                "choose an empty directory or remove it explicitly"
+            ]
+        )
+    if clean:
+        shutil.rmtree(destination)
+        destination.mkdir(parents=True)
 
 
 def _validate_publication_tree(blueprint: Path) -> None:
@@ -368,8 +403,11 @@ def _write_publication_manifest(
     blueprint: Path,
     graph: Graph,
     linker: SourceLinker,
+    *,
+    complete: bool,
 ) -> None:
     manifest = {
+        "complete": complete,
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
         "source_revision": _source_revision(blueprint),
