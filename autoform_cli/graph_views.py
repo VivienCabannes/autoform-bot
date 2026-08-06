@@ -179,11 +179,61 @@ def focus_view(
         raise KeyError(f"unknown blueprint node: {node_id}")
     if radius < 0:
         raise ValueError("focus radius must be non-negative")
+    return _focus_view(
+        graph,
+        statuses,
+        node_id,
+        radius=radius,
+        adjacency=_adjacency(graph),
+        order_index={candidate: index for index, candidate in enumerate(topological_order(graph))},
+    )
 
-    adjacency: dict[str, set[str]] = {candidate: set() for candidate in graph.nodes}
-    for source, target, _ in _relations(graph):
-        adjacency[source].add(target)
-        adjacency[target].add(source)
+
+def focus_views(
+    graph: Graph,
+    statuses: dict[str, NodeStatus],
+    *,
+    radius: int = 1,
+) -> dict[str, GraphView]:
+    """Build every local view while sharing the graph-wide indexes.
+
+    Static publication writes one focus page per theorem. Recomputing adjacency
+    and topological order for every page becomes quadratic on a large book, so
+    the bulk path constructs both once and keeps each page proportional to its
+    local neighborhood.
+    """
+    if radius < 0:
+        raise ValueError("focus radius must be non-negative")
+    adjacency = _adjacency(graph)
+    order_index = {
+        candidate: index for index, candidate in enumerate(topological_order(graph))
+    }
+    return {
+        node_id: _focus_view(
+            graph,
+            statuses,
+            node_id,
+            radius=radius,
+            adjacency=adjacency,
+            order_index=order_index,
+        )
+        for node_id in graph.nodes
+    }
+
+
+def _focus_view(
+    graph: Graph,
+    statuses: dict[str, NodeStatus],
+    node_id: str,
+    *,
+    radius: int,
+    adjacency: dict[str, set[str]],
+    order_index: dict[str, int],
+) -> GraphView:
+    if node_id not in graph.nodes:
+        raise KeyError(f"unknown blueprint node: {node_id}")
+    if radius < 0:
+        raise ValueError("focus radius must be non-negative")
 
     selected = {node_id}
     frontier = {node_id}
@@ -193,7 +243,12 @@ def focus_view(
         if not frontier:
             break
 
-    view = _node_view(graph, statuses, selected)
+    view = _node_view(
+        graph,
+        statuses,
+        sorted(selected, key=order_index.__getitem__),
+        ordered=True,
+    )
     nodes = tuple(
         ViewNode(
             id=node.id,
@@ -227,18 +282,39 @@ def _node_view(
     graph: Graph,
     statuses: dict[str, NodeStatus],
     selected: Iterable[str],
+    *,
+    ordered: bool = False,
 ) -> GraphView:
-    selected_ids = frozenset(selected)
+    ordered_ids = list(dict.fromkeys(node_id for node_id in selected if node_id in graph.nodes))
+    selected_ids = frozenset(ordered_ids)
+    if not ordered:
+        order_index = {
+            node_id: index for index, node_id in enumerate(topological_order(graph))
+        }
+        ordered_ids.sort(key=order_index.__getitem__)
     nodes = tuple(
         _theorem_node(graph.nodes[node_id], statuses[node_id])
-        for node_id in topological_order(graph)
-        if node_id in selected_ids
+        for node_id in ordered_ids
     )
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
-    for source, target, proof_only in _relations(graph):
-        if source in selected_ids and target in selected_ids:
-            edge_counts[(source, target)][1 if proof_only else 0] += 1
+    for target in ordered_ids:
+        node = graph.nodes[target]
+        statement = set(node.statement_dependencies)
+        for source in node.statement_dependencies:
+            if source in selected_ids:
+                edge_counts[(source, target)][0] += 1
+        for source in node.proof_dependencies:
+            if source in selected_ids and source not in statement:
+                edge_counts[(source, target)][1] += 1
     return GraphView(kind="full", title="", nodes=nodes, edges=_edges(edge_counts))
+
+
+def _adjacency(graph: Graph) -> dict[str, set[str]]:
+    adjacency: dict[str, set[str]] = {candidate: set() for candidate in graph.nodes}
+    for source, target, _ in _relations(graph):
+        adjacency[source].add(target)
+        adjacency[target].add(source)
+    return adjacency
 
 
 def _project_edges(graph: Graph) -> tuple[ViewEdge, ...]:
@@ -307,6 +383,7 @@ __all__ = [
     "ViewNode",
     "chapter_view",
     "focus_view",
+    "focus_views",
     "full_view",
     "group_id",
     "group_nodes",

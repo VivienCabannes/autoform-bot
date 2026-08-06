@@ -1,4 +1,11 @@
-"""Load an Autoform blueprint from a small Markdown wiki."""
+"""Compile an Autoform dependency graph from its Markdown blueprint.
+
+Markdown is both the human wiki and the sole authored graph representation:
+node paths are stable ids, frontmatter carries checked facts, and links under
+the two dependency headings are typed edges. ``Graph`` is only a validated
+in-memory projection. It rejects broken links and cycles instead of persisting
+a second graph file that could drift from the book.
+"""
 
 from __future__ import annotations
 

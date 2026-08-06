@@ -35,8 +35,11 @@ For a new or incomplete repository:
   Mathlib revisions;
 - create `blueprint/` with a landing page plus `roadmap/`, `coverage/`, and
   `sources/`; later Roadmap work places `kind: node` pages beside their
-  milestones under `roadmap/`. Keep personal `.obsidian/`, `.trash/`, generated
-  graphs, and site output ignored;
+  milestones under `roadmap/`. A roadmap folder is a book chapter; a node page
+  is normally one PR-sized major result or important definition. Markdown
+  properties and dependency links are the graph, so do not create a parallel
+  `graph.json`. Keep personal `.obsidian/`, `.trash/`, generated graphs, and
+  site output ignored;
 - preserve or create the root `README.md` with a link to `blueprint/README.md`;
   when a deployed site exists, also feature its verified canonical URL
   prominently, never an inferred or pending URL;
@@ -77,9 +80,12 @@ uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 `site-src/`, `site/`, and `blueprint/dependencies.md`.
 
 Publication is opt-in because files under `blueprint/` become public site
-content. Confirm the exact repository and visibility, default to private, and
-warn that private Pages may require a paid GitHub plan. When approved, prepare
-the commit, remote, Pages source, and push; otherwise leave the workflow inert.
+content, together with derived progress, graph pages, and a path-free
+publication manifest. Show that boundary, confirm the exact repository and
+visibility, default to private, and warn that private Pages may require a paid
+GitHub plan. Rendering rejects symlinks and operational or sensitive files.
+When approved, prepare the commit, remote, Pages source, and push; otherwise
+leave the workflow inert.
 If credentials, hosting, or repository settings block publication, report the
 minimal owner action required.
 

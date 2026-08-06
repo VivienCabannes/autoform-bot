@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -103,6 +104,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     )
 
     assert report.unresolved == []
+    manifest = json.loads((site / "publication.json").read_text(encoding="utf-8"))
+    assert manifest["schema"] == "autoform-publication/v1"
+    assert manifest["nodes"] == 7
+    assert manifest["dependencies"] == 9
+    assert manifest["git_ref"] == "0" * 40
+    assert str(example) not in json.dumps(manifest)
     graph = load_graph(example / "blueprint")
 
     # Statements are published as environments on their milestone chapter,

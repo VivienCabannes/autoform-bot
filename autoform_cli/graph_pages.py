@@ -1,4 +1,11 @@
-"""Publish navigable graph projections beside the textbook blueprint."""
+"""Publish scalable graph projections beside the textbook blueprint.
+
+One Markdown DAG supports several reading scales: chapters collapsed into a
+project map, declarations within one chapter with external chapters collapsed
+to boundaries, a theorem's one-hop neighborhood, and an optional full graph.
+Every projection links back to the same book anchors and never becomes another
+source of graph state.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +17,7 @@ from .graph import Graph
 from .graph_views import (
     GraphView,
     chapter_view,
-    focus_view,
+    focus_views,
     full_view,
     group_id,
     group_nodes,
@@ -38,6 +45,7 @@ def write_graph_pages(
     """
     destination = Path(destination).resolve()
     groups = group_nodes(graph)
+    local_views = focus_views(graph, statuses)
     project_page = destination / "dependencies.md"
     full_page = destination / "dependencies/full.md"
     chapter_pages = {
@@ -149,7 +157,7 @@ def write_graph_pages(
     )
 
     for node_id, focus_page in focus_pages.items():
-        view = focus_view(graph, statuses, node_id)
+        view = local_views[node_id]
         chapter_page = chapter_pages[group_id(node_id)]
         statement_href = _markdown_document_link(node_links(focus_page)[node_id])
         navigation = _navigation(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from autoform_cli.lean import _normalize_remote
-from autoform_cli.render import render_site
+from autoform_cli.render import PUBLICATION_MANIFEST, PublicationError, render_site
 from autoform_cli.status import STATES
 
 
@@ -67,6 +69,7 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert (out / "dependencies/full.md").is_file()
     assert (out / "stylesheets/blueprint.css").is_file()
     assert (out / "javascripts/blueprint-mermaid.js").is_file()
+    assert (out / PUBLICATION_MANIFEST).is_file()
     # Nodes are absorbed into their chapter, not published one page each.
     assert not (out / "roadmap/base.md").exists()
     assert not (out / "roadmap/top.md").exists()
@@ -249,11 +252,94 @@ def test_the_generated_script_is_valid_javascript(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_refuses_to_render_over_the_vault(tmp_path: Path) -> None:
+@pytest.mark.parametrize("destination", ("same", "child", "parent"))
+def test_refuses_overlapping_source_and_output(tmp_path: Path, destination: str) -> None:
     project = _project(tmp_path)
+    blueprint = project / "blueprint"
+    output = {
+        "same": blueprint,
+        "child": blueprint / "site-src",
+        "parent": project,
+    }[destination]
 
-    with pytest.raises(ValueError, match="over itself"):
-        render_site(project / "blueprint", project / "blueprint")
+    with pytest.raises(PublicationError, match="must be disjoint"):
+        render_site(blueprint, output)
+
+
+def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    outputs = [tmp_path / "first", tmp_path / "second"]
+    for output in outputs:
+        render_site(
+            project / "blueprint",
+            output,
+            lean_root=project,
+            repository_url="https://github.com/owner/repo",
+            ref="a" * 40,
+        )
+
+    def files(root: Path) -> dict[str, bytes]:
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    first = files(outputs[0])
+    assert first == files(outputs[1])
+    manifest = json.loads(first[PUBLICATION_MANIFEST])
+    assert manifest == {
+        "dependencies": 1,
+        "git_ref": "a" * 40,
+        "nodes": 2,
+        "schema": "autoform-publication/v1",
+        "source": "blueprint/roadmap Markdown",
+        "source_revision": manifest["source_revision"],
+        "views": ["book", "progress", "project", "chapter", "focus", "full"],
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", manifest["source_revision"])
+    assert str(tmp_path).encode() not in b"".join(first.values())
+
+
+def test_render_rejects_symlinks_before_cleaning_an_existing_site(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    outside = tmp_path / "private.md"
+    outside.write_text("secret\n", encoding="utf-8")
+    (project / "blueprint" / "linked.md").symlink_to(outside)
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "existing.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match="refusing symlink.*linked.md"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ("task_queue.json", ".autoform/agents_status.json", "sources/dispatcher.log", ".env.local"),
+)
+def test_render_rejects_operational_or_sensitive_inputs(
+    tmp_path: Path, relative: str
+) -> None:
+    project = _project(tmp_path)
+    local = project / "blueprint" / relative
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text("private\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match="local or sensitive.*" + re.escape(relative)):
+        render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+
+def test_render_omits_benign_hidden_files(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/.gitignore").write_text("site/\n", encoding="utf-8")
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    assert not (tmp_path / "out/.gitignore").exists()
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,7 @@ from pathlib import Path
 from . import status
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
-from .render import render_site
+from .render import PublicationError, render_site
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -87,7 +87,7 @@ def _render(args: argparse.Namespace) -> int:
             repository_url=args.repository_url,
             ref=args.ref,
         )
-    except GraphValidationError as exc:
+    except (GraphValidationError, PublicationError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1
