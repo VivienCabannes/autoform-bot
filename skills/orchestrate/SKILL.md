@@ -67,8 +67,8 @@ Resolve:
 
 - dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then a
   running dashboard's graph parent;
-- Lean project: `graph.json` metadata `lean_root`, otherwise the dispatch
-  project's repository parent;
+- Lean project: the repository containing `blueprint/` and the generated
+  `graph.json`, otherwise the explicit project argument;
 - proof backend: explicit choice for this run, otherwise run `backend_config.py get
   --fallback codex` on Codex, `--fallback max` on Claude, or `--fallback muse`
   on Muse. A persisted choice wins over the host fallback;
@@ -81,6 +81,18 @@ if it is not installed/authenticated, stop and ask the user to select another
 available backend or install Claude. The `muse` prover or judge requires the
 `tbh` CLI and its configured provider authentication. Never silently override a
 resolved choice.
+
+When `blueprint/roadmap/` exists, validate that the compatibility graph is
+current before starting the engine:
+
+```bash
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint engine-graph \
+  "$DISPATCH_PROJECT/blueprint" --output "$DISPATCH_PROJECT/graph.json" \
+  --project-root "$DISPATCH_PROJECT" --lean-root "$LEAN_PROJECT" --check
+```
+
+If stale, regenerate it from Markdown and include both files in the same
+durable change. Never repair a Markdown project by editing `graph.json`.
 
 For every distinct API provider (`openai` or `avocado`) used by either prover or
 judge, run the local configuration check before launching:
@@ -226,14 +238,15 @@ For a tier-1 cluster:
 1. Claim the planner task.
 2. Spawn the canonical `splitter` role with the cluster, sources, existing prerequisite node index,
    and output paths.
-3. Upsert returned node records through `scripts/merge_node.py`.
-4. Spawn one canonical `mathlib-checker` per new tier-2 node in parallel; merge its
-   structured result through `merge_node.py`.
+3. Write or update the cluster's `kind: node` Markdown pages and typed dependency links.
+4. Spawn one canonical `mathlib-checker` per new node in parallel; record only
+   checked `mathlib`, `lean`, and source facts in the corresponding pages.
 5. Spawn canonical `graph-reviewer` and `content-reviewer` roles in parallel over the cluster.
-   Route structural edits through `merge_node.py`; the content role owns only its
-   prose files.
+   Structural and prose edits both land in the Markdown pages; keep each role
+   inside its assigned files.
 6. Enqueue jury review for the new nodes.
-7. Mark the planner task done only after all earlier steps have durable output.
+7. Validate the Markdown DAG and regenerate `graph.json`. Mark the planner task
+   done only after all earlier steps have durable output.
 
 ## Proof recovery pipeline
 
@@ -248,15 +261,17 @@ it means proof recovery. Claim the task and run these waves in order:
    statement is corrected; park the recovery in the meantime.
 3. If neither proof nor disproof succeeds, spawn independent decomposition
    agents. Accept sublemmas only with an explicit reconstruction of the target,
-   then add them through `merge_node.py` and schedule them foundations-first.
+   then add them as roadmap node pages with explicit dependency links and
+   schedule them foundations-first.
 4. If the decomposition is not viable, broaden exploration with distinct
    mathematical methods and sources. Record checked routes so later recovery
    work does not repeat them.
 
 Child research agents return findings without editing project files. The recovery
-coordinator records the selected route, counterexample, or reconstruction in one
-structured graph `recovery` field through `scripts/merge_node.py`; operational
-search logs never enter published theorem prose. Mark the recovery `done` and
+coordinator records the selected mathematical route, counterexample, or
+reconstruction in the target's Markdown proof notes; raw operational search
+logs remain local. Regenerate the compatibility graph after structural edits.
+Mark the recovery `done` and
 enqueue a worker only after a durable input or strategy change. If a complete
 wave finds no defensible next route, use
 `dispatch_queue.py <project> park <task-id> --reason <evidence>`.
@@ -294,7 +309,7 @@ Unless manual/drop-only mode was requested:
    or every remaining theorem has a parked recovery with a durable evidence
    ledger.
 
-Proof recovery may add a real missing prerequisite through `merge_node.py`,
+Proof recovery may add a real missing prerequisite to the Markdown DAG,
 start a cluster-level planner pass, or establish a false statement or toolchain
 failure. Do not grow the DAG repeatedly to disguise an unresolved proof. The
 engine has no arbitrary attempt cap; its fingerprint gate blocks unchanged

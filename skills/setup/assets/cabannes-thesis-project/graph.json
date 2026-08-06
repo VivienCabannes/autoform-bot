@@ -1,0 +1,218 @@
+{
+  "metadata": {
+    "generated_by": "autoform-blueprint",
+    "source": "blueprint",
+    "source_revision": "e9f1967bcc3cd675b97eb5829bff9a25f9dfbd60837d972a87dde9e0f897a8c1",
+    "sources": [
+      {
+        "file": "blueprint/sources/thesis.md",
+        "format": "markdown",
+        "title": "Thesis source map"
+      }
+    ]
+  },
+  "nodes": {
+    "chapter:full-supervision": {
+      "content": "blueprint/roadmap/full-supervision/README.md",
+      "depends_on": [],
+      "description": "Full Supervision",
+      "generated": true,
+      "id": "chapter:full-supervision",
+      "kind": "definition",
+      "mathlib_declarations": [],
+      "mathlib_status": "missing",
+      "parent": null,
+      "tier": 1
+    },
+    "chapter:infimum-loss": {
+      "content": "blueprint/roadmap/infimum-loss/README.md",
+      "depends_on": [
+        "chapter:full-supervision"
+      ],
+      "description": "Infimum Loss milestone",
+      "generated": true,
+      "id": "chapter:infimum-loss",
+      "kind": "definition",
+      "mathlib_declarations": [],
+      "mathlib_status": "missing",
+      "parent": null,
+      "tier": 1
+    },
+    "full-supervision/definitions/full-supervision": {
+      "content": "blueprint/roadmap/full-supervision/definitions/full-supervision.md",
+      "depends_on": [],
+      "description": "Full supervision",
+      "generated": true,
+      "id": "full-supervision/definitions/full-supervision",
+      "kind": "definition",
+      "lean_file": "CabannesThesis/Basic.lean",
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:full-supervision",
+      "proof_formalized": false,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": true,
+      "tier": 2
+    },
+    "infimum-loss/definitions/eligibility": {
+      "content": "blueprint/roadmap/infimum-loss/definitions/eligibility.md",
+      "depends_on": [],
+      "description": "Eligibility",
+      "generated": true,
+      "id": "infimum-loss/definitions/eligibility",
+      "kind": "definition",
+      "lean_file": "CabannesThesis/Basic.lean",
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:infimum-loss",
+      "proof_formalized": false,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": true,
+      "tier": 2
+    },
+    "infimum-loss/definitions/non-ambiguity": {
+      "content": "blueprint/roadmap/infimum-loss/definitions/non-ambiguity.md",
+      "depends_on": [
+        "infimum-loss/definitions/eligibility"
+      ],
+      "description": "Non-ambiguity",
+      "generated": true,
+      "id": "infimum-loss/definitions/non-ambiguity",
+      "kind": "definition",
+      "lean_file": "CabannesThesis/Basic.lean",
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:infimum-loss",
+      "proof_formalized": false,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": true,
+      "tier": 2
+    },
+    "infimum-loss/theorems/infimum-loss": {
+      "content": "blueprint/roadmap/infimum-loss/theorems/infimum-loss.md",
+      "depends_on": [
+        "infimum-loss/definitions/eligibility"
+      ],
+      "description": "Infimum loss",
+      "generated": true,
+      "id": "infimum-loss/theorems/infimum-loss",
+      "kind": "theorem",
+      "lean_file": null,
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:infimum-loss",
+      "proof_formalized": false,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": false,
+      "tier": 2
+    },
+    "infimum-loss/theorems/non-ambiguity-determinism": {
+      "content": "blueprint/roadmap/infimum-loss/theorems/non-ambiguity-determinism.md",
+      "depends_on": [
+        "infimum-loss/definitions/non-ambiguity"
+      ],
+      "description": "Non-ambiguity determinism",
+      "generated": true,
+      "id": "infimum-loss/theorems/non-ambiguity-determinism",
+      "kind": "theorem",
+      "lean_file": "CabannesThesis/Basic.lean",
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:infimum-loss",
+      "proof_formalized": true,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": true,
+      "tier": 2
+    },
+    "infimum-loss/theorems/supervision-non-ambiguous": {
+      "content": "blueprint/roadmap/infimum-loss/theorems/supervision-non-ambiguous.md",
+      "depends_on": [
+        "full-supervision/definitions/full-supervision",
+        "infimum-loss/definitions/non-ambiguity"
+      ],
+      "description": "Full supervision is non-ambiguous",
+      "generated": true,
+      "id": "infimum-loss/theorems/supervision-non-ambiguous",
+      "kind": "theorem",
+      "lean_file": "CabannesThesis/Basic.lean",
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:infimum-loss",
+      "proof_formalized": true,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": true,
+      "tier": 2
+    },
+    "infimum-loss/theorems/supervision-recovery": {
+      "content": "blueprint/roadmap/infimum-loss/theorems/supervision-recovery.md",
+      "depends_on": [
+        "infimum-loss/theorems/infimum-loss",
+        "full-supervision/definitions/full-supervision",
+        "infimum-loss/theorems/non-ambiguity-determinism",
+        "infimum-loss/theorems/supervision-non-ambiguous"
+      ],
+      "description": "Supervision recovery",
+      "generated": true,
+      "id": "infimum-loss/theorems/supervision-recovery",
+      "kind": "theorem",
+      "lean_file": null,
+      "mathlib_declarations": [],
+      "mathlib_file": null,
+      "mathlib_status": "missing",
+      "not_ready": false,
+      "origin": "cited",
+      "parent": "chapter:infimum-loss",
+      "proof_formalized": false,
+      "source_refs": [
+        {
+          "file": "blueprint/sources/thesis.md"
+        }
+      ],
+      "statement_formalized": false,
+      "tier": 2
+    }
+  },
+  "version": 2
+}

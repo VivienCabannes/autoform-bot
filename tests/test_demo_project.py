@@ -70,7 +70,7 @@ def test_project_bootstrap_commands_use_a_portable_locale():
 def test_project_creation_is_internal_to_setup():
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     assert not (ROOT / "skills" / "make-project" / "SKILL.md").exists()
-    assert "scripts/make_project.sh" in setup
+    assert "buildable Lean project" in setup
     assert (ROOT / "scripts" / "make_project.sh").is_file()
 
 
@@ -79,18 +79,17 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
         path.parent.name
         for path in (ROOT / "skills").glob("*/SKILL.md")
     }
-    assert public == {"setup", "roadmap", "orchestrate", "evaluate"}
+    assert public == {"setup", "roadmap", "orchestrate"}
 
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     roadmap = (ROOT / "skills" / "roadmap" / "SKILL.md").read_text()
     orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
-    evaluate = (ROOT / "skills" / "evaluate" / "SKILL.md").read_text()
-    assert "internal/runbooks/planning.md" in roadmap
-    assert "scripts/workspace_inspector.py" in setup
+    assert "autoform-blueprint engine-graph" in roadmap
+    assert "autoform-blueprint engine-graph" in setup
+    assert "Markdown as the sole source of truth" in roadmap
     assert "internal/runbooks/proving.md" in orchestrate
     assert "internal/runbooks/review.md" in orchestrate
     assert "scripts/backend_config.py" in orchestrate
-    assert "scripts/evaluate.py" in evaluate
 
     for path in (ROOT / "internal" / "runbooks").glob("*.md"):
         assert not path.read_text().lstrip().startswith("---")

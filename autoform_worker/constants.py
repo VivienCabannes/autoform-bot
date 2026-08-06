@@ -36,7 +36,8 @@ _MERGE_PATH_ALLOW = (
     r"^[^/]+\.lean$",            # top-level lean (rare)
     r"^[A-Za-z0-9_./-]+\.lean$",  # library lean files
     r"^kernel/",                  # kernel evidence
-    r"^informal_content/",        # node prose
+    r"^blueprint/",               # Markdown roadmap and mathematical sources
+    r"^informal_content/",        # legacy node prose during migration
     r"^review_status\.json$",     # sidecar folds
 )
 _MERGE_PATH_DENY = (

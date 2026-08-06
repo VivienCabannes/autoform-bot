@@ -40,5 +40,7 @@ jobs:
         run: make lint
       - name: Lint plugin surfaces
         run: python3 scripts/lint_plugin.py
+      - name: Validate bundled Markdown blueprint
+        run: make check-blueprint-example
       - name: Reject whitespace errors
         run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD

@@ -24,20 +24,22 @@ using their native plugin and subagent surfaces. See the
 ```mermaid
 flowchart LR
     A[Lean + Mathlib repository] -->|/autoform:setup| R[AutoformBot-ready repository<br/>dashboard + CI + Pages]
-    S[textbook<br/>LaTeX / MD / PDF] -->|/autoform:roadmap| B[tiered dependency graph<br/>graph.json + prose per node]
+    S[textbook<br/>LaTeX / MD / PDF] -->|/autoform:roadmap| B[Markdown mathematical book<br/>typed dependency links]
     R --> B
     B -->|/autoform:orchestrate| C[prover workers<br/>claude · aristotle · codex · muse · openai · avocado]
     C --> D{honesty gate<br/>lake build + #print axioms}
     D -->|rejected| C
     D -->|verified| E[3-judge review jury<br/>faithfulness · proof integrity · style]
     E --> F[review dashboard<br/>human sign-off]
-    B -.-> G[interactive blueprint]
+    B -.-> G[book + progress + multiscale DAG]
+    B -.-> H[generated graph.json<br/>worker/dashboard compatibility]
 ```
 
-- **Plan** — a two-phase pipeline reads your sources and builds a tiered DAG:
-  coarse concept clusters first, then fine per-statement nodes with their own
-  paraphrased prose, each mapped against Mathlib (in-mathlib / partial /
-  missing). Rendered as an interactive leanblueprint with a tier toggle.
+- **Plan** — roadmap folders are book chapters and `kind: node` Markdown pages
+  are PR-sized definitions or results. Typed links form the validated fine DAG;
+  chapter contraction forms its coarse tier. The same files render as a book,
+  progress report, and multiscale graph. `graph.json` is generated only for
+  compatibility with the worker and local dashboard.
 - **Prove** — a deterministic dispatch engine drains a shared task queue:
   prover workers write real Lean, iterating against build feedback. Backends
   are thin adapters behind one driver; a steering judge watches live-steerable
@@ -119,19 +121,19 @@ then use:
 /autoform:setup                 # prepare the Lean repository, dashboard, CI, and Pages
 /autoform:roadmap               # sources → reviewed dependency graph + blueprint
 /autoform:orchestrate           # choose backends and launch prover workers + review jury
-/autoform:evaluate              # audit a corpus or benchmark a prover without mutating tasks
 ```
 
 `/autoform:setup` walks you through creating a project (via the LeanProject
 template, with Mathlib cache), repairing prerequisites, inspecting an existing
 workspace, initializing durable state, and opening the review dashboard.
-`/autoform:roadmap` then scopes the sources, builds and reviews `graph.json`,
-and optionally renders the mathematical blueprint. `/autoform:orchestrate`
+`/autoform:roadmap` then scopes the sources and builds the Markdown book and
+dependency DAG. It regenerates the worker/dashboard projection after changes.
+`/autoform:orchestrate`
 selects the prover backend (`max` | `aristotle` | `codex` | `muse` | `openai` |
 `avocado`) and drives the formalization autonomously, from the dashboard, or
 both, off one shared queue. Ask Orchestrate to persist a backend as the default
-when needed. `/autoform:evaluate` runs read-only statement audits or isolated
-prover benchmarks outside that durable queue.
+when needed. Read-only audits and isolated prover benchmarks are bounded
+Orchestrate operations rather than another user workflow.
 
 ## Prover backends
 
@@ -179,8 +181,8 @@ existing project with `python3 scripts/formalization.py init <project-dir>`.
 **The complete user command surface** — `/autoform:setup` (repository
 installation, inspection, services, CI, and publication setup),
 `/autoform:roadmap` (source scope, dependency planning, review, and visualization),
-`/autoform:orchestrate` (backend selection and launch/drive the engine), and
-`/autoform:evaluate` (read-only corpus audits and isolated prover benchmarks).
+and `/autoform:orchestrate` (backend selection, proving, review, prior-art
+search, and bounded evaluation).
 
 Mathlib conventions, proof discipline, environment repair, workspace
 inspection, jury rubrics, and Zulip search are internal runbooks or MCP
@@ -200,8 +202,8 @@ local Mathlib search CLI, and the Zulip API on demand.
 
 **Dashboards**: the loopback dashboard owns live agents, queues, backend
 selection, cancellation, and human verdict entry. The optional GitHub Pages
-dashboard is a deterministic, read-only snapshot built only from committed graph,
-theorem, review, proof-status, and kernel-evidence inputs. Setup fails closed on
+site is a deterministic, read-only book, progress report, and multiscale DAG
+built from committed Markdown, theorem, review, proof-status, and kernel-evidence inputs. Setup fails closed on
 unclear repository visibility and never enables publication without approval.
 
 **The distributed worker** (`./autoform`, TauCetiWorker-style): many machines
@@ -222,11 +224,12 @@ contract, with diagrams.
 ## Repository layout
 
 ```
-skills/          four user workflows: setup, roadmap, orchestrate, evaluate
+skills/          three user workflows: setup, roadmap, orchestrate
 internal/        non-discoverable runbooks, reference material, and jury rubrics
 agents/          worker, reader, planning crew, review jury
 servers/         stateful MCP servers plus shared prover/search implementation code
 scripts/         plan/graph tooling, dispatch engine, review UI, formalization.py
+autoform_cli/    Markdown DAG validation, projections, and static publication
 autoform_worker/ the distributed worker CLI (rounds, claims, scoreboards, PRs)
 docs/            maintained architecture, usage, release, and worker contracts
 tests/           deterministic suite, fixtures, and optional live smoke tests
@@ -238,7 +241,8 @@ tests/           deterministic suite, fixtures, and optional live smoke tests
 uv sync --extra dev --extra zulip
 uv run python -m pytest -q               # full suite
 python3 scripts/lint_plugin.py           # plugin-surface lint (CI runs this)
-uv run ruff check scripts servers tests skills
+uv run ruff check autoform_cli scripts servers autoform_worker tests
+make check-blueprint-example
 make demo PYTHON="uv run python"
 ```
 

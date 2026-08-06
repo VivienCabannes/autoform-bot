@@ -16,6 +16,7 @@ PLUGIN_DIR  := $(CURDIR)
 PLUGIN      := autoform@autoform
 MARKETPLACE := autoform
 MUSE_DIST   ?= $(CURDIR)/dist/muse/autoform
+BLUEPRINT_EXAMPLE := skills/setup/assets/cabannes-thesis-project
 
 .DEFAULT_GOAL := help
 
@@ -83,7 +84,17 @@ test: ## Run the test suite
 
 .PHONY: lint
 lint: ## Lint the Python sources (ruff)
-	uv run --with ruff ruff check scripts/ servers/ autoform_worker/ tests/
+	uv run --with ruff ruff check autoform_cli/ scripts/ servers/ autoform_worker/ tests/
+
+.PHONY: check-blueprint-example
+check-blueprint-example: ## Validate and render the bundled Markdown blueprint
+	uv run autoform-blueprint check $(BLUEPRINT_EXAMPLE)/blueprint --lean-root $(BLUEPRINT_EXAMPLE)
+	uv run autoform-visualize $(BLUEPRINT_EXAMPLE)/blueprint
+	uv run autoform-blueprint render $(BLUEPRINT_EXAMPLE)/blueprint \
+		--output $(BLUEPRINT_EXAMPLE)/site-src \
+		--lean-root $(BLUEPRINT_EXAMPLE) \
+		--require-declarations
+	uv run --extra dev mkdocs build --strict --config-file $(BLUEPRINT_EXAMPLE)/mkdocs.yml
 
 .PHONY: clean
 clean: ## Remove .venv and caches

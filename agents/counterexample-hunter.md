@@ -39,7 +39,7 @@ Formalization introduces failure modes the informal source never had:
 
 ## Method
 
-1. Read the node's statement and its prose in `informal_content/<node>.md`,
+1. Read the node's statement and its page under `blueprint/roadmap/`,
    plus the cited source location.
 2. Enumerate the candidate failure modes above that actually apply. Ignore the
    ones that cannot typecheck.

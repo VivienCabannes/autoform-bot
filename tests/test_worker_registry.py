@@ -491,6 +491,22 @@ def test_build_prompt_states_the_write_protocol(tmp_path, monkeypatch):
     assert "FAILED:" in prompt
 
 
+def test_build_prompt_uses_markdown_protocol_when_blueprint_exists(tmp_path, monkeypatch):
+    cfg, role, _prompt = make_prompt(tmp_path, monkeypatch, "# Role\n")
+    (cfg.project / "blueprint" / "roadmap").mkdir(parents=True)
+    task = agent_work.QueuedTask(
+        task_id="numerics:n1", kind="numerics", node="n1", node_label="Node one"
+    )
+    prompt = agent_work.build_prompt(
+        role, task, cfg, Survey(canonical="o/r", default_branch="main", me="me")
+    )
+
+    assert str(cfg.project / "blueprint" / "roadmap") in prompt
+    assert "Never edit `graph.json`" in prompt
+    assert "`Depends on` / `Proof depends on`" in prompt
+    assert "merge_node.py" not in prompt
+
+
 def test_build_prompt_includes_task_note_verbatim(tmp_path, monkeypatch):
     _cfg, _role, prompt = make_prompt(tmp_path, monkeypatch, "# Role\n", note="rw_pow failed: no lemma")
     assert "rw_pow failed: no lemma" in prompt

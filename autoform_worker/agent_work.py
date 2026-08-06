@@ -10,7 +10,7 @@ Two write paths, matching what the artifact is:
 
 * **Lean proofs** (the ``prove`` unit) go through a PR, get a jury scoreboard,
   and auto-merge — code deserves review.
-* **Roadmap curation** (graph.json, ``informal_content/``) is committed and
+* **Roadmap curation** (``blueprint/`` plus generated ``graph.json``) is committed and
   CAS-pushed straight to the default branch under a claim. It is frequent,
   conflict-rare, and humans watch it on the dashboards rather than in PRs;
   a lost CAS simply retries next round.
@@ -77,12 +77,16 @@ def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) ->
     except ValueError:
         return False
     prefix = "" if str(project_rel) == "." else f"{project_rel.as_posix()}/"
-    content_prefix = f"{prefix}informal_content/"
-    content = all(path.startswith(content_prefix) for path in paths)
+    graph_path = f"{prefix}graph.json"
+    if (cfg.project / "blueprint" / "roadmap").is_dir():
+        content_prefix = f"{prefix}blueprint/"
+    else:
+        content_prefix = f"{prefix}informal_content/"
+    content = all(path.startswith(content_prefix) or path == graph_path for path in paths)
     if role.writes == "content":
         return content
     if role.writes == "graph":
-        return all(path == f"{prefix}graph.json" or path.startswith(content_prefix) for path in paths)
+        return content
     return role.writes == "none" and not paths
 
 
@@ -140,29 +144,41 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
         if listed:
             sources = "\n".join(f"  - {s}" for s in listed)
 
+    markdown_roadmap = (cfg.project / "blueprint" / "roadmap").is_dir()
     context = [
         "# Your assignment",
         "",
         f"- role: `{role.name}` (queue kind `{role.kind}`)",
         f"- target node: `{task.node}` ({task.node_label})",
         f"- dispatch project: {cfg.project}",
-        f"- graph: {graph_path}",
+        f"- {'generated engine graph (read-only)' if markdown_roadmap else 'graph'}: {graph_path}",
         f"- Lean project: {cfg.lean_root}",
-        f"- node prose lives in: {cfg.project / 'informal_content'}/<node>.md",
+        (
+            f"- authoritative roadmap: {cfg.project / 'blueprint' / 'roadmap'}"
+            if markdown_roadmap
+            else f"- node prose lives in: {cfg.project / 'informal_content'}/<node>.md"
+        ),
     ]
     if sources:
         context += ["- sources:", sources]
     if task.note:
         context += ["", "## Task note (verbatim — often a worker's own words)", "",
                     "```", task.note[:2400], "```"]
+    context += ["", "## How to finish", ""]
+    if markdown_roadmap:
+        context += [
+            "- Edit only the Markdown roadmap. Folder structure defines chapters, frontmatter "
+            "records checked facts, and links under `Depends on` / `Proof depends on` define edges.",
+            "- Never edit `graph.json`; the worker harness regenerates that compatibility projection.",
+        ]
+    else:
+        context += [
+            "- Make every graph edit through "
+            f"`python {cfg.plugin_root}/scripts/merge_node.py {graph_path} --payload <file>` — "
+            "it is the only writer of graph.json.",
+            "- Write node prose directly to `informal_content/<node>.md`.",
+        ]
     context += [
-        "",
-        "## How to finish",
-        "",
-        "- Make every graph edit through "
-        f"`python {cfg.plugin_root}/scripts/merge_node.py {graph_path} --payload <file>` — "
-        "it is the only writer of graph.json.",
-        "- Write node prose directly to `informal_content/<node>.md`.",
         "- Do NOT run `git push` and do NOT open PRs; the worker harness commits and "
         "pushes what you leave in the tree, under a lease.",
         "- Do not edit `lean-toolchain`, `lakefile.*`, CI workflows, or anything under "
@@ -234,6 +250,16 @@ def do_agent_task(
                 dq.main([str(cfg.project), "fail", task.task_id, "--reason",
                          f"agent rc={rc} (log: {log_path})", "--report-file", str(log_path)])
                 return UnitResult(False, f"{task.kind} {task.node}: agent failed rc={rc}")
+
+            if role.writes != "none" and (work_cfg.project / "blueprint" / "roadmap").is_dir():
+                from autoform_cli.engine_graph import write_engine_graph
+
+                write_engine_graph(
+                    work_cfg.project / "blueprint",
+                    work_cfg.graph_path,
+                    project_root=work_cfg.project,
+                    lean_root=work_cfg.lean_root,
+                )
 
             pushed = False
             changed = _changed_paths(work_cfg.lean_root, base_oid)

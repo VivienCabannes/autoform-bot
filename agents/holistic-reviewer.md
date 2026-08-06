@@ -26,7 +26,7 @@ Your remit is **graph quality only**: is this a coherent, well-proportioned, wel
 
 You receive:
 - The full graph (all nodes and their dependencies), built out to whichever tier the current phase has reached.
-- For a Phase-2 graph, the `informal_content/<id>.md` prose for the fine nodes.
+- For a detailed roadmap, the `kind: node` Markdown pages and their source links.
 - Path(s) to the source textbook(s) for reference.
 - Context: this graph has already been reviewed for edge correctness, structural issues, and missing intermediates.
 

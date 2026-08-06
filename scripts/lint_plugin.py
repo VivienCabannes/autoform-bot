@@ -20,8 +20,7 @@ Checks (all stdlib):
     completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
-  - The user-visible skill set is exactly `setup`, `roadmap`, `orchestrate`, and
-    `evaluate`;
+  - The user-visible skill set is exactly `setup`, `roadmap`, and `orchestrate`;
     supporting runbooks do not reappear as slash commands.
   - No legacy `commands/*` file adds an extra user-visible command.
   - Every `references/<file>` a SKILL.md cites exists in that skill's `references/`.
@@ -54,7 +53,7 @@ EXPECTED_MCP_SERVERS = frozenset(
         "autoform-prover",
     }
 )
-PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate", "evaluate"})
+PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate"})
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/evaluation.md",

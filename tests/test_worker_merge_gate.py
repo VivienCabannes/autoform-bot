@@ -135,6 +135,7 @@ def test_merge_paths_allowed_accepts_roadmap_content():
     assert merge_paths_allowed(["Top.lean"])
     assert merge_paths_allowed(["Proj/Sub/Deep_Name-2.lean"])
     assert merge_paths_allowed(["informal_content/node-a.md"])
+    assert merge_paths_allowed(["blueprint/roadmap/chapter/node-a.md"])
     assert merge_paths_allowed(["kernel/node-a/evidence.json"])
     assert merge_paths_allowed(["review_status.json"])
     assert merge_paths_allowed(["Proj/A.lean", "informal_content/a.md", "kernel/a.json",

@@ -150,6 +150,22 @@ def resolve_config(
 ) -> WorkerConfig:
     proj = _find_graph_project(project)
     lean_root = _lean_root_of(proj)
+    blueprint = proj / "blueprint"
+    if (blueprint / "roadmap").is_dir():
+        from autoform_cli.engine_graph import write_engine_graph
+
+        if not write_engine_graph(
+            blueprint,
+            proj / "graph.json",
+            project_root=proj,
+            lean_root=lean_root,
+            check=True,
+        ):
+            raise Die(
+                "graph.json is a stale generated projection of blueprint/; run "
+                "`autoform-blueprint engine-graph blueprint --output graph.json "
+                "--project-root . --lean-root .` and commit both changes"
+            )
     wid_raw = worker_id or os.environ.get("AUTOFORM_WORKER_ID") or ""
     if not wid_raw:
         wid_raw = f"{os.environ.get('USER', 'worker')}-{socket.gethostname().split('.')[0]}"
