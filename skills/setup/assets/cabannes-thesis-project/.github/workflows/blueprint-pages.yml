@@ -5,12 +5,14 @@ on:
     branches: [main]
     paths:
       - "blueprint/**"
+      - "graph.json"
       - "**.lean"
       - "mkdocs.yml"
       - ".github/workflows/blueprint-pages.yml"
   pull_request:
     paths:
       - "blueprint/**"
+      - "graph.json"
       - "**.lean"
       - "mkdocs.yml"
       - ".github/workflows/blueprint-pages.yml"
@@ -39,14 +41,23 @@ jobs:
       # declaration that is not in the sources.
       - name: Validate the theorem DAG and its declarations
         run: >-
-          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@6dab7c091613030c47e76a64ac0779d105fb8915
           autoform-blueprint check blueprint --lean-root .
+
+      - name: Reject a stale worker projection
+        run: >-
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@6dab7c091613030c47e76a64ac0779d105fb8915
+          autoform-blueprint engine-graph blueprint
+          --output graph.json
+          --project-root .
+          --lean-root .
+          --check
 
       # Writes site-src/: statement boxes, derived statuses, the Mermaid graph,
       # and permalinks into the Lean code at this exact commit.
       - name: Render the blueprint
         run: >-
-          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@6dab7c091613030c47e76a64ac0779d105fb8915
           autoform-blueprint render blueprint
           --output site-src
           --lean-root .
