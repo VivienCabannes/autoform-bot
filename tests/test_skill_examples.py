@@ -262,7 +262,14 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
     roadmap_metadata = (repo_root / "skills/roadmap/agents/openai.yaml").read_text(encoding="utf-8")
     orchestrate = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
-    review = (repo_root / "skills/review/SKILL.md").read_text(encoding="utf-8")
+    agent_review = (repo_root / "skills/agent-review/SKILL.md").read_text(encoding="utf-8")
+    agent_review_metadata = (repo_root / "skills/agent-review/agents/openai.yaml").read_text(
+        encoding="utf-8"
+    )
+    human_review = (repo_root / "skills/human-review/SKILL.md").read_text(encoding="utf-8")
+    human_review_metadata = (repo_root / "skills/human-review/agents/openai.yaml").read_text(
+        encoding="utf-8"
+    )
     develop_plugin = (repo_root / "skills/develop-plugin/SKILL.md").read_text(encoding="utf-8")
     develop_plugin_metadata = (repo_root / "skills/develop-plugin/agents/openai.yaml").read_text(
         encoding="utf-8"
@@ -289,11 +296,21 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "## Depends on",
         "ordered mathematical book",
         "reading order",
+        "mathematical significance",
+        "pull-request-sized unit",
+        "one unique main result",
+        "targeted lookups",
+        "exact verified upstream result",
+        "Reconcile the coarse milestone pages",
     ):
         assert required in roadmap
     assert "renders them only at the bottom of\n  book pages" in setup
     assert "references/thesis-worked-node.md" in orchestrate
-    assert "references/thesis-review-case.md" in review
+    assert "Schedule prerequisite nodes before their dependents" in orchestrate
+    assert "references/thesis-review-case.md" in agent_review
+    assert "references/roadmap-quality.md" in agent_review
+    assert "autoform-visualize" in human_review
+    assert "`approve`, `revise`, or\n`block`" in human_review
     for required in (
         "example-based plugin",
         "independent formalization",
@@ -308,10 +325,17 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert len(develop_plugin.split()) <= 220
     assert "$setup" in setup_metadata
     assert "$roadmap" in roadmap_metadata
+    assert "$agent-review" in agent_review_metadata
+    assert "$human-review" in human_review_metadata
     assert "$develop-plugin" in develop_plugin_metadata
     assert "stops before\nmathematical planning" in setup
     assert "Do not\nscan for undecomposed chapters" in orchestrate
     assert "When developing or adapting" not in roadmap
     assert (repo_root / "skills/roadmap/references/cabannes-thesis-roadmap.md").is_file()
+    roadmap_example = (
+        repo_root / "skills/roadmap/references/cabannes-thesis-roadmap.md"
+    ).read_text(encoding="utf-8")
+    assert "coherent pull\nrequest and review unit" in roadmap_example
     assert (repo_root / "skills/orchestrate/references/thesis-worked-node.md").is_file()
-    assert (repo_root / "skills/review/references/thesis-review-case.md").is_file()
+    assert (repo_root / "skills/agent-review/references/thesis-review-case.md").is_file()
+    assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()

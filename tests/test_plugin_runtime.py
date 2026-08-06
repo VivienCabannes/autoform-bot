@@ -10,16 +10,24 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-def test_plugin_surface_is_five_skills_and_two_servers(repo_root):
+def test_plugin_surface_is_six_skills_and_two_servers(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
-    assert skills == {"setup", "roadmap", "orchestrate", "review", "develop-plugin"}
+    assert skills == {
+        "setup",
+        "roadmap",
+        "orchestrate",
+        "human-review",
+        "agent-review",
+        "develop-plugin",
+    }
 
-    review_dir = repo_root / "skills" / "review"
+    review_dir = repo_root / "skills" / "agent-review"
     references = {
         "faithfulness.md",
         "proof-integrity.md",
         "code-quality.md",
         "mathlib-style.md",
+        "roadmap-quality.md",
         "thesis-review-case.md",
     }
     assert {path.name for path in (review_dir / "references").glob("*.md")} == references
@@ -42,13 +50,14 @@ def test_plugin_surface_is_five_skills_and_two_servers(repo_root):
             assert config["mcpServers"][name]["args"][-2:] == ["-m", module]
 
     codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
-    assert len(codex_manifest["interface"]["defaultPrompt"]) == 5
+    assert len(codex_manifest["interface"]["defaultPrompt"]) == 6
     muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
     assert [command["id"] for command in muse["capabilities"]["commands"]] == [
         "setup",
         "roadmap",
         "orchestrate",
-        "review",
+        "human-review",
+        "agent-review",
         "develop-plugin",
     ]
     for command in muse["capabilities"]["commands"]:

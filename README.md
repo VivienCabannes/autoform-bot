@@ -37,13 +37,14 @@ and MCP servers are reloaded. The installed package and commands retain the
 ## Plugin surface
 
 Invoke a skill from your coding agent with `/autoform:setup`,
-`/autoform:roadmap`, `/autoform:orchestrate`, `/autoform:review`, or
-`/autoform:develop-plugin`.
+`/autoform:roadmap`, `/autoform:orchestrate`, `/autoform:human-review`,
+`/autoform:agent-review`, or `/autoform:develop-plugin`.
 
 - `setup` creates or repairs the Lean repository, Markdown blueprint, CI, and Pages infrastructure.
-- `roadmap` confirms sources and scope, then builds roadmap, coverage, and theorem DAG notes.
+- `roadmap` confirms sources and scope, then builds milestones, coverage, and pull-request-sized DAG nodes.
 - `orchestrate` works ready nodes with native subagents and Lean tools.
-- `review` independently checks faithfulness, proof integrity, and Mathlib code quality.
+- `human-review` prepares graph, progress, source, and Lean-code views for a person's judgment.
+- `agent-review` independently scores roadmap quality or Lean faithfulness, integrity, and code quality from evidence.
 - `develop-plugin` maintains Autoform itself through its executable formalization example.
 
 The plugin also gives coding agents execution and inspection tools through a
@@ -59,7 +60,7 @@ generated database:
 ```text
 blueprint/
 ├── README.md                 project landing page
-├── roadmap/                  milestones and formalization-sized DAG nodes
+├── roadmap/                  milestones and pull-request-sized DAG nodes
 │   ├── README.md             high-level direction
 │   └── convexity/
 │       ├── README.md         milestone narrative

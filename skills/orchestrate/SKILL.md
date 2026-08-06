@@ -8,6 +8,8 @@ links as the source of truth. Work ready nodes with native subagents plus the
 Lean LSP and REPL servers. Record only what compiled: `statement: formalized`,
 `proof: formalized`, and the exact declaration name in `lean`; ready and
 fully-proved are derived by `autoform check`, so never write them by hand.
+Schedule prerequisite nodes before their dependents and parallelize only nodes
+whose declared statement or proof prerequisites are satisfied.
 Search local Mathlib or community prior art
 with host-native tools when useful, then verify every candidate with Lean before
 reporting completion.

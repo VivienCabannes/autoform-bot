@@ -12,8 +12,9 @@ description: >-
 
 # Build an Autoform roadmap
 
-Turn confirmed mathematical sources into a human-editable roadmap and a
-theorem-sized DAG. Keep Markdown as the sole source of truth.
+Turn confirmed mathematical sources into a human-editable roadmap and a DAG
+of pull-request-sized formalization units. Keep Markdown as the sole source of
+truth.
 
 ## Establish the planning boundary
 
@@ -32,8 +33,13 @@ mathematics.
 ## Build from coarse to fine
 
 1. Record source notes under `blueprint/sources/`, including stable locations
-   for every definition or theorem used in the plan.
+   for every definition or theorem used in the plan. Work from the source text;
+   for large sources, use targeted lookups for a named result or definition and
+   record the exact passage rather than relying on memory. Surface prerequisites
+   not covered by the confirmed sources instead of inventing them.
 2. Write the high-level direction and milestones under `blueprint/roadmap/`.
+   Group milestones by coherent mathematical significance, not by source
+   section size.
    Begin each planning page with simple YAML scalar properties such as
    `kind: roadmap` and `status: active` so Obsidian and people can see its
    state immediately. Treat `blueprint/README.md` and the roadmap pages it
@@ -47,16 +53,24 @@ mathematics.
    partial theorem slice.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
-5. After approval, create one file per formalization-sized definition or
-   statement beside its milestone under `blueprint/roadmap/**/*.md`. Set
-   `kind: node`; its path relative to `roadmap/`, without `.md`, is its stable
-   ID. Give it exactly one H1, a `declaration` naming the intended Lean
-   artifact, a source-grounded statement or proof sketch, and a
-   `## Depends on` section. Never overload `kind` with the declaration.
+5. After approval, create one file per pull-request-sized unit beside its
+   milestone under `blueprint/roadmap/**/*.md`. A node may contain several
+   supporting definitions or statements when they should land and be reviewed
+   together, but it must identify one unique main result that determines when
+   the node is complete. Set `kind: node`; its path relative to `roadmap/`,
+   without `.md`, is its stable ID. Give it exactly one H1, a `declaration`
+   naming the main Lean artifact, a source-grounded statement or proof sketch,
+   and a `## Depends on` section. Never overload `kind` with the declaration.
 6. Put only genuine prerequisite links under `## Depends on`; those relative
    Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
    a prerequisite the proof needs but the statement does not. Keep roadmap,
    coverage, and source links under other headings.
+7. Search the pinned Mathlib checkout before planning new work. Set
+   `mathlib: true` only for an exact verified upstream result; record partial or
+   uncertain candidates as notes, never as formalization status.
+8. Reconcile the coarse milestone pages and coverage contract with the finished
+   fine DAG so newly discovered prerequisites, moved units, and deferred scope
+   do not leave the roadmap stale.
 
 Assert only what is checked: `statement: formalized`, `proof: formalized`,
 `mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
@@ -79,4 +93,6 @@ Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
 `lean:` names before handoff. Report roadmap and coverage status, node and edge
 counts, the derived state summary, unresolved source questions, and the
 vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
-hand CI, Pages, Lean-project, or vault infrastructure changes back to Setup.
+hand the draft to Agent Review for mathematical-plan judgment or Human Review
+for visual inspection; hand CI, Pages, Lean-project, or vault infrastructure
+changes back to Setup.

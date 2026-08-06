@@ -17,8 +17,13 @@ The example stays intentionally small:
 - seven DAG nodes decompose one representative “Infimum Loss” slice and its
   supporting full-supervision construction.
 
+These nodes happen to map one-to-one to main public artifacts. That is not a
+format restriction: a node may carry several supporting definitions or
+statements when one unique main result makes the whole node a coherent pull
+request and review unit.
+
 This asymmetry is deliberate. The six chapter entries are candidate roadmap
-clusters, while only one cluster has theorem-sized nodes. The example is not a
+clusters, while only one cluster has pull-request-sized nodes. The example is not a
 completed whole-thesis plan: comparison, consistency, learning-rate results,
 and the other chapters still need source inspection and decomposition.
 
