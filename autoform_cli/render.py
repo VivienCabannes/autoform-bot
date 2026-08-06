@@ -9,6 +9,7 @@ from Markdown instead.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
@@ -29,8 +30,23 @@ _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
 _DEPENDENCY_SECTIONS = frozenset({"depends on", "proof depends on"})
 _SKIPPED_DIRECTORIES = frozenset({".obsidian", ".trash", ".git"})
+PUBLICATION_MANIFEST = "publication.json"
 #: Derived views this command rewrites; stale copies must not leak into the site.
-_GENERATED_FILES = frozenset({"dependencies.md", "dependencies.html", "graph.html", "progress.md"})
+_GENERATED_FILES = frozenset(
+    {"dependencies.md", "dependencies.html", "graph.html", "progress.md", PUBLICATION_MANIFEST}
+)
+_LOCAL_ONLY_NAMES = frozenset(
+    {
+        ".autoform",
+        "agents_status.json",
+        "backend_config.json",
+        "credentials.json",
+        "dispatcher.log",
+        "provider_settings.json",
+        "secrets.json",
+        "task_queue.json",
+    }
+)
 
 #: How a ``declaration:`` value is announced in the statement box.
 DECLARATION_LABELS = {
@@ -126,6 +142,14 @@ class RenderReport:
     unresolved: list[str] = field(default_factory=list)
 
 
+class PublicationError(ValueError):
+    """The requested static publication could expose or destroy local state."""
+
+    def __init__(self, issues: Iterable[str]) -> None:
+        self.issues = tuple(issues)
+        super().__init__("; ".join(self.issues))
+
+
 def render_site(
     blueprint_dir: str | Path,
     output_dir: str | Path,
@@ -135,11 +159,20 @@ def render_site(
     ref: str | None = None,
     clean: bool = True,
 ) -> RenderReport:
-    """Write the published form of *blueprint_dir* into *output_dir*."""
+    """Write deterministic, read-only projections of the Markdown blueprint.
+
+    Authored Markdown remains the only graph authority. The output joins three
+    reader surfaces over it: a book, derived progress, and multiscale dependency
+    maps. Publication excludes hidden and operational files, rejects symlinks,
+    and never embeds timestamps or machine-specific paths.
+    """
     blueprint = Path(blueprint_dir).expanduser().resolve()
     destination = Path(output_dir).expanduser().resolve()
-    if destination == blueprint:
-        raise ValueError("refusing to render a blueprint over itself")
+    if _is_within(destination, blueprint) or _is_within(blueprint, destination):
+        raise PublicationError(
+            ["blueprint and output directories must be disjoint; refusing destructive render"]
+        )
+    _validate_publication_tree(blueprint)
 
     graph = load_graph(blueprint)
     statuses = status.derive(graph)
@@ -178,7 +211,7 @@ def render_site(
 
     for source in sorted(blueprint.rglob("*")):
         relative = source.relative_to(blueprint)
-        if _SKIPPED_DIRECTORIES.intersection(relative.parts):
+        if _SKIPPED_DIRECTORIES.intersection(relative.parts) or _is_hidden(relative):
             continue
         if relative.name in _GENERATED_FILES:
             continue
@@ -278,7 +311,77 @@ def render_site(
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
+    _write_publication_manifest(destination, blueprint, graph, linker)
     return report
+
+
+def _validate_publication_tree(blueprint: Path) -> None:
+    """Reject inputs that could leak local state through a public artifact."""
+    issues: list[str] = []
+    if not blueprint.is_dir():
+        return
+    for source in sorted(blueprint.rglob("*")):
+        relative = source.relative_to(blueprint)
+        folded_parts = {part.casefold() for part in relative.parts}
+        name = relative.name.casefold()
+        if (
+            folded_parts.intersection(_LOCAL_ONLY_NAMES)
+            or name == ".env"
+            or name.startswith(".env.")
+            or name.endswith((".key", ".log", ".pem"))
+        ):
+            issues.append(f"refusing local or sensitive publication input: {relative.as_posix()}")
+            continue
+        if _is_hidden(relative):
+            continue
+        if source.is_symlink():
+            issues.append(f"refusing symlink in blueprint publication: {relative.as_posix()}")
+    if issues:
+        raise PublicationError(issues)
+
+
+def _is_hidden(relative: Path) -> bool:
+    return any(part.startswith(".") for part in relative.parts)
+
+
+def _published_source_files(blueprint: Path):
+    """Yield the regular authored inputs that contribute to the static site."""
+    for source in sorted(blueprint.rglob("*")):
+        relative = source.relative_to(blueprint)
+        if _SKIPPED_DIRECTORIES.intersection(relative.parts) or _is_hidden(relative):
+            continue
+        if relative.name in _GENERATED_FILES or not source.is_file():
+            continue
+        yield source, relative
+
+
+def _source_revision(blueprint: Path) -> str:
+    digest = hashlib.sha256(b"autoform-markdown-publication/v1\0")
+    for source, relative in _published_source_files(blueprint):
+        digest.update(relative.as_posix().encode("utf-8") + b"\0")
+        digest.update(source.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def _write_publication_manifest(
+    destination: Path,
+    blueprint: Path,
+    graph: Graph,
+    linker: SourceLinker,
+) -> None:
+    manifest = {
+        "schema": "autoform-publication/v1",
+        "source": "blueprint/roadmap Markdown",
+        "source_revision": _source_revision(blueprint),
+        "git_ref": linker.ref,
+        "nodes": len(graph.nodes),
+        "dependencies": graph.edge_count,
+        "views": ["book", "progress", "project", "chapter", "focus", "full"],
+    }
+    (destination / PUBLICATION_MANIFEST).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _group_nodes(graph: Graph) -> dict[str, list[str]]:
@@ -1408,6 +1511,8 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
 __all__ = [
     "DECLARATION_LABELS",
     "MERMAID_SCRIPT",
+    "PUBLICATION_MANIFEST",
+    "PublicationError",
     "STYLESHEET",
     "RenderReport",
     "render_site",

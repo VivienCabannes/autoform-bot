@@ -4,8 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from autoform_cli import graph_views
 from autoform_cli.graph import Graph, Node
-from autoform_cli.graph_views import chapter_view, focus_view, full_view, project_view
+from autoform_cli.graph_views import chapter_view, focus_view, focus_views, full_view, project_view
 from autoform_cli.status import derive
 
 
@@ -113,6 +114,27 @@ def test_focus_view_uses_graph_distance_independently_of_chapter_scope(tmp_path:
 
     with pytest.raises(ValueError, match="non-negative"):
         focus_view(graph, statuses, "b/top", radius=-1)
+
+
+def test_bulk_focus_views_share_graph_wide_indexes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = _graph(tmp_path)
+    statuses = derive(graph)
+    original = graph_views.topological_order
+    calls = 0
+
+    def counted(candidate: Graph) -> list[str]:
+        nonlocal calls
+        calls += 1
+        return original(candidate)
+
+    monkeypatch.setattr(graph_views, "topological_order", counted)
+    views = focus_views(graph, statuses)
+
+    assert calls == 1
+    assert set(views) == set(graph.nodes)
+    assert views["b/top"] == focus_view(graph, statuses, "b/top")
 
 
 def test_full_view_preserves_every_fine_node_and_edge(tmp_path: Path) -> None:

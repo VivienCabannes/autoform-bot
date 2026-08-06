@@ -129,3 +129,16 @@ correctness to the agent and the Lean kernel.
 
 The Markdown files are the source of truth. Graphs and sites are derived views
 that may be regenerated at any time.
+
+## Publication contract
+
+`autoform render` publishes three views of the same committed Markdown: the
+book, derived progress, and dependency maps at project, chapter, local, and
+full-graph scales. It never reads a `graph.json` or an operational queue.
+Hidden files are omitted, while symlinks, credentials, logs, provider state,
+and agent/task state inside the blueprint cause the render to fail rather than
+silently leak them. Source and output directories must be disjoint.
+
+Every render writes `publication.json` with the source-content hash, Git ref,
+node and dependency counts, and available views. It contains no timestamp or
+absolute path, so identical inputs produce identical output files.

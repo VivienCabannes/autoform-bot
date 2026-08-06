@@ -78,6 +78,10 @@ and validation reference](autoform_cli/README.md), the [repository
 example](skills/setup/assets/cabannes-thesis-project/README.md), or the [roadmap
 example](skills/roadmap/references/cabannes-thesis-roadmap.md).
 
+Conventionally, each first-level roadmap folder is a book chapter and each
+node page is one PR-sized major result or important definition. Project,
+chapter, one-hop, and full-DAG views are generated from those same files.
+
 ## CLI commands
 
 Autoform ships command-line tools with the plugin package. From this
