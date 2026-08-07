@@ -309,6 +309,10 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "targeted lookups",
         "exact verified upstream result",
         "Reconcile the coarse milestone pages",
+        "GitHub pull requests and issues",
+        "Zulip topics",
+        "project-authored specification",
+        "never contact people",
     ):
         assert required in roadmap
     assert "renders them only at the bottom of\n  book pages" in setup
@@ -325,6 +329,10 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "make check-example",
         "plugin-creator",
         "new thread",
+        "user nudges",
+        "product evidence",
+        "future agents need less steering",
+        "not the transcript",
     ):
         assert required in develop_plugin
     assert re.search(r"consumer\s+scenario", develop_plugin)

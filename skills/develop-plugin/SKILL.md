@@ -6,24 +6,26 @@ description: >-
   consumer Lean projects; not for their mathematics.
 ---
 
-# Develop Autoform from consumer outcomes
+# Develop Autoform from consumer nudges
 
-Treat Autoform as an example-based plugin. Its product is installed behavior in
-an independent formalization repository; the bundled Cabannes thesis repository
-is only an executable consumer example.
+Treat Autoform as an example-based plugin whose product is installed behavior
+in an independent formalization repository. Use the bundled Cabannes thesis
+repository only as an executable consumer example.
 
-Inspect the worktree, then state a consumer scenario: given installed Autoform,
-what action should produce what result? Trace only relevant layers. For a
-refactor, name the installed behavior that must stay invariant.
+Inspect the worktree, state a consumer scenario, and observe installed behavior.
+For a refactor, name the invariant. Trace needed layers.
+
+Treat user nudges during real work as product evidence. Distill reusable ones
+into the owning skill as a trigger, decision rule, and action.
+Ensure future agents need less steering.
+Preserve the insight, not the transcript or consumer choice.
+Add a focused test and acceptance assertion in `tests/test_skill_examples.py`.
 
 Implement reusable plugin behavior. Keep Cabannes-specific facts in the example
-and references; use it to demonstrate outcomes, never special-case it. Prefer a
-focused mechanism test and an acceptance assertion in
-`tests/test_skill_examples.py`.
+and references; demonstrate outcomes without special-casing them.
 
-Keep plugin and formalization roots distinct and development policy here.
-Skills must be succinct. Agents can infer routine details; include only
-non-obvious constraints, domain knowledge, and fragile steps.
+Keep plugin and formalization roots distinct. Agents can infer routine details;
+keep skills to non-obvious constraints and fragile domain steps.
 
 Run focused checks, then normally run:
 
@@ -34,6 +36,5 @@ make check-example
 ```
 
 Run `lake build` when example Lean results change. Validate edited skills and
-the manifest with the skill-creator and plugin-creator validators. Use the
-plugin-creator cachebuster and reinstall workflow only to test installed
-discovery in a new thread. Report the consumer outcome and checks.
+the manifest with skill-creator and plugin-creator. Use cachebuster and reinstall
+only to test installed discovery in a new thread. Report outcome and checks.

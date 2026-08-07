@@ -2,19 +2,37 @@
 name: roadmap
 description: >-
   Build, inspect, refine, or visualize the mathematical roadmap and theorem
-  dependency DAG in an existing Autoform Markdown blueprint. Use for confirming
-  source scope, writing roadmap and coverage notes, decomposing mathematics
-  into kind: node Markdown pages under blueprint/roadmap/, setting planning
-  statuses, or checking roadmap
-  completeness; do not install repository infrastructure or prove Lean
-  declarations.
+  dependency DAG in an existing Autoform Markdown blueprint. Use for discovering
+  prior work, choosing or drafting mathematical sources, confirming scope,
+  writing roadmap and coverage notes, decomposing mathematics into kind: node
+  Markdown pages under blueprint/roadmap/, setting planning statuses, or
+  checking roadmap completeness; do not install repository infrastructure or
+  prove Lean declarations.
 ---
 
 # Build an Autoform roadmap
 
-Turn confirmed mathematical sources into a human-editable roadmap and a DAG
-of pull-request-sized formalization units. Keep Markdown as the sole source of
-truth.
+Turn an agreed mathematical specification into a human-editable roadmap and a
+DAG of pull-request-sized formalization units. Keep Markdown as the sole source
+of truth.
+
+## Discover prior work and sources
+
+Before fixing the architecture, search the pinned Mathlib checkout for existing
+primitives and gaps. When network access is available, also make targeted,
+read-only searches of relevant GitHub pull requests and issues, Zulip topics,
+and authoritative mathematical literature. Report overlapping work, active
+contributors, design rationale, and candidate references; never contact people
+or post externally without explicit user approval.
+
+Distinguish implementation prior art from mathematical sources. Let the user
+choose whether to adopt a reference, ask the agent to locate one, or develop a
+project-authored specification collaboratively. For the last option, brainstorm
+the representation and downstream API first, then record explicit definitions,
+assumptions, intended equivalences, and unresolved choices under
+`blueprint/sources/`; label this material as project-authored rather than
+implying external provenance. Do not expand a fine DAG until its statements are
+grounded in an adopted reference or this agreed specification.
 
 ## Establish the planning boundary
 
