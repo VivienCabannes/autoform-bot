@@ -218,6 +218,7 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs
+    assert "repo_url: https://github.com/facebookresearch/autoform-bot" in mkdocs
     assert "use_directory_urls: false" in mkdocs
     assert "md_in_html" in mkdocs
     assert "pymdownx.superfences" in mkdocs
@@ -243,6 +244,7 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         'Developed with <a href="https://github.com/facebookresearch/autoform-bot">'
         "AutoformBot</a>."
     ) in theme
+    assert '<a href="{{ config.repo_url }}">Formalization source on GitHub</a>.' in theme
     assert "Documentation built with {{ mkdocs_link }}." in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow

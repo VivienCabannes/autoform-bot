@@ -6,6 +6,7 @@
 <hr>
 <p>
   Developed with <a href="https://github.com/facebookresearch/autoform-bot">AutoformBot</a>.
+  {% if config.repo_url %}<a href="{{ config.repo_url }}">Formalization source on GitHub</a>.{% endif %}
   {% trans mkdocs_link='<a href="https://www.mkdocs.org/">MkDocs</a>' %}Documentation built with {{ mkdocs_link }}.{% endtrans %}
 </p>
 {% endblock %}
