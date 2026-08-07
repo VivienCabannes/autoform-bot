@@ -26,6 +26,13 @@ def _project(tmp_path: Path) -> Path:
         "---\nkind: blueprint\n---\n\n# Overview\n\n- [Roadmap](roadmap/README.md)\n",
         encoding="utf-8",
     )
+    (roadmap / "README.md").write_text(
+        "---\nkind: article\n---\n\n# Roadmap\n\n"
+        "This chapter develops the base object before the main result.\n\n"
+        "## Definitions\n\n- [Base](base.md)\n\n"
+        "## Results\n\n- [Top](top.md)\n",
+        encoding="utf-8",
+    )
     (roadmap / "base.md").write_text(
         "---\nkind: node\ndeclaration: def\nstatement: formalized\nlean: Project.Base\n---\n\n"
         "# Base\n\nThe base object.\n\n## Depends on\n\nThis node has no prerequisites.\n",
@@ -82,11 +89,13 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert '"dependencies/chapters/roadmap.html"' in project_map
 
 
-def test_a_chapter_carries_every_statement_in_dependency_order(tmp_path: Path) -> None:
+def test_a_chapter_places_statements_in_the_authored_narrative(tmp_path: Path) -> None:
     _render(tmp_path)
     page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
 
-    assert page.index('id="base"') < page.index('id="top"')
+    assert page.index("This chapter develops") < page.index('class="bp-progress-overview"')
+    assert page.index("## Definitions") < page.index('id="base"') < page.index("## Results")
+    assert page.index("## Results") < page.index('id="top"')
     assert '<div class="bp-thmwrapper theorem-style-definition bp-fully_proved" id="base"' in page
     assert '<div class="bp-thmwrapper theorem-style-plain bp-fully_proved" id="top"' in page
     assert '<span class="bp-thmcaption">Definition</span><span class="bp-thmlabel">1</span>' in page
@@ -98,6 +107,36 @@ def test_a_chapter_carries_every_statement_in_dependency_order(tmp_path: Path) -
     assert "###### Sources" in page
     assert "\n## Sources" not in page
     assert "## Depends on" not in page
+    assert "Additional formalization targets" not in page
+
+
+def test_unplaced_statements_use_an_explicit_fallback_section(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    roadmap = project / "blueprint/roadmap"
+    (roadmap / "README.md").write_text(
+        "# Roadmap\n\nOpening prose.\n\n## Results\n\n- [Top](top.md)\n",
+        encoding="utf-8",
+    )
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+
+    assert page.index('id="top"') < page.index("## Additional formalization targets")
+    assert page.index("## Additional formalization targets") < page.index('id="base"')
+
+
+def test_authored_slots_override_dependency_order_for_book_flow(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    roadmap = project / "blueprint/roadmap"
+    (roadmap / "README.md").write_text(
+        "# Roadmap\n\n## Reading order\n\n- [Top](top.md)\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+    page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+
+    assert page.index('id="top"') < page.index('id="base"')
 
 
 def test_cross_references_point_at_anchors_on_the_chapter(tmp_path: Path) -> None:
@@ -150,12 +189,18 @@ def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp
 def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> None:
     project = _project(tmp_path)
     (project / "blueprint/README.md").write_text(
-        "---\nkind: blueprint\n---\n\n# Overview\n\n- [Top](roadmap/top.md)\n", encoding="utf-8"
+        "---\nkind: blueprint\n---\n\n# Overview\n\n"
+        "- [Roadmap](roadmap/README.md)\n- [Top](roadmap/top.md)\n",
+        encoding="utf-8",
     )
     render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
     overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
     assert "[Top](roadmap/README.md#top)" in overview
+    assert overview.count("bp-book-nav-next") == 1
+    assert chapter.count("bp-book-nav-previous") == 1
+    assert "bp-book-nav-next" not in chapter
 
 
 def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
@@ -164,6 +209,7 @@ def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
     (project / "blueprint/sources.md").write_text("# Paper\n", encoding="utf-8")
     nested = project / "blueprint/roadmap/chapter/deep.md"
     nested.parent.mkdir(parents=True)
+    (nested.parent / "README.md").write_text("# Chapter\n", encoding="utf-8")
     nested.write_text(
         "---\nkind: node\ndeclaration: theorem\n---\n\n# Deep\n\nBody.\n\n"
         "## Sources\n\n- [Paper](../../sources.md)\n",
@@ -292,7 +338,7 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
         "complete": True,
         "dependencies": 1,
         "git_ref": "a" * 40,
-        "nodes": 2,
+        "nodes": 3,
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
         "source_revision": manifest["source_revision"],

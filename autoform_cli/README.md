@@ -1,21 +1,36 @@
 # Blueprint format and CLI
 
-The Autoform CLI validates, visualizes, and publishes the fine-grained
-dependency graph embedded in `blueprint/roadmap/`. Roadmap and coverage
-organization remain project policy; the CLI deliberately enforces only marked
-node pages and graph structure.
+The Autoform CLI validates, visualizes, and publishes the multilevel dependency
+graph embedded in `blueprint/roadmap/`. The Markdown book is the graph: no
+separate authored or generated graph file exists.
 
-## Nodes
+## Articles and containment
 
-A Markdown file below `blueprint/roadmap/` is a node when its frontmatter sets
-`kind: node`. Its path relative to `roadmap/`, without `.md`, is its stable ID.
-Other roadmap pages are ignored by the graph loader. The H1 is the node's human
-title; frontmatter records what has been *checked*:
+Every Markdown file below `blueprint/roadmap/` is an article node. A
+`README.md` represents its directory and strictly contains the articles below
+it; the nearest ancestor `README.md` is the single parent. This supports any
+number of levels, from book to chapter to section to declaration. Ordinary
+files use their path without `.md` as a stable ID; `README.md` uses its
+directory path, with the root article named `roadmap`.
+
+Use `kind: article` for clarity. The H1 is the article's human title. Container
+prose supplies the mathematical exposition, and a standalone list item linking
+to a formalizable leaf places that definition or result at the exact position in
+the published chapter. Leaves without a placement slot appear under an explicit
+“Additional formalization targets” section rather than disappearing.
+
+Keep the root roadmap article short: it is the book's preface and table of
+contents, not a dump of every planned milestone. Large planning inventories
+belong in coverage or progress views; detailed containers should introduce their
+mathematics in prose and place statements under meaningful section headings.
+
+Frontmatter records checked facts:
 
 ```markdown
 ---
-kind: node
+kind: article
 declaration: theorem
+origin: cited
 statement: formalized
 proof: formalized
 lean: MyProject.separatingHyperplane
@@ -38,22 +53,29 @@ State the intended result and proof sketch here.
 - [Chapter 2](../../sources/convexity.md#separation)
 ```
 
-`## Depends on` lists what the node needs in order to be *stated*;
+`## Depends on` lists what the article needs in order to be *stated*;
 `## Proof depends on` lists what only its *proof* needs. Both are graph edges.
 Links anywhere else are ordinary navigation or citations. Dependencies resolve
-relative to the current node and must point at another `kind: node` file inside
-the blueprint.
+relative to the current article and must point at another roadmap article.
 
-`kind` describes the role of a Markdown page, alongside values such as
-`roadmap`, `coverage`, and `source`. The optional `declaration` field describes
-the intended Lean artifact, for example `def`, `theorem`, `lemma`, `structure`,
-or `instance`. Autoform records this hint but does not constrain the set of Lean
-declaration commands. Declarations that introduce data rather than a
-proposition carry no separate proof obligation.
+The optional `declaration` field marks a formalizable leaf and describes its
+intended Lean artifact, for example `def`, `theorem`, `lemma`, `structure`, or
+`instance`. Container and exposition articles omit it. Autoform records this
+hint but does not constrain the set of Lean declaration commands. Declarations
+that introduce data rather than a proposition carry no separate proof
+obligation.
+
+`origin` records provenance for formalizable work: `cited` for a direct source
+target, `bridged` for a result introduced between source targets, and
+`background` for prerequisite mathematics.
+
+Legacy `kind: node` pages under `blueprint/roadmap/` and
+`blueprint/nodes/` continue to load with migration warnings. New roadmaps should
+use articles under `blueprint/roadmap/`.
 
 ## Assertions and derived status
 
-A node asserts only facts a human or agent verified:
+An article asserts only facts a human or agent verified:
 
 | Key | Meaning |
 | --- | --- |
@@ -61,8 +83,8 @@ A node asserts only facts a human or agent verified:
 | `proof: formalized` | The Lean proof is complete. |
 | `mathlib: true` | The result is upstreamed into Mathlib. |
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
-| `lean: Ns.decl` | Declaration name(s) that discharge the node. |
-| `discussion: 42` | Issue number or URL where the node is being discussed. |
+| `lean: Ns.decl` | Declaration name(s) that discharge the article. |
+| `discussion: 42` | Issue number or URL where the article is being discussed. |
 
 Everything a reader thinks of as progress is *derived* from the DAG on every
 run, so it cannot go stale:
@@ -108,37 +130,38 @@ maps, and direct links to Lean declarations at the current commit:
 autoform render blueprint --output site-src --lean-root . --require-declarations
 ```
 
-`render` never writes into the vault. It derives `progress.md`, injects a
-compact progress summary into the blueprint introduction, and shows a source
+`render` never writes into the vault. It derives `progress.md`, places a
+compact progress summary after each chapter's opening prose, and shows a source
 icon when a `lean:` declaration resolves to a repository permalink. Its
-`dependencies.md` entry point collapses nodes by textbook chapter, with links
-to theorem-level chapter maps, one-hop local contexts, and the complete DAG.
-Every graph node returns to the numbered statement, and every statement links
-to its local context. Point `mkdocs.yml` at `docs_dir: site-src` and enable
+`dependencies.md` entry point rolls dependencies through the article hierarchy,
+with links to declaration maps, one-hop local contexts, and the complete DAG.
+Every graph article returns to the book, and every formal statement links to
+its local context. Point `mkdocs.yml` at `docs_dir: site-src` and enable
 `md_in_html` plus a `pymdownx.superfences` mermaid fence; see the [repository
 example](../skills/setup/assets/cabannes-thesis-project/mkdocs.yml).
 
 ## Validation
 
 `autoform check` rejects cycles, missing targets, escaping paths,
-self-dependencies, missing H1 titles, unsupported frontmatter keys, and
-assertion values it does not recognize. With `--lean-root` it also fails on a
-`lean:` name absent from the sources, the job `leanblueprint checkdecls` does
-for LaTeX blueprints. It validates structure and leaves mathematical
-correctness to the agent and the Lean kernel.
+self-dependencies, cycles introduced at any rolled-up containment level,
+missing or multiple H1 titles, unsupported frontmatter keys, and assertion
+values it does not recognize. With `--lean-root` it also fails on a `lean:` name
+absent from the sources, as `leanblueprint checkdecls` does for LaTeX
+blueprints. It validates structure and leaves mathematical correctness to the
+agent and the Lean kernel.
 
 The Markdown files are the source of truth. Graphs and sites are derived views
 that may be regenerated at any time.
 
 ## Publication contract
 
-`autoform render` publishes three views of the same committed Markdown: the
-book, derived progress, and dependency maps at project, chapter, local, and
-full-graph scales. It never reads a `graph.json` or an operational queue.
-Hidden files are omitted, while symlinks, credentials, logs, provider state,
-and agent/task state inside the blueprint cause the render to fail rather than
-silently leak them. Source and output directories must be disjoint.
+`autoform render` publishes the book, derived progress, and dependency maps at
+project, chapter, nested-scope, local, and full-graph scales. It never reads a
+`graph.json` or an operational queue. Hidden files are omitted, while symlinks,
+credentials, logs, provider state, and agent/task state inside the blueprint
+cause the render to fail rather than silently leak them. Source and output
+directories must be disjoint.
 
 Every render writes `publication.json` with the source-content hash, Git ref,
-node and dependency counts, and available views. It contains no timestamp or
+article and dependency counts, and available views. It contains no timestamp or
 absolute path, so identical inputs produce identical output files.

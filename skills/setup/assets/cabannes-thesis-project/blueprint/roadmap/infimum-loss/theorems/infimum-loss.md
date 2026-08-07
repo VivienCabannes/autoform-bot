@@ -1,12 +1,19 @@
 ---
-kind: node
+kind: article
 declaration: theorem
+origin: cited
 ---
 
 # Infimum loss
 
-The next formalization target is the chapter's infimum-loss result, with the
-same objects and hypotheses as the source.
+Let $f^*$ be a solution obtained from the disambiguated distribution. Then
+$f^*$ minimizes the weak risk
+
+$$
+\mathcal R_S(f) = \mathbb E_{(X,S)\sim\tau}[L(f(X),S)],
+$$
+
+where the infimum loss is $L(z,S)=\inf_{y\in S}\ell(z,y)$.
 
 ## Sources
 

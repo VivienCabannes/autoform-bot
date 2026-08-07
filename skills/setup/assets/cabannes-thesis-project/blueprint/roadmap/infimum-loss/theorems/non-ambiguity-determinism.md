@@ -1,6 +1,7 @@
 ---
-kind: node
+kind: article
 declaration: theorem
+origin: cited
 statement: formalized
 proof: formalized
 lean: CabannesThesis.nonAmbiguous_determinism

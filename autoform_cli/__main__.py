@@ -55,7 +55,7 @@ def _check(args: argparse.Namespace) -> int:
 
     statuses = status.derive(graph)
     summary = " · ".join(f"{count} {state.label}" for state, count in status.summarize(statuses))
-    print(f"OK: {len(graph.nodes)} nodes, {graph.edge_count} dependencies")
+    print(f"OK: {len(graph.nodes)} articles, {graph.edge_count} dependencies")
     if summary:
         print(f"    {summary}")
 

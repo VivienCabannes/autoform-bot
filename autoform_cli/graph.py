@@ -29,7 +29,10 @@ _FRONTMATTER_KEYS = frozenset(
         "statement",
         "proof",
         "mathlib",
+        "mathlib_declaration",
+        "mathlib_file",
         "not_ready",
+        "origin",
         "discussion",
         "status",
     }
@@ -43,6 +46,7 @@ _FALSE = frozenset({"false", "no"})
 #: Both are graph edges, mirroring where leanblueprint places ``\uses``.
 _STATEMENT_SECTION = "depends on"
 _PROOF_SECTION = "proof depends on"
+_SOURCES_SECTION = "sources"
 
 
 class GraphValidationError(ValueError):
@@ -63,7 +67,7 @@ class LegacyStatusWarning(UserWarning):
 
 @dataclass(frozen=True, slots=True)
 class Node:
-    """One Markdown node in a blueprint.
+    """One Markdown article in a blueprint.
 
     Only the ``statement``/``proof``/``mathlib``/``not_ready`` assertions are
     recorded here. Everything a reader thinks of as progress -- ready to state,
@@ -83,8 +87,19 @@ class Node:
     statement_formalized: bool = False
     proof_formalized: bool = False
     mathlib: bool = False
+    mathlib_declaration: str | None = None
+    mathlib_file: str | None = None
     not_ready: bool = False
     discussion: str | None = None
+    origin: str | None = None
+    sources: tuple[str, ...] = ()
+    parent: str | None = None
+    depth: int = 0
+
+    @property
+    def formalizable(self) -> bool:
+        """Whether this article names a concrete Lean declaration."""
+        return self.declaration is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +113,10 @@ class Graph:
     def edge_count(self) -> int:
         return sum(len(node.dependencies) for node in self.nodes.values())
 
+    def children(self, node_id: str) -> tuple[str, ...]:
+        """Return the direct contained articles of *node_id*."""
+        return tuple(node.id for node in self.nodes.values() if node.parent == node_id)
+
 
 @dataclass(frozen=True, slots=True)
 class _ParsedNode:
@@ -106,6 +125,7 @@ class _ParsedNode:
     path: Path
     statement_targets: tuple[str, ...]
     proof_targets: tuple[str, ...]
+    source_targets: tuple[str, ...]
     metadata: dict[str, str]
 
 
@@ -132,7 +152,7 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     issues.extend(discovery_issues)
     if uses_legacy_nodes:
         warnings.warn(
-            "blueprint/nodes/ is deprecated; move node files under blueprint/roadmap/ and set kind: node",
+            "blueprint/nodes/ is deprecated; move articles under blueprint/roadmap/ and set kind: article",
             LegacyNodesDirectoryWarning,
             stacklevel=2,
         )
@@ -172,6 +192,7 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     if issues:
         raise GraphValidationError(issues)
 
+    parents = _article_parents(parsed)
     nodes: dict[str, Node] = {}
     for parsed_node in parsed:
 
@@ -201,18 +222,26 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             dependencies=tuple(dependencies),
             statement_dependencies=tuple(statement_dependencies),
             proof_dependencies=tuple(proof_dependencies),
-            kind="node",
+            kind="article",
             declaration=metadata.get("declaration"),
             lean=metadata.get("lean"),
             statement_formalized=metadata.get("statement") == _FORMALIZED,
             proof_formalized=metadata.get("proof") == _FORMALIZED,
             mathlib=metadata.get("mathlib") in _TRUE,
+            mathlib_declaration=metadata.get("mathlib_declaration"),
+            mathlib_file=metadata.get("mathlib_file"),
             not_ready=metadata.get("not_ready") in _TRUE,
             discussion=metadata.get("discussion"),
+            origin=metadata.get("origin"),
+            sources=parsed_node.source_targets,
+            parent=parents[parsed_node.id],
+            depth=_article_depth(parsed_node.id, parents),
         )
 
     if not issues:
         issues.extend(_find_cycles(nodes))
+    if not issues:
+        issues.extend(_find_rollup_cycles(nodes))
     if issues:
         raise GraphValidationError(issues)
     return Graph(blueprint_dir=blueprint, nodes=nodes)
@@ -235,9 +264,7 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str], bool
                 relative = path.relative_to(roadmap_root).as_posix()
                 issues.append(f"{relative}: cannot read roadmap page: {exc}")
                 continue
-            if not _declares_node(text):
-                continue
-            node_id = path.relative_to(roadmap_root).with_suffix("").as_posix()
+            node_id = _article_id(path, roadmap_root)
             canonical = path.resolve()
             if not _is_within(canonical, roadmap_root):
                 issues.append(f"{node_id}: node file escapes the roadmap directory")
@@ -264,20 +291,40 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str], bool
     return sources, issues, uses_legacy_nodes
 
 
-def _declares_node(text: str) -> bool:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return False
-    for raw in lines[1:]:
-        stripped = raw.strip()
-        if stripped == "---":
-            break
-        if ":" not in stripped:
-            continue
-        key, value = (part.strip() for part in stripped.split(":", 1))
-        if key == "kind" and _unquote_scalar(value) == "node":
-            return True
-    return False
+def _article_id(path: Path, roadmap_root: Path) -> str:
+    relative = path.relative_to(roadmap_root)
+    if relative.name.casefold() == "readme.md":
+        parent = relative.parent.as_posix()
+        return parent if parent != "." else "roadmap"
+    return relative.with_suffix("").as_posix()
+
+
+def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
+    """Infer strict single-parent containment from nested README articles."""
+    by_path = {node.path.resolve(): node.id for node in parsed}
+    parents: dict[str, str | None] = {}
+    for node in parsed:
+        candidate = node.path.parent
+        if node.path.name.casefold() == "readme.md":
+            candidate = candidate.parent
+        parent: str | None = None
+        while candidate != candidate.parent:
+            readme = (candidate / "README.md").resolve()
+            if readme in by_path:
+                parent = by_path[readme]
+                break
+            candidate = candidate.parent
+        parents[node.id] = parent
+    return parents
+
+
+def _article_depth(node_id: str, parents: dict[str, str | None]) -> int:
+    depth = 0
+    parent = parents[node_id]
+    while parent is not None:
+        depth += 1
+        parent = parents[parent]
+    return depth
 
 
 def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None, list[str]]:
@@ -285,7 +332,11 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
     metadata, body_start, issues = _parse_frontmatter(node_id, lines)
     title: str | None = None
     title_count = 0
-    targets: dict[str, list[str]] = {_STATEMENT_SECTION: [], _PROOF_SECTION: []}
+    targets: dict[str, list[str]] = {
+        _STATEMENT_SECTION: [],
+        _PROOF_SECTION: [],
+        _SOURCES_SECTION: [],
+    }
     section: str | None = None
     fence: tuple[str, int] | None = None
     body = _HTML_COMMENT.sub("", "\n".join(lines[body_start:]))
@@ -334,6 +385,7 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
         path,
         tuple(targets[_STATEMENT_SECTION]),
         tuple(targets[_PROOF_SECTION]),
+        tuple(targets[_SOURCES_SECTION]),
         metadata,
     )
     return parsed, []
@@ -389,6 +441,10 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
     if key in {"mathlib", "not_ready"}:
         if folded not in _TRUE | _FALSE:
             return value, f"{location}: {key!r} accepts only true or false"
+        return folded, None
+    if key == "origin":
+        if folded not in {"cited", "bridged", "background"}:
+            return value, f"{location}: 'origin' accepts cited, bridged, or background"
         return folded, None
     return value, None
 
@@ -472,6 +528,59 @@ def _find_cycles(nodes: dict[str, Node]) -> list[str]:
     for node_id in sorted(nodes):
         if state.get(node_id, 0) == 0:
             visit(node_id)
+    return issues
+
+
+def _find_rollup_cycles(nodes: dict[str, Node]) -> list[str]:
+    """Reject cycles introduced by contracting articles at any hierarchy level."""
+    children: dict[str | None, list[str]] = {}
+    for node in nodes.values():
+        children.setdefault(node.parent, []).append(node.id)
+
+    def direct_child(scope: str | None, node_id: str) -> str | None:
+        current = node_id
+        while nodes[current].parent != scope:
+            parent = nodes[current].parent
+            if parent is None:
+                return None
+            current = parent
+        return current
+
+    issues: list[str] = []
+    for scope, siblings in children.items():
+        if len(siblings) < 2:
+            continue
+        dependencies = {sibling: set() for sibling in siblings}
+        for target in nodes.values():
+            target_child = direct_child(scope, target.id)
+            if target_child not in dependencies:
+                continue
+            for dependency in target.dependencies:
+                source_child = direct_child(scope, dependency)
+                if source_child in dependencies and source_child != target_child:
+                    dependencies[target_child].add(source_child)
+        state: dict[str, int] = {}
+        stack: list[str] = []
+
+        def visit(article_id: str) -> None:
+            state[article_id] = 1
+            stack.append(article_id)
+            for prerequisite in sorted(dependencies[article_id]):
+                if state.get(prerequisite, 0) == 0:
+                    visit(prerequisite)
+                elif state.get(prerequisite) == 1:
+                    start = stack.index(prerequisite)
+                    cycle = stack[start:] + [prerequisite]
+                    label = scope or "root"
+                    message = f"rolled-up dependency cycle in {label}: {' -> '.join(cycle)}"
+                    if message not in issues:
+                        issues.append(message)
+            stack.pop()
+            state[article_id] = 2
+
+        for article_id in sorted(dependencies):
+            if state.get(article_id, 0) == 0:
+                visit(article_id)
     return issues
 
 

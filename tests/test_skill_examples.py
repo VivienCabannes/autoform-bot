@@ -25,15 +25,24 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     graph = load_graph(blueprint)
 
     assert set(graph.nodes) == {
+        "roadmap",
+        "infimum-loss",
+        "full-supervision",
         "infimum-loss/definitions/eligibility",
         "infimum-loss/definitions/non-ambiguity",
         "infimum-loss/theorems/infimum-loss",
         "infimum-loss/theorems/non-ambiguity-determinism",
         "infimum-loss/theorems/supervision-recovery",
         "full-supervision/definitions/full-supervision",
-        "full-supervision/theorems/supervision-non-ambiguous",
+        "infimum-loss/theorems/supervision-non-ambiguous",
     }
     assert graph.edge_count == 9
+    assert graph.nodes["roadmap"].parent is None
+    assert graph.nodes["infimum-loss"].parent == "roadmap"
+    assert graph.nodes["full-supervision"].parent == "roadmap"
+    formalizable = {node.id for node in graph.nodes.values() if node.formalizable}
+    assert len(formalizable) == 7
+    assert all(graph.nodes[node_id].origin == "cited" for node_id in formalizable)
     eligibility = graph.nodes["infimum-loss/definitions/eligibility"]
     assert eligibility.declaration == "def"
     assert eligibility.statement_formalized
@@ -45,7 +54,7 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     )
     assert recovery.proof_dependencies == (
         "infimum-loss/theorems/non-ambiguity-determinism",
-        "full-supervision/theorems/supervision-non-ambiguous",
+        "infimum-loss/theorems/supervision-non-ambiguous",
     )
 
     # The example exercises two real book chapters and an honest cross-chapter
@@ -55,7 +64,7 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert statuses["infimum-loss/theorems/supervision-recovery"].key == "planned"
     assert statuses["infimum-loss/theorems/infimum-loss"].key == "can_state"
     assert statuses["infimum-loss/definitions/eligibility"].key == "fully_proved"
-    assert statuses["full-supervision/theorems/supervision-non-ambiguous"].key == (
+    assert statuses["infimum-loss/theorems/supervision-non-ambiguous"].key == (
         "fully_proved"
     )
 
@@ -110,11 +119,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert report.unresolved == []
     manifest = json.loads((site / "publication.json").read_text(encoding="utf-8"))
     assert manifest["schema"] == "autoform-publication/v1"
-    assert manifest["nodes"] == 7
+    assert manifest["nodes"] == 10
     assert manifest["dependencies"] == 9
     assert manifest["git_ref"] == "0" * 40
     assert str(example) not in json.dumps(manifest)
     graph = load_graph(example / "blueprint")
+    formalizable = {node.id for node in graph.nodes.values() if node.formalizable}
 
     # Statements are published as environments on their milestone chapter,
     # each anchored so every cross-reference still lands on the statement.
@@ -138,11 +148,11 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert '<details class="bp-dependencies"><summary>Dependencies</summary>' in chapter
     assert 'href="../../progress.html"' in chapter
     assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in chapter
-    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
     assert (
-        'class="bp-book-nav-link bp-book-nav-next" '
+        'class="bp-book-nav-link bp-book-nav-previous" '
         'href="../full-supervision/index.html"'
     ) in chapter
+    assert 'bp-book-nav-next' not in chapter
 
     support_path = site / "roadmap/full-supervision/README.md"
     support = support_path.read_text(encoding="utf-8")
@@ -152,13 +162,13 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         anchor = node_id.split("/", 1)[1].replace("/", "-")
         assert f'id="{anchor}"' in support, node_id
     assert 'class="bp-thmwrapper theorem-style-definition bp-fully_proved"' in support
-    assert 'class="bp-thmwrapper theorem-style-plain bp-fully_proved"' in support
+    assert 'class="bp-thmwrapper theorem-style-plain' not in support
     assert '<a class="bp-code-link"' in support
+    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in support
     assert (
-        'class="bp-book-nav-link bp-book-nav-previous" '
+        'class="bp-book-nav-link bp-book-nav-next" '
         'href="../infimum-loss/index.html"'
     ) in support
-    assert 'bp-book-nav-next' not in support
 
     for href in _HREF.findall(chapter):
         if href.startswith(("http", "#")):
@@ -186,7 +196,7 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     )
     assert "graph_view: chapter" in chapter_graph
     assert "graph_view: chapter" in support_graph
-    for node_id in graph.nodes:
+    for node_id in formalizable:
         anchor = node_id.split("/", 1)[1].replace("/", "-")
         group = node_id.split("/", 1)[0]
         target_graph = chapter_graph if group == "infimum-loss" else support_graph
