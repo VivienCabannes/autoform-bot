@@ -1,6 +1,6 @@
 {
   "name": "autoform",
-  "version": "0.5.0+codex.20260805134416",
+  "version": "0.5.0+codex.20260806102126",
   "description": "Set up Lean repositories, build source-grounded Markdown roadmaps, prove ready nodes, and support human or agent review.",
   "author": {
     "name": "Vivien Cabannes"

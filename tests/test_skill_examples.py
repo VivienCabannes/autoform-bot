@@ -83,6 +83,10 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
 
     readme = (example / "README.md").read_text(encoding="utf-8")
     assert "[Browse the formalization blueprint](blueprint/README.md)" in readme
+    assert (
+        "Developed with "
+        "[AutoformBot](https://github.com/facebookresearch/autoform-bot)."
+    ) in readme
     assert (example / "CabannesThesis.lean").is_file()
     assert (example / "CabannesThesis/Basic.lean").is_file()
     toolchain = (example / "lean-toolchain").read_text(encoding="utf-8").strip()
@@ -234,6 +238,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "custom_dir: theme" in mkdocs
     theme = (example / "theme" / "main.html").read_text(encoding="utf-8")
     assert "{% block next_prev %}{% endblock %}" in theme
+    assert "{% block footer %}" in theme
+    assert (
+        'Developed with <a href="https://github.com/facebookresearch/autoform-bot">'
+        "AutoformBot</a>."
+    ) in theme
+    assert "Documentation built with {{ mkdocs_link }}." in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow
@@ -311,6 +321,9 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "Reconcile the coarse milestone pages",
         "GitHub pull requests and issues",
         "Zulip topics",
+        "`.zuliprc`",
+        "without printing or copying its credentials",
+        "ask the user to provide its path or configure one",
         "project-authored specification",
         "never contact people",
     ):

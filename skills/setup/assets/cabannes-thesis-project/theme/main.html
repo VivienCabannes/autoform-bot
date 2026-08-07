@@ -1,3 +1,11 @@
 {% extends "base.html" %}
 
 {% block next_prev %}{% endblock %}
+
+{% block footer %}
+<hr>
+<p>
+  Developed with <a href="https://github.com/facebookresearch/autoform-bot">AutoformBot</a>.
+  {% trans mkdocs_link='<a href="https://www.mkdocs.org/">MkDocs</a>' %}Documentation built with {{ mkdocs_link }}.{% endtrans %}
+</p>
+{% endblock %}
