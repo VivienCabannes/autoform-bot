@@ -4,9 +4,10 @@ description: >-
   Set up, inspect, or repair repository infrastructure for an Autoform Lean
   project, including the Lean/Mathlib shell, an in-repository
   Obsidian-compatible blueprint vault, ignore rules, MkDocs, GitHub Pages, and
-  verification CI. Use for new repositories, environment repair, publication
-  setup, or infrastructure checks; do not choose mathematical scope or build
-  the roadmap and theorem DAG.
+  verification CI, with optional Zulip community synchronization. Use for new
+  repositories, environment repair, publication setup, infrastructure checks,
+  or an explicitly requested Zulip project sync; do not choose mathematical
+  scope or build the roadmap and theorem DAG.
 ---
 
 # Set up an Autoform repository
@@ -91,6 +92,11 @@ When approved, prepare the commit, remote, Pages source, and push; otherwise
 leave the workflow inert.
 If credentials, hosting, or repository settings block publication, report the
 minimal owner action required.
+
+Zulip synchronization is a separate opt-in outward-facing action. When the user
+asks to discover community context or announce and coordinate the project, read
+and follow [the shared Zulip workflow](references/zulip.md). Do not infer consent
+to post from repository setup, roadmap work, or permission to search.
 
 Report the Lean toolchain, vault path, CI and Pages files, validation results,
 the publication decision, and any one-time GitHub setting the user must still

@@ -302,6 +302,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "GitHub Pages",
         "root `README.md`",
         "verified canonical URL",
+        "references/zulip.md",
+        "separate opt-in outward-facing action",
     ):
         assert required in setup
     for required in (
@@ -323,9 +325,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "Reconcile the coarse milestone pages",
         "GitHub pull requests and issues",
         "Zulip topics",
-        "`.zuliprc`",
-        "without printing or copying its credentials",
-        "ask the user to provide its path or configure one",
+        "../setup/references/zulip.md",
         "project-authored specification",
         "never contact people",
     ):
@@ -369,3 +369,25 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert (repo_root / "skills/orchestrate/references/thesis-worked-node.md").is_file()
     assert (repo_root / "skills/agent-review/references/thesis-review-case.md").is_file()
     assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()
+
+
+def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
+    setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+    zulip = (repo_root / "skills/setup/references/zulip.md").read_text(encoding="utf-8")
+
+    for required in (
+        "Treat reading and writing as separate permissions",
+        "exact active Zulip identities",
+        "Ground the wording in the actual project state",
+        "Present ongoing work as",
+        "people who have already thought about the design",
+        "does not duplicate or scoop existing efforts",
+        "After sending, fetch the",
+        "stream, topic, links, and rendered mentions",
+    ):
+        assert required in zulip
+
+    assert "references/zulip.md" in setup
+    assert "Do not infer consent" in setup
+    assert "../setup/references/zulip.md" in roadmap

@@ -25,10 +25,8 @@ and authoritative mathematical literature. Report overlapping work, active
 contributors, design rationale, and candidate references; never contact people
 or post externally without explicit user approval.
 
-When Zulip API search would help, look for an existing `.zuliprc` in standard
-local locations without printing or copying its credentials. If none is
-available, ask the user to provide its path or configure one. Keep API access
-read-only.
+For Zulip discovery or project coordination, follow Setup's
+[shared opt-in Zulip workflow](../setup/references/zulip.md).
 
 Distinguish implementation prior art from mathematical sources. Let the user
 choose whether to adopt a reference, ask the agent to locate one, or develop a
