@@ -202,15 +202,31 @@ Claims are temporary operational state, never article frontmatter. Future
 Deicyde workers may share this protocol, but their current continue-uncoordinated
 failure behavior must be removed before they use the canonical claim API.
 
-## Future runtime integration
+## Runtime contract
 
-A later Deicyde adapter may project the canonical Markdown graph into an
-in-memory worker schema. It must not restore `graph.json` as an authority, and
-it must distinguish narrative containers from dispatchable formalizable leaves.
-Before importing durable queues, reviews, recovery records, PR markers, or
-dashboard routes, the adapter must also define how article identity survives
-path moves. Those operational records and all logs remain private and excluded
-from publication.
+`autoform_cli.runtime` projects the canonical Markdown graph into the versioned,
+deeply immutable in-memory schema `autoform-runtime/v1`. Its declared authority
+is `markdown-articles`: the adapter copies hierarchy, typed statement and proof
+dependencies, authored assertions, derived progress, provenance, and optional
+local Lean source locations, but it provides no persistence or write API.
+`RuntimeGraph.as_dict()` and `to_json()` are deterministic compatibility
+snapshots for consumers, not an authored or generated graph file. Autoform never
+creates, synchronizes, or treats `graph.json` as an authority.
+
+Every article remains in the runtime view so consumers can preserve the book's
+arbitrary containment hierarchy. A node is dispatchable only when it is both a
+formalizable article and a leaf; narrative containers and prose-only leaves are
+never proof work units. The source revision hashes exact roadmap article paths
+and bytes, excluding timestamps, absolute paths, Git state, and operational
+state. Optional Lean locations come from a local lexical scan and do not by
+themselves establish compilation or proof correctness.
+
+Schema v1 retains the graph's path-derived article ID. That is suitable for
+an ephemeral runtime projection and temporary claims, but it is not yet an
+approved durable identity. Queues, reviews, recovery records, PR markers,
+dashboard routes, providers, and logs must not persist against this ID until a
+path-move identity and migration policy is defined. Those records remain private
+and excluded from runtime snapshots and publication.
 
 ## Publication contract
 
