@@ -123,6 +123,21 @@ and read-only: it neither contacts network services nor writes findings back
 into the blueprint. Pass `--json` for stable machine-readable output; a nonzero
 exit status means the audit found at least one issue.
 
+Coordinate temporary cross-machine ownership without modifying the book:
+
+```bash
+export AUTOFORM_WORKER_ID="agent-name"
+autoform claim acquire "chapter/main-result"
+autoform claim renew "chapter/main-result"
+autoform claim release "chapter/main-result"
+```
+
+Claims are fail-closed compare-and-swap leases under
+`refs/autoform-claims/` on the Git `origin`; pass `--repo` for another claim
+board. A failed acquire or renew means the caller cannot prove ownership and
+must stop before committing or pushing protected work. Claims do not prove
+mathematical correctness and do not replace branch-level Git CAS.
+
 Write the Mermaid dependency graph into the vault, where Obsidian renders it:
 
 ```bash
@@ -173,6 +188,29 @@ and declaration kinds are checked against the Lean source index.
 The audit API also accepts an already compiled graph. Future orchestration may
 turn its findings into private work items, but the audit itself never enqueues
 work, stamps articles, or creates another graph artifact.
+
+## Claim contract
+
+Claims use canonical `autoform-claim/v1` JSON in orphan commit messages and
+exact observed object IDs as update preconditions. Absent and verifiably expired
+leases may be acquired; live peer leases are refused. Malformed or unreadable
+refs are unverifiable and may not be acquired, renewed, released, or removed by
+cleanup. A heartbeat verifies ownership on entry and permanently records any
+later refusal or transport uncertainty as lost ownership.
+
+Claims are temporary operational state, never article frontmatter. Future
+Deicyde workers may share this protocol, but their current continue-uncoordinated
+failure behavior must be removed before they use the canonical claim API.
+
+## Future runtime integration
+
+A later Deicyde adapter may project the canonical Markdown graph into an
+in-memory worker schema. It must not restore `graph.json` as an authority, and
+it must distinguish narrative containers from dispatchable formalizable leaves.
+Before importing durable queues, reviews, recovery records, PR markers, or
+dashboard routes, the adapter must also define how article identity survives
+path moves. Those operational records and all logs remain private and excluded
+from publication.
 
 ## Publication contract
 
