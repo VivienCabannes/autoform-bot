@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import status
+from .audit import audit_blueprint
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
@@ -24,6 +25,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Lean project to resolve 'lean:' declarations against (enables declaration checking)",
     )
 
+    audit = subparsers.add_parser("audit", help="audit roadmap completeness and checked facts")
+    audit.add_argument("blueprint_dir")
+    audit.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
+    audit.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
     render.add_argument("-o", "--output", default="site-src", help="output directory")
@@ -40,6 +46,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "check":
         return _check(args)
+    if args.command == "audit":
+        return _audit(args)
     if args.command == "render":
         return _render(args)
     return 2
@@ -76,6 +84,18 @@ def _check(args: argparse.Namespace) -> int:
     declared = sum(1 for node in graph.nodes.values() if node.lean)
     print(f"    {declared} declaration(s) resolved in the Lean sources")
     return 0
+
+
+def _audit(args: argparse.Namespace) -> int:
+    result = audit_blueprint(args.blueprint_dir, lean_root=args.lean_root)
+    if args.json:
+        print(result.to_json())
+    elif result.clean:
+        print("OK: roadmap audit passed")
+    else:
+        for finding in result.findings:
+            print(f"error: {finding.article_path}: {finding.code}: {finding.reason}")
+    return 0 if result.clean else 1
 
 
 def _render(args: argparse.Namespace) -> int:

@@ -114,7 +114,14 @@ in the project's Lean sources:
 
 ```bash
 autoform check blueprint --lean-root .
+autoform audit blueprint --lean-root .
 ```
+
+`check` validates the graph contract. `audit` adds deterministic completeness,
+provenance, coverage, checked-fact, and optional Lean-target checks. It is local
+and read-only: it neither contacts network services nor writes findings back
+into the blueprint. Pass `--json` for stable machine-readable output; a nonzero
+exit status means the audit found at least one issue.
 
 Write the Mermaid dependency graph into the vault, where Obsidian renders it:
 
@@ -152,6 +159,20 @@ agent and the Lean kernel.
 
 The Markdown files are the source of truth. Graphs and sites are derived views
 that may be regenerated at any time.
+
+## Audit contract
+
+`autoform audit` reports structured findings at blueprint-relative paths. It
+checks that formalizable articles are declaration-sized leaves with statement
+text and an explicit dependency section, that asserted proof and Mathlib facts
+are internally consistent, and that cited work resolves to local source
+material without escaping the blueprint. Coverage files are checked for broken
+links and explicitly declared gaps. With `--lean-root`, local declaration names
+and declaration kinds are checked against the Lean source index.
+
+The audit API also accepts an already compiled graph. Future orchestration may
+turn its findings into private work items, but the audit itself never enqueues
+work, stamps articles, or creates another graph artifact.
 
 ## Publication contract
 
