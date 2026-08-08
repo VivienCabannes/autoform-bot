@@ -202,6 +202,30 @@ Claims are temporary operational state, never article frontmatter. Future
 Deicyde workers may share this protocol, but their current continue-uncoordinated
 failure behavior must be removed before they use the canonical claim API.
 
+## Local runtime doctor
+
+Use the runtime projection and roadmap audit together without contacting any
+external service:
+
+```bash
+autoform doctor . --lean-root .
+autoform doctor blueprint --json
+```
+
+The doctor reports six ordered checks: blueprint resolution, runtime schema,
+graph counts, reference invariants, roadmap audit, and optional local Lean
+targets. It exits zero only when every required check passes. Omitting
+`--lean-root` records an explicit advisory pass; supplying it performs only a
+lexical local-source check, not a Lean build, kernel check, or proof-honesty
+review. The bundled example intentionally exits nonzero while its declared
+coverage remains `PARTIAL`.
+
+This command is strictly read-only and local. It does not invoke Git, GitHub,
+subprocesses, network services, claims, queues, reviews, recovery state,
+providers, workers, renderers, or dashboards, and it creates no cache, scratch
+repository, service, state directory, or `graph.json`. It is a project/runtime
+doctor, separate from any future Deicyde fleet or machine-capability preflight.
+
 ## Runtime contract
 
 `autoform_cli.runtime` projects the canonical Markdown graph into the versioned,
