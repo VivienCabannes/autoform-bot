@@ -14,6 +14,7 @@ from pathlib import Path
 from . import status
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
+from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
@@ -35,6 +36,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit.add_argument("blueprint_dir")
     audit.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     audit.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
+    doctor = subparsers.add_parser("doctor", help="diagnose the local Markdown runtime contract")
+    doctor.add_argument("project_or_blueprint")
+    doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
+    doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     claim = subparsers.add_parser("claim", help="coordinate temporary node ownership through Git refs")
     claim_subparsers = claim.add_subparsers(dest="claim_command", required=True)
@@ -69,6 +75,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _check(args)
     if args.command == "audit":
         return _audit(args)
+    if args.command == "doctor":
+        return _doctor(args)
     if args.command == "claim":
         return _claim(args)
     if args.command == "render":
@@ -128,6 +136,17 @@ def _audit(args: argparse.Namespace) -> int:
     else:
         for finding in result.findings:
             print(f"error: {finding.article_path}: {finding.code}: {finding.reason}")
+    return 0 if result.clean else 1
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    result = diagnose_project(args.project_or_blueprint, lean_root=args.lean_root)
+    if args.json:
+        print(result.to_json())
+    else:
+        for check in result.checks:
+            marker = "PASS" if check.ok else "FAIL"
+            print(f"{marker}: {check.name}: {check.detail}")
     return 0 if result.clean else 1
 
 
