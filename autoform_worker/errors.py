@@ -6,6 +6,8 @@ hot). Everything else is a bug and propagates.
 """
 from __future__ import annotations
 
+from autoform_cli.claims import ClaimTransportError
+
 EX_OK = 0
 EX_ERROR = 1
 EX_NOPROGRESS = 75
@@ -25,9 +27,13 @@ class NoProgress(RuntimeError):
     """
 
 
-class ClaimTransportError(RuntimeError):
-    """The claim board itself is unreachable/broken (network, auth, bad repo).
-
-    Claims are cooperative ([COOP]): callers may log loudly and continue
-    uncoordinated — safety comes from CAS pushes, never from claims.
-    """
+__all__ = [
+    "ClaimTransportError",
+    "Die",
+    "EX_ERROR",
+    "EX_INT",
+    "EX_NOPROGRESS",
+    "EX_OK",
+    "EX_TERM",
+    "NoProgress",
+]

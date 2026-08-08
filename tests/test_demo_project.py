@@ -79,7 +79,15 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
         path.parent.name
         for path in (ROOT / "skills").glob("*/SKILL.md")
     }
-    assert public == {"setup", "roadmap", "orchestrate", "evaluate"}
+    assert public == {
+        "setup",
+        "roadmap",
+        "orchestrate",
+        "evaluate",
+        "agent-review",
+        "human-review",
+        "develop-plugin",
+    }
 
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     roadmap = (ROOT / "skills" / "roadmap" / "SKILL.md").read_text()

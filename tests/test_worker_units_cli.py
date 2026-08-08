@@ -22,6 +22,7 @@ from autoform_worker.githost import GitHost
 from autoform_worker.gitutil import clean_tree, current_branch, remote_ref_oid
 from autoform_worker.registry import Registry
 from autoform_worker.survey import Candidate, PRInfo, Survey
+from tests.worker_markdown import write_markdown_roadmap
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -75,12 +76,14 @@ def world(tmp_path, monkeypatch):
                              "description": "A test node", "depends_on": []}},
     }
     (project / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
-    _git(["add", "plan/graph.json"], lean_root)
+    write_markdown_roadmap(project, graph["nodes"], lean_root=lean_root)
+    _git(["add", "plan/graph.json", "plan/blueprint"], lean_root)
     _git(["commit", "--quiet", "-m", "add roadmap"], lean_root)
     _git(["push", "--quiet", "origin", "main"], lean_root)
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(project))
+    monkeypatch.setenv("AUTOFORM_LEAN_ROOT", str(lean_root))
 
-    cfg = resolve_config(worker_id="tester")
+    cfg = resolve_config(worker_id="tester", respect_claims=False)
     return SimpleNamespace(bare=bare, lean_root=lean_root, project=project, cfg=cfg,
                            counters=Counters(cfg.counters_path))
 

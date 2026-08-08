@@ -60,7 +60,7 @@ def test_acquire_free_key_and_read_schema(tmp_path):
     assert lease["schema"] == CLAIM_SCHEMA
     assert lease["owner"] == "worker-a"
     assert lease["resource"] == "author/node-1"
-    assert before + 600 <= lease["expires_at"] <= int(time.time()) + 600
+    assert before + 600 <= lease["expires_at"] <= time.time() + 600
     assert lease["acquired_at"] <= lease["expires_at"]
 
 
@@ -129,15 +129,13 @@ def test_expired_lease_taken_over_without_steal(tmp_path):
     assert b.holds("k") is True
 
 
-def test_steal_takes_over_live_lease(tmp_path):
+def test_live_foreign_lease_cannot_be_taken_over(tmp_path):
     url = _make_board_repo(tmp_path)
     a = _board(tmp_path, url, "worker-a")
     b = _board(tmp_path, url, "worker-b")
     assert a.acquire("k", ttl=600) is True
     assert b.acquire("k", ttl=600) is False
-    assert b.acquire("k", ttl=600, steal=True) is True
-    assert b.read("k")["owner"] == "worker-b"
-    assert a.holds("k") is False
+    assert b.read("k")["owner"] == "worker-a"
 
 
 # -- release -----------------------------------------------------------------
@@ -221,17 +219,17 @@ def _plant_malformed_lease(board_url, key):
     _run(["-C", board_url, *ident, "update-ref", CLAIM_REF_PREFIX + key, commit])
 
 
-def test_malformed_lease_reads_none_and_is_takeover_able(tmp_path):
+def test_malformed_lease_fails_closed_and_cannot_be_taken_over(tmp_path):
     url = _make_board_repo(tmp_path)
     _plant_malformed_lease(url, "bad")
     a = _board(tmp_path, url, "worker-a")
-    assert a.read("bad") is None
+    with pytest.raises(claims.MalformedLeaseError):
+        a.read("bad")
     listed = {item["_key"]: item for item in a.list()}
-    assert listed["bad"]["_expired"] is True  # unreadable counts as expired
-    assert a.acquire("bad", ttl=600) is True  # takeover without steal
-    lease = a.read("bad")
-    assert lease["owner"] == "worker-a"
-    assert lease["schema"] == CLAIM_SCHEMA
+    assert listed["bad"]["_malformed"] is True
+    assert listed["bad"]["_expired"] is False
+    with pytest.raises(claims.MalformedLeaseError):
+        a.acquire("bad", ttl=600)
 
 
 # -- key validation / transport errors --------------------------------------
@@ -272,18 +270,11 @@ def test_heartbeat_renews_lease(tmp_path):
     assert a.holds("k") is True
 
 
-def test_heartbeat_sets_lost_when_lease_stolen(tmp_path):
+def test_heartbeat_sets_lost_when_lease_is_replaced(tmp_path):
     url = _make_board_repo(tmp_path)
     a = _board(tmp_path, url, "worker-a")
-    b = _board(tmp_path, url, "worker-b")
     assert a.acquire("k", ttl=600) is True
     with claims.Heartbeat(a, "k", interval=0.2) as hb:
-        for _ in range(50):  # a renewal may slip between our read and push; retry
-            if b.acquire("k", ttl=600, steal=True):
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("steal never landed")
+        _run(["-C", url, "update-ref", "-d", CLAIM_REF_PREFIX + "k"])
         assert hb.lost.wait(timeout=10) is True
-    assert b.read("k")["owner"] == "worker-b"
     assert a.holds("k") is False

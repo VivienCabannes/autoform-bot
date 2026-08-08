@@ -22,6 +22,7 @@ from autoform_worker import survey  # noqa: E402
 from autoform_worker.config import resolve_config  # noqa: E402
 from autoform_worker.counters import Counters  # noqa: E402
 from autoform_worker.githost import GitHost  # noqa: E402
+from tests.worker_markdown import write_markdown_roadmap  # noqa: E402
 
 METRIC_KEYS = {"cone_size", "unproved_mass", "ready", "critical_path", "done"}
 
@@ -205,8 +206,10 @@ def make_target_cfg(tmp_path, monkeypatch, worker_id="wa", targets=("zz-goal",))
         meta["targets"] = list(targets)
     (proj / "graph.json").write_text(
         json.dumps({"version": 2, "metadata": meta, "nodes": nodes}), encoding="utf-8")
+    write_markdown_roadmap(proj, nodes, lean_root=lean)
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(proj))
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("AUTOFORM_LEAN_ROOT", str(lean))
     monkeypatch.setenv("AUTOFORM_CONFIG", str(tmp_path / "autoform-config.json"))
     monkeypatch.setenv("AUTOFORM_GIT_BASE_URL", str(tmp_path / "remotes"))
     monkeypatch.delenv("AUTOFORM_RESPECT_CLAIMS", raising=False)
@@ -246,33 +249,28 @@ def prove_nodes(s):
     return [c.node for c in s.actionable("prove")]
 
 
-def test_collect_targets_put_on_cone_node_first(tmp_path, monkeypatch):
-    # "wa" and "wb" shuffle a 2-element list in OPPOSITE orders (checked below via
-    # the no-targets test); the stable priority sort must beat both the shuffle and
-    # the alphabetical order (which would pick aa-off first).
+def test_collect_ignores_legacy_targets_and_keeps_seeded_order(tmp_path, monkeypatch):
+    orders = set()
     for wid in ("wa", "wb"):
         cfg = make_target_cfg(tmp_path, monkeypatch, worker_id=wid)
-        s = run_collect(cfg)
-        assert prove_nodes(s) == ["zz-mid", "aa-off"], f"worker {wid}"
+        picture = run_collect(cfg)
+        assert sorted(prove_nodes(picture)) == ["aa-off", "zz-mid"]
+        assert picture.targets == {}
+        orders.add(tuple(prove_nodes(picture)))
+    assert orders == {("zz-mid", "aa-off"), ("aa-off", "zz-mid")}
 
 
-def test_collect_targets_metrics_in_to_json(tmp_path, monkeypatch):
+def test_collect_does_not_publish_unapproved_target_metadata(tmp_path, monkeypatch):
     cfg = make_target_cfg(tmp_path, monkeypatch)
-    s = run_collect(cfg)
-    assert set(s.targets) == {"zz-goal"}
-    assert set(s.targets["zz-goal"]) == METRIC_KEYS
-    payload = s.to_json()["targets"]["zz-goal"]
-    assert payload["cone_size"] == 3          # zz-goal + zz-mid + t1
-    assert payload["unproved_mass"] == 2      # zz-mid, zz-goal
-    assert payload["ready"] == 1              # zz-mid (t1 trusted)
-    assert payload["critical_path"] == 2
-    assert payload["done"] is False
+    picture = run_collect(cfg)
+    assert picture.targets == {}
+    assert picture.to_json()["targets"] == {}
 
 
-def test_collect_targets_unknown_target_id_is_dropped(tmp_path, monkeypatch):
+def test_collect_drops_all_legacy_target_ids(tmp_path, monkeypatch):
     cfg = make_target_cfg(tmp_path, monkeypatch, targets=("zz-goal", "ghost"))
-    s = run_collect(cfg)
-    assert set(s.targets) == {"zz-goal"}  # only targets that exist in the graph
+    picture = run_collect(cfg)
+    assert picture.targets == {}
 
 
 def test_collect_no_targets_falls_back_to_worker_shuffle(tmp_path, monkeypatch):

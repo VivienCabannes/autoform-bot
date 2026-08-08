@@ -92,29 +92,29 @@ def _isolated_worktree(cfg: WorkerConfig, start_ref: str):
 
 @contextlib.contextmanager
 def _cooperative_claim(board: ClaimBoard | None, respect: bool, key: str, notes: list[str]):
-    """Acquire+heartbeat a claim when the board is usable; fail open otherwise.
+    """Acquire and verify a claim, refusing coordinated work on uncertainty.
 
-    Yields ``(acquired, heartbeat)`` — ``heartbeat`` may be None. When the board
-    says a *live peer* holds the key the caller must skip the candidate; that is
-    signaled by ``acquired is False`` with ``heartbeat`` None.
+    Yields ``(acquired, heartbeat)``. A missing board is allowed only when the
+    operator explicitly disabled claims; otherwise transport errors propagate
+    and stop the work unit before it can mutate or push.
     """
-    if board is None or not respect:
+    if not respect:
         yield True, None
         return
+    if board is None:
+        raise ClaimTransportError("claim board is required for coordinated mutation")
     try:
         if not board.acquire(key):
             yield False, None
             return
     except ClaimTransportError as error:
-        notes.append(f"claim board down ({error}); continuing uncoordinated")
-        yield True, None
-        return
+        notes.append(f"claim board unavailable ({error}); refusing uncoordinated work")
+        raise
     try:
         with board.heartbeat(key) as hb:
             yield True, hb
     finally:
-        with contextlib.suppress(ClaimTransportError):
-            board.release(key)
+        board.release(key)
 
 
 def _lease_ok(heartbeat) -> bool:
@@ -153,7 +153,7 @@ def _enqueue_escalation(
                 "phase": "proof-research",
                 "round": rounds + 1,
                 "fingerprint": recovery_state.proof_fingerprint(
-                    cfg.graph_path, node_id, cfg.lean_root, backend
+                    cfg.compatibility_graph_path, node_id, cfg.lean_root, backend
                 ),
                 "backend": backend,
             },
@@ -210,7 +210,7 @@ def do_prove(
             f"backend {backend!r} sends project data to a configured API endpoint; "
             f"re-run with --allow-api-egress {adapter} after explicit user approval"
         )
-    nodes, _meta = rm.load_graph(cfg.graph_path)
+    nodes, _meta = rm.load_graph(cfg.compatibility_graph_path)
     node = nodes.get(node_id)
     if node is None:
         return UnitResult(False, f"prove {node_id}: node vanished from graph")
@@ -242,7 +242,7 @@ def do_prove(
             status = "failed"
             try:
                 status, reason, detail = prover(
-                    node_id, node, work_cfg.project, str(work_cfg.graph_path), str(work_cfg.lean_root),
+                    node_id, node, work_cfg.project, str(work_cfg.compatibility_graph_path), str(work_cfg.lean_root),
                     PROVE_MAX_STEERS, backend=adapter, judge_backend=judge_backend,
                     worker_timeout=PROVE_TIMEOUT_S,
                 )
@@ -333,7 +333,7 @@ def do_review(
 
     import dispatch_runner  # noqa: PLC0415
 
-    nodes, _meta = rm.load_graph(cfg.graph_path)
+    nodes, _meta = rm.load_graph(cfg.compatibility_graph_path)
     node = nodes.get(pr.node)
     if node is None:
         counters.bump(f"review-err-{pr.number}")

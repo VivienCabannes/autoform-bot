@@ -10,14 +10,11 @@ Two write paths, matching what the artifact is:
 
 * **Lean proofs** (the ``prove`` unit) go through a PR, get a jury scoreboard,
   and auto-merge — code deserves review.
-* **Roadmap curation** (graph.json, ``informal_content/``) is committed and
-  CAS-pushed straight to the default branch under a claim. It is frequent,
-  conflict-rare, and humans watch it on the dashboards rather than in PRs;
-  a lost CAS simply retries next round.
+* **Roadmap curation** remains disabled until graph-writing roles are rewritten
+  to edit canonical Markdown articles and durable article identity is approved.
 """
 from __future__ import annotations
 
-import contextlib
 import re
 from dataclasses import dataclass
 
@@ -82,7 +79,7 @@ def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) ->
     if role.writes == "content":
         return content
     if role.writes == "graph":
-        return all(path == f"{prefix}graph.json" or path.startswith(content_prefix) for path in paths)
+        return False
     return role.writes == "none" and not paths
 
 
@@ -130,15 +127,11 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
     The role body is authored material (``agents/<role>.md``) and is passed
     through verbatim — the registry never paraphrases a role.
     """
-    sources = ""
-    graph_path = cfg.graph_path
-    with contextlib.suppress(Exception):
-        import json
-
-        meta = json.loads(graph_path.read_text(encoding="utf-8")).get("metadata", {})
-        listed = [s.get("file", "") for s in (meta.get("sources") or []) if s.get("file")]
-        if listed:
-            sources = "\n".join(f"  - {s}" for s in listed)
+    sources = "\n".join(
+        f"  - {target}"
+        for node in cfg.runtime.nodes
+        for target in node.source_targets
+    )
 
     context = [
         "# Your assignment",
@@ -146,7 +139,8 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
         f"- role: `{role.name}` (queue kind `{role.kind}`)",
         f"- target node: `{task.node}` ({task.node_label})",
         f"- dispatch project: {cfg.project}",
-        f"- graph: {graph_path}",
+        f"- blueprint: {cfg.project / 'blueprint'}",
+        f"- runtime revision: {cfg.runtime.source_revision}",
         f"- Lean project: {cfg.lean_root}",
         f"- node prose lives in: {cfg.project / 'informal_content'}/<node>.md",
     ]
@@ -159,9 +153,8 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
         "",
         "## How to finish",
         "",
-        "- Make every graph edit through "
-        f"`python {cfg.plugin_root}/scripts/merge_node.py {graph_path} --payload <file>` — "
-        "it is the only writer of graph.json.",
+        "- Do not edit roadmap structure: graph-writing roles remain disabled until "
+        "they are ported to canonical Markdown articles.",
         "- Write node prose directly to `informal_content/<node>.md`.",
         "- Do NOT run `git push` and do NOT open PRs; the worker harness commits and "
         "pushes what you leave in the tree, under a lease.",
@@ -241,7 +234,7 @@ def do_agent_task(
             recovery_fingerprint = ""
             if task.kind == "escalation" and task.recovery:
                 recovery_fingerprint = scripts_modules()["recovery_state"].proof_fingerprint(
-                    work_cfg.graph_path,
+                    work_cfg.compatibility_graph_path,
                     task.node,
                     work_cfg.lean_root,
                     str(task.recovery.get("backend") or ""),

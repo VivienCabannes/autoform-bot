@@ -25,9 +25,12 @@ dev = [
 
 [project.scripts]
 autoform = "autoform_worker.cli:cli_main"
+autoform-blueprint = "autoform_cli.__main__:main"
+autoform-visualize = "autoform_cli.visualize:main"
+autoform-lean-runtime = "servers.lean_runtime:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["servers", "autoform_worker"]
+packages = ["autoform_cli", "servers", "autoform_worker"]
 
 [tool.ruff]
 line-length = 120

@@ -58,7 +58,16 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
         checks.append(("project", False, "no dispatch project resolved — pass --project"))
         return checks
     checks.append(("project", True, str(cfg.project)))
-    checks.append(("graph.json", cfg.graph_path.exists(), str(cfg.graph_path)))
+    checks.append((
+        "Markdown runtime",
+        cfg.runtime.authority == "markdown-articles",
+        f"{cfg.runtime.article_count} articles at {cfg.runtime.source_revision[:12]}",
+    ))
+    checks.append((
+        "durable article identity",
+        cfg.durable_identity_ready,
+        "not configured - stateful worker execution remains disabled",
+    ))
     checks.append(("lean repo", is_git_repo(cfg.lean_root), str(cfg.lean_root)))
 
     url = origin_url(cfg.lean_root)
@@ -84,7 +93,7 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
             board.list()
             checks.append(("claim board", True, f"refs/autoform-claims/* reachable on {canonical}"))
         except ClaimTransportError as error:
-            checks.append(("claim board", False, f"{error} — rounds run uncoordinated"))
+            checks.append(("claim board", False, f"{error} - coordinated mutation disabled"))
     except Die as error:
         checks.append(("canonical repo", False, str(error)))
 

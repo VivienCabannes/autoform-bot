@@ -28,7 +28,7 @@ from .scoreboard import parse_target
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", type=Path, default=None,
-                        help="dispatch project dir (owns graph.json); default: $AUTOFORM_DISPATCH_PROJECT or cwd")
+                        help="project dir (owns blueprint/roadmap); default: $AUTOFORM_DISPATCH_PROJECT or cwd")
     parser.add_argument("--worker-id", default=None, help="stable worker identity (default: <user>-<host>)")
 
 
@@ -43,8 +43,6 @@ def _add_round_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-api-egress", action="append", default=[],
                         metavar="PROVIDER", choices=["openai", "avocado"],
                         help="per-process consent that PROVIDER may receive project data (repeatable)")
-    parser.add_argument("--ignore-claims", action="store_true",
-                        help="skip the cooperative claim board entirely (CAS safety still applies)")
     parser.add_argument("--extra-identities", default="",
                         help="comma-separated extra GitHub logins whose PRs count as yours")
     parser.add_argument("--merge-without-ci", action="store_true",
@@ -105,8 +103,15 @@ def _round_opts(args) -> round_mod.RoundOpts:
 
 
 def _config(args) -> WorkerConfig:
-    return resolve_config(project=args.project, worker_id=args.worker_id,
-                          respect_claims=not getattr(args, "ignore_claims", False))
+    return resolve_config(project=args.project, worker_id=args.worker_id)
+
+
+def _require_durable_identity(cfg: WorkerConfig, operation: str) -> None:
+    if not cfg.durable_identity_ready:
+        raise Die(
+            f"{operation} stores path-derived article IDs; it remains disabled until "
+            "the durable identity and migration contract is implemented"
+        )
 
 
 def _round_passthrough(args) -> list[str]:
@@ -126,8 +131,6 @@ def _round_passthrough(args) -> list[str]:
         out += ["--judge-backend", args.judge_backend]
     for provider in args.allow_api_egress:
         out += ["--allow-api-egress", provider]
-    if args.ignore_claims:
-        out.append("--ignore-claims")
     if args.extra_identities:
         out += ["--extra-identities", args.extra_identities]
     if args.review_foreign:
@@ -232,7 +235,7 @@ def cmd_claim(args) -> int:
         if not args.key:
             raise Die(f"claim {args.action} needs a key")
         if args.action == "acquire":
-            ok = board.acquire(args.key, ttl=args.ttl, steal=args.steal)
+            ok = board.acquire(args.key, ttl=args.ttl)
             print("acquired" if ok else "held by a live peer")
             return EX_OK if ok else EX_ERROR
         if args.action == "renew":
@@ -285,9 +288,10 @@ def cmd_pr_create(args, gh_args: list[str]) -> int:
     node = parse_target(body_text)
     if not node or not TARGET_MARK_RE.search(body_text):
         raise Die("PR body must carry a well-formed <!--autoform-target:v1 {\"node\": …}--> marker")
+    cfg = _config(args)
+    _require_durable_identity(cfg, "PR creation")
     claim_key = os.environ.get("AUTOFORM_AUTHOR_CLAIM_KEY")
     if claim_key:
-        cfg = _config(args)
         host = GitHost()
         canonical, _default = round_mod.resolve_repo(cfg, host)
         board = round_mod.default_board(cfg, canonical)
@@ -323,14 +327,15 @@ def cmd_issues_sync(args) -> int:
     from .work_units import _sync_escalation_issues
 
     cfg = _config(args)
+    if args.dry_run:
+        print("[dry-run] would sync active proof recoveries to issues and close resolved ones")
+        return EX_OK
+    _require_durable_identity(cfg, "GitHub issue synchronization")
     host = GitHost()
     canonical, _default = round_mod.resolve_repo(cfg, host)
     if not host.has_issues(canonical):
         print(f"issues are disabled on {canonical} — nothing to sync "
               "(enable them in repo settings for cross-machine escalations)")
-        return EX_OK
-    if args.dry_run:
-        print("[dry-run] would sync active proof recoveries to issues and close resolved ones")
         return EX_OK
     changed = _sync_escalation_issues(cfg, host, canonical)
     print(f"synced {changed} escalation issue(s)")
@@ -338,31 +343,23 @@ def cmd_issues_sync(args) -> int:
 
 
 def cmd_dashboard(args) -> int:
-    """Thin wrappers over the existing dashboard scripts (single source of truth)."""
+    """Refuse the legacy durable dashboard until article identity is stable."""
     cfg = _config(args)
-    root = plugin_root()
-    if args.dashboard_cmd == "export":
-        argv = [sys.executable, str(root / "scripts" / "export_github_dashboard.py"),
-                "--graph", str(cfg.graph_path), "--repo-root", str(cfg.lean_root)]
-    else:  # serve
-        argv = [sys.executable, str(root / "scripts" / "service_control.py"), "start", "review",
-                "--project", str(cfg.project), "--plugin-root", str(root),
-                "--graph", str(cfg.graph_path), "--lean-root", str(cfg.lean_root), "--port", "0"]
-    proc = subprocess.run(argv, cwd=str(root))
-    return proc.returncode
+    _require_durable_identity(cfg, "the Deicyde review dashboard")
+    raise AssertionError("durable dashboard support is not implemented")
 
 
 def cmd_audit(args) -> int:
-    """Run the roadmap completeness audit (scripts/roadmap_audit.py)."""
+    """Run the canonical read-only Markdown roadmap audit."""
+    if args.enqueue or args.stamp_verified:
+        raise Die("audit queue/stamp mutations are disabled; Markdown audit is read-only")
     cfg = _config(args)
-    root = plugin_root()
-    argv = [sys.executable, str(root / "scripts" / "roadmap_audit.py"), str(cfg.graph_path)]
-    for flag in ("json", "enqueue", "verify_decls", "stamp_verified"):
-        if getattr(args, flag):
-            argv.append("--" + flag.replace("_", "-"))
-    if args.mathlib:
-        argv += ["--mathlib", args.mathlib]
-    return subprocess.run(argv, cwd=str(root)).returncode
+    from autoform_cli.__main__ import main as blueprint_main
+
+    argv = ["audit", str(cfg.project / "blueprint"), "--lean-root", str(cfg.lean_root)]
+    if args.json:
+        argv.append("--json")
+    return blueprint_main(argv)
 
 
 def cmd_agents(args) -> int:
@@ -433,7 +430,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_claim.add_argument("--node", default=None,
                          help="derive the canonical author/<slug>-<hash> key from a graph node id")
     p_claim.add_argument("--ttl", type=int, default=CLAIM_TTL_S)
-    p_claim.add_argument("--steal", action="store_true", help="take over a live foreign lease (be sure)")
 
     p_push = sub.add_parser("push", help="CAS branch push (git-safe-push semantics)")
     _add_common(p_push)

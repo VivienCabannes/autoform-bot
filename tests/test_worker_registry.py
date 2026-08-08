@@ -17,6 +17,7 @@ from autoform_worker.constants import MAX_AGENT_ATTEMPTS
 from autoform_worker.counters import Counters
 from autoform_worker.registry import ENGINE_KINDS, Registry
 from autoform_worker.survey import Survey
+from tests.worker_markdown import write_markdown_roadmap
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,17 +48,20 @@ def make_project(tmp_path, monkeypatch, tasks=None, raw_queue=None, worker_id="w
     lean.mkdir(exist_ok=True)
     proj = tmp_path / "proj"
     proj.mkdir(exist_ok=True)
+    nodes = {"n1": {"tier": 1, "depends_on": []}}
     (proj / "graph.json").write_text(json.dumps({
         "version": 2,
         "metadata": {"lean_root": str(lean), "sources": [{"file": "book.pdf"}]},
-        "nodes": {"n1": {"tier": 1, "depends_on": []}},
+        "nodes": nodes,
     }), encoding="utf-8")
+    write_markdown_roadmap(proj, nodes, lean_root=lean)
     if raw_queue is not None:
         (proj / "task_queue.json").write_text(raw_queue, encoding="utf-8")
     elif tasks is not None:
         (proj / "task_queue.json").write_text(json.dumps(tasks), encoding="utf-8")
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(proj))
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("AUTOFORM_LEAN_ROOT", str(lean))
     monkeypatch.setenv("AUTOFORM_CONFIG", str(tmp_path / "autoform-config.json"))
     monkeypatch.setenv("AUTOFORM_GIT_BASE_URL", str(tmp_path / "remotes"))
     monkeypatch.delenv("AUTOFORM_RESPECT_CLAIMS", raising=False)
@@ -476,16 +480,18 @@ def test_build_prompt_carries_role_body_and_context(tmp_path, monkeypatch):
     assert body.strip() in prompt
     assert "`numerics-auditor` (queue kind `numerics`)" in prompt
     assert "`n1` (Node one)" in prompt
-    assert str(cfg.graph_path) in prompt
+    assert str(cfg.project / "blueprint") in prompt
+    assert cfg.runtime.source_revision in prompt
+    assert str(cfg.compatibility_graph_path) not in prompt
     assert str(cfg.lean_root) in prompt
     assert str(cfg.project / "informal_content") in prompt
-    assert "- sources:" in prompt and "book.pdf" in prompt
+    assert "book.pdf" not in prompt
 
 
 def test_build_prompt_states_the_write_protocol(tmp_path, monkeypatch):
     cfg, _role, prompt = make_prompt(tmp_path, monkeypatch, "# Role\n")
-    assert f"python {cfg.plugin_root}/scripts/merge_node.py {cfg.graph_path} --payload <file>" in prompt
-    assert "only writer of graph.json" in prompt
+    assert "canonical Markdown articles" in prompt
+    assert "graph.json" not in prompt
     assert "Do NOT run `git push`" in prompt
     assert "do NOT open PRs" in prompt
     assert "FAILED:" in prompt

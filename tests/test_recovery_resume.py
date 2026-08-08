@@ -28,8 +28,9 @@ from autoform_worker import round as round_mod  # noqa: E402
 from autoform_worker import survey  # noqa: E402
 from autoform_worker.config import resolve_config  # noqa: E402
 from autoform_worker.counters import Counters  # noqa: E402
-from autoform_worker.errors import NoProgress  # noqa: E402
+from autoform_worker.errors import Die  # noqa: E402
 from autoform_worker.githost import GitHost  # noqa: E402
+from tests.worker_markdown import write_markdown_roadmap  # noqa: E402
 
 NODE = "target"
 TASK = "escalation:target"
@@ -51,12 +52,14 @@ def make_project(tmp_path):
     lean.mkdir(exist_ok=True)
     (proj / "informal_content" / f"{NODE}.md").write_text("strategy: induct on n\n", encoding="utf-8")
     (lean / "Target.lean").write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    nodes = {NODE: {"tier": 2, "mathlib_status": "missing", "depends_on": [],
+                    "lean_file": "Target.lean"}}
     (proj / "graph.json").write_text(json.dumps({
         "version": 2,
         "metadata": {"lean_root": str(lean)},
-        "nodes": {NODE: {"tier": 2, "mathlib_status": "missing", "depends_on": [],
-                         "lean_file": "Target.lean"}},
+        "nodes": nodes,
     }), encoding="utf-8")
+    write_markdown_roadmap(proj, nodes, lean_root=lean)
     (proj / "review_status.json").write_text(json.dumps({
         "version": 1, "settings": {"dial": "on-demand"}, "reviews": {},
     }), encoding="utf-8")
@@ -73,6 +76,7 @@ def make_cfg(tmp_path, monkeypatch, worker_id="w1"):
     proj, _lean = make_project(tmp_path)
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(proj))
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("AUTOFORM_LEAN_ROOT", str(_lean))
     monkeypatch.setenv("AUTOFORM_CONFIG", str(tmp_path / "autoform-config.json"))
     monkeypatch.setenv("AUTOFORM_GIT_BASE_URL", str(tmp_path / "remotes"))
     monkeypatch.delenv("AUTOFORM_RESPECT_CLAIMS", raising=False)
@@ -84,7 +88,9 @@ def make_cfg(tmp_path, monkeypatch, worker_id="w1"):
 def park_recovery(cfg, fingerprint=None):
     """Park a recovery carrying the fingerprint of the project's CURRENT state."""
     if fingerprint is None:
-        fingerprint = rs.proof_fingerprint(cfg.graph_path, NODE, cfg.lean_root, ADAPTER)
+        fingerprint = rs.proof_fingerprint(
+            cfg.compatibility_graph_path, NODE, cfg.lean_root, ADAPTER
+        )
     (cfg.project / "task_queue.json").write_text(json.dumps(parked_queue(fingerprint)),
                                                  encoding="utf-8")
     return fingerprint
@@ -236,8 +242,10 @@ def test_collect_keeps_a_park_that_no_new_evidence_supports(tmp_path, monkeypatc
 def test_collect_reports_a_resumable_park_once_the_prose_moves(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, monkeypatch)
     park_recovery(cfg)
-    (cfg.project / "informal_content" / f"{NODE}.md").write_text("strategy: try Nat.rec\n",
-                                                                 encoding="utf-8")
+    article = cfg.project / "blueprint" / "roadmap" / f"{NODE}.md"
+    article.write_text(article.read_text(encoding="utf-8") + "\nstrategy: try Nat.rec\n",
+                       encoding="utf-8")
+    cfg = resolve_config(project=cfg.project, worker_id=cfg.worker_id, lean_root=cfg.lean_root)
     s = run_collect(cfg)
     # Reported as resumable, and deliberately NOT prove-actionable: the round
     # resumes the recovery and re-surveys, so an actionable prove here would
@@ -260,12 +268,14 @@ def test_collect_park_survives_irrelevant_churn(tmp_path, monkeypatch):
 
 # -- round.run_round --------------------------------------------------------
 
-def test_run_round_unparks_the_task_then_resurveys(tmp_path, monkeypatch):
-    """The round must un-park before the cascade: nobody is watching to do it."""
+def test_run_round_does_not_unpark_before_durable_identity(tmp_path, monkeypatch):
+    """The identity gate must preserve queued recovery state byte-for-byte."""
     cfg = make_cfg(tmp_path, monkeypatch)
     park_recovery(cfg)
-    (cfg.project / "informal_content" / f"{NODE}.md").write_text("strategy: try Nat.rec\n",
-                                                                 encoding="utf-8")
+    article = cfg.project / "blueprint" / "roadmap" / f"{NODE}.md"
+    article.write_text(article.read_text(encoding="utf-8") + "\nstrategy: try Nat.rec\n",
+                       encoding="utf-8")
+    cfg = resolve_config(project=cfg.project, worker_id=cfg.worker_id, lean_root=cfg.lean_root)
     subprocess.run(["git", "init", "--quiet", str(cfg.lean_root)], check=True)
     subprocess.run(["git", "-C", str(cfg.lean_root), "remote", "add", "origin",
                     "https://github.com/o/r.git"], check=True)
@@ -275,23 +285,14 @@ def test_run_round_unparks_the_task_then_resurveys(tmp_path, monkeypatch):
     opts = round_mod.RoundOpts(only=("merge",))
     deps = round_mod.RoundDeps(host=GitHost(runner=make_runner()),
                                board_factory=lambda cfg, canonical: None)
-    with pytest.raises(NoProgress) as stop:
+    queue_path = cfg.project / "task_queue.json"
+    before = queue_path.read_bytes()
+    with pytest.raises(Die, match="durable article identity"):
         round_mod.run_round(cfg, opts, deps)
-    assert "no actionable work" in str(stop.value)   # reached the cascade, not a budget backoff
-
-    queue = json.loads((cfg.project / "task_queue.json").read_text(encoding="utf-8"))
-    assert queue[0]["status"] == "queued"
-    assert queue[0]["recovery"]["phase"] == "proof-research"
-    assert "finished_at" not in queue[0]
-
-    # The hand-off after the re-survey: the revived recovery now owns the node,
-    # so the park is spent (never re-fired) and prove waits on the recovery.
-    after = run_collect(cfg)
-    assert after.resumable_parks == []
-    assert prove_reasons(after, actionable=False)[NODE] == "proof recovery queued"
+    assert queue_path.read_bytes() == before
 
 
-def test_run_round_leaves_an_unmoved_park_alone(tmp_path, monkeypatch):
+def test_run_round_leaves_unmoved_park_alone_before_durable_identity(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, monkeypatch)
     park_recovery(cfg)
     subprocess.run(["git", "init", "--quiet", str(cfg.lean_root)], check=True)
@@ -301,12 +302,11 @@ def test_run_round_leaves_an_unmoved_park_alone(tmp_path, monkeypatch):
     opts = round_mod.RoundOpts(only=("merge",))
     deps = round_mod.RoundDeps(host=GitHost(runner=make_runner()),
                                board_factory=lambda cfg, canonical: None)
-    with pytest.raises(NoProgress) as stop:
+    queue_path = cfg.project / "task_queue.json"
+    before = queue_path.read_bytes()
+    with pytest.raises(Die, match="durable article identity"):
         round_mod.run_round(cfg, opts, deps)
-    assert "no actionable work" in str(stop.value)
-
-    queue = json.loads((cfg.project / "task_queue.json").read_text(encoding="utf-8"))
-    assert queue[0]["status"] == "parked"
+    assert queue_path.read_bytes() == before
 
 
 # -- dispatch_runner: the engine-side gate ----------------------------------

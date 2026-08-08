@@ -21,7 +21,7 @@ from .render import PublicationError, render_site
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="autoform")
+    parser = argparse.ArgumentParser(prog="autoform-blueprint")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check = subparsers.add_parser("check", help="validate a Markdown blueprint")

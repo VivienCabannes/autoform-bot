@@ -49,6 +49,12 @@ def proof_fingerprint(
     except (OSError, UnicodeError, json.JSONDecodeError):
         graph = {}
     node = _node(graph, node_id)
+    metadata = graph.get("metadata", {})
+    source_revision = (
+        str(metadata.get("source_revision") or "")
+        if isinstance(metadata, dict)
+        else ""
+    )
     project = graph_path.parent
     content = node.get("content") if isinstance(node.get("content"), str) else None
     if content is None:
@@ -58,6 +64,7 @@ def proof_fingerprint(
     digest = hashlib.sha256()
     parts = (
         ("schema", b"autoform-proof-recovery/v1"),
+        ("source_revision", source_revision.encode("utf-8")),
         ("node", json.dumps(node, sort_keys=True, separators=(",", ":"),
                             ensure_ascii=False).encode("utf-8")),
         ("content", _safe_bytes(project, content)),

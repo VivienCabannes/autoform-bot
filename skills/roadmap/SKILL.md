@@ -1,193 +1,120 @@
 ---
 name: roadmap
 description: >-
-  Build, resume, review, reset, or visualize the informal formalization roadmap
-  — the tiered dependency DAG (graph.json + per-node prose) an AutoformBot
-  fleet proves against. Use for plan a formalization, build or grow the
-  roadmap/DAG, scope sources or chapters, split clusters, re-plan, reset the
-  plan, view the graph, or render the mathematical blueprint. Repository and
-  environment readiness belong to Setup; proving belongs to Orchestrate.
+  Build, inspect, refine, or visualize the mathematical roadmap and theorem
+  dependency DAG in an existing Autoform Markdown blueprint. Use for discovering
+  prior work, choosing or drafting mathematical sources, confirming scope,
+  writing roadmap and coverage notes, decomposing mathematics into kind: node
+  Markdown pages under blueprint/roadmap/, setting planning statuses, or
+  checking roadmap completeness; do not install repository infrastructure or
+  prove Lean declarations.
 ---
 
-# Build the formalization roadmap
+# Build an Autoform roadmap
 
-Turn confirmed informal sources into the durable, reviewed dependency graph
-that provers and reviewers drain. Roadmap owns the *plan*: sources and scope,
-the tiered DAG, per-node prose, Mathlib status, and graph visualization. It
-assumes a Setup-ready project (Lean repository, durable state, dashboard) and
-never proves anything — proving and reviewing are Orchestrate's.
+Turn an agreed mathematical specification into a human-editable roadmap and a
+DAG of pull-request-sized formalization units. Keep Markdown as the sole source
+of truth. Use `internal/runbooks/planning.md` for the preserved detailed planning
+workflow when this concise skill needs deeper operational guidance.
 
-## Resolve the plugin root
+## Discover prior work and sources
 
-Resolve one absolute plugin root. Prefer a valid `AUTOFORM_PLUGIN_ROOT`,
-`MUSE_PLUGIN_ROOT`, `PLUGIN_ROOT`, or `CLAUDE_PLUGIN_ROOT`; otherwise use
-`Path(<this loaded SKILL.md>).resolve().parents[2]`. The result must contain
-`scripts/merge_node.py` and `internal/runbooks/planning.md`; stop if it does
-not. In every command below, replace `<AUTOFORM_PLUGIN_ROOT>` with that quoted
-absolute path; do not depend on a variable exported by a previous shell call.
+Before fixing the architecture, search the pinned Mathlib checkout for existing
+primitives and gaps. When network access is available, also make targeted,
+read-only searches of relevant GitHub pull requests and issues, Zulip topics,
+and authoritative mathematical literature. Report overlapping work, active
+contributors, design rationale, and candidate references; never contact people
+or post externally without explicit user approval.
 
-## Start with a run brief
+For Zulip discovery or project coordination, follow Setup's
+[shared opt-in Zulip workflow](../setup/references/zulip.md).
 
-Before reading sources or spawning any subagent, tell the user:
+Distinguish implementation prior art from mathematical sources. Let the user
+choose whether to adopt a reference, ask the agent to locate one, or develop a
+project-authored specification collaboratively. For the last option, brainstorm
+the representation and downstream API first, then record explicit definitions,
+assumptions, intended equivalences, and unresolved choices under
+`blueprint/sources/`; label this material as project-authored rather than
+implying external provenance. Do not expand a fine DAG until its statements are
+grounded in an adopted reference or this agreed specification.
 
-- the resolved Lean repository and plan/roadmap directory;
-- whether this is a fresh plan, a resume of a partial graph, or a re-plan;
-- the confirmed source files and exact chapter/section scope, or the specific
-  missing information you need before planning;
-- the artifacts this run will create or update (`graph.json`,
-  `informal_content/`, and the live dashboard view);
-- the checkpoints: coarse roadmap approval before detailed splitting, and that
-  no prover is dispatched from this workflow.
+## Establish the planning boundary
 
-Do not make the user infer whether subagents have started or which files they
-may touch. Report those transitions when they occur.
+Inspect the Lean repository and existing `blueprint/` before writing. Require
+the vault, ignore rules, and site configuration to exist; if they do not, hand
+the task to Setup rather than creating repository infrastructure here.
 
-Publish pipeline position to the dashboard feed at every transition —
-``dispatch_queue.py <project> orchestrator --state working --stage <s> --phase
-"<label>" --detail "<one line>"`` — with ``--stage plan`` during coarse
-planning and review waves, ``--stage approve`` while waiting at the
-coarse-roadmap checkpoint, and ``--stage split`` during detailed splitting.
-The stage drives the dashboard's position stepper; the phase/detail lines are
-free text and should stay in plain language a user can read without knowing
-the pipeline's internals (say "fixing 2 major findings from the big-picture
-reviewers", not internal shorthand).
+State the exact source files, requested chapters or sections, current roadmap
+state, and files that may change. Do not infer missing scope or silently reset
+existing notes. Preserve accepted material and ask before replacing it.
 
-## Procedure
+Read the concise [Cabannes thesis roadmap](references/cabannes-thesis-roadmap.md)
+when a concrete source-to-DAG pattern is useful. Adapt its method, never its
+mathematics.
 
-1. Resolve the project. `DISPATCH_PROJECT` is the directory owning
-   `graph.json`; `PROJECT_DIR` is the Lean repository (from `graph.json`
-   metadata when present). If there is no Lean project or the environment is
-   broken, run Setup first — Roadmap does not install or create repositories.
-   If only the durable state is missing, initialize it non-destructively:
+## Build from coarse to fine
 
-   ```bash
-   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-     "<AUTOFORM_PLUGIN_ROOT>/scripts/init_plan.py" \
-     --project "$DISPATCH_PROJECT" --lean-root "$PROJECT_DIR"
-   ```
+1. Record source notes under `blueprint/sources/`, including stable locations
+   for every definition or theorem used in the plan. Work from the source text;
+   for large sources, use targeted lookups for a named result or definition and
+   record the exact passage rather than relying on memory. Surface prerequisites
+   not covered by the confirmed sources instead of inventing them.
+2. Write the high-level direction and milestones under `blueprint/roadmap/`.
+   Group milestones by coherent mathematical significance, not by source
+   section size.
+   Begin each planning page with simple YAML scalar properties such as
+   `kind: roadmap` and `status: active` so Obsidian and people can see its
+   state immediately. Treat `blueprint/README.md` and the roadmap pages it
+   links as an ordered mathematical book: link meaningful chapter pages in
+   their intended reading order. The renderer derives bottom-of-page previous
+   and next chapter links from this Markdown structure, so do not maintain a
+   second navigation manifest.
+3. Define project-specific coverage targets and completion rules under
+   `blueprint/coverage/`. Distinguish material that is merely mapped from
+   material decomposed into nodes; never report whole-source completion from a
+   partial theorem slice.
+4. Present this coarse roadmap and coverage contract for user approval before
+   expanding it into a fine DAG.
+5. After approval, create one file per pull-request-sized unit beside its
+   milestone under `blueprint/roadmap/**/*.md`. A node may contain several
+   supporting definitions or statements when they should land and be reviewed
+   together, but it must identify one unique main result that determines when
+   the node is complete. Set `kind: node`; its path relative to `roadmap/`,
+   without `.md`, is its stable ID. Give it exactly one H1, a `declaration`
+   naming the main Lean artifact, a source-grounded statement or proof sketch,
+   and a `## Depends on` section. Never overload `kind` with the declaration.
+6. Put only genuine prerequisite links under `## Depends on`; those relative
+   Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
+   a prerequisite the proof needs but the statement does not. Keep roadmap,
+   coverage, and source links under other headings.
+7. Search the pinned Mathlib checkout before planning new work. Set
+   `mathlib: true` only for an exact verified upstream result; record partial or
+   uncertain candidates as notes, never as formalization status.
+8. Reconcile the coarse milestone pages and coverage contract with the finished
+   fine DAG so newly discovered prerequisites, moved units, and deferred scope
+   do not leave the roadmap stale.
 
-2. A request to "rebuild" or "re-plan" does not authorize deletion: resume the
-   graph and refine it. Only an explicit user-confirmed plan reset authorizes
-   adding `--reset-plan`. Before executing it, state that graph, prose, queue,
-   reviews, and activity will be reset and that a timestamped snapshot will be
-   retained under `<dispatch-project>/.autoform/snapshots/`.
+Assert only what is checked: `statement: formalized`, `proof: formalized`,
+`mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
+blocked, and fully-proved are derived from the DAG — never hand-write them, and
+never start proof workers merely to advance a state. The
+[blueprint format reference](../../autoform_cli/README.md) has the full table.
 
-3. Confirm source files and scope with the user before planning. If sources
-   the user named are absent from the machine, say exactly what is missing
-   before proceeding.
+## Validate and report
 
-   The roadmap is a UNIFIED ARGUMENT you author, in the leanblueprint sense —
-   not a transcription of any one source. Cited material anchors it, but real
-   papers have gaps, and bridging them with your own mathematical knowledge is
-   part of the job: write the connective statements, mark them `origin:
-   bridged`, and let the adversarial reviewers (counterexample, faithfulness,
-   content) hold them to the same standard as everything else. Standard
-   textbook material may enter as `origin: background`. Two provenance rules
-   are absolute: never fabricate a citation (a `cited` node's `source_refs`
-   must genuinely support its statement), and never leave a node's origin
-   ambiguous — the blueprint must always know which mathematics is recovered
-   from the corpus and which is authored.
+`<AUTOFORM_PLUGIN_ROOT>` is the AutoformBot checkout this skill was loaded
+from; substitute its absolute path and run:
 
-   Map the whole requested source at roadmap and coverage granularity before
-   decomposing theorem nodes, then build the detailed DAG only for the approved
-   milestone. Every `origin: cited` detailed node must retain a stable
-   `source_refs` anchor. Bridged and background nodes carry explicit origin
-   without fabricated citations. The cited source remains authoritative for
-   statement recovery and faithfulness review.
+```bash
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check "<PROJECT>/blueprint" \
+  --lean-root "<PROJECT>"
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize "<PROJECT>/blueprint"
+```
 
-4. Ensure the dashboard is visible so the DAG appears while it grows: reuse a
-   service already serving this project, otherwise start it exactly as Setup
-   does (`scripts/service_control.py start review …`). A dashboard failure
-   never blocks planning; report it and continue.
-
-5. When the project ALREADY contains a Lean formalization and the graph is
-   empty, bootstrap from the code before planning from sources — otherwise the
-   dashboard, blueprint, and workers all see nothing while a real
-   formalization sits in the repo:
-
-   ```bash
-   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-     "<AUTOFORM_PLUGIN_ROOT>/scripts/import_lean_repo.py" "$PROJECT_DIR" \
-     --project "$DISPATCH_PROJECT" --dry-run
-   ```
-
-   Show the user the dry-run counts, then re-run without `--dry-run` to import.
-   Each Lean module becomes a tier-1 cluster and each declaration a tier-2 node
-   carrying `lean_file`, so incomplete proofs are immediately prove-eligible and
-   complete ones are review-eligible.
-
-   Say plainly what this is: a DRAFT with the shape of the code, not of the
-   mathematics. Modules are not always concepts and the imported `depends_on`
-   edges are textual. Follow an import with the graph-reviewer and
-   content-reviewer roles, and attach real sources when the user has them —
-   imported nodes are `origin: background` until then, and no imported node
-   ever claims `in-mathlib` (that status is trusted by construction and must be
-   earned by a verified check).
-
-6. Read and follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/planning.md`,
-   including its schema at
-   `<AUTOFORM_PLUGIN_ROOT>/internal/references/plan-json-schema.md`. Planning
-   is incomplete when the graph is absent or empty, a tier-1 cluster has no
-   tier-2 children, or a node has null content. Preserve every durable node
-   already merged.
-
-   Phase 1 (coarse clusters) ends at a user checkpoint: present the tier-1
-   roadmap and get approval before detailed splitting. Phase 2 runs the
-   split/check/review waves per cluster with native subagents for the
-   canonical roles (`splitter`, `mathlib-checker`, `graph-reviewer`,
-   `content-reviewer`, `holistic-reviewer`), and routes every graph edit
-   through `scripts/merge_node.py` — it is the only writer of `graph.json`.
-
-7. When the user names a target theorem (a mission sink the fleet should reach),
-   record it as first-class graph state through the single writer:
-
-   ```bash
-   echo '{"metadata": {"targets": [{"node": "<target-node-id>"}]}}' | \
-     uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-     "<AUTOFORM_PLUGIN_ROOT>/scripts/merge_node.py" "$DISPATCH_PROJECT/graph.json"
-   ```
-
-   Targets drive the workers' prove ordering (critical path first) and the
-   audit's reachability clause; the status surfaces report distance to each.
-
-8. Before reporting, audit completeness — structure plus every roadmap clause
-   (status vocabulary, grounding, verified in-Mathlib claims, prose, provenance,
-   targets, Lean paths):
-
-   ```bash
-   uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
-     "<AUTOFORM_PLUGIN_ROOT>/scripts/roadmap_audit.py" \
-     "$DISPATCH_PROJECT/graph.json"
-   ```
-
-   A structural failure is this run's to fix, not the next workflow's. Other
-   clauses may legitimately have offenders mid-planning; report the counts.
-
-   When a Mathlib checkout is present (`$PROJECT_DIR/.lake/packages/mathlib`,
-   or `MATHLIB_PATH`), ALWAYS add `--verify-decls --stamp-verified` — never
-   leave in-Mathlib claims unverified. The trust frontier believes an
-   `in-mathlib` status by construction, so a single hallucinated declaration
-   among unstamped claims poisons everything built on it, and the check is a
-   deterministic grep (seconds, no model tokens). Run it as soon as the
-   mathlib-check wave has merged its statuses, not only at the end. Skip it
-   only when no checkout exists — and say so in the report.
-
-   Add `--enqueue` only when the user wants the remaining gaps turned into
-   queued role tasks for Orchestrate/worker rounds to drain.
-
-9. The lightweight dashboard is the default visualization. Only when the user
-   explicitly requests the publication-style mathematical blueprint, read and
-   follow `<AUTOFORM_PLUGIN_ROOT>/internal/runbooks/visualization.md` to
-   export, build, and serve it. A blueprint toolchain failure must not turn an
-   otherwise successful Roadmap run into a failure; report it as an optional
-   visualization limitation.
-
-10. Report: tier-1 and tier-2 counts, Mathlib-status breakdown
-   (in-mathlib / partial / missing), the dashboard URL, any unresolved gaps,
-   and the next step: run Orchestrate.
-
-## Resume semantics
-
-Derive readiness from `graph.json`; do not rely on chat history. A crash loses
-only in-flight subagent work. Completed merges, queue entries, verdicts, and
-content files remain authoritative.
+Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
+`lean:` names before handoff. Report roadmap and coverage status, node and edge
+counts, the derived state summary, unresolved source questions, and the
+vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
+hand the draft to Agent Review for mathematical-plan judgment or Human Review
+for visual inspection; hand CI, Pages, Lean-project, or vault infrastructure
+changes back to Setup.

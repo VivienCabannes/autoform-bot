@@ -19,6 +19,7 @@ from autoform_worker.config import resolve_config
 from autoform_worker.constants import STAGES
 from autoform_worker.counters import Counters
 from autoform_worker.githost import GitHost, build_state_of
+from tests.worker_markdown import write_markdown_roadmap
 
 GREEN = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
 RED = [{"conclusion": "FAILURE", "status": "COMPLETED"}]
@@ -52,6 +53,7 @@ def make_cfg(tmp_path, monkeypatch, worker_id="w1"):
     }
     (proj / "graph.json").write_text(json.dumps(
         {"version": 2, "metadata": {"lean_root": str(lean)}, "nodes": nodes}), encoding="utf-8")
+    write_markdown_roadmap(proj, nodes, lean_root=lean)
     (proj / "review_status.json").write_text(json.dumps({
         "version": 1, "settings": {"dial": "on-demand"},
         "reviews": {
@@ -61,6 +63,7 @@ def make_cfg(tmp_path, monkeypatch, worker_id="w1"):
     }), encoding="utf-8")
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(proj))
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("AUTOFORM_LEAN_ROOT", str(lean))
     monkeypatch.setenv("AUTOFORM_CONFIG", str(tmp_path / "autoform-config.json"))
     monkeypatch.setenv("AUTOFORM_GIT_BASE_URL", str(tmp_path / "remotes"))
     monkeypatch.delenv("AUTOFORM_RESPECT_CLAIMS", raising=False)
@@ -318,7 +321,7 @@ def test_collect_suppresses_proof_while_recovery_is_parked(tmp_path, monkeypatch
             # evidence arrived and the recovery is resumable instead — covered
             # in tests/test_recovery_resume.py.
             "fingerprint": recovery_state.proof_fingerprint(
-                cfg.graph_path, "no-lean", cfg.lean_root, "claude"),
+                cfg.compatibility_graph_path, "no-lean", cfg.lean_root, "claude"),
             "backend": "claude",
         },
     }]), encoding="utf-8")

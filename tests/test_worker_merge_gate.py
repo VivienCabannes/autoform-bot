@@ -21,6 +21,7 @@ from autoform_worker.constants import HOLD_LABELS, MAX_MERGE_ATTEMPTS, merge_pat
 from autoform_worker.counters import Counters
 from autoform_worker.githost import GitHost
 from autoform_worker.survey import Candidate, PRInfo, Survey
+from tests.worker_markdown import write_markdown_roadmap
 
 GREEN = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
 HEAD = "b" * 40
@@ -43,6 +44,7 @@ def make_cfg(tmp_path, monkeypatch, human_verdict=None, worker_id="w1"):
                     "lean_file": "Clean.lean"}}
     (proj / "graph.json").write_text(json.dumps(
         {"version": 2, "metadata": {"lean_root": str(lean)}, "nodes": nodes}), encoding="utf-8")
+    write_markdown_roadmap(proj, nodes, lean_root=lean)
     review = {NODE: {"ai": {"verdict": "clean"}}}
     if human_verdict is not None:
         review[NODE]["human"] = {"verdict": human_verdict, "by": "jack", "at": "2026-08-01T00:00:00Z"}
@@ -50,6 +52,7 @@ def make_cfg(tmp_path, monkeypatch, human_verdict=None, worker_id="w1"):
         {"version": 1, "settings": {"dial": "on-demand"}, "reviews": review}), encoding="utf-8")
     monkeypatch.setenv("AUTOFORM_DISPATCH_PROJECT", str(proj))
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("AUTOFORM_LEAN_ROOT", str(lean))
     monkeypatch.setenv("AUTOFORM_CONFIG", str(tmp_path / "autoform-config.json"))
     monkeypatch.setenv("AUTOFORM_GIT_BASE_URL", str(tmp_path / "remotes"))
     monkeypatch.delenv("AUTOFORM_RESPECT_CLAIMS", raising=False)

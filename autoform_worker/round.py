@@ -131,6 +131,11 @@ def run_round(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps | None = None)
         raise NoProgress(f"GitHub REST budget too low ({core_left} left) — backing off")
 
     picture, host, board, counters = build_survey(cfg, opts, deps)
+    if not opts.dry_run and not cfg.durable_identity_ready:
+        raise Die(
+            "durable article identity is not configured; stateful worker execution "
+            "is disabled until path-move migration is implemented"
+        )
 
     # Revive parked recoveries whose durable inputs moved (a merged sibling, a
     # Mathlib bump, a re-plan). Parking must never be permanent — an unattended

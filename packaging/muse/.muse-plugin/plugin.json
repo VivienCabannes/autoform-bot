@@ -30,6 +30,21 @@
         "id": "evaluate",
         "path": "skills/evaluate/SKILL.md",
         "enabledDefault": true
+      },
+      {
+        "id": "agent-review",
+        "path": "skills/agent-review/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "human-review",
+        "path": "skills/human-review/SKILL.md",
+        "enabledDefault": true
+      },
+      {
+        "id": "develop-plugin",
+        "path": "skills/develop-plugin/SKILL.md",
+        "enabledDefault": true
       }
     ],
     "mcpServers": [

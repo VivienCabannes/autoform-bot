@@ -34,6 +34,7 @@ from .constants import (
 from .counters import Counters
 from .errors import ClaimTransportError
 from .githost import GitHost, build_state_of
+from .runtime_graph import eligible_prove_nodes as runtime_eligible_prove_nodes
 
 
 @dataclass
@@ -140,32 +141,20 @@ def _tended(pr: PRInfo, me: str, extra_identities: list[str]) -> bool:
 
 
 def eligible_prove_nodes(cfg: WorkerConfig) -> list[tuple[str, dict, str]]:
-    """(node_id, node, reason) for every node prove-eligible from *local* state:
-    tier 2, not in Mathlib, unproved or defective, all prerequisites trusted."""
-    mods = scripts_modules()
-    rm = mods["review_model"]
-    try:
-        nodes, _meta = rm.load_graph(cfg.graph_path)
-    except Exception as error:
-        raise SystemExit(f"cannot load graph {cfg.graph_path}: {error}") from error
+    """Refine runtime-eligible leaves with private review and Lean evidence."""
+    rm = scripts_modules()["review_model"]
     sidecar = rm.load_sidecar(cfg.project / "review_status.json")
-
-    import export_blueprint as eb  # noqa: PLC0415  — path set up by scripts_modules()
-
-    out: list[tuple[str, dict, str]] = []
-    for node_id, node in nodes.items():
-        if eb.node_tier(node) != 2 or rm.is_in_mathlib(node):
-            continue
+    eligible: list[tuple[str, dict, str]] = []
+    for node_id, node, runtime_reason in runtime_eligible_prove_nodes(cfg.runtime):
         verdict = rm.verdict_of(node_id, sidecar)
         lean_file = node.get("lean_file")
-        lean_path = (cfg.lean_root / lean_file) if lean_file else None
+        lean_path = (cfg.lean_root / str(lean_file)) if lean_file else None
         if lean_path is not None:
-            # graph fields are data — never follow a path outside the repo
             try:
                 lean_path.resolve().relative_to(cfg.lean_root.resolve())
             except ValueError:
                 lean_path = None
-        has_lean = lean_path is not None and lean_path.exists()
+        has_lean = lean_path is not None and lean_path.is_file()
         sorried = has_lean and rm.lean_has_incomplete_proof(
             lean_path.read_text(encoding="utf-8", errors="replace")
         )
@@ -176,13 +165,9 @@ def eligible_prove_nodes(cfg: WorkerConfig) -> list[tuple[str, dict, str]]:
         elif sorried:
             reason = "Lean present but sorry'd"
         else:
-            continue  # proved and not rejected — review's business, not prove's
-        deps = node.get("depends_on") or []
-        untrusted = [d for d in deps if d in nodes and not rm.is_trusted(d, nodes[d], sidecar)]
-        if untrusted:
-            continue  # foundations first — prerequisites must be trusted
-        out.append((node_id, node, reason))
-    return sorted(out, key=lambda item: item[0])
+            continue
+        eligible.append((node_id, node, reason))
+    return sorted(eligible, key=lambda item: item[0])
 
 
 def collect(
@@ -225,11 +210,13 @@ def collect(
     sidecar = rm.load_sidecar(cfg.project / "review_status.json")
 
     claims: list[dict] = []
+    claim_board_available = True
     if board is not None and cfg.respect_claims:
         try:
             claims = board.list()
         except ClaimTransportError as error:
-            survey.notes.append(f"claim board unreachable — proceeding uncoordinated: {error}")
+            claim_board_available = False
+            survey.notes.append(f"claim board unreachable — coordinated mutation disabled: {error}")
     survey.claims = claims
     live_foreign = {
         lease.get("resource"): lease
@@ -242,6 +229,9 @@ def collect(
         survey.suppressed.setdefault(stage, [])
 
     def push_cand(stage: str, cand: Candidate, ok: bool) -> None:
+        if ok and cfg.respect_claims and not claim_board_available and stage != "review":
+            cand.reason = "claim board unreachable - coordinated mutation disabled"
+            ok = False
         (survey.stages if ok else survey.suppressed)[stage].append(cand)
 
     # --- PR-tending stages --------------------------------------------------
@@ -386,7 +376,7 @@ def collect(
     rng = random.Random(cfg.worker_id)
     rng.shuffle(eligible)
     try:
-        graph_nodes, graph_meta = rm.load_graph(cfg.graph_path)
+        graph_nodes, graph_meta = rm.load_graph(cfg.compatibility_graph_path)
         priority = rm.prove_priority(graph_nodes, sidecar, graph_meta)
         survey.targets = {t: rm.target_metrics(t, graph_nodes, sidecar)
                           for t in rm.graph_targets(graph_meta) if t in graph_nodes}
@@ -411,7 +401,7 @@ def collect(
         # asking. Checked BEFORE the parked suppression below, which would
         # otherwise make parking permanent and silently cost the fleet a node.
         resumable = recovery_state.resumable_park(
-            queue_tasks, node_id, cfg.graph_path, cfg.lean_root, adapter)
+            queue_tasks, node_id, cfg.compatibility_graph_path, cfg.lean_root, adapter)
         if resumable is not None:
             # Report it, but do NOT make it prove-actionable: the round resumes
             # the recovery and re-surveys, so claiming a prove here would make
@@ -427,7 +417,7 @@ def collect(
             ), False)
             continue
         if recovery_state.unchanged_recovery(
-                queue_tasks, node_id, cfg.graph_path, cfg.lean_root, adapter):
+                queue_tasks, node_id, cfg.compatibility_graph_path, cfg.lean_root, adapter):
             push_cand("prove", Candidate(
                 "prove", "proof recovery produced no new prover input", node=node_id
             ), False)
