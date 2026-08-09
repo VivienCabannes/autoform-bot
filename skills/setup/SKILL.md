@@ -66,19 +66,19 @@ or enabling Pages are separate outward-facing actions; perform them only when
 the user requests them. Pin third-party Actions and the Autoform CLI source to
 immutable commits.
 
-Validate the prepared repository with the corresponding local commands.
-`<AUTOFORM_PLUGIN_ROOT>` is the AutoformBot checkout this skill was loaded
-from; substitute its absolute path:
+Validate the prepared repository before reporting it ready. Build Lean first,
+then run the publication sequence:
 
 ```bash
 lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
-  --output site-src --lean-root . --require-declarations
-uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
+
+Then validate, visualize, render, and strict-build the site, keeping
+`--require-declarations` so a named Lean declaration that does not exist fails
+here rather than in CI. The exact invocations, including how to resolve
+`<AUTOFORM_PLUGIN_ROOT>`, are in the [CLI reference](../../autoform_cli/README.md#commands);
+do not restate them here.
 
 `render` writes a derived tree; the vault stays the source of truth. Ignore
 `site-src/`, `site/`, and `blueprint/dependencies.md`.

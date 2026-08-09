@@ -109,6 +109,32 @@ The flat `status:` field is deprecated. It still loads with a warning:
 
 ## Commands
 
+This section is the single source of truth for the command line. Skills
+describe what to achieve and link here; they do not restate flags, so a change
+to the CLI lands in one place.
+
+The commands below are written as they appear on `PATH`. Inside a consumer
+project the plugin is not installed, so resolve `<AUTOFORM_PLUGIN_ROOT>` from
+the loaded plugin and prefix each one, running from the project root:
+
+```bash
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
+```
+
+Publishing a project runs four steps in order: validate, write the Mermaid
+graph into the vault, render the site source, then strict-build the site.
+
+```bash
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
+  --output site-src --lean-root . --require-declarations
+uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
+```
+
+Drop `--require-declarations` when reviewing work in progress, where a
+statement may name a Lean declaration that does not exist yet.
+
 Validate structure, and optionally check that every `lean:` name really exists
 in the project's Lean sources:
 
