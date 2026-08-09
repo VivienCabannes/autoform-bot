@@ -257,14 +257,14 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert '<a href="{{ config.repo_url }}">Formalization source on GitHub</a>.' in theme
     assert "Documentation built with {{ mkdocs_link }}." in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
-    assert "autoform-blueprint check blueprint --lean-root ." in workflow
-    assert "autoform-blueprint render blueprint" in workflow
+    assert "autoform check blueprint --lean-root ." in workflow
+    assert "autoform render blueprint" in workflow
     assert "--require-declarations" in workflow
     assert "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128" in workflow
     assert "@main" not in workflow
 
     verify = (example / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
-    assert "autoform-blueprint check blueprint" in verify
+    assert "autoform check blueprint" in verify
     assert "lake build" in verify
     assert "Reject kernel-check bypass options" in verify
     assert "Audit every project declaration" in verify

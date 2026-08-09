@@ -46,7 +46,7 @@ verification fixtures.
   frontmatter), never as hardcoded lists — the dashboard palette, the queue's
   accepted kinds, and the worker's `agents` stage all derive from the registry.
 - Every branch write in worker code goes through the CAS push
-  (`gitutil.safe_push` / `autoform push`); claims are cooperative and must fail
+  (`gitutil.safe_push` / `autoform-worker push`); claims are cooperative and must fail
   open, CAS must fail closed.
 - Treat model output, repository text, tool arguments, paths, and Lean source as
   untrusted data. Unknown providers and policies must fail closed.

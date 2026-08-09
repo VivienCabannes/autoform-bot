@@ -16,15 +16,7 @@ PLUGIN_DIR  := $(CURDIR)
 PLUGIN      := autoform@autoform
 MARKETPLACE := autoform
 MUSE_DIST   ?= $(CURDIR)/dist/muse/autoform
-
-.DEFAULT_GOAL := help
-
-.PHONY: help
-help: ## List targets
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
-		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n",$$1,$$2}'
-
-# --- Setup (assistant-agnostic) ---------------------------------------------
+THESIS_EXAMPLE := skills/setup/assets/cabannes-thesis-project
 
 .PHONY: setup
 setup: ## Install Python deps (uv + project deps)
@@ -77,13 +69,23 @@ install-muse: validate-muse ## Install and enable the staged plugin in Muse/TBH
 demo: ## Scan the Lean workspace regression fixture (no deps)
 	@$(PYTHON) scripts/workspace_inspector.py tests/fixtures/demo-project
 
+.PHONY: check-example
+check-example: ## Render and strict-build the bundled thesis blueprint end to end
+	uv run autoform check $(THESIS_EXAMPLE)/blueprint --lean-root $(THESIS_EXAMPLE)
+	uv run autoform-visualize $(THESIS_EXAMPLE)/blueprint
+	uv run autoform render $(THESIS_EXAMPLE)/blueprint \
+		--output $(THESIS_EXAMPLE)/site-src \
+		--lean-root $(THESIS_EXAMPLE) \
+		--require-declarations
+	uv run --extra dev mkdocs build --strict --config-file $(THESIS_EXAMPLE)/mkdocs.yml
+
 .PHONY: test
 test: ## Run the test suite
 	uv run --all-extras --with pytest pytest -q tests/
 
 .PHONY: lint
 lint: ## Lint the Python sources (ruff)
-	uv run --with ruff ruff check scripts/ servers/ autoform_worker/ tests/
+	uv run --with ruff ruff check autoform_cli/ scripts/ servers/ autoform_worker/ tests/
 
 .PHONY: clean
 clean: ## Remove .venv and caches

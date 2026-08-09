@@ -7,7 +7,7 @@ scope against the sources, then inspect the fine DAG and its coarse roadmap.
 
 1. Read the coverage contract and the cited source passages; summaries are not
    substitutes for the source.
-2. Run `autoform-blueprint check` and inspect the project, chapter, and node-neighborhood
+2. Run `autoform check` and inspect the project, chapter, and node-neighborhood
    graphs.
 3. Inspect every milestone and every node in the requested review scope.
 4. Distinguish statement prerequisites from proof-only prerequisites.

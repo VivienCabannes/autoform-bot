@@ -52,7 +52,7 @@ flowchart LR
   clean / flagged / rejected verdict. Humans review packets or use the local
   dashboard; a human verdict is immutable and always wins over the AI's.
 - **Distribute** — with a shared GitHub repo, any number of machines run
-  `autoform work --loop`: git-ref leases keep them off each other's nodes,
+  `autoform-worker work --loop`: git-ref leases keep them off each other's nodes,
   proofs travel as PRs with jury scoreboards, clean PRs auto-merge behind a
   machine-checked gate, and the roadmap site republishes from every merge.
   Humans steer from the dashboards, not from merge buttons.

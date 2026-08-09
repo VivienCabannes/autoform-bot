@@ -332,7 +332,7 @@ def ensure_role(registry: Registry, kind: str) -> AgentRole:
 
 
 def role_summary(registry: Registry) -> list[str]:
-    """Human-readable registry listing for `autoform agents`."""
+    """Human-readable registry listing for `autoform-worker agents`."""
     lines = []
     for kind in sorted(registry.roles):
         role = registry.roles[kind]

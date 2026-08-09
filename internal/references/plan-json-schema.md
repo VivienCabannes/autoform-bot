@@ -82,7 +82,7 @@ records, written only through `merge_node.py` (payload key `"metadata"`), which
 validates each entry resolves to an existing node. Targets drive the workers'
 prove ordering (critical-path first), the audit's target-reachability clause,
 and the distance metrics (`cone`, `unproved mass`, `ready`, `critical path`)
-reported by `autoform status` and the audit.
+reported by `autoform-worker status` and the audit.
 
 ### What is *not* a field
 

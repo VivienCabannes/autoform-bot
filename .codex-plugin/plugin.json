@@ -10,8 +10,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "AutoForm Bot",
-    "shortDescription": "Lean 4 autoformalization workflows for coding agents",
-    "longDescription": "AutoForm Bot packages a host-neutral formalization workflow as Agent Skills, native Codex role agents, and MCP tool servers for Lean 4 and Mathlib projects.",
+    "shortDescription": "Lean setup, roadmaps, proving, and review",
+    "longDescription": "AutoForm separates repository setup from source-grounded roadmap construction, keeps the plan as authored Markdown articles, publishes it with GitHub Pages, checks proofs through public Lean MCP servers, and provides distinct visual human-review and rubric-driven agent-review workflows.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
     "capabilities": [
@@ -19,10 +19,13 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Set up an Autoform Lean formalization project from my sources.",
-      "Run or resume the Autoform orchestration workflow.",
+      "Set up this Lean repository with an Autoform blueprint, verification CI, and GitHub Pages without planning the mathematics.",
+      "Build or refine an Autoform roadmap from my mathematical sources.",
+      "Work through the ready nodes in my Autoform blueprint.",
+      "Prepare the visual blueprint surfaces so I can review this formalization.",
+      "Judge this roadmap or Lean formalization with evidence-based review rubrics.",
       "Audit this formalization corpus or benchmark an Autoform prover.",
-      "Help me formalize this theorem in Lean 4."
+      "Develop Autoform itself through its executable formalization example."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/autoform-small.svg",

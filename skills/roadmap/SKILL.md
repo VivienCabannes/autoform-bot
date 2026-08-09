@@ -106,7 +106,7 @@ never start proof workers merely to advance a state. The
 from; substitute its absolute path and run:
 
 ```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check "<PROJECT>/blueprint" \
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check "<PROJECT>/blueprint" \
   --lean-root "<PROJECT>"
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize "<PROJECT>/blueprint"
 ```

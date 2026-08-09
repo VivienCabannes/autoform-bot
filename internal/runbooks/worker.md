@@ -31,7 +31,7 @@ python -m autoform_worker doctor --json
 Every failing check must either be fixed or explicitly accepted by the user
 (e.g. "issues disabled — escalation sync degrades to local"). Never start a
 loop on a failing `gh auth` or missing `origin`. Worker units use disposable
-worktrees, so uncommitted operator edits are left untouched; `autoform sync`
+worktrees, so uncommitted operator edits are left untouched; `autoform-worker sync`
 still requires a clean default branch because it fast-forwards that branch.
 
 ## The round contract
@@ -92,17 +92,17 @@ run two loops for one worker id.
 ## Claims — cooperative leases, CAS safety
 
 - A claim is a git ref lease (`refs/autoform-claims/<key>`) in the canonical
-  repo; `acquire`/`renew`/`release`/`holds`/`list`/`gc` via `autoform claim`.
+  repo; `acquire`/`renew`/`release`/`holds`/`list`/`gc` via `autoform-worker claim`.
 - Keys: `author/<slug>-<hash>` for proving a node (node ids are free text, so
-  the key is DERIVED — always use `autoform claim acquire --node "<node id>"`
+  the key is DERIVED — always use `autoform-worker claim acquire --node "<node id>"`
   rather than hand-building it), `branch/<pr>` (rewriting a PR head),
   `progress` (the fold/publish unit).
 - Claims are cooperative. The board being down NEVER blocks work — log it and
-  continue; safety is the CAS push layer (`autoform push` /
+  continue; safety is the CAS push layer (`autoform-worker push` /
   `gitutil.safe_push`), which refuses any branch write whose observed remote
   OID went stale.
 - Before manually proving a node in a distributed project (engine or native
-  subagent path), run `autoform claim acquire --node "<node id>"` first and
+  subagent path), run `autoform-worker claim acquire --node "<node id>"` first and
   release it when the PR opens or the attempt ends. If the acquire reports
   "held by a live peer", pick different work — never race a peer on the same
   node.
@@ -115,7 +115,7 @@ run two loops for one worker id.
   head SHA. The committed `review_status.json` is updated only by the
   `progress` unit folding *merged* PRs' scoreboards (deterministic and
   idempotent — every machine converges).
-- `autoform sync` folds merged scoreboards into the LOCAL sidecar without
+- `autoform-worker sync` folds merged scoreboards into the LOCAL sidecar without
   pushing — run it at orchestration start in distributed projects so local
   dashboards reflect merged reality.
 - Human verdicts recorded in the local dashboard remain immutable; folds only
@@ -123,7 +123,7 @@ run two loops for one worker id.
 
 ## Proof recovery and GitHub issues
 
-When the canonical repo has Issues enabled, `progress` (or `autoform issues
+When the canonical repo has Issues enabled, `progress` (or `autoform-worker issues
 sync`) mirrors active proof recoveries to issues labeled `autoform:escalation`
 and closes resolved ones. The historical label remains for compatibility.
 Humans register intent with assigned
@@ -136,8 +136,8 @@ local-only — say so rather than silently losing the sync.
 - Prove PRs: branch `autoform/<node-slug>-<worker-id>-<stamp>`, body carries
   the `autoform-target:v1` marker, verification statement, and backend
   attribution. Opened via the fork when the operator lacks push access.
-- Agent-driven pushes go ONLY through `autoform push` (CAS + lease check) and
-  PRs through `autoform pr-create` (marker + lease gate). Raw `git push` from
+- Agent-driven pushes go ONLY through `autoform-worker push` (CAS + lease check) and
+  PRs through `autoform-worker pr-create` (marker + lease gate). Raw `git push` from
   a spawned agent is a defect.
 - Merging follows the worker's verified auto-merge gate; dashboard verdicts and
   hold labels remain the human override.
@@ -151,7 +151,7 @@ input parks its node instead of retrying. The evidence gate is symmetric: the
 moment the node's durable inputs change — a merged sibling proof, a Mathlib
 bump, a re-planned cluster, an edited statement — the round resumes the parked
 recovery automatically and the node becomes prove-eligible again on that same
-pass. Never treat a parked node as finished; `autoform status --json` lists
+pass. Never treat a parked node as finished; `autoform-worker status --json` lists
 `resumable_parks` when inputs have moved.
 
 **Spend is paced, judgment is not.** Recovery retries are deliberately uncapped

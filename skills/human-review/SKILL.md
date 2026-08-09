@@ -18,9 +18,9 @@ derived review views.
 Resolve `<AUTOFORM_PLUGIN_ROOT>` from the loaded plugin and run from `<PROJECT>`:
 
 ```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check blueprint --lean-root .
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint render blueprint \
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
   --output site-src --lean-root .
 uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```

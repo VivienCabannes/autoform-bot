@@ -148,7 +148,7 @@ def cmd_work(args) -> int:
     if args.loop:
         if args.dry_run:
             raise Die("--loop and --dry-run are incompatible — a dry-run loop would spin forever; "
-                      "use `autoform status` or a single `work --dry-run` round")
+                      "use `autoform-worker status` or a single `work --dry-run` round")
         return loop_mod.cmd_loop(_round_passthrough(args))
     return cmd_round(args)
 
@@ -406,7 +406,7 @@ def cmd_doctor(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="autoform",
+        prog="autoform-worker",
         description="Autoform distributed worker — many machines, one formalization roadmap.",
     )
     parser.add_argument("--version", action="version", version=f"autoform-worker {__version__}")

@@ -32,7 +32,7 @@ jobs:
       - name: Validate the theorem DAG
         run: >-
           uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
-          autoform-blueprint check blueprint
+          autoform check blueprint
 
       - name: Install elan
         run: |

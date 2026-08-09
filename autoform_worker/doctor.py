@@ -1,4 +1,4 @@
-"""``autoform doctor`` — environment/auth/repo capability audit.
+"""``autoform-worker doctor`` — environment/auth/repo capability audit.
 
 Answers "can this machine be a worker?" before any round runs: tool presence,
 gh auth, project resolution, remote shape, push access, fork, Issues, and a

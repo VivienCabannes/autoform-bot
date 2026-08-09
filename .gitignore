@@ -1,14 +1,15 @@
 .DS_Store
 .claude/
 .zuliprc
-node_modules/
-dist/
-*.skill
-__pycache__/
-*.pyc
 .venv/
 .lake/
 traces/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+dist/
+node_modules/
 
 # Review surface runtime data (the verdict sidecar — single source of truth,
 # regenerated per project, never committed).

@@ -439,7 +439,7 @@ def collect(
         if remote_default and local_default and remote_default != local_default:
             survey.notes.append(
                 f"local {default_branch} ({local_default[:8]}) differs from remote "
-                f"({remote_default[:8]}) — run `git pull` / `autoform sync` before trusting prove eligibility"
+                f"({remote_default[:8]}) — run `git pull` / `autoform-worker sync` before trusting prove eligibility"
             )
     except Exception:
         pass  # a staleness hint must never break the survey

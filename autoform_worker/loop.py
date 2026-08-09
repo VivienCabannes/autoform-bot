@@ -1,4 +1,4 @@
-"""``autoform work --loop`` — rounds forever, with honest backoff.
+"""``autoform-worker work --loop`` — rounds forever, with honest backoff.
 
 Each round runs in a *subprocess* in its own session, hard-killed at the round
 timeout, so a wedged agent or build can never wedge the loop (TauCeti's

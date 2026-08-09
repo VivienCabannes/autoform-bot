@@ -12,7 +12,7 @@ Developed with [AutoformBot](https://github.com/facebookresearch/autoform-bot).
   Lean and Mathlib `v4.32.2` releases.
 - `blueprint/` is an Obsidian-compatible Markdown vault with roadmap, coverage,
   sources, and a seven-node theorem DAG spanning two formalization chapters.
-- `mkdocs.yml` builds the `autoform-blueprint render` output as a leanblueprint-styled
+- `mkdocs.yml` builds the `autoform render` output as a leanblueprint-styled
   mathematical book: an aggregate progress view, numbered statement boxes,
   direct Lean source icons, collapsed dependency details, and project, chapter,
   local-context, and full-DAG Mermaid maps. The render also records a

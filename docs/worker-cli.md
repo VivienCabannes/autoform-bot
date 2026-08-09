@@ -41,7 +41,7 @@ distinguishes `[HARD]` safety from `[COOP]` throughput):
 
 ```mermaid
 flowchart LR
-    subgraph A["machine A — autoform work --loop"]
+    subgraph A["machine A — autoform-worker work --loop"]
         A1["prove node<br/>(claim → prover → verify gate)"]
     end
     subgraph G["GitHub — canonical repo"]
@@ -50,7 +50,7 @@ flowchart LR
         M["auto-merge gate"]
         R["roadmap: graph.json,<br/>Lean, review_status.json"]
     end
-    subgraph B["machine B — autoform work --loop"]
+    subgraph B["machine B — autoform-worker work --loop"]
         B1["review PR — 3-axis jury"]
     end
     A1 -. "lease (CAS ref)" .-> C
@@ -71,7 +71,7 @@ flowchart LR
 ```
 
 Keys: `author/<slug>-<sha1[:8]>` for proving a node (derived from the free-text
-node id — `autoform claim acquire --node "<id>"` derives it canonically),
+node id — `autoform-worker claim acquire --node "<id>"` derives it canonically),
 `branch/<pr>` (rewriting a PR head), `progress` (the global progress/publication
 unit). TTL 1500 s, heartbeat renewal every 300 s while a unit runs; an expired
 lease may be taken over. The claims repo defaults to the project's canonical repo
@@ -107,7 +107,7 @@ the local graph/sidecar + the claim board.
 
 ```mermaid
 flowchart TD
-    L["autoform work --loop"] --> R["one round — own subprocess,<br/>process group, 90 min hard cap"]
+    L["autoform-worker work --loop"] --> R["one round — own subprocess,<br/>process group, 90 min hard cap"]
     R --> S["survey (read-only): open PRs ·<br/>claim board · graph + sidecar · task queue"]
     S --> C{"cascade — first actionable stage wins:<br/>rebase → fix-ci → fix → review →<br/>merge → progress → agents → prove"}
     C -- "ran one unit" --> E0["exit 0 — next round in 20 s"]
@@ -184,7 +184,7 @@ writes: content           # none | content | graph
 ---
 ```
 
-`autoform agents` lists what is registered and where each role came from.
+`autoform-worker agents` lists what is registered and where each role came from.
 
 ## PR conventions
 
@@ -193,7 +193,7 @@ writes: content           # none | content | graph
   push access; PRs open with `--head <fork-owner>:<branch>`.
 - Body must carry `<!--autoform-target:v1 {"node": "<node-id>"}-->` — the
   machine-readable link from PR to graph node (duplicate detection, scoreboard
-  folding, avoid-lists). `autoform pr-create` refuses to open a PR without a
+  folding, avoid-lists). `autoform-worker pr-create` refuses to open a PR without a
   valid marker or with a lost author lease — the `gh-safe-pr-create` semantics.
 - Footer: `🤖 Prepared with <backend> via autoform worker`.
 - Labels (best-effort): `autoform`, `autoform:prove` etc.
@@ -236,7 +236,7 @@ Verdicts land in the committed sidecar only when the PR merges (via `progress`).
 
 ## GitHub issues
 
-When the project repo has Issues enabled, `progress` (and `autoform issues sync`)
+When the project repo has Issues enabled, `progress` (and `autoform-worker issues sync`)
 mirrors active proof recoveries from `task_queue.json` to issues labeled
 `autoform:escalation` (the label and title retain the historical queue-kind name
 for compatibility). Parked recoveries remain open; resolved ones close. Humans can
@@ -247,22 +247,22 @@ doctor note) when Issues are disabled.
 ## CLI surface
 
 ```
-autoform work   [--loop] [--only S1,S2] [--skip S1] [--backend B] [--dry-run]
+autoform-worker work   [--loop] [--only S1,S2] [--skip S1] [--backend B] [--dry-run]
                 [--project DIR] [--worker-id ID] [--allow-api-egress P]...
                 [--review-foreign] [--merge-without-ci] [--ignore-claims]
                 [--extra-identities L1,L2]
-autoform status [--json]            # survey + claims + target distance snapshot
-autoform audit  [--json] [--enqueue] [--verify-decls] [--stamp-verified]
+autoform-worker status [--json]            # survey + claims + target distance snapshot
+autoform-worker audit  [--json] [--enqueue] [--verify-decls] [--stamp-verified]
                                     # roadmap completeness -> queued gap tasks
-autoform agents [--json]            # the discovered role registry (agents/*.md)
-autoform claim  acquire|renew|release|holds|read|list|gc [key] [--node ID]
+autoform-worker agents [--json]            # the discovered role registry (agents/*.md)
+autoform-worker claim  acquire|renew|release|holds|read|list|gc [key] [--node ID]
                 [--ttl N] [--steal]
-autoform push   <ref> [--expect OID] [--remote URL]     # CAS push (git-safe-push)
-autoform pr-create ... --body-file F                    # marker+lease-gated gh pr create
-autoform sync   [--json]            # fast-forward local default branch to canonical state
-autoform issues sync [--dry-run]    # proof recoveries <-> GitHub issues
-autoform dashboard export|serve     # thin wrappers over the existing scripts
-autoform doctor [--json]            # environment + auth + repo capability audit
+autoform-worker push   <ref> [--expect OID] [--remote URL]     # CAS push (git-safe-push)
+autoform-worker pr-create ... --body-file F                    # marker+lease-gated gh pr create
+autoform-worker sync   [--json]            # fast-forward local default branch to canonical state
+autoform-worker issues sync [--dry-run]    # proof recoveries <-> GitHub issues
+autoform-worker dashboard export|serve     # thin wrappers over the existing scripts
+autoform-worker doctor [--json]            # environment + auth + repo capability audit
 ```
 
 Exit codes: `0` progress, `75` genuine no-progress (loop backs off), `1` error,
@@ -332,7 +332,7 @@ recovery waves park with an evidence ledger until new information appears.
 ## Multi-machine walkthrough
 
 Machine A (Vivien) and machine B (Jack) both clone `org/formal-project`, both run
-`autoform work --loop`. A's survey finds nodes `alpha`,`beta` eligible; B's finds
+`autoform-worker work --loop`. A's survey finds nodes `alpha`,`beta` eligible; B's finds
 the same. A claims `author/alpha` (ref CAS — B's later acquire of `alpha` returns
 "held", B takes `beta`). Both prove, push branches to their forks, open PRs with
 target markers. B's next round picks stage `review` for A's PR (CI green, no

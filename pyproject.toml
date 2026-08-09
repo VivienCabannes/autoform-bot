@@ -1,12 +1,13 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "autoform"
 version = "0.6.1"
 description = "Turn any AI coding assistant into a Lean 4 formalization agent"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "aristotlelib>=2.0",
@@ -19,15 +20,16 @@ zulip = [
     "zulip>=0.9.0",
 ]
 dev = [
+    "mkdocs>=1.6,<2",
+    "pymdown-extensions>=10,<11",
     "pytest>=7.0",
     "ruff>=0.4",
 ]
 
 [project.scripts]
-autoform = "autoform_worker.cli:cli_main"
-autoform-blueprint = "autoform_cli.__main__:main"
+autoform = "autoform_cli.__main__:main"
+autoform-worker = "autoform_worker.cli:cli_main"
 autoform-visualize = "autoform_cli.visualize:main"
-autoform-lean-runtime = "servers.lean_runtime:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["autoform_cli", "servers", "autoform_worker"]

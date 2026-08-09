@@ -1,7 +1,7 @@
 site_name: Cabannes thesis formalization
 repo_url: https://github.com/facebookresearch/autoform-bot
 
-# `autoform-blueprint render` writes this directory from blueprint/. The vault stays the
+# `autoform render` writes this directory from blueprint/. The vault stays the
 # source of truth; everything here is regenerated.
 docs_dir: site-src
 site_dir: site

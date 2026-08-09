@@ -54,7 +54,7 @@ For a new or incomplete repository:
   and a linked “Developed with AutoformBot” credit; when a deployed site
   exists, also feature its verified canonical URL prominently, never an
   inferred or pending URL;
-- configure `mkdocs.yml` to build the `autoform-blueprint render` output, not the vault
+- configure `mkdocs.yml` to build the `autoform render` output, not the vault
   itself: `docs_dir: site-src`, `md_in_html`, a `pymdownx.superfences` mermaid
   fence, a verified repository URL in `repo_url`, and the generated stylesheet
   and mermaid init. Keep the
@@ -82,9 +82,9 @@ from; substitute its absolute path:
 ```bash
 lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check blueprint --lean-root .
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint render blueprint \
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
   --output site-src --lean-root . --require-declarations
 uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
