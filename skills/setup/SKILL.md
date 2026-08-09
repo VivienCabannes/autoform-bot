@@ -44,8 +44,8 @@ For a new or incomplete repository:
 - create or repair a buildable Lean project with matching `lean-toolchain` and
   Mathlib revisions;
 - create `blueprint/` with a landing page plus `roadmap/`, `coverage/`, and
-  `sources/`; later Roadmap work places `kind: node` pages beside their
-  milestones under `roadmap/`. A roadmap folder is a book chapter; a node page
+  `sources/`; later Roadmap work places `kind: article` pages beside their
+  milestones under `roadmap/`. A roadmap folder is a book chapter; an article page
   is normally one PR-sized major result or important definition. Markdown
   properties and dependency links are the graph, so do not create a parallel
   `graph.json`. Keep personal `.obsidian/`, `.trash/`, generated graphs, and
