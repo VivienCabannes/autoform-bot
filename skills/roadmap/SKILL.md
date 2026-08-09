@@ -102,14 +102,10 @@ never start proof workers merely to advance a state. The
 
 ## Validate and report
 
-`<AUTOFORM_PLUGIN_ROOT>` is the AutoformBot checkout this skill was loaded
-from; substitute its absolute path and run:
-
-```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check "<PROJECT>/blueprint" \
-  --lean-root "<PROJECT>"
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize "<PROJECT>/blueprint"
-```
+Validate `<PROJECT>/blueprint` and refresh its Mermaid graph before handing
+off. Rendering and the strict site build belong to Setup and Human Review; here
+only the first two steps of the publication sequence in the
+[CLI reference](../../autoform_cli/README.md#commands) apply.
 
 Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
 `lean:` names before handoff. Report roadmap and coverage status, node and edge

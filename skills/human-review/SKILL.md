@@ -15,15 +15,13 @@ existing Autoform vault and site configuration; hand missing infrastructure to
 Setup. Keep the Markdown vault as the source of truth and regenerate only
 derived review views.
 
-Resolve `<AUTOFORM_PLUGIN_ROOT>` from the loaded plugin and run from `<PROJECT>`:
-
-```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
-  --output site-src --lean-root .
-uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
-```
+Regenerate the review views from `<PROJECT>`: validate the blueprint, refresh
+the Mermaid graph with `autoform-visualize` so Obsidian shows current
+dependencies, render the site source, then strict-build the site. Follow the
+publication sequence in the [CLI reference](../../autoform_cli/README.md#commands),
+but omit `--require-declarations`: review happens while statements are still
+unformalized, and a missing declaration is something for the reviewer to see
+rather than a reason to refuse to render.
 
 Stop on structural failures and present them before asking for mathematical
 judgment. For vault review, point the user to `blueprint/README.md`, coverage,

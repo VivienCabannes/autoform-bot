@@ -437,3 +437,63 @@ def test_orchestrate_documents_the_claim_protocol(repo_root: Path) -> None:
         "ownership is unproven",
     ):
         assert required in orchestrate
+
+
+def _documented_invocations(reference: str) -> set[tuple[str, ...]]:
+    """Every `autoform ...` command line inside the reference's bash fences."""
+    invocations: set[tuple[str, ...]] = set()
+    for block in re.findall(r"```bash\n(.*?)```", reference, re.DOTALL):
+        for line in block.splitlines():
+            line = line.strip().rstrip("\\").strip()
+            words = line.split()
+            if "autoform" not in words:
+                continue
+            rest = words[words.index("autoform") + 1 :]
+            verbs = tuple(word for word in rest if word and not word.startswith("-"))
+            if not verbs:
+                continue
+            if verbs[0] == "claim" and len(verbs) > 1:
+                invocations.add(verbs[:2])
+            else:
+                invocations.add(verbs[:1])
+    return invocations
+
+
+def test_cli_reference_documents_only_commands_that_exist(repo_root: Path) -> None:
+    """The CLI reference is the single source of truth, so it must be checkable.
+
+    Skills link here instead of restating flags. That only stays safe if the
+    reference cannot drift from the parser, so every command it shows must
+    parse.
+    """
+    import pytest
+
+    from autoform_cli.__main__ import main
+
+    reference = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
+    documented = _documented_invocations(reference)
+    assert {("check",), ("audit",), ("render",), ("claim", "acquire")} <= documented
+
+    for invocation in sorted(documented):
+        with pytest.raises(SystemExit) as exit_info:
+            main([*invocation, "--help"])
+        assert exit_info.value.code == 0, f"reference documents unknown command: {' '.join(invocation)}"
+
+
+def test_skills_delegate_the_command_line_to_the_reference(repo_root: Path) -> None:
+    """Skills state intent and link to the reference; they do not restate flags.
+
+    Duplicated invocations are what let the CLI move underneath the agent's
+    instructions, so a skill that needs the command line must cite the
+    reference instead of copying it.
+    """
+    citing = 0
+    for skill in sorted((repo_root / "skills").glob("*/SKILL.md")):
+        text = skill.read_text(encoding="utf-8")
+        assert "uv run --project" not in text, (
+            f"{skill.relative_to(repo_root)} restates a CLI invocation; "
+            "link to autoform_cli/README.md#commands instead"
+        )
+        if "autoform_cli/README.md" in text:
+            citing += 1
+    assert citing >= 3
