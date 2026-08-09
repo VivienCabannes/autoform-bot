@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def _make_adapter(
     backend: str,
-    graph_path: str,
+    blueprint_path: str,
     max_wait_seconds: float,
     extra_args: list[str] | None = None,
     mcp_config: str | None = None,
@@ -49,7 +49,7 @@ def _make_adapter(
         # Lazy import: only initialize Aristotle when that backend is selected.
         from .aristotle_adapter import AristotleAdapter
 
-        return AristotleAdapter(graph_path=graph_path, max_wait_seconds=max_wait_seconds)
+        return AristotleAdapter(graph_path=blueprint_path, max_wait_seconds=max_wait_seconds)
     if backend == "codex":
         # Lazy import: the OpenAI ``codex`` CLI backend (its own auth, not Max).
         from .codex_adapter import CodexAdapter
@@ -64,7 +64,7 @@ def _make_adapter(
         # private endpoint/model/auth must be configured explicitly.
         from .openai_adapter import OpenAICompatAdapter
 
-        return OpenAICompatAdapter(graph_path=graph_path, preset=backend,
+        return OpenAICompatAdapter(graph_path=blueprint_path, preset=backend,
                                    max_wait_seconds=max_wait_seconds)
     raise ValueError(
         f"unknown backend {backend!r}; expected 'claude', 'aristotle', 'codex', "
@@ -74,7 +74,8 @@ def _make_adapter(
 
 def run_prove_node(
     *,
-    graph_path: str,
+    blueprint_path: str = "",
+    graph_path: str | None = None,
     node_id: str,
     project_dir: str,
     backend: str = "claude",
@@ -97,8 +98,9 @@ def run_prove_node(
             "set allow_api_egress=true only after the provider, base URL, and "
             "project data scope were shown to the user"
         )
-    spec = build_node_spec(Path(graph_path), node_id, project_dir=Path(project_dir))
-    adapter = _make_adapter(backend, graph_path, max_wait_seconds, extra_args, mcp_config)
+    source = blueprint_path or graph_path or str(Path(project_dir) / "blueprint")
+    spec = build_node_spec(Path(source), node_id, project_dir=Path(project_dir))
+    adapter = _make_adapter(backend, source, max_wait_seconds, extra_args, mcp_config)
     result = prove(
         adapter,
         node_id,
@@ -163,7 +165,7 @@ def create_prover_server() -> FastMCP:
 
     @server.tool
     def prove_node(
-        graph_path: str,
+        blueprint_path: str,
         node_id: str,
         project_dir: str,
         backend: str = "claude",
@@ -187,7 +189,7 @@ def create_prover_server() -> FastMCP:
         proof downstream.
 
         Args:
-            graph_path: Path to the plan's graph.json (the node spec source).
+            blueprint_path: Path to the project's authoritative blueprint directory.
             node_id: The target node id (verbatim, e.g. "Chernoff bound").
             project_dir: The Lean project directory (where the proof is written
                 and informal_content/ lives).
@@ -222,7 +224,7 @@ def create_prover_server() -> FastMCP:
         """
         try:
             result = run_prove_node(
-                graph_path=graph_path,
+                blueprint_path=blueprint_path,
                 node_id=node_id,
                 project_dir=project_dir,
                 backend=backend,

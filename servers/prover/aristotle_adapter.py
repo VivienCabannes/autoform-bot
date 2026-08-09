@@ -89,7 +89,7 @@ class AristotleAdapter(ProverAdapter):
     """Drive Harmonic's Aristotle as a swappable prover backend.
 
     Args:
-        graph_path: Path to the plan's ``graph.json`` (the node spec source).
+        graph_path: Path to the Markdown blueprint (the article spec source).
         manager: An :class:`AristotleManager`; when ``None`` one is built lazily
             (constructing it does NOT import ``aristotlelib``).
         system_prompt: The no-cheating delegate contract (defaults to

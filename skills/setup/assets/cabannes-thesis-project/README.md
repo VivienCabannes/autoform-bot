@@ -9,9 +9,9 @@ slice as a handoff example.
 - `lean-toolchain`, `lakefile.toml`, and `CabannesThesis/` pin matching stable
   Lean and Mathlib `v4.32.2` releases.
 - `blueprint/` is an Obsidian-compatible Markdown vault with roadmap, coverage,
-  sources, and a seven-node theorem DAG spanning two formalization chapters.
-- `graph.json` is the deterministic compatibility projection consumed by the
-  worker and local dashboard. Regenerate it from Markdown; never edit it.
+  sources, and a ten-article hierarchy whose seven leaves span two formalization chapters.
+- `blueprint/roadmap/` is consumed directly by workers, dashboards, and the
+  static renderer; there is no secondary graph file to synchronize.
 - `mkdocs.yml` builds the `autoform-blueprint render` output as a leanblueprint-styled
   mathematical book: an aggregate progress view, numbered statement boxes,
   direct Lean source icons, collapsed dependency details, and project, chapter,

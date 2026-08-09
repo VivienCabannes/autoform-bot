@@ -417,11 +417,15 @@ def _slugify(node_id: str) -> str:
 
 
 def load_node(graph_path: Path, node_id: str) -> dict[str, Any]:
-    """Read a node record from ``graph.json``. Raises ``KeyError`` if absent."""
-    graph = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+    """Read an article from Markdown (with legacy JSON fixture compatibility)."""
+    path = Path(graph_path)
+    if path.is_dir():
+        from autoform_cli.runtime import load_runtime_node
+        return load_runtime_node(path, node_id)
+    graph = json.loads(path.read_text(encoding="utf-8"))
     nodes = graph.get("nodes", {})
     if node_id not in nodes:
-        raise KeyError(f"node {node_id!r} not found in {graph_path}")
+        raise KeyError(f"node {node_id!r} not found in {path}")
     return nodes[node_id]
 
 

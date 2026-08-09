@@ -205,6 +205,13 @@ def render_site(
         for group, node_ids in groups.items()
         for node_id in node_ids
     }
+    targets.update(
+        {
+            node_id: (destination / node.path.relative_to(blueprint), "")
+            for node_id, node in graph.nodes.items()
+            if graph.children(node_id)
+        }
+    )
     node_sources = {
         node.path.resolve(): node_id for node_id, node in graph.nodes.items()
     }
@@ -220,8 +227,10 @@ def render_site(
         # nothing but absorbed nodes leaves no empty shell behind.
         if source.is_dir():
             continue
-        # A node file no longer becomes a page of its own.
-        if source.resolve() in node_paths:
+        # Container articles remain book pages. Leaf articles are consolidated
+        # into their containing chapter with stable anchors.
+        article = node_paths.get(source.resolve())
+        if article is not None and not graph.children(article.id):
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         if source.suffix.lower() == ".md":
@@ -397,7 +406,11 @@ def _group_nodes(graph: Graph) -> dict[str, list[str]]:
 
 def _group_page(group: str) -> Path:
     """Where a milestone's consolidated chapter lives in the output tree."""
-    return Path("roadmap") / group / "README.md" if group else Path("roadmap/README.md")
+    return (
+        Path("roadmap/README.md")
+        if group in {"", "roadmap"}
+        else Path("roadmap") / group / "README.md"
+    )
 
 
 def _book_page_order(blueprint: Path, destination: Path) -> list[Path]:
@@ -531,7 +544,11 @@ def _render_overview_summary(
     node_ids: list[str] | None = None,
 ) -> str:
     """Render the compact, honest progress strip shown at the start of the book."""
-    selected_ids = node_ids if node_ids is not None else list(graph.nodes)
+    selected_ids = (
+        node_ids
+        if node_ids is not None
+        else [node_id for node_id in graph.nodes if not graph.children(node_id)]
+    )
     definitions = sum(is_definition(graph.nodes[node_id]) for node_id in selected_ids)
     results = len(selected_ids) - definitions
     item_parts = []
@@ -692,7 +709,8 @@ def _shift_headings(text: str, levels: int) -> str:
 
 def _anchor(node_id: str, group: str) -> str:
     """A stable in-page anchor for a node, unique within its chapter."""
-    remainder = node_id[len(group) + 1 :] if group else node_id
+    prefix = f"{group}/" if group else ""
+    remainder = node_id[len(prefix) :] if prefix and node_id.startswith(prefix) else node_id
     return remainder.replace("/", "-")
 
 
@@ -712,12 +730,12 @@ def _anchored_links(
     links: dict[str, str] = {}
     for node_id, (target, anchor) in targets.items():
         if target.resolve() == resolved_page:
-            links[node_id] = f"#{anchor}"
+            links[node_id] = f"#{anchor}" if anchor else "#"
         else:
             href = mermaid.relative_link(target, page, extension)
             if extension == ".html":
                 href = _as_published(href)
-            links[node_id] = f"{href}#{anchor}"
+            links[node_id] = f"{href}#{anchor}" if anchor else href
     return links
 
 
@@ -854,7 +872,7 @@ def _render_chapter(
     else:
         title = group.replace("-", " ").capitalize() if group else "Roadmap"
         sections.extend(
-            ["---", f"kind: roadmap\ntitle: {title}", "---", "", f"# {title}", "", chapter_summary]
+            ["---", f"kind: article\ntitle: {title}", "---", "", f"# {title}", "", chapter_summary]
         )
 
     for node_id in node_ids:

@@ -15,7 +15,7 @@ writes: graph
 ---
 
 Check one mathematical node against the real Mathlib checkout. Do not answer
-from memory and never edit generated `graph.json`.
+from memory and never create a separate graph artifact.
 
 Search in this order:
 
@@ -33,4 +33,4 @@ or correct an existing positive claim that cannot be verified.
 Do not put a Mathlib declaration in `lean:`. That field names a declaration in
 the current project and is checked against project sources. Report the queries
 used, the observed declaration, and any generality difference. Regenerate the
-compatibility graph after a metadata change.
+derived views after a metadata change.

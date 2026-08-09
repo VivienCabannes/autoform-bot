@@ -2,7 +2,7 @@
 """Pure-compute review model for the DAG-native review surface.
 
 This module holds **all** the review logic the server needs, with **no I/O side
-effects** beyond reading the two source files (``graph.json`` + sidecar) and never
+effects** beyond reading Markdown articles plus the review sidecar and never
 writing anything. Every function here is a pure function of (graph, sidecar):
 load them once, then compute verdicts / taint / roll-ups / coverage / frontier and
 a recolored DOT — the HTTP layer in ``serve_review.py`` only formats the output and
@@ -213,8 +213,21 @@ DIALS = ("on-demand", "targets", "full")
 # ---------------------------------------------------------------------------
 
 def load_graph(path: Path) -> Tuple[Dict[str, dict], dict]:
-    """Load graph.json -> (nodes_by_id, metadata) via the exporter's loader."""
-    return eb.load_graph(Path(path))
+    """Load the authoritative Markdown blueprint into the in-memory review model.
+
+    JSON remains readable only for old standalone fixtures and migrations; the
+    project workflow resolves a repository or ``blueprint/`` directory here.
+    """
+    candidate = Path(path)
+    if candidate.is_dir():
+        root = _SCRIPTS_DIR.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        from autoform_cli.runtime import load_runtime_model, resolve_blueprint
+
+        blueprint, project = resolve_blueprint(candidate)
+        return load_runtime_model(blueprint, project_root=project, lean_root=project)
+    return eb.load_graph(candidate)
 
 
 def empty_sidecar() -> dict:
@@ -831,7 +844,7 @@ def coverage(
     original behavior exactly.
     """
     sorry_set = sorry_set or set()
-    tier2 = [nid for nid, node in nodes.items() if eb.node_tier(node) == 2]
+    tier2 = [nid for nid, node in nodes.items() if node.get("formalizable", eb.node_tier(node) == 2)]
     reviewed = [nid for nid in tier2 if verdict_of(nid, sidecar) != "unreviewed"]
     human = [nid for nid in tier2 if review_source(nid, sidecar) == "human"]
     in_mathlib = [nid for nid in tier2 if is_in_mathlib(nodes[nid])]
@@ -867,7 +880,10 @@ def trust_frontier(
     reproduces the original behavior exactly.
     """
     sorry_set = sorry_set or set()
-    tier2 = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == 2}
+    tier2 = {
+        nid: node for nid, node in nodes.items()
+        if node.get("formalizable", eb.node_tier(node) == 2)
+    }
     rev = _dependents_index(tier2)
     sinks = [nid for nid in tier2 if not rev.get(nid)]
 

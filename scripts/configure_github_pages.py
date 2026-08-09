@@ -184,7 +184,7 @@ def _atomic_write(path: Path, payload: str) -> None:
 
 def _workflow(
     *,
-    graph: Path,
+    blueprint: Path,
     site: Path,
     default_branch: str,
     autoform_repository: str,
@@ -192,14 +192,10 @@ def _workflow(
 ) -> str:
     if not TEMPLATE.is_file():
         raise PagesConfigError(f"workflow template missing: {TEMPLATE}")
-    graph_dir = graph.parent
     watch = (
-        graph,
-        graph_dir / "informal_content/**",
-        graph_dir / "kernel/**",
-        graph_dir / "review_status.json",
-        Path("blueprint/web/**"),
+        blueprint / "**",
         Path("**/*.lean"),
+        Path("mkdocs.yml"),
         CONFIG_PATH,
         WORKFLOW_PATH,
     )
@@ -210,8 +206,8 @@ def _workflow(
         .replace("__DEFAULT_BRANCH__", json.dumps(default_branch))
         .replace("__AUTOFORM_REPOSITORY__", autoform_repository)
         .replace("__AUTOFORM_REVISION__", autoform_revision)
-        .replace("__GRAPH_PATH__", json.dumps(str(graph)))
-        .replace("__SITE_PATH__", json.dumps(str(site)))
+        .replace("__BLUEPRINT_PATH__", str(blueprint))
+        .replace("__SITE_PATH__", str(site))
     )
 
 
@@ -220,7 +216,7 @@ def install_configuration(
     *,
     repository: str,
     visibility: str,
-    graph: Path | str,
+    blueprint: Path | str,
     site: Path | str,
     autoform_repository: str,
     autoform_revision: str,
@@ -253,10 +249,10 @@ def install_configuration(
         or ".." in default_branch
     ):
         raise PagesConfigError("default branch name is invalid")
-    graph = _safe_relative(repo_root, graph, label="graph")
+    blueprint = _safe_relative(repo_root, blueprint, label="blueprint")
     site = _safe_relative(repo_root, site, label="site output")
-    if site == Path(".") or graph == site or site in graph.parents:
-        raise PagesConfigError("site output must be a dedicated directory separate from the graph")
+    if site == Path(".") or blueprint == site or site in blueprint.parents:
+        raise PagesConfigError("site output must be a dedicated directory separate from the blueprint")
     config_path = repo_root / CONFIG_PATH
     workflow_path = repo_root / WORKFLOW_PATH
     for path in (config_path, workflow_path):
@@ -271,7 +267,7 @@ def install_configuration(
         "repository_visibility": visibility,
         "default_branch": default_branch,
         "private_pages_verified": bool(private_pages_verified),
-        "graph": str(graph),
+        "blueprint": str(blueprint),
         "site": str(site),
         "autoform_exporter": {
             "repository": autoform_repository,
@@ -282,7 +278,7 @@ def install_configuration(
     }
     config_payload = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     workflow_payload = _workflow(
-        graph=graph,
+        blueprint=blueprint,
         site=site,
         default_branch=default_branch,
         autoform_repository=autoform_repository,
@@ -302,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
 
     install = subparsers.add_parser("install")
     install.add_argument("--repository")
-    install.add_argument("--graph", type=Path, default=Path(".autoform/graph.json"))
+    install.add_argument("--blueprint", type=Path, default=Path("blueprint"))
     install.add_argument("--site", type=Path, default=Path(".autoform/site"))
     install.add_argument("--autoform-root", type=Path, default=AUTOFORM_ROOT)
     install.add_argument("--autoform-repository")
@@ -340,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             repo_root,
             repository=repository,
             visibility=visibility,
-            graph=args.graph,
+            blueprint=args.blueprint,
             site=args.site,
             autoform_repository=autoform_repository,
             autoform_revision=autoform_revision,

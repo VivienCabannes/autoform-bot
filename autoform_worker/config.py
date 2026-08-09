@@ -7,8 +7,8 @@ worker never re-implements what ``scripts/`` already owns.
 """
 from __future__ import annotations
 
-import json
 import os
+import json
 import re
 import socket
 import sys
@@ -79,15 +79,25 @@ class WorkerConfig:
     """Everything a round needs, resolved once at CLI entry."""
 
     worker_id: str
-    project: Path        # dispatch project — the dir owning graph.json
+    project: Path        # dispatch project — the dir owning blueprint/roadmap
     lean_root: Path      # the Lean git repo (may equal project)
     plugin_root: Path
     state_dir: Path      # ~/.autoform/worker/<wid>/
     respect_claims: bool = True
 
     @property
-    def graph_path(self) -> Path:
+    def blueprint_path(self) -> Path:
+        blueprint = self.project / "blueprint"
+        if (blueprint / "roadmap").is_dir():
+            return blueprint
+        # Read-only migration compatibility for projects created before the
+        # Markdown authority. Setup never creates this form.
         return self.project / "graph.json"
+
+    @property
+    def graph_path(self) -> Path:
+        """Deprecated alias for legacy integrations; new projects use blueprint_path."""
+        return self.blueprint_path
 
     @property
     def counters_path(self) -> Path:
@@ -106,40 +116,45 @@ class WorkerConfig:
         return self.state_dir / "claims-scratch"
 
 
-def _find_graph_project(explicit: Path | None) -> Path:
-    """The dispatch project: explicit arg, env, else the cwd if it owns a graph."""
+def _find_blueprint_project(explicit: Path | None) -> Path:
+    """Resolve the project containing the authoritative Markdown roadmap."""
     if explicit is not None:
         proj = explicit.expanduser().resolve()
-        if not (proj / "graph.json").exists():
-            raise Die(f"no graph.json in {proj} — run /autoform:setup first (or pass the right --project)")
+        if not (proj / "blueprint" / "roadmap").is_dir() and not (proj / "graph.json").is_file():
+            raise Die(f"no blueprint/roadmap in {proj} — run /autoform:setup first")
         return proj
     env = os.environ.get("AUTOFORM_DISPATCH_PROJECT")
     if env:
         proj = Path(env).expanduser().resolve()
-        if not (proj / "graph.json").exists():
-            raise Die(f"AUTOFORM_DISPATCH_PROJECT={env} has no graph.json")
+        if not (proj / "blueprint" / "roadmap").is_dir() and not (proj / "graph.json").is_file():
+            raise Die(f"AUTOFORM_DISPATCH_PROJECT={env} has no blueprint/roadmap")
         return proj
     cwd = Path.cwd()
-    for cand in (cwd, cwd / ".autoform"):
-        if (cand / "graph.json").exists():
+    for cand in (cwd, *cwd.parents):
+        if (cand / "blueprint" / "roadmap").is_dir() or (cand / "graph.json").is_file():
             return cand.resolve()
     raise Die(
         "no dispatch project found — pass --project, set AUTOFORM_DISPATCH_PROJECT, "
-        "or run from a directory containing graph.json"
+        "or run from a repository containing blueprint/roadmap"
     )
 
 
 def _lean_root_of(project: Path) -> Path:
-    """The Lean repo root from graph metadata (the durable pointer), else the project."""
-    try:
-        meta = json.loads((project / "graph.json").read_text(encoding="utf-8")).get("metadata", {})
-    except (OSError, json.JSONDecodeError) as error:
-        raise Die(f"cannot read {project / 'graph.json'}: {error}") from error
-    lean_root = meta.get("lean_root")
-    if lean_root:
-        p = Path(lean_root)
-        if p.is_dir():
-            return p.resolve()
+    """Return the Lean checkout; projects are self-contained by default."""
+    configured = os.environ.get("AUTOFORM_LEAN_ROOT")
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if not path.is_dir():
+            raise Die(f"AUTOFORM_LEAN_ROOT is not a directory: {path}")
+        return path
+    legacy = project / "graph.json"
+    if legacy.is_file() and not (project / "blueprint" / "roadmap").is_dir():
+        try:
+            value = json.loads(legacy.read_text(encoding="utf-8")).get("metadata", {}).get("lean_root")
+            if value and Path(value).is_dir():
+                return Path(value).resolve()
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     return project
 
 
@@ -148,24 +163,8 @@ def resolve_config(
     worker_id: str | None = None,
     respect_claims: bool = True,
 ) -> WorkerConfig:
-    proj = _find_graph_project(project)
+    proj = _find_blueprint_project(project)
     lean_root = _lean_root_of(proj)
-    blueprint = proj / "blueprint"
-    if (blueprint / "roadmap").is_dir():
-        from autoform_cli.engine_graph import write_engine_graph
-
-        if not write_engine_graph(
-            blueprint,
-            proj / "graph.json",
-            project_root=proj,
-            lean_root=lean_root,
-            check=True,
-        ):
-            raise Die(
-                "graph.json is a stale generated projection of blueprint/; run "
-                "`autoform-blueprint engine-graph blueprint --output graph.json "
-                "--project-root . --lean-root .` and commit both changes"
-            )
     wid_raw = worker_id or os.environ.get("AUTOFORM_WORKER_ID") or ""
     if not wid_raw:
         wid_raw = f"{os.environ.get('USER', 'worker')}-{socket.gethostname().split('.')[0]}"

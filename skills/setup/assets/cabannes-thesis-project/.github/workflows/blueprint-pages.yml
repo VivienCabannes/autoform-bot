@@ -5,14 +5,12 @@ on:
     branches: [main]
     paths:
       - "blueprint/**"
-      - "graph.json"
       - "**.lean"
       - "mkdocs.yml"
       - ".github/workflows/blueprint-pages.yml"
   pull_request:
     paths:
       - "blueprint/**"
-      - "graph.json"
       - "**.lean"
       - "mkdocs.yml"
       - ".github/workflows/blueprint-pages.yml"
@@ -43,15 +41,6 @@ jobs:
         run: >-
           uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@6dab7c091613030c47e76a64ac0779d105fb8915
           autoform-blueprint check blueprint --lean-root .
-
-      - name: Reject a stale worker projection
-        run: >-
-          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@6dab7c091613030c47e76a64ac0779d105fb8915
-          autoform-blueprint engine-graph blueprint
-          --output graph.json
-          --project-root .
-          --lean-root .
-          --check
 
       # Writes site-src/: statement boxes, derived statuses, the Mermaid graph,
       # and permalinks into the Lean code at this exact commit.

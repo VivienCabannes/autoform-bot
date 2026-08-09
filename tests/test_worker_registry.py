@@ -502,8 +502,9 @@ def test_build_prompt_uses_markdown_protocol_when_blueprint_exists(tmp_path, mon
     )
 
     assert str(cfg.project / "blueprint" / "roadmap") in prompt
-    assert "Never edit `graph.json`" in prompt
-    assert "`Depends on` / `Proof depends on`" in prompt
+    assert "Every roadmap article is a node" in prompt
+    assert "dependency headings define DAG edges" in prompt
+    assert "graph.json" not in prompt
     assert "merge_node.py" not in prompt
 
 

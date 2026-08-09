@@ -15,7 +15,7 @@ writes: graph
 ---
 
 Review the assigned `blueprint/roadmap/` node pages. Markdown is authoritative;
-never edit the generated `graph.json`.
+never create a separate graph artifact.
 
 Your assignment bounds what you edit, not what you read. Inspect neighboring
 nodes, source pages, Lean declarations, and Mathlib as needed. Edit only the
@@ -38,5 +38,5 @@ recommend the survivor and exact re-links.
 
 Run `autoform-blueprint check blueprint --lean-root .` before finishing. It
 must reject broken links, fine-node cycles, and cycles introduced by chapter
-contraction. Regenerate `graph.json` after accepted edits. Report concrete
+contraction at every containment level. Revalidate after accepted edits. Report concrete
 edits first, then flagged changes outside your partition.

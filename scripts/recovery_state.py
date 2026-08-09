@@ -32,7 +32,7 @@ def _safe_bytes(base: Path, relative: str | None) -> bytes:
 
 
 def proof_fingerprint(
-    graph_path: Path,
+    blueprint_path: Path,
     node_id: str,
     lean_root: Path,
     backend: str,
@@ -43,16 +43,31 @@ def proof_fingerprint(
     A graph edit, prose strategy update, Lean edit, or backend change produces a
     new fingerprint; merely re-enqueueing the same work does not.
     """
-    graph_path = graph_path.resolve()
-    try:
-        graph = json.loads(graph_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        graph = {}
-    node = _node(graph, node_id)
-    project = graph_path.parent
+    blueprint_path = blueprint_path.resolve()
+    if blueprint_path.is_dir():
+        try:
+            from autoform_cli.runtime import load_runtime_model, resolve_blueprint
+            blueprint, project = resolve_blueprint(blueprint_path)
+            nodes, _metadata = load_runtime_model(
+                blueprint, project_root=project, lean_root=lean_root
+            )
+            node = nodes.get(node_id, {})
+        except (OSError, ValueError):
+            project, node = blueprint_path.parent, {}
+    else:  # compatibility for old recovery ledgers and isolated fixtures
+        try:
+            graph = json.loads(blueprint_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            graph = {}
+        node = _node(graph, node_id)
+        project = blueprint_path.parent
     content = node.get("content") if isinstance(node.get("content"), str) else None
     if content is None:
-        content = f"informal_content/{node_id}.md"
+        content = (
+            f"blueprint/roadmap/{node_id}.md"
+            if blueprint_path.is_dir()
+            else f"informal_content/{node_id}.md"
+        )
     lean_file = node.get("lean_file") if isinstance(node.get("lean_file"), str) else None
 
     digest = hashlib.sha256()

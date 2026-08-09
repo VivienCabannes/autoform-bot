@@ -1,6 +1,5 @@
 ---
-kind: roadmap
-status: active
+kind: article
 ---
 
 # Thesis roadmap

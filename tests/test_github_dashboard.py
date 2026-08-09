@@ -229,11 +229,13 @@ def test_export_remains_complete_after_plugin_cache_is_deleted(tmp_path):
 
 
 def test_pages_configuration_fails_closed_and_generates_pinned_workflow(tmp_path):
-    graph, _site = _project(tmp_path)
-    relative_graph = graph.relative_to(tmp_path)
+    _graph, _site = _project(tmp_path)
+    blueprint = tmp_path / "blueprint" / "roadmap"
+    blueprint.mkdir(parents=True)
+    (blueprint / "README.md").write_text("# Roadmap\n", encoding="utf-8")
     kwargs = {
         "repository": "owner/project",
-        "graph": relative_graph,
+        "blueprint": Path("blueprint"),
         "site": Path(".autoform/site"),
         "autoform_repository": "facebookresearch/autoform-bot",
         "autoform_revision": "a" * 40,
@@ -259,9 +261,10 @@ def test_pages_configuration_fails_closed_and_generates_pinned_workflow(tmp_path
     workflow = workflow_path.read_text()
     assert "facebookresearch/autoform-bot" in workflow
     assert "a" * 40 in workflow
-    assert "export_github_dashboard.py" in workflow
-    assert "blueprint/web/**" in workflow
-    assert "blueprint/web/index.html" in workflow
+    assert "autoform-blueprint render" in workflow
+    assert '"blueprint/**"' in workflow
+    assert "mkdocs build --strict" in workflow
+    assert "export_github_dashboard.py" not in workflow
     assert "apt-get" not in workflow
     assert "pip install" not in workflow
     assert "leanblueprint web" not in workflow
@@ -345,12 +348,15 @@ def test_incremental_verify_script_handles_existing_debt_renames_and_comments(tm
 
 
 def test_private_pages_install_requires_and_records_verification(tmp_path):
-    graph, _site = _project(tmp_path)
+    _graph, _site = _project(tmp_path)
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    roadmap.mkdir(parents=True)
+    (roadmap / "README.md").write_text("# Roadmap\n", encoding="utf-8")
     config_path, _workflow_path = pages.install_configuration(
         tmp_path,
         repository="enterprise/private-project",
         visibility="private",
-        graph=graph.relative_to(tmp_path),
+        blueprint=Path("blueprint"),
         site=Path(".autoform/site"),
         autoform_repository="facebookresearch/autoform-bot",
         autoform_revision="b" * 40,

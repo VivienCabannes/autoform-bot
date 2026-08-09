@@ -34,12 +34,11 @@ For a new or incomplete repository:
 - create or repair a buildable Lean project with matching `lean-toolchain` and
   Mathlib revisions;
 - create `blueprint/` with a landing page plus `roadmap/`, `coverage/`, and
-  `sources/`; later Roadmap work places `kind: node` pages beside their
-  milestones under `roadmap/`. A roadmap folder is a book chapter; a node page
-  is normally one PR-sized major result or important definition. Markdown
-  properties and dependency links are the graph. Generate `graph.json` only as
-  the deterministic compatibility projection consumed by the worker and local
-  dashboard; never hand-edit it. Keep personal `.obsidian/`, `.trash/`,
+  `sources/`; later Roadmap work places `kind: article` pages under
+  `roadmap/`. Every folder that acts as a scope has a `README.md` article; it
+  strictly contains the nested articles, while one leaf article is normally
+  one PR-sized result or important definition. Markdown properties, layout,
+  and dependency links are the complete graph authority. Keep personal `.obsidian/`, `.trash/`,
   generated visualizations, and site output ignored;
 - preserve or create the root `README.md` with a link to `blueprint/README.md`;
   when a deployed site exists, also feature its verified canonical URL
@@ -53,8 +52,8 @@ For a new or incomplete repository:
   global previous/next controls: Autoform derives those links from the
   blueprint's Markdown reading order and renders them only at the bottom of
   book pages, never on Progress or Dependencies;
-- adapt `autoform-verify.yml` to validate the Markdown DAG, reject a stale
-  generated `graph.json`, build Lean, reject unfinished or unsafe proofs, and
+- adapt `autoform-verify.yml` to validate the Markdown hierarchy and DAG,
+  build Lean, reject unfinished or unsafe proofs, and
   audit theorem axioms on pull requests; and
 - adapt `blueprint-pages.yml` to validate the DAG and its `lean:` declarations,
   render the blueprint, build MkDocs, and deploy GitHub Pages.
@@ -72,8 +71,6 @@ from; substitute its absolute path:
 lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check blueprint --lean-root .
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint engine-graph blueprint \
-  --output graph.json --project-root . --lean-root .
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint render blueprint \
   --output site-src --lean-root . --require-declarations
@@ -84,11 +81,11 @@ uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 `site-src/`, `site/`, and `blueprint/dependencies.md`.
 
 When the user wants live local operations, start the existing loopback
-dashboard against the generated `graph.json` with `scripts/service_control.py`.
+dashboard against `blueprint/` with `scripts/service_control.py`.
 That dashboard may read queues, agents, logs, and uncommitted state; none of
 those operational files belongs in the Markdown vault or Pages artifact.
-Distributed workers use the same generated graph and refuse to start when it
-is stale relative to `blueprint/`.
+Distributed workers read the same Markdown articles directly, so there is no
+secondary graph artifact to synchronize or become stale.
 
 Publication is opt-in because files under `blueprint/` become public site
 content, together with derived progress, graph pages, and a path-free

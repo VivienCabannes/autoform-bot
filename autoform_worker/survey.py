@@ -141,20 +141,18 @@ def _tended(pr: PRInfo, me: str, extra_identities: list[str]) -> bool:
 
 def eligible_prove_nodes(cfg: WorkerConfig) -> list[tuple[str, dict, str]]:
     """(node_id, node, reason) for every node prove-eligible from *local* state:
-    tier 2, not in Mathlib, unproved or defective, all prerequisites trusted."""
+    a concrete Lean declaration, not in Mathlib, unproved or defective, with trusted prerequisites."""
     mods = scripts_modules()
     rm = mods["review_model"]
     try:
-        nodes, _meta = rm.load_graph(cfg.graph_path)
+        nodes, _meta = rm.load_graph(cfg.blueprint_path)
     except Exception as error:
-        raise SystemExit(f"cannot load graph {cfg.graph_path}: {error}") from error
+        raise SystemExit(f"cannot load blueprint {cfg.blueprint_path}: {error}") from error
     sidecar = rm.load_sidecar(cfg.project / "review_status.json")
-
-    import export_blueprint as eb  # noqa: PLC0415  — path set up by scripts_modules()
 
     out: list[tuple[str, dict, str]] = []
     for node_id, node in nodes.items():
-        if eb.node_tier(node) != 2 or rm.is_in_mathlib(node):
+        if not node.get("formalizable", node.get("tier") == 2) or rm.is_in_mathlib(node):
             continue
         verdict = rm.verdict_of(node_id, sidecar)
         lean_file = node.get("lean_file")
@@ -386,7 +384,7 @@ def collect(
     rng = random.Random(cfg.worker_id)
     rng.shuffle(eligible)
     try:
-        graph_nodes, graph_meta = rm.load_graph(cfg.graph_path)
+        graph_nodes, graph_meta = rm.load_graph(cfg.blueprint_path)
         priority = rm.prove_priority(graph_nodes, sidecar, graph_meta)
         survey.targets = {t: rm.target_metrics(t, graph_nodes, sidecar)
                           for t in rm.graph_targets(graph_meta) if t in graph_nodes}
@@ -411,7 +409,7 @@ def collect(
         # asking. Checked BEFORE the parked suppression below, which would
         # otherwise make parking permanent and silently cost the fleet a node.
         resumable = recovery_state.resumable_park(
-            queue_tasks, node_id, cfg.graph_path, cfg.lean_root, adapter)
+            queue_tasks, node_id, cfg.blueprint_path, cfg.lean_root, adapter)
         if resumable is not None:
             # Report it, but do NOT make it prove-actionable: the round resumes
             # the recovery and re-surveys, so claiming a prove here would make
@@ -427,7 +425,7 @@ def collect(
             ), False)
             continue
         if recovery_state.unchanged_recovery(
-                queue_tasks, node_id, cfg.graph_path, cfg.lean_root, adapter):
+                queue_tasks, node_id, cfg.blueprint_path, cfg.lean_root, adapter):
             push_cand("prove", Candidate(
                 "prove", "proof recovery produced no new prover input", node=node_id
             ), False)

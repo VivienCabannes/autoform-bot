@@ -1,5 +1,5 @@
 ---
-kind: node
+kind: article
 declaration: theorem
 origin: cited
 statement: formalized

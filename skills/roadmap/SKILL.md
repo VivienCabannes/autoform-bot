@@ -4,7 +4,7 @@ description: >-
   Build, inspect, refine, or visualize the mathematical roadmap and theorem
   dependency DAG in an existing Autoform Markdown blueprint. Use for confirming
   source scope, writing roadmap and coverage notes, decomposing mathematics
-  into kind: node Markdown pages under blueprint/roadmap/, setting planning
+  into kind: article Markdown pages under blueprint/roadmap/, setting planning
   statuses, or checking roadmap
   completeness; do not install repository infrastructure or prove Lean
   declarations.
@@ -35,7 +35,7 @@ mathematics.
    for every definition or theorem used in the plan.
 2. Write the high-level direction and milestones under `blueprint/roadmap/`.
    Begin each planning page with simple YAML scalar properties such as
-   `kind: roadmap` and `status: active` so Obsidian and people can see its
+   `kind: article` so Obsidian, the renderer, and people share its
    state immediately. Treat `blueprint/README.md` and the roadmap pages it
    links as an ordered mathematical book: link meaningful chapter pages in
    their intended reading order. The renderer derives bottom-of-page previous
@@ -49,7 +49,7 @@ mathematics.
    expanding it into a fine DAG.
 5. After approval, create one file per formalization-sized definition or
    statement beside its milestone under `blueprint/roadmap/**/*.md`. Set
-   `kind: node`; its path relative to `roadmap/`, without `.md`, is its stable
+   `kind: article`; its path relative to `roadmap/`, without `.md`, is its stable
    ID. Give it exactly one H1, a `declaration` naming the intended Lean
    artifact, a source-grounded statement or proof sketch, and a
    `## Depends on` section. Never overload `kind` with the declaration.
@@ -73,16 +73,12 @@ from; substitute its absolute path and run:
 ```bash
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check "<PROJECT>/blueprint" \
   --lean-root "<PROJECT>"
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint engine-graph \
-  "<PROJECT>/blueprint" --output "<PROJECT>/graph.json" \
-  --project-root "<PROJECT>" --lean-root "<PROJECT>"
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize "<PROJECT>/blueprint"
 ```
 
 Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
-`lean:` names before handoff. Treat `graph.json` as generated compatibility
-output: commit it with the Markdown changes when existing workers or the local
-dashboard consume it, but never edit it directly. Report roadmap and coverage
+`lean:` names before handoff. Workers, dashboards, and publication all compile
+their views directly from the Markdown articles. Report roadmap and coverage
 status, node and edge counts, the derived state summary, unresolved source
-questions, and the vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
+questions, and the blueprint path. Hand nodes that are ready to state or prove to Orchestrate;
 hand CI, Pages, Lean-project, or vault infrastructure changes back to Setup.

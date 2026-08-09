@@ -26,6 +26,9 @@ def _project(tmp_path: Path) -> Path:
         "---\nkind: blueprint\n---\n\n# Overview\n\n- [Roadmap](roadmap/README.md)\n",
         encoding="utf-8",
     )
+    (roadmap / "README.md").write_text(
+        "---\nkind: article\n---\n\n# Roadmap\n", encoding="utf-8"
+    )
     (roadmap / "base.md").write_text(
         "---\nkind: node\ndeclaration: def\nstatement: formalized\nlean: Project.Base\n---\n\n"
         "# Base\n\nThe base object.\n\n## Depends on\n\nThis node has no prerequisites.\n",
@@ -164,6 +167,7 @@ def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
     (project / "blueprint/sources.md").write_text("# Paper\n", encoding="utf-8")
     nested = project / "blueprint/roadmap/chapter/deep.md"
     nested.parent.mkdir(parents=True)
+    (nested.parent / "README.md").write_text("# Chapter\n", encoding="utf-8")
     nested.write_text(
         "---\nkind: node\ndeclaration: theorem\n---\n\n# Deep\n\nBody.\n\n"
         "## Sources\n\n- [Paper](../../sources.md)\n",
@@ -291,7 +295,7 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
     assert manifest == {
         "dependencies": 1,
         "git_ref": "a" * 40,
-        "nodes": 2,
+        "nodes": 3,
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
         "source_revision": manifest["source_revision"],

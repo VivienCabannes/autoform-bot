@@ -84,8 +84,10 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     roadmap = (ROOT / "skills" / "roadmap" / "SKILL.md").read_text()
     orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
-    assert "autoform-blueprint engine-graph" in roadmap
-    assert "autoform-blueprint engine-graph" in setup
+    assert "autoform-blueprint check" in roadmap
+    assert "autoform-blueprint check" in setup
+    assert "graph.json" not in roadmap
+    assert "graph.json" not in setup
     assert "Markdown as the sole source of truth" in roadmap
     assert "internal/runbooks/proving.md" in orchestrate
     assert "internal/runbooks/review.md" in orchestrate

@@ -13,10 +13,10 @@ writes: graph
 ---
 
 Build one chapter of `blueprint/roadmap/`. Markdown is the authored roadmap;
-`graph.json` is generated compatibility output and must not be edited.
+The Markdown articles are the only graph authority; do not create a parallel graph file.
 
 1. Read the assigned source passages and neighboring roadmap chapters.
-2. Create one `kind: node` page per PR-sized important definition or result.
+2. Create one `kind: article` page per PR-sized important definition or result.
    The path below `roadmap/` is the stable node ID. Give every page one H1,
    an intended `declaration`, an explicit `origin` (`cited`, `bridged`, or
    `background`), mathematical prose, and source links under `## Sources`.
@@ -34,5 +34,5 @@ reconstruct the target. Preserve existing accepted pages. If the sources do
 not support a planned claim, omit it and report the gap.
 
 Before finishing, run `autoform-blueprint check blueprint --lean-root .`, then
-regenerate `graph.json` with `autoform-blueprint engine-graph`. Report node and
+run `autoform-blueprint check` after edits. Report article and
 edge counts, verified Mathlib roots, and unresolved source questions.

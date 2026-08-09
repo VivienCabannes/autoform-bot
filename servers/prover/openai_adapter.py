@@ -116,7 +116,7 @@ def _env(preset: str, suffix: str) -> str:
             or os.environ.get(f"AUTOFORM_OPENAI_{suffix}", "")).strip()
 
 
-def _resolve_target_file(graph_path: str, node: str, project_dir: str) -> Path | None:
+def _resolve_target_file(blueprint_path: str, node: str, project_dir: str) -> Path | None:
     """The node's Lean file: the plan's explicit ``lean_file`` pin, when present.
 
     The pin gets the same sanitization as a model-declared header — the graph
@@ -124,8 +124,13 @@ def _resolve_target_file(graph_path: str, node: str, project_dir: str) -> Path |
     of where it came from.
     """
     try:
-        graph = json.loads(Path(graph_path).read_text(encoding="utf-8"))
-        entry = (graph.get("nodes") or {}).get(node) or {}
+        candidate = Path(blueprint_path)
+        if candidate.is_dir():
+            from autoform_cli.runtime import load_runtime_node
+            entry = load_runtime_node(candidate, node, project_root=project_dir)
+        else:  # compatibility for explicit legacy benchmark fixtures
+            graph = json.loads(candidate.read_text(encoding="utf-8"))
+            entry = (graph.get("nodes") or {}).get(node) or {}
         rel = _sanitize_rel(str(entry.get("lean_file") or ""))
         if rel:
             return _safe_project_target(project_dir, rel)
@@ -177,7 +182,7 @@ class OpenAICompatAdapter(ProverAdapter):
     """Drive any OpenAI-compatible chat endpoint as a request/response prover.
 
     Args:
-        graph_path: The plan's graph.json — used to resolve the node's target
+        graph_path: The blueprint path — used to resolve the article's target
             ``lean_file``; a model-declared ``-- FILE: <rel>`` header inside the
             fence is the sanitized fallback.
         preset: ``"openai"`` or ``"avocado"`` — selects default base URL, model

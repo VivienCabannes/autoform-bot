@@ -27,13 +27,13 @@ API:
                                   delta (new effective verdicts + tainted set).
   * ``GET  /assets/*``          — review.css / review.js (+ any static asset).
 
-Inputs (read-only): ``graph.json``, ``informal_content/<id>.md``, the built
+Inputs (read-only): Markdown under ``blueprint/``, the built
 blueprint (``dep_graph_document.html`` for the ``div.thm#<slug>`` fragments), an
 optional ``kernel/<id>.txt`` (``#print axioms`` dump), and the sidecar.
 
 Run:
-    python serve_review.py --graph path/to/graph.json
-    python serve_review.py --graph graph.json --port 8765 --open
+    python serve_review.py --blueprint path/to/blueprint
+    python serve_review.py --blueprint blueprint --port 8765 --open
 """
 from __future__ import annotations
 
@@ -305,7 +305,7 @@ def _bounded_queue(queue: List[dict]) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# project context — resolves all the read-only inputs around graph.json
+# project context — resolves all inputs around the Markdown blueprint
 # ---------------------------------------------------------------------------
 
 class Project:
@@ -315,16 +315,17 @@ class Project:
     correct if the graph or a re-run of the jury changes the files under it).
     """
 
-    def __init__(self, graph_path: Path):
-        self.graph_path = graph_path.resolve()
-        self.root = self.graph_path.parent
-        self.content_dir = self.root / "informal_content"
+    def __init__(self, blueprint_path: Path):
+        self.blueprint_path = blueprint_path.resolve()
+        legacy = self.blueprint_path.is_file()
+        self.root = self.blueprint_path.parent
+        self.content_dir = self.root / "informal_content" if legacy else self.blueprint_path / "roadmap"
         self.kernel_dir = self.root / "kernel"
         self.sidecar_path = self.root / "review_status.json"
-        # Live activity feed, read-only, sitting next to graph.json. The orchestrator
+        # Live activity feed, read-only, sitting next to blueprint/. The orchestrator
         # may write it while a run is in flight; this server only ever reads it.
         self.agents_path = self.root / "agents_status.json"
-        # Dispatch queue, sitting next to graph.json. This is the SECOND deliberate
+        # Dispatch queue, sitting next to blueprint/. This is the SECOND deliberate
         # write this server performs (beyond review_status.json): an append-only-ish
         # list of task requests an external orchestrator consumes. The server writes
         # it but NEVER spawns an agent / runs claude — it only dispatches.
@@ -342,11 +343,11 @@ class Project:
 
     # --- graph + sidecar ---
     def nodes(self):
-        nodes, _meta = rm.load_graph(self.graph_path)
+        nodes, _meta = rm.load_graph(self.blueprint_path)
         return nodes
 
     def metadata(self):
-        _nodes, meta = rm.load_graph(self.graph_path)
+        _nodes, meta = rm.load_graph(self.blueprint_path)
         return meta
 
     def sidecar(self) -> dict:
@@ -363,7 +364,7 @@ class Project:
 
     # --- the dispatch queue (the second deliberate write) ---
     def task_queue(self, *, strict: bool = False) -> List[dict]:
-        """The current dispatch queue, read from ``task_queue.json`` next to graph.json.
+        """The current dispatch queue, read from project-local ``task_queue.json``.
 
         Read-only dashboard rendering is best-effort: malformed state degrades
         to an empty list instead of taking down the UI. Every mutation passes
@@ -1643,7 +1644,9 @@ def make_handler(proj: Project):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Local DAG review server (127.0.0.1)")
-    ap.add_argument("--graph", type=Path, required=True, help="path to graph.json")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--blueprint", type=Path, help="path to blueprint directory")
+    source.add_argument("--graph", type=Path, help=argparse.SUPPRESS)
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--open", action="store_true",
                     help="open the home screen in a browser")
@@ -1653,10 +1656,12 @@ def main(argv=None) -> int:
                          "module packets. Overrides graph metadata.lean_root.")
     args = ap.parse_args(argv)
 
-    graph_path = args.graph.resolve()
-    if not graph_path.is_file():
-        ap.error(f"graph.json not found: {graph_path}")
-    proj = Project(graph_path)
+    blueprint_path = (args.blueprint or args.graph).resolve()
+    if args.blueprint is not None and not (blueprint_path / "roadmap").is_dir():
+        ap.error(f"blueprint/roadmap not found: {blueprint_path}")
+    if args.graph is not None and not blueprint_path.is_file():
+        ap.error(f"legacy graph not found: {blueprint_path}")
+    proj = Project(blueprint_path)
     if args.lean_root is not None:
         proj.lean_root = args.lean_root.resolve()
 
@@ -1664,7 +1669,7 @@ def main(argv=None) -> int:
     actual_port = int(server.server_address[1])
     url = f"http://127.0.0.1:{actual_port}/"
     print(f"review server → {url}  (Ctrl-C to stop)")
-    print(f"  graph:   {graph_path}")
+    print(f"  blueprint: {blueprint_path}")
     print(f"  sidecar: {proj.sidecar_path}")
     if not proj.blueprint_html.is_file():
         print(f"  note: blueprint not built at {proj.blueprint_html}\n"

@@ -58,7 +58,7 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
         checks.append(("project", False, "no dispatch project resolved — pass --project"))
         return checks
     checks.append(("project", True, str(cfg.project)))
-    checks.append(("graph.json", cfg.graph_path.exists(), str(cfg.graph_path)))
+    checks.append(("blueprint/roadmap", (cfg.blueprint_path / "roadmap").is_dir(), str(cfg.blueprint_path / "roadmap")))
     checks.append(("lean repo", is_git_repo(cfg.lean_root), str(cfg.lean_root)))
 
     url = origin_url(cfg.lean_root)

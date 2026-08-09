@@ -153,7 +153,7 @@ def _enqueue_escalation(
                 "phase": "proof-research",
                 "round": rounds + 1,
                 "fingerprint": recovery_state.proof_fingerprint(
-                    cfg.graph_path, node_id, cfg.lean_root, backend
+                    cfg.blueprint_path, node_id, cfg.lean_root, backend
                 ),
                 "backend": backend,
             },
@@ -210,7 +210,7 @@ def do_prove(
             f"backend {backend!r} sends project data to a configured API endpoint; "
             f"re-run with --allow-api-egress {adapter} after explicit user approval"
         )
-    nodes, _meta = rm.load_graph(cfg.graph_path)
+    nodes, _meta = rm.load_graph(cfg.blueprint_path)
     node = nodes.get(node_id)
     if node is None:
         return UnitResult(False, f"prove {node_id}: node vanished from graph")
@@ -242,7 +242,7 @@ def do_prove(
             status = "failed"
             try:
                 status, reason, detail = prover(
-                    node_id, node, work_cfg.project, str(work_cfg.graph_path), str(work_cfg.lean_root),
+                    node_id, node, work_cfg.project, str(work_cfg.blueprint_path), str(work_cfg.lean_root),
                     PROVE_MAX_STEERS, backend=adapter, judge_backend=judge_backend,
                     worker_timeout=PROVE_TIMEOUT_S,
                 )
@@ -333,7 +333,7 @@ def do_review(
 
     import dispatch_runner  # noqa: PLC0415
 
-    nodes, _meta = rm.load_graph(cfg.graph_path)
+    nodes, _meta = rm.load_graph(cfg.blueprint_path)
     node = nodes.get(pr.node)
     if node is None:
         counters.bump(f"review-err-{pr.number}")

@@ -15,7 +15,7 @@ from autoform_cli.graph import (
 
 
 def _node_text(body: str, **metadata: str) -> str:
-    properties = ["kind: node", *(f"{key}: {value}" for key, value in metadata.items())]
+    properties = ["kind: article", *(f"{key}: {value}" for key, value in metadata.items())]
     return "\n".join(["---", *properties, "---", body])
 
 
@@ -63,7 +63,7 @@ def test_loads_nested_wiki_and_metadata(tmp_path: Path) -> None:
 
     assert list(graph.nodes) == ["foundations/base", "result"]
     assert graph.nodes["foundations/base"].title == "Base theorem"
-    assert graph.nodes["foundations/base"].kind == "node"
+    assert graph.nodes["foundations/base"].kind == "article"
     assert graph.nodes["foundations/base"].declaration == "theorem"
     assert graph.nodes["foundations/base"].statement_formalized
     assert graph.nodes["foundations/base"].proof_formalized
@@ -123,13 +123,14 @@ def test_rejects_self_edge(tmp_path: Path) -> None:
         load_graph(blueprint)
 
 
-def test_dependency_must_target_a_marked_node(tmp_path: Path) -> None:
+def test_every_roadmap_markdown_file_is_an_article(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _roadmap_page(blueprint, "notes.md", "---\nkind: roadmap\n---\n# Notes\n")
     _node(blueprint, "result.md", "# Result\n## Depends on\n[Notes](notes.md)\n")
 
-    with pytest.raises(GraphValidationError, match="dependency target is not a node"):
-        load_graph(blueprint)
+    graph = load_graph(blueprint)
+    assert graph.nodes["notes"].title == "Notes"
+    assert graph.nodes["result"].dependencies == ("notes",)
 
 
 def test_rejects_cycle(tmp_path: Path) -> None:
@@ -143,6 +144,8 @@ def test_rejects_cycle(tmp_path: Path) -> None:
 
 def test_rejects_cycle_created_only_by_chapter_contraction(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
+    _roadmap_page(blueprint, "a/README.md", "# A\n")
+    _roadmap_page(blueprint, "b/README.md", "# B\n")
     _node(blueprint, "a/first.md", "# A first\n")
     _node(
         blueprint,
@@ -155,7 +158,7 @@ def test_rejects_cycle_created_only_by_chapter_contraction(tmp_path: Path) -> No
         "# A last\n## Depends on\n[B middle](../b/middle.md)\n",
     )
 
-    with pytest.raises(GraphValidationError, match=r"chapter dependency cycle: a -> b -> a"):
+    with pytest.raises(GraphValidationError, match=r"rolled-up dependency cycle in root: a -> b -> a"):
         load_graph(blueprint)
 
 
@@ -194,15 +197,21 @@ def test_requires_blueprint_and_roadmap_directories(tmp_path: Path) -> None:
         load_graph(blueprint)
 
 
-def test_ignores_unmarked_roadmap_pages(tmp_path: Path) -> None:
+def test_loads_container_articles_and_infers_single_parent_hierarchy(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _roadmap_page(
         blueprint,
         "README.md",
-        "---\nkind: roadmap\nowner: planning\n---\n\n# Roadmap\n",
+        "---\nkind: article\n---\n\n# Roadmap\n",
     )
+    _roadmap_page(blueprint, "chapter/README.md", "# Chapter\n")
+    _node(blueprint, "chapter/result.md", "# Result\n")
 
-    assert load_graph(blueprint).nodes == {}
+    graph = load_graph(blueprint)
+    assert graph.nodes["roadmap"].parent is None
+    assert graph.nodes["chapter"].parent == "roadmap"
+    assert graph.nodes["chapter/result"].parent == "chapter"
+    assert graph.nodes["chapter/result"].depth == 2
 
 
 def test_splits_statement_and_proof_dependencies(tmp_path: Path) -> None:
@@ -297,7 +306,7 @@ def test_loads_legacy_nodes_with_normalized_metadata(tmp_path: Path) -> None:
     with pytest.warns(LegacyNodesDirectoryWarning, match="kind: node"):
         graph = load_graph(blueprint)
 
-    assert graph.nodes["base"].kind == "node"
+    assert graph.nodes["base"].kind == "article"
     assert graph.nodes["base"].declaration == "theorem"
 
 
@@ -313,7 +322,7 @@ def test_check_cli(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     lines = result.stdout.splitlines()
-    assert lines[0] == "OK: 1 nodes, 0 dependencies"
+    assert lines[0] == "OK: 1 articles, 0 dependencies"
     assert lines[1].strip() == "1 ready to state"
 
 

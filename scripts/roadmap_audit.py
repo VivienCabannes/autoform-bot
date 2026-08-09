@@ -34,7 +34,7 @@ Enqueue mapping (``--enqueue``, deduplicated by the queue itself):
 
 Exit code: 0 = no offenders, 1 = offenders found, 2 = cannot audit.
 Usage:
-    roadmap_audit.py <graph.json> [--json] [--enqueue] [--verify-decls]
+    roadmap_audit.py <blueprint/> [--json] [--enqueue] [--verify-decls]
                      [--stamp-verified] [--mathlib PATH]
 """
 from __future__ import annotations
@@ -85,6 +85,13 @@ def _offender(node: str, detail: str) -> dict:
 
 def audit_structural(graph_path: Path) -> list[dict]:
     """check_invariants' structural gates, captured instead of printed."""
+    if graph_path.is_dir():
+        try:
+            from autoform_cli.graph import load_graph
+            load_graph(graph_path)
+            return []
+        except ValueError as error:
+            return [_offender("(blueprint)", str(error))]
     buffer = io.StringIO()
     with redirect_stdout(buffer):
         structural_ok, _grounded_ok = check_invariants.check(str(graph_path))
@@ -128,7 +135,7 @@ def audit_grounding(nodes: dict) -> list[dict]:
 
     return [_offender(nid, "missing node with no in-mathlib root in its dependency closure")
             for nid, node in nodes.items()
-            if eb.node_tier(node) == 2
+            if node.get("formalizable", eb.node_tier(node) == 2)
             and rm.normalize_status(node.get("mathlib_status")) == "missing"
             and not grounds(nid, frozenset())]
 
@@ -155,6 +162,8 @@ def audit_verified(nodes: dict, lean_root: Path | None, verify_decls: bool,
         decls = [d for d in (node.get("mathlib_declarations") or []) if isinstance(d, str) and d]
         if not decls:
             offenders.append(_offender(nid, "in-mathlib with no mathlib_declarations — unverifiable claim"))
+            continue
+        if node.get("blueprint_article") and not verify_decls:
             continue
         if node.get("mathlib_verified"):
             continue
@@ -192,7 +201,7 @@ def audit_content(nodes: dict, project: Path) -> list[dict]:
     out = []
     referenced: set[str] = set()
     for nid, node in nodes.items():
-        if eb.node_tier(node) != 2:
+        if not node.get("formalizable", eb.node_tier(node) == 2):
             continue
         content = node.get("content")
         if not content:
@@ -228,7 +237,8 @@ def audit_provenance(nodes: dict) -> list[dict]:
     """
     out = []
     for nid, node in nodes.items():
-        if eb.node_tier(node) != 2 or rm.normalize_status(node.get("mathlib_status")) == "in-mathlib":
+        if (not node.get("formalizable", eb.node_tier(node) == 2)
+                or rm.normalize_status(node.get("mathlib_status")) == "in-mathlib"):
             continue
         origin = node.get("origin")
         refs = node.get("source_refs") or []
@@ -301,7 +311,7 @@ def run_audit(graph_path: Path, verify_decls: bool = False,
               mathlib_override: str | None = None) -> tuple[dict, dict]:
     nodes, meta = rm.load_graph(graph_path)
     project = graph_path.parent
-    lean_root = None
+    lean_root = project if graph_path.is_dir() else None
     raw_root = (meta or {}).get("lean_root")
     if raw_root and Path(raw_root).is_dir():
         lean_root = Path(raw_root)
@@ -319,7 +329,7 @@ def run_audit(graph_path: Path, verify_decls: bool = False,
         "leanpaths": audit_leanpaths(nodes, lean_root),
     }
     report = {
-        "graph": str(graph_path),
+        "blueprint": str(graph_path),
         "at": _now(),
         "clauses": clauses,
         "summary": {name: len(offs) for name, offs in clauses.items()},

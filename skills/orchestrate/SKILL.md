@@ -65,10 +65,10 @@ backend as Claude; let validation fail closed.
 
 Resolve:
 
-- dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then a
-  running dashboard's graph parent;
-- Lean project: the repository containing `blueprint/` and the generated
-  `graph.json`, otherwise the explicit project argument;
+- dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then
+  the nearest repository containing `blueprint/roadmap/`;
+- Lean project: that repository, unless `AUTOFORM_LEAN_ROOT` explicitly points
+  at a separate checkout;
 - proof backend: explicit choice for this run, otherwise run `backend_config.py get
   --fallback codex` on Codex, `--fallback max` on Claude, or `--fallback muse`
   on Muse. A persisted choice wins over the host fallback;
@@ -82,17 +82,14 @@ available backend or install Claude. The `muse` prover or judge requires the
 `tbh` CLI and its configured provider authentication. Never silently override a
 resolved choice.
 
-When `blueprint/roadmap/` exists, validate that the compatibility graph is
-current before starting the engine:
+Validate the Markdown hierarchy and dependency DAG before starting the engine:
 
 ```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint engine-graph \
-  "$DISPATCH_PROJECT/blueprint" --output "$DISPATCH_PROJECT/graph.json" \
-  --project-root "$DISPATCH_PROJECT" --lean-root "$LEAN_PROJECT" --check
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check \
+  "$DISPATCH_PROJECT/blueprint" --lean-root "$LEAN_PROJECT"
 ```
 
-If stale, regenerate it from Markdown and include both files in the same
-durable change. Never repair a Markdown project by editing `graph.json`.
+Fix validation failures in their Markdown articles before dispatching work.
 
 For every distinct API provider (`openai` or `avocado`) used by either prover or
 judge, run the local configuration check before launching:
@@ -233,19 +230,19 @@ Loogle, LeanExplore, and `scripts/mathlib_search.py` for stateless Mathlib searc
 
 ## Planner pipeline
 
-For a tier-1 cluster:
+For a container article whose leaves have not been decomposed:
 
 1. Claim the planner task.
 2. Spawn the canonical `splitter` role with the cluster, sources, existing prerequisite node index,
    and output paths.
-3. Write or update the cluster's `kind: node` Markdown pages and typed dependency links.
+3. Write or update the cluster's `kind: article` Markdown pages and typed dependency links.
 4. Spawn one canonical `mathlib-checker` per new node in parallel; record only
    checked `mathlib`, `lean`, and source facts in the corresponding pages.
 5. Spawn canonical `graph-reviewer` and `content-reviewer` roles in parallel over the cluster.
    Structural and prose edits both land in the Markdown pages; keep each role
    inside its assigned files.
 6. Enqueue jury review for the new nodes.
-7. Validate the Markdown DAG and regenerate `graph.json`. Mark the planner task
+7. Validate the Markdown hierarchy and DAG. Mark the planner task
    done only after all earlier steps have durable output.
 
 ## Proof recovery pipeline
@@ -270,7 +267,7 @@ it means proof recovery. Claim the task and run these waves in order:
 Child research agents return findings without editing project files. The recovery
 coordinator records the selected mathematical route, counterexample, or
 reconstruction in the target's Markdown proof notes; raw operational search
-logs remain local. Regenerate the compatibility graph after structural edits.
+logs remain local. Revalidate the Markdown graph after structural edits.
 Mark the recovery `done` and
 enqueue a worker only after a durable input or strategy change. If a complete
 wave finds no defensible next route, use
@@ -292,14 +289,14 @@ Unless manual/drop-only mode was requested:
 1. Read graph, reviews, queue, and open proof recoveries.
 2. Drain interactive-host work first, proof recoveries first.
 3. Traverse foundations-first (with declared targets, critical path first):
-   - roadmap gaps → run `scripts/roadmap_audit.py "$DISPATCH_PROJECT/graph.json"
+   - roadmap gaps → run `scripts/roadmap_audit.py "$DISPATCH_PROJECT/blueprint"
      --enqueue` once per pass; it turns every completeness failure (status,
      grounding, unverified in-Mathlib claims, missing prose, target
      reachability) into a queued role task the loop drains;
    - unreviewed node → enqueue `reviewer`;
    - defective or unproved node with clean prerequisites and no open recovery
      → enqueue `worker`;
-   - unsplit tier-1 cluster → planner pipeline;
+   - undecomposed container article → planner pipeline;
    - stale or guessed Mathlib status → `mathcheck`.
 4. Enqueue a bounded wave. Queue operations deduplicate; never double-run engine
    tasks as subagents.

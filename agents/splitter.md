@@ -8,7 +8,7 @@ mcpServers: []
 ---
 
 Split one approved mathematical chapter into node pages under its
-`blueprint/roadmap/<chapter>/` folder. Do not edit `graph.json`.
+`blueprint/roadmap/<chapter>/` folder. Do not create a parallel graph file.
 
 Use one node for each important definition or result that can reasonably land
 in one pull request. Split a hard theorem into intermediate lemmas only when
@@ -18,7 +18,7 @@ summaries.
 
 Every node page must have:
 
-- scalar frontmatter with `kind: node`, intended `declaration`, and explicit
+- scalar frontmatter with `kind: article`, intended `declaration`, and explicit
   `origin: cited|bridged|background`;
 - exactly one H1 and a precise mathematical statement or proof strategy;
 - source hyperlinks under `## Sources` when cited;

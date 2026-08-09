@@ -32,14 +32,13 @@ flowchart LR
     D -->|verified| E[3-judge review jury<br/>faithfulness · proof integrity · style]
     E --> F[review dashboard<br/>human sign-off]
     B -.-> G[book + progress + multiscale DAG]
-    B -.-> H[generated graph.json<br/>worker/dashboard compatibility]
+    B --> H[worker + dashboard<br/>direct Markdown loader]
 ```
 
-- **Plan** — roadmap folders are book chapters and `kind: node` Markdown pages
-  are PR-sized definitions or results. Typed links form the validated fine DAG;
-  chapter contraction forms its coarse tier. The same files render as a book,
-  progress report, and multiscale graph. `graph.json` is generated only for
-  compatibility with the worker and local dashboard.
+- **Plan** — every roadmap Markdown article is a node. Nested `README.md`
+  articles define strict containment, while typed dependency links form the
+  fine DAG and roll up through every containment level. The same articles drive
+  the book, progress report, workers, dashboard, and multiscale graph directly.
 - **Prove** — a deterministic dispatch engine drains a shared task queue:
   prover workers write real Lean, iterating against build feedback. Backends
   are thin adapters behind one driver; a steering judge watches live-steerable
@@ -137,7 +136,7 @@ Orchestrate operations rather than another user workflow.
 
 ## Prover backends
 
-One MCP tool proves a node — `prove_node(graph_path, node_id, project_dir,
+One MCP tool proves an article — `prove_node(blueprint_path, node_id, project_dir,
 backend=...)` — and the driver, steerer, and honesty gate are identical for
 every backend; only the adapter differs. Direct OpenAI/Avocado calls also
 require `allow_api_egress=true` after explicit approval for that project/run.

@@ -28,7 +28,7 @@ from .scoreboard import parse_target
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", type=Path, default=None,
-                        help="dispatch project dir (owns graph.json); default: $AUTOFORM_DISPATCH_PROJECT or cwd")
+                        help="project containing blueprint/roadmap; default: $AUTOFORM_DISPATCH_PROJECT or cwd")
     parser.add_argument("--worker-id", default=None, help="stable worker identity (default: <user>-<host>)")
 
 
@@ -338,16 +338,19 @@ def cmd_issues_sync(args) -> int:
 
 
 def cmd_dashboard(args) -> int:
-    """Thin wrappers over the existing dashboard scripts (single source of truth)."""
+    """Build the static book or start the Markdown-backed local dashboard."""
     cfg = _config(args)
     root = plugin_root()
     if args.dashboard_cmd == "export":
-        argv = [sys.executable, str(root / "scripts" / "export_github_dashboard.py"),
-                "--graph", str(cfg.graph_path), "--repo-root", str(cfg.lean_root)]
+        argv = [
+            "uv", "run", "--directory", str(root), "autoform-blueprint", "render",
+            str(cfg.blueprint_path), "--output", str(cfg.project / "site-src"),
+            "--lean-root", str(cfg.lean_root), "--require-declarations",
+        ]
     else:  # serve
         argv = [sys.executable, str(root / "scripts" / "service_control.py"), "start", "review",
                 "--project", str(cfg.project), "--plugin-root", str(root),
-                "--graph", str(cfg.graph_path), "--lean-root", str(cfg.lean_root), "--port", "0"]
+                "--blueprint", str(cfg.blueprint_path), "--lean-root", str(cfg.lean_root), "--port", "0"]
     proc = subprocess.run(argv, cwd=str(root))
     return proc.returncode
 
@@ -356,7 +359,7 @@ def cmd_audit(args) -> int:
     """Run the roadmap completeness audit (scripts/roadmap_audit.py)."""
     cfg = _config(args)
     root = plugin_root()
-    argv = [sys.executable, str(root / "scripts" / "roadmap_audit.py"), str(cfg.graph_path)]
+    argv = [sys.executable, str(root / "scripts" / "roadmap_audit.py"), str(cfg.blueprint_path)]
     for flag in ("json", "enqueue", "verify_decls", "stamp_verified"):
         if getattr(args, flag):
             argv.append("--" + flag.replace("_", "-"))

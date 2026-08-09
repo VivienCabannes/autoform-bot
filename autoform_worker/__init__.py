@@ -1,7 +1,7 @@
 """Autoform worker CLI — the distributed-coordination layer.
 
 Multiple machines advance one shared formalization roadmap (a GitHub repo holding
-``graph.json`` + Lean sources) with minimal human coordination. Modeled on
+Markdown blueprint articles + Lean sources) with minimal human coordination. Modeled on
 TauCetiWorker: CAS branch pushes for safety, git-ref lease claims for
 throughput, scoreboard comments for cross-machine review state.
 

@@ -18,7 +18,7 @@ Usage::
       [--repo <lean-repo>] [--jobs 9] [--judge-backend claude|codex|muse|openai|avocado]
       [--model <provider-model>] [--limit N] [--dry-run]
 
-``<project-dir>`` holds graph.json + task_queue.json + review_status.json.
+``<project-dir>`` holds ``blueprint/`` plus local queue and review sidecars.
 """
 from __future__ import annotations
 
@@ -281,7 +281,7 @@ def _raise_escalation(queue: list, node_id: str, label: str, note: str,
     not by declaring a theorem exhausted after an arbitrary number of calls.
     Returns True iff a new task was added.
 
-    The engine NEVER mutates ``graph.json`` from a worker result — whether a wall is a
+    The engine never mutates the Markdown roadmap from a prover result — whether a wall is a
     real new prerequisite, a duplicate, a cluster-level gap, or a non-DAG failure
     (toolchain / false statement / honest give-up) is a judgment call. It only raises
     the flag + the worker's own words (``note``); ``/autoform:orchestrate`` decides."""
@@ -335,8 +335,8 @@ def sweep_stale_running(queue_path: Path, feed_path: Path) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic parallel review dispatcher.")
-    ap.add_argument("project", type=Path, help="dir holding graph.json + task_queue.json")
-    ap.add_argument("--repo", type=Path, default=None, help="Lean repo = judge cwd (default: graph metadata.lean_root, else <project>/../..)")
+    ap.add_argument("project", type=Path, help="repository holding blueprint/ + task_queue.json")
+    ap.add_argument("--repo", type=Path, default=None, help="Lean repo and judge cwd (default: project)")
     ap.add_argument("--jobs", type=int, default=max(3, 3 * len(AXES)), help=f"max concurrent judges (default = 3 nodes x {len(AXES)} axes)")
     ap.add_argument("--judge-backend", choices=judge_runtime.SUPPORTED_JUDGES,
                     default=os.environ.get("AUTOFORM_JUDGE_BACKEND", "claude"),
@@ -427,12 +427,14 @@ def _run_dispatch(a) -> int:
     _ACTIVE_JUDGE_BACKEND = a.judge_backend
 
     proj = a.project
-    graph = json.loads((proj / "graph.json").read_text())
-    nodes = graph.get("nodes", {})
+    source = proj / "blueprint"
+    if not (source / "roadmap").is_dir():
+        source = proj / "graph.json"  # legacy project migration support
+    nodes, metadata = rm.load_graph(source)
     sidecar_path = proj / "review_status.json"
     queue_path = proj / "task_queue.json"
     feed_path = proj / "agents_status.json"
-    repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
+    repo = str(a.repo or proj)
 
     try:
         dq.load_queue(queue_path)
@@ -610,12 +612,12 @@ def _run_dispatch(a) -> int:
             # A parked recovery blocks the node only while its inputs are
             # unchanged; once they move, the evidence gate below re-admits it.
             if any(e.get("status") == "parked" for e in escs) and not recovery_state.resumable_park(
-                    c, t["node"], proj / "graph.json", Path(repo),
+                    c, t["node"], source, Path(repo),
                     backend_config.prover_of(a.backend)):
                 return 0
             adapter = backend_config.prover_of(a.backend)
             if recovery_state.unchanged_recovery(
-                    c, t["node"], proj / "graph.json", Path(repo), adapter):
+                    c, t["node"], source, Path(repo), adapter):
                 for x in c:
                     if x["id"] == t["id"]:
                         x["status"], x["finished_at"] = "failed", dq._now()
@@ -651,7 +653,7 @@ def _run_dispatch(a) -> int:
         print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
         try:
             status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                                str(proj / "graph.json"), repo, a.max_steers,
+                                                str(source), repo, a.max_steers,
                                                 backend=adapter,
                                                 judge_backend=a.judge_backend,
                                                 judge_model=a.model,
@@ -669,7 +671,7 @@ def _run_dispatch(a) -> int:
             if status != "proved":      # open ordered proof recovery; do not blindly retry
                 lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
                 fingerprint = recovery_state.proof_fingerprint(
-                    proj / "graph.json", t["node"], Path(repo), adapter
+                    source, t["node"], Path(repo), adapter
                 )
                 recovery = {
                     "version": 1,

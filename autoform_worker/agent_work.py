@@ -10,7 +10,7 @@ Two write paths, matching what the artifact is:
 
 * **Lean proofs** (the ``prove`` unit) go through a PR, get a jury scoreboard,
   and auto-merge — code deserves review.
-* **Roadmap curation** (``blueprint/`` plus generated ``graph.json``) is committed and
+* **Roadmap curation** (the Markdown articles under ``blueprint/``) is committed and
   CAS-pushed straight to the default branch under a claim. It is frequent,
   conflict-rare, and humans watch it on the dashboards rather than in PRs;
   a lost CAS simply retries next round.
@@ -77,12 +77,13 @@ def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) ->
     except ValueError:
         return False
     prefix = "" if str(project_rel) == "." else f"{project_rel.as_posix()}/"
-    graph_path = f"{prefix}graph.json"
-    if (cfg.project / "blueprint" / "roadmap").is_dir():
-        content_prefix = f"{prefix}blueprint/"
-    else:
-        content_prefix = f"{prefix}informal_content/"
-    content = all(path.startswith(content_prefix) or path == graph_path for path in paths)
+    markdown_roadmap = (cfg.project / "blueprint" / "roadmap").is_dir()
+    content_prefix = f"{prefix}{'blueprint/' if markdown_roadmap else 'informal_content/'}"
+    legacy_graph = f"{prefix}graph.json"
+    content = all(
+        path.startswith(content_prefix) or (not markdown_roadmap and path == legacy_graph)
+        for path in paths
+    )
     if role.writes == "content":
         return content
     if role.writes == "graph":
@@ -135,11 +136,16 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
     through verbatim — the registry never paraphrases a role.
     """
     sources = ""
-    graph_path = cfg.graph_path
+    blueprint_path = cfg.blueprint_path
     with contextlib.suppress(Exception):
-        import json
-
-        meta = json.loads(graph_path.read_text(encoding="utf-8")).get("metadata", {})
+        if blueprint_path.is_dir():
+            from autoform_cli.runtime import load_runtime_model
+            _nodes, meta = load_runtime_model(
+                blueprint_path, project_root=cfg.project, lean_root=cfg.lean_root
+            )
+        else:
+            import json
+            meta = json.loads(blueprint_path.read_text(encoding="utf-8")).get("metadata", {})
         listed = [s.get("file", "") for s in (meta.get("sources") or []) if s.get("file")]
         if listed:
             sources = "\n".join(f"  - {s}" for s in listed)
@@ -151,12 +157,12 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
         f"- role: `{role.name}` (queue kind `{role.kind}`)",
         f"- target node: `{task.node}` ({task.node_label})",
         f"- dispatch project: {cfg.project}",
-        f"- {'generated engine graph (read-only)' if markdown_roadmap else 'graph'}: {graph_path}",
+        f"- authoritative blueprint: {blueprint_path}",
         f"- Lean project: {cfg.lean_root}",
         (
-            f"- authoritative roadmap: {cfg.project / 'blueprint' / 'roadmap'}"
+            f"- roadmap articles: {blueprint_path / 'roadmap'}"
             if markdown_roadmap
-            else f"- node prose lives in: {cfg.project / 'informal_content'}/<node>.md"
+            else f"- legacy node prose: {cfg.project / 'informal_content'}"
         ),
     ]
     if sources:
@@ -167,16 +173,16 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
     context += ["", "## How to finish", ""]
     if markdown_roadmap:
         context += [
-            "- Edit only the Markdown roadmap. Folder structure defines chapters, frontmatter "
-            "records checked facts, and links under `Depends on` / `Proof depends on` define edges.",
-            "- Never edit `graph.json`; the worker harness regenerates that compatibility projection.",
+            "- Edit only Markdown under `blueprint/`. Every roadmap article is a node; nested "
+            "`README.md` articles define containment and dependency headings define DAG edges.",
+            "- Run `autoform-blueprint check blueprint --lean-root .` before finishing.",
         ]
     else:
         context += [
-            "- Make every graph edit through "
-            f"`python {cfg.plugin_root}/scripts/merge_node.py {graph_path} --payload <file>` — "
+            "- This is a legacy project. Make structural edits through "
+            f"`python {cfg.plugin_root}/scripts/merge_node.py {blueprint_path} --payload <file>`; "
             "it is the only writer of graph.json.",
-            "- Write node prose directly to `informal_content/<node>.md`.",
+            "- Write prose to `informal_content/<node>.md`; migrate the repository with Setup when possible.",
         ]
     context += [
         "- Do NOT run `git push` and do NOT open PRs; the worker harness commits and "
@@ -251,23 +257,13 @@ def do_agent_task(
                          f"agent rc={rc} (log: {log_path})", "--report-file", str(log_path)])
                 return UnitResult(False, f"{task.kind} {task.node}: agent failed rc={rc}")
 
-            if role.writes != "none" and (work_cfg.project / "blueprint" / "roadmap").is_dir():
-                from autoform_cli.engine_graph import write_engine_graph
-
-                write_engine_graph(
-                    work_cfg.project / "blueprint",
-                    work_cfg.graph_path,
-                    project_root=work_cfg.project,
-                    lean_root=work_cfg.lean_root,
-                )
-
             pushed = False
             changed = _changed_paths(work_cfg.lean_root, base_oid)
             recovery_outcome = _recovery_outcome(log_path) if task.kind == "escalation" else None
             recovery_fingerprint = ""
             if task.kind == "escalation" and task.recovery:
                 recovery_fingerprint = scripts_modules()["recovery_state"].proof_fingerprint(
-                    work_cfg.graph_path,
+                    work_cfg.blueprint_path,
                     task.node,
                     work_cfg.lean_root,
                     str(task.recovery.get("backend") or ""),

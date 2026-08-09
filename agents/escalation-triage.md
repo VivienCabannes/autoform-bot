@@ -30,10 +30,10 @@ Run these waves in order and stop on a decisive result:
    not repeat them.
 
 Child researchers do not edit files. You alone update the target's mathematical
-proof notes. Add accepted sublemmas as `kind: node` Markdown pages and typed
+proof notes. Add accepted sublemmas as `kind: article` Markdown pages and typed
 dependency links. Keep raw search logs local; preserve only the checked route,
 counterexample, reconstruction, citations, and failed mathematical approaches
-that help later work. Never edit generated `graph.json` directly.
+that help later work. Markdown remains the only graph authority.
 
 End with exactly one marker:
 
@@ -41,5 +41,5 @@ End with exactly one marker:
 - `RECOVERY: REFUTED - <verified witness or precise defect>`
 - `RECOVERY: PARK - <checked surfaces exhausted>`
 
-Regenerate the compatibility graph after structural edits. Parking preserves a
+Revalidate the Markdown graph after structural edits. Parking preserves a
 durable research frontier; it is not a request for a person to prove the node.

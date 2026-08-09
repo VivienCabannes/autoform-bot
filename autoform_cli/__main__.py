@@ -7,7 +7,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import status
-from .engine_graph import ProjectionError, write_engine_graph
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
@@ -37,28 +36,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
 
-    engine_graph = subparsers.add_parser(
-        "engine-graph",
-        help="derive the compatibility graph consumed by workers and the local dashboard",
-    )
-    engine_graph.add_argument("blueprint_dir")
-    engine_graph.add_argument("-o", "--output", default="graph.json")
-    engine_graph.add_argument("--project-root", type=Path)
-    engine_graph.add_argument("--lean-root", type=Path)
-    engine_graph.add_argument(
-        "--check",
-        action="store_true",
-        help="fail instead of writing when the existing projection is stale",
-    )
-
     args = parser.parse_args(argv)
 
     if args.command == "check":
         return _check(args)
     if args.command == "render":
         return _render(args)
-    if args.command == "engine-graph":
-        return _engine_graph(args)
     return 2
 
 
@@ -72,7 +55,7 @@ def _check(args: argparse.Namespace) -> int:
 
     statuses = status.derive(graph)
     summary = " · ".join(f"{count} {state.label}" for state, count in status.summarize(statuses))
-    print(f"OK: {len(graph.nodes)} nodes, {graph.edge_count} dependencies")
+    print(f"OK: {len(graph.nodes)} articles, {graph.edge_count} dependencies")
     if summary:
         print(f"    {summary}")
 
@@ -114,27 +97,6 @@ def _render(args: argparse.Namespace) -> int:
         print(f"warning: declaration not found in the Lean sources: {issue}")
     if report.unresolved and args.require_declarations:
         return 1
-    return 0
-
-
-def _engine_graph(args: argparse.Namespace) -> int:
-    try:
-        current = write_engine_graph(
-            args.blueprint_dir,
-            args.output,
-            project_root=args.project_root,
-            lean_root=args.lean_root,
-            check=args.check,
-        )
-    except (GraphValidationError, ProjectionError, OSError) as exc:
-        issues = getattr(exc, "issues", (str(exc),))
-        for issue in issues:
-            print(f"error: {issue}")
-        return 1
-    if args.check and not current:
-        print(f"error: stale generated engine graph: {args.output}")
-        return 1
-    print(f"{'current' if args.check else 'wrote'}: {args.output}")
     return 0
 
 

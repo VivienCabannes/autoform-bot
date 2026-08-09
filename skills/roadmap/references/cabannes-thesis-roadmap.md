@@ -40,5 +40,5 @@ target without being presented as additional thesis statements.
 
 Use the pattern—whole-source map, explicit coverage contract, approved small
 slice, then dependency links—not the thesis mathematics. Validate the example
-with `autoform check` and inspect its generated graph before handing ready nodes
+with `autoform check` and inspect its derived graph views before handing ready nodes
 to Orchestrate.
