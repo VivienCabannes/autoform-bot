@@ -3,7 +3,7 @@ name: orchestrate
 description: Work through an Autoform Markdown blueprint with native agents and Lean tools.
 ---
 
-Treat `kind: node` pages under `blueprint/roadmap/**/*.md` and their dependency
+Treat `kind: article` pages under `blueprint/roadmap/**/*.md` and their dependency
 links as the source of truth. Work ready nodes with native subagents plus the
 Lean LSP and REPL servers. Record only what compiled: `statement: formalized`,
 `proof: formalized`, and the exact declaration name in `lean`; ready and
@@ -13,6 +13,22 @@ whose declared statement or proof prerequisites are satisfied.
 Search local Mathlib or community prior art
 with host-native tools when useful, then verify every candidate with Lean before
 reporting completion.
+
+Claim a node before working it, so two agents or machines cannot take the same
+one. Set a stable identity in `AUTOFORM_WORKER_ID`, then acquire, renew while
+the attempt runs, and release when it ends, including on failure or handoff:
+
+```bash
+autoform claim acquire "<node-id>"
+autoform claim renew   "<node-id>"
+autoform claim release "<node-id>"
+```
+
+Claims are fail-closed Git-ref leases. A refusal or a claim-board error means
+ownership is unproven: pick different work or stop, and never fall back to
+working the node unclaimed. If renewal fails or becomes uncertain mid-attempt,
+stop before committing or pushing. `autoform claim list` shows the current
+holders; a stale lease expires on its own, so do not clear one by hand.
 
 Roadmap owns initial source decomposition and deliberate DAG revisions. Do not
 scan for undecomposed chapters or construct the initial plan here; hand a
