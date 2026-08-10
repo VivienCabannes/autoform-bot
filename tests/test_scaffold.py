@@ -191,10 +191,16 @@ def test_scaffolded_theme_defers_navigation_to_the_book(tmp_path: Path) -> None:
     theme = (tmp_path / "theme/main.html").read_text(encoding="utf-8")
     mkdocs = (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
 
-    assert "{% block next_prev %}{% endblock %}" in theme
+    # Material renders previous/next in its footer partial; overriding the
+    # whole footer suppresses it, because Autoform derives reading order from
+    # the vault and prints it at the bottom of book pages only.
+    assert '{% block footer %}' in theme
+    assert "md-footer" in theme
+    assert "md-footer__link" not in theme
     assert "docs_dir: site-src" in mkdocs
     assert "md_in_html" in mkdocs
     assert "custom_dir: theme" in mkdocs
+    assert "name: material" in mkdocs
 
 
 def test_generated_ci_pins_the_checkout_that_scaffolded_it(tmp_path: Path) -> None:

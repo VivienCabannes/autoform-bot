@@ -99,7 +99,7 @@ def _mermaid_script() -> str:
   );
 
   function scheme() {{
-    return document.documentElement.getAttribute("data-bs-theme") === "dark" ? "dark" : "light";
+    return document.body.getAttribute("data-md-color-scheme") === "slate" ? "dark" : "light";
   }}
 
   function draw() {{
@@ -126,9 +126,9 @@ def _mermaid_script() -> str:
 
   new MutationObserver(function (mutations) {{
     mutations.forEach(function (mutation) {{
-      if (mutation.attributeName === "data-bs-theme") draw();
+      if (mutation.attributeName === "data-md-color-scheme") draw();
     }});
-  }}).observe(document.documentElement, {{ attributes: true }});
+  }}).observe(document.body, {{ attributes: true }});
 }})();
 """
 
@@ -1469,7 +1469,7 @@ def _stylesheet() -> str:
 
     Light is the community blog's palette -- Merriweather headings, Open Sans
     body, Source Code Pro, and its deep blue link. Dark is a terminal scheme
-    rather than the light one dimmed, and hangs off ``data-bs-theme`` so the
+    rather than the light one dimmed, and hangs off Material's colour scheme so the
     theme's own toggle drives it.
     """
     light = "\n".join(
@@ -1482,18 +1482,18 @@ def _stylesheet() -> str:
         for state in status.STATES
     )
     dark = "\n".join(
-        f"[data-bs-theme=dark] .bp-{state.key} .bp-mark {{ color: {state.dark_stroke}; }}\n"
-        f"[data-bs-theme=dark] .bp-{state.key} > .bp-thmcontent "
+        f"[data-md-color-scheme=slate] .bp-{state.key} .bp-mark {{ color: {state.dark_stroke}; }}\n"
+        f"[data-md-color-scheme=slate] .bp-{state.key} > .bp-thmcontent "
         f"{{ border-left-color: {state.dark_stroke}; }}\n"
-        f"[data-bs-theme=dark] .bp-ref-{state.key}::before, "
-        f"[data-bs-theme=dark] .bp-swatch-{state.key} "
+        f"[data-md-color-scheme=slate] .bp-ref-{state.key}::before, "
+        f"[data-md-color-scheme=slate] .bp-swatch-{state.key} "
         f"{{ background: {state.dark_fill}; border-color: {state.dark_stroke}; }}\n"
-        f"[data-bs-theme=dark] .mermaid g.node.{state.key} > rect, "
-        f"[data-bs-theme=dark] .mermaid g.node.{state.key} > path, "
-        f"[data-bs-theme=dark] .mermaid g.node.{state.key} > polygon "
+        f"[data-md-color-scheme=slate] .mermaid g.node.{state.key} > rect, "
+        f"[data-md-color-scheme=slate] .mermaid g.node.{state.key} > path, "
+        f"[data-md-color-scheme=slate] .mermaid g.node.{state.key} > polygon "
         f"{{ fill: {state.dark_fill} !important; stroke: {state.dark_stroke} !important; }}\n"
-        f"[data-bs-theme=dark] .mermaid g.node.{state.key} .nodeLabel, "
-        f"[data-bs-theme=dark] .mermaid g.node.{state.key} .nodeLabel p "
+        f"[data-md-color-scheme=slate] .mermaid g.node.{state.key} .nodeLabel, "
+        f"[data-md-color-scheme=slate] .mermaid g.node.{state.key} .nodeLabel p "
         f"{{ color: {state.dark_text} !important; fill: {state.dark_text} !important; }}"
         for state in status.STATES
     )
@@ -1509,7 +1509,7 @@ def _stylesheet() -> str:
   --bp-link: hsl(210, 100%, 30%);
   --bp-link-hover: hsl(210, 100%, 40%);
 }}
-[data-bs-theme=dark] {{
+[data-md-color-scheme=slate] {{
   --bp-fg: #c9d1d9;
   --bp-muted: #8b949e;
   --bp-rule: #30363d;
@@ -1519,7 +1519,7 @@ def _stylesheet() -> str:
 }}
 
 body {{ font-family: {sans}; color: var(--bp-fg); }}
-main[role="main"], [role="main"] {{
+.md-typeset {{
   max-width: 72ch;
   font-family: {serif};
   line-height: 1.75;
@@ -1530,50 +1530,8 @@ code, pre {{ background: var(--bp-surface); border-radius: 5px; }}
 a, a:visited {{ color: var(--bp-link); }}
 a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underline; }}
 
-[data-bs-theme=dark] body {{ background-color: #0d1117; }}
-[data-bs-theme=dark] pre, [data-bs-theme=dark] code {{ color: var(--bp-fg); }}
-
-/* The theme's banner is a solid Bootstrap bar. Drive it from the palette so it
-   follows the toggle instead of staying blue. */
-.navbar {{
-  --bs-navbar-color: var(--bp-fg);
-  --bs-navbar-hover-color: var(--bp-link-hover);
-  --bs-navbar-active-color: var(--bp-link);
-  --bs-navbar-brand-color: var(--bp-fg);
-  --bs-navbar-brand-hover-color: var(--bp-link-hover);
-  background-color: var(--bp-surface) !important;
-  border-bottom: 1px solid var(--bp-rule);
-}}
-html[data-bs-theme=dark] body .navbar.navbar-light.bg-light {{
-  background: #161b22 !important;
-  border-bottom-color: #30363d;
-}}
-html[data-bs-theme=dark] body .navbar .navbar-brand,
-html[data-bs-theme=dark] body .navbar .nav-link {{
-  color: #f0f6fc !important;
-}}
-html[data-bs-theme=dark] body .navbar .nav-link.active,
-html[data-bs-theme=dark] body .navbar .nav-link:hover,
-html[data-bs-theme=dark] body .navbar .navbar-brand:hover {{
-  color: var(--bp-link-hover) !important;
-}}
-html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
-  filter: invert(1) grayscale(100%) brightness(200%);
-}}
-.navbar .navbar-brand {{
-  font-family: {serif};
-  font-weight: 700;
-  color: var(--bp-fg);
-}}
-.navbar .nav-link, .navbar .navbar-text, .navbar .dropdown-toggle {{ color: var(--bp-fg); }}
-.navbar .nav-link:hover, .navbar .navbar-brand:hover {{ color: var(--bp-link-hover); }}
-.navbar .navbar-toggler {{ border-color: var(--bp-rule); }}
-.bs-sidebar, .bs-sidebar .nav > li > a {{ color: var(--bp-fg); }}
-.bs-sidebar .nav > li > a:hover {{ color: var(--bp-link-hover); background: transparent; }}
-[data-bs-theme=dark] .bs-sidebar,
-[data-bs-theme=dark] .dropdown-menu {{ background-color: #0d1117; }}
-[data-bs-theme=dark] .dropdown-item {{ color: var(--bp-fg); }}
-[data-bs-theme=dark] footer, [data-bs-theme=dark] hr {{ border-color: var(--bp-rule); }}
+[data-md-color-scheme=slate] body {{ background-color: #0d1117; }}
+[data-md-color-scheme=slate] pre, [data-md-color-scheme=slate] code {{ color: var(--bp-fg); }}
 
 /* The book opens with a compact progress summary. It reports only decomposed
    blueprint items, leaving source-wide coverage to the dedicated page. */
@@ -1767,7 +1725,7 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
 .bp-lean {{ font-family: {mono}; }}
 .bp-where {{ color: var(--bp-muted); }}
 .bp-missing {{ color: #b91c1c; }}
-[data-bs-theme=dark] .bp-missing {{ color: #ff7b72; }}
+[data-md-color-scheme=slate] .bp-missing {{ color: #ff7b72; }}
 .bp-ref::before {{
   content: "";
   display: inline-block;
@@ -1790,14 +1748,14 @@ html[data-bs-theme=dark] body .navbar .navbar-toggler-icon {{
 
 /* The graph is an SVG Mermaid builds from the fence, so the dark scheme has
    to reach into it rather than restyle a stylesheet it never wrote. */
-[data-bs-theme=dark] .mermaid .edgePath path,
-[data-bs-theme=dark] .mermaid .flowchart-link {{ stroke: #8b949e !important; }}
-[data-bs-theme=dark] .mermaid marker path {{
+[data-md-color-scheme=slate] .mermaid .edgePath path,
+[data-md-color-scheme=slate] .mermaid .flowchart-link {{ stroke: #8b949e !important; }}
+[data-md-color-scheme=slate] .mermaid marker path {{
   fill: #8b949e !important;
   stroke: #8b949e !important;
 }}
-[data-bs-theme=dark] .mermaid .edgeLabel,
-[data-bs-theme=dark] .mermaid .edgeLabel rect {{
+[data-md-color-scheme=slate] .mermaid .edgeLabel,
+[data-md-color-scheme=slate] .mermaid .edgeLabel rect {{
   background: #0d1117 !important;
   fill: #0d1117 !important;
   color: var(--bp-fg) !important;
