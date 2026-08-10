@@ -20,7 +20,6 @@ from .graph_views import (
     focus_views,
     full_view,
     group_nodes,
-    group_title,
     project_view,
     scope_view,
 )
@@ -82,18 +81,6 @@ def write_graph_pages(
         )
         for view_node in project.nodes
     }
-    chapter_list = [
-        f"- [{group_title(graph, group)}]({_markdown_link(chapter_pages[group], project_page)})"
-        for group in groups
-    ]
-    project_extra = "\n".join(
-        [
-            "## Zoom in",
-            "",
-            *chapter_list,
-            f"- [Full theorem DAG]({_markdown_link(full_page, project_page)})",
-        ]
-    )
     written.append(
         _write_page(
             project_page,
@@ -105,7 +92,6 @@ def write_graph_pages(
                 f"{len(graph.nodes)} items across "
                 f"{len(groups)} chapter{'s' if len(groups) != 1 else ''}."
             ),
-            extra=project_extra,
         )
     )
 
@@ -130,19 +116,6 @@ def write_graph_pages(
             ("Full theorem DAG", _markdown_link(full_page, chapter_page)),
             ("Open textbook chapter", _markdown_link(book_page, chapter_page)),
         )
-        focus_list = [
-            f"- [{graph.nodes[node_id].title}]({_markdown_link(focus_pages[node_id], chapter_page)})"
-            for node_id in groups[group]
-        ]
-        extra = "\n".join(
-            [
-                "## Local context",
-                "",
-                "Focus on one item and its immediate prerequisites and dependents:",
-                "",
-                *focus_list,
-            ]
-        )
         written.append(
             _write_page(
                 chapter_page,
@@ -155,7 +128,6 @@ def write_graph_pages(
                     "Dashed chapter boxes stand for external prerequisites or dependents."
                 ),
                 navigation=navigation,
-                extra=extra,
             )
         )
 

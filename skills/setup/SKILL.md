@@ -53,7 +53,11 @@ deploys GitHub Pages. Pass `--autoform-ref` to pin them at an immutable commit.
 
 After it runs, fill in what only a human or a source can supply: the project
 description in `blueprint/README.md`, the coverage contract, and a verified
-`repo_url`. When a deployed site exists, feature its verified canonical URL in
+`repo_url`. That URL is the *formalization project's own* repository, never
+AutoformBot's: Material renders it as the repository link in the site header,
+and pointing it at the plugin sends every reader to the wrong project. Pass
+`--repository-url` to `autoform init`, or leave the key out until the remote
+exists rather than guessing it. When a deployed site exists, feature its verified canonical URL in
 the root `README.md`, never an inferred or pending one.
 
 Adding workflow files is a local repository edit. Creating a remote, pushing,
