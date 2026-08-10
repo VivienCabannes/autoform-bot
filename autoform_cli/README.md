@@ -115,6 +115,18 @@ the loaded plugin and prefix each one, running from the project root:
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
 ```
 
+Create a new project's vault, site configuration, and CI. The layout is fixed,
+so it is written rather than described; existing files are left alone, which
+makes the same command the repair path:
+
+```bash
+autoform init . --title "Finite Flat Group Schemes" \
+  --repository-url https://github.com/owner/repo
+```
+
+Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
+commit, `--force` to overwrite, and `--json` for machine-readable output.
+
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.
 

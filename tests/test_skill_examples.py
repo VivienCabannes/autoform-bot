@@ -339,7 +339,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "never contact people",
     ):
         assert required in roadmap
-    assert "renders them only at the bottom of\n  book pages" in setup
+    assert "autoform init" in setup
     assert "references/thesis-worked-node.md" in orchestrate
     assert "Schedule prerequisite nodes before their dependents" in orchestrate
     assert "references/thesis-review-case.md" in agent_review

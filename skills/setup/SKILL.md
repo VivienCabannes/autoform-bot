@@ -33,33 +33,28 @@ thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 For a new or incomplete repository:
 
 - create or repair a buildable Lean project with matching `lean-toolchain` and
-  Mathlib revisions;
-- create `blueprint/` with a landing page plus `roadmap/`, `coverage/`, and
-  `sources/`; later Roadmap work places article pages beside their
-  milestones under `roadmap/`. A roadmap folder is a book chapter; an article page
-  is normally one PR-sized major result or important definition. Markdown
-  properties and dependency links are the graph, so do not create a parallel
-  `graph.json`. Keep personal `.obsidian/`, `.trash/`, generated graphs, and
-  site output ignored;
-- preserve or create the root `README.md` with a link to `blueprint/README.md`
-  and a linked “Developed with AutoformBot” credit; when a deployed site
-  exists, also feature its verified canonical URL prominently, never an
-  inferred or pending URL;
-- configure `mkdocs.yml` to build the `autoform render` output, not the vault
-  itself: `docs_dir: site-src`, `md_in_html`, a `pymdownx.superfences` mermaid
-  fence, a verified repository URL in `repo_url`, and the generated stylesheet
-  and mermaid init. Keep the
-  project-independent primary navigation focused on the Blueprint book, its
-  generated Progress page, and Dependencies. Point Blueprint at the rendered
-  `README.md` contents page. Use a small theme override to link the formalized
-  code repository, credit AutoformBot, and retain the MkDocs footer. Remove
-  MkDocs' global previous/next controls: Autoform derives those links from the
-  blueprint's Markdown reading order and renders them only at the bottom of
-  book pages, never on Progress or Dependencies;
-- adapt `autoform-verify.yml` to validate the Markdown DAG, build Lean, reject
-  unfinished or unsafe proofs, and audit theorem axioms on pull requests; and
-- adapt `blueprint-pages.yml` to validate the DAG and its `lean:` declarations,
-  render the blueprint, build MkDocs, and deploy GitHub Pages.
+  Mathlib revisions; and
+- write the blueprint vault, site configuration, and CI with `autoform init`.
+
+`autoform init` is the whole vault: `blueprint/` with its landing page,
+`roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
+override, both workflows, and ignore rules. Do not hand-build any of it and do
+not copy the bundled example: the layout is fixed, and a chapter written as a
+sibling file instead of `<chapter>/README.md` still validates while publishing
+a book with no chapters. `init` never overwrites an existing file, so it is
+also the repair path; it reports what it left alone. See the
+[CLI reference](../../autoform_cli/README.md#commands) for its flags.
+
+The two workflows it writes are `autoform-verify.yml`, which validates the
+Markdown DAG, builds Lean, rejects unfinished or unsafe proofs, and audits
+theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the
+DAG and its `lean:` declarations, renders the blueprint, builds MkDocs, and
+deploys GitHub Pages. Pass `--autoform-ref` to pin them at an immutable commit.
+
+After it runs, fill in what only a human or a source can supply: the project
+description in `blueprint/README.md`, the coverage contract, and a verified
+`repo_url`. When a deployed site exists, feature its verified canonical URL in
+the root `README.md`, never an inferred or pending one.
 
 Adding workflow files is a local repository edit. Creating a remote, pushing,
 or enabling Pages are separate outward-facing actions; perform them only when
