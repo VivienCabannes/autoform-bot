@@ -18,7 +18,7 @@ def _article(
     path = blueprint / "roadmap" / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     title = path.stem.replace("-", " ").title()
-    properties = ["kind: article", *(f"{key}: {value}" for key, value in metadata.items())]
+    properties = [*(f"{key}: {value}" for key, value in metadata.items())]
     lines = ["---", *properties, "---", "", f"# {title}", "", prose]
     if sources:
         lines.extend(["", "## Sources", "", *(f"- [source]({target})" for target in sources)])
@@ -286,7 +286,7 @@ def test_audit_returns_graph_validation_errors_with_article_paths(tmp_path: Path
     _coverage(blueprint)
     _article(blueprint, "bad.md", declaration="theorem")
     path = blueprint / "roadmap" / "bad.md"
-    path.write_text("---\nkind: article\n---\nNo H1\n", encoding="utf-8")
+    path.write_text("---\n---\nNo H1\n", encoding="utf-8")
 
     result = audit_blueprint(blueprint)
 

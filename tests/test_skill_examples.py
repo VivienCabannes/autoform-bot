@@ -320,7 +320,6 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "references/cabannes-thesis-roadmap.md",
         "blueprint/roadmap/",
         "blueprint/coverage/",
-        "kind: article",
         "blueprint/roadmap/**/*.md",
         "declaration",
         "coarse roadmap",
@@ -406,18 +405,17 @@ def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
 def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
     """Agent instructions must match what `autoform_cli.graph` actually parses.
 
-    `load_graph` normalizes every roadmap page to `kind: article` and deprecates
-    `status`, so a skill that still teaches `kind: node` or `status: active`
-    makes agents author frontmatter the parser has to rewrite.
+    `kind` and `status` were removed from the frontmatter contract, so a skill
+    that still teaches either makes agents author keys the parser rejects.
     """
     for skill in sorted((repo_root / "skills").glob("*/SKILL.md")):
         text = skill.read_text(encoding="utf-8")
-        for stale in ("kind: node", "kind: roadmap", "status: active"):
+        for stale in ("kind: node", "kind: article", "kind: roadmap", "status: active"):
             assert stale not in text, f"{skill.relative_to(repo_root)} still teaches `{stale}`"
 
     example = repo_root / _EXAMPLE / "blueprint/roadmap"
     for article in sorted(example.rglob("*.md")):
-        assert "kind: article" in article.read_text(encoding="utf-8")
+        assert "kind:" not in article.read_text(encoding="utf-8")
 
 
 def test_orchestrate_documents_the_claim_protocol(repo_root: Path) -> None:

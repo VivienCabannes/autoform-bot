@@ -21,7 +21,7 @@ def _write_node(
     **metadata: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    properties = ["kind: node", *(f"{key}: {value}" for key, value in metadata.items())]
+    properties = [*(f"{key}: {value}" for key, value in metadata.items())]
     lines = ["---", *properties, "---", "", f"# {title}"]
     if dependencies:
         lines.extend(["", "## Depends on", ""])
@@ -97,7 +97,7 @@ def test_proof_only_dependencies_are_dashed(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _write_node(blueprint / "roadmap" / "tool.md", "Tool")
     (blueprint / "roadmap" / "result.md").write_text(
-        "---\nkind: node\n---\n\n# Result\n\n## Proof depends on\n\n- [Tool](tool.md)\n",
+        "---\n---\n\n# Result\n\n## Proof depends on\n\n- [Tool](tool.md)\n",
         encoding="utf-8",
     )
 

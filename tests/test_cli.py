@@ -14,7 +14,7 @@ def _clean_blueprint(tmp_path: Path) -> Path:
     roadmap.mkdir(parents=True)
     coverage.mkdir(parents=True)
     (roadmap / "result.md").write_text(
-        "---\nkind: article\ndeclaration: theorem\n---\n\n"
+        "---\ndeclaration: theorem\n---\n\n"
         "# Result\n\nA precise statement.\n\n## Depends on\n\nNo prerequisites.\n",
         encoding="utf-8",
     )

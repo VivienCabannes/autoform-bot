@@ -21,7 +21,6 @@ def _article(
         "\n".join(
             [
                 "---",
-                "kind: article",
                 *metadata,
                 "---",
                 "",

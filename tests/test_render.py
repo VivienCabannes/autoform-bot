@@ -27,19 +27,19 @@ def _project(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (roadmap / "README.md").write_text(
-        "---\nkind: article\n---\n\n# Roadmap\n\n"
+        "---\n---\n\n# Roadmap\n\n"
         "This chapter develops the base object before the main result.\n\n"
         "## Definitions\n\n- [Base](base.md)\n\n"
         "## Results\n\n- [Top](top.md)\n",
         encoding="utf-8",
     )
     (roadmap / "base.md").write_text(
-        "---\nkind: node\ndeclaration: def\nstatement: formalized\nlean: Project.Base\n---\n\n"
+        "---\ndeclaration: def\nstatement: formalized\nlean: Project.Base\n---\n\n"
         "# Base\n\nThe base object.\n\n## Depends on\n\nThis node has no prerequisites.\n",
         encoding="utf-8",
     )
     (roadmap / "top.md").write_text(
-        "---\nkind: node\ndeclaration: theorem\nstatement: formalized\nproof: formalized\n"
+        "---\ndeclaration: theorem\nstatement: formalized\nproof: formalized\n"
         "lean: Project.top\ndiscussion: 42\n---\n\n"
         "# Top\n\nThe main result.\n\n## Sources\n\n- [Paper](../sources.md)\n\n"
         "## Depends on\n\n- [Base](base.md)\n",
@@ -211,7 +211,7 @@ def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
     nested.parent.mkdir(parents=True)
     (nested.parent / "README.md").write_text("# Chapter\n", encoding="utf-8")
     nested.write_text(
-        "---\nkind: node\ndeclaration: theorem\n---\n\n# Deep\n\nBody.\n\n"
+        "---\ndeclaration: theorem\n---\n\n# Deep\n\nBody.\n\n"
         "## Sources\n\n- [Paper](../../sources.md)\n",
         encoding="utf-8",
     )
@@ -224,7 +224,7 @@ def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
 def test_unresolved_declarations_are_reported_not_linked(tmp_path: Path) -> None:
     project = _project(tmp_path)
     (project / "blueprint/roadmap/top.md").write_text(
-        "---\nkind: node\ndeclaration: theorem\nstatement: formalized\nlean: Project.absent\n---\n"
+        "---\ndeclaration: theorem\nstatement: formalized\nlean: Project.absent\n---\n"
         "\n# Top\n",
         encoding="utf-8",
     )

@@ -3,7 +3,7 @@ name: orchestrate
 description: Work through an Autoform Markdown blueprint with native agents and Lean tools.
 ---
 
-Treat `kind: article` pages under `blueprint/roadmap/**/*.md` and their dependency
+Treat every Markdown page under `blueprint/roadmap/**/*.md` and its dependency
 links as the source of truth. Work ready nodes with native subagents plus the
 Lean LSP and REPL servers. Record only what compiled: `statement: formalized`,
 `proof: formalized`, and the exact declaration name in `lean`; ready and

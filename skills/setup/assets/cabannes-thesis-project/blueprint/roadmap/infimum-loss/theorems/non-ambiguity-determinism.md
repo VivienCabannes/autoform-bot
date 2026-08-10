@@ -1,5 +1,4 @@
 ---
-kind: article
 declaration: theorem
 origin: cited
 statement: formalized

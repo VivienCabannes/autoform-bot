@@ -8,14 +8,12 @@ import pytest
 
 from autoform_cli.graph import (
     GraphValidationError,
-    LegacyNodesDirectoryWarning,
-    LegacyStatusWarning,
     load_graph,
 )
 
 
 def _node_text(body: str, **metadata: str) -> str:
-    properties = ["kind: article", *(f"{key}: {value}" for key, value in metadata.items())]
+    properties = [*(f"{key}: {value}" for key, value in metadata.items())]
     return "\n".join(["---", *properties, "---", body])
 
 
@@ -92,7 +90,7 @@ def test_resolves_links_relative_to_each_node(tmp_path: Path) -> None:
     [
         (_node_text("No title\n"), "missing H1 title"),
         (_node_text("# First title\n# Second title\n"), "multiple H1 titles"),
-        ("---\nkind: node\n# Title\n", "unterminated frontmatter"),
+        ("---\ndeclaration: theorem\n# Title\n", "unterminated frontmatter"),
         (_node_text("# Title\n", owner="me"), "unsupported frontmatter key"),
         (_node_text("# Result\n## Depends on\n[x](missing.md)\n"), "does not exist"),
         (_node_text("# Result\n## Depends on\n[x](note.txt)\n"), "relative .md file"),
@@ -125,7 +123,7 @@ def test_rejects_self_edge(tmp_path: Path) -> None:
 
 def test_every_roadmap_markdown_file_is_an_article(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
-    _roadmap_page(blueprint, "notes.md", "---\nkind: roadmap\n---\n# Notes\n")
+    _roadmap_page(blueprint, "notes.md", "# Notes\n")
     _node(blueprint, "result.md", "# Result\n## Depends on\n[Notes](notes.md)\n")
 
     graph = load_graph(blueprint)
@@ -202,7 +200,7 @@ def test_loads_container_articles_and_infers_single_parent_hierarchy(tmp_path: P
     _roadmap_page(
         blueprint,
         "README.md",
-        "---\nkind: article\n---\n\n# Roadmap\n",
+        "---\n---\n\n# Roadmap\n",
     )
     _roadmap_page(blueprint, "chapter/README.md", "# Chapter\n")
     _node(blueprint, "chapter/result.md", "# Result\n")
@@ -276,38 +274,6 @@ def test_records_origin_and_source_links_without_treating_them_as_edges(tmp_path
     assert node.sources == ("../../sources/paper.md#result",)
     assert node.dependencies == ()
 
-
-def test_legacy_status_becomes_explicit_assertions(tmp_path: Path) -> None:
-    blueprint = tmp_path / "blueprint"
-    _node(blueprint, "done.md", "# Done\n", status="proved")
-    _node(blueprint, "stuck.md", "# Stuck\n", status="blocked")
-    _node(blueprint, "vague.md", "# Vague\n", status="ready")
-
-    with pytest.warns(LegacyStatusWarning, match="'status' is deprecated"):
-        graph = load_graph(blueprint)
-
-    assert graph.nodes["done"].statement_formalized
-    assert graph.nodes["done"].proof_formalized
-    assert graph.nodes["stuck"].not_ready
-    # 'ready' asserted nothing the graph cannot work out for itself.
-    assert not graph.nodes["vague"].statement_formalized
-    assert not graph.nodes["vague"].not_ready
-
-
-def test_loads_legacy_nodes_with_normalized_metadata(tmp_path: Path) -> None:
-    blueprint = tmp_path / "blueprint"
-    legacy = blueprint / "nodes" / "base.md"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text(
-        "---\nkind: theorem\nstatus: proved\nlean: Autoform.Base\n---\n# Base\n",
-        encoding="utf-8",
-    )
-
-    with pytest.warns(LegacyNodesDirectoryWarning, match="kind: article"):
-        graph = load_graph(blueprint)
-
-    assert graph.nodes["base"].kind == "article"
-    assert graph.nodes["base"].declaration == "theorem"
 
 
 def test_check_cli(tmp_path: Path) -> None:

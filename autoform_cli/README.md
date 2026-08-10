@@ -13,7 +13,7 @@ number of levels, from book to chapter to section to declaration. Ordinary
 files use their path without `.md` as a stable ID; `README.md` uses its
 directory path, with the root article named `roadmap`.
 
-Use `kind: article` for clarity. The H1 is the article's human title. Container
+The H1 is the article's human title. Container
 prose supplies the mathematical exposition, and a standalone list item linking
 to a formalizable leaf places that definition or result at the exact position in
 the published chapter. Leaves without a placement slot appear under an explicit
@@ -28,7 +28,6 @@ Frontmatter records checked facts:
 
 ```markdown
 ---
-kind: article
 declaration: theorem
 origin: cited
 statement: formalized
@@ -69,9 +68,8 @@ obligation.
 target, `bridged` for a result introduced between source targets, and
 `background` for prerequisite mathematics.
 
-Legacy `kind: node` pages under `blueprint/roadmap/` and
-`blueprint/nodes/` continue to load with migration warnings. New roadmaps should
-use articles under `blueprint/roadmap/`.
+Frontmatter is optional. A container article that only supplies prose and
+placement needs none at all; only checked facts are recorded.
 
 ## Assertions and derived status
 
@@ -102,10 +100,6 @@ compiles but which rests on an unproved lemma is green, not dark green. The
 palette and state names follow
 [leanblueprint](https://pypi.org/project/leanblueprint/), so the published
 graph reads the same way as the Lean community's LaTeX blueprints.
-
-The flat `status:` field is deprecated. It still loads with a warning:
-`proved` becomes `statement`+`proof`, `blocked` becomes `not_ready`, and
-`ready`/`planned` are dropped because the graph derives them.
 
 ## Commands
 
