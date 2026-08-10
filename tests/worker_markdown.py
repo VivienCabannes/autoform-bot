@@ -14,14 +14,14 @@ def write_markdown_roadmap(
     """Author a minimal canonical roadmap equivalent to a legacy node fixture."""
     roadmap = project / "blueprint" / "roadmap"
     roadmap.mkdir(parents=True, exist_ok=True)
-    (roadmap / "README.md").write_text("---\nkind: article\n---\n\n# Roadmap\n", encoding="utf-8")
+    (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
 
     for node_id, node in nodes.items():
         if node_id == "roadmap":
             continue
         path = roadmap / f"{node_id}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = ["kind: article"]
+        metadata = []
         tier = int(node.get("tier", 2))
         formalizable = tier == 2 and node.get("kind") not in {"chapter", "section"}
         if formalizable:

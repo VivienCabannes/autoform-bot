@@ -31,7 +31,7 @@ def _article(
     path = project / "blueprint" / "roadmap" / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     title = title or path.parent.name.title() if path.name.casefold() == "readme.md" else title or path.stem.title()
-    lines = ["---", "kind: article", *(f"{key}: {value}" for key, value in metadata.items()), "---", "", f"# {title}", "", prose]
+    lines = ["---", *(f"{key}: {value}" for key, value in metadata.items()), "---", "", f"# {title}", "", prose]
     if statement_dependencies:
         lines.extend(["", "## Depends on", "", *(f"- [dependency]({target})" for target in statement_dependencies)])
     if proof_dependencies:

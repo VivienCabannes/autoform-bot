@@ -3,7 +3,7 @@ name: orchestrate
 description: Work through an Autoform Markdown blueprint with native agents and Lean tools.
 ---
 
-Treat `kind: article` pages under `blueprint/roadmap/**/*.md` and their dependency
+Treat every Markdown page under `blueprint/roadmap/**/*.md` and its dependency
 links as the source of truth. Follow `internal/runbooks/proving.md` and
 `internal/runbooks/review.md` for the preserved detailed worker procedures, and
 use `scripts/backend_config.py` for provider selection. Work ready nodes with native subagents plus the

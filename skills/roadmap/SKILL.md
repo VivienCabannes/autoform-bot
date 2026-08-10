@@ -4,8 +4,8 @@ description: >-
   Build, inspect, refine, or visualize the mathematical roadmap and theorem
   dependency DAG in an existing Autoform Markdown blueprint. Use for discovering
   prior work, choosing or drafting mathematical sources, confirming scope,
-  writing roadmap and coverage notes, decomposing mathematics into kind: article
-  Markdown pages under blueprint/roadmap/, setting planning statuses, or
+  writing roadmap and coverage notes, decomposing mathematics into Markdown
+  article pages under blueprint/roadmap/, or
   checking roadmap completeness; do not install repository infrastructure or
   prove Lean declarations.
 ---
@@ -62,9 +62,8 @@ mathematics.
 2. Write the high-level direction and milestones under `blueprint/roadmap/`.
    Group milestones by coherent mathematical significance, not by source
    section size.
-   Begin each planning page with `kind: article` so Obsidian and people can see
-   what it is immediately. Do not set `status`; the parser deprecates it and
-   derives state from the checked facts instead. Treat `blueprint/README.md` and the roadmap pages it
+   A chapter page needs no frontmatter at all: its H1 is the title and its
+   position in the tree is its identity. Treat `blueprint/README.md` and the roadmap pages it
    links as an ordered mathematical book: link meaningful chapter pages in
    their intended reading order. The renderer derives bottom-of-page previous
    and next chapter links from this Markdown structure, so do not maintain a
@@ -79,10 +78,10 @@ mathematics.
    milestone under `blueprint/roadmap/**/*.md`. A node may contain several
    supporting definitions or statements when they should land and be reviewed
    together, but it must identify one unique main result that determines when
-   the node is complete. Set `kind: article`; its path relative to `roadmap/`,
-   without `.md`, is its stable ID. Give it exactly one H1, a `declaration`
-   naming the main Lean artifact, a source-grounded statement or proof sketch,
-   and a `## Depends on` section. Never overload `kind` with the declaration.
+   the node is complete. Its path relative to `roadmap/`, without `.md`, is its
+   stable ID. Give it exactly one H1, a `declaration` naming the kind of Lean
+   artifact, a source-grounded statement or proof sketch, and a
+   `## Depends on` section.
 6. Put only genuine prerequisite links under `## Depends on`; those relative
    Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
    a prerequisite the proof needs but the statement does not. Keep roadmap,

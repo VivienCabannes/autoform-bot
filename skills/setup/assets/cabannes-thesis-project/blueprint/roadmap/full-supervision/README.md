@@ -1,7 +1,3 @@
----
-kind: article
----
-
 # Full Supervision
 
 This supporting formalization chapter isolates the fully supervised observation

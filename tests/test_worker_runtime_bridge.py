@@ -15,7 +15,7 @@ from autoform_worker.work_units import _cooperative_claim
 def _article(project: Path, relative: str, *, declaration: str | None = None, statement: bool = False) -> None:
     path = project / "blueprint" / "roadmap" / relative
     path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = ["kind: article"]
+    metadata = []
     if declaration:
         metadata.append(f"declaration: {declaration}")
     if statement:

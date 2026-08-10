@@ -58,7 +58,7 @@ def test_nested_container_keeps_its_own_narrative_and_statements(tmp_path: Path)
         encoding="utf-8",
     )
     (section / "result.md").write_text(
-        "---\nkind: article\ndeclaration: theorem\n---\n\n"
+        "---\ndeclaration: theorem\n---\n\n"
         "# Local result\n\nA local statement.\n\n## Depends on\n\nNo prerequisites.\n",
         encoding="utf-8",
     )
@@ -105,7 +105,7 @@ def test_same_named_leaf_slots_are_scoped_to_their_container(tmp_path: Path) -> 
             encoding="utf-8",
         )
         (directory / "result.md").write_text(
-            "---\nkind: article\ndeclaration: theorem\n---\n\n"
+            "---\ndeclaration: theorem\n---\n\n"
             f"# Result {chapter.upper()}\n\nStatement {chapter.upper()}.\n\n"
             "## Depends on\n\nNo prerequisites.\n",
             encoding="utf-8",
@@ -140,7 +140,7 @@ def test_render_preserves_fragment_on_container_article_link(tmp_path: Path) -> 
         "# Chapter\n\n[Jump](README.md#details)\n\n## Details\n\nText.\n", encoding="utf-8"
     )
     (chapter / "result.md").write_text(
-        "---\nkind: article\ndeclaration: theorem\n---\n\n"
+        "---\ndeclaration: theorem\n---\n\n"
         "# Result\n\nStatement.\n\n## Depends on\n\nNo prerequisites.\n",
         encoding="utf-8",
     )

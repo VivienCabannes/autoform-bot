@@ -10,7 +10,6 @@ a second graph file that could drift from the book.
 from __future__ import annotations
 
 import re
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -23,7 +22,6 @@ _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
 _FRONTMATTER_KEYS = frozenset(
     {
-        "kind",
         "declaration",
         "lean",
         "statement",
@@ -34,7 +32,6 @@ _FRONTMATTER_KEYS = frozenset(
         "not_ready",
         "origin",
         "discussion",
-        "status",
     }
 )
 _FORMALIZED = "formalized"
@@ -55,14 +52,6 @@ class GraphValidationError(ValueError):
     def __init__(self, issues: list[str] | tuple[str, ...]) -> None:
         self.issues = tuple(issues)
         super().__init__("; ".join(self.issues))
-
-
-class LegacyNodesDirectoryWarning(UserWarning):
-    """A blueprint still uses the deprecated top-level ``nodes/`` directory."""
-
-
-class LegacyStatusWarning(UserWarning):
-    """A node still asserts the deprecated flat ``status`` field."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +123,6 @@ class _NodeSource:
     id: str
     path: Path
     text: str
-    legacy: bool = False
 
 
 def load_graph(blueprint_dir: str | Path) -> Graph:
@@ -148,14 +136,8 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     parsed: list[_ParsedNode] = []
     canonical_ids: dict[Path, str] = {}
     node_ids: dict[str, Path] = {}
-    sources, discovery_issues, uses_legacy_nodes = _discover_nodes(blueprint)
+    sources, discovery_issues = _discover_nodes(blueprint)
     issues.extend(discovery_issues)
-    if uses_legacy_nodes:
-        warnings.warn(
-            "blueprint/nodes/ is deprecated; move articles under blueprint/roadmap/ and set kind: article",
-            LegacyNodesDirectoryWarning,
-            stacklevel=2,
-        )
 
     for source in sources:
         canonical = source.path.resolve()
@@ -170,23 +152,6 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
         node, node_issues = _parse_node(source.id, canonical, source.text)
         issues.extend(node_issues)
         if node is not None:
-            if source.legacy:
-                legacy_declaration = node.metadata.get("kind")
-                explicit_declaration = node.metadata.get("declaration")
-                if legacy_declaration in {None, "node"}:
-                    legacy_declaration = None
-                if (
-                    legacy_declaration is not None
-                    and explicit_declaration is not None
-                    and legacy_declaration != explicit_declaration
-                ):
-                    issues.append(
-                        f"{source.id}: conflicting legacy kind {legacy_declaration!r} "
-                        f"and declaration {explicit_declaration!r}"
-                    )
-                elif legacy_declaration is not None:
-                    node.metadata["declaration"] = legacy_declaration
-                node.metadata["kind"] = "node"
             parsed.append(node)
 
     if issues:
@@ -247,48 +212,29 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     return Graph(blueprint_dir=blueprint, nodes=nodes)
 
 
-def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str], bool]:
+def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
     roadmap_root = blueprint / "roadmap"
-    legacy_root = blueprint / "nodes"
-    if not roadmap_root.is_dir() and not legacy_root.is_dir():
-        return [], [f"roadmap directory does not exist: {roadmap_root}"], False
+    if not roadmap_root.is_dir():
+        return [], [f"roadmap directory does not exist: {roadmap_root}"]
 
     issues: list[str] = []
     sources: list[_NodeSource] = []
-    if roadmap_root.is_dir():
-        roadmap_root = roadmap_root.resolve()
-        for path in sorted(roadmap_root.rglob("*.md")):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError) as exc:
-                relative = path.relative_to(roadmap_root).as_posix()
-                issues.append(f"{relative}: cannot read roadmap page: {exc}")
-                continue
-            node_id = _article_id(path, roadmap_root)
-            canonical = path.resolve()
-            if not _is_within(canonical, roadmap_root):
-                issues.append(f"{node_id}: node file escapes the roadmap directory")
-                continue
-            sources.append(_NodeSource(node_id, canonical, text))
+    roadmap_root = roadmap_root.resolve()
+    for path in sorted(roadmap_root.rglob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            relative = path.relative_to(roadmap_root).as_posix()
+            issues.append(f"{relative}: cannot read roadmap page: {exc}")
+            continue
+        node_id = _article_id(path, roadmap_root)
+        canonical = path.resolve()
+        if not _is_within(canonical, roadmap_root):
+            issues.append(f"{node_id}: node file escapes the roadmap directory")
+            continue
+        sources.append(_NodeSource(node_id, canonical, text))
 
-    uses_legacy_nodes = False
-    if legacy_root.is_dir():
-        legacy_root = legacy_root.resolve()
-        for path in sorted(legacy_root.rglob("*.md")):
-            uses_legacy_nodes = True
-            node_id = path.relative_to(legacy_root).with_suffix("").as_posix()
-            canonical = path.resolve()
-            if not _is_within(canonical, legacy_root):
-                issues.append(f"{node_id}: node file escapes the legacy nodes directory")
-                continue
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError) as exc:
-                issues.append(f"{node_id}: cannot read node: {exc}")
-                continue
-            sources.append(_NodeSource(node_id, canonical, text, legacy=True))
-
-    return sources, issues, uses_legacy_nodes
+    return sources, issues
 
 
 def _article_id(path: Path, roadmap_root: Path) -> str:
@@ -426,7 +372,6 @@ def _parse_frontmatter(node_id: str, lines: list[str]) -> tuple[dict[str, str], 
             continue
         metadata[key] = value
 
-    _absorb_legacy_status(node_id, metadata)
     return metadata, end + 1, issues
 
 
@@ -447,29 +392,6 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
             return value, f"{location}: 'origin' accepts cited, bridged, or background"
         return folded, None
     return value, None
-
-
-def _absorb_legacy_status(node_id: str, metadata: dict[str, str]) -> None:
-    """Map the deprecated flat ``status`` field onto explicit assertions.
-
-    ``ready`` and ``planned`` carry no information the graph cannot derive, so
-    they are simply dropped.
-    """
-    status = metadata.pop("status", None)
-    if status is None:
-        return
-    warnings.warn(
-        f"{node_id}: 'status' is deprecated; assert 'statement: formalized', "
-        "'proof: formalized', 'mathlib: true', or 'not_ready: true' instead",
-        LegacyStatusWarning,
-        stacklevel=2,
-    )
-    folded = status.casefold()
-    if folded == "proved":
-        metadata.setdefault("statement", _FORMALIZED)
-        metadata.setdefault("proof", _FORMALIZED)
-    elif folded == "blocked":
-        metadata.setdefault("not_ready", "true")
 
 
 def _unquote_scalar(value: str) -> str:
@@ -595,8 +517,6 @@ def _is_within(path: Path, directory: Path) -> bool:
 __all__ = [
     "Graph",
     "GraphValidationError",
-    "LegacyNodesDirectoryWarning",
-    "LegacyStatusWarning",
     "Node",
     "load_graph",
 ]
