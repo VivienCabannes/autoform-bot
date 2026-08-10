@@ -228,6 +228,94 @@ def load_runtime_graph(
     return build_runtime_graph(graph, project_root=paths.project_root, lean_root=lean_root)
 
 
+def model_kind(declaration: str | None) -> str:
+    """Fold a declaration intent into the coarse kind legacy consumers expect."""
+
+    folded = (declaration or "theorem").casefold()
+    if folded in {"abbrev", "class", "def", "definition", "inductive", "instance", "structure"}:
+        return "definition"
+    if folded in {"lemma", "proposition", "corollary", "example"}:
+        return folded
+    return "theorem"
+
+
+def model_node(node: RuntimeNode) -> dict[str, object]:
+    """Project one runtime article into the flat record read-only surfaces read.
+
+    ``tier`` is the article's containment depth, so a chapter's statements are
+    one tier below it and the review surface's tier-N/tier-N+1 walk works at any
+    depth. ``formalizable`` carries what the old two-level schema could only
+    imply by ``tier == 2``: a deeply nested statement is still a reviewable unit.
+    """
+
+    lean_file = next(
+        (target.source_file for target in node.lean_targets if target.source_file),
+        None,
+    )
+    return {
+        "id": node.id,
+        "name": node.title,
+        "kind": model_kind(node.declaration),
+        "tier": node.depth,
+        "parent": node.parent,
+        "formalizable": node.formalizable,
+        "dispatchable": node.dispatchable,
+        "depends_on": list(node.dependencies),
+        "statement_dependencies": list(node.statement_dependencies),
+        "proof_dependencies": list(node.proof_dependencies),
+        "mathlib_status": "in-mathlib" if node.mathlib else "missing",
+        "mathlib_declarations": list(node.mathlib_declarations),
+        "mathlib_file": node.mathlib_file,
+        "source_refs": [{"file": target} for target in node.source_targets],
+        "origin": node.origin,
+        "content": node.article_path,
+        "lean_file": lean_file,
+        "statement_formalized": node.assertions.statement_formalized,
+        "proof_formalized": node.assertions.proof_formalized,
+        "not_ready": node.assertions.not_ready,
+        "runtime_status": node.status.state,
+    }
+
+
+def runtime_model(runtime: RuntimeGraph) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    """Project a runtime graph into the ``(nodes_by_id, metadata)`` review shape.
+
+    The root article is the book's preface rather than a reviewable unit, so it
+    is left out and the chapters below it become tier 1. That keeps the review
+    surface's meaning of a tier intact -- the outermost thing you can open -- for
+    a roadmap of any depth, and a depth-1 article reports no parent because its
+    container is not in the model.
+    """
+
+    root_ids = {node.id for node in runtime.nodes if node.depth == 0}
+    nodes: dict[str, dict[str, object]] = {}
+    for node in runtime.nodes:
+        if node.depth == 0:
+            continue
+        record = model_node(node)
+        if record["parent"] in root_ids:
+            record["parent"] = None
+        nodes[node.id] = record
+    metadata = {
+        "authority": runtime.authority,
+        "blueprint_path": runtime.blueprint_path,
+        "generated_by": RUNTIME_SCHEMA,
+        "schema": runtime.schema,
+        "source_revision": runtime.source_revision,
+    }
+    return nodes, metadata
+
+
+def load_runtime_model(
+    project_or_blueprint: str | Path,
+    *,
+    lean_root: str | Path | None = None,
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    """Load the Markdown wiki and return it in the review surface's shape."""
+
+    return runtime_model(load_runtime_graph(project_or_blueprint, lean_root=lean_root))
+
+
 def build_runtime_graph(
     graph: Graph,
     *,
@@ -507,5 +595,9 @@ __all__ = [
     "RuntimeStatus",
     "build_runtime_graph",
     "load_runtime_graph",
+    "load_runtime_model",
+    "model_kind",
+    "model_node",
     "resolve_runtime_paths",
+    "runtime_model",
 ]

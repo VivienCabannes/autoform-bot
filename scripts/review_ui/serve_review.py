@@ -27,13 +27,16 @@ API:
                                   delta (new effective verdicts + tainted set).
   * ``GET  /assets/*``          — review.css / review.js (+ any static asset).
 
-Inputs (read-only): ``graph.json``, ``informal_content/<id>.md``, the built
+Inputs (read-only): the ``blueprint/`` Markdown wiki, ``informal_content/<id>.md``, the built
 blueprint (``dep_graph_document.html`` for the ``div.thm#<slug>`` fragments), an
 optional ``kernel/<id>.txt`` (``#print axioms`` dump), and the sidecar.
 
 Run:
-    python serve_review.py --graph path/to/graph.json
-    python serve_review.py --graph graph.json --port 8765 --open
+    python serve_review.py --blueprint path/to/project/blueprint
+    python serve_review.py --blueprint blueprint --port 8765 --open
+
+``--graph path/to/graph.json`` still loads a legacy JSON fixture; it is not any
+project's source of truth.
 """
 from __future__ import annotations
 
@@ -316,6 +319,9 @@ class Project:
     """
 
     def __init__(self, graph_path: Path):
+        # Either the project's ``blueprint/`` directory -- the authoritative
+        # Markdown wiki -- or a legacy ``graph.json``. Both sit directly inside
+        # the project root, so every path below is derived the same way.
         self.graph_path = graph_path.resolve()
         self.root = self.graph_path.parent
         self.content_dir = self.root / "informal_content"
@@ -1643,7 +1649,11 @@ def make_handler(proj: Project):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Local DAG review server (127.0.0.1)")
-    ap.add_argument("--graph", type=Path, required=True, help="path to graph.json")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--blueprint", type=Path,
+                        help="path to the project's blueprint/ (the Markdown wiki)")
+    source.add_argument("--graph", type=Path,
+                        help="path to a legacy graph.json (fixtures and migrations only)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--open", action="store_true",
                     help="open the home screen in a browser")
@@ -1653,9 +1663,22 @@ def main(argv=None) -> int:
                          "module packets. Overrides graph metadata.lean_root.")
     args = ap.parse_args(argv)
 
-    graph_path = args.graph.resolve()
-    if not graph_path.is_file():
-        ap.error(f"graph.json not found: {graph_path}")
+    if args.blueprint is not None:
+        root = Path(__file__).resolve().parents[2]
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        from autoform_cli.runtime import RuntimeProjectionError, resolve_runtime_paths
+
+        try:
+            # Accepts a project root or its blueprint/ and always hands back the
+            # blueprint, so the project root below is the real one either way.
+            graph_path = resolve_runtime_paths(args.blueprint).blueprint_dir
+        except RuntimeProjectionError as error:
+            ap.error(f"not an Autoform blueprint: {args.blueprint}: {error}")
+    else:
+        graph_path = args.graph.resolve()
+        if not graph_path.is_file():
+            ap.error(f"graph.json not found: {graph_path}")
     proj = Project(graph_path)
     if args.lean_root is not None:
         proj.lean_root = args.lean_root.resolve()
@@ -1664,7 +1687,7 @@ def main(argv=None) -> int:
     actual_port = int(server.server_address[1])
     url = f"http://127.0.0.1:{actual_port}/"
     print(f"review server → {url}  (Ctrl-C to stop)")
-    print(f"  graph:   {graph_path}")
+    print(f"  roadmap: {graph_path}")
     print(f"  sidecar: {proj.sidecar_path}")
     if not proj.blueprint_html.is_file():
         print(f"  note: blueprint not built at {proj.blueprint_html}\n"

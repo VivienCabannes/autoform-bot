@@ -125,3 +125,65 @@ def test_non_macos_start_fails_with_actionable_fallback(
         ]
     ) == 1
     assert "documented foreground command" in capsys.readouterr().err
+
+
+def test_review_service_launches_against_the_blueprint(tmp_path, monkeypatch):
+    """The dashboard's default source is the Markdown wiki, not graph.json."""
+    project = tmp_path / "project"
+    plugin = tmp_path / "plugin"
+    blueprint = project / "blueprint"
+    lean_root = tmp_path / "lean"
+    server = plugin / "scripts" / "review_ui" / "serve_review.py"
+    (blueprint / "roadmap").mkdir(parents=True)
+    lean_root.mkdir()
+    server.parent.mkdir(parents=True)
+    server.write_text("# test server")
+    monkeypatch.setattr(sc.shutil, "which", lambda command: "/opt/local/bin/uv")
+
+    spec = sc.review_spec(
+        project=project,
+        plugin_root=plugin,
+        blueprint=blueprint,
+        lean_root=lean_root,
+        port=48765,
+    )
+
+    assert "--blueprint" in spec.command
+    assert spec.command[spec.command.index("--blueprint") + 1] == str(blueprint.resolve())
+    assert "--graph" not in spec.command
+
+
+def test_review_service_rejects_a_directory_that_is_not_a_blueprint(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    plugin = tmp_path / "plugin"
+    lean_root = tmp_path / "lean"
+    server = plugin / "scripts" / "review_ui" / "serve_review.py"
+    (project / "blueprint").mkdir(parents=True)
+    lean_root.mkdir()
+    server.parent.mkdir(parents=True)
+    server.write_text("# test server")
+    monkeypatch.setattr(sc.shutil, "which", lambda command: "/opt/local/bin/uv")
+
+    with pytest.raises(sc.ServiceError, match="no roadmap directory"):
+        sc.review_spec(
+            project=project,
+            plugin_root=plugin,
+            blueprint=project / "blueprint",
+            lean_root=lean_root,
+            port=48765,
+        )
+
+
+def test_review_service_requires_a_source(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    plugin = tmp_path / "plugin"
+    lean_root = tmp_path / "lean"
+    server = plugin / "scripts" / "review_ui" / "serve_review.py"
+    project.mkdir()
+    lean_root.mkdir()
+    server.parent.mkdir(parents=True)
+    server.write_text("# test server")
+    monkeypatch.setattr(sc.shutil, "which", lambda command: "/opt/local/bin/uv")
+
+    with pytest.raises(sc.ServiceError, match="blueprint directory is required"):
+        sc.review_spec(project=project, plugin_root=plugin, lean_root=lean_root, port=0)

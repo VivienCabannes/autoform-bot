@@ -7,7 +7,7 @@ helper path.
 A formalization is only trustworthy when a human Lean expert will vouch for the
 **statements** (the kernel already vouches for the proofs). This runbook produces the
 artifacts that make that vouching fast and decisive, **DAG-native** over the tiered
-plan (`graph.json` + the built blueprint), keyed by node `id`.
+plan (the `blueprint/` Markdown wiki + the built blueprint), keyed by article `id`.
 
 Two outputs from the review path:
 
@@ -21,7 +21,7 @@ Both read the same sidecar, `review_status.json` — the single source of truth 
 verdicts. The headless packet writes nothing; the review server writes exactly
 **two** files — the sidecar and `task_queue.json` (the dispatch queue that
 drag-and-drop / `POST /api/request` enqueues into for the orchestrate engine).
-`graph.json` and `informal_content/` stay pristine.
+the `blueprint/` articles and `informal_content/` stay pristine.
 
 The packet's structure, trust-class taxonomy, and the rules that make it honest live
 in `<AUTOFORM_PLUGIN_ROOT>/internal/references/reviewer-packet.md` — read it
@@ -68,7 +68,7 @@ recorded human verdict freezes the node: re-running the jury rewrites only the
   closure is fully clean. These are the results a human can currently trust
   end-to-end.
 
-All of these are pure functions of (`graph.json`, `review_status.json`) implemented
+All of these are pure functions of (the roadmap, `review_status.json`) implemented
 in `<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/review_model.py` (`verdict_of`,
 `tainted_set`, `cluster_rollup`, `coverage`, `trust_frontier`, `recolor_dot`).
 
@@ -91,7 +91,7 @@ the dial, set `settings.dial` in `review_status.json` to one of the three values
 
 ## Headless: `review <id>` (the text packet)
 
-Resolve `<id>` to a node or a tier-1 cluster in `graph.json`, then emit the packet:
+Resolve `<id>` to an article or a tier-1 container in the wiki, then emit the packet:
 
 1. **Spec sheet** — for the node (or each child of a cluster): the Lean statement
    (verbatim signature) · the source statement (verbatim, from `source_refs`) ·
@@ -116,7 +116,7 @@ This default is text-only and writes nothing. It is the CI/agent path.
 1. **Build the blueprint if stale.** The UI injects the *built* `div.thm#<slug>`
    fragments (MathJax already run) — it never regenerates the informalization. If the
    blueprint under `blueprint_export/blueprint/web/` is missing or older than
-   `graph.json`, build it first by following the visualization runbook's steps
+   the roadmap, build it first by following the visualization runbook's steps
    (check toolchain → `export_blueprint.py` → `make web`). Do not call `plastex`
    directly.
 
@@ -125,7 +125,7 @@ This default is text-only and writes nothing. It is the CI/agent path.
    ```bash
    uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
        "<AUTOFORM_PLUGIN_ROOT>/scripts/review_ui/serve_review.py" \
-       --graph <path/to/graph.json> [--lean-root <path/to/Lean/sources>] \
+       --blueprint <path/to/project/blueprint> [--lean-root <path/to/Lean/sources>] \
        [--port 8765] [--open]
    ```
 
@@ -140,8 +140,8 @@ This default is text-only and writes nothing. It is the CI/agent path.
      card + the jury scorecard; the bottom **verdict panel** writes the `human` slot
      via `POST /api/verdict/<id>` and the home graph re-taints live.
 
-   The server reads `graph.json`, `informal_content/`, the built blueprint, an
-   optional `kernel/<id>.txt`, and `review_status.json`; it **writes only**
+   The server reads the `blueprint/` Markdown wiki, `informal_content/`, the built
+   blueprint, an optional `kernel/<id>.txt`, and `review_status.json`; it **writes only**
    `review_status.json` (verdicts) and `task_queue.json` (dispatch requests).
 
 ## Spec-gate (targets) — faithfulness on the DAG roots
@@ -165,6 +165,6 @@ status, no new infrastructure — it reuses the same jury + sidecar + packet.
 - Never claim "compiles" / "axiom-clean" without the command output in the packet.
 - A packet with an unexplained `AXIOM`/`SORRY` row is a **failed** packet — say so.
 - The surface writes **only** `review_status.json` and `task_queue.json`. Never
-  edit `graph.json`, `informal_content/`, or the built blueprint from the review
+  edit the `blueprint/` articles, `informal_content/`, or the built blueprint from the review
   path.
 - Human verdicts are immutable — re-running the jury never overrides a human slot.

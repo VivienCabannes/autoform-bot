@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-from autoform_cli.runtime import RuntimeGraph, RuntimeNode
+from autoform_cli.runtime import RuntimeGraph, RuntimeNode, model_kind
 
 
 def legacy_node(node: RuntimeNode) -> dict[str, object]:
@@ -21,7 +21,7 @@ def legacy_node(node: RuntimeNode) -> dict[str, object]:
     )
     return {
         "id": node.id,
-        "kind": _legacy_kind(node.declaration),
+        "kind": model_kind(node.declaration),
         "description": node.title,
         "depends_on": list(node.dependencies),
         "statement_dependencies": list(node.statement_dependencies),
@@ -94,15 +94,6 @@ def eligible_prove_nodes(runtime: RuntimeGraph) -> list[tuple[str, dict[str, obj
         reason = "statement formalized; proof ready" if node.status.stated else "ready to formalize"
         eligible.append((node.id, legacy_node(node), reason))
     return sorted(eligible, key=lambda item: item[0])
-
-
-def _legacy_kind(declaration: str | None) -> str:
-    folded = (declaration or "theorem").casefold()
-    if folded in {"abbrev", "class", "def", "definition", "inductive", "instance", "structure"}:
-        return "definition"
-    if folded in {"lemma", "proposition", "corollary", "example"}:
-        return folded
-    return "theorem"
 
 
 __all__ = ["eligible_prove_nodes", "legacy_node", "legacy_nodes", "write_private_snapshot"]

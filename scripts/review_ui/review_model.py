@@ -213,8 +213,32 @@ DIALS = ("on-demand", "targets", "full")
 # ---------------------------------------------------------------------------
 
 def load_graph(path: Path) -> Tuple[Dict[str, dict], dict]:
-    """Load graph.json -> (nodes_by_id, metadata) via the exporter's loader."""
-    return eb.load_graph(Path(path))
+    """Load the roadmap -> (nodes_by_id, metadata).
+
+    A directory is the authoritative Markdown wiki (a project root or its
+    ``blueprint/``) and is projected through ``autoform_cli.runtime``. A file is
+    a legacy ``graph.json``, still read for standalone fixtures and migrations
+    but no longer any project's source of truth.
+    """
+    candidate = Path(path)
+    if candidate.is_dir():
+        root = _SCRIPTS_DIR.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        from autoform_cli.runtime import load_runtime_model  # noqa: PLC0415
+
+        return load_runtime_model(candidate)
+    return eb.load_graph(candidate)
+
+
+def _is_reviewable(node: dict) -> bool:
+    """Whether a node is a formal unit a reviewer judges, rather than a container.
+
+    A Markdown roadmap nests to any depth, so the unit is marked explicitly.
+    Legacy ``graph.json`` had only two levels and said the same thing by being
+    tier 2, which is the fallback.
+    """
+    return bool(node.get("formalizable", eb.node_tier(node) == 2))
 
 
 def empty_sidecar() -> dict:
@@ -831,7 +855,7 @@ def coverage(
     original behavior exactly.
     """
     sorry_set = sorry_set or set()
-    tier2 = [nid for nid, node in nodes.items() if eb.node_tier(node) == 2]
+    tier2 = [nid for nid, node in nodes.items() if _is_reviewable(node)]
     reviewed = [nid for nid in tier2 if verdict_of(nid, sidecar) != "unreviewed"]
     human = [nid for nid in tier2 if review_source(nid, sidecar) == "human"]
     in_mathlib = [nid for nid in tier2 if is_in_mathlib(nodes[nid])]
@@ -867,7 +891,7 @@ def trust_frontier(
     reproduces the original behavior exactly.
     """
     sorry_set = sorry_set or set()
-    tier2 = {nid: node for nid, node in nodes.items() if eb.node_tier(node) == 2}
+    tier2 = {nid: node for nid, node in nodes.items() if _is_reviewable(node)}
     rev = _dependents_index(tier2)
     sinks = [nid for nid in tier2 if not rev.get(nid)]
 

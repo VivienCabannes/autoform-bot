@@ -11,7 +11,7 @@ Examples:
 
     python service_control.py start review \
       --project /path/to/plan --plugin-root /path/to/autoform \
-      --graph /path/to/plan/graph.json --lean-root /path/to/lean --port 0
+      --blueprint /path/to/plan/blueprint --lean-root /path/to/lean --port 0
 
     python service_control.py start blueprint \
       --project /path/to/plan \
@@ -157,13 +157,23 @@ def review_spec(
     *,
     project: str | Path,
     plugin_root: str | Path,
-    graph: str | Path,
+    blueprint: str | Path | None = None,
+    graph: str | Path | None = None,
     lean_root: str | Path,
     port: int,
 ) -> ServiceSpec:
     project_path = _resolved_directory(project, "project")
     plugin_path = _resolved_directory(plugin_root, "plugin root")
-    graph_path = _resolved_file(graph, "graph")
+    if blueprint is not None:
+        source_path = _resolved_directory(blueprint, "blueprint")
+        if not (source_path / "roadmap").is_dir():
+            raise ServiceError(f"blueprint has no roadmap directory: {source_path}")
+        source_flag = "--blueprint"
+    elif graph is not None:
+        source_path = _resolved_file(graph, "legacy graph")
+        source_flag = "--graph"
+    else:
+        raise ServiceError("a blueprint directory is required")
     lean_path = _resolved_directory(lean_root, "Lean root")
     server_path = _resolved_file(
         plugin_path / "scripts" / "review_ui" / "serve_review.py",
@@ -182,8 +192,8 @@ def review_spec(
         "python",
         "-u",
         str(server_path),
-        "--graph",
-        str(graph_path),
+        source_flag,
+        str(source_path),
         "--lean-root",
         str(lean_path),
         "--port",
@@ -436,7 +446,9 @@ def _parser() -> argparse.ArgumentParser:
     review = starts.add_parser("review", help="start the review dashboard")
     review.add_argument("--project", required=True)
     review.add_argument("--plugin-root", required=True)
-    review.add_argument("--graph", required=True)
+    source = review.add_mutually_exclusive_group(required=True)
+    source.add_argument("--blueprint")
+    source.add_argument("--graph", help=argparse.SUPPRESS)
     review.add_argument("--lean-root", required=True)
     review.add_argument("--port", type=int, default=0)
     review.add_argument("--timeout", type=float, default=60)
@@ -470,6 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 spec = review_spec(
                     project=args.project,
                     plugin_root=args.plugin_root,
+                    blueprint=args.blueprint,
                     graph=args.graph,
                     lean_root=args.lean_root,
                     port=args.port,
