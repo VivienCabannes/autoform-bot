@@ -237,6 +237,9 @@ def _write_page(
     if navigation:
         sections.extend([navigation, ""])
     sections.extend([lead, "", diagram, ""])
+    legend = mermaid.render_legend(statuses)
+    if legend:
+        sections.extend(["<details><summary>What the colours mean</summary>", "", legend, "", "</details>", ""])
     if extra:
         sections.extend([extra, ""])
     page.parent.mkdir(parents=True, exist_ok=True)

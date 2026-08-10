@@ -295,45 +295,6 @@ def render_site(
     )
     _append_book_navigation(book_pages)
 
-    book = _render_book_page(book_pages, destination)
-    if book:
-        (destination / BOOK_PAGE).write_text(book, encoding="utf-8")
-        report.pages += 1
-        # The one-page book is the same material as the chapter pages, so it
-        # earns a link from the contents page rather than a competing nav entry.
-        if overview.is_file():
-            link = (
-                f'<p class="bp-read-whole"><a href="{BOOK_PAGE[:-3]}.html">'
-                "Read the whole blueprint on one page "
-                '<span aria-hidden="true">→</span></a></p>'
-            )
-            text = overview.read_text(encoding="utf-8")
-            marker = '<nav class="bp-book-nav"'
-            # Sits with the contents links, above the previous/next footer.
-            if marker in text:
-                head, _, tail = text.partition(marker)
-                text = f"{head.rstrip()}\n\n{link}\n\n{marker}{tail}"
-            else:
-                text = f"{text.rstrip()}\n\n{link}\n"
-            overview.write_text(text, encoding="utf-8")
-
-    progress_page = destination / "progress.md"
-    progress_page.write_text(
-        _render_progress_page(
-            graph,
-            statuses,
-            groups=groups,
-            group_pages=group_pages,
-            page=progress_page,
-            blueprint=blueprint,
-            destination=destination,
-            node_sources=node_sources,
-            targets=targets,
-        ),
-        encoding="utf-8",
-    )
-    report.pages += 1
-
     generated_graph_pages = graph_pages.write_graph_pages(
         graph,
         statuses,
@@ -535,131 +496,10 @@ def _book_page_order(blueprint: Path, destination: Path, graph: Graph) -> list[P
     return ordered
 
 
-BOOK_PAGE = "book.md"
-
-_BOOK_NAV = re.compile(r"\n*<nav class=\"bp-book-nav\".*?</nav>\s*\Z", re.DOTALL)
-_BOOK_HEADING = re.compile(r"^(#{1,6})(\s+)(.*)$")
-_BOOK_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-_HTML_ID = re.compile(r'id="([^"]+)"')
-_HREF = re.compile(r'href="([^"]+)"')
-_MD_TARGET = re.compile(r"\]\(([^)\s]+)\)")
 
 
-def _book_slug(page: Path, destination: Path) -> str:
-    """A stable per-page anchor namespace, so chapters cannot collide."""
-
-    relative = page.relative_to(destination).with_suffix("")
-    slug = relative.as_posix()
-    if slug.endswith("/README"):
-        slug = slug[: -len("/README")]
-    if slug in {"README", ""}:
-        return "preface"
-    return slug.replace("/", "-")
 
 
-def _book_anchor(slug: str, anchor: str) -> str:
-    return f"{slug}--{anchor}" if anchor else slug
-
-
-def _render_book_page(pages: list[Path], destination: Path) -> str:
-    """Concatenate the book's pages into one linear document.
-
-    The split into chapter pages is a navigation choice, not a property of the
-    mathematics. Readers who want the whole argument in one scroll, or a single
-    file to print or hand to a model, get it here without a second source.
-    """
-
-    if not pages:
-        return ""
-
-    slugs = {page.resolve(): _book_slug(page, destination) for page in pages}
-    title = _first_h1(pages[0].read_text(encoding="utf-8")) or "Blueprint"
-    out: list[str] = [f"# {title}", ""]
-
-    for index, page in enumerate(pages):
-        slug = slugs[page.resolve()]
-        text = _BOOK_NAV.sub("", page.read_text(encoding="utf-8"))
-        text = _strip_book_frontmatter(text)
-
-        def rewrite_target(target: str) -> str:
-            if target.startswith(("http://", "https://", "mailto:")):
-                return target
-            if target.startswith("#"):
-                return "#" + _book_anchor(slug, target[1:])
-            path, _, fragment = target.partition("#")
-            resolved = (page.parent / path).resolve()
-            for candidate in (resolved, resolved.with_name("README.md")):
-                if candidate in slugs:
-                    return "#" + _book_anchor(slugs[candidate], fragment)
-            if candidate_html := _html_to_markdown(resolved):
-                if candidate_html in slugs:
-                    return "#" + _book_anchor(slugs[candidate_html], fragment)
-            try:
-                relative = resolved.relative_to(destination).as_posix()
-            except ValueError:
-                return target
-            return relative + (f"#{fragment}" if fragment else "")
-
-        text = _HTML_ID.sub(lambda m: f'id="{_book_anchor(slug, m.group(1))}"', text)
-        text = _HREF.sub(lambda m: f'href="{rewrite_target(m.group(1))}"', text)
-        text = _MD_TARGET.sub(lambda m: f"]({rewrite_target(m.group(1))})", text)
-
-        out.append(f'<a id="{slug}"></a>')
-        out.append("")
-        out.append(_demote_book_headings(text, drop_first_h1=index == 0))
-        out.append("")
-
-    return "\n".join(out).rstrip() + "\n"
-
-
-def _strip_book_frontmatter(text: str) -> str:
-    """Chapter pages keep their properties for Obsidian; the book does not."""
-
-    if not text.startswith("---\n"):
-        return text
-    end = text.find("\n---\n", 4)
-    return text[end + len("\n---\n") :] if end != -1 else text
-
-
-def _html_to_markdown(path: Path) -> Path | None:
-    """`index.html` and `x.html` in a rendered href map back to their sources."""
-
-    if path.suffix != ".html":
-        return None
-    if path.name == "index.html":
-        return path.with_name("README.md")
-    return path.with_suffix(".md")
-
-
-def _demote_book_headings(text: str, *, drop_first_h1: bool) -> str:
-    """Push every heading one level down so chapters nest under the book title."""
-
-    lines: list[str] = []
-    fence: str | None = None
-    dropped = False
-    for line in text.splitlines():
-        opening = _BOOK_FENCE.match(line)
-        if opening:
-            marker = opening.group(1)
-            if fence is None:
-                fence = marker
-            elif line.strip().startswith(fence):
-                fence = None
-            lines.append(line)
-            continue
-        if fence is not None:
-            lines.append(line)
-            continue
-        heading = _BOOK_HEADING.match(line)
-        if heading:
-            hashes, space, rest = heading.groups()
-            if len(hashes) == 1 and drop_first_h1 and not dropped:
-                dropped = True
-                continue
-            lines.append(("#" * min(len(hashes) + 1, 6)) + space + rest)
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
 
 
 def _append_book_navigation(pages: list[Path]) -> None:
@@ -768,7 +608,6 @@ def _render_overview_summary(
     graph: Graph,
     statuses: dict[str, status.NodeStatus],
     *,
-    progress_href: str | None = "progress.html",
     node_ids: list[str] | None = None,
 ) -> str:
     """Render the compact, honest progress strip shown at the start of the book."""
@@ -795,84 +634,15 @@ def _render_overview_summary(
             f"{html.escape(state.label)}</span>"
         )
     states = "".join(state_parts)
-    detail_link = (
-        f'<a class="bp-progress-link" href="{html.escape(progress_href, quote=True)}">'
-        'Detailed progress <span aria-hidden="true">→</span></a>'
-        if progress_href is not None
-        else ""
-    )
     return (
         '<div class="bp-progress-overview">'
         '<div class="bp-progress-kicker">Formalization progress</div>'
         f'<div class="bp-progress-total">{item_summary}</div>'
         f'<div class="bp-progress-states">{states}</div>'
-        f"{detail_link}"
+        f""
         "</div>"
     )
 
-
-def _render_progress_page(
-    graph: Graph,
-    statuses: dict[str, status.NodeStatus],
-    *,
-    groups: dict[str, list[str]],
-    group_pages: dict[str, Path],
-    page: Path,
-    blueprint: Path,
-    destination: Path,
-    node_sources: dict[Path, str],
-    targets: dict[str, tuple[Path, str]],
-) -> str:
-    """Build the aggregate view while keeping source coverage distinct from DAG progress."""
-    sections = [
-        "---",
-        "kind: progress",
-        "---",
-        "",
-        "# Progress",
-        "",
-        _render_overview_summary(graph, statuses, progress_href=None),
-        "",
-        "## Chapters",
-        "",
-    ]
-
-    if groups:
-        sections.extend(
-            [
-                "| Chapter | Blueprint items | Current state |",
-                "| --- | ---: | --- |",
-            ]
-        )
-        for group, node_ids in groups.items():
-            chapter_page = group_pages[group]
-            title = _first_h1(chapter_page.read_text(encoding="utf-8"))
-            if title is None:
-                title = group.replace("-", " ").title() if group else "Roadmap"
-            href = mermaid.relative_link(chapter_page, page, ".md")
-            summary = _status_phrase(statuses[node_id] for node_id in node_ids)
-            sections.append(
-                f"| [{_markdown_table_cell(title)}]({href}) | {len(node_ids)} | "
-                f"{_markdown_table_cell(summary)} |"
-            )
-    else:
-        sections.append("No formalization-sized definitions or results have been planned yet.")
-
-    legend = mermaid.render_legend(statuses)
-    if legend:
-        sections.extend(["", "## What the states mean", "", legend])
-
-    coverage_source = blueprint / "coverage" / "README.md"
-    if coverage_source.is_file():
-        href = mermaid.relative_link(destination / "coverage" / "README.md", page, ".md")
-        sections.extend(
-            [
-                "",
-                f"Derived states describe the DAG. What the project *claims* to cover, "
-                f"and what it deliberately excludes, is the [coverage contract]({href}).",
-            ]
-        )
-    return "\n".join(sections).rstrip() + "\n"
 
 
 def _status_phrase(node_statuses: Iterable[status.NodeStatus]) -> str:
@@ -1102,11 +872,9 @@ def _render_chapter(
         linked += node_linked
         unresolved.extend(node_unresolved)
 
-    progress_href = mermaid.relative_link(destination / "progress.md", page, ".html")
     chapter_summary = _render_overview_summary(
         graph,
         statuses,
-        progress_href=progress_href,
         node_ids=node_ids,
     )
     if narrative is None:
@@ -1207,6 +975,7 @@ def _render_environment(
 
     code_links, implementation_rows, linked, unresolved = _lean_presentation(node, linker)
     context_link = _graph_context_link(node, page=page, destination=destination)
+    source_link = _vault_source_link(node, blueprint=blueprint, linker=linker)
     meta_rows = implementation_rows
     if node.discussion:
         meta_rows.append(("Discussion", _discussion_link(node.discussion, linker)))
@@ -1233,6 +1002,7 @@ def _render_environment(
         f'<span class="bp-thmtitle">{html.escape(node.title)}</span>'
         f"{code_links}"
         f"{context_link}"
+        f"{source_link}"
         f'<a class="bp-permalink" href="#{html.escape(anchor, quote=True)}">#</a>'
         f'<span class="bp-mark" title="{html.escape(node_status.label, quote=True)}">'
         f'{mark}<span class="bp-mark-label">{html.escape(node_status.label)}</span></span>',
@@ -1294,6 +1064,31 @@ def _code_icon() -> str:
         '<svg class="bp-code-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
         '<path d="m8 9-3 3 3 3M16 9l3 3-3 3M14 5l-4 14"/>'
         "</svg>"
+    )
+
+
+def _vault_source_link(node: Node, *, blueprint: Path, linker) -> str:
+    """Link a statement to the Markdown article it was authored in.
+
+    The graph view and the published statement are both derived. This is the
+    file a reader edits, so it is worth one click from the statement itself.
+    """
+    if not linker.repository_url or not linker.ref:
+        return ""
+    try:
+        relative = node.path.resolve().relative_to(blueprint.parent.resolve()).as_posix()
+    except ValueError:
+        return ""
+    href = f"{linker.repository_url}/blob/{linker.ref}/{relative}"
+    label = html.escape(f"Edit the Markdown source for {node.title}", quote=True)
+    icon = (
+        '<svg class="bp-source-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+        '<path d="M4 4h9l7 7v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/>'
+        '<path d="M13 4v7h7"/></svg>'
+    )
+    return (
+        f'<a class="bp-source-link" href="{html.escape(href, quote=True)}" '
+        f'aria-label="{label}" title="{label}">{icon}</a>'
     )
 
 
@@ -1560,7 +1355,6 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
   font-size: 0.85rem;
 }}
 .bp-progress-state {{ display: inline-flex; align-items: center; gap: 0.35rem; }}
-.bp-progress-link {{ display: inline-block; margin-top: 0.65rem; font-size: 0.85rem; }}
 
 /* Reading order belongs to the book itself, not to MkDocs' global navbar. */
 .bp-book-nav {{
@@ -1605,6 +1399,10 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 .bp-thmtitle::before {{ content: "("; }}
 .bp-thmtitle::after {{ content: ")"; }}
 
+.bp-source-link {{ color: var(--bp-muted); margin-left: 0.3rem; }}
+.bp-source-link:hover {{ color: var(--bp-link-hover); text-decoration: none; }}
+.bp-source-icon {{ width: 0.95em; height: 0.95em; fill: none; stroke: currentColor;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; vertical-align: -0.12em; }}
 .bp-code-links {{ display: inline-flex; align-items: center; gap: 0.2rem; margin-left: 0.45rem; }}
 .bp-code-link {{
   display: inline-flex;
