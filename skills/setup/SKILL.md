@@ -45,6 +45,15 @@ a book with no chapters. `init` never overwrites an existing file, so it is
 also the repair path; it reports what it left alone. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
+`init` pins the generated workflows to the Autoform commit that ran it, but it
+can only do that when Autoform is running from a Git checkout. Installed as a
+plugin it is a plain directory copy, so there is nothing to read and `init`
+writes no CI rather than guess a ref: guessing produced projects whose first
+push failed with nothing in the workflow to explain why. When it reports that,
+find the commit the plugin was installed from and pass
+`--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
+Never invent a ref.
+
 The two workflows it writes are `autoform-verify.yml`, which validates the
 Markdown DAG, builds Lean, rejects unfinished or unsafe proofs, and audits
 theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the

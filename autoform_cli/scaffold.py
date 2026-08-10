@@ -47,21 +47,30 @@ def _git(*args: str) -> str | None:
 
 
 def plugin_pin() -> tuple[str, str]:
-    """The Autoform source and commit that generated CI should install.
+    """The Autoform source and commit generated CI should install, if knowable.
 
-    A floating ref is a trap: `facebookresearch/autoform-bot@main` predates the
-    CLI entirely, so a scaffolded project's first CI run installs a build with
-    no `autoform` command. Pinning the checkout that scaffolded the project
-    means the workflow runs the same Autoform the author ran, and the pin is
-    immutable by construction.
+    Returns empty strings when it cannot be known. That happens whenever
+    Autoform runs from something other than a Git checkout, which is the normal
+    case for an installed plugin: `claude plugin install` copies the directory
+    without its `.git`.
+
+    An earlier version fell back to `facebookresearch/autoform-bot@main`. That
+    commit predates `autoform_cli` entirely, so every project scaffolded through
+    the plugin got CI that installed a build with no `autoform` command and
+    failed at the first step, with nothing in the workflow to explain why. A
+    wrong pin is worse than no pin: guessing here is what made the failure
+    silent.
     """
 
-    source = _git("remote", "get-url", "origin") or DEFAULT_AUTOFORM_SOURCE
+    source = _git("remote", "get-url", "origin")
+    ref = _git("rev-parse", "HEAD")
+    if not source or not ref:
+        return "", ""
     if source.startswith("git@github.com:"):
         source = "https://github.com/" + source[len("git@github.com:") :]
     if not source.endswith(".git"):
         source += ".git"
-    return source, _git("rev-parse", "HEAD") or DEFAULT_AUTOFORM_REF
+    return source, ref
 
 
 class ScaffoldError(ValueError):
@@ -79,12 +88,14 @@ class ScaffoldResult:
     project: str
     written: tuple[str, ...]
     skipped: tuple[str, ...]
+    unpinned: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
             "project": self.project,
             "written": list(self.written),
             "skipped": list(self.skipped),
+            "unpinned": self.unpinned,
         }
 
 
@@ -132,11 +143,17 @@ def scaffold_project(
         raise ScaffoldError(issues)
 
     pinned_source, pinned_ref = plugin_pin()
+    source = autoform_source.strip() or pinned_source
+    ref = autoform_ref.strip() or pinned_ref
+    # CI installs Autoform from a Git ref. Without one, writing the workflows
+    # anyway would publish a project whose first push fails for a reason no
+    # file in it explains, so they are skipped and reported instead.
+    unpinned = not (source and ref)
     substitutions = {
         "PROJECT_TITLE": title.strip(),
         "REPO_URL": repository_url.strip(),
-        "AUTOFORM_SOURCE": autoform_source.strip() or pinned_source,
-        "AUTOFORM_REF": autoform_ref.strip() or pinned_ref,
+        "AUTOFORM_SOURCE": source,
+        "AUTOFORM_REF": ref,
     }
 
     written: list[str] = []
@@ -145,6 +162,9 @@ def scaffold_project(
         if not template.is_file():
             continue
         relative = template.relative_to(_TEMPLATES).as_posix()
+        if unpinned and relative.startswith("github/workflows/"):
+            skipped.append(_destination(relative))
+            continue
         destination = root / _destination(relative)
         if destination.exists() and not force:
             skipped.append(_destination(relative))
@@ -159,7 +179,7 @@ def scaffold_project(
             )
         written.append(_destination(relative))
 
-    return ScaffoldResult(title.strip(), tuple(written), tuple(skipped))
+    return ScaffoldResult(title.strip(), tuple(written), tuple(skipped), unpinned)
 
 
 __all__ = [

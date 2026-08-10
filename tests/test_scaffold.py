@@ -233,3 +233,48 @@ def test_explicit_pin_overrides_the_checkout(tmp_path: Path) -> None:
 
     verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert f"git+https://example.test/autoform.git@{'1' * 40}" in verify
+
+
+def test_no_ci_rather_than_a_guessed_pin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wrong pin is worse than no pin, because it fails silently.
+
+    Installed as a plugin, Autoform is a directory copy with no `.git`, so
+    `plugin_pin` has nothing to read. It used to fall back to
+    `facebookresearch/autoform-bot@main`, a commit predating the CLI, and every
+    project scaffolded that way got CI that died at the first step.
+    """
+    from autoform_cli import scaffold as scaffold_module
+
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
+    result = scaffold_module.scaffold_project(tmp_path, title="Finite Flat")
+
+    assert result.unpinned is True
+    assert not (tmp_path / ".github/workflows/autoform-verify.yml").exists()
+    assert not (tmp_path / ".github/workflows/blueprint-pages.yml").exists()
+    assert ".github/workflows/autoform-verify.yml" in result.skipped
+    # Everything a project needs to be authored still lands.
+    assert (tmp_path / "blueprint/roadmap/README.md").is_file()
+    assert (tmp_path / "mkdocs.yml").is_file()
+
+
+def test_an_explicit_ref_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
+    result = scaffold_module.scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="2" * 40,
+    )
+
+    assert result.unpinned is False
+    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+    assert f"git+https://example.test/autoform.git@{'2' * 40}" in verify
+
+
+def test_plugin_pin_is_empty_outside_a_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    monkeypatch.setattr(scaffold_module, "_git", lambda *args: None)
+    assert scaffold_module.plugin_pin() == ("", "")
