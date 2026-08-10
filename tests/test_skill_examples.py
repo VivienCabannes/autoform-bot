@@ -222,8 +222,11 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "<strong>1</strong> ready to state" in progress
     assert "<strong>1</strong> planned" in progress
     assert "Full Supervision" in progress
-    assert "## Scope coverage" in progress
-    assert "Experiments and narrative material" in progress
+    # The coverage contract lives on its own page; Progress links to it.
+    assert "## Scope coverage" not in progress
+    assert "[coverage contract](coverage/README.md)" in progress
+    coverage = (site / "coverage/README.md").read_text(encoding="utf-8")
+    assert "Experiments and narrative material" in coverage
     assert "bp-book-nav" not in progress
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
