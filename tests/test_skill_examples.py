@@ -333,7 +333,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "one unique main result",
         "targeted lookups",
         "exact verified upstream result",
-        "Reconcile the coarse milestone pages",
+        "Reconcile every page whose claims this work has just invalidated",
         "GitHub pull requests and issues",
         "Zulip topics",
         "../setup/references/zulip.md",
@@ -497,3 +497,32 @@ def test_skills_delegate_the_command_line_to_the_reference(repo_root: Path) -> N
         if "autoform_cli/README.md" in text:
             citing += 1
     assert citing >= 3
+
+
+def test_roadmap_reconciles_the_pages_setup_wrote(repo_root: Path) -> None:
+    """Setup declares the project empty; Roadmap must retract that.
+
+    A live run decomposed a chapter into nine nodes and published a site whose
+    front page still read "no chapters, statements, or dependencies exist
+    below". Setup authored that sentence before any scope existed and Roadmap
+    updated the chapter and the coverage contract but not the two landing pages,
+    so the first thing a visitor read was that the project was empty.
+    """
+
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+
+    for required in ("blueprint/README.md", "repository `README.md`"):
+        assert required in roadmap, f"Roadmap never reconciles {required}"
+
+
+def test_roadmap_commits_so_the_published_site_can_catch_up(repo_root: Path) -> None:
+    """CI publishes from the repository, not from a working tree.
+
+    Roadmap was the only workflow skill silent on committing, which left the
+    deploy waiting on a step nobody owned. Pushing stays the user's call.
+    """
+
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+
+    assert "Commit the vault" in roadmap
+    assert "outward-facing" in roadmap
