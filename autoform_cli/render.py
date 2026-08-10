@@ -288,13 +288,17 @@ def render_site(
         report.linked += linked
         report.unresolved.extend(unresolved)
 
-    _append_book_navigation(
-        _book_page_order(
-            blueprint,
-            destination,
-            graph,
-        )
+    book_pages = _book_page_order(
+        blueprint,
+        destination,
+        graph,
     )
+    _append_book_navigation(book_pages)
+
+    book = _render_book_page(book_pages, destination)
+    if book:
+        (destination / BOOK_PAGE).write_text(book, encoding="utf-8")
+        report.pages += 1
 
     progress_page = destination / "progress.md"
     progress_page.write_text(
@@ -512,6 +516,133 @@ def _book_page_order(blueprint: Path, destination: Path, graph: Graph) -> list[P
 
     visit(blueprint / "README.md")
     return ordered
+
+
+BOOK_PAGE = "book.md"
+
+_BOOK_NAV = re.compile(r"\n*<nav class=\"bp-book-nav\".*?</nav>\s*\Z", re.DOTALL)
+_BOOK_HEADING = re.compile(r"^(#{1,6})(\s+)(.*)$")
+_BOOK_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_HTML_ID = re.compile(r'id="([^"]+)"')
+_HREF = re.compile(r'href="([^"]+)"')
+_MD_TARGET = re.compile(r"\]\(([^)\s]+)\)")
+
+
+def _book_slug(page: Path, destination: Path) -> str:
+    """A stable per-page anchor namespace, so chapters cannot collide."""
+
+    relative = page.relative_to(destination).with_suffix("")
+    slug = relative.as_posix()
+    if slug.endswith("/README"):
+        slug = slug[: -len("/README")]
+    if slug in {"README", ""}:
+        return "preface"
+    return slug.replace("/", "-")
+
+
+def _book_anchor(slug: str, anchor: str) -> str:
+    return f"{slug}--{anchor}" if anchor else slug
+
+
+def _render_book_page(pages: list[Path], destination: Path) -> str:
+    """Concatenate the book's pages into one linear document.
+
+    The split into chapter pages is a navigation choice, not a property of the
+    mathematics. Readers who want the whole argument in one scroll, or a single
+    file to print or hand to a model, get it here without a second source.
+    """
+
+    if not pages:
+        return ""
+
+    slugs = {page.resolve(): _book_slug(page, destination) for page in pages}
+    title = _first_h1(pages[0].read_text(encoding="utf-8")) or "Blueprint"
+    out: list[str] = [f"# {title}", ""]
+
+    for index, page in enumerate(pages):
+        slug = slugs[page.resolve()]
+        text = _BOOK_NAV.sub("", page.read_text(encoding="utf-8"))
+        text = _strip_book_frontmatter(text)
+
+        def rewrite_target(target: str) -> str:
+            if target.startswith(("http://", "https://", "mailto:")):
+                return target
+            if target.startswith("#"):
+                return "#" + _book_anchor(slug, target[1:])
+            path, _, fragment = target.partition("#")
+            resolved = (page.parent / path).resolve()
+            for candidate in (resolved, resolved.with_name("README.md")):
+                if candidate in slugs:
+                    return "#" + _book_anchor(slugs[candidate], fragment)
+            if candidate_html := _html_to_markdown(resolved):
+                if candidate_html in slugs:
+                    return "#" + _book_anchor(slugs[candidate_html], fragment)
+            try:
+                relative = resolved.relative_to(destination).as_posix()
+            except ValueError:
+                return target
+            return relative + (f"#{fragment}" if fragment else "")
+
+        text = _HTML_ID.sub(lambda m: f'id="{_book_anchor(slug, m.group(1))}"', text)
+        text = _HREF.sub(lambda m: f'href="{rewrite_target(m.group(1))}"', text)
+        text = _MD_TARGET.sub(lambda m: f"]({rewrite_target(m.group(1))})", text)
+
+        out.append(f'<a id="{slug}"></a>')
+        out.append("")
+        out.append(_demote_book_headings(text, drop_first_h1=index == 0))
+        out.append("")
+
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _strip_book_frontmatter(text: str) -> str:
+    """Chapter pages keep their properties for Obsidian; the book does not."""
+
+    if not text.startswith("---\n"):
+        return text
+    end = text.find("\n---\n", 4)
+    return text[end + len("\n---\n") :] if end != -1 else text
+
+
+def _html_to_markdown(path: Path) -> Path | None:
+    """`index.html` and `x.html` in a rendered href map back to their sources."""
+
+    if path.suffix != ".html":
+        return None
+    if path.name == "index.html":
+        return path.with_name("README.md")
+    return path.with_suffix(".md")
+
+
+def _demote_book_headings(text: str, *, drop_first_h1: bool) -> str:
+    """Push every heading one level down so chapters nest under the book title."""
+
+    lines: list[str] = []
+    fence: str | None = None
+    dropped = False
+    for line in text.splitlines():
+        opening = _BOOK_FENCE.match(line)
+        if opening:
+            marker = opening.group(1)
+            if fence is None:
+                fence = marker
+            elif line.strip().startswith(fence):
+                fence = None
+            lines.append(line)
+            continue
+        if fence is not None:
+            lines.append(line)
+            continue
+        heading = _BOOK_HEADING.match(line)
+        if heading:
+            hashes, space, rest = heading.groups()
+            if len(hashes) == 1 and drop_first_h1 and not dropped:
+                dropped = True
+                continue
+            lines.append(("#" * min(len(hashes) + 1, 6)) + space + rest)
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _append_book_navigation(pages: list[Path]) -> None:
