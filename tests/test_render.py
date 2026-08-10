@@ -68,7 +68,9 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert report.nodes == 2
     assert report.linked == 2
     assert report.unresolved == []
-    assert (out / "progress.md").is_file()
+    # Progress folded into the Book landing and the Graph; no separate page.
+    assert not (out / "progress.md").exists()
+    assert not (out / "book.md").exists()
     assert (out / "dependencies.md").is_file()
     assert (out / "dependencies/chapters/roadmap.md").is_file()
     assert (out / "dependencies/nodes/base.md").is_file()
@@ -102,7 +104,6 @@ def test_a_chapter_places_statements_in_the_authored_narrative(tmp_path: Path) -
     assert '<span class="bp-thmtitle">Top</span>' in page
     assert "The main result." in page
     assert "1 definition · 1 result" in page
-    assert 'href="../progress.html"' in page
     # A node's own subheadings must not compete with the chapter's structure.
     assert "###### Sources" in page
     assert "\n## Sources" not in page
@@ -156,27 +157,23 @@ def test_cross_references_point_at_anchors_on_the_chapter(tmp_path: Path) -> Non
     assert 'href="https://github.com/owner/repo/issues/42">#42' in page
 
 
-def test_overview_and_progress_separate_dag_counts_from_source_coverage(tmp_path: Path) -> None:
+def test_overview_carries_the_counts_without_a_separate_progress_page(tmp_path: Path) -> None:
+    """Progress is folded in: the landing page states it, the Graph colours it."""
+
     _render(tmp_path)
     overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
-    progress = (tmp_path / "out/progress.md").read_text(encoding="utf-8")
 
     assert overview.index("# Overview") < overview.index('class="bp-progress-overview"')
     assert "1 definition · 1 result" in overview
-    assert 'href="progress.html"' in overview
-    assert "# Progress" in progress
-    assert "| [Roadmap](roadmap/README.md) | 2 | 2 fully proved |" in progress
-    # Progress is a scoreboard. It no longer explains itself, and it no longer
-    # inlines the coverage contract, which has its own page.
-    assert "already decomposed in the blueprint" not in progress
-    assert "## Scope coverage" not in progress
+    # No page to send the reader to, so no link out of the summary.
+    assert "bp-progress-link" not in overview
+    assert not (tmp_path / "out/progress.md").exists()
 
 
 def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp_path: Path) -> None:
     _render(tmp_path)
     overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
     chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
-    progress = (tmp_path / "out/progress.md").read_text(encoding="utf-8")
     dependencies = (tmp_path / "out/dependencies.md").read_text(encoding="utf-8")
 
     assert overview.rstrip().endswith("</nav>")
@@ -184,7 +181,8 @@ def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp
     assert 'class="bp-book-nav-link bp-book-nav-next" href="roadmap/index.html"' in overview
     assert chapter.rstrip().endswith("</nav>")
     assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
-    assert "bp-book-nav" not in progress
+    graph_page = (tmp_path / "out/dependencies.md").read_text(encoding="utf-8")
+    assert "bp-book-nav" not in graph_page
     assert "bp-book-nav" not in dependencies
 
 
@@ -245,7 +243,7 @@ def test_stale_generated_files_are_not_republished(tmp_path: Path) -> None:
 
     assert not (tmp_path / "out/dependencies.html").exists()
     assert (tmp_path / "out/dependencies.md").is_file()
-    assert "# Progress" in (tmp_path / "out/progress.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "out/progress.md").exists()
 
 
 def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
@@ -443,54 +441,9 @@ def test_git_remotes_normalize_to_web_urls(remote: str, expected: str | None) ->
     assert _normalize_remote(remote) == expected
 
 
-def _book(tmp_path: Path) -> str:
-    project = _project(tmp_path)
-    site = tmp_path / "site-src"
-    render_site(project / "blueprint", site, lean_root=project)
-    return (site / "book.md").read_text(encoding="utf-8")
 
 
-def test_book_page_is_the_whole_blueprint_in_reading_order(tmp_path: Path) -> None:
-    """The chapter split is a navigation choice, not a property of the argument.
-
-    One file gives a reader the entire development in a single scroll, and gives
-    a model one artifact to consume, without a second authored source.
-    """
-
-    book = _book(tmp_path)
-
-    headings = [line for line in book.splitlines() if line.startswith("#")]
-    assert headings[0].startswith("# "), "the book opens with exactly one title"
-    assert sum(1 for line in headings if line.startswith("# ") and not line.startswith("## ")) == 1
 
 
-def test_book_namespaces_anchors_so_chapters_cannot_collide(tmp_path: Path) -> None:
-    book = _book(tmp_path)
-
-    ids = re.findall(r'id="([^"]+)"', book)
-    assert ids
-    assert len(ids) == len(set(ids)), "two chapters produced the same anchor"
 
 
-def test_book_resolves_every_in_document_reference(tmp_path: Path) -> None:
-    book = _book(tmp_path)
-
-    ids = set(re.findall(r'id="([^"]+)"', book))
-    refs = set(re.findall(r'href="#([^"]+)"', book))
-    assert refs <= ids, f"dangling anchors: {sorted(refs - ids)}"
-
-
-def test_book_rewrites_cross_page_links_and_keeps_the_rest_root_relative(tmp_path: Path) -> None:
-    book = _book(tmp_path)
-
-    # Nothing may escape the site root: book.md sits one level above the
-    # chapter pages whose relative links it inherited.
-    assert '../' not in book or not re.search(r'href="\.\./', book)
-    assert not re.search(r"\]\(\.\./", book)
-
-
-def test_book_drops_navigation_and_page_properties(tmp_path: Path) -> None:
-    book = _book(tmp_path)
-
-    assert "bp-book-nav" not in book, "previous/next is meaningless in a linear read"
-    assert not book.startswith("---")

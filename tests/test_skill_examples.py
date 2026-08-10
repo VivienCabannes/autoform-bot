@@ -146,7 +146,6 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert '<a class="bp-context-link"' in chapter
     assert "dependencies/nodes/infimum-loss/theorems/supervision-recovery.html" in chapter
     assert '<details class="bp-dependencies"><summary>Dependencies</summary>' in chapter
-    assert 'href="../../progress.html"' in chapter
     assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in chapter
     assert (
         'class="bp-book-nav-link bp-book-nav-previous" '
@@ -216,18 +215,17 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         "theorems-supervision-recovery)"
     ) in focus_graph
 
-    progress = (site / "progress.md").read_text(encoding="utf-8")
-    assert "3 definitions · 4 results" in progress
-    assert "<strong>5</strong> fully proved" in progress
-    assert "<strong>1</strong> ready to state" in progress
-    assert "<strong>1</strong> planned" in progress
-    assert "Full Supervision" in progress
-    # The coverage contract lives on its own page; Progress links to it.
-    assert "## Scope coverage" not in progress
-    assert "[coverage contract](coverage/README.md)" in progress
+    # Progress folded into the Book landing and the Graph; no separate page.
+    assert not (site / "progress.md").exists()
+    assert not (site / "book.md").exists()
+    overview = (site / "README.md").read_text(encoding="utf-8")
+    assert "3 definitions · 4 results" in overview
+    assert "<strong>5</strong> fully proved" in overview
+    assert "bp-progress-link" not in overview
     coverage = (site / "coverage/README.md").read_text(encoding="utf-8")
     assert "Experiments and narrative material" in coverage
-    assert "bp-book-nav" not in progress
+    graph_page = (site / "dependencies.md").read_text(encoding="utf-8")
+    assert "bp-book-nav" not in graph_page
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs
@@ -243,16 +241,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     nav = mkdocs.split("\nnav:\n", 1)[1].split("\ntheme:\n", 1)[0]
     # The one-page book is the same material as the chapter pages, so it is
     # linked from the contents page instead of competing in the nav.
-    assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == [
-        "Blueprint",
-        "Progress",
-        "Dependencies",
-    ]
-    assert "- Blueprint: README.md" in nav
+    # Two tabs: the human-readable book, and the DAG.
+    assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == ["Book", "Graph"]
+    assert "- Book: README.md" in nav
+    assert "- Graph: dependencies.md" in nav
     assert "book.md" not in nav
-    overview = (site / "README.md").read_text(encoding="utf-8")
-    assert 'class="bp-read-whole"' in overview
-    assert 'href="book.html"' in overview
+    assert "progress.md" not in nav
     assert "roadmap/" not in nav
     assert "sources/" not in nav
     # Material owns the chrome; both colour schemes stay reachable by toggle.
