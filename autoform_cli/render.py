@@ -622,34 +622,72 @@ def _next_target(
     *,
     page: Path,
     destination: Path,
+    group_pages: dict[str, Path] | None = None,
     targets: dict[str, str] | None = None,
 ) -> str:
-    """Name the result a contributor could pick up right now.
+    """Name the result a contributor could pick up right now, with the way in.
 
     A dashboard that only counts is a scoreboard. The useful question on
-    arriving is "what is unblocked?", which the DAG already answers: the first
-    node in topological order whose prerequisites are met and whose proof is
-    still open.
+    arriving is "what is unblocked, and where do I start reading?", which the
+    DAG already answers: the first node in topological order whose
+    prerequisites are met and whose proof is still open. Naming it without
+    linking to it makes the reader hunt, so the card carries the statement, its
+    chapter, and its dependency view.
     """
     for node_id in status.topological_order(graph):
         node_status = statuses.get(node_id)
         node = graph.nodes[node_id]
         if node_status is None or graph.children(node_id) or not node.formalizable:
             continue
-        if node_status.key in {"can_prove", "can_state"}:
-            href = (targets or {}).get(node_id)
-            title = html.escape(node.title)
-            label = html.escape(node_status.label)
-            link = f'<a href="{html.escape(href, quote=True)}">{title}</a>' if href else title
-            return (
-                '<div class="bp-next-target">'
-                '<div class="bp-next-kicker">Next up</div>'
-                f'<div class="bp-next-title">{link}</div>'
-                f'<div class="bp-next-state">{label}</div>'
-                "</div>"
-            )
-    return ""
+        if node_status.key not in {"can_prove", "can_state"}:
+            continue
 
+        chapter_id = node.id.split("/", 1)[0] if "/" in node.id else ""
+        chapter_page = (group_pages or {}).get(chapter_id)
+        statement = (targets or {}).get(node_id)
+        if statement is None and chapter_page is not None:
+            anchor = node.id.split("/", 1)[1].replace("/", "-") if "/" in node.id else node.id
+            statement = f"{mermaid.relative_link(chapter_page, page, '.html')}#{anchor}"
+        graph_href = mermaid.relative_link(
+            graph_pages.focus_page_path(destination, node.id), page, ".html"
+        )
+
+        title = html.escape(node.title)
+        heading = (
+            f'<a href="{html.escape(statement, quote=True)}">{title}</a>' if statement else title
+        )
+        why = (
+            "Every prerequisite is proved, so the proof can be written now."
+            if node_status.key == "can_prove"
+            else "Every prerequisite is stated, so this can be written down."
+        )
+        actions = [f'<a href="{html.escape(graph_href, quote=True)}">Dependencies</a>']
+        if chapter_page is not None:
+            chapter_title = _first_h1(chapter_page.read_text(encoding="utf-8")) or "chapter"
+            href = mermaid.relative_link(chapter_page, page, ".html")
+            actions.insert(
+                0, f'<a href="{html.escape(href, quote=True)}">{html.escape(chapter_title)}</a>'
+            )
+        blockers = [
+            graph.nodes[dep].title
+            for dep in node.dependencies
+            if statuses.get(dep) and statuses[dep].key not in {"fully_proved", "mathlib"}
+        ]
+        rests = (
+            f'<div class="bp-next-rests">Rests on {html.escape(", ".join(blockers[:3]))}</div>'
+            if blockers
+            else ""
+        )
+        return (
+            '<div class="bp-next-target">'
+            '<div class="bp-next-kicker">Next up</div>'
+            f'<div class="bp-next-title">{heading}</div>'
+            f'<div class="bp-next-why">{why}</div>'
+            f"{rests}"
+            f'<div class="bp-next-actions">{" · ".join(actions)}</div>'
+            "</div>"
+        )
+    return ""
 
 
 def _render_summary_nav(
@@ -710,16 +748,26 @@ def _render_landing_page(
         f"# {title}",
         "",
         _render_overview_summary(graph, statuses),
-        _next_target(graph, statuses, page=page, destination=destination, targets=targets),
+        _next_target(
+            graph,
+            statuses,
+            page=page,
+            destination=destination,
+            group_pages=group_pages,
+            targets=targets,
+        ),
         "",
         body,
     ]
     project = graph_views.project_view(graph, statuses)
     if project.nodes:
+        # Clicking a chapter on the home page opens that chapter's dependency
+        # map: the home map is a preview of the Graph tab, not a second index.
         links = {
-            node.id: mermaid.relative_link(group_pages[node.id], page, ".html")
+            node.id: mermaid.relative_link(
+                destination / "dependencies/chapters" / f"{node.id or 'roadmap'}.md", page, ".html"
+            )
             for node in project.nodes
-            if node.id in group_pages
         }
         parts.extend(
             [
@@ -1525,6 +1573,48 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 .bp-thmlabel {{ margin-left: 0.4rem; margin-right: 0.5rem; }}
 .bp-thmtitle::before {{ content: "("; }}
 .bp-thmtitle::after {{ content: ")"; }}
+
+/* Material stacks the tab row under the header. Merging them reads as one
+   banner: title and repository link on the left, Book and Graph beside them. */
+.md-header {{ box-shadow: none; }}
+.md-tabs {{
+  background-color: var(--md-primary-fg-color);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  margin-top: -0.2rem;
+}}
+.md-tabs__list {{ padding-left: 0.2rem; }}
+.md-tabs__item {{ height: 2rem; }}
+
+/* "Next up" is the one card a visitor reads first, so it gets real hierarchy
+   and a way into the mathematics rather than three stacked words. */
+.bp-next-target {{
+  border: 1px solid var(--bp-rule);
+  border-left: 3px solid var(--bp-link);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin: 1rem 0 1.5rem;
+  background: var(--bp-surface);
+}}
+.bp-next-kicker {{
+  font-family: {sans};
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--bp-muted);
+}}
+.bp-next-title {{ font-family: {serif}; font-size: 1.15rem; margin-top: 0.15rem; }}
+.bp-next-why, .bp-next-rests {{
+  font-family: {sans};
+  font-size: 0.85rem;
+  color: var(--bp-muted);
+  margin-top: 0.2rem;
+}}
+.bp-next-actions {{ font-family: {sans}; font-size: 0.85rem; margin-top: 0.5rem; }}
+
+/* The legend is a reference, not prose: no outer borders, swatch first. */
+.bp-legend summary {{ font-family: {sans}; font-size: 0.85rem; cursor: pointer; }}
+.bp-legend table {{ font-family: {sans}; font-size: 0.85rem; }}
 
 .bp-source-link {{ color: var(--bp-muted); margin-left: 0.3rem; }}
 .bp-source-link:hover {{ color: var(--bp-link-hover); text-decoration: none; }}

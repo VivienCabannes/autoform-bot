@@ -32,17 +32,7 @@ theme:
     - toc.follow
     - search.suggest
   palette:
-    # Dark is the default; the toggle and the OS preference both still work.
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      toggle:
-        icon: material/weather-sunny
-        name: Light mode
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      toggle:
-        icon: material/weather-night
-        name: Dark mode
+    scheme: slate
 
 plugins:
   - search
