@@ -134,9 +134,51 @@ def test_roadmap_readme_teaches_the_chapter_shape(tmp_path: Path) -> None:
     scaffold_project(tmp_path, title="Finite Flat")
     roadmap = (tmp_path / "blueprint/roadmap/README.md").read_text(encoding="utf-8")
 
-    assert "<chapter>/README.md" in roadmap or "README.md" in roadmap
-    assert "without a `README.md` is not a chapter" in roadmap
+    assert "<chapter>/README.md" in roadmap
+    assert "WITHOUT a README.md is not a chapter" in roadmap
 
+
+def test_authoring_guidance_never_reaches_the_published_site(tmp_path: Path) -> None:
+    """Guidance is for the author in the vault, not for a reader on the site.
+
+    The first live run published the scaffold's own instructions as the body of
+    the roadmap page: an ASCII directory diagram and "run `autoform check`"
+    where a reader expected the book. Guidance now lives in HTML comments, so
+    the agent still reads it while the rendered page stays clean.
+    """
+
+    from autoform_cli.render import render_site
+
+    scaffold_project(tmp_path / "project", title="Finite Flat")
+    site = tmp_path / "site-src"
+    render_site(tmp_path / "project/blueprint", site)
+
+    for page in sorted(site.rglob("*.md")):
+        visible = re.sub(r"<!--.*?-->", "", page.read_text(encoding="utf-8"), flags=re.DOTALL)
+        for leaked in ("AUTHORING NOTES", "is not a chapter", "some-definition.md", "autoform check"):
+            assert leaked not in visible, f"{page.name} publishes authoring guidance: {leaked}"
+
+
+def test_an_empty_vault_reads_as_empty_not_as_a_tutorial(tmp_path: Path) -> None:
+    scaffold_project(tmp_path, title="Finite Flat")
+
+    for relative, expected in (
+        ("blueprint/roadmap/README.md", "No chapters yet."),
+        ("blueprint/coverage/README.md", "Not yet defined."),
+        ("blueprint/sources/README.md", "No sources recorded yet."),
+    ):
+        text = (tmp_path / relative).read_text(encoding="utf-8")
+        visible = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+        assert expected in visible
+        # An empty section publishes as an empty heading, so there must be none.
+        assert not re.search(r"^## ", visible, flags=re.MULTILINE), relative
+
+
+def test_scaffolded_gitignore_covers_agent_bootstrap_output(tmp_path: Path) -> None:
+    """The first live run committed a stray bootstrap.log."""
+
+    scaffold_project(tmp_path, title="Finite Flat")
+    assert "*.log" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
 
 def test_scaffolded_theme_defers_navigation_to_the_book(tmp_path: Path) -> None:
     """Autoform derives reading order from the vault, so MkDocs must not.

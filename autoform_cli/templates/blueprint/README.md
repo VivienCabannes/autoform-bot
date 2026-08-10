@@ -1,6 +1,7 @@
 # {{PROJECT_TITLE}}
 
-State in a sentence or two what this project formalizes and from which source.
+<!-- Replace this line with a sentence or two on what the project formalizes
+     and from which source. These comments are not published. -->
 
 - [Roadmap](roadmap/README.md) — the book: chapters, statements, and their
   dependencies.

@@ -1,16 +1,14 @@
 # Coverage contract
 
-Record what this project claims to cover, so partial progress is never reported
-as completion.
+Not yet defined.
 
-## In scope
+<!-- AUTHORING NOTES — these comments are not published.
 
-<!-- The results this project intends to formalize. -->
+     Replace the line above with what this project claims to cover, so partial
+     progress is never reported as completion. Add these sections once each has
+     real content; an empty heading publishes as an empty section.
 
-## Out of scope
-
-<!-- Material deliberately excluded, and why. -->
-
-## Done means
-
-<!-- The condition under which a chapter counts as finished. -->
+       ## In scope      the results this project intends to formalize
+       ## Out of scope  material deliberately excluded, and why
+       ## Done means    the condition under which a chapter counts as finished
+-->
