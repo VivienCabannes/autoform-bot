@@ -257,26 +257,23 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     # both hang off the theme's own data-bs-theme toggle.
     assert "Merriweather" in css and "Open Sans" in css and "Source Code Pro" in css
     assert "hsl(210, 100%, 30%)" in css
-    assert "[data-bs-theme=dark]" in css
+    assert "[data-md-color-scheme=slate]" in css
     assert "--bp-link: #58a6ff" in css
     assert "--bp-link-hover: #79c0ff" in css
     for state in STATES:
         assert f".bp-{state.key} .bp-mark {{ color: {state.stroke}; }}" in css
-        assert f"[data-bs-theme=dark] .bp-{state.key} .bp-mark" in css
+        assert f"[data-md-color-scheme=slate] .bp-{state.key} .bp-mark" in css
 
-    # The theme's banner is a solid Bootstrap bar and must be driven from the
-    # palette, or it stays blue in both schemes.
-    assert "background-color: var(--bp-surface) !important" in css
-    assert "html[data-bs-theme=dark] body .navbar.navbar-light.bg-light" in css
-    assert "color: #f0f6fc !important" in css
-    assert "filter: invert(1) grayscale(100%) brightness(200%)" in css
-    assert "--bs-navbar-active-color: var(--bp-link)" in css
-    assert ".navbar {" in css
+    # Material draws its own header and sidebars, so the stylesheet no longer
+    # restyles theme chrome. It sets the reading column and nothing else.
+    assert ".md-typeset {" in css
+    assert ".navbar" not in css
+    assert "data-bs-theme" not in css
 
     # A rendered diagram cannot be restyled, so the script owns both palettes
     # and redraws when the scheme changes.
     assert '"light"' in script and '"dark"' in script
-    assert "data-bs-theme" in script
+    assert "data-md-color-scheme" in script
     assert "MutationObserver" in script
     assert "bindFunctions" in script
     for state in STATES:
