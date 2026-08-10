@@ -1,5 +1,6 @@
 site_name: Cabannes thesis formalization
-repo_url: https://github.com/facebookresearch/autoform-bot
+# A project's own repository, never AutoformBot's. Setup fills this in.
+repo_url: https://github.com/VivienCabannes/cabannes-thesis
 
 # `autoform render` writes this directory from blueprint/. The vault stays the
 # source of truth; everything here is regenerated.
@@ -34,22 +35,26 @@ theme:
     - toc.follow
     - search.suggest
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      toggle:
-        icon: material/weather-night
-        name: Dark mode
+    # Dark is the default; the toggle and the OS preference both still work.
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       toggle:
         icon: material/weather-sunny
         name: Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
 
 plugins:
   - search
 
 markdown_extensions:
   - attr_list
+  # Statement boxes carry h6 note headings; keep them out of the TOC.
+  - toc:
+      toc_depth: 2-3
   - md_in_html          # lets the generated statement boxes contain Markdown
   - tables
   - pymdownx.arithmatex:

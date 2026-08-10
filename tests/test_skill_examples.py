@@ -231,7 +231,10 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs
-    assert "repo_url: https://github.com/facebookresearch/autoform-bot" in mkdocs
+    # Material renders repo_url as the header link, so it must be the project's
+    # own repository. Pointing it at AutoformBot sends readers to the plugin.
+    assert "repo_url: https://github.com/VivienCabannes/cabannes-thesis" in mkdocs
+    assert "repo_url: https://github.com/facebookresearch/autoform-bot" not in mkdocs
     assert "use_directory_urls: false" in mkdocs
     assert "md_in_html" in mkdocs
     assert "pymdownx.superfences" in mkdocs
