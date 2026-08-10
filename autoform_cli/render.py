@@ -740,7 +740,7 @@ def _render_summary_nav(
             "- Graph",
             "    - [Dependency maps](dependencies.md)",
             "    - [Full theorem DAG](dependencies/full.md)",
-            f"- [Wiki]({WIKI_DIR}/)",
+            f"    - [Markdown vault]({WIKI_DIR}/)",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -784,6 +784,9 @@ def _render_landing_page(
         "",
         body,
     ]
+    breakdown = mermaid.render_legend(statuses)
+    if breakdown:
+        parts.extend(["", "## Status breakdown", "", breakdown])
     project = graph_views.project_view(graph, statuses)
     if project.nodes:
         # Clicking a chapter on the home page opens that chapter's dependency
@@ -1599,16 +1602,15 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 .bp-thmtitle::before {{ content: "("; }}
 .bp-thmtitle::after {{ content: ")"; }}
 
-/* Material stacks the tab row under the header. Merging them reads as one
-   banner: title and repository link on the left, Book and Graph beside them. */
-.md-header {{ box-shadow: none; }}
-.md-tabs {{
-  background-color: var(--md-primary-fg-color);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-  margin-top: -0.2rem;
-}}
+/* With sticky tabs Material renders them inside <header>, so the title, the
+   repository link and the tabs are one bar. These rules only remove the seam
+   between the two rows of that bar. */
+.md-header {{ box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35); }}
+.md-tabs {{ background-color: transparent; box-shadow: none; }}
 .md-tabs__list {{ padding-left: 0.2rem; }}
-.md-tabs__item {{ height: 2rem; }}
+.md-tabs__item {{ height: 1.9rem; }}
+.md-tabs__link {{ font-size: 0.72rem; opacity: 0.9; margin-top: 0; }}
+.md-tabs__link--active, .md-tabs__link:hover {{ opacity: 1; }}
 
 /* "Next up" is the one card a visitor reads first, so it gets real hierarchy
    and a way into the mathematics rather than three stacked words. */

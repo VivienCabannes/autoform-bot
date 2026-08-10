@@ -23,6 +23,7 @@ theme:
   features:
     # Book and Graph sit across the top; the sidebar shows the open tab.
     - navigation.tabs
+    - navigation.tabs.sticky
     # The chapter tree stays visible, which is what makes a blueprint readable
     # as a book rather than as a pile of pages.
     - navigation.sections
