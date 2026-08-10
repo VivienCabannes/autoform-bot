@@ -301,6 +301,7 @@ def render_site(
     # The landing page is a dashboard, not chapter one. Previous/next belongs
     # to the book, so the strip starts at the contents page.
     _append_book_navigation([p for p in book_pages if p != overview])
+    report.pages += _publish_vault(blueprint, destination)
     (destination / "SUMMARY.md").write_text(
         _render_summary_nav(book_pages, destination=destination, overview=overview),
         encoding="utf-8",
@@ -690,6 +691,29 @@ def _next_target(
     return ""
 
 
+
+WIKI_DIR = "wiki"
+
+
+def _publish_vault(blueprint: Path, destination: Path) -> int:
+    """Copy the authored vault verbatim so every article has a URL.
+
+    The book is a reading of the vault; this is the vault. Its internal links
+    are all relative, so preserving the tree preserves them, and nothing is
+    rewritten: what a reader sees here is the file an author edits.
+    """
+    root = destination / WIKI_DIR
+    written = 0
+    for source in sorted(blueprint.rglob("*.md")):
+        if source.is_symlink():
+            continue
+        relative = source.relative_to(blueprint)
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        written += 1
+    return written
+
 def _render_summary_nav(
     book_pages: list[Path],
     *,
@@ -716,6 +740,7 @@ def _render_summary_nav(
             "- Graph",
             "    - [Dependency maps](dependencies.md)",
             "    - [Full theorem DAG](dependencies/full.md)",
+            f"- [Wiki]({WIKI_DIR}/)",
         ]
     )
     return "\n".join(lines) + "\n"
