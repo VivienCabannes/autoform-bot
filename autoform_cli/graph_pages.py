@@ -88,12 +88,10 @@ def write_graph_pages(
     ]
     project_extra = "\n".join(
         [
-            "## Choose a level",
+            "## Zoom in",
             "",
             *chapter_list,
             f"- [Full theorem DAG]({_markdown_link(full_page, project_page)})",
-            "",
-            "Each chapter map links to one-hop local views for its definitions and results.",
         ]
     )
     written.append(
@@ -104,9 +102,8 @@ def write_graph_pages(
             links=project_links,
             heading="Dependency maps",
             lead=(
-                f"This project map groups {len(graph.nodes)} decomposed blueprint items into "
-                f"{len(groups)} textbook chapter{'s' if len(groups) != 1 else ''}. "
-                "Select a chapter to inspect its theorem-level structure."
+                f"{len(graph.nodes)} items across "
+                f"{len(groups)} chapter{'s' if len(groups) != 1 else ''}."
             ),
             extra=project_extra,
         )
@@ -270,9 +267,6 @@ def _write_page(
     sections.extend([lead, "", diagram, ""])
     if extra:
         sections.extend([extra, ""])
-    legend = mermaid.render_legend(statuses)
-    if legend:
-        sections.extend(["## Status legend", "", legend, ""])
     page.parent.mkdir(parents=True, exist_ok=True)
     page.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
     return page

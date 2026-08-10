@@ -165,9 +165,11 @@ def test_overview_and_progress_separate_dag_counts_from_source_coverage(tmp_path
     assert "1 definition · 1 result" in overview
     assert 'href="progress.html"' in overview
     assert "# Progress" in progress
-    assert "already decomposed in the blueprint" in progress
     assert "| [Roadmap](roadmap/README.md) | 2 | 2 fully proved |" in progress
-    assert "No project-specific coverage contract has been recorded yet." in progress
+    # Progress is a scoreboard. It no longer explains itself, and it no longer
+    # inlines the coverage contract, which has its own page.
+    assert "already decomposed in the blueprint" not in progress
+    assert "## Scope coverage" not in progress
 
 
 def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp_path: Path) -> None:

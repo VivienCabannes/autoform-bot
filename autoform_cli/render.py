@@ -816,10 +816,7 @@ def _render_progress_page(
         "",
         _render_overview_summary(graph, statuses, progress_href=None),
         "",
-        "The counts above cover the definitions and results already decomposed in the blueprint. "
-        "They do not claim completion of material that has not yet been decomposed.",
-        "",
-        "## Blueprint chapters",
+        "## Chapters",
         "",
     ]
 
@@ -846,24 +843,18 @@ def _render_progress_page(
 
     legend = mermaid.render_legend(statuses)
     if legend:
-        sections.extend(["", "## Status breakdown", "", legend])
+        sections.extend(["", "## What the states mean", "", legend])
 
-    sections.extend(["", "## Scope coverage", ""])
     coverage_source = blueprint / "coverage" / "README.md"
     if coverage_source.is_file():
-        coverage = _rewrite_links(
-            coverage_source.read_text(encoding="utf-8"),
-            source_dir=coverage_source.parent,
-            page=page,
-            blueprint=blueprint,
-            destination=destination,
-            node_sources=node_sources,
-            targets=targets,
+        href = mermaid.relative_link(destination / "coverage" / "README.md", page, ".md")
+        sections.extend(
+            [
+                "",
+                f"Derived states describe the DAG. What the project *claims* to cover, "
+                f"and what it deliberately excludes, is the [coverage contract]({href}).",
+            ]
         )
-        coverage_body = _shift_headings(_document_body(coverage), 1)
-        sections.append(coverage_body)
-    else:
-        sections.append("No project-specific coverage contract has been recorded yet.")
     return "\n".join(sections).rstrip() + "\n"
 
 
