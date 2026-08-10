@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -18,11 +19,25 @@ from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
+from .scaffold import DEFAULT_AUTOFORM_SOURCE, ScaffoldError, scaffold_project
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="autoform")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init = subparsers.add_parser("init", help="write the blueprint vault, site config, and CI")
+    init.add_argument("target", nargs="?", default=".", help="project root (default: current directory)")
+    init.add_argument("--title", help="human project title (default: the directory name)")
+    init.add_argument("--repository-url", default="", help="project URL, e.g. https://github.com/owner/repo")
+    init.add_argument(
+        "--autoform-source",
+        default=DEFAULT_AUTOFORM_SOURCE,
+        help="Autoform Git source the generated workflows install from",
+    )
+    init.add_argument("--autoform-ref", default="main", help="immutable ref the workflows pin")
+    init.add_argument("--force", action="store_true", help="overwrite files that already exist")
+    init.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     check = subparsers.add_parser("check", help="validate a Markdown blueprint")
     check.add_argument("blueprint_dir")
@@ -71,6 +86,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.command == "init":
+        return _init(args)
     if args.command == "check":
         return _check(args)
     if args.command == "audit":
@@ -92,6 +109,37 @@ def _add_claim_board_arguments(parser: argparse.ArgumentParser) -> None:
         help="stable identity for this agent (or set AUTOFORM_WORKER_ID)",
     )
     parser.add_argument("--scratch", type=Path, help="local bare Git object cache")
+
+
+def _init(args: argparse.Namespace) -> int:
+    target = Path(args.target).expanduser()
+    title = args.title or target.resolve().name
+    try:
+        result = scaffold_project(
+            target,
+            title=title,
+            repository_url=args.repository_url,
+            autoform_source=args.autoform_source,
+            autoform_ref=args.autoform_ref,
+            force=args.force,
+        )
+    except ScaffoldError as error:
+        for issue in error.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+        return 0
+
+    print(f"{target}: {len(result.written)} files written")
+    for path in result.written:
+        print(f"  + {path}")
+    for path in result.skipped:
+        print(f"  = {path} (exists, left alone)")
+    print("Next: describe the project in blueprint/README.md, then add chapters "
+          "as roadmap/<chapter>/README.md.")
+    return 0
 
 
 def _check(args: argparse.Namespace) -> int:
