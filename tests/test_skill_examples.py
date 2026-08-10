@@ -237,10 +237,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     nav = mkdocs.split("\nnav:\n", 1)[1].split("\ntheme:\n", 1)[0]
     assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == [
         "Blueprint",
+        "Book",
         "Progress",
         "Dependencies",
     ]
     assert "- Blueprint: README.md" in nav
+    assert "- Book: book.md" in nav
     assert "roadmap/" not in nav
     assert "sources/" not in nav
     # A blue Bootstrap banner and no dark-mode toggle are both theme defaults.

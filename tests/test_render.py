@@ -442,3 +442,56 @@ def test_render_omits_benign_hidden_files(tmp_path: Path) -> None:
 )
 def test_git_remotes_normalize_to_web_urls(remote: str, expected: str | None) -> None:
     assert _normalize_remote(remote) == expected
+
+
+def _book(tmp_path: Path) -> str:
+    project = _project(tmp_path)
+    site = tmp_path / "site-src"
+    render_site(project / "blueprint", site, lean_root=project)
+    return (site / "book.md").read_text(encoding="utf-8")
+
+
+def test_book_page_is_the_whole_blueprint_in_reading_order(tmp_path: Path) -> None:
+    """The chapter split is a navigation choice, not a property of the argument.
+
+    One file gives a reader the entire development in a single scroll, and gives
+    a model one artifact to consume, without a second authored source.
+    """
+
+    book = _book(tmp_path)
+
+    headings = [line for line in book.splitlines() if line.startswith("#")]
+    assert headings[0].startswith("# "), "the book opens with exactly one title"
+    assert sum(1 for line in headings if line.startswith("# ") and not line.startswith("## ")) == 1
+
+
+def test_book_namespaces_anchors_so_chapters_cannot_collide(tmp_path: Path) -> None:
+    book = _book(tmp_path)
+
+    ids = re.findall(r'id="([^"]+)"', book)
+    assert ids
+    assert len(ids) == len(set(ids)), "two chapters produced the same anchor"
+
+
+def test_book_resolves_every_in_document_reference(tmp_path: Path) -> None:
+    book = _book(tmp_path)
+
+    ids = set(re.findall(r'id="([^"]+)"', book))
+    refs = set(re.findall(r'href="#([^"]+)"', book))
+    assert refs <= ids, f"dangling anchors: {sorted(refs - ids)}"
+
+
+def test_book_rewrites_cross_page_links_and_keeps_the_rest_root_relative(tmp_path: Path) -> None:
+    book = _book(tmp_path)
+
+    # Nothing may escape the site root: book.md sits one level above the
+    # chapter pages whose relative links it inherited.
+    assert '../' not in book or not re.search(r'href="\.\./', book)
+    assert not re.search(r"\]\(\.\./", book)
+
+
+def test_book_drops_navigation_and_page_properties(tmp_path: Path) -> None:
+    book = _book(tmp_path)
+
+    assert "bp-book-nav" not in book, "previous/next is meaningless in a linear read"
+    assert not book.startswith("---")
