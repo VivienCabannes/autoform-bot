@@ -299,6 +299,23 @@ def render_site(
     if book:
         (destination / BOOK_PAGE).write_text(book, encoding="utf-8")
         report.pages += 1
+        # The one-page book is the same material as the chapter pages, so it
+        # earns a link from the contents page rather than a competing nav entry.
+        if overview.is_file():
+            link = (
+                f'<p class="bp-read-whole"><a href="{BOOK_PAGE[:-3]}.html">'
+                "Read the whole blueprint on one page "
+                '<span aria-hidden="true">→</span></a></p>'
+            )
+            text = overview.read_text(encoding="utf-8")
+            marker = '<nav class="bp-book-nav"'
+            # Sits with the contents links, above the previous/next footer.
+            if marker in text:
+                head, _, tail = text.partition(marker)
+                text = f"{head.rstrip()}\n\n{link}\n\n{marker}{tail}"
+            else:
+                text = f"{text.rstrip()}\n\n{link}\n"
+            overview.write_text(text, encoding="utf-8")
 
     progress_page = destination / "progress.md"
     progress_page.write_text(

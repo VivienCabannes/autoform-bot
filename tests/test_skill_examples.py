@@ -238,14 +238,18 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "stylesheets/blueprint.css" in mkdocs
     assert "javascripts/blueprint-mermaid.js" in mkdocs
     nav = mkdocs.split("\nnav:\n", 1)[1].split("\ntheme:\n", 1)[0]
+    # The one-page book is the same material as the chapter pages, so it is
+    # linked from the contents page instead of competing in the nav.
     assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == [
         "Blueprint",
-        "Book",
         "Progress",
         "Dependencies",
     ]
     assert "- Blueprint: README.md" in nav
-    assert "- Book: book.md" in nav
+    assert "book.md" not in nav
+    overview = (site / "README.md").read_text(encoding="utf-8")
+    assert 'class="bp-read-whole"' in overview
+    assert 'href="book.html"' in overview
     assert "roadmap/" not in nav
     assert "sources/" not in nav
     # A blue Bootstrap banner and no dark-mode toggle are both theme defaults.
