@@ -97,9 +97,14 @@ mathematics.
 7. Search the pinned Mathlib checkout before planning new work. Set
    `mathlib: true` only for an exact verified upstream result; record partial or
    uncertain candidates as notes, never as formalization status.
-8. Reconcile the coarse milestone pages and coverage contract with the finished
-   fine DAG so newly discovered prerequisites, moved units, and deferred scope
-   do not leave the roadmap stale.
+8. Reconcile every page whose claims this work has just invalidated. That means
+   the coarse milestone pages and the coverage contract, and also the two
+   landing pages Setup wrote before any scope existed: `blueprint/README.md`
+   and the repository `README.md`. Setup states there that no chapters exist
+   and nothing is planned. The moment a chapter exists that is false, and it is
+   the first thing a visitor to the published site reads. Newly discovered
+   prerequisites, moved units, and deferred scope must not leave any of these
+   stale either.
 
 Assert only what is checked: `statement: formalized`, `proof: formalized`,
 `mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
@@ -115,7 +120,15 @@ only the first two steps of the publication sequence in the
 [CLI reference](../../autoform_cli/README.md#commands) apply.
 
 Fix missing targets, escaping links, self-dependencies, cycles, and unresolved
-`lean:` names before handoff. Report roadmap and coverage status, node and edge
+`lean:` names before handoff.
+
+Commit the vault once `autoform check` passes. CI renders and publishes from
+the repository, not from your working tree, so roadmap work left uncommitted
+leaves the site advertising a project with no chapters. Pushing is
+outward-facing: report the command and let the user run it, unless they have
+already asked you to push.
+
+Report roadmap and coverage status, node and edge
 counts, the derived state summary, unresolved source questions, and the
 vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
 hand the draft to Agent Review for mathematical-plan judgment or Human Review
