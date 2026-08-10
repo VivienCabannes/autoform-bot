@@ -8,6 +8,7 @@ clean and publishes a book with no chapters, so these tests pin the shape.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -152,3 +153,35 @@ def test_scaffolded_theme_defers_navigation_to_the_book(tmp_path: Path) -> None:
     assert "docs_dir: site-src" in mkdocs
     assert "md_in_html" in mkdocs
     assert "custom_dir: theme" in mkdocs
+
+
+def test_generated_ci_pins_the_checkout_that_scaffolded_it(tmp_path: Path) -> None:
+    """A floating ref installs an Autoform that may not have this CLI.
+
+    `facebookresearch/autoform-bot@main` predates `autoform_cli` entirely, so
+    defaulting to it meant every scaffolded project's first CI run installed a
+    build with no `autoform` command. The pin now comes from the checkout doing
+    the scaffolding, which is immutable and known-good by construction.
+    """
+
+    from autoform_cli.scaffold import plugin_pin
+
+    scaffold_project(tmp_path, title="Finite Flat")
+    source, ref = plugin_pin()
+    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+
+    assert f"git+{source}@{ref}" in verify
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), "the pin must be an immutable commit"
+    assert "@main" not in verify
+
+
+def test_explicit_pin_overrides_the_checkout(tmp_path: Path) -> None:
+    scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+    )
+
+    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+    assert f"git+https://example.test/autoform.git@{'1' * 40}" in verify

@@ -11,6 +11,7 @@ fixed, so the tool writes it.
 from __future__ import annotations
 
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,42 @@ _DOTTED = {
 }
 
 DEFAULT_AUTOFORM_SOURCE = "https://github.com/facebookresearch/autoform-bot.git"
+DEFAULT_AUTOFORM_REF = "main"
+
+
+def _git(*args: str) -> str | None:
+    """Read a value from the Autoform checkout this CLI is running out of."""
+
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent.parent), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = done.stdout.strip()
+    return value if done.returncode == 0 and value else None
+
+
+def plugin_pin() -> tuple[str, str]:
+    """The Autoform source and commit that generated CI should install.
+
+    A floating ref is a trap: `facebookresearch/autoform-bot@main` predates the
+    CLI entirely, so a scaffolded project's first CI run installs a build with
+    no `autoform` command. Pinning the checkout that scaffolded the project
+    means the workflow runs the same Autoform the author ran, and the pin is
+    immutable by construction.
+    """
+
+    source = _git("remote", "get-url", "origin") or DEFAULT_AUTOFORM_SOURCE
+    if source.startswith("git@github.com:"):
+        source = "https://github.com/" + source[len("git@github.com:") :]
+    if not source.endswith(".git"):
+        source += ".git"
+    return source, _git("rev-parse", "HEAD") or DEFAULT_AUTOFORM_REF
 
 
 class ScaffoldError(ValueError):
@@ -71,8 +108,8 @@ def scaffold_project(
     *,
     title: str,
     repository_url: str = "",
-    autoform_source: str = DEFAULT_AUTOFORM_SOURCE,
-    autoform_ref: str = "main",
+    autoform_source: str = "",
+    autoform_ref: str = "",
     force: bool = False,
 ) -> ScaffoldResult:
     """Write the blueprint vault, site config, and CI into *target*.
@@ -94,11 +131,12 @@ def scaffold_project(
     if issues:
         raise ScaffoldError(issues)
 
+    pinned_source, pinned_ref = plugin_pin()
     substitutions = {
         "PROJECT_TITLE": title.strip(),
         "REPO_URL": repository_url.strip(),
-        "AUTOFORM_SOURCE": autoform_source.strip(),
-        "AUTOFORM_REF": autoform_ref.strip(),
+        "AUTOFORM_SOURCE": autoform_source.strip() or pinned_source,
+        "AUTOFORM_REF": autoform_ref.strip() or pinned_ref,
     }
 
     written: list[str] = []
@@ -125,8 +163,10 @@ def scaffold_project(
 
 
 __all__ = [
+    "DEFAULT_AUTOFORM_REF",
     "DEFAULT_AUTOFORM_SOURCE",
     "ScaffoldError",
     "ScaffoldResult",
+    "plugin_pin",
     "scaffold_project",
 ]

@@ -19,7 +19,7 @@ from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
-from .scaffold import DEFAULT_AUTOFORM_SOURCE, ScaffoldError, scaffold_project
+from .scaffold import ScaffoldError, scaffold_project
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -32,10 +32,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     init.add_argument("--repository-url", default="", help="project URL, e.g. https://github.com/owner/repo")
     init.add_argument(
         "--autoform-source",
-        default=DEFAULT_AUTOFORM_SOURCE,
-        help="Autoform Git source the generated workflows install from",
+        default="",
+        help="Autoform Git source the generated workflows install from (default: this checkout's origin)",
     )
-    init.add_argument("--autoform-ref", default="main", help="immutable ref the workflows pin")
+    init.add_argument(
+        "--autoform-ref",
+        default="",
+        help="immutable ref the workflows pin (default: this checkout's HEAD commit)",
+    )
     init.add_argument("--force", action="store_true", help="overwrite files that already exist")
     init.add_argument("--json", action="store_true", help="write stable machine-readable output")
 

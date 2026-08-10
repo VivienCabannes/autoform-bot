@@ -39,14 +39,14 @@ jobs:
       # declaration that is not in the sources.
       - name: Validate the theorem DAG and its declarations
         run: >-
-          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@43097b2c07e68df899d6b8bca7849d091c294754
           autoform check blueprint --lean-root .
 
       # Writes site-src/: statement boxes, derived statuses, the Mermaid graph,
       # and permalinks into the Lean code at this exact commit.
       - name: Render the blueprint
         run: >-
-          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@c3e0ba4059359f4a309d18f6c75b344264deec38
+          uvx --from git+https://github.com/VivienCabannes/autoform-bot.git@43097b2c07e68df899d6b8bca7849d091c294754
           autoform render blueprint
           --output site-src
           --lean-root .
