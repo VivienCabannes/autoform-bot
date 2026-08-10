@@ -56,6 +56,7 @@ jobs:
         run: >-
           uvx --from mkdocs==1.6.1
           --with mkdocs-material==9.6.21
+          --with mkdocs-literate-nav==0.6.2
           --with pymdown-extensions==10.21.3
           mkdocs build --strict
 

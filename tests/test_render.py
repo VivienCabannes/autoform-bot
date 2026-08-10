@@ -176,11 +176,10 @@ def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp
     chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
     dependencies = (tmp_path / "out/dependencies.md").read_text(encoding="utf-8")
 
-    assert overview.rstrip().endswith("</nav>")
-    assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in overview
-    assert 'class="bp-book-nav-link bp-book-nav-next" href="roadmap/index.html"' in overview
-    assert chapter.rstrip().endswith("</nav>")
-    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
+    # The landing page is a dashboard, not chapter one, so it carries no strip.
+    # This fixture has a single chapter, which leaves nowhere to page to.
+    assert "bp-book-nav" not in overview
+    assert "bp-book-nav" not in chapter
     graph_page = (tmp_path / "out/dependencies.md").read_text(encoding="utf-8")
     assert "bp-book-nav" not in graph_page
     assert "bp-book-nav" not in dependencies
@@ -198,9 +197,8 @@ def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> 
     overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
     chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
     assert "[Top](roadmap/README.md#top)" in overview
-    assert overview.count("bp-book-nav-next") == 1
-    assert chapter.count("bp-book-nav-previous") == 1
-    assert "bp-book-nav-next" not in chapter
+    assert "bp-book-nav" not in overview
+    assert "bp-book-nav" not in chapter
 
 
 def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
