@@ -25,7 +25,7 @@ explicit artifact boundary; that would create a second orchestration stack.
 | Aristotle prover backend | `servers/aristotle/`, `servers/prover/aristotle_adapter.py` | Implemented inside the unified prover |
 | Lean LSP | external `lean-lsp-mcp` | Stateful MCP dependency installed by Setup |
 | Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json` | Implemented |
-| Distributed worker CLI (claims, rounds, auto-merge gate, role registry) | `autoform_worker/`, `./autoform` | Implemented; design contract in `docs/worker-cli.md` |
+| Distributed worker CLI (claims, rounds, auto-merge gate, role registry) | `autoform_worker/`, `./autoform-worker` | Implemented; design contract in `docs/worker-cli.md` |
 
 Useful next contributions include an OpenAI Responses transport beside Chat
 Completions, live opt-in provider contract tests, and additional adversarial

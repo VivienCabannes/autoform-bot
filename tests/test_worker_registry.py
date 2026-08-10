@@ -462,10 +462,12 @@ def test_agent_candidates_one_below_budget_is_still_ready(tmp_path, monkeypatch)
 
 # -- agent_work.build_prompt -------------------------------------------------
 
-def make_prompt(tmp_path, monkeypatch, body, note=""):
+def make_prompt(tmp_path, monkeypatch, body, note="", writes=""):
     cfg = make_project(tmp_path, monkeypatch)
-    write_role(tmp_path / "plugin" / "agents", "auditor.md",
-               "name: numerics-auditor\ndescription: audits\nkind: numerics", body=body)
+    front = "name: numerics-auditor\ndescription: audits\nkind: numerics"
+    if writes:
+        front += f"\nwrites: {writes}"
+    write_role(tmp_path / "plugin" / "agents", "auditor.md", front, body=body)
     role = registry.discover(tmp_path / "plugin")["numerics"]
     task = agent_work.QueuedTask(task_id="numerics:n1", kind="numerics", node="n1",
                                  node_label="Node one", note=note)
@@ -489,12 +491,39 @@ def test_build_prompt_carries_role_body_and_context(tmp_path, monkeypatch):
 
 
 def test_build_prompt_states_the_write_protocol(tmp_path, monkeypatch):
-    cfg, _role, prompt = make_prompt(tmp_path, monkeypatch, "# Role\n")
-    assert "canonical Markdown articles" in prompt
+    _cfg, _role, prompt = make_prompt(tmp_path, monkeypatch, "# Role\n")
     assert "graph.json" not in prompt
     assert "Do NOT run `git push`" in prompt
     assert "do NOT open PRs" in prompt
     assert "FAILED:" in prompt
+
+
+def test_build_prompt_scopes_the_write_contract_to_the_role(tmp_path, monkeypatch):
+    _cfg, _role, read_only = make_prompt(tmp_path, monkeypatch, "# Role\n")
+    _cfg, _role, content = make_prompt(tmp_path, monkeypatch, "# Role\n", writes="content")
+    _cfg, _role, graph = make_prompt(tmp_path, monkeypatch, "# Role\n", writes="graph")
+
+    assert "read-only" in read_only
+    assert "canonical Markdown articles" not in read_only
+    assert "informal_content/<node>.md" in content
+    assert "canonical Markdown articles" not in content
+    assert "canonical Markdown articles" in graph
+    assert "blueprint/roadmap/" in graph
+
+
+def test_build_prompt_tells_a_graph_role_to_repair_a_wrong_statement(tmp_path, monkeypatch):
+    _cfg, _role, prompt = make_prompt(tmp_path, monkeypatch, "# Role\n", writes="graph")
+
+    assert "RECOVERY: REPAIRED" in prompt
+    assert "does not match its source" in prompt
+
+
+def test_build_prompt_withholds_repair_when_the_operator_opts_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_STATEMENT_REPAIR", "0")
+    _cfg, _role, prompt = make_prompt(tmp_path, monkeypatch, "# Role\n", writes="graph")
+
+    assert "disabled unattended statement repair" in prompt
+    assert "RECOVERY: REPAIRED" not in prompt
 
 
 def test_build_prompt_includes_task_note_verbatim(tmp_path, monkeypatch):

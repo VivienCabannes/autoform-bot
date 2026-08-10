@@ -32,6 +32,27 @@ working the node unclaimed. If renewal fails or becomes uncertain mid-attempt,
 stop before committing or pushing. `autoform claim list` shows the current
 holders; a stale lease expires on its own, so do not clear one by hand.
 
+Run parallel agents in one worktree each, and serialize the build. Several
+agents editing a single checkout collide on files and on `lake` state, so give
+each its own worktree and let its edits be independent:
+
+```bash
+git worktree add "../autoform-$AUTOFORM_WORKER_ID" -b "work/$AUTOFORM_WORKER_ID"
+```
+
+Builds are not independent even across worktrees: they share the elan toolchain
+and the Mathlib cache. Hold a claim around the build, renewing it for a long
+one, and release it when the build ends, including on failure:
+
+```bash
+autoform claim acquire lake-build || exit 1
+lake build
+autoform claim release lake-build
+```
+
+The claim board takes any string as a key, so `lake-build` is an ordinary
+fail-closed lease: a refusal means wait or pick other work, never build anyway.
+
 Roadmap owns initial source decomposition and deliberate DAG revisions. Do not
 scan for undecomposed chapters or construct the initial plan here; hand a
 planning gap back to Roadmap unless the user explicitly requests that bounded

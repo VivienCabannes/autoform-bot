@@ -54,7 +54,20 @@ EXPECTED_MCP_SERVERS = frozenset(
         "autoform-prover",
     }
 )
-PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate", "evaluate"})
+#: The user-facing surface. The Muse manifest's command set and the Codex
+#: `defaultPrompt` enumerate the same skills; keep all three in step when the
+#: surface changes.
+PUBLIC_WORKFLOW_SKILLS = frozenset(
+    {
+        "setup",
+        "roadmap",
+        "orchestrate",
+        "evaluate",
+        "agent-review",
+        "human-review",
+        "develop-plugin",
+    }
+)
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
     "internal/runbooks/evaluation.md",
@@ -107,6 +120,11 @@ def rel(p: Path) -> str:
         return str(p.relative_to(REPO_ROOT))
     except ValueError:
         return str(p)
+
+
+def _surface() -> str:
+    """Name the public skills in an error, so the list cannot drift from the set."""
+    return ", ".join(sorted(PUBLIC_WORKFLOW_SKILLS))
 
 
 def strip_comments(text: str) -> str:
@@ -411,13 +429,13 @@ def check_skills() -> int:
         checks += 1
         err(
             f"missing core workflow skill: skills/{name}/SKILL.md "
-            "(Setup, Roadmap, Orchestrate, and Evaluate must ship in every host)"
+            f"({_surface()} must ship in every host)"
         )
     for name in sorted(found - PUBLIC_WORKFLOW_SKILLS):
         checks += 1
         err(
             f"unexpected user-facing skill: skills/{name}/SKILL.md "
-            "(Autoform exposes only Setup, Roadmap, Orchestrate, and Evaluate)"
+            f"(Autoform exposes only {_surface()})"
         )
     expected_paths = {
         (REPO_ROOT / "skills" / name / "SKILL.md").resolve()
@@ -432,7 +450,7 @@ def check_skills() -> int:
             continue
         checks += 1
         err(
-            f"stray SKILL.md outside the four-command surface: {rel(path)} "
+            f"stray SKILL.md outside the public command surface: {rel(path)} "
             "(store supporting material under internal/)"
         )
     return count
@@ -474,10 +492,12 @@ def check_skill_references() -> None:
     Backtick-quoted and bare path forms are both accepted; HTML comments stripped.
     """
     global checks
-    # `internal/references/...` is rooted at the plugin and validated through
-    # REQUIRED_INTERNAL_ASSETS; only a skill-local `references/...` citation
-    # belongs beside that public SKILL.md.
-    ref_cite = re.compile(r"(?<!internal/)references/([A-Za-z0-9_./-]+)")
+    # A skill-local citation is `references/...` with nothing pathlike in front
+    # of it. Any prefix means the target is rooted elsewhere and is not this
+    # skill's to hold: `internal/references/...` is plugin-rooted and validated
+    # through REQUIRED_INTERNAL_ASSETS, and a cross-skill link such as
+    # `../setup/references/zulip.md` belongs to the skill it names.
+    ref_cite = re.compile(r"(?<![\w./-])references/([A-Za-z0-9_./-]+)")
     for skill_md in sorted((REPO_ROOT / "skills").glob("*/SKILL.md")):
         refs_dir = skill_md.parent / "references"
         body = strip_comments(skill_md.read_text(encoding="utf-8"))

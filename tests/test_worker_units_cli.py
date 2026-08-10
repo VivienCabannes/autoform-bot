@@ -524,6 +524,90 @@ def test_agent_task_pushes_only_declared_content(world):
     assert queue[0]["report"] == "reviewed node-a\n"
 
 
+def _escalation_candidate(world):
+    task_id = "escalation:node-a:1"
+    (world.project / "task_queue.json").write_text(json.dumps([{
+        "id": task_id, "agent": "escalation", "node": "node-a", "node_label": "Node A",
+        "status": "queued", "at": "2026-08-09T00:00:00Z", "source": "engine",
+        "recovery": {"version": 1, "phase": "proof-research", "round": 1,
+                     "fingerprint": "unset", "backend": "claude"},
+    }]), encoding="utf-8")
+    task = agent_work.QueuedTask(task_id, "escalation", "node-a", "Node A",
+                                 recovery={"backend": "claude"})
+    candidate = Candidate("escalation", "queued", node="node-a")
+    candidate.task = task
+    return candidate
+
+
+def _repairing_runner(world, marker):
+    """An escalation agent that corrects the article and reports *marker*."""
+    def runner(_provider, cwd, _prompt, _log_dir, _timeout):
+        article = Path(cwd) / "blueprint" / "roadmap" / "node-a.md"
+        article.write_text("---\ndeclaration: theorem\n---\n\n# Node A, corrected\n",
+                           encoding="utf-8")
+        _git(["add", "-A"], Path(cwd).parents[0])
+        _git(["commit", "--quiet", "-m", "agent corrected the statement"], Path(cwd).parents[0])
+        log = world.cfg.log_dir / "agent.log"
+        log.write_text(f"checked the source\n{marker}\n", encoding="utf-8")
+        return 0, log
+    return runner
+
+
+def test_agent_task_lands_a_statement_repair_in_the_blueprint(world):
+    """The unattended default: a wrong statement is corrected, not left for a human."""
+    candidate = _escalation_candidate(world)
+
+    result = agent_work.do_agent_task(
+        world.cfg, GitHost(runner=RecordingRunner()), None, world.counters, _survey(), candidate,
+        registry=Registry(REPO_ROOT, world.project), backend="max",
+        runner=_repairing_runner(world, "RECOVERY: REPAIRED - source says n > 0"),
+    )
+
+    assert result.progressed and "[repaired]" in result.summary
+    landed = _git_out(["show", "main:plan/blueprint/roadmap/node-a.md"], world.bare)
+    assert "Node A, corrected" in landed
+    queue = json.loads((world.project / "task_queue.json").read_text())
+    assert queue[0]["status"] == "done"
+    assert "repaired the statement" in queue[0]["result"]
+
+
+def test_agent_task_withholds_a_repair_when_the_operator_opts_out(world, monkeypatch):
+    """Humans who want the loop keep it: the refusal is enforced, not advisory."""
+    monkeypatch.setenv("AUTOFORM_STATEMENT_REPAIR", "0")
+    cfg = resolve_config(worker_id="tester", respect_claims=False)
+    candidate = _escalation_candidate(world)
+
+    result = agent_work.do_agent_task(
+        cfg, GitHost(runner=RecordingRunner()), None, world.counters, _survey(), candidate,
+        registry=Registry(REPO_ROOT, world.project), backend="max",
+        runner=_repairing_runner(world, "RECOVERY: REPAIRED - source says n > 0"),
+    )
+
+    assert result.progressed and "parked" in result.summary
+    queue = json.loads((world.project / "task_queue.json").read_text())
+    assert queue[0]["status"] == "parked"
+    assert "statement repair is disabled" in queue[0]["result"]
+    absent = subprocess.run(["git", "show", "main:plan/blueprint/roadmap/node-a.md"],
+                            cwd=world.bare, capture_output=True, text=True)
+    assert "corrected" not in absent.stdout
+
+
+def test_agent_task_parks_a_statement_it_could_not_repair(world):
+    """REFUTED now means repair was attempted and no correction was established."""
+    candidate = _escalation_candidate(world)
+
+    result = agent_work.do_agent_task(
+        world.cfg, GitHost(runner=RecordingRunner()), None, world.counters, _survey(), candidate,
+        registry=Registry(REPO_ROOT, world.project), backend="max",
+        runner=_repairing_runner(world, "RECOVERY: REFUTED - counterexample at n = 0"),
+    )
+
+    assert result.progressed
+    queue = json.loads((world.project / "task_queue.json").read_text())
+    assert queue[0]["status"] == "parked"
+    assert "no correction was established" in queue[0]["result"]
+
+
 def test_agent_task_without_push_access_stays_queued(world):
     candidate = _queued_agent_candidate(world)
     result = agent_work.do_agent_task(

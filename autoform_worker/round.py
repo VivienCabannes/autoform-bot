@@ -121,6 +121,48 @@ def build_survey(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps):
     return picture, host, board, counters
 
 
+def _park_orphaned_tasks(cfg: WorkerConfig) -> int:
+    """Park queued work whose node no longer exists in the blueprint.
+
+    Article IDs are path-derived, so a graph-writing role that moves, renames,
+    or splits an article changes its ID and leaves durable state pointing at one
+    that is gone. Such a task can never run: nothing would pick it up and the
+    node it named would quietly stop being worked. Parking it with a reason
+    keeps that visible instead of silently dropping the node.
+    """
+    live = {node.id for node in cfg.runtime.nodes}
+    mods = scripts_modules()
+    dq, fslock = mods["dispatch_queue"], mods["fslock"]
+    queue_path = cfg.project / "task_queue.json"
+    parked = 0
+    with fslock.locked(queue_path):
+        try:
+            tasks = dq.load_queue(queue_path)
+        except Exception:
+            return 0       # a corrupt queue is the orchestrator's to repair
+        orphans = [
+            str(task.get("id"))
+            for task in tasks
+            if task.get("status") == "queued"
+            and task.get("node")
+            and str(task.get("node")) not in live
+        ]
+    # `park` is only legal from `running`, so take ownership first. Tasks
+    # already running are left to the machine that owns them.
+    for task_id in orphans:
+        try:
+            claimed = dq.main([str(cfg.project), "claim", task_id, "--detail",
+                               f"orphan sweep by autoform worker {cfg.worker_id}"])
+            if claimed != 0:
+                continue
+            dq.main([str(cfg.project), "park", task_id, "--reason",
+                     "node no longer exists in the blueprint; it was moved, renamed, or split"])
+            parked += 1
+        except Exception:
+            continue
+    return parked
+
+
 def run_round(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps | None = None) -> str:
     """Execute at most one unit. Returns the unit summary; raises NoProgress."""
     deps = deps or RoundDeps()
@@ -133,9 +175,11 @@ def run_round(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps | None = None)
     picture, host, board, counters = build_survey(cfg, opts, deps)
     if not opts.dry_run and not cfg.durable_identity_ready:
         raise Die(
-            "durable article identity is not configured; stateful worker execution "
-            "is disabled until path-move migration is implemented"
+            "durable article identity is disabled for this operator "
+            "(AUTOFORM_DURABLE_IDENTITY=0); stateful worker execution is refused"
         )
+    if not opts.dry_run:
+        _park_orphaned_tasks(cfg)
 
     # Revive parked recoveries whose durable inputs moved (a merged sibling, a
     # Mathlib bump, a re-plan). Parking must never be permanent — an unattended

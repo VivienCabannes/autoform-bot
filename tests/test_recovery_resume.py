@@ -268,17 +268,27 @@ def test_collect_park_survives_irrelevant_churn(tmp_path, monkeypatch):
 
 # -- round.run_round --------------------------------------------------------
 
-def test_run_round_does_not_unpark_before_durable_identity(tmp_path, monkeypatch):
+def _opted_out(cfg, monkeypatch):
+    """Re-resolve *cfg* with the operator's identity opt-out set."""
+    monkeypatch.setenv("AUTOFORM_DURABLE_IDENTITY", "0")
+    return resolve_config(project=cfg.project, worker_id=cfg.worker_id, lean_root=cfg.lean_root)
+
+
+def _origin(cfg):
+    subprocess.run(["git", "init", "--quiet", str(cfg.lean_root)], check=True)
+    subprocess.run(["git", "-C", str(cfg.lean_root), "remote", "add", "origin",
+                    "https://github.com/o/r.git"], check=True)
+
+
+def test_run_round_does_not_unpark_when_identity_is_opted_out(tmp_path, monkeypatch):
     """The identity gate must preserve queued recovery state byte-for-byte."""
     cfg = make_cfg(tmp_path, monkeypatch)
     park_recovery(cfg)
     article = cfg.project / "blueprint" / "roadmap" / f"{NODE}.md"
     article.write_text(article.read_text(encoding="utf-8") + "\nstrategy: try Nat.rec\n",
                        encoding="utf-8")
-    cfg = resolve_config(project=cfg.project, worker_id=cfg.worker_id, lean_root=cfg.lean_root)
-    subprocess.run(["git", "init", "--quiet", str(cfg.lean_root)], check=True)
-    subprocess.run(["git", "-C", str(cfg.lean_root), "remote", "add", "origin",
-                    "https://github.com/o/r.git"], check=True)
+    cfg = _opted_out(cfg, monkeypatch)
+    _origin(cfg)
 
     # Only the merge stage runs, so nothing here can spawn a prover; the resume
     # happens before the stage cascade either way.
@@ -292,12 +302,11 @@ def test_run_round_does_not_unpark_before_durable_identity(tmp_path, monkeypatch
     assert queue_path.read_bytes() == before
 
 
-def test_run_round_leaves_unmoved_park_alone_before_durable_identity(tmp_path, monkeypatch):
+def test_run_round_leaves_unmoved_park_alone_when_identity_is_opted_out(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, monkeypatch)
     park_recovery(cfg)
-    subprocess.run(["git", "init", "--quiet", str(cfg.lean_root)], check=True)
-    subprocess.run(["git", "-C", str(cfg.lean_root), "remote", "add", "origin",
-                    "https://github.com/o/r.git"], check=True)
+    cfg = _opted_out(cfg, monkeypatch)
+    _origin(cfg)
 
     opts = round_mod.RoundOpts(only=("merge",))
     deps = round_mod.RoundDeps(host=GitHost(runner=make_runner()),
@@ -307,6 +316,28 @@ def test_run_round_leaves_unmoved_park_alone_before_durable_identity(tmp_path, m
     with pytest.raises(Die, match="durable article identity"):
         round_mod.run_round(cfg, opts, deps)
     assert queue_path.read_bytes() == before
+
+
+def test_a_task_naming_a_vanished_article_is_parked_not_silently_dropped(tmp_path, monkeypatch):
+    """Path-derived IDs move when a graph role splits or renames an article.
+
+    The task can never run again under the old ID, so the round must say so
+    rather than leave the node quietly unworked.
+    """
+    cfg = make_cfg(tmp_path, monkeypatch)
+    queue_path = cfg.project / "task_queue.json"
+    queue_path.write_text(json.dumps([
+        {"id": "escalation:gone", "agent": "escalation", "node": "chapter/renamed-away",
+         "status": "queued"},
+        {"id": "escalation:here", "agent": "escalation", "node": NODE, "status": "queued"},
+    ]), encoding="utf-8")
+
+    assert round_mod._park_orphaned_tasks(cfg) == 1
+
+    queue = {task["id"]: task for task in json.loads(queue_path.read_text(encoding="utf-8"))}
+    assert queue["escalation:gone"]["status"] == "parked"
+    assert "no longer exists" in json.dumps(queue["escalation:gone"])
+    assert queue["escalation:here"]["status"] == "queued"
 
 
 # -- dispatch_runner: the engine-side gate ----------------------------------

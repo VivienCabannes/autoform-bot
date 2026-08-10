@@ -59,6 +59,15 @@ def sanitize_worker_id(raw: str) -> str:
     return worker_id[:64] or "worker"
 
 
+_OFF = frozenset({"0", "no", "off", "false"})
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Read an opt-out environment switch; anything unset keeps the default."""
+    raw = os.environ.get(name)
+    return default if raw is None else raw.strip().casefold() not in _OFF
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     """Everything a worker command needs, resolved once at CLI entry."""
@@ -71,10 +80,18 @@ class WorkerConfig:
     runtime: RuntimeGraph
     respect_claims: bool = True
 
-    @property
-    def durable_identity_ready(self) -> bool:
-        """Path-derived runtime IDs are not approved for durable worker state."""
-        return False
+    #: Article IDs are path-derived, so moving an article changes its ID and
+    #: orphans durable state keyed by the old one. The round reconciles that by
+    #: parking tasks whose node has vanished rather than letting them reference
+    #: nothing, which is why stateful execution is on by default. Set
+    #: ``AUTOFORM_DURABLE_IDENTITY=0`` to go back to refusing stateful work.
+    durable_identity_ready: bool = True
+
+    #: Unattended formalization is the default mode: an agent that finds a node's
+    #: Lean statement does not match its source repairs the article rather than
+    #: parking it for a person. Set ``AUTOFORM_STATEMENT_REPAIR=0`` to require a
+    #: human for every statement change.
+    statement_repair: bool = True
 
     @property
     def compatibility_graph_path(self) -> Path:
@@ -177,4 +194,6 @@ def resolve_config(
         state_dir=state_dir,
         runtime=runtime,
         respect_claims=respect_claims,
+        durable_identity_ready=_env_flag("AUTOFORM_DURABLE_IDENTITY"),
+        statement_repair=_env_flag("AUTOFORM_STATEMENT_REPAIR"),
     )

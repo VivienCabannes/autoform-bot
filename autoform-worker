@@ -5,8 +5,11 @@
 # ///
 """Run-from-checkout shim for the autoform worker CLI (mirrors TauCeti's ./tauceti).
 
-Installed wheels get the same entry as the `autoform` console script; a checkout
-gets it via `./autoform ...` with zero setup beyond uv.
+Installed wheels expose this as the `autoform-worker` console script; a checkout
+gets it via `./autoform-worker ...` with zero setup beyond uv. The name matches
+that console script deliberately: `autoform` is the blueprint CLI
+(`autoform_cli.__main__`), so the two must not be the same command with
+different behaviour depending on how you installed.
 """
 import sys
 from pathlib import Path

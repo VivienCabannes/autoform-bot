@@ -66,7 +66,16 @@ def run_doctor(cfg: WorkerConfig | None, host: GitHost | None = None) -> list[tu
     checks.append((
         "durable article identity",
         cfg.durable_identity_ready,
-        "not configured - stateful worker execution remains disabled",
+        "enabled; a task naming a vanished article is parked each round"
+        if cfg.durable_identity_ready
+        else "disabled by AUTOFORM_DURABLE_IDENTITY=0 - stateful execution is refused",
+    ))
+    checks.append((
+        "statement repair",
+        True,
+        "unattended: a refuted statement is repaired against its source"
+        if cfg.statement_repair
+        else "disabled by AUTOFORM_STATEMENT_REPAIR=0 - a refuted statement parks for a human",
     ))
     checks.append(("lean repo", is_git_repo(cfg.lean_root), str(cfg.lean_root)))
 

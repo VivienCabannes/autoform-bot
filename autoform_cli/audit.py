@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
+from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from . import status
 from .graph import Graph, GraphValidationError, Node, load_graph
-from .lean import declaration_names, index_project
+from .lean import SourceIndex, declaration_names, index_project
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -35,6 +37,18 @@ _COVERAGE_GAP = re.compile(
 )
 _EXTERNAL_SCHEMES = frozenset({"http", "https"})
 _MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
+_README = "readme.md"
+
+#: More siblings than this at one level is a table of contents, not a chapter.
+_MAX_DIRECT_CHILDREN = 24
+
+#: A node is reported as oversized only once its finished Lean work clears both
+#: an absolute floor and a large multiple of this project's own median. The
+#: multiple self-calibrates -- a project whose nodes are routinely long is
+#: measured against itself, and a project with too few finished nodes to have a
+#: meaningful median cannot clear the multiple at all.
+_NODE_SIZE_FLOOR = 200
+_NODE_SIZE_MULTIPLE = 4
 
 _DECLARATION_KEYWORDS = {
     "abbrev": frozenset({"abbrev"}),
@@ -161,6 +175,16 @@ def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditRe
                     )
                 )
 
+        if len(children) > _MAX_DIRECT_CHILDREN:
+            findings.append(
+                AuditFinding(
+                    article_path,
+                    "overfull-container",
+                    f"article directly contains {len(children)} articles, more than the "
+                    f"{_MAX_DIRECT_CHILDREN}-article limit; group them into chapters",
+                )
+            )
+
         if node.proof_formalized and not node.statement_formalized:
             findings.append(
                 AuditFinding(
@@ -199,6 +223,7 @@ def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditRe
 
         findings.extend(_source_findings(graph, node, article_path))
 
+    findings.extend(_chapter_findings(graph.blueprint_dir))
     findings.extend(_coverage_findings(graph.blueprint_dir))
     if lean_root is not None:
         findings.extend(_lean_findings(graph, lean_root))
@@ -349,6 +374,43 @@ def _markdown_anchors(path: Path) -> set[str]:
     return anchors
 
 
+def _chapter_findings(blueprint: Path) -> list[AuditFinding]:
+    """Report chapter directories that hold articles but name no chapter.
+
+    Containment is inferred from nested ``README.md`` articles, so a chapter
+    directory without one is invisible to the hierarchy: its pages attach to
+    the root and the published book has no chapters at all. The graph is still
+    valid, which is exactly why this needs its own check.
+
+    Only directories directly under ``roadmap/`` are chapters. Deeper ones --
+    the ``definitions/`` and ``theorems/`` buckets the bundled example uses --
+    are a filing convention inside a chapter, and are deliberately left alone.
+    """
+
+    roadmap = blueprint / "roadmap"
+    if not roadmap.is_dir():
+        return []
+
+    findings: list[AuditFinding] = []
+    try:
+        chapters = sorted(path for path in roadmap.iterdir() if path.is_dir())
+    except OSError:
+        return []
+    for chapter in chapters:
+        names = [path.name for path in chapter.glob("*.md") if path.is_file()]
+        if not names or any(name.casefold() == _README for name in names):
+            continue
+        findings.append(
+            AuditFinding(
+                _relative_path(chapter / "README.md", blueprint),
+                "missing-chapter-article",
+                f"chapter directory holds {len(names)} article(s) but no README.md, "
+                "so they attach to the roadmap root instead of a chapter",
+            )
+        )
+    return findings
+
+
 def _coverage_findings(blueprint: Path) -> list[AuditFinding]:
     coverage_root = blueprint / "coverage"
     contract = coverage_root / "README.md"
@@ -493,6 +555,8 @@ def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
 
     findings: list[AuditFinding] = []
     index = index_project(root)
+    spans = _source_spans(index)
+    sizes: dict[str, int] = {}
     for node_id in sorted(graph.nodes):
         node = graph.nodes[node_id]
         article_path = _relative_path(node.path, graph.blueprint_dir)
@@ -531,7 +595,62 @@ def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
                     f"Lean target kind {actual} does not match declaration intent {node.declaration}",
                 )
             )
+
+        if resolved:
+            sizes[node_id] = sum(spans[declaration.name] for declaration in resolved)
+
+    findings.extend(_size_findings(graph, sizes))
     return findings
+
+
+def _source_spans(index: SourceIndex) -> dict[str, int]:
+    """Measure each declaration's source span, up to the next declaration.
+
+    This is the retrospective size signal: unlike anything authored in the
+    article, it is what the node actually cost once it was formalized.
+    """
+
+    starts: dict[Path, list[int]] = {}
+    for declaration in index.declarations.values():
+        starts.setdefault(declaration.path, []).append(declaration.line)
+    tails: dict[Path, int] = {}
+    for path, lines in starts.items():
+        lines.sort()
+        tails[path] = _line_count(index.root / path)
+
+    spans: dict[str, int] = {}
+    for declaration in index.declarations.values():
+        lines = starts[declaration.path]
+        following = bisect_right(lines, declaration.line)
+        end = lines[following] - 1 if following < len(lines) else tails[declaration.path]
+        spans[declaration.name] = max(1, end - declaration.line + 1)
+    return spans
+
+
+def _line_count(path: Path) -> int:
+    try:
+        return len(path.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError):
+        return 0
+
+
+def _size_findings(graph: Graph, sizes: dict[str, int]) -> list[AuditFinding]:
+    """Flag finished nodes that are large outliers against this project's own work."""
+
+    if not sizes:
+        return []
+    median = statistics.median(sizes.values())
+    limit = max(_NODE_SIZE_FLOOR, _NODE_SIZE_MULTIPLE * median)
+    return [
+        AuditFinding(
+            _relative_path(graph.nodes[node_id].path, graph.blueprint_dir),
+            "node-too-large",
+            f"node's Lean declarations span {size} lines against this project's "
+            f"{median:g}-line median; split it into pull-request-sized nodes",
+        )
+        for node_id, size in sorted(sizes.items())
+        if size >= limit
+    ]
 
 
 def _stable_validation_reason(blueprint: Path, issue: str) -> str:

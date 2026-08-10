@@ -44,6 +44,14 @@ KIND_PRIORITY = ("escalation", "planner", "mathcheck", "graphreview",
                  "contentreview", "counterexample", "priorart", "holistic")
 
 
+#: Outcomes that must be backed by a durable change in the tree. ``REPAIRED``
+#: is the statement-failure branch: the node's Lean statement did not match its
+#: source, so the article was corrected rather than the proof retried.
+_EVIDENCED_OUTCOMES = frozenset({"RETRY", "REFUTED", "REPAIRED"})
+
+_RECOVERY_MARKER = re.compile(r"^\s*RECOVERY:\s*(RETRY|REFUTED|REPAIRED|PARK)\b")
+
+
 def _recovery_outcome(log_path) -> str | None:
     """Read the recovery coordinator's machine-readable final marker."""
     try:
@@ -51,7 +59,7 @@ def _recovery_outcome(log_path) -> str | None:
     except OSError:
         return None
     for line in reversed(text.splitlines()):
-        match = re.match(r"^\s*RECOVERY:\s*(RETRY|REFUTED|PARK)\b", line)
+        match = _RECOVERY_MARKER.match(line)
         if match:
             return match.group(1)
     return None
@@ -66,7 +74,13 @@ def _changed_paths(repo, base_ref: str = "HEAD") -> set[str]:
 
 
 def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) -> bool:
-    """Enforce the role's durable write contract before any commit or push."""
+    """Enforce the role's durable write contract before any commit or push.
+
+    ``content`` may touch node prose only. ``graph`` may additionally edit the
+    canonical Markdown articles under ``blueprint/`` -- statements, frontmatter,
+    and dependency edges -- because that is where the roadmap now lives and a
+    graph role that cannot reach it cannot repair anything.
+    """
     if not paths:
         return True
     try:
@@ -75,11 +89,11 @@ def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) ->
         return False
     prefix = "" if str(project_rel) == "." else f"{project_rel.as_posix()}/"
     content_prefix = f"{prefix}informal_content/"
-    content = all(path.startswith(content_prefix) for path in paths)
+    graph_prefixes = (content_prefix, f"{prefix}blueprint/")
     if role.writes == "content":
-        return content
+        return all(path.startswith(content_prefix) for path in paths)
     if role.writes == "graph":
-        return False
+        return all(path.startswith(graph_prefixes) for path in paths)
     return role.writes == "none" and not paths
 
 
@@ -149,13 +163,36 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
     if task.note:
         context += ["", "## Task note (verbatim — often a worker's own words)", "",
                     "```", task.note[:2400], "```"]
+    if role.writes == "graph":
+        write_contract = [
+            "- Edit the canonical Markdown articles under `blueprint/roadmap/`: their "
+            "statements, frontmatter, and `## Depends on` links are the roadmap.",
+            "- You may also write node prose to `informal_content/<node>.md`.",
+        ]
+        if cfg.statement_repair:
+            write_contract.append(
+                "- This operator runs unattended. When a node's Lean statement does not "
+                "match its source, repair the article yourself and end with "
+                "`RECOVERY: REPAIRED - <what you corrected and why>`. Do not leave a "
+                "wrong statement in place for a person to find."
+            )
+        else:
+            write_contract.append(
+                "- This operator has disabled unattended statement repair. Record the "
+                "correction you would make and park the node instead; a `REPAIRED` "
+                "outcome will be refused."
+            )
+    elif role.writes == "content":
+        write_contract = ["- Write node prose directly to `informal_content/<node>.md`, "
+                          "and change nothing else."]
+    else:
+        write_contract = ["- This role is read-only: leave the tree exactly as you found it."]
+
     context += [
         "",
         "## How to finish",
         "",
-        "- Do not edit roadmap structure: graph-writing roles remain disabled until "
-        "they are ported to canonical Markdown articles.",
-        "- Write node prose directly to `informal_content/<node>.md`.",
+        *write_contract,
         "- Do NOT run `git push` and do NOT open PRs; the worker harness commits and "
         "pushes what you leave in the tree, under a lease.",
         "- Do not edit `lean-toolchain`, `lakefile.*`, CI workflows, or anything under "
@@ -241,16 +278,25 @@ def do_agent_task(
                 )
             invalid_recovery = task.kind == "escalation" and (
                 recovery_outcome is None
-                or (recovery_outcome in {"RETRY", "REFUTED"} and not changed)
+                or (recovery_outcome in _EVIDENCED_OUTCOMES and not changed)
             )
+            # A repair rewrites the authored statement. When the operator has
+            # opted out of unattended repair it is refused here rather than in
+            # the prompt, so a role that ignores its instructions cannot land
+            # one anyway.
+            refused_repair = recovery_outcome == "REPAIRED" and not cfg.statement_repair
             if not _agent_paths_allowed(role, work_cfg, changed):
                 paths = ", ".join(sorted(changed)[:8]) or "(none)"
                 dq.main([str(cfg.project), "fail", task.task_id, "--reason",
                          f"role write contract rejected: {paths}"])
                 return UnitResult(False, f"{task.kind} {task.node}: rejected out-of-contract paths: {paths}")
-            if invalid_recovery:
-                reason = ("recovery produced no outcome marker" if recovery_outcome is None
-                          else "recovery requested action without durable evidence")
+            if invalid_recovery or refused_repair:
+                if refused_repair:
+                    reason = "statement repair is disabled for this operator; repair withheld"
+                elif recovery_outcome is None:
+                    reason = "recovery produced no outcome marker"
+                else:
+                    reason = "recovery requested action without durable evidence"
                 args = [str(cfg.project), "park", task.task_id, "--reason", reason]
                 if log_path.is_file():
                     args += ["--report-file", str(log_path)]
@@ -275,7 +321,7 @@ def do_agent_task(
                     return UnitResult(False, f"{task.kind} {task.node}: CAS lost, retry next round")
 
             if task.kind == "escalation" and recovery_outcome in {"PARK", "REFUTED"}:
-                parked_reason = ("statement refuted; correct it before retry"
+                parked_reason = ("statement is false and no correction was established"
                                  if recovery_outcome == "REFUTED"
                                  else "recovery wave exhausted; evidence ledger preserved")
                 args = [str(cfg.project), "park", task.task_id, "--reason", parked_reason]
@@ -285,13 +331,19 @@ def do_agent_task(
                     args += ["--fingerprint", recovery_fingerprint]
                 dq.main(args)
             else:
+                # A repair changes the node's durable inputs, so its recovery
+                # fingerprint moves and the prover may attempt the corrected
+                # statement on a later round without anyone un-parking it.
+                result = (f"{role.name} repaired the statement" if recovery_outcome == "REPAIRED"
+                          else f"{role.name} completed")
                 done_args = [str(cfg.project), "done", task.task_id, "--result",
-                             f"{role.name} completed" + (" (pushed)" if pushed else "")]
+                             result + (" (pushed)" if pushed else "")]
                 if log_path.is_file():
                     done_args += ["--report-file", str(log_path)]
                 dq.main(done_args)
             counters.clear(counter_key)
-            detail = "; ".join([f"{task.kind} {task.node}: {role.name} done"
+            outcome = f" [{recovery_outcome.lower()}]" if recovery_outcome else ""
+            detail = "; ".join([f"{task.kind} {task.node}: {role.name} done{outcome}"
                                 + (" + pushed" if pushed else " (no durable change)"), *notes])
             return UnitResult(True, detail)
 

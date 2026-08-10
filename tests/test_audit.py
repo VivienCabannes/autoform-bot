@@ -35,6 +35,17 @@ def _coverage(blueprint: Path, text: str = "The roadmap covers every declared ta
     return path
 
 
+def _lean_project(tmp_path: Path, spans: dict[str, int]) -> Path:
+    """Write one Lean file per declaration, padded to the requested line count."""
+    root = tmp_path / "lean"
+    root.mkdir(exist_ok=True)
+    for name, lines in spans.items():
+        steps = "\n".join(f"  -- step {step}" for step in range(lines - 2))
+        source = f"theorem {name} : True := by\n{steps}\n  trivial\n"
+        (root / f"{name.rsplit('.', 1)[-1]}.lean").write_text(source, encoding="utf-8")
+    return root
+
+
 def _finding_map(blueprint: Path, *, lean_root: Path | None = None) -> dict[str, list[tuple[str, str]]]:
     result = audit_blueprint(blueprint, lean_root=lean_root)
     findings: dict[str, list[tuple[str, str]]] = {}
@@ -295,6 +306,102 @@ def test_audit_returns_graph_validation_errors_with_article_paths(tmp_path: Path
     assert result.findings[0].code == "invalid-graph"
     assert result.findings[0].reason == "bad: missing H1 title"
     assert json.loads(result.to_json()) == result.as_dict()
+
+
+def test_audit_reports_a_chapter_directory_that_names_no_chapter(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "README.md", depends=False)
+    _article(blueprint, "orphaned/first.md", declaration="theorem")
+    _article(blueprint, "orphaned/second.md", declaration="lemma")
+    _article(blueprint, "chapter/README.md", depends=False)
+    _article(blueprint, "chapter/theorems/result.md", declaration="theorem")
+
+    findings = _finding_map(blueprint)
+
+    assert findings["roadmap/orphaned/README.md"] == [
+        (
+            "missing-chapter-article",
+            "chapter directory holds 2 article(s) but no README.md, "
+            "so they attach to the roadmap root instead of a chapter",
+        )
+    ]
+    # A ``theorems/`` bucket inside a real chapter is a filing convention, not a
+    # missing level: its articles still attach to the chapter above it.
+    assert "roadmap/chapter/theorems/README.md" not in findings
+
+
+def test_audit_reports_a_container_holding_too_many_articles(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "README.md", depends=False)
+    for index in range(25):
+        _article(blueprint, f"unit-{index:02d}.md", declaration="theorem")
+
+    findings = _finding_map(blueprint)["roadmap/README.md"]
+
+    assert findings == [
+        (
+            "overfull-container",
+            "article directly contains 25 articles, more than the 24-article limit; "
+            "group them into chapters",
+        )
+    ]
+
+
+def test_audit_reports_nodes_that_are_large_outliers_for_their_project(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "README.md", depends=False)
+    spans = {f"Project.small{index}": 6 for index in range(5)}
+    spans["Project.big"] = 420
+    for name in spans:
+        _article(
+            blueprint,
+            f"{name.rsplit('.', 1)[-1]}.md",
+            declaration="theorem",
+            statement="formalized",
+            proof="formalized",
+            lean=name,
+        )
+    lean_root = _lean_project(tmp_path, spans)
+
+    findings = _finding_map(blueprint, lean_root=lean_root)
+
+    assert findings == {
+        "roadmap/big.md": [
+            (
+                "node-too-large",
+                "node's Lean declarations span 420 lines against this project's "
+                "6-line median; split it into pull-request-sized nodes",
+            )
+        ]
+    }
+
+
+def test_audit_measures_node_size_against_the_project_rather_than_a_fixed_limit(
+    tmp_path: Path,
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "README.md", depends=False)
+    spans = {f"Project.long{index}": 300 for index in range(5)}
+    for name in spans:
+        _article(
+            blueprint,
+            f"{name.rsplit('.', 1)[-1]}.md",
+            declaration="theorem",
+            statement="formalized",
+            proof="formalized",
+            lean=name,
+        )
+    lean_root = _lean_project(tmp_path, spans)
+
+    result = audit_blueprint(blueprint, lean_root=lean_root)
+
+    # Every node clears the absolute floor, but none is an outlier here, so a
+    # project whose units are uniformly long is not gated on its own norm.
+    assert result.clean
 
 
 def test_audit_is_read_only(tmp_path: Path) -> None:

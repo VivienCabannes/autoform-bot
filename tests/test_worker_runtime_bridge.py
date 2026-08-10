@@ -44,7 +44,9 @@ def test_worker_loads_markdown_runtime_without_project_graph(tmp_path: Path, mon
     assert config.runtime.dispatchable_count == 1
     assert not (project / "graph.json").exists()
     assert not hasattr(config, "graph_path")
-    assert not config.durable_identity_ready
+    # Unattended operation is the default: both switches are opt-out, not opt-in.
+    assert config.durable_identity_ready
+    assert config.statement_repair
 
 
 def test_private_snapshot_is_disposable_and_excludes_containers_from_dispatch(tmp_path: Path, monkeypatch) -> None:
@@ -78,11 +80,12 @@ def test_cli_namespaces_coexist_and_unsafe_claim_switches_are_absent() -> None:
     assert not hasattr(claim, "steal")
 
 
-def test_durable_cli_operations_are_gated_but_issue_dry_run_is_available(
+def test_durable_cli_operations_are_gated_only_when_the_operator_opts_out(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     project = _project(tmp_path)
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
+    monkeypatch.setenv("AUTOFORM_DURABLE_IDENTITY", "0")
     body = tmp_path / "pr-body.md"
     body.write_text('<!--autoform-target:v1 {"node": "chapter/theorem"}-->\n', encoding="utf-8")
 
@@ -97,21 +100,16 @@ def test_durable_cli_operations_are_gated_but_issue_dry_run_is_available(
     assert "[dry-run]" in capsys.readouterr().out
 
 
-def test_stateful_worker_candidates_are_suppressed_until_identity_is_stable(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_unattended_switches_are_opt_out(tmp_path: Path, monkeypatch) -> None:
     project = _project(tmp_path)
     monkeypatch.setenv("AUTOFORM_WORKER_STATE", str(tmp_path / "state"))
-    config = resolve_config(project=project, worker_id="worker")
-    candidate = survey.Candidate("prove", "ready", node="chapter/theorem")
-    picture = survey.Survey(canonical="owner/repo", default_branch="main", me="worker")
-    picture.stages = {stage: [] for stage in ("prove",)}
-    picture.suppressed = {stage: [] for stage in ("prove",)}
 
-    # Exercise the externally visible contract through the immutable flag. The
-    # full collect path is covered by the existing worker survey suite.
-    assert not config.durable_identity_ready
-    candidate.reason = "durable article identity is not configured - stateful worker execution disabled"
-    picture.suppressed["prove"].append(candidate)
-    assert picture.stages["prove"] == []
-    assert "durable article identity" in picture.suppressed["prove"][0].reason
+    assert resolve_config(project=project, worker_id="worker").durable_identity_ready
+    assert resolve_config(project=project, worker_id="worker").statement_repair
+
+    monkeypatch.setenv("AUTOFORM_DURABLE_IDENTITY", "off")
+    monkeypatch.setenv("AUTOFORM_STATEMENT_REPAIR", "0")
+    disabled = resolve_config(project=project, worker_id="worker")
+
+    assert not disabled.durable_identity_ready
+    assert not disabled.statement_repair

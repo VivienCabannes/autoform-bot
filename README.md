@@ -204,7 +204,7 @@ dashboard is a deterministic, read-only snapshot built only from committed graph
 theorem, review, proof-status, and kernel-evidence inputs. Setup fails closed on
 unclear repository visibility and never enables publication without approval.
 
-**The distributed worker** (`./autoform`, TauCetiWorker-style): many machines
+**The distributed worker** (`./autoform-worker`, TauCetiWorker-style): many machines
 advancing one shared roadmap through GitHub. One round = one work unit from the
 cascade `rebase → fix-ci → fix → review → merge → progress → agents → prove`;
 proofs land as marker-tagged PRs, jury verdicts land as scoreboard comments,
@@ -219,10 +219,42 @@ setup, no Issues requirement, safe under any race. Orchestrate drives it in
 distributed mode; [docs/worker-cli.md](docs/worker-cli.md) is the design
 contract, with diagrams.
 
+## Unattended operation
+
+Fully-automated formalization is a supported mode, not a way of holding the
+tool wrong. Human review is something you opt into, and every workflow runs
+without it. Two switches set how far the fleet goes on its own; both default to
+unattended:
+
+| Switch | Default | Off means |
+| --- | --- | --- |
+| `AUTOFORM_STATEMENT_REPAIR` | on | A statement the evidence refutes parks for a person instead of being corrected against its source. |
+| `AUTOFORM_DURABLE_IDENTITY` | on | Stateful worker execution is refused entirely. |
+
+A prover failure is triaged into one of two kinds, because they need opposite
+responses. A *proof* failure means the route was wrong: research a better one or
+decompose the node. A *statement* failure means the formalization does not say
+what the source says, so every further proof attempt is wasted. With repair on,
+the escalation role rewrites the article to match its cited source and reports
+`RECOVERY: REPAIRED`; the corrected node re-enters the prover on a later round
+because its recovery fingerprint has moved. A statement it cannot correct from
+the source is parked as `REFUTED` with the counterexample recorded. Nothing is
+dropped: a node is repaired, parked with a reason, or still queued.
+
+What holds without a human: CI re-validates the DAG, builds the project, rejects
+`sorry` and unsafe axioms, and audits kernel trust on every PR; auto-merge
+requires green CI, a trusted `clean` scoreboard at the exact head, roadmap-only
+paths, and no hold label; claims are fail-closed leases. What nothing checks:
+whether the formalization is *faithful to the mathematics you meant*. A repair
+is only ever licensed by a cited source passage, and the review rubrics judge
+faithfulness, but neither is a proof that the roadmap says what you wanted. That
+judgment stays yours whenever you choose to make it.
+
 ## Repository layout
 
 ```
-skills/          four user workflows: setup, roadmap, orchestrate, evaluate
+skills/          user workflows: setup, roadmap, orchestrate, evaluate,
+                 agent-review, human-review, develop-plugin
 internal/        non-discoverable runbooks, reference material, and jury rubrics
 agents/          worker, reader, planning crew, review jury
 servers/         stateful MCP servers plus shared prover/search implementation code

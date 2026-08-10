@@ -22,6 +22,13 @@ Read the exact Lean statement, node prose, dependencies, source references, all
 earlier recovery notes, and the worker's failure report. Then run these waves in
 order. Stop as soon as one wave produces a decisive result.
 
+First separate the two failure modes, because they need opposite responses. A
+*proof* failure means the statement is right and the route was wrong: research a
+better route (Wave 1) or decompose it (Wave 3). A *statement* failure means the
+formalization does not say what the source says, so every proof attempt against
+it is wasted: repair the article (Wave 2). Check the statement against its source
+before spending another wave on the proof.
+
 ## Wave 1: find a proof route
 
 Spawn at least two independent `proof-strategy-researcher` subagents when the
@@ -46,16 +53,29 @@ Run this only when Wave 1 found no viable route. Run at least two independent
 `counterexample-hunter` passes with different edge-case assignments. Verify
 a proposed witness in Lean when practical.
 
-If the exact statement is false, record the witness and smallest proposed
-correction in the node's graph `recovery` field. Do not edit the Lean statement
-or send the false statement back to the prover.
-If the intended correction is not established, park it and end with:
+If the exact statement is false, record the witness in the node's graph
+`recovery` field. Never send the false statement back to the prover.
+
+A false statement is a *statement* failure, not a proof failure, so repair the
+statement rather than retrying against it. When the source establishes what the
+result should have said, correct the node's Markdown article under
+`blueprint/roadmap/` (its statement text, `declaration`, and dependency links)
+so the article matches the source again. Cite the exact source passage that
+licenses the correction in the `recovery` field, clear any `statement:
+formalized` or `proof: formalized` assertion the correction invalidates, and end
+with:
+
+`RECOVERY: REPAIRED - <what you corrected, and the source passage that licenses it>`
+
+Repair only what the source supports. If no correction is established, because
+the source is silent, ambiguous, or itself wrong, do not invent one. Leave the
+witness and the precise defect in the `recovery` field and end with:
 
 `RECOVERY: REFUTED - <verified counterexample or precise statement defect>`
 
-A sourced correction still requires a separate statement-editing task with its
-own provenance review. Park this recovery as refuted rather than editing Lean
-under a graph-only write contract.
+Those are the only two endings for a refuted statement. Never leave a statement
+you know to be false in place without either repairing it or recording why you
+could not.
 
 ## Wave 3: derive useful sublemmas
 
@@ -93,6 +113,9 @@ it is not a request for a person to solve it. End with:
 - Do not grow the DAG unless you can state how the new lemmas reconstruct the
   target.
 - Do not call absence of a counterexample a proof.
+- Repair a statement only against a cited source passage, never to make a proof
+  succeed. A statement edited to fit the proof you happen to have is a silent
+  weakening, which is worse than the failure it hides.
 - Cite URLs, source locations, and verified Mathlib declarations exactly.
 - Child research passes return findings only. You are the sole project writer.
 - Keep one structured graph `recovery` record and update it through

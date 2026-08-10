@@ -109,8 +109,8 @@ def _config(args) -> WorkerConfig:
 def _require_durable_identity(cfg: WorkerConfig, operation: str) -> None:
     if not cfg.durable_identity_ready:
         raise Die(
-            f"{operation} stores path-derived article IDs; it remains disabled until "
-            "the durable identity and migration contract is implemented"
+            f"{operation} stores path-derived article IDs, and durable identity is "
+            "disabled for this operator (AUTOFORM_DURABLE_IDENTITY=0)"
         )
 
 
