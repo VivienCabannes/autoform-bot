@@ -238,22 +238,16 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "pymdownx.superfences" in mkdocs
     assert "stylesheets/blueprint.css" in mkdocs
     assert "javascripts/blueprint-mermaid.js" in mkdocs
-    nav = mkdocs.split("\nnav:\n", 1)[1].split("\ntheme:\n", 1)[0]
-    # The one-page book is the same material as the chapter pages, so it is
-    # linked from the contents page instead of competing in the nav.
-    # Two tabs: the human-readable book, and the DAG.
-    assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == ["Book", "Graph"]
-    assert "- Book: README.md" in nav
-    assert "- Graph: dependencies.md" in nav
-    assert "book.md" not in nav
-    assert "progress.md" not in nav
-    assert "roadmap/" not in nav
-    assert "sources/" not in nav
-    # Material owns the chrome; both colour schemes stay reachable by toggle.
-    assert "name: material" in mkdocs
-    assert "scheme: default" in mkdocs
-    assert "scheme: slate" in mkdocs
-    assert "custom_dir: theme" in mkdocs
+    # The nav is generated from the vault into SUMMARY.md, so mkdocs.yml has
+    # none: a hand-written chapter list would drift from the book.
+    assert "\nnav:\n" not in mkdocs
+    assert "literate-nav" in mkdocs
+    assert "navigation.tabs" in mkdocs
+    summary = (site / "SUMMARY.md").read_text(encoding="utf-8")
+    assert summary.startswith("- [Home](README.md)")
+    assert "- Book" in summary
+    assert "- Graph" in summary
+    assert "[Infimum Loss milestone](roadmap/infimum-loss/README.md)" in summary
     theme = (example / "theme" / "main.html").read_text(encoding="utf-8")
     assert "{% block footer %}" in theme
     assert "AutoformBot" in theme

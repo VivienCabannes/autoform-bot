@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from . import graph_pages, mermaid, status
+from . import graph_pages, graph_views, mermaid, status
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
 from .status import is_definition
@@ -255,9 +255,14 @@ def render_site(
     overview = destination / "README.md"
     if overview.is_file():
         overview.write_text(
-            _inject_after_title(
+            _render_landing_page(
                 overview.read_text(encoding="utf-8"),
-                _render_overview_summary(graph, statuses),
+                graph=graph,
+                statuses=statuses,
+                groups=groups,
+                group_pages=group_pages,
+                page=overview,
+                destination=destination,
             ),
             encoding="utf-8",
         )
@@ -293,7 +298,13 @@ def render_site(
         destination,
         graph,
     )
-    _append_book_navigation(book_pages)
+    # The landing page is a dashboard, not chapter one. Previous/next belongs
+    # to the book, so the strip starts at the contents page.
+    _append_book_navigation([p for p in book_pages if p != overview])
+    (destination / "SUMMARY.md").write_text(
+        _render_summary_nav(book_pages, destination=destination, overview=overview),
+        encoding="utf-8",
+    )
 
     generated_graph_pages = graph_pages.write_graph_pages(
         graph,
@@ -603,6 +614,122 @@ def _inject_after_lead(text: str, block: str) -> str:
             return "\n".join(merged) + ("\n" if text.endswith("\n") else "")
     return text.rstrip() + "\n\n" + block.rstrip() + "\n"
 
+
+
+def _next_target(
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    *,
+    page: Path,
+    destination: Path,
+    targets: dict[str, str] | None = None,
+) -> str:
+    """Name the result a contributor could pick up right now.
+
+    A dashboard that only counts is a scoreboard. The useful question on
+    arriving is "what is unblocked?", which the DAG already answers: the first
+    node in topological order whose prerequisites are met and whose proof is
+    still open.
+    """
+    for node_id in status.topological_order(graph):
+        node_status = statuses.get(node_id)
+        node = graph.nodes[node_id]
+        if node_status is None or graph.children(node_id) or not node.formalizable:
+            continue
+        if node_status.key in {"can_prove", "can_state"}:
+            href = (targets or {}).get(node_id)
+            title = html.escape(node.title)
+            label = html.escape(node_status.label)
+            link = f'<a href="{html.escape(href, quote=True)}">{title}</a>' if href else title
+            return (
+                '<div class="bp-next-target">'
+                '<div class="bp-next-kicker">Next up</div>'
+                f'<div class="bp-next-title">{link}</div>'
+                f'<div class="bp-next-state">{label}</div>'
+                "</div>"
+            )
+    return ""
+
+
+
+def _render_summary_nav(
+    book_pages: list[Path],
+    *,
+    destination: Path,
+    overview: Path,
+) -> str:
+    """Write the site nav as Markdown so the Book tab holds real chapters.
+
+    mkdocs.yml cannot know a project's chapters, and hand-listing them would be
+    the second navigation manifest the roadmap skill forbids. mkdocs-literate-nav
+    reads this file instead, so the tabs come from the same page order the book
+    itself uses.
+    """
+    lines = [f"- [Home]({overview.relative_to(destination).as_posix()})", "- Book"]
+    for page in book_pages:
+        if page == overview:
+            continue
+        title = _first_h1(page.read_text(encoding="utf-8")) or page.parent.name
+        depth = len(page.relative_to(destination).parts) - 1
+        indent = "    " * max(depth, 1)
+        lines.append(f"{indent}- [{title}]({page.relative_to(destination).as_posix()})")
+    lines.extend(
+        [
+            "- Graph",
+            "    - [Dependency maps](dependencies.md)",
+            "    - [Full theorem DAG](dependencies/full.md)",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+def _render_landing_page(
+    text: str,
+    *,
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    groups: dict[str, list[str]],
+    group_pages: dict[str, Path],
+    page: Path,
+    destination: Path,
+    targets: dict[str, str] | None = None,
+) -> str:
+    """The landing page: what this is, how far it has got, and what is next.
+
+    Material renders a table of contents beside every page. On a short
+    dashboard it lists one or two headings and steals a third of the width, so
+    the page opts out.
+    """
+    body = _document_body(text)
+    title = _first_h1(text) or "Blueprint"
+    parts = [
+        "---",
+        "hide:",
+        "  - toc",
+        "---",
+        "",
+        f"# {title}",
+        "",
+        _render_overview_summary(graph, statuses),
+        _next_target(graph, statuses, page=page, destination=destination, targets=targets),
+        "",
+        body,
+    ]
+    project = graph_views.project_view(graph, statuses)
+    if project.nodes:
+        links = {
+            node.id: mermaid.relative_link(group_pages[node.id], page, ".html")
+            for node in project.nodes
+            if node.id in group_pages
+        }
+        parts.extend(
+            [
+                "",
+                "## Project map",
+                "",
+                mermaid.render_view_diagram(project, links=links, include_classdefs=False),
+            ]
+        )
+    return "\n".join(part for part in parts if part is not None).rstrip() + "\n"
 
 def _render_overview_summary(
     graph: Graph,
