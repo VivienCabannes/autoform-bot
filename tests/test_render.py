@@ -91,6 +91,52 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert '"dependencies/chapters/roadmap.html"' in project_map
 
 
+def _chapter_map_links(page: Path) -> set[str]:
+    return set(re.findall(r'"(dependencies/chapters/[^"]+)\.html"', page.read_text("utf-8")))
+
+
+def test_the_home_page_project_map_links_to_chapter_pages_that_exist(tmp_path: Path) -> None:
+    """The home map and the Graph tab draw the same view but built links apart.
+
+    A project-view node is a chapter, so its id is namespaced `scope:<group>`,
+    and only the Graph tab stripped that before naming the page. The home map
+    asked for `dependencies/chapters/scope:<group>.html`, which is nothing.
+    """
+    _render(tmp_path)
+    out = tmp_path / "out"
+
+    links = _chapter_map_links(out / "README.md")
+    assert links, "the home page should carry a project map"
+    assert links == _chapter_map_links(out / "dependencies.md")
+    for link in links:
+        assert (out / f"{link}.md").is_file(), f"home page links to a missing page: {link}"
+
+
+def test_the_home_page_project_map_survives_named_chapters(tmp_path: Path) -> None:
+    """The flat project exercises the `or 'roadmap'` fallback, not the prefix."""
+    project = _project(tmp_path)
+    chapter = project / "blueprint" / "roadmap" / "structure"
+    chapter.mkdir()
+    (chapter / "README.md").write_text(
+        "---\n---\n\n# Structure\n\nA named chapter.\n\n## Results\n\n- [Side](side.md)\n",
+        encoding="utf-8",
+    )
+    (chapter / "side.md").write_text(
+        "---\ndeclaration: theorem\nstatement: formalized\nlean: Project.top\n---\n\n"
+        "# Side\n\nA statement in a named chapter.\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+
+    render_site(project / "blueprint", out, lean_root=project)
+
+    links = _chapter_map_links(out / "README.md")
+    assert "dependencies/chapters/structure" in links
+    assert not any("scope:" in link for link in links)
+    for link in links:
+        assert (out / f"{link}.md").is_file(), f"home page links to a missing page: {link}"
+
+
 def test_a_chapter_places_statements_in_the_authored_narrative(tmp_path: Path) -> None:
     _render(tmp_path)
     page = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
