@@ -257,18 +257,36 @@ def test_no_ci_rather_than_a_guessed_pin(tmp_path: Path, monkeypatch: pytest.Mon
     assert (tmp_path / "mkdocs.yml").is_file()
 
 
-def test_an_explicit_ref_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_ref_alone_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The commit is the unguessable half; the repository has a sane default.
+
+    Setup tells the agent to pass `--autoform-ref`. If the source had to be
+    supplied too, following that instruction would still yield no CI, and the
+    fail-closed behaviour would be indistinguishable from a broken flag.
+    """
     from autoform_cli import scaffold as scaffold_module
 
     monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
-    result = scaffold_module.scaffold_project(
+    result = scaffold_module.scaffold_project(tmp_path, title="Finite Flat", autoform_ref="2" * 40)
+
+    assert result.unpinned is False
+    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+    assert f"git+{scaffold_module.DEFAULT_AUTOFORM_SOURCE}@{'2' * 40}" in verify
+
+
+def test_an_explicit_source_overrides_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
+    scaffold_module.scaffold_project(
         tmp_path,
         title="Finite Flat",
         autoform_source="https://example.test/autoform.git",
         autoform_ref="2" * 40,
     )
 
-    assert result.unpinned is False
     verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert f"git+https://example.test/autoform.git@{'2' * 40}" in verify
 
