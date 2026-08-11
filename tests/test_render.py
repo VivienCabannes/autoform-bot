@@ -487,9 +487,14 @@ def test_source_notes_leave_the_site_for_the_repository(tmp_path: Path) -> None:
 
 
 def test_source_notes_stay_published_when_there_is_nowhere_to_send_readers(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Without repository coordinates, dropping the pages would strand the links."""
+    # An empty argument falls through to detection, and detection reads the
+    # Actions environment, so on CI this test would otherwise be handed the
+    # coordinates it is meant to be doing without.
+    for variable in ("GITHUB_REPOSITORY", "GITHUB_SERVER_URL", "GITHUB_SHA"):
+        monkeypatch.delenv(variable, raising=False)
     project = _with_source_notes(tmp_path)
     out = tmp_path / "out"
 
