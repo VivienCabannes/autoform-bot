@@ -143,12 +143,13 @@ def scaffold_project(
         raise ScaffoldError(issues)
 
     pinned_source, pinned_ref = plugin_pin()
-    source = autoform_source.strip() or pinned_source
+    source = autoform_source.strip() or pinned_source or DEFAULT_AUTOFORM_SOURCE
     ref = autoform_ref.strip() or pinned_ref
-    # CI installs Autoform from a Git ref. Without one, writing the workflows
-    # anyway would publish a project whose first push fails for a reason no
-    # file in it explains, so they are skipped and reported instead.
-    unpinned = not (source and ref)
+    # CI installs Autoform from a Git ref. Where Autoform lives is a fixed fact
+    # worth defaulting; which commit is not, and a guessed one publishes a
+    # project whose first CI step fails for a reason no file in it explains. So
+    # the ref alone decides: without one the workflows are skipped and reported.
+    unpinned = not ref
     substitutions = {
         "PROJECT_TITLE": title.strip(),
         "REPO_URL": repository_url.strip(),

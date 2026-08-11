@@ -142,16 +142,19 @@ def _init(args: argparse.Namespace) -> int:
     for path in result.skipped:
         note = "no Autoform ref to pin" if result.unpinned and ".github" in path else "exists, left alone"
         print(f"  = {path} ({note})")
+    print("Next: describe the project in blueprint/README.md, then add chapters "
+          "as roadmap/<chapter>/README.md.")
     if result.unpinned:
+        # Flush first: stdout is block-buffered when piped, so without this the
+        # warning jumps ahead of the file list it is explaining.
+        sys.stdout.flush()
         print(
             "\nCI was not written: generated workflows install Autoform from a Git\n"
             "ref, and this Autoform is not running from a checkout, so there is\n"
-            "nothing to pin. Re-run with an immutable commit to add them:\n"
-            "  autoform init --autoform-ref <40-char-sha> [--autoform-source <url>]",
+            "nothing to pin. Re-run with the commit to add them:\n"
+            "  autoform init --autoform-ref <40-char-sha>",
             file=sys.stderr,
         )
-    print("Next: describe the project in blueprint/README.md, then add chapters "
-          "as roadmap/<chapter>/README.md.")
     return 0
 
 
