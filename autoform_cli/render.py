@@ -873,9 +873,17 @@ def _render_landing_page(
     if project.nodes:
         # Clicking a chapter on the home page opens that chapter's dependency
         # map: the home map is a preview of the Graph tab, not a second index.
+        # A project-view node is a whole chapter, so its id is namespaced
+        # `scope:<group>`; the page is named for the group alone. Stripping has
+        # to precede the empty-group fallback, or the root chapter asks for
+        # `scope:.html` -- a truthy id, and so never the fallback it needs.
         links = {
             node.id: mermaid.relative_link(
-                destination / "dependencies/chapters" / f"{node.id or 'roadmap'}.md", page, ".html"
+                destination
+                / "dependencies/chapters"
+                / f"{node.id.removeprefix('scope:') or 'roadmap'}.md",
+                page,
+                ".html",
             )
             for node in project.nodes
         }
