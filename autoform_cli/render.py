@@ -32,6 +32,9 @@ _ARTICLE_SLOT = re.compile(
 )
 _DEPENDENCY_SECTIONS = frozenset({"depends on", "proof depends on"})
 _SKIPPED_DIRECTORIES = frozenset({".obsidian", ".trash", ".git"})
+
+#: Transcriptions of the paper being formalised. Vault material, not chapters.
+SOURCES_DIR = "sources"
 PUBLICATION_MANIFEST = "publication.json"
 #: Derived views this command rewrites; stale copies must not leak into the site.
 _GENERATED_FILES = frozenset(
@@ -188,6 +191,7 @@ def render_site(
     )
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
+    sources_base = _sources_base(blueprint, linker)
 
     _prepare_destination(destination, clean=clean)
     _write_publication_manifest(destination, blueprint, graph, linker, complete=False)
@@ -226,6 +230,10 @@ def render_site(
             continue
         if relative.name in _GENERATED_FILES:
             continue
+        # Source notes leave the site entirely once readers can reach them in
+        # the repository, so the book has one reference surface rather than two.
+        if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
+            continue
         target = destination / relative
         # Directories are created on demand below, so a directory holding
         # nothing but absorbed nodes leaves no empty shell behind.
@@ -246,6 +254,7 @@ def render_site(
                 destination=destination,
                 node_sources=node_sources,
                 targets=targets,
+                sources_base=sources_base,
             )
             target.write_text(rewritten, encoding="utf-8")
         else:
@@ -285,6 +294,7 @@ def render_site(
             blueprint=blueprint,
             destination=destination,
             node_sources=node_sources,
+            sources_base=sources_base,
         )
         page.write_text(chapter, encoding="utf-8")
         if narrative is None:  # a milestone with no narrative page of its own
@@ -301,7 +311,7 @@ def render_site(
     # The landing page is a dashboard, not chapter one. Previous/next belongs
     # to the book, so the strip starts at the contents page.
     _append_book_navigation([p for p in book_pages if p != overview])
-    report.pages += _publish_vault(blueprint, destination)
+    report.pages += _publish_vault(blueprint, destination, sources_base=sources_base)
     (destination / "SUMMARY.md").write_text(
         _render_summary_nav(book_pages, destination=destination, overview=overview),
         encoding="utf-8",
@@ -383,6 +393,37 @@ def _validate_publication_tree(blueprint: Path) -> None:
 
 def _is_hidden(relative: Path) -> bool:
     return any(part.startswith(".") for part in relative.parts)
+
+
+def _sources_base(blueprint: Path, linker: SourceLinker) -> str | None:
+    """Where `blueprint/sources/` lives in the repository, if it can be linked.
+
+    Source notes are a reader's transcription of the paper being formalised.
+    Publishing them put a second copy of the reference on the site, at a URL
+    nothing links deliberately and every `## Sources` list pointed at, so the
+    book kept handing readers a page that was neither the book nor the paper.
+    They stay in the vault and the site links out to them instead.
+
+    Returns ``None`` when there are no repository coordinates to build a link
+    from. The pages are then published as before, because a site with no
+    sources and no way to reach them is worse than a redundant page.
+    """
+    if not linker.repository_url or not linker.ref:
+        return None
+    try:
+        relative = (blueprint / SOURCES_DIR).relative_to(blueprint.parent).as_posix()
+    except ValueError:  # pragma: no cover - blueprint is always under its parent
+        return None
+    return f"{linker.repository_url}/blob/{linker.ref}/{relative}"
+
+
+def _source_href(sources_base: str, tail: tuple[str, ...]) -> str:
+    """A repository URL for a source note, or for the sources directory itself."""
+    if not tail:
+        # A vault often links the directory rather than a note in it, and
+        # GitHub serves directories under /tree/ rather than /blob/.
+        return sources_base.replace("/blob/", "/tree/", 1)
+    return f"{sources_base}/{'/'.join(tail)}"
 
 
 def _published_source_files(blueprint: Path):
@@ -695,12 +736,17 @@ def _next_target(
 WIKI_DIR = "wiki"
 
 
-def _publish_vault(blueprint: Path, destination: Path) -> int:
+def _publish_vault(blueprint: Path, destination: Path, *, sources_base: str | None) -> int:
     """Copy the authored vault verbatim so every article has a URL.
 
     The book is a reading of the vault; this is the vault. Its internal links
-    are all relative, so preserving the tree preserves them, and nothing is
-    rewritten: what a reader sees here is the file an author edits.
+    are all relative, so preserving the tree preserves them, and what a reader
+    sees here is otherwise the file an author edits.
+
+    Source notes are the exception. When *sources_base* gives a repository to
+    reach them in, mirroring them here would put the same transcription at a
+    third URL, so they are left out. Links naming them are then redirected at
+    the repository rather than left pointing at a page that is no longer here.
     """
     root = destination / WIKI_DIR
     written = 0
@@ -708,11 +754,47 @@ def _publish_vault(blueprint: Path, destination: Path) -> int:
         if source.is_symlink():
             continue
         relative = source.relative_to(blueprint)
+        if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
+            continue
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        body = source.read_text(encoding="utf-8")
+        if sources_base is not None:
+            body = _redirect_source_links(
+                body, source_dir=source.parent, blueprint=blueprint, sources_base=sources_base
+            )
+        target.write_text(body, encoding="utf-8")
         written += 1
     return written
+
+
+def _redirect_source_links(
+    text: str, *, source_dir: Path, blueprint: Path, sources_base: str
+) -> str:
+    """Point links at source notes into the repository, leaving the rest alone.
+
+    The vault mirror is verbatim by design, so this touches only the links that
+    would otherwise dangle: the ones naming a file under ``blueprint/sources``,
+    which is no longer published.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group("target")
+        bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
+        path, separator, fragment = bare.partition("#")
+        if not path or urlsplit(path).scheme or path.startswith("/"):
+            return match.group(0)
+        candidate = (source_dir / unquote(path)).resolve()
+        if not _is_within(candidate, blueprint):
+            return match.group(0)
+        relative = candidate.relative_to(blueprint)
+        if relative.parts[:1] != (SOURCES_DIR,):
+            return match.group(0)
+        href = _source_href(sources_base, relative.parts[1:])
+        return f"[{match.group('label')}]({href}{separator}{fragment})"
+
+    return _outside_fences(text, lambda line: _MARKDOWN_LINK.sub(replace, line))
+
 
 def _render_summary_nav(
     book_pages: list[Path],
@@ -952,13 +1034,15 @@ def _rewrite_links(
     destination: Path,
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
+    sources_base: str | None = None,
 ) -> str:
     """Resolve a page's relative links against where it is being published.
 
-    Two things move. Node files stop being pages once their chapter absorbs
-    them, so a link naming one becomes an anchor. And a node's body is hoisted
-    out of its own directory onto the chapter page, so its remaining relative
-    links have to be recomputed from there.
+    Three things move. Node files stop being pages once their chapter absorbs
+    them, so a link naming one becomes an anchor. A node's body is hoisted out
+    of its own directory onto the chapter page, so its remaining relative links
+    have to be recomputed from there. And source notes are not published at
+    all when *sources_base* says where to reach them in the repository.
     """
     anchored = _anchored_links(targets, page, extension=".md")
 
@@ -978,7 +1062,11 @@ def _rewrite_links(
             return f"[{match.group('label')}]({href})"
         if not _is_within(candidate, blueprint):
             return match.group(0)
-        published = destination / candidate.relative_to(blueprint)
+        relative = candidate.relative_to(blueprint)
+        if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
+            href = _source_href(sources_base, relative.parts[1:])
+            return f"[{match.group('label')}]({href}{separator}{fragment})"
+        published = destination / relative
         moved = mermaid.relative_link(published, page, candidate.suffix)
         return f"[{match.group('label')}]({moved}{separator}{fragment})"
 
@@ -1049,6 +1137,7 @@ def _render_chapter(
     blueprint: Path,
     destination: Path,
     node_sources: dict[Path, str],
+    sources_base: str | None = None,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
     links = _anchored_links(targets, page)
@@ -1070,6 +1159,7 @@ def _render_chapter(
             destination=destination,
             node_sources=node_sources,
             targets=targets,
+            sources_base=sources_base,
         )
         environments[node_id] = environment
         linked += node_linked
@@ -1157,6 +1247,7 @@ def _render_environment(
     destination: Path,
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
+    sources_base: str | None = None,
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
     caption, _, number = numbers[node.id].rpartition(" ")
@@ -1172,6 +1263,7 @@ def _render_environment(
             destination=destination,
             node_sources=node_sources,
             targets=targets,
+            sources_base=sources_base,
         )
         for part in (statement, remainder)
     )
