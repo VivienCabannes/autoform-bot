@@ -52,7 +52,9 @@ writes no CI rather than guess a ref: guessing produced projects whose first
 push failed with nothing in the workflow to explain why. When it reports that,
 find the commit the plugin was installed from and pass
 `--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
-Never invent a ref.
+Never invent a ref. It must be a full 40-character commit sha: `init` refuses a
+branch, a tag, or an abbreviated sha, because CI would silently reinstall a
+different Autoform later and break a project that was passing.
 
 The two workflows it writes are `autoform-verify.yml`, which validates the
 Markdown DAG, builds Lean, rejects unfinished or unsafe proofs, and audits

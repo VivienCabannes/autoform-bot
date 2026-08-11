@@ -274,6 +274,26 @@ def test_a_ref_alone_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert f"git+{scaffold_module.DEFAULT_AUTOFORM_SOURCE}@{'2' * 40}" in verify
 
 
+@pytest.mark.parametrize("ref", ["main", "0f018613", "v1.0.0", "2" * 39, ("2" * 39) + "Z"])
+def test_a_mutable_ref_is_refused(ref: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hand-supplying a branch is the bug this gate exists to prevent.
+
+    Setup asks the agent to find the commit the plugin came from. An agent that
+    answers `main` would pin CI to whatever that branch points at next week,
+    which is how projects got a build with no `autoform` command in the first
+    place. The scaffold refuses instead of writing CI that rots.
+    """
+    from autoform_cli import scaffold as scaffold_module
+
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
+    with pytest.raises(scaffold_module.ScaffoldError) as caught:
+        scaffold_module.scaffold_project(tmp_path, title="Finite Flat", autoform_ref=ref)
+
+    assert "40-character commit sha" in str(caught.value)
+    assert not (tmp_path / ".github").exists()
+    assert not (tmp_path / "blueprint").exists()
+
+
 def test_an_explicit_source_overrides_the_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
