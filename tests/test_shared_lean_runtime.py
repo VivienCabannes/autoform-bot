@@ -365,8 +365,8 @@ def test_lsp_diagnostic_formatting_remains_stable():
     )
 
 
-def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(tmp_path, monkeypatch):
-    socket_path = tmp_path / "lean.sock"
+def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_dir, monkeypatch):
+    socket_path = runtime_dir / "lean.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     monkeypatch.setenv("AUTOFORM_MAX_LEAN_PROJECTS", "1")
     clients = [
@@ -415,10 +415,11 @@ def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(tmp_path, 
 
 def test_daemon_outlives_the_separate_process_that_started_it(
     tmp_path,
+    runtime_dir,
     repo_root,
     monkeypatch,
 ):
-    socket_path = tmp_path / "owner.sock"
+    socket_path = runtime_dir / "owner.sock"
     project = make_lake_project(tmp_path, "cold")
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     monkeypatch.setenv("AUTOFORM_MAX_LEAN_PROJECTS", "1")
@@ -461,8 +462,8 @@ def test_daemon_outlives_the_separate_process_that_started_it(
         client.stop()
 
 
-def test_stop_then_immediate_start_is_serialized(tmp_path, monkeypatch):
-    socket_path = tmp_path / "restart.sock"
+def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
+    socket_path = runtime_dir / "restart.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     client = LeanRuntimeClient(socket_path=socket_path, startup_timeout=15)
     first_pid = client.ensure_running()["pid"]
@@ -475,10 +476,10 @@ def test_stop_then_immediate_start_is_serialized(tmp_path, monkeypatch):
         client.stop()
 
 
-def test_new_build_replaces_previous_runtime_at_same_install_path(tmp_path, monkeypatch):
-    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(tmp_path))
+def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
-    old_socket = tmp_path / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
+    old_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
     old_client = LeanRuntimeClient(socket_path=old_socket, startup_timeout=15)
     old_pid = old_client.ensure_running()["pid"]
 
@@ -491,12 +492,12 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(tmp_path, monk
         current.stop()
 
 
-def test_default_cli_stop_finds_a_previous_build(tmp_path, monkeypatch, capsys):
+def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsys):
     from servers import lean_runtime
 
-    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
-    old_socket = tmp_path / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
+    old_socket = runtime_dir / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}-old.sock"
     old_client = LeanRuntimeClient(socket_path=old_socket, startup_timeout=15)
     old_client.ensure_running()
 
@@ -507,8 +508,8 @@ def test_default_cli_stop_finds_a_previous_build(tmp_path, monkeypatch, capsys):
     assert not old_socket.exists()
 
 
-def test_silent_connection_cannot_block_graceful_stop(tmp_path, monkeypatch):
-    socket_path = tmp_path / "silent.sock"
+def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
+    socket_path = runtime_dir / "silent.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
     monkeypatch.setenv("AUTOFORM_RUNTIME_READ_TIMEOUT", "0.2")
     client = LeanRuntimeClient(socket_path=socket_path, startup_timeout=15)
@@ -537,7 +538,7 @@ def test_silent_connection_cannot_block_graceful_stop(tmp_path, monkeypatch):
             thread.join(timeout=3)
 
 
-def test_connected_send_failure_is_never_retried(tmp_path, monkeypatch):
+def test_connected_send_failure_is_never_retried(runtime_dir, monkeypatch):
     from servers import lean_client
 
     class FailingSocket:
@@ -553,7 +554,7 @@ def test_connected_send_failure_is_never_retried(tmp_path, monkeypatch):
         def close(self):
             pass
 
-    client = LeanRuntimeClient(socket_path=tmp_path / "fake.sock")
+    client = LeanRuntimeClient(socket_path=runtime_dir / "fake.sock")
     monkeypatch.setattr(lean_client.socket, "socket", lambda *args: FailingSocket())
     monkeypatch.setattr(
         client,
