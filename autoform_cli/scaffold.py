@@ -10,6 +10,7 @@ fixed, so the tool writes it.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -28,15 +29,23 @@ _DOTTED = {
 
 DEFAULT_AUTOFORM_SOURCE = "https://github.com/facebookresearch/autoform-bot.git"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
-DEFAULT_AUTOFORM_REF = "main"
+
+#: Where `claude plugin install` records the marketplace each plugin came from.
+_PLUGIN_REGISTRY = Path.home() / ".claude" / "plugins" / "known_marketplaces.json"
 
 
-def _git(*args: str) -> str | None:
-    """Read a value from the Autoform checkout this CLI is running out of."""
+def _here() -> Path:
+    """The Autoform directory this CLI is running out of."""
+
+    return Path(__file__).resolve().parent.parent
+
+
+def _git(*args: str, root: Path | None = None) -> str | None:
+    """Read a value from an Autoform checkout, defaulting to this one."""
 
     try:
         done = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parent.parent), *args],
+            ["git", "-C", str(root or _here()), *args],
             capture_output=True,
             text=True,
             timeout=10,
@@ -48,25 +57,64 @@ def _git(*args: str) -> str | None:
     return value if done.returncode == 0 and value else None
 
 
+def _marketplace_checkout() -> Path | None:
+    """The checkout an installed plugin copy was made from, if it is on disk.
+
+    `claude plugin install` copies into
+    ``~/.claude/plugins/cache/<marketplace>/<plugin>/<version>`` from a
+    marketplace it keeps as a real Git checkout, and records where in
+    ``known_marketplaces.json``. That checkout is this code's actual provenance,
+    so reading it is not the guess :func:`plugin_pin` refuses to make.
+
+    Returns ``None`` on anything unexpected: not running from a plugin cache, no
+    registry, no such marketplace, or a location that is not a checkout of
+    Autoform. A wrong answer here is worse than no answer.
+    """
+
+    parts = _here().parts
+    try:
+        cache = len(parts) - 1 - parts[::-1].index("cache")
+    except ValueError:
+        return None
+    if cache + 1 >= len(parts):
+        return None
+    try:
+        registry = json.loads(_PLUGIN_REGISTRY.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entry = registry.get(parts[cache + 1]) if isinstance(registry, dict) else None
+    location = entry.get("installLocation") if isinstance(entry, dict) else None
+    if not isinstance(location, str) or not location:
+        return None
+    checkout = Path(location).expanduser()
+    # Insist it is a checkout of *this* project, not merely a checkout.
+    if not (checkout / ".git").exists():
+        return None
+    if not (checkout / "autoform_cli" / "scaffold.py").is_file():
+        return None
+    return checkout
+
+
 def plugin_pin() -> tuple[str, str]:
     """The Autoform source and commit generated CI should install, if knowable.
 
-    Returns empty strings when it cannot be known. That happens whenever
-    Autoform runs from something other than a Git checkout, which is the normal
-    case for an installed plugin: `claude plugin install` copies the directory
-    without its `.git`.
+    Read from the Autoform checkout this CLI runs out of, or, when there is none
+    because `claude plugin install` copied the directory without its `.git`,
+    from the marketplace checkout that copy was made from. Both are records of
+    where this code came from rather than assumptions about it.
 
-    An earlier version fell back to `facebookresearch/autoform-bot@main`. That
-    commit predates `autoform_cli` entirely, so every project scaffolded through
-    the plugin got CI that installed a build with no `autoform` command and
-    failed at the first step, with nothing in the workflow to explain why. A
-    wrong pin is worse than no pin: guessing here is what made the failure
-    silent.
+    Returns empty strings when neither is available. An earlier version fell
+    back to `facebookresearch/autoform-bot@main` instead. That commit predates
+    `autoform_cli` entirely, so every project scaffolded through the plugin got
+    CI that installed a build with no `autoform` command and failed at the first
+    step, with nothing in the workflow to explain why. A wrong pin is worse than
+    no pin: guessing here is what made the failure silent.
     """
 
-    source = _git("remote", "get-url", "origin")
-    ref = _git("rev-parse", "HEAD")
-    if not source or not ref:
+    root = None if (_here() / ".git").exists() else _marketplace_checkout()
+    source = _git("remote", "get-url", "origin", root=root)
+    ref = _git("rev-parse", "HEAD", root=root)
+    if not source or not ref or not _FULL_SHA.fullmatch(ref):
         return "", ""
     if source.startswith("git@github.com:"):
         source = "https://github.com/" + source[len("git@github.com:") :]
@@ -195,7 +243,6 @@ def scaffold_project(
 
 
 __all__ = [
-    "DEFAULT_AUTOFORM_REF",
     "DEFAULT_AUTOFORM_SOURCE",
     "ScaffoldError",
     "ScaffoldResult",

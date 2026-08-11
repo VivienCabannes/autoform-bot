@@ -314,5 +314,82 @@ def test_an_explicit_source_overrides_the_default(
 def test_plugin_pin_is_empty_outside_a_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
     from autoform_cli import scaffold as scaffold_module
 
-    monkeypatch.setattr(scaffold_module, "_git", lambda *args: None)
+    monkeypatch.setattr(scaffold_module, "_git", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scaffold_module, "_marketplace_checkout", lambda: None)
+    assert scaffold_module.plugin_pin() == ("", "")
+
+
+def _fake_plugin_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Lay out a plugin cache copy and the marketplace checkout behind it."""
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = tmp_path / "src" / "autoform-bot"
+    (checkout / "autoform_cli").mkdir(parents=True)
+    (checkout / "autoform_cli" / "scaffold.py").write_text("", encoding="utf-8")
+    (checkout / ".git").mkdir()
+
+    copied = tmp_path / ".claude/plugins/cache/autoform/autoform/0.5.0/autoform_cli"
+    copied.mkdir(parents=True)
+    monkeypatch.setattr(scaffold_module, "_here", lambda: copied.parent)
+
+    registry = tmp_path / "known_marketplaces.json"
+    registry.write_text(
+        json.dumps({"autoform": {"installLocation": str(checkout)}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(scaffold_module, "_PLUGIN_REGISTRY", registry)
+    return checkout
+
+
+def test_an_installed_plugin_pins_from_the_marketplace_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy has no `.git`, but the checkout it was copied from does.
+
+    Without this, `init` under a plugin can only fail closed, and the operator
+    is asked for a commit that nothing on their machine reports. That is a real
+    provenance record, not the guess `plugin_pin` refuses to make.
+    """
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = _fake_plugin_install(tmp_path, monkeypatch)
+    seen: list[Path | None] = []
+
+    def fake_git(*args: str, root: Path | None = None) -> str | None:
+        seen.append(root)
+        return "git@github.com:owner/autoform-bot.git" if args[0] == "remote" else "3" * 40
+
+    monkeypatch.setattr(scaffold_module, "_git", fake_git)
+
+    assert scaffold_module.plugin_pin() == (
+        "https://github.com/owner/autoform-bot.git",
+        "3" * 40,
+    )
+    assert seen == [checkout, checkout]
+
+
+def test_an_unrelated_marketplace_checkout_is_not_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A location that is not Autoform would pin CI to somebody else's repo."""
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = _fake_plugin_install(tmp_path, monkeypatch)
+    (checkout / "autoform_cli" / "scaffold.py").unlink()
+
+    assert scaffold_module._marketplace_checkout() is None
+
+
+def test_a_branch_in_the_marketplace_checkout_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever the provenance says, only a full sha may reach the workflows."""
+    from autoform_cli import scaffold as scaffold_module
+
+    _fake_plugin_install(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        scaffold_module,
+        "_git",
+        lambda *args, **kwargs: ("https://example.test/a.git" if args[0] == "remote" else "main"),
+    )
+
     assert scaffold_module.plugin_pin() == ("", "")
