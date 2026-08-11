@@ -57,6 +57,22 @@ def _git(*args: str, root: Path | None = None) -> str | None:
     return value if done.returncode == 0 and value else None
 
 
+def _checkout_root(directory: Path) -> Path | None:
+    """*directory* if it is itself the root of a Git checkout, otherwise ``None``.
+
+    ``git -C`` searches upwards, so asking an installed copy for "its" origin
+    answers with whatever repository happens to enclose it. Autoform installed
+    into a project's own virtualenv sits under that project, so the plain
+    question pins the project's CI to the project, at the project's HEAD --
+    a pin that is both wrong and confidently specific.
+    """
+
+    top = _git("rev-parse", "--show-toplevel", root=directory)
+    if top is None:
+        return None
+    return directory if Path(top).resolve() == directory.resolve() else None
+
+
 def _marketplace_checkout() -> Path | None:
     """The checkout an installed plugin copy was made from, if it is on disk.
 
@@ -87,12 +103,11 @@ def _marketplace_checkout() -> Path | None:
     if not isinstance(location, str) or not location:
         return None
     checkout = Path(location).expanduser()
-    # Insist it is a checkout of *this* project, not merely a checkout.
-    if not (checkout / ".git").exists():
-        return None
+    # Insist it is a checkout of *this* project, and is itself the root of one
+    # rather than a directory sitting somewhere inside an unrelated repository.
     if not (checkout / "autoform_cli" / "scaffold.py").is_file():
         return None
-    return checkout
+    return _checkout_root(checkout)
 
 
 def plugin_pin() -> tuple[str, str]:
@@ -101,7 +116,9 @@ def plugin_pin() -> tuple[str, str]:
     Read from the Autoform checkout this CLI runs out of, or, when there is none
     because `claude plugin install` copied the directory without its `.git`,
     from the marketplace checkout that copy was made from. Both are records of
-    where this code came from rather than assumptions about it.
+    where this code came from rather than assumptions about it, and both must be
+    the root of a checkout: a directory that merely sits inside somebody else's
+    repository answers questions about that repository.
 
     Returns empty strings when neither is available. An earlier version fell
     back to `facebookresearch/autoform-bot@main` instead. That commit predates
@@ -111,7 +128,9 @@ def plugin_pin() -> tuple[str, str]:
     no pin: guessing here is what made the failure silent.
     """
 
-    root = None if (_here() / ".git").exists() else _marketplace_checkout()
+    root = _checkout_root(_here()) or _marketplace_checkout()
+    if root is None:
+        return "", ""
     source = _git("remote", "get-url", "origin", root=root)
     ref = _git("rev-parse", "HEAD", root=root)
     if not source or not ref or not _FULL_SHA.fullmatch(ref):
