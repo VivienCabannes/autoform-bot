@@ -10,6 +10,7 @@ fixed, so the tool writes it.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ _DOTTED = {
 }
 
 DEFAULT_AUTOFORM_SOURCE = "https://github.com/facebookresearch/autoform-bot.git"
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
 DEFAULT_AUTOFORM_REF = "main"
 
 
@@ -139,6 +141,15 @@ def scaffold_project(
     root = requested.resolve()
     if root.exists() and not root.is_dir():
         issues.append(f"target exists and is not a directory: {root}")
+    # A branch name or an abbreviated sha is the same silent failure this
+    # gate exists to prevent, just supplied by hand: CI would reinstall a
+    # different Autoform later and break a project that was passing.
+    given_ref = autoform_ref.strip()
+    if given_ref and not _FULL_SHA.fullmatch(given_ref):
+        issues.append(
+            f"--autoform-ref must be a full 40-character commit sha, not {given_ref!r}; "
+            "branches and abbreviated shas do not stay put"
+        )
     if issues:
         raise ScaffoldError(issues)
 
