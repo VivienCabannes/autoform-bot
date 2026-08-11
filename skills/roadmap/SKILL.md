@@ -57,7 +57,10 @@ mathematics.
    for every definition or theorem used in the plan. Work from the source text;
    for large sources, use targeted lookups for a named result or definition and
    record the exact passage rather than relying on memory. Surface prerequisites
-   not covered by the confirmed sources instead of inventing them.
+   not covered by the confirmed sources instead of inventing them. These notes
+   are vault material, not chapters: the site does not publish them, and a
+   statement's `## Sources` list is rewritten to the file in the repository, so
+   write them for a reader with the repository open.
 2. Write the high-level direction and milestones under `blueprint/roadmap/`.
    Group milestones by coherent mathematical significance, not by source
    section size.

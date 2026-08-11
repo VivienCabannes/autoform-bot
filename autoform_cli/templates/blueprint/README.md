@@ -7,4 +7,8 @@
   dependencies.
 - [Coverage](coverage/README.md) — what counts as done, and what is out of
   scope.
-- [Sources](sources/) — the reference material every statement is grounded in.
+
+<!-- Reference material goes in sources/. It is vault material rather than a
+     chapter, so the site does not publish it: a statement's "## Sources" list
+     links to the file in the repository instead. -->
+

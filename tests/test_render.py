@@ -439,6 +439,84 @@ def test_git_remotes_normalize_to_web_urls(remote: str, expected: str | None) ->
     assert _normalize_remote(remote) == expected
 
 
+def _with_source_notes(tmp_path: Path) -> Path:
+    """A project whose `## Sources` list cites a note under `blueprint/sources`."""
+    project = _project(tmp_path)
+    sources = project / "blueprint" / "sources"
+    sources.mkdir()
+    (sources / "paper.md").write_text(
+        "---\n---\n\n# Paper\n\nTranscribed statements from the paper.\n", encoding="utf-8"
+    )
+    (project / "blueprint" / "roadmap" / "top.md").write_text(
+        "---\ndeclaration: theorem\nstatement: formalized\nproof: formalized\n"
+        "lean: Project.top\n---\n\n"
+        "# Top\n\nThe main result.\n\n## Sources\n\n"
+        "- [Paper](../sources/paper.md#lemma-3)\n\n"
+        "## Depends on\n\n- [Base](base.md)\n",
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_source_notes_leave_the_site_for_the_repository(tmp_path: Path) -> None:
+    """Publishing them put the same transcription at a URL nothing links to.
+
+    A `## Sources` entry names the paper the statement came from. Rendering
+    that note as a site page gave the book a third surface, neither chapter nor
+    paper, that every statement pointed at. The note stays in the vault and the
+    site links to it in the repository.
+    """
+    project = _with_source_notes(tmp_path)
+    out = tmp_path / "out"
+
+    render_site(
+        project / "blueprint",
+        out,
+        lean_root=project,
+        repository_url="https://github.com/owner/repo",
+        ref="cafe1234",
+    )
+
+    assert not (out / "sources").exists()
+    assert not (out / "wiki/sources").exists()
+    expected = "https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper.md#lemma-3"
+    assert expected in (out / "roadmap/README.md").read_text(encoding="utf-8")
+    # The vault mirror is verbatim, but a link left pointing at a page that is
+    # no longer published would simply be dead.
+    assert expected in (out / "wiki/roadmap/top.md").read_text(encoding="utf-8")
+
+
+def test_source_notes_stay_published_when_there_is_nowhere_to_send_readers(
+    tmp_path: Path,
+) -> None:
+    """Without repository coordinates, dropping the pages would strand the links."""
+    project = _with_source_notes(tmp_path)
+    out = tmp_path / "out"
+
+    render_site(project / "blueprint", out, lean_root=project, repository_url="", ref="")
+
+    assert (out / "sources/paper.md").is_file()
+    assert (out / "wiki/sources/paper.md").is_file()
+    assert "github.com" not in (out / "roadmap/README.md").read_text(encoding="utf-8")
+
+
+def test_only_source_links_are_rewritten_in_the_vault_mirror(tmp_path: Path) -> None:
+    """The mirror's promise is that it is the file an author edits."""
+    project = _with_source_notes(tmp_path)
+    out = tmp_path / "out"
+
+    render_site(
+        project / "blueprint",
+        out,
+        lean_root=project,
+        repository_url="https://github.com/owner/repo",
+        ref="cafe1234",
+    )
+
+    mirrored = (out / "wiki/roadmap/top.md").read_text(encoding="utf-8")
+    assert "- [Base](base.md)" in mirrored
+
+
 
 
 
