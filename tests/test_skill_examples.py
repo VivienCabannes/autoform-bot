@@ -219,9 +219,13 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert not (site / "progress.md").exists()
     assert not (site / "book.md").exists()
     overview = (site / "README.md").read_text(encoding="utf-8")
-    assert "3 definitions · 4 results" in overview
-    assert "<strong>5</strong> fully proved" in overview
+    # The landing page states progress as figures; the chapters keep the strip.
+    assert "5 of 7 items settled" in overview
+    assert ">71%<" in overview
     assert "bp-progress-link" not in overview
+    # A chapter strip counts that chapter, so this is 4 of the project's 5.
+    milestone = (site / "roadmap/infimum-loss/README.md").read_text(encoding="utf-8")
+    assert "<strong>4</strong> fully proved" in milestone
     coverage = (site / "coverage/README.md").read_text(encoding="utf-8")
     assert "Experiments and narrative material" in coverage
     graph_page = (site / "dependencies.md").read_text(encoding="utf-8")

@@ -91,6 +91,122 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert '"dependencies/chapters/roadmap.html"' in project_map
 
 
+def test_a_graph_page_hides_its_legend_behind_an_icon(tmp_path: Path) -> None:
+    """Every graph page carried a disclosure captioned "What the colours mean".
+
+    That is a headline-sized row, under every diagram, for a question a reader
+    asks once. The legend is the same; only its trigger shrank. It has to open
+    without script and by keyboard, so it is a real button revealed on
+    :focus-within rather than a hover-only span.
+    """
+    _render(tmp_path)
+    page = (tmp_path / "out/dependencies/chapters/roadmap.md").read_text(encoding="utf-8")
+    css = (tmp_path / "out/stylesheets/blueprint.css").read_text(encoding="utf-8")
+
+    assert "<summary>What the colours mean</summary>" not in page
+    assert '<details class="bp-legend"' not in page
+    assert 'class="bp-legend-icon"' in page
+    # The legend itself is still there, just not laid out on the page.
+    assert 'class="bp-legend-grid"' in page
+    assert page.index("bp-legend-icon") < page.index("```mermaid")
+    assert "<button" in page and 'aria-describedby="bp-legend-note"' in page
+    assert ".bp-legend-tip:focus-within .bp-legend-note" in css
+
+
+def test_the_structure_page_shows_the_tree_not_the_content(tmp_path: Path) -> None:
+    """Auditing layout needs directories; every chapter's file is `README.md`.
+
+    Listing filenames alone puts three indistinguishable `README.md` rows on
+    the page, which is exactly the question the reader came to answer.
+    """
+    _render(tmp_path)
+    page = (tmp_path / "out/structure.md").read_text(encoding="utf-8")
+
+    assert "<strong>roadmap/</strong>" in page
+    assert "<strong>blueprint/</strong>" in page
+    # Files carry their title and status, and link to the statement itself.
+    assert "top.md" in page and "bp-tree-title'>Top<" in page
+    assert "roadmap/README.md#top" in page
+    assert 'bp-swatch-fully_proved"' in page
+    # Prose that was never meant to be a node is not an anomaly.
+    assert "not in the graph" not in page
+    assert "bp-tree-warn" not in page
+
+
+def test_the_structure_page_names_a_vault_with_no_chapters(tmp_path: Path) -> None:
+    """The fault this page exists for: articles heaped directly under roadmap/.
+
+    It parses, `autoform check` passes, and the book publishes as one
+    undivided list, so no rendered view of the content reveals it.
+    """
+    project = tmp_path / "flat"
+    roadmap = project / "blueprint" / "roadmap"
+    roadmap.mkdir(parents=True)
+    (project / "blueprint" / "README.md").write_text("---\n---\n\n# Flat\n", encoding="utf-8")
+    (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
+    for name in ("a", "b", "c", "d"):
+        (roadmap / f"{name}.md").write_text(
+            f"---\ndeclaration: theorem\n---\n\n# Result {name}\n", encoding="utf-8"
+        )
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    page = (tmp_path / "out/structure.md").read_text(encoding="utf-8")
+    assert "bp-tree-warn" in page
+    assert "publishes as one undivided list" in page
+
+
+def test_the_site_publishes_no_second_copy_of_the_vault(tmp_path: Path) -> None:
+    """One address per statement.
+
+    The site used to mirror the authored Markdown under `wiki/`, which gave
+    every article a second URL holding the same words. What that was for is
+    already covered: an absorbed leaf keeps an anchor on its chapter page, and
+    each statement links to its own file in the repository, where the raw text
+    comes with history and an edit button.
+    """
+    _render(tmp_path)
+    out = tmp_path / "out"
+    chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
+
+    assert not (out / "wiki").exists()
+    assert "Markdown source" not in (out / "SUMMARY.md").read_text(encoding="utf-8")
+    # The two things the mirror was there for.
+    assert 'id="top"' in chapter
+    assert "blueprint/roadmap/top.md" in chapter
+
+
+def test_the_vault_graph_keeps_a_visible_legend(tmp_path: Path) -> None:
+    """Obsidian never loads this stylesheet, so a hover note is unreachable there."""
+    from autoform_cli.visualize import export_graph
+
+    project = _project(tmp_path)
+    document = export_graph(project / "blueprint").read_text(encoding="utf-8")
+
+    assert "bp-legend-icon" not in document
+    assert "## Legend" in document
+    assert 'class="bp-legend-grid"' in document
+
+
+def test_the_site_carries_its_own_mark(tmp_path: Path) -> None:
+    """The logo is generated, so a project never has to commit a binary for it.
+
+    Both `logo` and `favicon` in the template name this path, so a build that
+    stopped writing it would fall back to Material's default without failing.
+    """
+    import xml.etree.ElementTree as ElementTree
+
+    _render(tmp_path)
+    mark = tmp_path / "out/assets/autoform.svg"
+
+    assert mark.is_file()
+    root = ElementTree.fromstring(mark.read_text(encoding="utf-8"))
+    assert root.get("viewBox") == "0 0 48 48"
+    # Square, so it is not letterboxed in the header or the favicon slot.
+    assert root.get("width") == root.get("height")
+    assert root.find("{http://www.w3.org/2000/svg}title").text == "Autoform"
+
+
 def _chapter_map_links(page: Path) -> set[str]:
     return set(re.findall(r'"(dependencies/chapters/[^"]+)\.html"', page.read_text("utf-8")))
 
@@ -209,11 +325,35 @@ def test_overview_carries_the_counts_without_a_separate_progress_page(tmp_path: 
     _render(tmp_path)
     overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
 
-    assert overview.index("# Overview") < overview.index('class="bp-progress-overview"')
-    assert "1 definition · 1 result" in overview
+    # The landing page leads with the figures; a chapter keeps the compact strip.
+    assert overview.index("bp-hero-title") < overview.index("bp-hero-figures")
+    assert 'class="bp-figure-value"' in overview
+    chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
+    assert "1 definition · 1 result" in chapter
     # No page to send the reader to, so no link out of the summary.
     assert "bp-progress-link" not in overview
     assert not (tmp_path / "out/progress.md").exists()
+
+
+def test_the_landing_page_is_the_hero_and_the_map_and_nothing_else(tmp_path: Path) -> None:
+    """A blueprint's subject is the shape of the project, not its front matter.
+
+    The map used to sit below the authored prose and the status breakdown,
+    which put the one thing a visitor comes for last on the page. The prose
+    itself was a contents list and links to the roadmap, the coverage notes and
+    the dependency view, all of which are tabs.
+    """
+    _render(tmp_path)
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+
+    # The sidebar would hold a single "Home" entry here, so the page drops it.
+    assert "  - navigation" in overview.split("---")[1]
+    assert overview.index("bp-hero") < overview.index('class="bp-map"')
+    assert "bp-landing-prose" not in overview
+    assert "## Contents" not in overview
+    # The legend travels with the map instead of becoming a section of its own.
+    assert "## Status breakdown" not in overview
+    assert overview.index("bp-map-legend") > overview.index("bp-map-head")
 
 
 def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp_path: Path) -> None:
@@ -232,19 +372,44 @@ def test_book_navigation_is_bottom_only_and_never_crosses_into_project_views(tmp
 
 
 def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> None:
+    """A node stops being a page once its chapter absorbs it, so links move.
+
+    Checked from the coverage page because the landing page no longer prints
+    the authored body; the rewrite itself is the same code path either way.
+    """
     project = _project(tmp_path)
-    (project / "blueprint/README.md").write_text(
-        "---\nkind: blueprint\n---\n\n# Overview\n\n"
-        "- [Roadmap](roadmap/README.md)\n- [Top](roadmap/top.md)\n",
-        encoding="utf-8",
+    coverage = project / "blueprint" / "coverage"
+    coverage.mkdir()
+    (coverage / "README.md").write_text(
+        "---\n---\n\n# Coverage\n\nIn scope: [Top](../roadmap/top.md).\n", encoding="utf-8"
     )
     render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
+    published = (tmp_path / "out/coverage/README.md").read_text(encoding="utf-8")
     overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
     chapter = (tmp_path / "out/roadmap/README.md").read_text(encoding="utf-8")
-    assert "[Top](roadmap/README.md#top)" in overview
+    assert "[Top](../roadmap/README.md#top)" in published
     assert "bp-book-nav" not in overview
     assert "bp-book-nav" not in chapter
+
+
+def test_coverage_is_reachable_once_the_landing_page_stops_listing_it(
+    tmp_path: Path,
+) -> None:
+    """Dropping the authored body would otherwise strand the coverage contract.
+
+    Nothing else linked it: it is not a chapter, so the book order never picks
+    it up, and the landing page's prose was its only route.
+    """
+    project = _project(tmp_path)
+    coverage = project / "blueprint" / "coverage"
+    coverage.mkdir()
+    (coverage / "README.md").write_text("---\n---\n\n# Coverage\n\nWhat counts.\n", "utf-8")
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    nav = (tmp_path / "out/SUMMARY.md").read_text(encoding="utf-8")
+    assert "[Coverage](coverage/README.md)" in nav
 
 
 def test_a_hoisted_body_keeps_its_other_links_working(tmp_path: Path) -> None:
@@ -295,13 +460,17 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     css = (tmp_path / "out/stylesheets/blueprint.css").read_text(encoding="utf-8")
     script = (tmp_path / "out/javascripts/blueprint-mermaid.js").read_text(encoding="utf-8")
 
-    # Light follows the Lean community blog; dark is a terminal palette, and
-    # both hang off the theme's own data-bs-theme toggle.
-    assert "Merriweather" in css and "Open Sans" in css and "Source Code Pro" in css
-    assert "hsl(210, 100%, 30%)" in css
+    # Facebook's surface greys and Meta blue, not Material's defaults, and both
+    # schemes hang off the theme's own data-md-color-scheme attribute.
+    assert "Plus Jakarta Sans" in css and "JetBrains Mono" in css
+    assert "--bp-link: #0064E0" in css
     assert "[data-md-color-scheme=slate]" in css
-    assert "--bp-link: #58a6ff" in css
-    assert "--bp-link-hover: #79c0ff" in css
+    assert "--bp-link: #2D88FF" in css
+    assert "--bp-surface: #242526" in css
+    assert "background-color: #18191A" in css
+    # The brand sweep is defined once and reused, rather than pasted per rule.
+    assert css.count("--bp-sweep:") == 1
+    assert css.count("var(--bp-sweep)") >= 3
     for state in STATES:
         assert f".bp-{state.key} .bp-mark {{ color: {state.stroke}; }}" in css
         assert f"[data-md-color-scheme=slate] .bp-{state.key} .bp-mark" in css
@@ -321,8 +490,9 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     for state in STATES:
         assert f"classDef {state.key} fill:{state.fill}," in script
         assert f"classDef {state.key} fill:{state.dark_fill}," in script
-    assert "classDef scope fill:#EEF6FF" in script
-    assert "classDef scope fill:#161B22" in script
+    # Both palettes ship: the light chapter box and the dark one.
+    assert "classDef scope fill:#EBF2FE" in script
+    assert "classDef scope fill:#1C1D1F" in script
     assert "classDef boundary" in script
     assert "classDef focus" in script
 
@@ -524,12 +694,8 @@ def test_source_notes_leave_the_site_for_the_repository(tmp_path: Path) -> None:
     )
 
     assert not (out / "sources").exists()
-    assert not (out / "wiki/sources").exists()
     expected = "https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper.md#lemma-3"
     assert expected in (out / "roadmap/README.md").read_text(encoding="utf-8")
-    # The vault mirror is verbatim, but a link left pointing at a page that is
-    # no longer published would simply be dead.
-    assert expected in (out / "wiki/roadmap/top.md").read_text(encoding="utf-8")
 
 
 def test_source_notes_stay_published_when_there_is_nowhere_to_send_readers(
@@ -547,25 +713,7 @@ def test_source_notes_stay_published_when_there_is_nowhere_to_send_readers(
     render_site(project / "blueprint", out, lean_root=project, repository_url="", ref="")
 
     assert (out / "sources/paper.md").is_file()
-    assert (out / "wiki/sources/paper.md").is_file()
     assert "github.com" not in (out / "roadmap/README.md").read_text(encoding="utf-8")
-
-
-def test_only_source_links_are_rewritten_in_the_vault_mirror(tmp_path: Path) -> None:
-    """The mirror's promise is that it is the file an author edits."""
-    project = _with_source_notes(tmp_path)
-    out = tmp_path / "out"
-
-    render_site(
-        project / "blueprint",
-        out,
-        lean_root=project,
-        repository_url="https://github.com/owner/repo",
-        ref="cafe1234",
-    )
-
-    mirrored = (out / "wiki/roadmap/top.md").read_text(encoding="utf-8")
-    assert "- [Base](base.md)" in mirrored
 
 
 

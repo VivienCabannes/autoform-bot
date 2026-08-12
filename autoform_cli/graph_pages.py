@@ -236,10 +236,10 @@ def _write_page(
     ]
     if navigation:
         sections.extend([navigation, ""])
-    sections.extend([lead, "", diagram, ""])
-    legend = mermaid.render_legend(statuses)
-    if legend:
-        sections.extend(['<details class="bp-legend" markdown="1">', "<summary>What the colours mean</summary>", "", legend, "", "</details>", ""])
+    # The legend rides on the lead sentence rather than sitting under the
+    # diagram: it answers a question the reader asks once, not on every page.
+    tip = mermaid.render_legend_tip(statuses)
+    sections.extend([f"{lead} {tip}".rstrip(), "", diagram, ""])
     if extra:
         sections.extend([extra, ""])
     page.parent.mkdir(parents=True, exist_ok=True)
