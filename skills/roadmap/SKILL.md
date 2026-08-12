@@ -14,7 +14,8 @@ description: >-
 
 Turn an agreed mathematical specification into a human-editable roadmap and a
 DAG of pull-request-sized formalization units. Keep Markdown as the sole source
-of truth.
+of truth. Use `internal/runbooks/planning.md` for the preserved detailed planning
+workflow when this concise skill needs deeper operational guidance.
 
 ## Discover prior work and sources
 
@@ -65,7 +66,13 @@ mathematics.
    Group milestones by coherent mathematical significance, not by source
    section size.
    A chapter page needs no frontmatter at all: its H1 is the title and its
-   position in the tree is its identity. Treat `blueprint/README.md` and the roadmap pages it
+   position in the tree is its identity. Write it as
+   `roadmap/<chapter>/README.md`, never as a Markdown file beside the
+   directory: containment is inferred from nested READMEs, so a sibling
+   chapter page leaves every article in that directory hanging off the root
+   and publishes a book with no chapters. `autoform check` refuses a chapter
+   directory with no chapter page, so a vault in that shape never renders.
+   Treat `blueprint/README.md` and the roadmap pages it
    links as an ordered mathematical book: link meaningful chapter pages in
    their intended reading order. The renderer derives bottom-of-page previous
    and next chapter links from this Markdown structure, so do not maintain a
@@ -80,7 +87,11 @@ mathematics.
    milestone under `blueprint/roadmap/**/*.md`. A node may contain several
    supporting definitions or statements when they should land and be reviewed
    together, but it must identify one unique main result that determines when
-   the node is complete. Its path relative to `roadmap/`, without `.md`, is its
+   the node is complete. Nothing authored in an article predicts how much Lean
+   it will take, so "pull-request-sized" cannot be checked up front;
+   `autoform audit --lean-root` reports `node-too-large` afterwards, against
+   the project's own median. Read that finding as a decomposition bug in this
+   roadmap rather than a Lean problem, and split the node. Its path relative to `roadmap/`, without `.md`, is its
    stable ID. Give it exactly one H1, a `declaration` naming the kind of Lean
    artifact, a source-grounded statement or proof sketch, and a
    `## Depends on` section.

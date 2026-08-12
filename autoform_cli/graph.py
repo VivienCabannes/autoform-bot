@@ -234,7 +234,45 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
             continue
         sources.append(_NodeSource(node_id, canonical, text))
 
+    issues.extend(_chapter_issues(roadmap_root))
     return sources, issues
+
+
+def _chapter_issues(roadmap_root: Path) -> list[str]:
+    """Reject a chapter directory that names no chapter.
+
+    Containment is inferred from nested ``README.md`` articles, so a directory
+    without one is invisible to the hierarchy: its pages attach to the root and
+    the published book has no chapters at all. Every node still parses and
+    every link still resolves, which is why this has to be asserted separately
+    -- a real project reached publication with 71 of 72 articles at the root
+    and a clean ``autoform check``.
+
+    A load failure rather than an audit finding: audit is advisory, the
+    generated CI never runs it, and it reports after the fact. The layout
+    decides what the book is, so it belongs at the gate every author and both
+    workflows already pass through.
+
+    Only directories directly under ``roadmap/`` are chapters. Deeper ones --
+    the ``definitions/`` and ``theorems/`` buckets a chapter files its articles
+    into -- are a filing convention, and are deliberately left alone.
+    """
+
+    try:
+        chapters = sorted(path for path in roadmap_root.iterdir() if path.is_dir())
+    except OSError:
+        return []
+    issues = []
+    for chapter in chapters:
+        names = [path.name for path in chapter.glob("*.md") if path.is_file()]
+        if not names or any(name.casefold() == "readme.md" for name in names):
+            continue
+        issues.append(
+            f"{chapter.name}: chapter directory holds {len(names)} article(s) but no "
+            f"README.md, so they attach to the roadmap root instead of a chapter; "
+            f"add {chapter.name}/README.md with the chapter's H1 title"
+        )
+    return issues
 
 
 def _article_id(path: Path, roadmap_root: Path) -> str:

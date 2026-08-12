@@ -217,6 +217,38 @@ material without escaping the blueprint. Coverage files are checked for broken
 links and explicitly declared gaps. With `--lean-root`, local declaration names
 and declaration kinds are checked against the Lean source index.
 
+### Structure
+
+Containment is inferred from nested `README.md` articles, so a chapter
+directory without one is invisible to the hierarchy: its pages attach to the
+roadmap root and the book loses a level. `missing-chapter-article` reports a
+directory directly under `roadmap/` that holds articles but names no chapter.
+Deeper directories (the `definitions/` and `theorems/` buckets the bundled
+example uses) are a filing convention inside a chapter and are not checked.
+`overfull-container` reports an article with more than 24 direct children,
+which is a table of contents rather than a chapter. Both defects leave a valid
+graph, which is why they need their own checks rather than falling out of
+`autoform check`.
+
+### Node size
+
+`node-too-large` is retrospective and needs `--lean-root`: it measures the
+source span of a node's resolved `lean:` declarations, from each declaration's
+first line to the line before the next one. A node is reported only once it
+clears both 200 lines and four times this project's own median, so a project
+whose units are uniformly long is measured against itself rather than gated on
+an imported norm, and a project with too few finished nodes to have a
+meaningful median cannot clear the multiple at all. Every measurement appears
+in the finding's reason, so `--json` over a finished project is also the
+calibration corpus for the threshold.
+
+Nothing authored in an article predicts this. On the 43 finished nodes of
+[`phulin/finite-flat`](https://github.com/phulin/finite-flat), prose length
+correlates with realized Lean length at r = -0.03 and prerequisite count at
+r = 0.25; its largest node is 1344 lines of Lean behind 66 words of prose and a
+single declaration name. Pre-formalization size estimates were considered and
+rejected on that evidence.
+
 The audit API also accepts an already compiled graph. Future orchestration may
 turn its findings into private work items, but the audit itself never enqueues
 work, stamps articles, or creates another graph artifact.
@@ -229,6 +261,12 @@ leases may be acquired; live peer leases are refused. Malformed or unreadable
 refs are unverifiable and may not be acquired, renewed, released, or removed by
 cleanup. A heartbeat verifies ownership on entry and permanently records any
 later refusal or transport uncertainty as lost ownership.
+
+A claim key is a slug and digest of any string, not a validated node id, so a
+shared resource is locked the same way a node is. Parallel agents get one Git
+worktree each and serialize `lake build` behind a `lake-build` claim, because
+builds share the elan toolchain and the Mathlib cache even when the checkouts
+are separate.
 
 Claims are temporary operational state, never article frontmatter. Future
 Deicyde workers may share this protocol, but their current continue-uncoordinated

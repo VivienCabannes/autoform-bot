@@ -17,7 +17,8 @@ MkDocs, CI, and optionally publication. It does not scope sources, choose
 theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
 Inspect before writing and preserve existing Lean, Markdown, workflow, and
-ignore files. Infer safe local defaults from the request and repository. If a
+ignore files. Use `scripts/workspace_inspector.py` when auditing an existing
+Lean workspace. Infer safe local defaults from the request and repository. If a
 material choice is missing, ask once for the run type (new, repair, or inspect),
 UpperCamelCase package name, target directory, and whether publication is
 wanted. Without explicit publication approval, make no remote changes. Setup
@@ -29,6 +30,14 @@ as a concrete setup example. Reuse its structure selectively: rename the Lean
 package, check the current matching stable Lean/Mathlib release, update branch
 and immutable workflow pins, and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
+
+For a new repository, require a target directory that does not already exist and
+bootstrap the Lean/Mathlib shell with the plugin's internal helper:
+
+```bash
+bash "<AUTOFORM_PLUGIN_ROOT>/scripts/make_project.sh" \
+  <ProjectName> [target-dir]
+```
 
 For a new or incomplete repository:
 
