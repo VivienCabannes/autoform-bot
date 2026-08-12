@@ -365,3 +365,23 @@ def test_a_filing_bucket_inside_a_chapter_is_left_alone(tmp_path: Path) -> None:
     graph = load_graph(tmp_path / "blueprint")
 
     assert "chapter/theorems/result" in graph.nodes
+
+
+def test_a_chapter_whose_articles_are_all_in_buckets_is_still_refused(tmp_path: Path) -> None:
+    """Counting only direct children let the whole fault back through.
+
+    `orphan/theorems/leaf.md` with nothing beside it leaves `orphan/` with no
+    direct Markdown at all, which read as an empty directory. The article then
+    attached to the roadmap root and never reached the generated nav.
+    """
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    (roadmap / "orphan" / "theorems").mkdir(parents=True)
+    (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
+    (roadmap / "orphan" / "theorems" / "leaf.md").write_text(
+        "---\ndeclaration: theorem\n---\n\n# Leaf\n", encoding="utf-8"
+    )
+
+    with pytest.raises(GraphValidationError) as caught:
+        load_graph(tmp_path / "blueprint")
+
+    assert "orphan: chapter directory holds 1 article(s) but no README.md" in str(caught.value)

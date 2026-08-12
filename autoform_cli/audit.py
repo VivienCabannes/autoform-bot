@@ -37,6 +37,8 @@ _COVERAGE_GAP = re.compile(
 )
 _EXTERNAL_SCHEMES = frozenset({"http", "https"})
 _MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
+#: An explicit `{#id}` from attr_list, which MkDocs uses verbatim.
+_ATTR_LIST_ID = re.compile(r"\{#([^}\s]+)\}\s*$")
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -362,7 +364,16 @@ def _markdown_anchors(path: Path) -> set[str]:
         heading = _HEADING.match(line)
         if heading is None:
             continue
-        base = _MARKDOWN_ANCHOR_PUNCTUATION.sub("", heading.group(2).strip().casefold())
+        title = heading.group(2).strip()
+        # `attr_list` is enabled in the generated mkdocs.yml, so an explicit
+        # `{#id}` is what MkDocs renders and what a link must match. Deriving
+        # the slug from the heading text regardless reported a working anchor
+        # as missing.
+        explicit = _ATTR_LIST_ID.search(title)
+        if explicit is not None:
+            anchors.add(explicit.group(1))
+            continue
+        base = _MARKDOWN_ANCHOR_PUNCTUATION.sub("", title.casefold())
         base = re.sub(r"\s+", "-", base).strip("-")
         if not base:
             continue

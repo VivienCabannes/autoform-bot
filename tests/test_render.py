@@ -716,9 +716,60 @@ def test_source_notes_stay_published_when_there_is_nowhere_to_send_readers(
     assert "github.com" not in (out / "roadmap/README.md").read_text(encoding="utf-8")
 
 
+def test_permalinks_are_relative_to_the_repository_not_the_vaults_parent(
+    tmp_path: Path,
+) -> None:
+    """A blueprint at <repo>/docs/blueprint was described as <repo>/blueprint.
+
+    Every generated permalink dropped the intermediate directory and 404'd.
+    """
+    repo = tmp_path / "repo"
+    project = repo / "docs"
+    project.mkdir(parents=True)
+    inner = _project(project)  # writes into <repo>/docs/project/blueprint
+    out = tmp_path / "out"
+
+    render_site(
+        inner / "blueprint",
+        out,
+        lean_root=repo,
+        repository_url="https://github.com/owner/repo",
+        ref="cafe1234",
+    )
+
+    chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
+    assert "blob/cafe1234/docs/project/blueprint/roadmap/top.md" in chapter
+    assert "blob/cafe1234/blueprint/roadmap/top.md" not in chapter
 
 
+def test_reference_style_links_are_rewritten_with_the_inline_ones(tmp_path: Path) -> None:
+    """`[Paper][paper]` resolves through a definition the rewrite never saw.
 
+    Only inline links were rewritten, so the definition kept naming a source
+    page that is no longer published and the rendered link dangled. Placed on
+    the chapter page, which is published as authored.
+    """
+    project = _project(tmp_path)
+    sources = project / "blueprint" / "sources"
+    sources.mkdir()
+    (sources / "paper.md").write_text("---\n---\n\n# Paper\n", encoding="utf-8")
+    roadmap = project / "blueprint" / "roadmap" / "README.md"
+    roadmap.write_text(
+        roadmap.read_text(encoding="utf-8") + "\nGrounded in [Paper][paper].\n\n"
+        "[paper]: ../sources/paper.md\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
 
+    render_site(
+        project / "blueprint",
+        out,
+        lean_root=project,
+        repository_url="https://github.com/owner/repo",
+        ref="cafe1234",
+    )
 
-
+    chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
+    expected = "[paper]: https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper.md"
+    assert expected in chapter
+    assert "[paper]: ../sources/paper.md" not in chapter

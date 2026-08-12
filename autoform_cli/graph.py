@@ -255,7 +255,14 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
 
     Only directories directly under ``roadmap/`` are chapters. Deeper ones --
     the ``definitions/`` and ``theorems/`` buckets a chapter files its articles
-    into -- are a filing convention, and are deliberately left alone.
+    into -- are a filing convention, and need no chapter page of their own.
+
+    The count is recursive even though the chapter page is not. A chapter whose
+    articles all sit in those buckets, ``orphan/theorems/leaf.md`` with nothing
+    beside it, has no direct Markdown at all; counting only direct children
+    read that as an empty directory and let exactly the layout this rejects
+    through, with the articles attaching to the root and never reaching the
+    generated nav.
     """
 
     try:
@@ -264,9 +271,14 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
         return []
     issues = []
     for chapter in chapters:
-        names = [path.name for path in chapter.glob("*.md") if path.is_file()]
-        if not names or any(name.casefold() == "readme.md" for name in names):
+        articles = [path for path in chapter.rglob("*.md") if path.is_file()]
+        if not articles:
             continue
+        if (chapter / "README.md").is_file() or any(
+            path.name.casefold() == "readme.md" for path in chapter.glob("*.md")
+        ):
+            continue
+        names = articles
         issues.append(
             f"{chapter.name}: chapter directory holds {len(names)} article(s) but no "
             f"README.md, so they attach to the roadmap root instead of a chapter; "

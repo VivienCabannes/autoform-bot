@@ -135,7 +135,8 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
   --output site-src --lean-root . --require-declarations
-uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
+uv run --with mkdocs --with mkdocs-material --with mkdocs-literate-nav \
+  --with pymdown-extensions mkdocs build --strict
 ```
 
 Drop `--require-declarations` when reviewing work in progress, where a

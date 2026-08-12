@@ -11,4 +11,3 @@
 <!-- Reference material goes in sources/. It is vault material rather than a
      chapter, so the site does not publish it: a statement's "## Sources" list
      links to the file in the repository instead. -->
-

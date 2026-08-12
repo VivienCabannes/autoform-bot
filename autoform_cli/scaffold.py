@@ -177,10 +177,45 @@ def _destination(relative: str) -> str:
     return relative
 
 
+def _yaml_scalar(value: str) -> str:
+    """Quote *value* so it survives being pasted into a YAML document.
+
+    Substitutions land in `mkdocs.yml` as raw text, so a title containing a
+    colon-space -- `Algebra: Foundations` -- ends the key and makes the file
+    parse as a nested mapping, which `mkdocs build --strict` rejects with
+    "mapping values are not allowed here". Titles like that are ordinary.
+    """
+    if value == "":
+        return '""'
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+#: Substitutions that land in YAML and so have to be quoted as scalars. The
+#: rest are pasted into Markdown and workflow shell lines, where quoting would
+#: show up in the output.
+_YAML_VALUED = frozenset({"PROJECT_TITLE_YAML", "REPO_URL_YAML"})
+
+
 def _render(text: str, substitutions: dict[str, str]) -> str:
     for key, value in substitutions.items():
         text = text.replace("{{" + key + "}}", value)
     return text
+
+
+def _within(path: Path, root: Path) -> bool:
+    """True when *path* resolves to somewhere at or beneath *root*.
+
+    Resolution follows symlinks, so this is what confines the scaffold: it is
+    not enough to reject a symlinked project root, because a link one level
+    down -- `project/blueprint` pointing elsewhere -- redirects the whole vault
+    out of the project, and `--force` would then overwrite files there.
+    """
+    try:
+        path.resolve().relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def scaffold_project(
@@ -221,14 +256,21 @@ def scaffold_project(
         raise ScaffoldError(issues)
 
     pinned_source, pinned_ref = plugin_pin()
-    source = autoform_source.strip() or pinned_source or DEFAULT_AUTOFORM_SOURCE
-    ref = autoform_ref.strip() or pinned_ref
+    given_source = autoform_source.strip()
+    source = given_source or pinned_source or DEFAULT_AUTOFORM_SOURCE
+    # A ref identifies a commit in one repository. Naming a different source
+    # while inheriting this checkout's HEAD produces `git+other.git@our-sha`,
+    # which does not resolve there, so an explicit source carries its own ref
+    # or none at all.
+    ref = given_ref or ("" if given_source else pinned_ref)
     # CI installs Autoform from a Git ref. Where Autoform lives is a fixed fact
     # worth defaulting; which commit is not, and a guessed one publishes a
     # project whose first CI step fails for a reason no file in it explains. So
     # the ref alone decides: without one the workflows are skipped and reported.
     unpinned = not ref
     substitutions = {
+        "PROJECT_TITLE_YAML": _yaml_scalar(title.strip()),
+        "REPO_URL_YAML": _yaml_scalar(repository_url.strip()),
         "PROJECT_TITLE": title.strip(),
         "REPO_URL": repository_url.strip(),
         "AUTOFORM_SOURCE": source,
@@ -248,6 +290,18 @@ def scaffold_project(
         if destination.exists() and not force:
             skipped.append(_destination(relative))
             continue
+        # Confine every write, not just the root. Walk the path the scaffold is
+        # about to take and require each component that already exists to still
+        # be inside the project once symlinks are followed; a link at any depth
+        # would otherwise redirect the write, and --force would overwrite
+        # whatever it points at.
+        probe = root
+        for part in Path(_destination(relative)).parts:
+            probe = probe / part
+            if probe.exists() and not _within(probe, root):
+                raise ScaffoldError(
+                    [f"refusing to write outside the project through a link: {probe}"]
+                )
         destination.parent.mkdir(parents=True, exist_ok=True)
         if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
             shutil.copyfile(template, destination)

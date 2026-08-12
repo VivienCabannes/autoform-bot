@@ -27,6 +27,12 @@ from .status import is_definition
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
+#: A reference-style link definition, `[label]: target "title"`. Markdown
+#: resolves `[Paper][paper]` through one of these, so a rewrite that only sees
+#: inline links leaves the destination behind and publishes a dead link.
+_LINK_DEFINITION = re.compile(
+    r'^(?P<indent>[ ]{0,3})\[(?P<label>[^\]]+)\]:[ \t]*(?P<target>\S+)(?P<rest>[ \t]+.*)?$'
+)
 _ARTICLE_SLOT = re.compile(
     r"^(?P<indent>[ \t]*)[-*+]\s+\[[^\]]+\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)\s*$"
 )
@@ -246,14 +252,14 @@ def render_site(
 
     graph = load_graph(blueprint)
     statuses = status.derive(graph)
-    linker = build_linker(
-        lean_root if lean_root is not None else blueprint.parent,
-        repository_url=repository_url,
-        ref=ref,
-    )
+    # The repository root, not the vault's parent. A blueprint nested at
+    # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
+    # and every generated permalink would 404.
+    repo_root = Path(lean_root).expanduser().resolve() if lean_root is not None else blueprint.parent
+    linker = build_linker(repo_root, repository_url=repository_url, ref=ref)
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
-    sources_base = _sources_base(blueprint, linker)
+    sources_base = _sources_base(blueprint, repo_root, linker)
 
     _prepare_destination(destination, clean=clean)
     _write_publication_manifest(destination, blueprint, graph, linker, complete=False)
@@ -354,6 +360,7 @@ def render_site(
             targets=targets,
             narrative=narrative,
             blueprint=blueprint,
+            repo_root=repo_root,
             destination=destination,
             node_sources=node_sources,
             sources_base=sources_base,
@@ -473,7 +480,7 @@ def _is_hidden(relative: Path) -> bool:
     return any(part.startswith(".") for part in relative.parts)
 
 
-def _sources_base(blueprint: Path, linker: SourceLinker) -> str | None:
+def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> str | None:
     """Where `blueprint/sources/` lives in the repository, if it can be linked.
 
     Source notes are a reader's transcription of the paper being formalised.
@@ -489,8 +496,10 @@ def _sources_base(blueprint: Path, linker: SourceLinker) -> str | None:
     if not linker.repository_url or not linker.ref:
         return None
     try:
-        relative = (blueprint / SOURCES_DIR).relative_to(blueprint.parent).as_posix()
-    except ValueError:  # pragma: no cover - blueprint is always under its parent
+        relative = (blueprint / SOURCES_DIR).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        # The vault is outside the repository being linked, so no blob URL
+        # describes it. Better no link than one that 404s.
         return None
     return f"{linker.repository_url}/blob/{linker.ref}/{relative}"
 
@@ -1286,31 +1295,45 @@ def _rewrite_links(
     """
     anchored = _anchored_links(targets, page, extension=".md")
 
-    def replace(match: re.Match[str]) -> str:
-        raw = match.group("target")
+    def moved_target(raw: str) -> str | None:
+        """Where *raw* should point once published, or None to leave it alone."""
         bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
         path, separator, fragment = bare.partition("#")
         if not path or urlsplit(path).scheme or path.startswith("/"):
-            return match.group(0)
+            return None
         candidate = (source_dir / unquote(path)).resolve()
         node_id = node_sources.get(candidate)
         if node_id is not None:
-            anchor = targets[node_id][1]
             href = anchored[node_id]
-            if not anchor and separator:
+            if not targets[node_id][1] and separator:
                 href = f"{'' if href == '#' else href}#{fragment}"
-            return f"[{match.group('label')}]({href})"
+            return href
         if not _is_within(candidate, blueprint):
-            return match.group(0)
+            return None
         relative = candidate.relative_to(blueprint)
         if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
-            href = _source_href(sources_base, relative.parts[1:])
-            return f"[{match.group('label')}]({href}{separator}{fragment})"
+            return f"{_source_href(sources_base, relative.parts[1:])}{separator}{fragment}"
         published = destination / relative
-        moved = mermaid.relative_link(published, page, candidate.suffix)
-        return f"[{match.group('label')}]({moved}{separator}{fragment})"
+        return f"{mermaid.relative_link(published, page, candidate.suffix)}{separator}{fragment}"
 
-    return _outside_fences(text, lambda line: _MARKDOWN_LINK.sub(replace, line))
+    def replace(match: re.Match[str]) -> str:
+        href = moved_target(match.group("target"))
+        return match.group(0) if href is None else f"[{match.group('label')}]({href})"
+
+    def rewrite(line: str) -> str:
+        # A reference definition carries the destination for every `[x][label]`
+        # on the page. Rewriting only inline links leaves it pointing at the
+        # unpublished path and the rendered link dangles.
+        definition = _LINK_DEFINITION.match(line)
+        if definition is not None:
+            href = moved_target(definition.group("target"))
+            if href is not None:
+                indent, label = definition.group("indent"), definition.group("label")
+                return f"{indent}[{label}]: {href}{definition.group('rest') or ''}"
+            return line
+        return _MARKDOWN_LINK.sub(replace, line)
+
+    return _outside_fences(text, rewrite)
 
 
 def _is_within(path: Path, directory: Path) -> bool:
@@ -1375,6 +1398,7 @@ def _render_chapter(
     targets: dict[str, tuple[Path, str]],
     narrative: str | None,
     blueprint: Path,
+    repo_root: Path,
     destination: Path,
     node_sources: dict[Path, str],
     sources_base: str | None = None,
@@ -1396,6 +1420,7 @@ def _render_chapter(
             links=links,
             page=page,
             blueprint=blueprint,
+            repo_root=repo_root,
             destination=destination,
             node_sources=node_sources,
             targets=targets,
@@ -1484,6 +1509,7 @@ def _render_environment(
     links: dict[str, str],
     page: Path,
     blueprint: Path,
+    repo_root: Path,
     destination: Path,
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
@@ -1510,7 +1536,7 @@ def _render_environment(
 
     code_links, implementation_rows, linked, unresolved = _lean_presentation(node, linker)
     context_link = _graph_context_link(node, page=page, destination=destination)
-    source_link = _vault_source_link(node, blueprint=blueprint, linker=linker)
+    source_link = _vault_source_link(node, repo_root=repo_root, linker=linker)
     meta_rows = implementation_rows
     if node.discussion:
         meta_rows.append(("Discussion", _discussion_link(node.discussion, linker)))
@@ -1602,7 +1628,7 @@ def _code_icon() -> str:
     )
 
 
-def _vault_source_link(node: Node, *, blueprint: Path, linker) -> str:
+def _vault_source_link(node: Node, *, repo_root: Path, linker) -> str:
     """Link a statement to the Markdown article it was authored in.
 
     The graph view and the published statement are both derived. This is the
@@ -1611,7 +1637,7 @@ def _vault_source_link(node: Node, *, blueprint: Path, linker) -> str:
     if not linker.repository_url or not linker.ref:
         return ""
     try:
-        relative = node.path.resolve().relative_to(blueprint.parent.resolve()).as_posix()
+        relative = node.path.resolve().relative_to(repo_root).as_posix()
     except ValueError:
         return ""
     href = f"{linker.repository_url}/blob/{linker.ref}/{relative}"

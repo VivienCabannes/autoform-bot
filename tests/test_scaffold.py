@@ -62,8 +62,9 @@ def test_substitutions_reach_the_site_config(tmp_path: Path) -> None:
     )
 
     mkdocs = (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
-    assert "site_name: Finite Flat" in mkdocs
-    assert "repo_url: https://example.test/repo" in mkdocs
+    # Quoted: a title is a YAML scalar, not bare text pasted after a colon.
+    assert 'site_name: "Finite Flat"' in mkdocs
+    assert 'repo_url: "https://example.test/repo"' in mkdocs
 
     verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert f"git+https://example.test/autoform.git@{'0' * 40}" in verify
@@ -101,7 +102,7 @@ def test_force_overwrites(tmp_path: Path) -> None:
 
     scaffold_project(tmp_path, title="Finite Flat", force=True)
 
-    assert "site_name: Finite Flat" in (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
+    assert 'site_name: "Finite Flat"' in (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
 
 
 def test_refuses_an_empty_title(tmp_path: Path) -> None:
@@ -425,3 +426,78 @@ def test_a_branch_in_the_marketplace_checkout_is_refused(
     monkeypatch.setattr(scaffold_module, "_git", fake_git)
 
     assert scaffold_module.plugin_pin() == ("", "")
+
+
+def test_a_symlinked_subdirectory_cannot_redirect_the_scaffold(tmp_path: Path) -> None:
+    """Rejecting a symlinked root is not enough; any component can redirect.
+
+    `project/blueprint` pointing elsewhere sent the whole vault outside the
+    project, and --force would have overwritten whatever it found there.
+    """
+    from autoform_cli import scaffold as scaffold_module
+
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    (project / "blueprint").symlink_to(outside)
+
+    with pytest.raises(scaffold_module.ScaffoldError) as caught:
+        scaffold_module.scaffold_project(project, title="Probe")
+
+    assert "outside the project" in str(caught.value)
+    assert list(outside.iterdir()) == []
+
+
+def test_a_title_with_a_colon_stays_one_yaml_key(tmp_path: Path) -> None:
+    """`site_name: Algebra: Foundations` is a nested mapping, not a title."""
+    from autoform_cli import scaffold as scaffold_module
+
+    scaffold_module.scaffold_project(tmp_path, title="Algebra: Foundations")
+
+    config = (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
+    assert 'site_name: "Algebra: Foundations"' in config
+
+
+def test_a_quoted_title_is_escaped_not_just_wrapped(tmp_path: Path) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    scaffold_module.scaffold_project(tmp_path, title='The "Hard" Case')
+
+    config = (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
+    assert 'site_name: "The \\"Hard\\" Case"' in config
+
+
+def test_a_source_without_a_ref_does_not_borrow_this_checkouts_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sha identifies a commit in one repository, not in any repository.
+
+    Keeping the inferred ref while replacing the source emitted
+    `git+other.git@our-sha`, which does not resolve in `other`.
+    """
+    from autoform_cli import scaffold as scaffold_module
+
+    monkeypatch.setattr(
+        scaffold_module, "plugin_pin", lambda: ("https://example.test/ours.git", "1" * 40)
+    )
+    result = scaffold_module.scaffold_project(
+        tmp_path, title="Probe", autoform_source="https://example.test/other.git"
+    )
+
+    assert result.unpinned is True
+    assert not (tmp_path / ".github/workflows/autoform-verify.yml").exists()
+
+
+def test_a_source_with_its_own_ref_is_honoured(tmp_path: Path) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    scaffold_module.scaffold_project(
+        tmp_path,
+        title="Probe",
+        autoform_source="https://example.test/other.git",
+        autoform_ref="3" * 40,
+    )
+
+    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+    assert f"git+https://example.test/other.git@{'3' * 40}" in verify

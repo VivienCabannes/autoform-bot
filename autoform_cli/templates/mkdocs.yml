@@ -1,5 +1,5 @@
-site_name: {{PROJECT_TITLE}}
-repo_url: {{REPO_URL}}
+site_name: {{PROJECT_TITLE_YAML}}
+repo_url: {{REPO_URL_YAML}}
 
 # `autoform render` writes this directory from blueprint/. The vault stays the
 # source of truth; everything here is regenerated.

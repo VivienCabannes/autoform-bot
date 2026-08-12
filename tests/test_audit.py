@@ -419,3 +419,30 @@ def test_audit_is_read_only(tmp_path: Path) -> None:
         if path.is_file()
     }
     assert after == before
+
+
+def test_an_explicit_attr_list_anchor_resolves(tmp_path: Path) -> None:
+    """`attr_list` is enabled in the generated config, so `{#id}` is the anchor.
+
+    Deriving the slug from the heading text regardless reported a link that
+    MkDocs renders correctly as source-anchor-not-found.
+    """
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "README.md", depends=False)
+    _article(
+        blueprint,
+        "cited.md",
+        declaration="theorem",
+        origin="cited",
+        sources=("../sources/paper.md#main-result",),
+    )
+    paper = blueprint / "sources" / "paper.md"
+    paper.parent.mkdir(parents=True, exist_ok=True)
+    paper.write_text(
+        "---\n---\n\n# Paper\n\n## A result {#main-result}\n\nText.\n", encoding="utf-8"
+    )
+
+    codes = {finding.code for finding in audit_blueprint(blueprint).findings}
+
+    assert "source-anchor-not-found" not in codes
