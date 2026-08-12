@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ def _write_node(
 
 def test_export_writes_a_mermaid_page_linking_to_markdown(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "foundations" / "README.md", "Foundations")
     _write_node(blueprint / "roadmap" / "foundations" / "base lemma.md", "Base lemma")
     _write_node(
         blueprint / "roadmap" / "main.md",
@@ -44,9 +46,12 @@ def test_export_writes_a_mermaid_page_linking_to_markdown(tmp_path: Path) -> Non
     assert output == (blueprint / "dependencies.md").resolve()
     assert "```mermaid" in document
     assert "graph LR" in document
-    assert 'click n0 "roadmap/foundations/base lemma.md"' in document
-    assert 'click n1 "roadmap/main.md"' in document
-    assert "  n0 --> n1" in document
+    # Handles are assigned in sorted order, so pin the links and the edge by
+    # their targets rather than by whichever index a node happens to get.
+    handles = dict(re.findall(r'click (n\d+) "([^"]+)"', document))
+    lemma = next(k for k, v in handles.items() if v == "roadmap/foundations/base lemma.md")
+    main = next(k for k, v in handles.items() if v == "roadmap/main.md")
+    assert f"  {lemma} --> {main}" in document
     assert "Main <result>" in document
 
 

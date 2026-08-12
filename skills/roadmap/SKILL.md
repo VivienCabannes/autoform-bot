@@ -69,8 +69,10 @@ mathematics.
    position in the tree is its identity. Write it as
    `roadmap/<chapter>/README.md`, never as a Markdown file beside the
    directory: containment is inferred from nested READMEs, so a sibling
-   chapter page silently leaves every article in that directory hanging off
-   the root, and `autoform audit` reports `missing-chapter-article`. Treat `blueprint/README.md` and the roadmap pages it
+   chapter page leaves every article in that directory hanging off the root
+   and publishes a book with no chapters. `autoform check` refuses a chapter
+   directory with no chapter page, so a vault in that shape never renders.
+   Treat `blueprint/README.md` and the roadmap pages it
    links as an ordered mathematical book: link meaningful chapter pages in
    their intended reading order. The renderer derives bottom-of-page previous
    and next chapter links from this Markdown structure, so do not maintain a

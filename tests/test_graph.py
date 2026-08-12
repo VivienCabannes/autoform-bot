@@ -24,7 +24,27 @@ def _roadmap_page(blueprint: Path, relative: str, body: str) -> Path:
     return path
 
 
+def _ensure_chapter(blueprint: Path, relative: str) -> None:
+    """Give a chapter directory its chapter page, as every real vault has.
+
+    Containment comes from nested `README.md` articles, so a directory without
+    one is refused at load. Fixtures that only happen to nest are not trying to
+    model that fault; the tests that are do it explicitly.
+    """
+    parts = Path(relative).parts
+    if len(parts) < 2:
+        return
+    chapter = blueprint / "roadmap" / parts[0]
+    page = chapter / "README.md"
+    if not page.exists():
+        chapter.mkdir(parents=True, exist_ok=True)
+        page.write_text(
+            "---\n---\n\n# " + parts[0].replace("-", " ").title() + "\n", encoding="utf-8"
+        )
+
+
 def _node(blueprint: Path, relative: str, body: str, **metadata: str) -> Path:
+    _ensure_chapter(blueprint, relative)
     return _roadmap_page(blueprint, relative, _node_text(body, **metadata))
 
 
@@ -59,7 +79,8 @@ def test_loads_nested_wiki_and_metadata(tmp_path: Path) -> None:
 
     graph = load_graph(blueprint)
 
-    assert list(graph.nodes) == ["foundations/base", "result"]
+    # The chapter page is an article too, so it is a node in its own right.
+    assert list(graph.nodes) == ["foundations", "foundations/base", "result"]
     assert graph.nodes["foundations/base"].title == "Base theorem"
     assert graph.nodes["foundations/base"].kind == "article"
     assert graph.nodes["foundations/base"].declaration == "theorem"
@@ -304,3 +325,43 @@ def test_check_cli_reports_validation_errors(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "error: bad: missing H1 title" in result.stdout
+
+
+def test_a_chapter_directory_with_no_chapter_page_is_refused(tmp_path: Path) -> None:
+    """The layout decides what the book is, so check has to assert it.
+
+    Containment comes from nested `README.md` articles, so a directory without
+    one is invisible: its pages attach to the roadmap root and the book
+    publishes with no chapters. Every node parses and every link resolves,
+    which is how a real project shipped 71 of 72 articles at the root with a
+    clean run.
+    """
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    (roadmap / "orphaned").mkdir(parents=True)
+    (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
+    for name in ("first", "second"):
+        (roadmap / "orphaned" / f"{name}.md").write_text(
+            f"---\ndeclaration: theorem\n---\n\n# {name.title()}\n", encoding="utf-8"
+        )
+
+    with pytest.raises(GraphValidationError) as caught:
+        load_graph(tmp_path / "blueprint")
+
+    message = str(caught.value)
+    assert "orphaned: chapter directory holds 2 article(s) but no README.md" in message
+    assert "add orphaned/README.md" in message
+
+
+def test_a_filing_bucket_inside_a_chapter_is_left_alone(tmp_path: Path) -> None:
+    """`definitions/` and `theorems/` are a convention, not a missing level."""
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    (roadmap / "chapter" / "theorems").mkdir(parents=True)
+    (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
+    (roadmap / "chapter" / "README.md").write_text("---\n---\n\n# Chapter\n", encoding="utf-8")
+    (roadmap / "chapter" / "theorems" / "result.md").write_text(
+        "---\ndeclaration: theorem\n---\n\n# Result\n", encoding="utf-8"
+    )
+
+    graph = load_graph(tmp_path / "blueprint")
+
+    assert "chapter/theorems/result" in graph.nodes

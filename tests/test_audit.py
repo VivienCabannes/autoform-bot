@@ -6,6 +6,25 @@ from pathlib import Path
 from autoform_cli.audit import audit_blueprint
 
 
+def _ensure_chapter(blueprint: Path, relative: str) -> None:
+    """Give a chapter directory its chapter page, as every real vault has.
+
+    Containment comes from nested `README.md` articles, so a directory without
+    one is refused at load. Fixtures that only happen to nest are not trying to
+    model that fault; the tests that are do it explicitly.
+    """
+    parts = Path(relative).parts
+    if len(parts) < 2:
+        return
+    chapter = blueprint / "roadmap" / parts[0]
+    page = chapter / "README.md"
+    if not page.exists():
+        chapter.mkdir(parents=True, exist_ok=True)
+        page.write_text(
+            "---\n---\n\n# " + parts[0].replace("-", " ").title() + "\n", encoding="utf-8"
+        )
+
+
 def _article(
     blueprint: Path,
     relative: str,
@@ -15,6 +34,7 @@ def _article(
     sources: tuple[str, ...] = (),
     **metadata: str,
 ) -> Path:
+    _ensure_chapter(blueprint, relative)
     path = blueprint / "roadmap" / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     title = path.stem.replace("-", " ").title()
@@ -306,29 +326,6 @@ def test_audit_returns_graph_validation_errors_with_article_paths(tmp_path: Path
     assert result.findings[0].code == "invalid-graph"
     assert result.findings[0].reason == "bad: missing H1 title"
     assert json.loads(result.to_json()) == result.as_dict()
-
-
-def test_audit_reports_a_chapter_directory_that_names_no_chapter(tmp_path: Path) -> None:
-    blueprint = tmp_path / "blueprint"
-    _coverage(blueprint)
-    _article(blueprint, "README.md", depends=False)
-    _article(blueprint, "orphaned/first.md", declaration="theorem")
-    _article(blueprint, "orphaned/second.md", declaration="lemma")
-    _article(blueprint, "chapter/README.md", depends=False)
-    _article(blueprint, "chapter/theorems/result.md", declaration="theorem")
-
-    findings = _finding_map(blueprint)
-
-    assert findings["roadmap/orphaned/README.md"] == [
-        (
-            "missing-chapter-article",
-            "chapter directory holds 2 article(s) but no README.md, "
-            "so they attach to the roadmap root instead of a chapter",
-        )
-    ]
-    # A ``theorems/`` bucket inside a real chapter is a filing convention, not a
-    # missing level: its articles still attach to the chapter above it.
-    assert "roadmap/chapter/theorems/README.md" not in findings
 
 
 def test_audit_reports_a_container_holding_too_many_articles(tmp_path: Path) -> None:

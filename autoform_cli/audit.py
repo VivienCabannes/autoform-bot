@@ -37,7 +37,6 @@ _COVERAGE_GAP = re.compile(
 )
 _EXTERNAL_SCHEMES = frozenset({"http", "https"})
 _MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
-_README = "readme.md"
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -223,7 +222,6 @@ def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditRe
 
         findings.extend(_source_findings(graph, node, article_path))
 
-    findings.extend(_chapter_findings(graph.blueprint_dir))
     findings.extend(_coverage_findings(graph.blueprint_dir))
     if lean_root is not None:
         findings.extend(_lean_findings(graph, lean_root))
@@ -372,43 +370,6 @@ def _markdown_anchors(path: Path) -> set[str]:
         counts[base] = index + 1
         anchors.add(base if index == 0 else f"{base}_{index}")
     return anchors
-
-
-def _chapter_findings(blueprint: Path) -> list[AuditFinding]:
-    """Report chapter directories that hold articles but name no chapter.
-
-    Containment is inferred from nested ``README.md`` articles, so a chapter
-    directory without one is invisible to the hierarchy: its pages attach to
-    the root and the published book has no chapters at all. The graph is still
-    valid, which is exactly why this needs its own check.
-
-    Only directories directly under ``roadmap/`` are chapters. Deeper ones --
-    the ``definitions/`` and ``theorems/`` buckets the bundled example uses --
-    are a filing convention inside a chapter, and are deliberately left alone.
-    """
-
-    roadmap = blueprint / "roadmap"
-    if not roadmap.is_dir():
-        return []
-
-    findings: list[AuditFinding] = []
-    try:
-        chapters = sorted(path for path in roadmap.iterdir() if path.is_dir())
-    except OSError:
-        return []
-    for chapter in chapters:
-        names = [path.name for path in chapter.glob("*.md") if path.is_file()]
-        if not names or any(name.casefold() == _README for name in names):
-            continue
-        findings.append(
-            AuditFinding(
-                _relative_path(chapter / "README.md", blueprint),
-                "missing-chapter-article",
-                f"chapter directory holds {len(names)} article(s) but no README.md, "
-                "so they attach to the roadmap root instead of a chapter",
-            )
-        )
-    return findings
 
 
 def _coverage_findings(blueprint: Path) -> list[AuditFinding]:
