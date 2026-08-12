@@ -15,9 +15,15 @@ use_directory_urls: false
 theme:
   name: material
   custom_dir: theme
+  # `autoform render` writes this mark into the site source on every build, so
+  # it is always present and never has to be committed to the project.
+  logo: assets/autoform.svg
+  favicon: assets/autoform.svg
   font:
-    text: Merriweather
-    code: Source Code Pro
+    # Meta's own Optimistic is not publicly licensed; Plus Jakarta Sans is the
+    # nearest geometric humanist, and carries display and body on weight alone.
+    text: Plus Jakarta Sans
+    code: JetBrains Mono
   icon:
     repo: fontawesome/brands/github
   features:

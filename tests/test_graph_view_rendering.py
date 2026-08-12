@@ -36,7 +36,7 @@ def test_project_view_renders_status_distribution_and_aggregated_edges() -> None
     assert "n0 -->|3| n1" in diagram
     assert "n0 -.-> n1" in diagram
     assert 'click n0 "chapters/a.html"' in diagram
-    assert "classDef scope fill:#EEF6FF" in diagram
+    assert "classDef scope fill:#EBF2FE" in diagram
 
 
 def test_chapter_boundary_and_focused_theorem_have_distinct_presentation() -> None:

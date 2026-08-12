@@ -38,7 +38,15 @@ SOURCES_DIR = "sources"
 PUBLICATION_MANIFEST = "publication.json"
 #: Derived views this command rewrites; stale copies must not leak into the site.
 _GENERATED_FILES = frozenset(
-    {"dependencies.md", "dependencies.html", "graph.html", "progress.md", PUBLICATION_MANIFEST}
+    {
+        "dependencies.md",
+        "dependencies.html",
+        "graph.html",
+        "progress.md",
+        # The vault keeps its own Obsidian-readable copy; the site builds one.
+        "structure.md",
+        PUBLICATION_MANIFEST,
+    }
 )
 _LOCAL_ONLY_NAMES = frozenset(
     {
@@ -72,6 +80,45 @@ DECLARATION_LABELS = {
 
 STYLESHEET = "stylesheets/blueprint.css"
 MERMAID_SCRIPT = "javascripts/blueprint-mermaid.js"
+LOGO = "assets/autoform.svg"
+
+
+def _logo() -> str:
+    """The Autoform mark: the smallest blueprint there is, drawn as an A.
+
+    Two prerequisites at the base and one result above them is the smallest
+    non-trivial dependency graph, and its edges happen to be the strokes of an
+    A. So the letter and the thing it stands for are the same drawing.
+
+    It is set white on a gradient tile rather than as line art because the same
+    file serves as the 16px favicon, where a thin stroke disappears; a filled
+    tile also needs no light and dark variants, since it carries its own
+    background onto either header.
+    """
+
+    return """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" \
+height="48" role="img" aria-labelledby="autoform-logo-title">
+  <title id="autoform-logo-title">Autoform</title>
+  <defs>
+    <linearGradient id="autoform-sweep" x1="0" y1="0" x2="48" y2="48" \
+gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0082FB"/>
+      <stop offset="0.32" stop-color="#0064E0"/>
+      <stop offset="0.68" stop-color="#7B3FE4"/>
+      <stop offset="1" stop-color="#E0447B"/>
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="11" fill="url(#autoform-sweep)"/>
+  <g fill="#FFFFFF" stroke="#FFFFFF" stroke-width="3.6" stroke-linecap="round"
+     stroke-linejoin="round">
+    <path d="M12.4 35.2 L24 12.8 L35.6 35.2" fill="none"/>
+    <path d="M17.6 25.2 L30.4 25.2" fill="none"/>
+    <circle cx="24" cy="12.8" r="4.2" stroke="none"/>
+    <circle cx="12.4" cy="35.2" r="3.8" stroke="none"/>
+    <circle cx="35.6" cy="35.2" r="3.8" stroke="none"/>
+  </g>
+</svg>
+"""
 
 
 def _mermaid_script() -> str:
@@ -93,7 +140,20 @@ def _mermaid_script() -> str:
 (function () {{
   var CLASSDEFS = {classdefs};
   if (typeof mermaid === "undefined") return;
-  mermaid.initialize({{ startOnLoad: false, securityLevel: "loose", theme: "neutral" }});
+  // The map sits in a panel of the page's own colour, so the diagram supplies
+  // no background of its own and borrows the site's type and rules.
+  var FONT = '"Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+  function variables(mode) {{
+    return mode === "dark"
+      ? {{ background: "transparent", lineColor: "#8A8D91", primaryTextColor: "#E4E6EB",
+           mainBkg: "#242526", clusterBkg: "transparent", edgeLabelBackground: "#242526" }}
+      : {{ background: "transparent", lineColor: "#8A8D91", primaryTextColor: "#050505",
+           mainBkg: "#FFFFFF", clusterBkg: "transparent", edgeLabelBackground: "#FFFFFF" }};
+  }}
+  mermaid.initialize({{
+    startOnLoad: false, securityLevel: "loose", theme: "neutral",
+    fontFamily: FONT, themeVariables: variables("light")
+  }});
 
   var counter = 0;
   var blocks = Array.prototype.map.call(
@@ -110,7 +170,9 @@ def _mermaid_script() -> str:
     mermaid.initialize({{
       startOnLoad: false,
       securityLevel: "loose",
-      theme: mode === "dark" ? "dark" : "neutral"
+      theme: mode === "dark" ? "dark" : "neutral",
+      fontFamily: FONT,
+      themeVariables: variables(mode)
     }});
     blocks.forEach(function (block) {{
       var source = block.source + "\\n" + CLASSDEFS[mode].join("\\n");
@@ -311,7 +373,19 @@ def render_site(
     # The landing page is a dashboard, not chapter one. Previous/next belongs
     # to the book, so the strip starts at the contents page.
     _append_book_navigation([p for p in book_pages if p != overview])
-    report.pages += _publish_vault(blueprint, destination, sources_base=sources_base)
+    structure = destination / STRUCTURE_PAGE
+    structure.write_text(
+        _render_structure_page(
+            blueprint,
+            graph,
+            statuses,
+            page=structure,
+            targets=targets,
+            sources_base=sources_base,
+        ),
+        encoding="utf-8",
+    )
+    report.pages += 1
     (destination / "SUMMARY.md").write_text(
         _render_summary_nav(book_pages, destination=destination, overview=overview),
         encoding="utf-8",
@@ -325,7 +399,11 @@ def render_site(
     )
     report.pages += len(generated_graph_pages)
 
-    for relative, contents in ((STYLESHEET, _stylesheet()), (MERMAID_SCRIPT, _mermaid_script())):
+    for relative, contents in (
+        (STYLESHEET, _stylesheet()),
+        (MERMAID_SCRIPT, _mermaid_script()),
+        (LOGO, _logo()),
+    ):
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
@@ -733,67 +811,110 @@ def _next_target(
 
 
 
-WIKI_DIR = "wiki"
+STRUCTURE_PAGE = "structure.md"
 
 
-def _publish_vault(blueprint: Path, destination: Path, *, sources_base: str | None) -> int:
-    """Copy the authored vault verbatim so every article has a URL.
-
-    The book is a reading of the vault; this is the vault. Its internal links
-    are all relative, so preserving the tree preserves them, and what a reader
-    sees here is otherwise the file an author edits.
-
-    Source notes are the exception. When *sources_base* gives a repository to
-    reach them in, mirroring them here would put the same transcription at a
-    third URL, so they are left out. Links naming them are then redirected at
-    the repository rather than left pointing at a page that is no longer here.
-    """
-    root = destination / WIKI_DIR
-    written = 0
-    for source in sorted(blueprint.rglob("*.md")):
-        if source.is_symlink():
-            continue
-        relative = source.relative_to(blueprint)
-        if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
-            continue
-        target = root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        body = source.read_text(encoding="utf-8")
-        if sources_base is not None:
-            body = _redirect_source_links(
-                body, source_dir=source.parent, blueprint=blueprint, sources_base=sources_base
-            )
-        target.write_text(body, encoding="utf-8")
-        written += 1
-    return written
-
-
-def _redirect_source_links(
-    text: str, *, source_dir: Path, blueprint: Path, sources_base: str
+def _render_structure_page(
+    blueprint: Path,
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    *,
+    page: Path,
+    targets: dict[str, tuple[Path, str]],
+    sources_base: str | None,
 ) -> str:
-    """Point links at source notes into the repository, leaving the rest alone.
+    """List the vault as a file tree, so its shape can be checked at a glance.
 
-    The vault mirror is verbatim by design, so this touches only the links that
-    would otherwise dangle: the ones naming a file under ``blueprint/sources``,
-    which is no longer published.
+    The book answers what the project says; nothing answered how it is laid
+    out. A real project came back with 71 of 72 articles sitting directly under
+    `roadmap/`, which parses cleanly, passes `autoform check`, and publishes a
+    book with no chapters -- a fault invisible in every rendered view, because
+    every rendered view shows content rather than paths.
+
+    So this shows paths: the directory tree itself, with what the graph made of
+    each file beside it. Directories are rows too, because they are what a
+    chapter is; without them every `README.md` looks like every other one.
     """
+    links = _anchored_links(targets, page, extension=".md")
+    by_path = {node.path.resolve(): node for node in graph.nodes.values()}
 
-    def replace(match: re.Match[str]) -> str:
-        raw = match.group("target")
-        bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
-        path, separator, fragment = bare.partition("#")
-        if not path or urlsplit(path).scheme or path.startswith("/"):
-            return match.group(0)
-        candidate = (source_dir / unquote(path)).resolve()
-        if not _is_within(candidate, blueprint):
-            return match.group(0)
-        relative = candidate.relative_to(blueprint)
-        if relative.parts[:1] != (SOURCES_DIR,):
-            return match.group(0)
-        href = _source_href(sources_base, relative.parts[1:])
-        return f"[{match.group('label')}]({href}{separator}{fragment})"
+    def keep(relative: Path) -> bool:
+        if _SKIPPED_DIRECTORIES.intersection(relative.parts) or _is_hidden(relative):
+            return False
+        if relative.name in _GENERATED_FILES:
+            return False
+        return not (sources_base is not None and relative.parts[:1] == (SOURCES_DIR,))
 
-    return _outside_fences(text, lambda line: _MARKDOWN_LINK.sub(replace, line))
+    files = [p for p in sorted(blueprint.rglob("*.md")) if keep(p.relative_to(blueprint))]
+    directories = {p.relative_to(blueprint).parent for p in files}
+    directories.discard(Path("."))
+    for directory in list(directories):
+        for parent in directory.parents:
+            if parent != Path("."):
+                directories.add(parent)
+
+    def row(indent: int, label: str, kind: str, mark: str, extra: str = "") -> str:
+        return (
+            f'<span class="bp-tree-path{extra}" '
+            f'style="padding-left: {indent * 1.1:.1f}rem">{label}</span>'
+            f'<span class="bp-tree-kind">{kind}</span>'
+            f'<span class="bp-tree-mark">{mark}</span>'
+        )
+
+    rows = [row(0, "<strong>blueprint/</strong>", "vault root", "")]
+    for entry in sorted(directories | {p.relative_to(blueprint) for p in files}):
+        depth = len(entry.parts)
+        if entry in directories:
+            rows.append(row(depth, f"<strong>{html.escape(entry.name)}/</strong>", "", ""))
+            continue
+        source = blueprint / entry
+        node = by_path.get(source.resolve())
+        name = html.escape(entry.name)
+        if node is None:
+            # Everything under `roadmap/` is a node or the graph refuses to
+            # load, so a file with no node here is prose by construction: the
+            # blueprint landing page or the coverage contract.
+            rows.append(row(depth, name, "prose", ""))
+            continue
+        href = links.get(node.id)
+        label = f'<a href="{html.escape(href, quote=True)}">{name}</a>' if href else name
+        state = statuses[node.id]
+        rows.append(
+            row(
+                depth,
+                f"{label} <span class='bp-tree-title'>{html.escape(node.title)}</span>",
+                html.escape(node.declaration or node.kind),
+                f'<span class="bp-swatch bp-swatch-{state.key}"></span>'
+                f'<span class="bp-tree-state">{html.escape(state.label)}</span>',
+            )
+        )
+
+    article_depths = {len(p.relative_to(blueprint).parts) - 1 for p in by_path}
+    warnings = []
+    if len(by_path) > 3 and article_depths <= {1}:
+        warnings.append(
+            "Every article sits directly under <code>roadmap/</code>. Chapters come "
+            "from directories, so this vault publishes as one undivided list."
+        )
+    return "\n".join(
+        [
+            "---",
+            "title: Vault structure",
+            "hide:",
+            "  - toc",
+            "---",
+            "",
+            "# Vault structure",
+            "",
+            "Every Markdown file in the blueprint, as the vault holds them. Chapters "
+            "come from directories, so the shape of this tree is the shape of the book.",
+            "",
+            *(f'<div class="bp-tree-warn">{text}</div>' for text in warnings),
+            "",
+            f'<div class="bp-tree">{"".join(rows)}</div>',
+            "",
+        ]
+    )
 
 
 def _render_summary_nav(
@@ -817,12 +938,19 @@ def _render_summary_nav(
         depth = len(page.relative_to(destination).parts) - 1
         indent = "    " * max(depth, 1)
         lines.append(f"{indent}- [{title}]({page.relative_to(destination).as_posix()})")
+    # What counts as done belongs beside the book it qualifies. The landing
+    # page used to be the only route to it, which made the page impossible to
+    # simplify without stranding it.
+    coverage = destination / "coverage/README.md"
+    if coverage.is_file():
+        title = _first_h1(coverage.read_text(encoding="utf-8")) or "Coverage"
+        lines.append(f"    - [{title}](coverage/README.md)")
     lines.extend(
         [
             "- Graph",
             "    - [Dependency maps](dependencies.md)",
             "    - [Full theorem DAG](dependencies/full.md)",
-            f"    - [Markdown vault]({WIKI_DIR}/)",
+            f"    - [Vault structure]({STRUCTURE_PAGE})",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -848,13 +976,22 @@ def _render_landing_page(
     title = _first_h1(text) or "Blueprint"
     parts = [
         "---",
+        # The hero sets the H1 itself, so the page title has to be declared
+        # rather than discovered from the first Markdown heading.
+        f"title: {title}",
+        # The sidebar lists the open tab's pages, and this tab holds only this
+        # page, so on the landing page it is a column of one word. The tabs
+        # already carry the reader to Book and Graph, so it goes, and the hero
+        # and map get the width instead.
         "hide:",
+        "  - navigation",
         "  - toc",
         "---",
         "",
-        f"# {title}",
+        '<div class="bp-landing" markdown="1">',
         "",
-        _render_overview_summary(graph, statuses),
+        _render_hero(title, body, graph, statuses),
+        "",
         _next_target(
             graph,
             statuses,
@@ -863,12 +1000,8 @@ def _render_landing_page(
             group_pages=group_pages,
             targets=targets,
         ),
-        "",
-        body,
     ]
     breakdown = mermaid.render_legend(statuses)
-    if breakdown:
-        parts.extend(["", "## Status breakdown", "", breakdown])
     project = graph_views.project_view(graph, statuses)
     if project.nodes:
         # Clicking a chapter on the home page opens that chapter's dependency
@@ -887,15 +1020,114 @@ def _render_landing_page(
             )
             for node in project.nodes
         }
+        # The map is the subject of this page, not an appendix to it: a reader
+        # arriving at a blueprint wants the shape of the project first. It runs
+        # the full width, and the legend rides along as its caption rather than
+        # as a section of its own further down.
         parts.extend(
             [
                 "",
-                "## Project map",
+                '<div class="bp-map" markdown="1">',
+                '<div class="bp-map-head">',
+                '<span class="bp-map-title">Project map</span>',
+                '<span class="bp-map-hint">Select a chapter to open its dependencies</span>',
+                "</div>",
                 "",
                 mermaid.render_view_diagram(project, links=links, include_classdefs=False),
+                "",
+                f'<div class="bp-map-legend" markdown="1">\n\n{breakdown}\n\n</div>'
+                if breakdown
+                else "",
+                "</div>",
             ]
         )
+    elif breakdown:
+        parts.extend(["", "## Status breakdown", "", breakdown])
+    # The authored body is a contents list and links to the roadmap, the
+    # coverage notes and the dependency view. The tabs are all three, so
+    # repeating them here only pushes the map up the page for nothing. Its
+    # opening sentence is already the hero's lead.
+    parts.append("</div>")
     return "\n".join(part for part in parts if part is not None).rstrip() + "\n"
+
+
+def _render_hero(
+    title: str,
+    body: str,
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+) -> str:
+    """Open with the project's name, its one-line claim, and where it stands.
+
+    The dashboard this replaces was a paragraph of counts in a bordered box.
+    The same numbers set as figures answer "how far along is this?" before the
+    reader has finished the title, which is the only question the top of a
+    blueprint has to answer.
+    """
+    leaves = [node_id for node_id in graph.nodes if not graph.children(node_id)]
+    selected = {node_id: statuses[node_id] for node_id in leaves}
+    done = sum(
+        count for state, count in status.summarize(selected) if state.key in _SETTLED_STATES
+    )
+    actionable = sum(
+        count for state, count in status.summarize(selected) if state.key in _ACTIONABLE_STATES
+    )
+    total = len(leaves)
+    share = round(100 * done / total) if total else 0
+
+    figures = [
+        ("Formalized", f"{share}%", f"{done} of {total} items settled"),
+        ("Ready now", str(actionable), "unblocked, waiting for an author"),
+        ("Chapters", str(len(graph_views.group_nodes(graph))), "top-level milestones"),
+    ]
+    stats = "".join(
+        f'<div class="bp-figure"><div class="bp-figure-value">{value}</div>'
+        f'<div class="bp-figure-label">{html.escape(label)}</div>'
+        f'<div class="bp-figure-note">{html.escape(note)}</div></div>'
+        for label, value, note in figures
+    )
+    lead = _lead_sentence(body)
+    return (
+        '<div class="bp-hero">'
+        '<div class="bp-hero-rule"></div>'
+        '<div class="bp-hero-kicker">Formalization blueprint</div>'
+        f'<h1 class="bp-hero-title">{html.escape(title)}</h1>'
+        + (f'<p class="bp-hero-lead">{lead}</p>' if lead else "")
+        + f'<div class="bp-hero-figures">{stats}</div>'
+        f'<div class="bp-hero-bar" role="img" '
+        f'aria-label="{share}% of items formalized">'
+        f'<span style="width: {share}%"></span></div>'
+        "</div>"
+    )
+
+
+#: States that count as finished work for the headline percentage.
+_SETTLED_STATES = frozenset({"mathlib", "fully_proved", "proved", "defined", "stated"})
+#: States a contributor could pick up today.
+_ACTIONABLE_STATES = frozenset({"can_prove", "can_state"})
+
+
+def _lead_sentence(body: str) -> str:
+    """The blueprint's own opening sentence, for the hero.
+
+    Written by a human in `blueprint/README.md`, so it says what the project is
+    far better than anything derived from the graph could. Prose only: a
+    heading or a list is structure rather than a claim.
+    """
+    for block in body.split("\n\n"):
+        line = block.strip()
+        if not line or line.startswith(("#", "-", "*", "<", "|", ">", "!")):
+            continue
+        sentence = line.split(". ")[0].rstrip(".").replace("\n", " ")
+        # The hero is raw HTML, so Markdown never runs over it and a title in
+        # *emphasis* would otherwise show its asterisks. Escaping first means
+        # the substitutions below can only ever produce these two tags.
+        safe = html.escape(sentence)
+        safe = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", safe)
+        safe = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", safe)
+        safe = re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
+        return safe + "."
+    return ""
 
 def _render_overview_summary(
     graph: Graph,
@@ -1595,41 +1827,207 @@ def _stylesheet() -> str:
         f"{{ color: {state.dark_text} !important; fill: {state.dark_text} !important; }}"
         for state in status.STATES
     )
-    serif = '"Merriweather", Georgia, "Times New Roman", serif'
-    sans = '"Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
-    mono = '"Source Code Pro", ui-monospace, SFMono-Regular, Menlo, monospace'
+    serif = '"Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+    sans = '"Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+    mono = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace'
     return f"""/* Generated by autoform-blueprint render. Edits are overwritten. */
+/* Material requests 300/400/700 only, and the display sizes here are set in
+   600 and 800. Without this the browser synthesises them, which on a
+   geometric face reads as smeared rather than bold. */
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap");
+
+/* Facebook's product surfaces, not Material's defaults: the greys are the
+   ones Facebook ships in dark mode, the blue is Meta blue, and the accent
+   sweep is the brand gradient. A blueprint should look like it came from
+   here rather than from any documentation generator. */
 :root {{
-  --bp-fg: #111111;
-  --bp-muted: #6a737d;
-  --bp-rule: #cccccc;
-  --bp-surface: #f8f8f8;
-  --bp-link: hsl(210, 100%, 30%);
-  --bp-link-hover: hsl(210, 100%, 40%);
+  --bp-fg: #050505;
+  --bp-muted: #65676B;
+  --bp-rule: #CED0D4;
+  --bp-surface: #FFFFFF;
+  --bp-sunken: #F0F2F5;
+  --bp-link: #0064E0;
+  --bp-link-hover: #0082FB;
+  --bp-blue: #0064E0;
+  --bp-violet: #7B3FE4;
+  --bp-magenta: #E0447B;
+  --bp-sweep: linear-gradient(95deg, #0082FB 0%, #0064E0 32%, #7B3FE4 68%, #E0447B 100%);
+  --bp-radius: 12px;
 }}
 [data-md-color-scheme=slate] {{
-  --bp-fg: #c9d1d9;
-  --bp-muted: #8b949e;
-  --bp-rule: #30363d;
-  --bp-surface: #161b22;
-  --bp-link: #58a6ff;
-  --bp-link-hover: #79c0ff;
+  --bp-fg: #E4E6EB;
+  --bp-muted: #B0B3B8;
+  --bp-rule: #3E4042;
+  --bp-surface: #242526;
+  --bp-sunken: #1C1D1F;
+  --bp-link: #2D88FF;
+  --bp-link-hover: #7FB8FF;
+  --bp-blue: #2D88FF;
+  --bp-violet: #9B6BFF;
+  --bp-magenta: #FF6B9D;
 }}
 
 body {{ font-family: {sans}; color: var(--bp-fg); }}
 .md-typeset {{
   max-width: 72ch;
-  font-family: {serif};
-  line-height: 1.75;
+  font-family: {sans};
+  line-height: 1.7;
+  font-size: 0.8rem;
 }}
-h1, h2, h3, h4, h5, h6 {{ font-family: {serif}; font-weight: 500; }}
+/* One family throughout, separated by weight rather than by a second face.
+   Optimistic, Meta's own, is not public; Plus Jakarta Sans is the nearest
+   geometric humanist with the range to carry both display and body. */
+h1, h2, h3, h4, h5, h6 {{ font-family: {sans}; font-weight: 700; letter-spacing: -0.021em; }}
+.md-typeset h1 {{ font-weight: 800; letter-spacing: -0.032em; }}
 code, kbd, pre, samp {{ font-family: {mono}; }}
-code, pre {{ background: var(--bp-surface); border-radius: 5px; }}
+code, pre {{ background: var(--bp-sunken); border-radius: 6px; }}
 a, a:visited {{ color: var(--bp-link); }}
 a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underline; }}
 
-[data-md-color-scheme=slate] body {{ background-color: #0d1117; }}
+[data-md-color-scheme=slate] body {{ background-color: #18191A; }}
+[data-md-color-scheme=slate] .md-main,
+[data-md-color-scheme=slate] .md-container {{ background-color: #18191A; }}
 [data-md-color-scheme=slate] pre, [data-md-color-scheme=slate] code {{ color: var(--bp-fg); }}
+
+/* The brand sweep as a hairline under the header ties every page together
+   without spending any vertical space on decoration. */
+.md-header {{ box-shadow: none; border-bottom: 1px solid var(--bp-rule); }}
+.md-header::after {{
+  content: "";
+  display: block;
+  height: 3px;
+  background: var(--bp-sweep);
+}}
+[data-md-color-scheme=slate] .md-header,
+[data-md-color-scheme=slate] .md-tabs {{ background-color: #242526; }}
+.md-tabs {{ border-bottom: 1px solid var(--bp-rule); }}
+.md-tabs__link {{ font-weight: 600; opacity: 0.72; }}
+.md-tabs__link--active, .md-tabs__link:hover {{ opacity: 1; }}
+
+/* The landing page is a dashboard, not a chapter, so it drops the reading
+   column the rest of the book keeps. :has() is how a single generated
+   stylesheet can tell the two apart without a second page template; where it
+   is unsupported the page simply stays at reading width. */
+.md-typeset:has(.bp-landing) {{ max-width: 62rem; }}
+.bp-landing-prose {{ max-width: 72ch; }}
+
+.bp-hero {{ margin: 0 0 2.5rem; }}
+.bp-hero-rule {{
+  height: 4px;
+  width: 84px;
+  border-radius: 4px;
+  background: var(--bp-sweep);
+}}
+.bp-hero-kicker {{
+  margin-top: 1.1rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--bp-muted);
+}}
+.md-typeset .bp-hero-title {{
+  margin: 0.35rem 0 0;
+  font-size: 2.6rem;
+  line-height: 1.08;
+  font-weight: 800;
+  letter-spacing: -0.035em;
+}}
+.md-typeset .bp-hero-lead {{
+  margin: 0.9rem 0 0;
+  max-width: 54ch;
+  font-size: 1.05rem;
+  line-height: 1.55;
+  color: var(--bp-muted);
+}}
+
+/* Counts set as figures. The reader should get "how far along?" from the
+   shape of the numbers before reading any of the words around them. */
+.bp-hero-figures {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 1px;
+  margin-top: 2rem;
+  background: var(--bp-rule);
+  border: 1px solid var(--bp-rule);
+  border-radius: var(--bp-radius);
+  overflow: hidden;
+}}
+.bp-figure {{ padding: 1.1rem 1.25rem; background: var(--bp-surface); }}
+.bp-figure-value {{
+  font-size: 2.1rem;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  background: var(--bp-sweep);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}}
+.bp-figure-label {{
+  margin-top: 0.45rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}}
+.bp-figure-note {{ margin-top: 0.15rem; font-size: 0.7rem; color: var(--bp-muted); }}
+
+.bp-hero-bar {{
+  margin-top: 1rem;
+  height: 6px;
+  border-radius: 6px;
+  background: var(--bp-sunken);
+  border: 1px solid var(--bp-rule);
+  overflow: hidden;
+}}
+.bp-hero-bar > span {{ display: block; height: 100%; background: var(--bp-sweep); }}
+
+/* The map is the page's subject, so it gets a panel of its own and the
+   legend rides with it instead of becoming a section further down. */
+.bp-map {{
+  margin: 2.5rem 0;
+  border: 1px solid var(--bp-rule);
+  border-radius: var(--bp-radius);
+  background: var(--bp-surface);
+  overflow: hidden;
+}}
+.bp-map-head {{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--bp-rule);
+  background: var(--bp-sunken);
+}}
+.bp-map-title {{ font-size: 0.82rem; font-weight: 700; letter-spacing: -0.01em; }}
+.bp-map-hint {{ font-size: 0.7rem; color: var(--bp-muted); }}
+.bp-map .mermaid {{ margin: 0; padding: 1.75rem 1.25rem; text-align: center; }}
+.bp-map-legend {{
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--bp-rule);
+  background: var(--bp-sunken);
+}}
+
+/* One grid for the whole legend. The cells are emitted in reading order with
+   no row wrapper, so every swatch, label and count sits on the same axis
+   however long the text beside it runs. */
+.bp-legend-grid {{
+  display: grid;
+  grid-template-columns: auto auto auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0.5rem 0.9rem;
+  font-size: 0.72rem;
+}}
+.bp-legend-label {{ font-weight: 700; white-space: nowrap; }}
+.bp-legend-count {{
+  justify-self: end;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--bp-muted);
+}}
+.bp-legend-meaning {{ color: var(--bp-muted); }}
+.md-typeset .bp-legend-grid .bp-swatch {{ align-self: center; }}
 
 /* The book opens with a compact progress summary. It reports only decomposed
    blueprint items, leaving source-wide coverage to the dedicated page. */
@@ -1739,9 +2137,89 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 }}
 .bp-next-actions {{ font-family: {sans}; font-size: 0.85rem; margin-top: 0.5rem; }}
 
-/* The legend is a reference, not prose: no outer borders, swatch first. */
-.bp-legend summary {{ font-family: {sans}; font-size: 0.85rem; cursor: pointer; }}
-.bp-legend table {{ font-family: {sans}; font-size: 0.85rem; }}
+/* On a graph page the legend hangs off an icon at the end of the lead. It
+   opens on hover and on focus, so the button is reachable by keyboard; there
+   is no script behind it. */
+.bp-legend-tip {{ position: relative; display: inline-block; }}
+.bp-legend-icon {{
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--bp-muted);
+  cursor: help;
+  vertical-align: -0.14em;
+}}
+.bp-legend-icon svg {{
+  width: 1em;
+  height: 1em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}}
+.bp-legend-icon .bp-legend-dot {{ fill: currentColor; stroke: none; }}
+.bp-legend-icon:hover, .bp-legend-icon:focus-visible {{ color: var(--bp-link); }}
+.bp-legend-note {{
+  position: absolute;
+  z-index: 5;
+  left: 0;
+  top: calc(100% + 0.5rem);
+  width: max-content;
+  max-width: min(30rem, 78vw);
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--bp-rule);
+  border-radius: var(--bp-radius);
+  background: var(--bp-surface);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 22%);
+  /* Hidden without display:none, so the description stays announceable. */
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 90ms ease;
+}}
+.bp-legend-tip:hover .bp-legend-note,
+.bp-legend-tip:focus-within .bp-legend-note {{ opacity: 1; visibility: visible; }}
+/* The structure page is about paths, so it is set in the mono face and the
+   three columns are a grid: filenames stay on their indent, and the states
+   line up down the page where a mismatch is easy to spot. */
+.bp-tree {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: 0.3rem 1.25rem;
+  margin: 1.5rem 0;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--bp-rule);
+  border-radius: var(--bp-radius);
+  background: var(--bp-surface);
+  font-family: {mono};
+  font-size: 0.68rem;
+}}
+.bp-tree-path {{ overflow-wrap: anywhere; }}
+.bp-tree-title {{ font-family: {sans}; color: var(--bp-muted); margin-left: 0.5rem; }}
+.bp-tree-kind {{ color: var(--bp-muted); }}
+.bp-tree-mark {{ display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }}
+.bp-tree-state {{ color: var(--bp-muted); }}
+.bp-tree-warn {{
+  margin: 1rem 0;
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--bp-rule);
+  border-left: 3px solid #F7B928;
+  border-radius: var(--bp-radius);
+  background: var(--bp-sunken);
+  font-size: 0.75rem;
+}}
+
+.bp-visually-hidden {{
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}}
 
 .bp-source-link {{ color: var(--bp-muted); margin-left: 0.3rem; }}
 .bp-source-link:hover {{ color: var(--bp-link-hover); text-decoration: none; }}
@@ -1909,6 +2387,7 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 
 __all__ = [
     "DECLARATION_LABELS",
+    "LOGO",
     "MERMAID_SCRIPT",
     "PUBLICATION_MANIFEST",
     "PublicationError",

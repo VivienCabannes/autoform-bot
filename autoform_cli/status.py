@@ -44,29 +44,33 @@ class State:
 #: Ordered most complete first; this is also the legend order.
 #:
 #: Only finished work is filled in; everything in progress is an outline, which
-#: keeps the page quiet in the manner of the Lean community blog. Green tracks
-#: proof progress and amber marks work that cannot start. The dark scheme is a
-#: terminal palette -- dark panels with a bright foreground -- rather than the
-#: light one dimmed.
+#: keeps a chapter quiet when most of it is still open. The hues are Facebook's
+#: semantic set -- #31A24C green, #0064E0 blue, #F7B928 amber, #B0B3B8 grey --
+#: so that finished, actionable, blocked and untouched read at a glance without
+#: anyone learning a legend. Green tracks proof progress, blue marks what a
+#: contributor can pick up now, amber marks what nothing can start on.
+#:
+#: Dark is not light dimmed: on #18191A a saturated fill closes up, so dark
+#: states are near-black panels with a bright stroke and brighter label.
 STATES: tuple[State, ...] = (
-    State("mathlib", "in mathlib", "#0B5C2E", "#084423", "#FFFFFF",
-          "#0B2F16", "#238636", "#7EE787"),
-    State("fully_proved", "fully proved", "#1A7F37", "#12622A", "#FFFFFF",
-          "#16341F", "#3FB950", "#7EE787"),
-    State("proved", "proved", "#7FC98F", "#2C6E34", "#10240F",
-          "#12261A", "#2EA043", "#56D364"),
-    State("defined", "defined", "#B7E4C7", "#2C6E34", "#10240F",
-          "#12261A", "#238636", "#56D364"),
-    State("can_prove", "ready to prove", "#FFFFFF", "#0052CC", "#0052CC",
-          "#10202B", "#39C5CF", "#56D4DD"),
-    State("stated", "statement formalized", "#FFFFFF", "#1A7F37", "#12622A",
-          "#0D1117", "#2EA043", "#C9D1D9"),
-    State("can_state", "ready to state", "#FFFFFF", "#8B95A1", "#444444",
-          "#0D1117", "#39C5CF", "#C9D1D9"),
-    State("not_ready", "not ready", "#FFF3CD", "#B8860B", "#5C4405",
-          "#2B1D00", "#D29922", "#E3B341"),
-    State("planned", "planned", "#FFFFFF", "#CCCCCC", "#444444",
-          "#0D1117", "#484F58", "#8B949E"),
+    State("mathlib", "in mathlib", "#1C5C33", "#134426", "#FFFFFF",
+          "#10281A", "#42B72A", "#8BE78B"),
+    State("fully_proved", "fully proved", "#31A24C", "#22773A", "#FFFFFF",
+          "#13301E", "#42B72A", "#8BE78B"),
+    State("proved", "proved", "#8ED4A2", "#22773A", "#0B2415",
+          "#122A1B", "#31A24C", "#6BD97F"),
+    State("defined", "defined", "#C3E9CE", "#22773A", "#0B2415",
+          "#122A1B", "#2B8F44", "#6BD97F"),
+    State("can_prove", "ready to prove", "#FFFFFF", "#0064E0", "#0064E0",
+          "#101F33", "#2D88FF", "#7FB8FF"),
+    State("stated", "statement formalized", "#FFFFFF", "#31A24C", "#22773A",
+          "#18191A", "#31A24C", "#E4E6EB"),
+    State("can_state", "ready to state", "#FFFFFF", "#0082FB", "#0B4EA2",
+          "#18191A", "#2D88FF", "#E4E6EB"),
+    State("not_ready", "not ready", "#FFF3D6", "#B77900", "#5C3D00",
+          "#2E2205", "#F7B928", "#FFD772"),
+    State("planned", "planned", "#FFFFFF", "#CED0D4", "#65676B",
+          "#18191A", "#4E4F50", "#B0B3B8"),
 )
 
 _BY_KEY = {state.key: state for state in STATES}
