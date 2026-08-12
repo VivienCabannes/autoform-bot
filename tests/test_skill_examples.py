@@ -525,3 +525,31 @@ def test_roadmap_commits_so_the_published_site_can_catch_up(repo_root: Path) -> 
 
     assert "Commit the vault" in roadmap
     assert "outward-facing" in roadmap
+
+
+def test_the_example_site_config_matches_what_setup_would_write(repo_root) -> None:
+    """The bundled example is a second copy of the scaffold's mkdocs.yml.
+
+    Only the two substituted lines may differ. Everything else -- theme, fonts,
+    logo, features, plugins, extensions -- has to be what `autoform init`
+    writes, or the example stops demonstrating the product. It already drifted
+    once: the template moved to Plus Jakarta Sans and the example kept
+    requesting Merriweather, so the built demo showed the old typeface.
+    """
+    substituted = {"site_name", "repo_url"}
+
+    def significant(text: str) -> list[str]:
+        return [
+            line
+            for line in text.splitlines()
+            if line.strip()
+            and not line.lstrip().startswith("#")
+            and line.split(":", 1)[0].strip() not in substituted
+        ]
+
+    template = (repo_root / "autoform_cli/templates/mkdocs.yml").read_text(encoding="utf-8")
+    example = (
+        repo_root / "skills/setup/assets/cabannes-thesis-project/mkdocs.yml"
+    ).read_text(encoding="utf-8")
+
+    assert significant(example) == significant(template)

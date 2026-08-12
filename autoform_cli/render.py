@@ -1051,6 +1051,12 @@ def _render_landing_page(
     return "\n".join(part for part in parts if part is not None).rstrip() + "\n"
 
 
+#: States that count as finished work for the headline percentage.
+_SETTLED_STATES = frozenset({"mathlib", "fully_proved", "proved", "defined", "stated"})
+#: States a contributor could pick up today.
+_ACTIONABLE_STATES = frozenset({"can_prove", "can_state"})
+
+
 def _render_hero(
     title: str,
     body: str,
@@ -1099,12 +1105,6 @@ def _render_hero(
         f'<span style="width: {share}%"></span></div>'
         "</div>"
     )
-
-
-#: States that count as finished work for the headline percentage.
-_SETTLED_STATES = frozenset({"mathlib", "fully_proved", "proved", "defined", "stated"})
-#: States a contributor could pick up today.
-_ACTIONABLE_STATES = frozenset({"can_prove", "can_state"})
 
 
 def _lead_sentence(body: str) -> str:
@@ -1795,12 +1795,12 @@ def _body_without_dependencies(text: str) -> str:
 
 
 def _stylesheet() -> str:
-    """Blueprint styling: amsthm structure, Lean community blog typography.
+    """Blueprint styling: amsthm structure over Facebook's product surfaces.
 
-    Light is the community blog's palette -- Merriweather headings, Open Sans
-    body, Source Code Pro, and its deep blue link. Dark is a terminal scheme
-    rather than the light one dimmed, and hangs off Material's colour scheme so the
-    theme's own toggle drives it.
+    Both schemes are Facebook's shipped greys with Meta blue and the brand
+    gradient, set in Plus Jakarta Sans with JetBrains Mono for code. Dark is not
+    light dimmed: it is the palette Facebook uses in dark mode, and it hangs off
+    Material's colour scheme attribute so the theme's own toggle drives it.
     """
     light = "\n".join(
         f".bp-{state.key} .bp-mark {{ color: {state.stroke}; }}\n"
@@ -1909,7 +1909,6 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
    stylesheet can tell the two apart without a second page template; where it
    is unsupported the page simply stays at reading width. */
 .md-typeset:has(.bp-landing) {{ max-width: 62rem; }}
-.bp-landing-prose {{ max-width: 72ch; }}
 
 .bp-hero {{ margin: 0 0 2.5rem; }}
 .bp-hero-rule {{

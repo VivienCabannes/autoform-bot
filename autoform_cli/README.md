@@ -184,8 +184,10 @@ maps, and direct links to Lean declarations at the current commit:
 autoform render blueprint --output site-src --lean-root . --require-declarations
 ```
 
-`render` never writes into the vault. It derives `progress.md`, places a
-compact progress summary after each chapter's opening prose, and shows a source
+`render` never writes into the vault. It leads the landing page with the project
+map over a summary of what is formalized and what is unblocked, places a compact
+progress summary after each chapter's opening prose, writes `structure.md` so a
+vault's layout can be checked against the book it produces, and shows a source
 icon when a `lean:` declaration resolves to a repository permalink. Its
 `dependencies.md` entry point rolls dependencies through the article hierarchy,
 with links to declaration maps, one-hop local contexts, and the complete DAG.
