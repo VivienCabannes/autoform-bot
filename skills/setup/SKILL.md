@@ -17,7 +17,8 @@ MkDocs, CI, and optionally publication. It does not scope sources, choose
 theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
 Inspect before writing and preserve existing Lean, Markdown, workflow, and
-ignore files. Infer safe local defaults from the request and repository. If a
+ignore files. Use `scripts/workspace_inspector.py` when auditing an existing
+Lean workspace. Infer safe local defaults from the request and repository. If a
 material choice is missing, ask once for the run type (new, repair, or inspect),
 UpperCamelCase package name, target directory, and whether publication is
 wanted. Without explicit publication approval, make no remote changes. Setup
@@ -30,55 +31,73 @@ package, check the current matching stable Lean/Mathlib release, update branch
 and immutable workflow pins, and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 
+For a new repository, require a target directory that does not already exist and
+bootstrap the Lean/Mathlib shell with the plugin's internal helper:
+
+```bash
+bash "<AUTOFORM_PLUGIN_ROOT>/scripts/make_project.sh" \
+  <ProjectName> [target-dir]
+```
+
 For a new or incomplete repository:
 
 - create or repair a buildable Lean project with matching `lean-toolchain` and
-  Mathlib revisions;
-- create `blueprint/` with a landing page plus `roadmap/`, `coverage/`, and
-  `sources/`; later Roadmap work places `kind: node` pages beside their
-  milestones under `roadmap/`. A roadmap folder is a book chapter; a node page
-  is normally one PR-sized major result or important definition. Markdown
-  properties and dependency links are the graph, so do not create a parallel
-  `graph.json`. Keep personal `.obsidian/`, `.trash/`, generated graphs, and
-  site output ignored;
-- preserve or create the root `README.md` with a link to `blueprint/README.md`
-  and a linked “Developed with AutoformBot” credit; when a deployed site
-  exists, also feature its verified canonical URL prominently, never an
-  inferred or pending URL;
-- configure `mkdocs.yml` to build the `autoform render` output, not the vault
-  itself: `docs_dir: site-src`, `md_in_html`, a `pymdownx.superfences` mermaid
-  fence, a verified repository URL in `repo_url`, and the generated stylesheet
-  and mermaid init. Keep the
-  project-independent primary navigation focused on the Blueprint book, its
-  generated Progress page, and Dependencies. Point Blueprint at the rendered
-  `README.md` contents page. Use a small theme override to link the formalized
-  code repository, credit AutoformBot, and retain the MkDocs footer. Remove
-  MkDocs' global previous/next controls: Autoform derives those links from the
-  blueprint's Markdown reading order and renders them only at the bottom of
-  book pages, never on Progress or Dependencies;
-- adapt `autoform-verify.yml` to validate the Markdown DAG, build Lean, reject
-  unfinished or unsafe proofs, and audit theorem axioms on pull requests; and
-- adapt `blueprint-pages.yml` to validate the DAG and its `lean:` declarations,
-  render the blueprint, build MkDocs, and deploy GitHub Pages.
+  Mathlib revisions; and
+- write the blueprint vault, site configuration, and CI with `autoform init`.
+
+`autoform init` is the whole vault: `blueprint/` with its landing page,
+`roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
+override, both workflows, and ignore rules. Do not hand-build any of it and do
+not copy the bundled example: the layout is fixed, and a chapter written as a
+sibling file instead of `<chapter>/README.md` still validates while publishing
+a book with no chapters. `init` never overwrites an existing file, so it is
+also the repair path; it reports what it left alone. See the
+[CLI reference](../../autoform_cli/README.md#commands) for its flags.
+
+`init` pins the generated workflows to the Autoform commit that ran it, but it
+can only do that when Autoform is running from a Git checkout. Installed as a
+plugin it is a plain directory copy, so there is nothing to read and `init`
+writes no CI rather than guess a ref: guessing produced projects whose first
+push failed with nothing in the workflow to explain why. When it reports that,
+find the commit the plugin was installed from and pass
+`--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
+Never invent a ref. It must be a full 40-character commit sha: `init` refuses a
+branch, a tag, or an abbreviated sha, because CI would silently reinstall a
+different Autoform later and break a project that was passing.
+
+The two workflows it writes are `autoform-verify.yml`, which validates the
+Markdown DAG, builds Lean, rejects unfinished or unsafe proofs, and audits
+theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the
+DAG and its `lean:` declarations, renders the blueprint, builds MkDocs, and
+deploys GitHub Pages. Pass `--autoform-ref` to pin them at an immutable commit.
+
+After it runs, fill in what only a human or a source can supply: the project
+description in `blueprint/README.md`, the coverage contract, and a verified
+`repo_url`. That URL is the *formalization project's own* repository, never
+AutoformBot's: Material renders it as the repository link in the site header,
+and pointing it at the plugin sends every reader to the wrong project. Pass
+`--repository-url` to `autoform init`, or leave the key out until the remote
+exists rather than guessing it. When a deployed site exists, feature its verified canonical URL in
+the root `README.md`, never an inferred or pending one.
 
 Adding workflow files is a local repository edit. Creating a remote, pushing,
 or enabling Pages are separate outward-facing actions; perform them only when
 the user requests them. Pin third-party Actions and the Autoform CLI source to
 immutable commits.
 
-Validate the prepared repository with the corresponding local commands.
-`<AUTOFORM_PLUGIN_ROOT>` is the AutoformBot checkout this skill was loaded
-from; substitute its absolute path:
+Validate the prepared repository before reporting it ready. Build Lean first,
+then run the publication sequence:
 
 ```bash
 lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-visualize blueprint
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
-  --output site-src --lean-root . --require-declarations
-uv run --with mkdocs --with pymdown-extensions mkdocs build --strict
 ```
+
+Then validate, visualize, render, and strict-build the site, keeping
+`--require-declarations` so a named Lean declaration that does not exist fails
+here rather than in CI. The exact invocations, including how to resolve
+`<AUTOFORM_PLUGIN_ROOT>`, are in the [CLI reference](../../autoform_cli/README.md#commands);
+do not restate them here.
 
 `render` writes a derived tree; the vault stays the source of truth. Ignore
 `site-src/`, `site/`, and `blueprint/dependencies.md`.

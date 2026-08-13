@@ -16,8 +16,8 @@ wider thesis coverage.
 ## Contents
 
 - [Thesis roadmap](roadmap/README.md)
-- [Infimum Loss](roadmap/infimum-loss/README.md) — decomposed into definitions and results
 - [Full Supervision](roadmap/full-supervision/README.md) — supporting formalization chapter
+- [Infimum Loss](roadmap/infimum-loss/README.md) — decomposed into definitions and results
 
 The [thesis source map](sources/thesis.md) records the adopted references behind
 the statements. The [dependency view](dependencies.md) gives a structural view

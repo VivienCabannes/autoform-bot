@@ -1,6 +1,6 @@
 ---
-kind: node
 declaration: theorem
+origin: cited
 statement: formalized
 proof: formalized
 lean: CabannesThesis.supervision_nonAmbiguous
@@ -17,5 +17,5 @@ is non-ambiguous.
 
 ## Depends on
 
-- [Full supervision](../definitions/full-supervision.md)
-- [Non-ambiguity](../../infimum-loss/definitions/non-ambiguity.md)
+- [Full supervision](../../full-supervision/definitions/full-supervision.md)
+- [Non-ambiguity](../definitions/non-ambiguity.md)

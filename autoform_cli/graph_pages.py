@@ -19,10 +19,9 @@ from .graph_views import (
     chapter_view,
     focus_views,
     full_view,
-    group_id,
     group_nodes,
-    group_title,
     project_view,
+    scope_view,
 )
 from .status import NodeStatus
 
@@ -52,31 +51,36 @@ def write_graph_pages(
         group: destination / "dependencies/chapters" / f"{group or 'roadmap'}.md"
         for group in groups
     }
+    containers = [node_id for node_id in graph.nodes if graph.children(node_id)]
+    scope_pages = {
+        node_id: (
+            project_page
+            if node_id == "roadmap"
+            else chapter_pages[node_id]
+            if node_id in chapter_pages
+            else destination / "dependencies/scopes" / f"{node_id}.md"
+        )
+        for node_id in containers
+    }
+    article_groups = {
+        node_id: group for group, node_ids in groups.items() for node_id in node_ids
+    }
     focus_pages = {
         node_id: destination / "dependencies/nodes" / f"{node_id}.md"
-        for node_id in graph.nodes
+        for node_id in article_groups
     }
     written: list[Path] = []
 
     project = project_view(graph, statuses)
+    project_book_links = node_links(project_page)
     project_links = {
-        view_node.id: _published_link(chapter_pages[group], project_page)
-        for group, view_node in zip(groups, project.nodes)
+        view_node.id: (
+            _published_link(chapter_pages[view_node.id.removeprefix("scope:")], project_page)
+            if view_node.kind == "scope"
+            else project_book_links[view_node.id]
+        )
+        for view_node in project.nodes
     }
-    chapter_list = [
-        f"- [{group_title(graph, group)}]({_markdown_link(chapter_pages[group], project_page)})"
-        for group in groups
-    ]
-    project_extra = "\n".join(
-        [
-            "## Choose a level",
-            "",
-            *chapter_list,
-            f"- [Full theorem DAG]({_markdown_link(full_page, project_page)})",
-            "",
-            "Each chapter map links to one-hop local views for its definitions and results.",
-        ]
-    )
     written.append(
         _write_page(
             project_page,
@@ -85,11 +89,9 @@ def write_graph_pages(
             links=project_links,
             heading="Dependency maps",
             lead=(
-                f"This project map groups {len(graph.nodes)} decomposed blueprint items into "
-                f"{len(groups)} textbook chapter{'s' if len(groups) != 1 else ''}. "
-                "Select a chapter to inspect its theorem-level structure."
+                f"{len(graph.nodes)} items across "
+                f"{len(groups)} chapter{'s' if len(groups) != 1 else ''}."
             ),
-            extra=project_extra,
         )
     )
 
@@ -98,31 +100,21 @@ def write_graph_pages(
         links = dict(node_links(chapter_page))
         for node in view.nodes:
             if node.kind == "boundary":
-                external = group_id(node.members[0])
+                external = node.id.removeprefix("boundary:")
                 links[node.id] = _published_link(chapter_pages[external], chapter_page)
+            elif node.kind == "scope":
+                nested = node.id.removeprefix("scope:")
+                links[node.id] = _published_link(scope_pages[nested], chapter_page)
 
         book_page = (
-            destination / "roadmap" / group / "README.md"
-            if group
-            else destination / "roadmap/README.md"
+            destination / "roadmap/README.md"
+            if group in {"", "roadmap"}
+            else destination / "roadmap" / group / "README.md"
         )
         navigation = _navigation(
             ("Project map", _markdown_link(project_page, chapter_page)),
             ("Full theorem DAG", _markdown_link(full_page, chapter_page)),
             ("Open textbook chapter", _markdown_link(book_page, chapter_page)),
-        )
-        focus_list = [
-            f"- [{graph.nodes[node_id].title}]({_markdown_link(focus_pages[node_id], chapter_page)})"
-            for node_id in groups[group]
-        ]
-        extra = "\n".join(
-            [
-                "## Local context",
-                "",
-                "Focus on one item and its immediate prerequisites and dependents:",
-                "",
-                *focus_list,
-            ]
         )
         written.append(
             _write_page(
@@ -136,10 +128,41 @@ def write_graph_pages(
                     "Dashed chapter boxes stand for external prerequisites or dependents."
                 ),
                 navigation=navigation,
-                extra=extra,
             )
         )
 
+    for scope in containers:
+        if scope in {"roadmap", *chapter_pages}:
+            continue
+        scope_page = scope_pages[scope]
+        view = scope_view(graph, statuses, scope)
+        links = dict(node_links(scope_page))
+        for node in view.nodes:
+            if node.kind == "scope":
+                nested = node.id.removeprefix("scope:")
+                links[node.id] = _published_link(scope_pages[nested], scope_page)
+            elif node.kind == "boundary":
+                external = node.id.removeprefix("boundary:")
+                links[node.id] = _published_link(chapter_pages[external], scope_page)
+        parent = graph.nodes[scope].parent
+        parent_page = scope_pages.get(parent or "roadmap", project_page)
+        written.append(
+            _write_page(
+                scope_page,
+                view=view,
+                statuses=_selected_statuses(statuses, view),
+                links=links,
+                heading=view.title,
+                lead=(
+                    "This map shows the container's direct articles. Nested containers "
+                    "are collapsed and clickable; dependency edges are rolled up from their leaves."
+                ),
+                navigation=_navigation(
+                    ("Parent map", _markdown_link(parent_page, scope_page)),
+                    ("Full theorem DAG", _markdown_link(full_page, scope_page)),
+                ),
+            )
+        )
     complete = full_view(graph, statuses)
     written.append(
         _write_page(
@@ -158,7 +181,8 @@ def write_graph_pages(
 
     for node_id, focus_page in focus_pages.items():
         view = local_views[node_id]
-        chapter_page = chapter_pages[group_id(node_id)]
+        parent = graph.nodes[node_id].parent
+        chapter_page = scope_pages.get(parent or article_groups[node_id], chapter_pages[article_groups[node_id]])
         statement_href = _markdown_document_link(node_links(focus_page)[node_id])
         navigation = _navigation(
             ("Project map", _markdown_link(project_page, focus_page)),
@@ -212,12 +236,12 @@ def _write_page(
     ]
     if navigation:
         sections.extend([navigation, ""])
-    sections.extend([lead, "", diagram, ""])
+    # The legend rides on the lead sentence rather than sitting under the
+    # diagram: it answers a question the reader asks once, not on every page.
+    tip = mermaid.render_legend_tip(statuses)
+    sections.extend([f"{lead} {tip}".rstrip(), "", diagram, ""])
     if extra:
         sections.extend([extra, ""])
-    legend = mermaid.render_legend(statuses)
-    if legend:
-        sections.extend(["## Status legend", "", legend, ""])
     page.parent.mkdir(parents=True, exist_ok=True)
     page.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
     return page

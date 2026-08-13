@@ -1,12 +1,14 @@
 ---
-kind: node
 declaration: theorem
+origin: cited
 ---
 
 # Supervision recovery
 
-The formalization target is the source theorem identifying conditions under
-which the infimum-loss construction recovers the fully supervised objective.
+Let $f_0$ minimize the fully supervised risk. If the weak distribution is
+non-ambiguous and each observed set at $x$ is the singleton $\{f_0(x)\}$, then
+the infimum-loss solution satisfies $f^*=f_0$. Moreover, if the original
+distribution is deterministic, the disambiguated distribution recovers it.
 
 ## Sources
 
@@ -20,4 +22,4 @@ which the infimum-loss construction recovers the fully supervised objective.
 ## Proof depends on
 
 - [Non-ambiguity determinism](non-ambiguity-determinism.md)
-- [Full supervision is non-ambiguous](../../full-supervision/theorems/supervision-non-ambiguous.md)
+- [Full supervision is non-ambiguous](supervision-non-ambiguous.md)

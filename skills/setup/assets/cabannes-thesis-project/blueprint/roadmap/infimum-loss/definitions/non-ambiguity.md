@@ -1,6 +1,6 @@
 ---
-kind: node
 declaration: def
+origin: cited
 statement: formalized
 lean: CabannesThesis.NonAmbiguous
 ---

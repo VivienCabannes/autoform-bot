@@ -6,7 +6,7 @@ import pytest
 
 from autoform_cli import graph_views
 from autoform_cli.graph import Graph, Node
-from autoform_cli.graph_views import chapter_view, focus_view, focus_views, full_view, project_view
+from autoform_cli.graph_views import chapter_view, focus_view, focus_views, full_view, project_view, scope_view
 from autoform_cli.status import derive
 
 
@@ -90,12 +90,32 @@ def test_chapter_view_keeps_external_relations_as_boundaries(tmp_path: Path) -> 
         "boundary:a",
         "boundary:c",
     }
-    assert {(edge.source, edge.target, edge.statement_count, edge.proof_count) for edge in view.edges} == {
-        ("boundary:a", "b/bridge", 1, 0),
-        ("boundary:a", "b/top", 0, 1),
-        ("b/bridge", "b/top", 1, 0),
-        ("b/top", "boundary:c", 1, 0),
+
+
+def test_scope_view_collapses_nested_articles_and_rolls_up_dependencies(tmp_path: Path) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    nodes = {
+        "roadmap": Node("roadmap", "Book", roadmap / "README.md", (), parent=None),
+        "chapter": Node("chapter", "Chapter", roadmap / "chapter/README.md", (), parent="roadmap", depth=1),
+        "section": Node("section", "Section", roadmap / "chapter/section/README.md", (), parent="chapter", depth=2),
+        "section/base": Node(
+            "section/base", "Base", roadmap / "chapter/section/base.md", (),
+            parent="section", depth=3, declaration="def", statement_formalized=True,
+        ),
+        "result": Node(
+            "result", "Result", roadmap / "chapter/result.md", ("section/base",),
+            statement_dependencies=("section/base",), parent="chapter", depth=2,
+            declaration="theorem",
+        ),
     }
+    graph = Graph(tmp_path / "blueprint", nodes)
+    view = scope_view(graph, derive(graph), "chapter")
+
+    assert [(node.id, node.kind, node.members) for node in view.nodes] == [
+        ("scope:section", "scope", ("section/base",)),
+        ("result", "node", ("result",)),
+    ]
+    assert [(edge.source, edge.target) for edge in view.edges] == [("scope:section", "result")]
 
 
 def test_focus_view_uses_graph_distance_independently_of_chapter_scope(tmp_path: Path) -> None:

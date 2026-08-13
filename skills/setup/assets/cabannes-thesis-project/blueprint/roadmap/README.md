@@ -1,8 +1,3 @@
----
-kind: roadmap
-status: active
----
-
 # Thesis roadmap
 
 The long-term goal is to identify and formalize the reusable mathematical core
@@ -16,8 +11,8 @@ for the remaining chapters.
    - Fast Rates for Structured Prediction
    - Exponential Convergence Rates for SVM
 2. **Learning with Partial Supervision**
-   - [Infimum Loss](infimum-loss/README.md) — initial node DAG
    - [Full Supervision](full-supervision/README.md) — supporting Lean chapter
+   - [Infimum Loss](infimum-loss/README.md) — initial article DAG
    - Disambiguation Framework
    - Laplacian Regularization
 3. **Active Labeling**

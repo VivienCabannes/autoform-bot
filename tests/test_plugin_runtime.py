@@ -67,8 +67,8 @@ def test_plugin_surface_is_six_skills_and_two_servers(repo_root):
 def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
     codex = json.loads((repo_root / ".mcp.json").read_text())
     for server in codex["mcpServers"].values():
-        assert server["cwd"] == "."
-        assert server["args"][:3] == ["run", "--project", "."]
+        assert server["cwd"] == "${CLAUDE_PLUGIN_ROOT}"
+        assert server["args"][:3] == ["run", "--project", "${CLAUDE_PLUGIN_ROOT}"]
 
     claude = json.loads((repo_root / ".claude-plugin" / "plugin.json").read_text())
     for server in claude["mcpServers"].values():

@@ -25,15 +25,24 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     graph = load_graph(blueprint)
 
     assert set(graph.nodes) == {
+        "roadmap",
+        "infimum-loss",
+        "full-supervision",
         "infimum-loss/definitions/eligibility",
         "infimum-loss/definitions/non-ambiguity",
         "infimum-loss/theorems/infimum-loss",
         "infimum-loss/theorems/non-ambiguity-determinism",
         "infimum-loss/theorems/supervision-recovery",
         "full-supervision/definitions/full-supervision",
-        "full-supervision/theorems/supervision-non-ambiguous",
+        "infimum-loss/theorems/supervision-non-ambiguous",
     }
     assert graph.edge_count == 9
+    assert graph.nodes["roadmap"].parent is None
+    assert graph.nodes["infimum-loss"].parent == "roadmap"
+    assert graph.nodes["full-supervision"].parent == "roadmap"
+    formalizable = {node.id for node in graph.nodes.values() if node.formalizable}
+    assert len(formalizable) == 7
+    assert all(graph.nodes[node_id].origin == "cited" for node_id in formalizable)
     eligibility = graph.nodes["infimum-loss/definitions/eligibility"]
     assert eligibility.declaration == "def"
     assert eligibility.statement_formalized
@@ -45,7 +54,7 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     )
     assert recovery.proof_dependencies == (
         "infimum-loss/theorems/non-ambiguity-determinism",
-        "full-supervision/theorems/supervision-non-ambiguous",
+        "infimum-loss/theorems/supervision-non-ambiguous",
     )
 
     # The example exercises two real book chapters and an honest cross-chapter
@@ -55,7 +64,7 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert statuses["infimum-loss/theorems/supervision-recovery"].key == "planned"
     assert statuses["infimum-loss/theorems/infimum-loss"].key == "can_state"
     assert statuses["infimum-loss/definitions/eligibility"].key == "fully_proved"
-    assert statuses["full-supervision/theorems/supervision-non-ambiguous"].key == (
+    assert statuses["infimum-loss/theorems/supervision-non-ambiguous"].key == (
         "fully_proved"
     )
 
@@ -110,11 +119,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert report.unresolved == []
     manifest = json.loads((site / "publication.json").read_text(encoding="utf-8"))
     assert manifest["schema"] == "autoform-publication/v1"
-    assert manifest["nodes"] == 7
+    assert manifest["nodes"] == 10
     assert manifest["dependencies"] == 9
     assert manifest["git_ref"] == "0" * 40
     assert str(example) not in json.dumps(manifest)
     graph = load_graph(example / "blueprint")
+    formalizable = {node.id for node in graph.nodes.values() if node.formalizable}
 
     # Statements are published as environments on their milestone chapter,
     # each anchored so every cross-reference still lands on the statement.
@@ -136,13 +146,12 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert '<a class="bp-context-link"' in chapter
     assert "dependencies/nodes/infimum-loss/theorems/supervision-recovery.html" in chapter
     assert '<details class="bp-dependencies"><summary>Dependencies</summary>' in chapter
-    assert 'href="../../progress.html"' in chapter
     assert '<nav class="bp-book-nav" aria-label="Blueprint chapters">' in chapter
-    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in chapter
     assert (
-        'class="bp-book-nav-link bp-book-nav-next" '
+        'class="bp-book-nav-link bp-book-nav-previous" '
         'href="../full-supervision/index.html"'
     ) in chapter
+    assert 'bp-book-nav-next' not in chapter
 
     support_path = site / "roadmap/full-supervision/README.md"
     support = support_path.read_text(encoding="utf-8")
@@ -152,13 +161,13 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         anchor = node_id.split("/", 1)[1].replace("/", "-")
         assert f'id="{anchor}"' in support, node_id
     assert 'class="bp-thmwrapper theorem-style-definition bp-fully_proved"' in support
-    assert 'class="bp-thmwrapper theorem-style-plain bp-fully_proved"' in support
+    assert 'class="bp-thmwrapper theorem-style-plain' not in support
     assert '<a class="bp-code-link"' in support
+    assert 'class="bp-book-nav-link bp-book-nav-previous" href="../index.html"' in support
     assert (
-        'class="bp-book-nav-link bp-book-nav-previous" '
+        'class="bp-book-nav-link bp-book-nav-next" '
         'href="../infimum-loss/index.html"'
     ) in support
-    assert 'bp-book-nav-next' not in support
 
     for href in _HREF.findall(chapter):
         if href.startswith(("http", "#")):
@@ -186,7 +195,7 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     )
     assert "graph_view: chapter" in chapter_graph
     assert "graph_view: chapter" in support_graph
-    for node_id in graph.nodes:
+    for node_id in formalizable:
         anchor = node_id.split("/", 1)[1].replace("/", "-")
         group = node_id.split("/", 1)[0]
         target_graph = chapter_graph if group == "infimum-loss" else support_graph
@@ -206,46 +215,48 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
         "theorems-supervision-recovery)"
     ) in focus_graph
 
-    progress = (site / "progress.md").read_text(encoding="utf-8")
-    assert "3 definitions · 4 results" in progress
-    assert "<strong>5</strong> fully proved" in progress
-    assert "<strong>1</strong> ready to state" in progress
-    assert "<strong>1</strong> planned" in progress
-    assert "Full Supervision" in progress
-    assert "## Scope coverage" in progress
-    assert "Experiments and narrative material" in progress
-    assert "bp-book-nav" not in progress
+    # Progress folded into the Book landing and the Graph; no separate page.
+    assert not (site / "progress.md").exists()
+    assert not (site / "book.md").exists()
+    overview = (site / "README.md").read_text(encoding="utf-8")
+    # The landing page states progress as figures; the chapters keep the strip.
+    assert "5 of 7 items settled" in overview
+    assert ">71%<" in overview
+    assert "bp-progress-link" not in overview
+    # A chapter strip counts that chapter, so this is 4 of the project's 5.
+    milestone = (site / "roadmap/infimum-loss/README.md").read_text(encoding="utf-8")
+    assert "<strong>4</strong> fully proved" in milestone
+    coverage = (site / "coverage/README.md").read_text(encoding="utf-8")
+    assert "Experiments and narrative material" in coverage
+    graph_page = (site / "dependencies.md").read_text(encoding="utf-8")
+    assert "bp-book-nav" not in graph_page
 
     mkdocs = (example / "mkdocs.yml").read_text(encoding="utf-8")
     assert "docs_dir: site-src" in mkdocs
-    assert "repo_url: https://github.com/facebookresearch/autoform-bot" in mkdocs
+    # Material renders repo_url as the header link, so it must be the project's
+    # own repository. Pointing it at AutoformBot sends readers to the plugin.
+    assert "repo_url: https://github.com/VivienCabannes/cabannes-thesis" in mkdocs
+    assert "repo_url: https://github.com/facebookresearch/autoform-bot" not in mkdocs
     assert "use_directory_urls: false" in mkdocs
     assert "md_in_html" in mkdocs
     assert "pymdownx.superfences" in mkdocs
     assert "stylesheets/blueprint.css" in mkdocs
     assert "javascripts/blueprint-mermaid.js" in mkdocs
-    nav = mkdocs.split("\nnav:\n", 1)[1].split("\ntheme:\n", 1)[0]
-    assert re.findall(r"^  - ([^:]+):", nav, flags=re.MULTILINE) == [
-        "Blueprint",
-        "Progress",
-        "Dependencies",
-    ]
-    assert "- Blueprint: README.md" in nav
-    assert "roadmap/" not in nav
-    assert "sources/" not in nav
-    # A blue Bootstrap banner and no dark-mode toggle are both theme defaults.
-    assert "nav_style: light" in mkdocs
-    assert "user_color_mode_toggle: true" in mkdocs
-    assert "custom_dir: theme" in mkdocs
+    # The nav is generated from the vault into SUMMARY.md, so mkdocs.yml has
+    # none: a hand-written chapter list would drift from the book.
+    assert "\nnav:\n" not in mkdocs
+    assert "literate-nav" in mkdocs
+    assert "navigation.tabs" in mkdocs
+    summary = (site / "SUMMARY.md").read_text(encoding="utf-8")
+    assert summary.startswith("- [Home](README.md)")
+    assert "- Book" in summary
+    assert "- Graph" in summary
+    assert "[Infimum Loss milestone](roadmap/infimum-loss/README.md)" in summary
     theme = (example / "theme" / "main.html").read_text(encoding="utf-8")
-    assert "{% block next_prev %}{% endblock %}" in theme
     assert "{% block footer %}" in theme
-    assert (
-        'Developed with <a href="https://github.com/facebookresearch/autoform-bot">'
-        "AutoformBot</a>."
-    ) in theme
-    assert '<a href="{{ config.repo_url }}">Formalization source on GitHub</a>.' in theme
-    assert "Documentation built with {{ mkdocs_link }}." in theme
+    assert "AutoformBot" in theme
+    assert "https://github.com/facebookresearch/autoform-bot" in theme
+    assert '<a href="{{ config.repo_url }}">Formalization source</a>.' in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow
@@ -310,7 +321,6 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "references/cabannes-thesis-roadmap.md",
         "blueprint/roadmap/",
         "blueprint/coverage/",
-        "kind: node",
         "blueprint/roadmap/**/*.md",
         "declaration",
         "coarse roadmap",
@@ -322,7 +332,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "one unique main result",
         "targeted lookups",
         "exact verified upstream result",
-        "Reconcile the coarse milestone pages",
+        "Reconcile every page whose claims this work has just invalidated",
         "GitHub pull requests and issues",
         "Zulip topics",
         "../setup/references/zulip.md",
@@ -330,7 +340,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         "never contact people",
     ):
         assert required in roadmap
-    assert "renders them only at the bottom of\n  book pages" in setup
+    assert "autoform init" in setup
     assert "references/thesis-worked-node.md" in orchestrate
     assert "Schedule prerequisite nodes before their dependents" in orchestrate
     assert "references/thesis-review-case.md" in agent_review
@@ -391,3 +401,155 @@ def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
     assert "references/zulip.md" in setup
     assert "Do not infer consent" in setup
     assert "../setup/references/zulip.md" in roadmap
+
+
+def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
+    """Agent instructions must match what `autoform_cli.graph` actually parses.
+
+    `kind` and `status` were removed from the frontmatter contract, so a skill
+    that still teaches either makes agents author keys the parser rejects.
+    """
+    for skill in sorted((repo_root / "skills").glob("*/SKILL.md")):
+        text = skill.read_text(encoding="utf-8")
+        for stale in ("kind: node", "kind: article", "kind: roadmap", "status: active"):
+            assert stale not in text, f"{skill.relative_to(repo_root)} still teaches `{stale}`"
+
+    example = repo_root / _EXAMPLE / "blueprint/roadmap"
+    for article in sorted(example.rglob("*.md")):
+        assert "kind:" not in article.read_text(encoding="utf-8")
+
+
+def test_orchestrate_documents_the_claim_protocol(repo_root: Path) -> None:
+    """Claims are fail-closed, so the skill that works nodes must acquire one.
+
+    `autoform_cli.claims` and the `claim` subcommand exist on both CLIs; without
+    this instruction a host agent works nodes unclaimed and two agents can
+    collide on the same node.
+    """
+    orchestrate = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
+
+    for required in (
+        "AUTOFORM_WORKER_ID",
+        "autoform claim acquire",
+        "autoform claim renew",
+        "autoform claim release",
+        "ownership is unproven",
+    ):
+        assert required in orchestrate
+
+
+def _documented_invocations(reference: str) -> set[tuple[str, ...]]:
+    """Every `autoform ...` command line inside the reference's bash fences."""
+    invocations: set[tuple[str, ...]] = set()
+    for block in re.findall(r"```bash\n(.*?)```", reference, re.DOTALL):
+        for line in block.splitlines():
+            line = line.strip().rstrip("\\").strip()
+            words = line.split()
+            if "autoform" not in words:
+                continue
+            rest = words[words.index("autoform") + 1 :]
+            verbs = tuple(word for word in rest if word and not word.startswith("-"))
+            if not verbs:
+                continue
+            if verbs[0] == "claim" and len(verbs) > 1:
+                invocations.add(verbs[:2])
+            else:
+                invocations.add(verbs[:1])
+    return invocations
+
+
+def test_cli_reference_documents_only_commands_that_exist(repo_root: Path) -> None:
+    """The CLI reference is the single source of truth, so it must be checkable.
+
+    Skills link here instead of restating flags. That only stays safe if the
+    reference cannot drift from the parser, so every command it shows must
+    parse.
+    """
+    import pytest
+
+    from autoform_cli.__main__ import main
+
+    reference = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
+    documented = _documented_invocations(reference)
+    assert {("check",), ("audit",), ("render",), ("claim", "acquire")} <= documented
+
+    for invocation in sorted(documented):
+        with pytest.raises(SystemExit) as exit_info:
+            main([*invocation, "--help"])
+        assert exit_info.value.code == 0, f"reference documents unknown command: {' '.join(invocation)}"
+
+
+def test_skills_delegate_the_command_line_to_the_reference(repo_root: Path) -> None:
+    """Skills state intent and link to the reference; they do not restate flags.
+
+    Duplicated invocations are what let the CLI move underneath the agent's
+    instructions, so a skill that needs the command line must cite the
+    reference instead of copying it.
+    """
+    citing = 0
+    for skill in sorted((repo_root / "skills").glob("*/SKILL.md")):
+        text = skill.read_text(encoding="utf-8")
+        assert "uv run --project" not in text, (
+            f"{skill.relative_to(repo_root)} restates a CLI invocation; "
+            "link to autoform_cli/README.md#commands instead"
+        )
+        if "autoform_cli/README.md" in text:
+            citing += 1
+    assert citing >= 3
+
+
+def test_roadmap_reconciles_the_pages_setup_wrote(repo_root: Path) -> None:
+    """Setup declares the project empty; Roadmap must retract that.
+
+    A live run decomposed a chapter into nine nodes and published a site whose
+    front page still read "no chapters, statements, or dependencies exist
+    below". Setup authored that sentence before any scope existed and Roadmap
+    updated the chapter and the coverage contract but not the two landing pages,
+    so the first thing a visitor read was that the project was empty.
+    """
+
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+
+    for required in ("blueprint/README.md", "repository `README.md`"):
+        assert required in roadmap, f"Roadmap never reconciles {required}"
+
+
+def test_roadmap_commits_so_the_published_site_can_catch_up(repo_root: Path) -> None:
+    """CI publishes from the repository, not from a working tree.
+
+    Roadmap was the only workflow skill silent on committing, which left the
+    deploy waiting on a step nobody owned. Pushing stays the user's call.
+    """
+
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+
+    assert "Commit the vault" in roadmap
+    assert "outward-facing" in roadmap
+
+
+def test_the_example_site_config_matches_what_setup_would_write(repo_root) -> None:
+    """The bundled example is a second copy of the scaffold's mkdocs.yml.
+
+    Only the two substituted lines may differ. Everything else -- theme, fonts,
+    logo, features, plugins, extensions -- has to be what `autoform init`
+    writes, or the example stops demonstrating the product. It already drifted
+    once: the template moved to Plus Jakarta Sans and the example kept
+    requesting Merriweather, so the built demo showed the old typeface.
+    """
+    substituted = {"site_name", "repo_url"}
+
+    def significant(text: str) -> list[str]:
+        return [
+            line
+            for line in text.splitlines()
+            if line.strip()
+            and not line.lstrip().startswith("#")
+            and line.split(":", 1)[0].strip() not in substituted
+        ]
+
+    template = (repo_root / "autoform_cli/templates/mkdocs.yml").read_text(encoding="utf-8")
+    example = (
+        repo_root / "skills/setup/assets/cabannes-thesis-project/mkdocs.yml"
+    ).read_text(encoding="utf-8")
+
+    assert significant(example) == significant(template)

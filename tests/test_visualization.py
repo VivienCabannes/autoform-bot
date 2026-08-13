@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from autoform_cli import mermaid
 from autoform_cli.graph import load_graph
 from autoform_cli.status import STATES, derive
-from autoform_cli.visualize import export_graph, main
+from autoform_cli.visualize import export_graph, export_structure, main
 
 
 def _state(key: str):
@@ -21,7 +22,7 @@ def _write_node(
     **metadata: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    properties = ["kind: node", *(f"{key}: {value}" for key, value in metadata.items())]
+    properties = [*(f"{key}: {value}" for key, value in metadata.items())]
     lines = ["---", *properties, "---", "", f"# {title}"]
     if dependencies:
         lines.extend(["", "## Depends on", ""])
@@ -31,6 +32,7 @@ def _write_node(
 
 def test_export_writes_a_mermaid_page_linking_to_markdown(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "foundations" / "README.md", "Foundations")
     _write_node(blueprint / "roadmap" / "foundations" / "base lemma.md", "Base lemma")
     _write_node(
         blueprint / "roadmap" / "main.md",
@@ -44,9 +46,12 @@ def test_export_writes_a_mermaid_page_linking_to_markdown(tmp_path: Path) -> Non
     assert output == (blueprint / "dependencies.md").resolve()
     assert "```mermaid" in document
     assert "graph LR" in document
-    assert 'click n0 "roadmap/foundations/base lemma.md"' in document
-    assert 'click n1 "roadmap/main.md"' in document
-    assert "  n0 --> n1" in document
+    # Handles are assigned in sorted order, so pin the links and the edge by
+    # their targets rather than by whichever index a node happens to get.
+    handles = dict(re.findall(r'click (n\d+) "([^"]+)"', document))
+    lemma = next(k for k, v in handles.items() if v == "roadmap/foundations/base lemma.md")
+    main = next(k for k, v in handles.items() if v == "roadmap/main.md")
+    assert f"  {lemma} --> {main}" in document
     assert "Main <result>" in document
 
 
@@ -75,7 +80,7 @@ def test_diagram_colours_and_shapes_follow_derived_status(tmp_path: Path) -> Non
     # The vault copy carries its palette inline; Obsidian has no init script.
     assert f"classDef fully_proved fill:{_state('fully_proved').fill}" in document
     assert '<span class="bp-swatch bp-swatch-fully_proved">' in document
-    assert "| fully proved | 2 |" in document
+    assert '<span class="bp-legend-count">2</span>' in document
 
 
 def test_the_published_graph_defers_its_palette_to_the_theme(tmp_path: Path) -> None:
@@ -97,7 +102,7 @@ def test_proof_only_dependencies_are_dashed(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _write_node(blueprint / "roadmap" / "tool.md", "Tool")
     (blueprint / "roadmap" / "result.md").write_text(
-        "---\nkind: node\n---\n\n# Result\n\n## Proof depends on\n\n- [Tool](tool.md)\n",
+        "---\n---\n\n# Result\n\n## Proof depends on\n\n- [Tool](tool.md)\n",
         encoding="utf-8",
     )
 
@@ -155,3 +160,44 @@ def test_cli_reports_invalid_blueprint(tmp_path: Path, capsys: pytest.CaptureFix
         main([str(tmp_path / "missing")])
 
     assert "blueprint directory does not exist" in capsys.readouterr().err
+
+
+def test_the_vault_gets_a_structure_page_obsidian_can_read(tmp_path: Path) -> None:
+    """Obsidian shows the tree but cannot derive a node's state from the file.
+
+    Plain Markdown only: the site stylesheet does not exist in a vault, so the
+    HTML grid the published page uses would render as a wall of tags here.
+    """
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "README.md", "Roadmap")
+    _write_node(blueprint / "roadmap" / "part" / "README.md", "Part")
+    _write_node(
+        blueprint / "roadmap" / "part" / "base.md",
+        "Base",
+        declaration="def",
+        statement="formalized",
+    )
+
+    output = export_structure(blueprint)
+
+    assert output == blueprint / "structure.md"
+    page = output.read_text(encoding="utf-8")
+    assert "- **roadmap/**" in page
+    assert "    - **part/**" in page
+    assert "[Base](roadmap/part/base.md) \u00b7 def \u00b7 fully proved" in page
+    assert "<" not in page.split("---", 2)[2]
+    # It never lists itself, and never the other generated view.
+    assert "structure.md)" not in page
+    assert "dependencies.md)" not in page
+
+
+def test_the_vault_structure_page_warns_about_a_flat_roadmap(tmp_path: Path) -> None:
+    """The one fault the file explorer cannot show, as an Obsidian callout."""
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "README.md", "Roadmap")
+    for name in ("a", "b", "c", "d"):
+        _write_node(blueprint / "roadmap" / f"{name}.md", f"Result {name}", declaration="theorem")
+
+    page = export_structure(blueprint).read_text(encoding="utf-8")
+
+    assert "> [!warning] Every article sits directly under `roadmap/`." in page

@@ -8,6 +8,7 @@ progress, exactly as ``leanblueprint`` draws its dependency graph.
 
 from __future__ import annotations
 
+import html
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -181,23 +182,33 @@ def classdef_lines(*, dark: bool = False) -> list[str]:
         f"color:{state.dark_text if dark else state.text},stroke-width:2px"
         for state in STATES
     ]
+    # Chapter and boundary boxes are the project map, which is the first thing
+    # on the landing page, so they take the same greys and blues as the rest of
+    # the site rather than the GitHub palette the states used to sit in.
     if dark:
         views = [
-            "classDef scope fill:#161B22,stroke:#58A6FF,color:#F0F6FC,stroke-width:2px",
-            "classDef boundary fill:#0D1117,stroke:#8B949E,color:#C9D1D9,stroke-width:2px,stroke-dasharray:5 3",
-            "classDef focus stroke:#F2CC60,stroke-width:4px",
+            "classDef scope fill:#1C1D1F,stroke:#2D88FF,color:#E4E6EB,stroke-width:2px",
+            "classDef boundary fill:#18191A,stroke:#8A8D91,color:#B0B3B8,stroke-width:2px,stroke-dasharray:5 3",
+            "classDef focus stroke:#F7B928,stroke-width:4px",
         ]
     else:
         views = [
-            "classDef scope fill:#EEF6FF,stroke:#0052CC,color:#102A43,stroke-width:2px",
-            "classDef boundary fill:#FFFFFF,stroke:#8B95A1,color:#444444,stroke-width:2px,stroke-dasharray:5 3",
-            "classDef focus stroke:#D97706,stroke-width:4px",
+            "classDef scope fill:#EBF2FE,stroke:#0064E0,color:#050505,stroke-width:2px",
+            "classDef boundary fill:#FFFFFF,stroke:#8A8D91,color:#65676B,stroke-width:2px,stroke-dasharray:5 3",
+            "classDef focus stroke:#F7B928,stroke-width:4px",
         ]
     return [*states, *views]
 
 
 def render_legend(statuses: dict[str, NodeStatus]) -> str:
-    """Return a Markdown legend covering the states actually in use."""
+    """Return a legend covering the states actually in use.
+
+    A Markdown table put this in a bordered box with a blank first heading over
+    the swatches, and left each column to size itself against its own longest
+    cell, so the swatch, the label and the count landed in a different place in
+    every row. This is one grid instead: the cells are emitted in reading order
+    and the columns line up because the grid, not the content, sets them.
+    """
     used = {status.key for status in statuses.values()}
     rows = [state for state in STATES if state.key in used]
     if not rows:
@@ -205,12 +216,48 @@ def render_legend(statuses: dict[str, NodeStatus]) -> str:
     counts = {state.key: 0 for state in STATES}
     for status in statuses.values():
         counts[status.key] += 1
-    lines = ["| | State | Nodes | Meaning |", "| --- | --- | --- | --- |"]
+    cells = []
     for state in rows:
         # Colour comes from the stylesheet, so the legend follows the theme.
-        swatch = f'<span class="bp-swatch bp-swatch-{state.key}"></span>'
-        lines.append(f"| {swatch} | {state.label} | {counts[state.key]} | {_MEANINGS[state.key]} |")
-    return "\n".join(lines)
+        cells.append(
+            f'<span class="bp-swatch bp-swatch-{state.key}"></span>'
+            f'<span class="bp-legend-label">{html.escape(state.label)}</span>'
+            f'<span class="bp-legend-count">{counts[state.key]}</span>'
+            f'<span class="bp-legend-meaning">{html.escape(_MEANINGS[state.key])}</span>'
+        )
+    return f'<div class="bp-legend-grid">{"".join(cells)}</div>'
+
+
+def render_legend_tip(statuses: dict[str, NodeStatus]) -> str:
+    """The legend behind a hover icon, for pages that only occasionally need it.
+
+    A graph page carried the legend in a disclosure captioned "What the colours
+    mean", which spent a headline-sized row on a question most readers never
+    ask, on every page, under every diagram. The same content hangs off an
+    icon instead.
+
+    Pure CSS: the icon is a real button, and the note shows on ``:hover`` and
+    on ``:focus-within``, so it opens by keyboard as well as by pointer. Not
+    used in the vault copy, which is read in Obsidian where this stylesheet
+    does not exist and the note would simply never be reachable.
+    """
+    legend = render_legend(statuses)
+    if not legend:
+        return ""
+    icon = (
+        '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">'
+        '<circle cx="8" cy="8" r="7"/>'
+        '<path d="M8 7v4.5" /><circle cx="8" cy="4.6" r="0.9" class="bp-legend-dot"/>'
+        "</svg>"
+    )
+    return (
+        '<span class="bp-legend-tip">'
+        '<button type="button" class="bp-legend-icon" aria-describedby="bp-legend-note">'
+        f'{icon}<span class="bp-visually-hidden">What the colours mean</span>'
+        "</button>"
+        f'<span class="bp-legend-note" id="bp-legend-note" role="tooltip">{legend}</span>'
+        "</span>"
+    )
 
 
 _MEANINGS = {
@@ -272,6 +319,7 @@ __all__ = [
     "relative_link",
     "render_diagram",
     "render_legend",
+    "render_legend_tip",
     "render_page",
     "render_view_diagram",
     "source_links",

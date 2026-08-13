@@ -11,7 +11,7 @@ from autoform_cli.status import derive, summarize
 def _node(blueprint: Path, relative: str, body: str = "", **metadata: str) -> None:
     path = blueprint / "roadmap" / relative
     path.parent.mkdir(parents=True, exist_ok=True)
-    properties = ["kind: node", *(f"{key}: {value}" for key, value in metadata.items())]
+    properties = [*(f"{key}: {value}" for key, value in metadata.items())]
     title = relative.removesuffix(".md").replace("-", " ").title()
     path.write_text(
         "\n".join(["---", *properties, "---", "", f"# {title}", "", body]) + "\n",
@@ -104,7 +104,7 @@ def test_fully_proved_is_transitive(tmp_path: Path) -> None:
 
     # Break the base and the colour must retreat all the way up the chain.
     (blueprint / "roadmap" / "a.md").write_text(
-        "---\nkind: node\ndeclaration: theorem\n---\n\n# A\n", encoding="utf-8"
+        "---\ndeclaration: theorem\n---\n\n# A\n", encoding="utf-8"
     )
     states = _states(blueprint)
     assert states == {"a": "can_state", "b": "proved", "c": "proved"}
