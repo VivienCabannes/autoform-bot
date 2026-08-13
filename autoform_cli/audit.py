@@ -37,8 +37,10 @@ _COVERAGE_GAP = re.compile(
 )
 _EXTERNAL_SCHEMES = frozenset({"http", "https"})
 _MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
-#: An explicit `{#id}` from attr_list, which MkDocs uses verbatim.
-_ATTR_LIST_ID = re.compile(r"\{#([^}\s]+)\}\s*$")
+#: The trailing attr-list block and an explicit `#id` within it. MkDocs allows
+#: the ID alongside classes and attributes, for example `{#result .highlight}`.
+_ATTR_LIST = re.compile(r"\{(?P<attributes>[^{}]*)\}\s*$")
+_ATTR_LIST_ID = re.compile(r"(?:^|\s)#(?P<id>[^\s#.={}]+)(?=\s|$)")
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -366,12 +368,16 @@ def _markdown_anchors(path: Path) -> set[str]:
             continue
         title = heading.group(2).strip()
         # `attr_list` is enabled in the generated mkdocs.yml, so an explicit
-        # `{#id}` is what MkDocs renders and what a link must match. Deriving
-        # the slug from the heading text regardless reported a working anchor
-        # as missing.
-        explicit = _ATTR_LIST_ID.search(title)
+        # `#id` in the trailing attribute block is what MkDocs renders and what
+        # a link must match. The ID may appear beside classes or attributes.
+        attributes = _ATTR_LIST.search(title)
+        explicit = (
+            _ATTR_LIST_ID.search(attributes.group("attributes"))
+            if attributes is not None
+            else None
+        )
         if explicit is not None:
-            anchors.add(explicit.group(1))
+            anchors.add(explicit.group("id"))
             continue
         base = _MARKDOWN_ANCHOR_PUNCTUATION.sub("", title.casefold())
         base = re.sub(r"\s+", "-", base).strip("-")

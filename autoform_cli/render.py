@@ -17,7 +17,7 @@ import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
 from .graph import Graph, Node, load_graph
@@ -31,7 +31,8 @@ _MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+
 #: resolves `[Paper][paper]` through one of these, so a rewrite that only sees
 #: inline links leaves the destination behind and publishes a dead link.
 _LINK_DEFINITION = re.compile(
-    r'^(?P<indent>[ ]{0,3})\[(?P<label>[^\]]+)\]:[ \t]*(?P<target>\S+)(?P<rest>[ \t]+.*)?$'
+    r'^(?P<indent>[ ]{0,3})\[(?P<label>[^\]]+)\]:[ \t]*'
+    r'(?P<target><[^>\r\n]+>|[^\s]+)(?P<rest>[ \t]+.*)?$'
 )
 _ARTICLE_SLOT = re.compile(
     r"^(?P<indent>[ \t]*)[-*+]\s+\[[^\]]+\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)\s*$"
@@ -480,7 +481,7 @@ def _is_hidden(relative: Path) -> bool:
     return any(part.startswith(".") for part in relative.parts)
 
 
-def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> str | None:
+def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> "_SourceBase | None":
     """Where `blueprint/sources/` lives in the repository, if it can be linked.
 
     Source notes are a reader's transcription of the paper being formalised.
@@ -501,16 +502,33 @@ def _sources_base(blueprint: Path, repo_root: Path, linker: SourceLinker) -> str
         # The vault is outside the repository being linked, so no blob URL
         # describes it. Better no link than one that 404s.
         return None
-    return f"{linker.repository_url}/blob/{linker.ref}/{relative}"
+    return _SourceBase(linker.repository_url, linker.ref, relative)
 
 
-def _source_href(sources_base: str, tail: tuple[str, ...]) -> str:
+@dataclass(frozen=True, slots=True)
+class _SourceBase:
+    """Where `blueprint/sources` lives in the repository, as parts.
+
+    Kept as parts rather than a formatted URL because a file link and a
+    directory link differ by one path segment -- GitHub serves directories
+    under `/tree/`, files under `/blob/`. Deriving one from the other by
+    replacing the first `/blob/` in the finished string rewrote the wrong
+    segment whenever the repository's own URL contained one.
+    """
+
+    repository_url: str
+    ref: str
+    relative: str
+
+    def href(self, tail: tuple[str, ...]) -> str:
+        verb = "blob" if tail else "tree"
+        path = "/".join((self.relative, *tail))
+        return f"{self.repository_url}/{verb}/{self.ref}/{quote(path, safe='/')}"
+
+
+def _source_href(sources_base: _SourceBase, tail: tuple[str, ...]) -> str:
     """A repository URL for a source note, or for the sources directory itself."""
-    if not tail:
-        # A vault often links the directory rather than a note in it, and
-        # GitHub serves directories under /tree/ rather than /blob/.
-        return sources_base.replace("/blob/", "/tree/", 1)
-    return f"{sources_base}/{'/'.join(tail)}"
+    return sources_base.href(tail)
 
 
 def _published_source_files(blueprint: Path):
@@ -830,7 +848,7 @@ def _render_structure_page(
     *,
     page: Path,
     targets: dict[str, tuple[Path, str]],
-    sources_base: str | None,
+    sources_base: "_SourceBase | None",
 ) -> str:
     """List the vault as a file tree, so its shape can be checked at a glance.
 
@@ -1066,6 +1084,22 @@ _SETTLED_STATES = frozenset({"mathlib", "fully_proved", "proved", "defined", "st
 _ACTIONABLE_STATES = frozenset({"can_prove", "can_state"})
 
 
+def _is_countable(graph: Graph, node_id: str) -> bool:
+    """Whether *node_id* is a formalization target the dashboards should count.
+
+    A leaf, and a leaf that declares something. Counting every leaf made a
+    freshly scaffolded vault report "0 of 1 items settled, 1 ready now": the
+    roadmap landing page has no children yet, so it counted as an unstarted
+    result, and the site claimed work existed before any had been planned.
+    """
+
+    return not graph.children(node_id) and graph.nodes[node_id].formalizable
+
+
+def _countable(graph: Graph) -> list[str]:
+    return [node_id for node_id in graph.nodes if _is_countable(graph, node_id)]
+
+
 def _render_hero(
     title: str,
     body: str,
@@ -1079,7 +1113,7 @@ def _render_hero(
     reader has finished the title, which is the only question the top of a
     blueprint has to answer.
     """
-    leaves = [node_id for node_id in graph.nodes if not graph.children(node_id)]
+    leaves = _countable(graph)
     selected = {node_id: statuses[node_id] for node_id in leaves}
     done = sum(
         count for state, count in status.summarize(selected) if state.key in _SETTLED_STATES
@@ -1145,11 +1179,11 @@ def _render_overview_summary(
     node_ids: list[str] | None = None,
 ) -> str:
     """Render the compact, honest progress strip shown at the start of the book."""
-    selected_ids = (
-        node_ids
-        if node_ids is not None
-        else [node_id for node_id in graph.nodes if not graph.children(node_id)]
-    )
+    selected_ids = [
+        node_id
+        for node_id in (node_ids if node_ids is not None else graph.nodes)
+        if _is_countable(graph, node_id)
+    ]
     definitions = sum(is_definition(graph.nodes[node_id]) for node_id in selected_ids)
     results = len(selected_ids) - definitions
     item_parts = []
@@ -1283,7 +1317,7 @@ def _rewrite_links(
     destination: Path,
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
-    sources_base: str | None = None,
+    sources_base: "_SourceBase | None" = None,
 ) -> str:
     """Resolve a page's relative links against where it is being published.
 
@@ -1401,7 +1435,7 @@ def _render_chapter(
     repo_root: Path,
     destination: Path,
     node_sources: dict[Path, str],
-    sources_base: str | None = None,
+    sources_base: "_SourceBase | None" = None,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
     links = _anchored_links(targets, page)
@@ -1513,7 +1547,7 @@ def _render_environment(
     destination: Path,
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
-    sources_base: str | None = None,
+    sources_base: "_SourceBase | None" = None,
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
     caption, _, number = numbers[node.id].rpartition(" ")

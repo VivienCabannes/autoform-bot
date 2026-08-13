@@ -440,7 +440,8 @@ def test_an_explicit_attr_list_anchor_resolves(tmp_path: Path) -> None:
     paper = blueprint / "sources" / "paper.md"
     paper.parent.mkdir(parents=True, exist_ok=True)
     paper.write_text(
-        "---\n---\n\n# Paper\n\n## A result {#main-result}\n\nText.\n", encoding="utf-8"
+        "---\n---\n\n# Paper\n\n## A result {#main-result .highlight data-kind=result}\n\nText.\n",
+        encoding="utf-8",
     )
 
     codes = {finding.code for finding in audit_blueprint(blueprint).findings}

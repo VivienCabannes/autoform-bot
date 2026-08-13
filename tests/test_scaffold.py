@@ -449,6 +449,21 @@ def test_a_symlinked_subdirectory_cannot_redirect_the_scaffold(tmp_path: Path) -
     assert list(outside.iterdir()) == []
 
 
+def test_a_dangling_destination_symlink_cannot_redirect_the_scaffold(tmp_path: Path) -> None:
+    """`Path.exists()` is false for a link whose outside target is absent."""
+    from autoform_cli import scaffold as scaffold_module
+
+    project = tmp_path / "project"
+    outside = tmp_path / "outside" / "mkdocs.yml"
+    project.mkdir()
+    (project / "mkdocs.yml").symlink_to(outside)
+
+    with pytest.raises(scaffold_module.ScaffoldError, match="outside the project"):
+        scaffold_module.scaffold_project(project, title="Probe")
+
+    assert not outside.exists()
+
+
 def test_a_title_with_a_colon_stays_one_yaml_key(tmp_path: Path) -> None:
     """`site_name: Algebra: Foundations` is a nested mapping, not a title."""
     from autoform_cli import scaffold as scaffold_module
@@ -501,3 +516,30 @@ def test_a_source_with_its_own_ref_is_honoured(tmp_path: Path) -> None:
 
     verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert f"git+https://example.test/other.git@{'3' * 40}" in verify
+
+
+def test_control_characters_in_yaml_values_are_escaped(tmp_path: Path) -> None:
+    """User text stays one scalar without silently changing its value."""
+    title = "safe\n---\nsite_name: pwned\t\x00"
+    repository_url = "https://example.test/repo\nextra: value"
+
+    scaffold_project(tmp_path, title=title, repository_url=repository_url)
+
+    config = (tmp_path / "mkdocs.yml").read_text(encoding="utf-8")
+    assert f"site_name: {json.dumps(title)}" in config
+    assert f"repo_url: {json.dumps(repository_url)}" in config
+    assert "\x00" not in config
+    # One key, not two: the apparent keys remain escaped inside their values.
+    keys = [line for line in config.splitlines() if line.startswith("site_name:")]
+    assert len(keys) == 1
+    assert not any(line.strip() == "---" for line in config.splitlines())
+
+
+def test_an_uppercase_ref_is_accepted(tmp_path: Path) -> None:
+    """Git prints shas lowercase but resolves them either way; a sha copied
+    from a web UI is valid input rather than a mistake."""
+    result = scaffold_project(tmp_path, title="Probe", autoform_ref="A" * 40)
+
+    assert result.unpinned is False
+    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+    assert f"@{'a' * 40}" in verify

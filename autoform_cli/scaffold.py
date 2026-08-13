@@ -178,17 +178,14 @@ def _destination(relative: str) -> str:
 
 
 def _yaml_scalar(value: str) -> str:
-    """Quote *value* so it survives being pasted into a YAML document.
+    """Serialize *value* as a quoted YAML scalar.
 
-    Substitutions land in `mkdocs.yml` as raw text, so a title containing a
-    colon-space -- `Algebra: Foundations` -- ends the key and makes the file
-    parse as a nested mapping, which `mkdocs build --strict` rejects with
-    "mapping values are not allowed here". Titles like that are ordinary.
+    JSON strings are valid YAML double-quoted scalars. Using the standard JSON
+    serializer preserves the value while escaping line breaks, tabs, nulls,
+    quotes, backslashes, and every other control character that could otherwise
+    alter the generated document.
     """
-    if value == "":
-        return '""'
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return json.dumps(value, ensure_ascii=False)
 
 
 #: Substitutions that land in YAML and so have to be quoted as scalars. The
@@ -246,7 +243,9 @@ def scaffold_project(
     # A branch name or an abbreviated sha is the same silent failure this
     # gate exists to prevent, just supplied by hand: CI would reinstall a
     # different Autoform later and break a project that was passing.
-    given_ref = autoform_ref.strip()
+    # Git treats a sha case-insensitively and always prints lowercase, so an
+    # uppercase one pasted from a web UI is valid input, not a mistake.
+    given_ref = autoform_ref.strip().lower()
     if given_ref and not _FULL_SHA.fullmatch(given_ref):
         issues.append(
             f"--autoform-ref must be a full 40-character commit sha, not {given_ref!r}; "
@@ -287,21 +286,20 @@ def scaffold_project(
             skipped.append(_destination(relative))
             continue
         destination = root / _destination(relative)
-        if destination.exists() and not force:
-            skipped.append(_destination(relative))
-            continue
-        # Confine every write, not just the root. Walk the path the scaffold is
-        # about to take and require each component that already exists to still
-        # be inside the project once symlinks are followed; a link at any depth
-        # would otherwise redirect the write, and --force would overwrite
-        # whatever it points at.
+        # Confine every write, not just the root. Reject links outright before
+        # checking whether the destination should be skipped: `exists()` is
+        # false for a dangling symlink, but opening that path still follows the
+        # link and can create a file outside the project.
         probe = root
         for part in Path(_destination(relative)).parts:
             probe = probe / part
-            if probe.exists() and not _within(probe, root):
+            if probe.is_symlink() or (probe.exists() and not _within(probe, root)):
                 raise ScaffoldError(
                     [f"refusing to write outside the project through a link: {probe}"]
                 )
+        if destination.exists() and not force:
+            skipped.append(_destination(relative))
+            continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
             shutil.copyfile(template, destination)

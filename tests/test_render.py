@@ -773,3 +773,66 @@ def test_reference_style_links_are_rewritten_with_the_inline_ones(tmp_path: Path
     expected = "[paper]: https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper.md"
     assert expected in chapter
     assert "[paper]: ../sources/paper.md" not in chapter
+
+
+def test_angle_bracket_reference_destinations_with_spaces_are_rewritten(tmp_path: Path) -> None:
+    """An angle-bracket destination may contain spaces and must stay whole."""
+    project = _project(tmp_path)
+    sources = project / "blueprint" / "sources"
+    sources.mkdir()
+    (sources / "paper note.md").write_text("---\n---\n\n# Paper\n", encoding="utf-8")
+    roadmap = project / "blueprint" / "roadmap" / "README.md"
+    roadmap.write_text(
+        roadmap.read_text(encoding="utf-8")
+        + '\nGrounded in [Paper][paper].\n\n[paper]: <../sources/paper note.md> "Source note"\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "out"
+
+    render_site(
+        project / "blueprint",
+        out,
+        lean_root=project,
+        repository_url="https://github.com/owner/repo",
+        ref="cafe1234",
+    )
+
+    chapter = (out / "roadmap/README.md").read_text(encoding="utf-8")
+    assert (
+        '[paper]: https://github.com/owner/repo/blob/cafe1234/blueprint/sources/paper%20note.md "Source note"'
+        in chapter
+    )
+    assert "<../sources/paper note.md>" not in chapter
+
+
+def test_a_fresh_vault_reports_no_work_rather_than_one_ready_item(tmp_path: Path) -> None:
+    """The roadmap landing page is not a formalization target.
+
+    Counting every childless article made a freshly scaffolded vault claim
+    "0 of 1 items settled, 1 ready now", so the site described work before any
+    had been planned.
+    """
+    from autoform_cli.scaffold import scaffold_project
+
+    project = tmp_path / "project"
+    scaffold_project(project, title="Empty")
+    out = tmp_path / "out"
+
+    render_site(project / "blueprint", out)
+
+    overview = (out / "README.md").read_text(encoding="utf-8")
+    assert "0 of 0 items settled" in overview
+    assert '<div class="bp-figure-value">0</div>' in overview
+
+
+def test_a_directory_link_uses_tree_even_when_the_repo_url_says_blob() -> None:
+    """Deriving the directory URL by replacing the first `/blob/` rewrote the
+    repository's own path when that happened to contain one."""
+    from autoform_cli.render import _SourceBase
+
+    base = _SourceBase("https://git.example/blob/x/repo", "abc", "blueprint/sources")
+
+    assert base.href(("paper.md",)) == (
+        "https://git.example/blob/x/repo/blob/abc/blueprint/sources/paper.md"
+    )
+    assert base.href(()) == "https://git.example/blob/x/repo/tree/abc/blueprint/sources"
