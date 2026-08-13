@@ -111,17 +111,19 @@ def group_title(graph: Graph, group: str) -> str:
 def project_view(graph: Graph, statuses: dict[str, NodeStatus]) -> GraphView:
     """Collapse every publication chapter to one project-map node."""
     grouped = group_nodes(graph)
+    edges = _project_edges(graph)
+    required_scopes = {endpoint.removeprefix("scope:") for edge in edges for endpoint in (edge.source, edge.target)}
+    scopes = [*grouped, *(scope for scope in sorted(required_scopes) if scope not in grouped)]
     nodes = tuple(
         ViewNode(
             id=_scope_node_id(group),
             title=group_title(graph, group),
             kind="scope",
-            members=node_ids,
-            status_counts=_status_counts(node_ids, statuses),
+            members=grouped.get(group, ()),
+            status_counts=_status_counts(grouped.get(group, ()), statuses),
         )
-        for group, node_ids in grouped.items()
+        for group in scopes
     )
-    edges = _project_edges(graph)
     return GraphView(kind="project", title="Project dependency map", nodes=nodes, edges=edges)
 
 
@@ -130,11 +132,12 @@ def chapter_view(graph: Graph, statuses: dict[str, NodeStatus], group: str) -> G
     if group in graph.nodes and graph.children(group):
         return scope_view(graph, statuses, group)
     grouped = group_nodes(graph)
+    group = group or "roadmap"
     if group not in grouped:
-        raise KeyError(f"unknown blueprint chapter: {group or 'roadmap'}")
+        raise KeyError(f"unknown blueprint chapter: {group}")
 
     inside = frozenset(grouped[group])
-    boundary_groups: set[str] = set()
+    boundaries: dict[str, set[str]] = defaultdict(set)
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for source, target, proof_only in _relations(graph):
         source_inside = source in inside
@@ -145,28 +148,24 @@ def chapter_view(graph: Graph, statuses: dict[str, NodeStatus], group: str) -> G
             projected_source, projected_target = source, target
         elif target_inside:
             external = _top_scope(graph, source)
-            boundary_groups.add(external)
+            boundaries[external].add(source)
             projected_source, projected_target = _boundary_node_id(external), target
         else:
             external = _top_scope(graph, target)
-            boundary_groups.add(external)
+            boundaries[external].add(target)
             projected_source, projected_target = source, _boundary_node_id(external)
         edge_counts[(projected_source, projected_target)][1 if proof_only else 0] += 1
 
-    nodes = [
-        _theorem_node(graph.nodes[node_id], statuses[node_id])
-        for node_id in grouped[group]
-    ]
+    nodes = [_theorem_node(graph.nodes[node_id], statuses[node_id]) for node_id in grouped[group]]
     nodes.extend(
         ViewNode(
             id=_boundary_node_id(external),
             title=group_title(graph, external),
             kind="boundary",
-            members=grouped[external],
-            status_counts=_status_counts(grouped[external], statuses),
+            members=tuple(sorted(external_members)),
+            status_counts=_status_counts(external_members, statuses),
         )
-        for external in grouped
-        if external in boundary_groups
+        for external, external_members in sorted(boundaries.items())
     )
     return GraphView(
         kind="chapter",
@@ -293,9 +292,7 @@ def focus_views(
     if radius < 0:
         raise ValueError("focus radius must be non-negative")
     adjacency = _adjacency(graph)
-    order_index = {
-        candidate: index for index, candidate in enumerate(topological_order(graph))
-    }
+    order_index = {candidate: index for index, candidate in enumerate(topological_order(graph))}
     return {
         node_id: _focus_view(
             graph,
@@ -376,14 +373,9 @@ def _node_view(
     ordered_ids = list(dict.fromkeys(node_id for node_id in selected if node_id in graph.nodes))
     selected_ids = frozenset(ordered_ids)
     if not ordered:
-        order_index = {
-            node_id: index for index, node_id in enumerate(topological_order(graph))
-        }
+        order_index = {node_id: index for index, node_id in enumerate(topological_order(graph))}
         ordered_ids.sort(key=order_index.__getitem__)
-    nodes = tuple(
-        _theorem_node(graph.nodes[node_id], statuses[node_id])
-        for node_id in ordered_ids
-    )
+    nodes = tuple(_theorem_node(graph.nodes[node_id], statuses[node_id]) for node_id in ordered_ids)
     edge_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for target in ordered_ids:
         node = graph.nodes[target]
@@ -466,7 +458,7 @@ def _boundary_node_id(group: str) -> str:
 
 
 def _top_scope(graph: Graph, node_id: str) -> str:
-    """Return the child of the roadmap root containing *node_id*."""
+    """Return the canonical roadmap scope containing *node_id*."""
     current = node_id
     while graph.nodes[current].parent is not None:
         parent = graph.nodes[current].parent
@@ -475,7 +467,7 @@ def _top_scope(graph: Graph, node_id: str) -> str:
         current = parent
     # Hand-built/legacy in-memory graphs did not carry containment. Preserve
     # their path-based chapter grouping without weakening Markdown inference.
-    return group_id(node_id)
+    return group_id(node_id) or "roadmap"
 
 
 def _direct_child(graph: Graph, scope: str, node_id: str) -> str | None:
@@ -491,11 +483,7 @@ def _leaf_descendants(graph: Graph, node_id: str) -> tuple[str, ...]:
     children = graph.children(node_id)
     if not children:
         return (node_id,)
-    return tuple(
-        leaf
-        for child in children
-        for leaf in _leaf_descendants(graph, child)
-    )
+    return tuple(leaf for child in children for leaf in _leaf_descendants(graph, child))
 
 
 __all__ = [

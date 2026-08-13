@@ -8,7 +8,7 @@ import pytest
 from autoform_cli import mermaid
 from autoform_cli.graph import load_graph
 from autoform_cli.status import STATES, derive
-from autoform_cli.visualize import export_graph, export_structure, main
+from autoform_cli.visualize import GENERATED_STRUCTURE_MARKER, export_graph, export_structure, main
 
 
 def _state(key: str):
@@ -132,7 +132,40 @@ def test_green_stops_at_an_unproved_prerequisite(tmp_path: Path) -> None:
     assert statuses["top"].key == "proved"
 
 
-def test_cli_writes_an_explicit_destination(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_writes_only_the_graph_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+
+    assert main([str(blueprint)]) == 0
+
+    output = (blueprint / "dependencies.md").resolve()
+    assert output.is_file()
+    assert not (blueprint / "structure.md").exists()
+    assert capsys.readouterr().out == f"{output}\n"
+    assert 'click n0 "roadmap/only.md"' in output.read_text(encoding="utf-8")
+
+
+def test_default_cli_leaves_authored_structure_untouched(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+    structure = blueprint / "structure.md"
+    structure.write_text("# Authored structure\n", encoding="utf-8")
+
+    assert main([str(blueprint)]) == 0
+
+    graph = (blueprint / "dependencies.md").resolve()
+    assert structure.read_text(encoding="utf-8") == "# Authored structure\n"
+    assert capsys.readouterr().out == f"{graph}\n"
+
+
+
+def test_cli_writes_an_explicit_graph_destination(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     blueprint = tmp_path / "blueprint"
     _write_node(blueprint / "roadmap" / "only.md", "Only node")
     output = tmp_path / "docs" / "dependencies.md"
@@ -140,8 +173,25 @@ def test_cli_writes_an_explicit_destination(tmp_path: Path, capsys: pytest.Captu
     assert main([str(blueprint), "-o", str(output)]) == 0
 
     assert output.is_file()
-    assert str(output.resolve()) in capsys.readouterr().out
+    assert capsys.readouterr().out == f"{output.resolve()}\n"
     assert 'click n0 "../blueprint/roadmap/only.md"' in output.read_text(encoding="utf-8")
+
+
+def test_cli_writes_structure_only_when_requested(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+
+    assert main([str(blueprint), "--structure"]) == 0
+
+    graph = (blueprint / "dependencies.md").resolve()
+    structure = (blueprint / "structure.md").resolve()
+    assert graph.is_file()
+    assert structure.is_file()
+    assert structure.read_text(encoding="utf-8").startswith(GENERATED_STRUCTURE_MARKER)
+    assert capsys.readouterr().out == f"{graph}\n"
+
 
 
 def test_cli_accepts_html_link_extension(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -160,6 +210,40 @@ def test_cli_reports_invalid_blueprint(tmp_path: Path, capsys: pytest.CaptureFix
         main([str(tmp_path / "missing")])
 
     assert "blueprint directory does not exist" in capsys.readouterr().err
+
+
+def test_cli_refuses_authored_structure_before_replacing_graph(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+    graph = blueprint / "dependencies.md"
+    graph.write_text("old graph\n", encoding="utf-8")
+    structure = blueprint / "structure.md"
+    structure.write_text("# Authored structure\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="2"):
+        main([str(blueprint), "--structure"])
+
+    assert graph.read_text(encoding="utf-8") == "old graph\n"
+    assert structure.read_text(encoding="utf-8") == "# Authored structure\n"
+    assert "refusing to overwrite" in capsys.readouterr().err
+
+
+
+def test_cli_refuses_to_alias_graph_and_structure_outputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only node")
+    structure = blueprint / "structure.md"
+
+    with pytest.raises(SystemExit, match="2"):
+        main([str(blueprint), "--output", str(structure), "--structure"])
+
+    assert not structure.exists()
+    assert "must be different paths" in capsys.readouterr().err
+
 
 
 def test_the_vault_gets_a_structure_page_obsidian_can_read(tmp_path: Path) -> None:
@@ -182,6 +266,7 @@ def test_the_vault_gets_a_structure_page_obsidian_can_read(tmp_path: Path) -> No
 
     assert output == blueprint / "structure.md"
     page = output.read_text(encoding="utf-8")
+    assert page.startswith(GENERATED_STRUCTURE_MARKER)
     assert "- **roadmap/**" in page
     assert "    - **part/**" in page
     assert "[Base](roadmap/part/base.md) \u00b7 def \u00b7 fully proved" in page
@@ -189,6 +274,109 @@ def test_the_vault_gets_a_structure_page_obsidian_can_read(tmp_path: Path) -> No
     # It never lists itself, and never the other generated view.
     assert "structure.md)" not in page
     assert "dependencies.md)" not in page
+
+
+def test_generated_structure_can_be_refreshed(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "first.md", "First")
+    output = export_structure(blueprint)
+    _write_node(blueprint / "roadmap" / "second.md", "Second")
+
+    assert export_structure(blueprint) == output
+
+    page = output.read_text(encoding="utf-8")
+    assert "[First](roadmap/first.md)" in page
+    assert "[Second](roadmap/second.md)" in page
+
+
+
+def test_export_structure_refuses_an_unmarked_existing_file(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only")
+    output = blueprint / "structure.md"
+    output.write_text("# Authored structure\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        export_structure(blueprint)
+
+    assert output.read_text(encoding="utf-8") == "# Authored structure\n"
+
+
+
+def test_non_utf8_structure_is_refused_without_replacement(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only")
+    output = blueprint / "structure.md"
+    authored = b"\xff\xfeauthored"
+    output.write_bytes(authored)
+
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        export_structure(blueprint)
+
+    assert output.read_bytes() == authored
+
+
+
+def test_marker_inside_authored_content_does_not_claim_ownership(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only")
+    output = blueprint / "structure.md"
+    authored = f"# Authored structure\n\n{GENERATED_STRUCTURE_MARKER}\n"
+    output.write_text(authored, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        export_structure(blueprint)
+
+    assert output.read_text(encoding="utf-8") == authored
+
+
+
+def test_atomic_write_failure_preserves_the_previous_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import visualize
+
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only")
+    output = blueprint / "dependencies.md"
+    output.write_text("old graph\n", encoding="utf-8")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        assert source.parent == destination.parent == blueprint.resolve()
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(visualize, "_replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        export_graph(blueprint)
+
+    assert output.read_text(encoding="utf-8") == "old graph\n"
+    assert list(blueprint.glob(".dependencies.md.*.tmp")) == []
+
+
+
+def test_atomic_write_failure_preserves_the_previous_structure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import visualize
+
+    blueprint = tmp_path / "blueprint"
+    _write_node(blueprint / "roadmap" / "only.md", "Only")
+    output = export_structure(blueprint)
+    previous = output.read_text(encoding="utf-8")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        assert source.parent == destination.parent == blueprint.resolve()
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(visualize, "_replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        export_structure(blueprint)
+
+    assert output.read_text(encoding="utf-8") == previous
+    assert list(blueprint.glob(".structure.md.*.tmp")) == []
+
 
 
 def test_the_vault_structure_page_warns_about_a_flat_roadmap(tmp_path: Path) -> None:

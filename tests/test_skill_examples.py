@@ -82,7 +82,10 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert "infimum/core.tex" in source
     assert "il:thm:ambiguity" in source
     assert "il:thm:non-ambiguity" in source
-    assert ".obsidian/" in (blueprint / ".gitignore").read_text(encoding="utf-8")
+    ignored = (blueprint / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".obsidian/" in ignored
+    assert "dependencies.md" in ignored
+    assert "structure.md" not in ignored
 
     overview = (blueprint / "README.md").read_text(encoding="utf-8")
     assert "kind: blueprint" in overview

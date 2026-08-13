@@ -182,6 +182,16 @@ def test_scaffolded_gitignore_covers_agent_bootstrap_output(tmp_path: Path) -> N
     scaffold_project(tmp_path, title="Finite Flat")
     assert "*.log" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
 
+
+def test_scaffolded_blueprint_tracks_authored_structure(tmp_path: Path) -> None:
+    scaffold_project(tmp_path, title="Finite Flat")
+
+    ignored = (tmp_path / "blueprint/.gitignore").read_text(encoding="utf-8").splitlines()
+
+    assert "dependencies.md" in ignored
+    assert "structure.md" not in ignored
+
+
 def test_scaffolded_theme_defers_navigation_to_the_book(tmp_path: Path) -> None:
     """Autoform derives reading order from the vault, so MkDocs must not.
 

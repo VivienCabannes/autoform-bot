@@ -92,6 +92,83 @@ def test_chapter_view_keeps_external_relations_as_boundaries(tmp_path: Path) -> 
     }
 
 
+@pytest.mark.parametrize(
+    ("source", "target"),
+    (("roadmap", "chapter/result"), ("chapter/result", "roadmap")),
+)
+def test_roadmap_root_dependencies_have_nodes_in_every_view(
+    tmp_path: Path,
+    source: str,
+    target: str,
+) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    nodes = {
+        "roadmap": Node("roadmap", "Roadmap", roadmap / "README.md", (), parent=None),
+        "chapter": Node(
+            "chapter",
+            "Chapter",
+            roadmap / "chapter/README.md",
+            (),
+            parent="roadmap",
+            depth=1,
+        ),
+        "chapter/result": Node(
+            "chapter/result",
+            "Result",
+            roadmap / "chapter/result.md",
+            (source,),
+            statement_dependencies=(source,),
+            parent="chapter",
+            depth=2,
+            declaration="theorem",
+        ),
+    }
+    if target == "roadmap":
+        nodes["roadmap"] = Node(
+            "roadmap",
+            "Roadmap",
+            roadmap / "README.md",
+            (source,),
+            statement_dependencies=(source,),
+            parent=None,
+        )
+        nodes["chapter/result"] = Node(
+            "chapter/result",
+            "Result",
+            roadmap / "chapter/result.md",
+            (),
+            parent="chapter",
+            depth=2,
+            declaration="theorem",
+        )
+    graph = Graph(tmp_path / "blueprint", nodes)
+    statuses = derive(graph)
+
+    project = project_view(graph, statuses)
+    assert {node.id for node in project.nodes} == {"scope:roadmap", "scope:chapter"}
+    assert next(node for node in project.nodes if node.id == "scope:roadmap").members == ()
+    assert {(edge.source, edge.target) for edge in project.edges} == {
+        (
+            "scope:roadmap" if source == "roadmap" else "scope:chapter",
+            "scope:roadmap" if target == "roadmap" else "scope:chapter",
+        )
+    }
+    assert {endpoint for edge in project.edges for endpoint in (edge.source, edge.target)} <= {
+        node.id for node in project.nodes
+    }
+
+    chapter = chapter_view(graph, statuses, "chapter")
+    boundary = next(node for node in chapter.nodes if node.id == "boundary:roadmap")
+    assert boundary.members == ("roadmap",)
+    assert {endpoint for edge in chapter.edges for endpoint in (edge.source, edge.target)} <= {
+        node.id for node in chapter.nodes
+    }
+
+    complete = full_view(graph, statuses)
+    assert set(complete.member_ids) == set(graph.nodes)
+    assert {(edge.source, edge.target) for edge in complete.edges} == {(source, target)}
+
+
 def test_scope_view_collapses_nested_articles_and_rolls_up_dependencies(tmp_path: Path) -> None:
     roadmap = tmp_path / "blueprint" / "roadmap"
     nodes = {
@@ -99,12 +176,23 @@ def test_scope_view_collapses_nested_articles_and_rolls_up_dependencies(tmp_path
         "chapter": Node("chapter", "Chapter", roadmap / "chapter/README.md", (), parent="roadmap", depth=1),
         "section": Node("section", "Section", roadmap / "chapter/section/README.md", (), parent="chapter", depth=2),
         "section/base": Node(
-            "section/base", "Base", roadmap / "chapter/section/base.md", (),
-            parent="section", depth=3, declaration="def", statement_formalized=True,
+            "section/base",
+            "Base",
+            roadmap / "chapter/section/base.md",
+            (),
+            parent="section",
+            depth=3,
+            declaration="def",
+            statement_formalized=True,
         ),
         "result": Node(
-            "result", "Result", roadmap / "chapter/result.md", ("section/base",),
-            statement_dependencies=("section/base",), parent="chapter", depth=2,
+            "result",
+            "Result",
+            roadmap / "chapter/result.md",
+            ("section/base",),
+            statement_dependencies=("section/base",),
+            parent="chapter",
+            depth=2,
             declaration="theorem",
         ),
     }
@@ -136,9 +224,7 @@ def test_focus_view_uses_graph_distance_independently_of_chapter_scope(tmp_path:
         focus_view(graph, statuses, "b/top", radius=-1)
 
 
-def test_bulk_focus_views_share_graph_wide_indexes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_bulk_focus_views_share_graph_wide_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     graph = _graph(tmp_path)
     statuses = derive(graph)
     original = graph_views.topological_order
