@@ -291,7 +291,6 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     setup_metadata = (repo_root / "skills/setup/agents/openai.yaml").read_text(encoding="utf-8")
     roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
     roadmap_metadata = (repo_root / "skills/roadmap/agents/openai.yaml").read_text(encoding="utf-8")
-    orchestrate = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
     agent_review = (repo_root / "skills/agent-review/SKILL.md").read_text(encoding="utf-8")
     agent_review_metadata = (repo_root / "skills/agent-review/agents/openai.yaml").read_text(
         encoding="utf-8"
@@ -341,8 +340,6 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     ):
         assert required in roadmap
     assert "autoform init" in setup
-    assert "references/thesis-worked-node.md" in orchestrate
-    assert "Schedule prerequisite nodes before their dependents" in orchestrate
     assert "references/thesis-review-case.md" in agent_review
     assert "references/roadmap-quality.md" in agent_review
     assert "autoform-visualize" in human_review
@@ -369,14 +366,12 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert "$human-review" in human_review_metadata
     assert "$develop-plugin" in develop_plugin_metadata
     assert "stops before\nmathematical planning" in setup
-    assert "Do not\nscan for undecomposed chapters" in orchestrate
     assert "When developing or adapting" not in roadmap
     assert (repo_root / "skills/roadmap/references/cabannes-thesis-roadmap.md").is_file()
     roadmap_example = (
         repo_root / "skills/roadmap/references/cabannes-thesis-roadmap.md"
     ).read_text(encoding="utf-8")
     assert "coherent pull\nrequest and review unit" in roadmap_example
-    assert (repo_root / "skills/orchestrate/references/thesis-worked-node.md").is_file()
     assert (repo_root / "skills/agent-review/references/thesis-review-case.md").is_file()
     assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()
 
@@ -417,25 +412,6 @@ def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE / "blueprint/roadmap"
     for article in sorted(example.rglob("*.md")):
         assert "kind:" not in article.read_text(encoding="utf-8")
-
-
-def test_orchestrate_documents_the_claim_protocol(repo_root: Path) -> None:
-    """Claims are fail-closed, so the skill that works nodes must acquire one.
-
-    `autoform_cli.claims` and the `claim` subcommand exist on both CLIs; without
-    this instruction a host agent works nodes unclaimed and two agents can
-    collide on the same node.
-    """
-    orchestrate = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
-
-    for required in (
-        "AUTOFORM_WORKER_ID",
-        "autoform claim acquire",
-        "autoform claim renew",
-        "autoform claim release",
-        "ownership is unproven",
-    ):
-        assert required in orchestrate
 
 
 def _documented_invocations(reference: str) -> set[tuple[str, ...]]:

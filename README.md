@@ -37,12 +37,12 @@ and MCP servers are reloaded. The installed package and commands retain the
 ## Plugin surface
 
 Invoke a skill from your coding agent with `/autoform:setup`,
-`/autoform:roadmap`, `/autoform:orchestrate`, `/autoform:human-review`,
-`/autoform:agent-review`, or `/autoform:develop-plugin`.
+`/autoform:roadmap`, `/autoform:human-review`, `/autoform:agent-review`, or
+`/autoform:develop-plugin`. The Deicyde overlay adds `/autoform:orchestrate`
+and its execution subagents without duplicating this planning and publication surface.
 
 - `setup` creates or repairs the Lean repository, Markdown blueprint, CI, and Pages infrastructure.
 - `roadmap` confirms sources and scope, then builds milestones, coverage, and pull-request-sized DAG nodes.
-- `orchestrate` works ready nodes with native subagents and Lean tools.
 - `human-review` prepares graph, progress, source, and Lean-code views for a person's judgment.
 - `agent-review` independently scores roadmap quality or Lean faithfulness, integrity, and code quality from evidence.
 - `develop-plugin` maintains Autoform itself through its executable formalization example.
