@@ -220,7 +220,18 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
     issues: list[str] = []
     sources: list[_NodeSource] = []
     roadmap_root = roadmap_root.resolve()
-    for path in sorted(roadmap_root.rglob("*.md")):
+    entries = sorted(roadmap_root.rglob("*"))
+    for path in entries:
+        if path.is_file() and path.name.casefold() == "readme.md" and path.name != "README.md":
+            relative = path.relative_to(roadmap_root).as_posix()
+            issues.append(
+                f"{relative}: noncanonical README filename; container pages must be named exactly README.md "
+                "for portable behavior on case-sensitive filesystems"
+            )
+
+    for path in entries:
+        if not path.is_file() or path.suffix != ".md":
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
@@ -274,9 +285,7 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
         articles = [path for path in chapter.rglob("*.md") if path.is_file()]
         if not articles:
             continue
-        if (chapter / "README.md").is_file() or any(
-            path.name.casefold() == "readme.md" for path in chapter.glob("*.md")
-        ):
+        if (chapter / "README.md").is_file():
             continue
         names = articles
         issues.append(
@@ -289,7 +298,7 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
 
 def _article_id(path: Path, roadmap_root: Path) -> str:
     relative = path.relative_to(roadmap_root)
-    if relative.name.casefold() == "readme.md":
+    if relative.name == "README.md":
         parent = relative.parent.as_posix()
         return parent if parent != "." else "roadmap"
     return relative.with_suffix("").as_posix()
@@ -301,7 +310,7 @@ def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
     parents: dict[str, str | None] = {}
     for node in parsed:
         candidate = node.path.parent
-        if node.path.name.casefold() == "readme.md":
+        if node.path.name == "README.md":
             candidate = candidate.parent
         parent: str | None = None
         while candidate != candidate.parent:

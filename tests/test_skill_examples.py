@@ -82,7 +82,10 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert "infimum/core.tex" in source
     assert "il:thm:ambiguity" in source
     assert "il:thm:non-ambiguity" in source
-    assert ".obsidian/" in (blueprint / ".gitignore").read_text(encoding="utf-8")
+    ignored = (blueprint / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".obsidian/" in ignored
+    assert "dependencies.md" in ignored
+    assert "structure.md" not in ignored
 
     overview = (blueprint / "README.md").read_text(encoding="utf-8")
     assert "kind: blueprint" in overview
@@ -96,12 +99,13 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
         "Developed with "
         "[AutoformBot](https://github.com/facebookresearch/autoform-bot)."
     ) in readme
-    assert (example / "CabannesThesis.lean").is_file()
-    assert (example / "CabannesThesis/Basic.lean").is_file()
+    assert (example / "src/CabannesThesis.lean").is_file()
+    assert (example / "src/CabannesThesis/Basic.lean").is_file()
     toolchain = (example / "lean-toolchain").read_text(encoding="utf-8").strip()
     manifest = tomllib.loads((example / "lakefile.toml").read_text(encoding="utf-8"))
     assert toolchain == "leanprover/lean4:v4.32.2"
     assert manifest["require"][0]["rev"] == "v4.32.2"
+    assert manifest["lean_lib"][0]["srcDir"] == "src"
 
 
 def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> None:
@@ -266,17 +270,23 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
 
     verify = (example / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint" in verify
+    assert 'lake clean "$root_package"' in verify
     assert "lake build" in verify
     assert "Reject kernel-check bypass options" in verify
-    assert "Audit every project declaration" in verify
-    assert "Lean.collectAxioms" in verify
-    assert "info.isUnsafe || info.isPartial" in verify
+    assert "Audit every root-package declaration" in verify
+    assert "python3 .github/autoform_audit.py" in verify
+    assert "lake pack" in verify
+    assert "lake-modules" not in verify
+    assert "contains no ILean artifacts" in (
+        example / ".github/autoform_audit.py"
+    ).read_text(encoding="utf-8")
     assert 'forbidden="skip""KernelTC"' in verify
     assert 'git grep -n -I "$forbidden" -- .' in verify
     assert 'version: "0.12.1"' in verify
     assert "elan/releases/download/v4.2.3" in verify
     assert "df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2" in verify
     assert "github.ref == 'refs/heads/main'" in workflow
+    assert workflow.count('- "theme/**"') == 2
     assert 'version: "0.12.1"' in workflow
     assert "@main" not in verify
 
@@ -501,6 +511,27 @@ def test_roadmap_commits_so_the_published_site_can_catch_up(repo_root: Path) -> 
 
     assert "Commit the vault" in roadmap
     assert "outward-facing" in roadmap
+
+
+def test_example_workflows_match_the_scaffold_templates(repo_root: Path) -> None:
+    """The executable example differs only by its concrete immutable pin."""
+
+    substitutions = {
+        "{{AUTOFORM_SOURCE_YAML}}": '"https://github.com/VivienCabannes/autoform-bot.git"',
+        "{{AUTOFORM_REF_YAML}}": '"43097b2c07e68df899d6b8bca7849d091c294754"',
+    }
+    template_dir = repo_root / "autoform_cli/templates/github/workflows"
+    example_dir = repo_root / _EXAMPLE / ".github/workflows"
+    assert (
+        repo_root / "autoform_cli/templates/github/autoform_audit.py"
+    ).read_bytes() == (repo_root / _EXAMPLE / ".github/autoform_audit.py").read_bytes()
+
+    for name in ("autoform-verify.yml", "blueprint-pages.yml"):
+        expected = (template_dir / name).read_text(encoding="utf-8")
+        for placeholder, value in substitutions.items():
+            expected = expected.replace(placeholder, value)
+        actual = (example_dir / name).read_text(encoding="utf-8")
+        assert actual == expected
 
 
 def test_the_example_site_config_matches_what_setup_would_write(repo_root) -> None:

@@ -233,6 +233,21 @@ def test_loads_container_articles_and_infers_single_parent_hierarchy(tmp_path: P
     assert graph.nodes["chapter/result"].depth == 2
 
 
+@pytest.mark.parametrize("relative", ["readme.md", "ReadMe.md", "README.MD", "chapter/readme.md"])
+def test_rejects_noncanonical_readme_case_with_actionable_error(tmp_path: Path, relative: str) -> None:
+    blueprint = tmp_path / "blueprint"
+    _roadmap_page(blueprint, relative, "# Wrongly cased container\n")
+    if relative.startswith("chapter/"):
+        _roadmap_page(blueprint, "chapter/result.md", "# Result\n")
+
+    with pytest.raises(GraphValidationError) as caught:
+        load_graph(blueprint)
+
+    message = str(caught.value)
+    assert relative in message
+    assert "must be named exactly README.md" in message
+
+
 def test_splits_statement_and_proof_dependencies(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _node(blueprint, "objects.md", "# Objects\n")
@@ -294,7 +309,6 @@ def test_records_origin_and_source_links_without_treating_them_as_edges(tmp_path
     assert node.origin == "cited"
     assert node.sources == ("../../sources/paper.md#result",)
     assert node.dependencies == ()
-
 
 
 def test_check_cli(tmp_path: Path) -> None:

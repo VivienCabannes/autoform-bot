@@ -7,17 +7,23 @@ on:
       - "blueprint/**"
       - "**.lean"
       - "mkdocs.yml"
+      - "theme/**"
       - ".github/workflows/blueprint-pages.yml"
   pull_request:
     paths:
       - "blueprint/**"
       - "**.lean"
       - "mkdocs.yml"
+      - "theme/**"
       - ".github/workflows/blueprint-pages.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  AUTOFORM_SOURCE: {{AUTOFORM_SOURCE_YAML}}
+  AUTOFORM_REF: {{AUTOFORM_REF_YAML}}
 
 concurrency:
   group: blueprint-pages
@@ -39,14 +45,14 @@ jobs:
       # declaration that is not in the sources.
       - name: Validate the theorem DAG and its declarations
         run: >-
-          uvx --from git+{{AUTOFORM_SOURCE}}@{{AUTOFORM_REF}}
+          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"
           autoform check blueprint --lean-root .
 
       # Writes site-src/: statement boxes, derived statuses, the Mermaid graph,
       # and permalinks into the Lean code at this exact commit.
       - name: Render the blueprint
         run: >-
-          uvx --from git+{{AUTOFORM_SOURCE}}@{{AUTOFORM_REF}}
+          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"
           autoform render blueprint
           --output site-src
           --lean-root .

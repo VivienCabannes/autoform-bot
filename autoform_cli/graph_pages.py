@@ -47,10 +47,7 @@ def write_graph_pages(
     local_views = focus_views(graph, statuses)
     project_page = destination / "dependencies.md"
     full_page = destination / "dependencies/full.md"
-    chapter_pages = {
-        group: destination / "dependencies/chapters" / f"{group or 'roadmap'}.md"
-        for group in groups
-    }
+    chapter_pages = {group: destination / "dependencies/chapters" / f"{group or 'roadmap'}.md" for group in groups}
     containers = [node_id for node_id in graph.nodes if graph.children(node_id)]
     scope_pages = {
         node_id: (
@@ -62,20 +59,23 @@ def write_graph_pages(
         )
         for node_id in containers
     }
-    article_groups = {
-        node_id: group for group, node_ids in groups.items() for node_id in node_ids
-    }
-    focus_pages = {
-        node_id: destination / "dependencies/nodes" / f"{node_id}.md"
-        for node_id in article_groups
-    }
+    scope_pages["roadmap"] = project_page
+    article_groups = {node_id: group for group, node_ids in groups.items() for node_id in node_ids}
+    focus_pages = {node_id: destination / "dependencies/nodes" / f"{node_id}.md" for node_id in article_groups}
     written: list[Path] = []
 
     project = project_view(graph, statuses)
+    project_item_count = sum(len(node_ids) for node_ids in groups.values())
     project_book_links = node_links(project_page)
     project_links = {
         view_node.id: (
-            _published_link(chapter_pages[view_node.id.removeprefix("scope:")], project_page)
+            _published_link(
+                chapter_pages.get(
+                    view_node.id.removeprefix("scope:"),
+                    scope_pages[view_node.id.removeprefix("scope:")],
+                ),
+                project_page,
+            )
             if view_node.kind == "scope"
             else project_book_links[view_node.id]
         )
@@ -89,7 +89,7 @@ def write_graph_pages(
             links=project_links,
             heading="Dependency maps",
             lead=(
-                f"{len(graph.nodes)} items across "
+                f"{project_item_count} item{'s' if project_item_count != 1 else ''} across "
                 f"{len(groups)} chapter{'s' if len(groups) != 1 else ''}."
             ),
         )
@@ -101,7 +101,7 @@ def write_graph_pages(
         for node in view.nodes:
             if node.kind == "boundary":
                 external = node.id.removeprefix("boundary:")
-                links[node.id] = _published_link(chapter_pages[external], chapter_page)
+                links[node.id] = _published_link(scope_pages[external], chapter_page)
             elif node.kind == "scope":
                 nested = node.id.removeprefix("scope:")
                 links[node.id] = _published_link(scope_pages[nested], chapter_page)
@@ -143,7 +143,7 @@ def write_graph_pages(
                 links[node.id] = _published_link(scope_pages[nested], scope_page)
             elif node.kind == "boundary":
                 external = node.id.removeprefix("boundary:")
-                links[node.id] = _published_link(chapter_pages[external], scope_page)
+                links[node.id] = _published_link(scope_pages[external], scope_page)
         parent = graph.nodes[scope].parent
         parent_page = scope_pages.get(parent or "roadmap", project_page)
         written.append(

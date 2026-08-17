@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from autoform_cli.graph import Graph, Node
 from autoform_cli.graph_views import project_view
 from autoform_cli.render import render_site
@@ -41,14 +43,53 @@ def test_project_view_maps_top_level_container_dependencies_to_its_chapter(tmp_p
     assert [(edge.source, edge.target) for edge in view.edges] == [("scope:b", "scope:a")]
 
 
+@pytest.mark.parametrize("root_depends_on_chapter", (False, True))
+def test_render_publishes_dependencies_between_the_roadmap_root_and_a_chapter(
+    tmp_path: Path,
+    root_depends_on_chapter: bool,
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    roadmap = blueprint / "roadmap"
+    chapter = roadmap / "chapter"
+    chapter.mkdir(parents=True)
+    (blueprint / "README.md").write_text(
+        "# Book\n\n- [Roadmap](roadmap/README.md)\n- [Chapter](roadmap/chapter/README.md)\n",
+        encoding="utf-8",
+    )
+    root_dependency = "\n## Depends on\n\n- [Chapter result](chapter/result.md)\n" if root_depends_on_chapter else ""
+    (roadmap / "README.md").write_text(
+        "# Root result\n" + root_dependency,
+        encoding="utf-8",
+    )
+    chapter_dependency = "" if root_depends_on_chapter else "\n## Depends on\n\n- [Root result](../README.md)\n"
+    (chapter / "README.md").write_text(
+        "# Chapter\n\n- [Chapter result](result.md)\n",
+        encoding="utf-8",
+    )
+    (chapter / "result.md").write_text(
+        "---\ndeclaration: theorem\n---\n\n# Chapter result\n" + chapter_dependency,
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "site-src"
+    render_site(blueprint, output)
+
+    project_map = (output / "dependencies.md").read_text(encoding="utf-8")
+    chapter_map = (output / "dependencies/chapters/chapter.md").read_text(encoding="utf-8")
+    full_map = (output / "dependencies/full.md").read_text(encoding="utf-8")
+    assert "1 item across 1 chapter" in project_map
+    assert '"../../dependencies.html"' in chapter_map
+    assert "External chapter: Root result" in chapter_map
+    assert "Root result" in full_map
+    assert "Chapter result" in full_map
+
+
 def test_nested_container_keeps_its_own_narrative_and_statements(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     roadmap = blueprint / "roadmap"
     section = roadmap / "chapter" / "section"
     section.mkdir(parents=True)
-    (blueprint / "README.md").write_text(
-        "# Book\n\n- [Chapter](roadmap/chapter/README.md)\n", encoding="utf-8"
-    )
+    (blueprint / "README.md").write_text("# Book\n\n- [Chapter](roadmap/chapter/README.md)\n", encoding="utf-8")
     (roadmap / "README.md").write_text("# Roadmap\n\n- [Chapter](chapter/README.md)\n", encoding="utf-8")
     (roadmap / "chapter" / "README.md").write_text(
         "# Chapter\n\nChapter prose.\n\n- [Section](section/README.md)\n", encoding="utf-8"
@@ -91,7 +132,7 @@ def test_prose_only_leaf_article_remains_a_book_page(tmp_path: Path) -> None:
 
     epilogue = (output / "roadmap/epilogue.md").read_text(encoding="utf-8")
     assert "Closing prose." in epilogue
-    assert 'bp-book-nav-previous' in epilogue
+    assert "bp-book-nav-previous" in epilogue
 
 
 def test_same_named_leaf_slots_are_scoped_to_their_container(tmp_path: Path) -> None:
@@ -114,9 +155,7 @@ def test_same_named_leaf_slots_are_scoped_to_their_container(tmp_path: Path) -> 
         "# Book\n\n- [A](roadmap/a/README.md)\n- [B](roadmap/b/README.md)\n",
         encoding="utf-8",
     )
-    (roadmap / "README.md").write_text(
-        "# Roadmap\n\n- [A](a/README.md)\n- [B](b/README.md)\n", encoding="utf-8"
-    )
+    (roadmap / "README.md").write_text("# Roadmap\n\n- [A](a/README.md)\n- [B](b/README.md)\n", encoding="utf-8")
 
     output = tmp_path / "site-src"
     render_site(blueprint, output)
@@ -132,16 +171,13 @@ def test_render_preserves_fragment_on_container_article_link(tmp_path: Path) -> 
     roadmap = blueprint / "roadmap"
     chapter = roadmap / "chapter"
     chapter.mkdir(parents=True)
-    (blueprint / "README.md").write_text(
-        "# Book\n\n[Details](roadmap/chapter/README.md#details)\n", encoding="utf-8"
-    )
+    (blueprint / "README.md").write_text("# Book\n\n[Details](roadmap/chapter/README.md#details)\n", encoding="utf-8")
     (roadmap / "README.md").write_text("# Roadmap\n", encoding="utf-8")
     (chapter / "README.md").write_text(
         "# Chapter\n\n[Jump](README.md#details)\n\n## Details\n\nText.\n", encoding="utf-8"
     )
     (chapter / "result.md").write_text(
-        "---\ndeclaration: theorem\n---\n\n"
-        "# Result\n\nStatement.\n\n## Depends on\n\nNo prerequisites.\n",
+        "---\ndeclaration: theorem\n---\n\n# Result\n\nStatement.\n\n## Depends on\n\nNo prerequisites.\n",
         encoding="utf-8",
     )
 
