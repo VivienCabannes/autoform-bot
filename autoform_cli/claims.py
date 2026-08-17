@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -56,10 +57,31 @@ def _validate_key(key: str) -> str:
     return key
 
 
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
 def _validate_ttl(ttl: int | float) -> int | float:
-    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or ttl <= 0:
-        raise ValueError("claim TTL must be a positive number")
+    if not _is_finite_number(ttl) or ttl <= 0:
+        raise ValueError("claim TTL must be a finite positive number")
     return ttl
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number {value!r}")
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
 
 
 def author_claim_key(node_id: str) -> str:
@@ -134,8 +156,12 @@ class ClaimBoard:
         if not separator:
             raise MalformedLeaseError(f"claim {key!r} has no lease message")
         try:
-            lease = json.loads(message)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            lease = json.loads(
+                message,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except (ValueError, UnicodeDecodeError) as exc:
             raise MalformedLeaseError(f"claim {key!r} has invalid lease JSON") from exc
         if not isinstance(lease, dict) or not self._lease_is_valid(lease, key):
             raise MalformedLeaseError(f"claim {key!r} has an invalid lease schema")
@@ -150,10 +176,8 @@ class ClaimBoard:
             and isinstance(lease.get("owner"), str)
             and bool(lease.get("owner"))
             and isinstance(lease.get("resource"), str)
-            and not isinstance(acquired_at, bool)
-            and isinstance(acquired_at, (int, float))
-            and not isinstance(expires_at, bool)
-            and isinstance(expires_at, (int, float))
+            and _is_finite_number(acquired_at)
+            and _is_finite_number(expires_at)
             and acquired_at <= expires_at
         )
         return bool(valid and (key is None or lease.get("resource") == key))
@@ -162,19 +186,27 @@ class ClaimBoard:
         key = _validate_key(key)
         ttl = _validate_ttl(ttl)
         now = time.time()
+        if not math.isfinite(now):
+            raise ValueError("claim timestamp must be finite")
+        try:
+            expires_at = now + ttl
+        except OverflowError as exc:
+            raise ValueError("claim expiry must be finite") from exc
+        if not math.isfinite(expires_at):
+            raise ValueError("claim expiry must be finite")
         lease: dict[str, Any] = {
             "schema": CLAIM_SCHEMA,
             "owner": self.worker_id,
             "host": socket.gethostname(),
             "pid": os.getpid(),
             "acquired_at": now,
-            "expires_at": now + ttl,
+            "expires_at": expires_at,
             "resource": key,
         }
         if note:
             lease["note"] = note
         tree = self._git(["mktree"], input_text="").stdout.strip()
-        message = json.dumps(lease, sort_keys=True, separators=(",", ":"))
+        message = json.dumps(lease, sort_keys=True, separators=(",", ":"), allow_nan=False)
         return self._git(["commit-tree", tree, "-m", message]).stdout.strip()
 
     def _cas_push(self, key: str, old: str | None, new: str) -> bool:
@@ -208,9 +240,12 @@ class ClaimBoard:
     def expired(cls, lease: Mapping[str, Any], now: float | None = None) -> bool:
         """Return whether a lease is malformed or no longer live."""
         expires_at = lease.get("expires_at")
-        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        if not _is_finite_number(expires_at):
             return True
-        return expires_at <= (time.time() if now is None else now)
+        comparison_time = time.time() if now is None else now
+        if not _is_finite_number(comparison_time):
+            raise ValueError("claim expiry comparison clock must be finite")
+        return expires_at <= comparison_time
 
     def acquire(self, key: str, ttl: int | float = CLAIM_TTL_S, steal: bool = False, note: str = "") -> bool:
         """CAS-acquire a free, expired, malformed, owned, or explicitly stolen lease."""
@@ -333,8 +368,8 @@ class Heartbeat:
         interval: float = CLAIM_HEARTBEAT_S,
         ttl: int | float = CLAIM_TTL_S,
     ) -> None:
-        if interval <= 0:
-            raise ValueError("heartbeat interval must be positive")
+        if not _is_finite_number(interval) or interval <= 0:
+            raise ValueError("heartbeat interval must be a finite positive number")
         _validate_key(key)
         _validate_ttl(ttl)
         if interval >= ttl:

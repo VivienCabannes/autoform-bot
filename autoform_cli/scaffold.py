@@ -11,11 +11,14 @@ fixed, so the tool writes it.
 from __future__ import annotations
 
 import json
+import os
 import re
-import shutil
+import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
 
@@ -29,6 +32,15 @@ _DOTTED = {
 
 DEFAULT_AUTOFORM_SOURCE = "https://github.com/facebookresearch/autoform-bot.git"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
+_SOURCE_HOST = re.compile(
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+)
+_SOURCE_PATH_PART = re.compile(r"[A-Za-z0-9._~-]+")
+_GITHUB_SCP_SOURCE = re.compile(
+    r"git@github\.com:(?P<path>[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+)"
+)
+_TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}")
 
 #: Where `claude plugin install` records the marketplace each plugin came from.
 _PLUGIN_REGISTRY = Path.home() / ".claude" / "plugins" / "known_marketplaces.json"
@@ -110,6 +122,54 @@ def _marketplace_checkout() -> Path | None:
     return _checkout_root(checkout)
 
 
+def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -> str | None:
+    """Return a safe, credential-free HTTPS Git source or ``None``.
+
+    Generated workflows persist this value and pass it to a shell. Keep the
+    accepted language deliberately small instead of attempting to quote every
+    URL or Git transport syntax. The one non-URL form is GitHub's SCP-style
+    origin, which is normalized only when reading local checkout provenance.
+    """
+
+    if not source or source != source.strip():
+        return None
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in source):
+        return None
+    if allow_github_scp:
+        scp = _GITHUB_SCP_SOURCE.fullmatch(source)
+        if scp is not None:
+            path = scp.group("path")
+            source = f"https://github.com/{path if path.endswith('.git') else f'{path}.git'}"
+    try:
+        parsed = urlsplit(source)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc.lower() != parsed.hostname.lower()
+        or not _SOURCE_HOST.fullmatch(parsed.hostname)
+    ):
+        return None
+    parts = parsed.path.split("/")
+    if (
+        len(parts) < 2
+        or parts[0]
+        or any(part in {"", ".", ".."} for part in parts[1:])
+        or any(_SOURCE_PATH_PART.fullmatch(part) is None for part in parts[1:])
+        or not parts[-1].endswith(".git")
+        or parts[-1] == ".git"
+    ):
+        return None
+    return source
+
+
 def plugin_pin() -> tuple[str, str]:
     """The Autoform source and commit generated CI should install, if knowable.
 
@@ -133,13 +193,12 @@ def plugin_pin() -> tuple[str, str]:
         return "", ""
     source = _git("remote", "get-url", "origin", root=root)
     ref = _git("rev-parse", "HEAD", root=root)
-    if not source or not ref or not _FULL_SHA.fullmatch(ref):
+    if not source or not source.endswith(".git"):
+        source = f"{source}.git" if source else ""
+    safe_source = _normalize_autoform_source(source, allow_github_scp=True)
+    if safe_source is None or not ref or not _FULL_SHA.fullmatch(ref):
         return "", ""
-    if source.startswith("git@github.com:"):
-        source = "https://github.com/" + source[len("git@github.com:") :]
-    if not source.endswith(".git"):
-        source += ".git"
-    return source, ref
+    return safe_source, ref
 
 
 class ScaffoldError(ValueError):
@@ -188,16 +247,41 @@ def _yaml_scalar(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-#: Substitutions that land in YAML and so have to be quoted as scalars. The
-#: rest are pasted into Markdown and workflow shell lines, where quoting would
-#: show up in the output.
-_YAML_VALUED = frozenset({"PROJECT_TITLE_YAML", "REPO_URL_YAML"})
-
-
 def _render(text: str, substitutions: dict[str, str]) -> str:
-    for key, value in substitutions.items():
-        text = text.replace("{{" + key + "}}", value)
-    return text
+    """Substitute tokens from the original template exactly once.
+
+    Replacement values are user-controlled in several templates. A sequential
+    series of ``str.replace`` calls can reinterpret token-shaped text inside an
+    earlier value, corrupting YAML and Markdown or exposing another generated
+    value. A single regex pass never scans replacement content again.
+    """
+
+    return _TEMPLATE_PLACEHOLDER.sub(
+        lambda match: substitutions.get(match.group("name"), match.group(0)),
+        text,
+    )
+
+
+def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
+    """Replace *destination* from a same-directory temporary file.
+
+    Replacing rather than truncating is essential when an existing destination
+    has hard links: ``--force`` must not modify another path to the old inode.
+    """
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -251,11 +335,24 @@ def scaffold_project(
             f"--autoform-ref must be a full 40-character commit sha, not {given_ref!r}; "
             "branches and abbreviated shas do not stay put"
         )
+    given_source = ""
+    if autoform_source:
+        normalized = _normalize_autoform_source(autoform_source)
+        if normalized is None:
+            issues.append(
+                "--autoform-source must be a safe credential-free HTTPS Git URL ending in .git"
+            )
+        else:
+            given_source = normalized
     if issues:
         raise ScaffoldError(issues)
 
     pinned_source, pinned_ref = plugin_pin()
-    given_source = autoform_source.strip()
+    safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
+    if safe_pinned_source is None or not _FULL_SHA.fullmatch(pinned_ref.lower()):
+        pinned_source, pinned_ref = "", ""
+    else:
+        pinned_source, pinned_ref = safe_pinned_source, pinned_ref.lower()
     source = given_source or pinned_source or DEFAULT_AUTOFORM_SOURCE
     # A ref identifies a commit in one repository. Naming a different source
     # while inheriting this checkout's HEAD produces `git+other.git@our-sha`,
@@ -274,15 +371,22 @@ def scaffold_project(
         "REPO_URL": repository_url.strip(),
         "AUTOFORM_SOURCE": source,
         "AUTOFORM_REF": ref,
+        "AUTOFORM_SOURCE_YAML": _yaml_scalar(source),
+        "AUTOFORM_REF_YAML": _yaml_scalar(ref),
     }
 
     written: list[str] = []
     skipped: list[str] = []
     for template in sorted(_TEMPLATES.rglob("*")):
-        if not template.is_file():
+        relative_path = template.relative_to(_TEMPLATES)
+        if (
+            not template.is_file()
+            or "__pycache__" in relative_path.parts
+            or template.suffix == ".pyc"
+        ):
             continue
-        relative = template.relative_to(_TEMPLATES).as_posix()
-        if unpinned and relative.startswith("github/workflows/"):
+        relative = relative_path.as_posix()
+        if unpinned and relative.startswith("github/"):
             skipped.append(_destination(relative))
             continue
         destination = root / _destination(relative)
@@ -302,12 +406,11 @@ def scaffold_project(
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
-            shutil.copyfile(template, destination)
+            content = template.read_bytes()
         else:
-            destination.write_text(
-                _render(template.read_text(encoding="utf-8"), substitutions),
-                encoding="utf-8",
-            )
+            rendered = _render(template.read_text(encoding="utf-8"), substitutions)
+            content = rendered.encode("utf-8")
+        _atomic_write(destination, content, mode=stat.S_IMODE(template.stat().st_mode))
         written.append(_destination(relative))
 
     return ScaffoldResult(title.strip(), tuple(written), tuple(skipped), unpinned)

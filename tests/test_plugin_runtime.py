@@ -99,6 +99,8 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "servers/repl/core.py",
             "servers/repl/server.py",
         } <= names
+        assert "autoform_cli/lake.py" not in names
+        assert "autoform_cli/templates/github/autoform_audit.py" in names
         assert not any(
             name.startswith(("scripts/", "autoform/", "visualization/", "servers/lean/", "servers/search/"))
             for name in names
@@ -111,6 +113,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             next(name for name in names if name.endswith(".dist-info/METADATA"))
         ).decode()
         assert "Requires-Dist: psutil>=5.9" in metadata
+        assert "Requires-Dist: tomli" not in metadata
         assert "Provides-Extra: repl" in metadata
         archive.extractall(site)
 

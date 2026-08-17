@@ -152,6 +152,32 @@ def test_malformed_lease_is_unverifiable_and_not_takeover_eligible(tmp_path: Pat
     assert board.cleanup() == 0
 
 
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf")])
+def test_acquire_rejects_nonfinite_ttl_without_mutating_remote(
+    tmp_path: Path, board_repo: Path, ttl: float
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(ValueError, match="finite positive number"):
+        board.acquire("nonfinite", ttl=ttl)
+
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX + "nonfinite", cwd=board_repo) == ""
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf")])
+def test_renew_rejects_nonfinite_ttl_without_replacing_lease(
+    tmp_path: Path, board_repo: Path, ttl: float
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+    assert board.acquire("owned", ttl=30)
+    oid = board._remote_oid("owned")
+
+    with pytest.raises(ValueError, match="finite positive number"):
+        board.renew("owned", ttl=ttl)
+
+    assert board._remote_oid("owned") == oid
+
+
 def test_owner_only_renew_and_release(tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = 2_000.0
     monkeypatch.setattr(claims.time, "time", lambda: now)
@@ -167,6 +193,24 @@ def test_owner_only_renew_and_release(tmp_path: Path, board_repo: Path, monkeypa
     assert owner.renew("owned", ttl=30)
     assert owner.read("owned")["expires_at"] > first_expiry
     assert owner.release("owned")
+
+
+@pytest.mark.parametrize("now", [float("nan"), float("inf"), float("-inf")])
+def test_expired_rejects_nonfinite_explicit_comparison_clock(now: float) -> None:
+    lease = {"expires_at": 200.0}
+
+    with pytest.raises(ValueError, match="comparison clock must be finite"):
+        claims.ClaimBoard.expired(lease, now=now)
+
+
+@pytest.mark.parametrize("now", [float("nan"), float("inf"), float("-inf")])
+def test_expired_rejects_nonfinite_default_comparison_clock(
+    monkeypatch: pytest.MonkeyPatch, now: float
+) -> None:
+    monkeypatch.setattr(claims.time, "time", lambda: now)
+
+    with pytest.raises(ValueError, match="comparison clock must be finite"):
+        claims.ClaimBoard.expired({"expires_at": 200.0})
 
 
 def test_cleanup_removes_only_expired_snapshot_entries(
@@ -262,6 +306,21 @@ def test_heartbeat_rejects_interval_that_can_outlive_lease() -> None:
         claims.Heartbeat(object(), "key", interval=30, ttl=30)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("interval", "ttl", "message"),
+    [
+        (float("nan"), 30, "heartbeat interval must be a finite positive number"),
+        (float("inf"), 30, "heartbeat interval must be a finite positive number"),
+        (1, float("nan"), "claim TTL must be a finite positive number"),
+        (1, float("inf"), "claim TTL must be a finite positive number"),
+        (1, float("-inf"), "claim TTL must be a finite positive number"),
+    ],
+)
+def test_heartbeat_rejects_nonfinite_timing(interval: float, ttl: float, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        claims.Heartbeat(object(), "key", interval=interval, ttl=ttl)  # type: ignore[arg-type]
+
+
 def test_heartbeat_marks_ownership_lost_on_transport_failure() -> None:
     attempted = threading.Event()
 
@@ -311,6 +370,12 @@ def test_heartbeat_marks_ownership_lost_when_renew_is_refused() -> None:
         {"resource": "different"},
         {"owner": ""},
         {"expires_at": "later"},
+        {"acquired_at": float("nan")},
+        {"acquired_at": float("inf")},
+        {"acquired_at": float("-inf")},
+        {"expires_at": float("nan")},
+        {"expires_at": float("inf")},
+        {"expires_at": float("-inf")},
     ],
 )
 def test_schema_resource_or_required_field_mismatch_is_malformed(
@@ -331,3 +396,63 @@ def test_schema_resource_or_required_field_mismatch_is_malformed(
         board.acquire("wrong", ttl=600)
     assert board.list()[0]["_malformed"] is True
     assert board.cleanup() == 0
+
+
+@pytest.mark.parametrize("field", ["schema", "owner", "resource", "acquired_at", "expires_at"])
+def test_planted_lease_with_duplicate_decision_field_is_rejected_by_strict_json_parser(
+    tmp_path: Path, board_repo: Path, field: str
+) -> None:
+    values = {
+        "schema": '"autoform-claim/v1"',
+        "owner": '"worker-a"',
+        "resource": '"duplicate"',
+        "acquired_at": "100.0",
+        "expires_at": "200.0",
+    }
+    pairs = [f'"{name}":{value}' for name, value in values.items()]
+    pairs.append(f'"{field}":{values[field]}')
+    _plant_message(board_repo, "duplicate", "{" + ",".join(pairs) + "}")
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(claims.MalformedLeaseError, match="invalid lease JSON"):
+        board.read("duplicate")
+
+    assert board.list()[0]["_malformed"] is True
+
+
+def test_planted_nonfinite_lease_is_rejected_by_strict_json_parser(
+    tmp_path: Path, board_repo: Path
+) -> None:
+    message = (
+        '{"schema":"autoform-claim/v1","owner":"worker-a","resource":"strict-json",'
+        '"acquired_at":0,"expires_at":NaN}'
+    )
+    _plant_message(board_repo, "strict-json", message)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(claims.MalformedLeaseError, match="invalid lease JSON"):
+        board.read("strict-json")
+
+
+def test_acquire_rejects_nonfinite_clock_before_commit_or_push(
+    tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+    monkeypatch.setattr(claims.time, "time", lambda: float("nan"))
+
+    with pytest.raises(ValueError, match="claim timestamp must be finite"):
+        board.acquire("bad-clock", ttl=30)
+
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX + "bad-clock", cwd=board_repo) == ""
+
+
+def test_acquire_rejects_nonfinite_expiry_before_commit_or_push(
+    tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+    monkeypatch.setattr(claims.time, "time", lambda: 1e308)
+
+    with pytest.raises(ValueError, match="claim expiry must be finite"):
+        board.acquire("bad-expiry", ttl=1e308)
+
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX + "bad-expiry", cwd=board_repo) == ""

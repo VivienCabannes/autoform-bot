@@ -9,3 +9,4 @@ rev = "v4.32.2"
 
 [[lean_lib]]
 name = "CabannesThesis"
+srcDir = "src"

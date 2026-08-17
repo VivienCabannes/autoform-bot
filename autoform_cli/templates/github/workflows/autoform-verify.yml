@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+env:
+  AUTOFORM_SOURCE: {{AUTOFORM_SOURCE_YAML}}
+  AUTOFORM_REF: {{AUTOFORM_REF_YAML}}
+
 concurrency:
   group: autoform-verify-${{ github.ref }}
   cancel-in-progress: true
@@ -31,7 +35,7 @@ jobs:
 
       - name: Validate the theorem DAG
         run: >-
-          uvx --from git+{{AUTOFORM_SOURCE}}@{{AUTOFORM_REF}}
+          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"
           autoform check blueprint
 
       - name: Install elan
@@ -67,78 +71,31 @@ jobs:
       - name: Fetch the Mathlib build cache
         run: lake exe cache get || echo "no cache available — building from source"
 
+      # Evaluate either Lake manifest language, then clean only the root package.
+      # Bare `lake clean` would also delete dependency build caches.
       - name: Build Lean
-        run: lake build
-
-      - name: Audit every project declaration
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import pathlib
-          import subprocess
-          import sys
+          evaluated_config="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-lake-config.XXXXXX.toml")"
+          trap 'rm -f "$evaluated_config"' EXIT
+          rm -f "$evaluated_config"
+          lake translate-config toml "$evaluated_config"
+          root_package="$(python3 .github/autoform_audit.py --root-package "$evaluated_config")"
+          echo "AUTOFORM_ROOT_PACKAGE=$root_package" >> "$GITHUB_ENV"
+          lake check-build
+          lake clean "$root_package"
+          lake build
 
-          modules = []
-          for path in sorted(pathlib.Path(".").rglob("*.lean")):
-              if (
-                  ".lake" in path.parts
-                  or path.name.startswith("lakefile")
-                  or path.name == "autoform_axiom_probe.lean"
-              ):
-                  continue
-              modules.append(".".join(path.with_suffix("").parts))
-          if not modules:
-              print("no Lean modules to audit")
-              sys.exit(0)
-
-          modules = list(dict.fromkeys(modules))
-          imports = "\n".join(f"import {module}" for module in modules)
-
-          def lean_name(module):
-              result = "Name.anonymous"
-              for part in module.split("."):
-                  result = f"Name.str ({result}) {json.dumps(part)}"
-              return result
-
-          target_modules = ", ".join(lean_name(module) for module in modules)
-          probe = imports + "\nimport Lean.Util.CollectAxioms\nimport Lean.Elab.Command\n\n" + f'''\
-          open Lean Elab Command
-
-          run_cmd do
-            let targetModules : List Name := [{target_modules}]
-            let allowed : List Name := [``propext, ``Classical.choice, ``Quot.sound]
-            let env ← getEnv
-            let mut checked : Nat := 0
-            let mut badSafety : Array Name := #[]
-            let mut badAxioms : Array (Name × Name) := #[]
-            for (declName, info) in env.constants do
-              if let some moduleIdx := env.getModuleIdxFor? declName then
-                let moduleName := env.header.moduleNames[moduleIdx.toNat]!
-                if targetModules.contains moduleName then
-                  checked := checked + 1
-                  if info.isUnsafe || info.isPartial then
-                    badSafety := badSafety.push declName
-                  for usedAxiom in (← Lean.collectAxioms declName) do
-                    unless allowed.contains usedAxiom do
-                      badAxioms := badAxioms.push (declName, usedAxiom)
-            for declName in badSafety do
-              logError m!"unsafe or partial declaration: {{declName}}"
-            for (declName, usedAxiom) in badAxioms do
-              logError m!"{{declName}} depends on unexpected axiom {{usedAxiom}}"
-            unless badSafety.isEmpty && badAxioms.isEmpty do
-              throwError "project declarations failed the kernel-trust audit"
-            logInfo m!"kernel trust clean ({{checked}} project declaration(s) audited)"
-          '''
-          pathlib.Path("autoform_axiom_probe.lean").write_text(probe, encoding="utf-8")
-
-          result = subprocess.run(
-              ["lake", "env", "lean", "autoform_axiom_probe.lean"],
-              capture_output=True,
-              text=True,
-          )
-          print(result.stdout)
-          if result.returncode != 0:
-              print(result.stderr, file=sys.stderr)
-              sys.exit("axiom probe failed to elaborate")
-          PY
+      - name: Audit every root-package declaration
+        run: |
+          set -euo pipefail
+          archive="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-root-build.XXXXXX.tgz")"
+          probe="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-axiom-probe.XXXXXX.lean")"
+          trap 'rm -f "$archive" "$probe"' EXIT
+          # Lake resolves both manifest languages and package/custom buildDir.
+          # `lake pack` archives only the root package's actual build directory,
+          # leaving dependency package artifacts outside the audit boundary.
+          lake pack "$archive"
+          python3 .github/autoform_audit.py \
+            "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          lake env lean "$probe"
