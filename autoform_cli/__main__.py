@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import status
+from .article_identity import plan_article_ids
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
 from .doctor import diagnose_project
@@ -76,6 +77,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_cleanup = claim_subparsers.add_parser("cleanup")
     _add_claim_board_arguments(claim_cleanup)
 
+    migrate = subparsers.add_parser("migrate", help="inspect authored migration contracts")
+    migrate_subparsers = migrate.add_subparsers(dest="migrate_command", required=True)
+    article_ids = migrate_subparsers.add_parser(
+        "article-ids",
+        help="plan durable roadmap article identifiers without writing files",
+    )
+    article_ids.add_argument("blueprint_dir")
+    article_ids.add_argument(
+        "--check",
+        action="store_true",
+        help="fail when an article is missing article_id frontmatter",
+    )
+    article_ids.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
+    render = subparsers.add_parser
+
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
     render.add_argument("-o", "--output", default="site-src", help="output directory")
@@ -100,6 +117,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _doctor(args)
     if args.command == "claim":
         return _claim(args)
+    if args.command == "migrate":
+        return _migrate(args)
     if args.command == "render":
         return _render(args)
     return 2
@@ -241,6 +260,28 @@ def _claim(args: argparse.Namespace) -> int:
     except (ClaimTransportError, ValueError) as exc:
         print(f"error: {exc}")
         return 1
+
+
+def _migrate(args: argparse.Namespace) -> int:
+    if args.migrate_command != "article-ids":
+        return 2
+    try:
+        plan = plan_article_ids(args.blueprint_dir)
+    except GraphValidationError as error:
+        for issue in error.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(plan.to_json())
+    elif plan.complete:
+        print(f"OK: {len(plan.entries)} articles have durable article_id metadata")
+    else:
+        print(f"{plan.missing_count} article(s) need article_id metadata")
+        for entry in plan.entries:
+            if not entry.assigned:
+                print(f"  {entry.article_path}: {entry.article_id}")
+    return 1 if args.check and not plan.complete else 0
 
 
 def _claim_board(args: argparse.Namespace) -> ClaimBoard:
