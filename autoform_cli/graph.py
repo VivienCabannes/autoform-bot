@@ -9,6 +9,7 @@ a second graph file that could drift from the book.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,8 +21,10 @@ _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
+ARTICLE_ID_PATTERN = re.compile(r"af_[0-9a-f]{24}\Z")
 _FRONTMATTER_KEYS = frozenset(
     {
+        "article_id",
         "declaration",
         "lean",
         "statement",
@@ -84,6 +87,8 @@ class Node:
     sources: tuple[str, ...] = ()
     parent: str | None = None
     depth: int = 0
+    article_id: str | None = None
+    source_sha256: str | None = None
 
     @property
     def formalizable(self) -> bool:
@@ -123,6 +128,7 @@ class _NodeSource:
     id: str
     path: Path
     text: str
+    source_sha256: str
 
 
 def load_graph(blueprint_dir: str | Path) -> Graph:
@@ -138,6 +144,8 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     node_ids: dict[str, Path] = {}
     sources, discovery_issues = _discover_nodes(blueprint)
     issues.extend(discovery_issues)
+    article_ids: dict[str, str] = {}
+    source_hashes = {source.id: source.source_sha256 for source in sources}
 
     for source in sources:
         canonical = source.path.resolve()
@@ -152,6 +160,15 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
         node, node_issues = _parse_node(source.id, canonical, source.text)
         issues.extend(node_issues)
         if node is not None:
+            article_id = node.metadata.get("article_id")
+            if article_id is not None:
+                previous = article_ids.get(article_id)
+                if previous is not None:
+                    issues.append(
+                        f"{node.id}: duplicate article_id {article_id!r} also used by {previous}"
+                    )
+                else:
+                    article_ids[article_id] = node.id
             parsed.append(node)
 
     if issues:
@@ -201,6 +218,8 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             sources=parsed_node.source_targets,
             parent=parents[parsed_node.id],
             depth=_article_depth(parsed_node.id, parents),
+            article_id=metadata.get("article_id"),
+            source_sha256=source_hashes[parsed_node.id],
         )
 
     if not issues:
@@ -233,7 +252,8 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
         if not path.is_file() or path.suffix != ".md":
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            content = path.read_bytes()
+            text = content.decode("utf-8")
         except (OSError, UnicodeError) as exc:
             relative = path.relative_to(roadmap_root).as_posix()
             issues.append(f"{relative}: cannot read roadmap page: {exc}")
@@ -243,7 +263,9 @@ def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
         if not _is_within(canonical, roadmap_root):
             issues.append(f"{node_id}: node file escapes the roadmap directory")
             continue
-        sources.append(_NodeSource(node_id, canonical, text))
+        sources.append(
+            _NodeSource(node_id, canonical, text, hashlib.sha256(content).hexdigest())
+        )
 
     issues.extend(_chapter_issues(roadmap_root))
     return sources, issues
@@ -438,6 +460,10 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
     """Canonicalize an assertion value, or explain why it is not one."""
     location = f"{node_id}:{line_number}"
     folded = value.casefold()
+    if key == "article_id":
+        if not ARTICLE_ID_PATTERN.fullmatch(value):
+            return value, f"{location}: malformed article_id {value!r}"
+        return value, None
     if key in {"statement", "proof"}:
         if folded != _FORMALIZED:
             return value, f"{location}: {key!r} accepts only {_FORMALIZED!r}; omit the key otherwise"

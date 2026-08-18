@@ -156,6 +156,19 @@ and read-only: it neither contacts network services nor writes findings back
 into the blueprint. Pass `--json` for stable machine-readable output; a nonzero
 exit status means the audit found at least one issue.
 
+Plan durable article identity metadata without changing the blueprint:
+
+```bash
+autoform migrate article-ids blueprint --json
+autoform migrate article-ids blueprint --check
+```
+
+`article_id` accepts opaque values in the form `af_` plus 24 lowercase hex
+digits. The planner validates uniqueness, proposes deterministic IDs for
+missing articles, includes exact source hashes, and is strictly read-only.
+Applying plans, moving runtime consumers and claims to durable IDs, and
+preserving publication routes are intentionally deferred to follow-up changes.
+
 Coordinate temporary cross-machine ownership without modifying the book:
 
 ```bash
