@@ -507,9 +507,25 @@ class LeanRepl:
 
         stdout_fd = self.process.stdout.fileno()
         stderr_fd = self.process.stderr.fileno()
-        response_buffer = ""
-        stderr_buffer = ""
+        os.set_blocking(stdout_fd, False)
+        os.set_blocking(stderr_fd, False)
+        response_buffer = bytearray()
+        stderr_buffer = bytearray()
         max_buffer = self.config.max_buffer_bytes
+
+        def drain_stderr() -> None:
+            while True:
+                try:
+                    chunk = os.read(stderr_fd, self.chunk_size)
+                except BlockingIOError:
+                    return
+                if not chunk:
+                    return
+                stderr_buffer.extend(chunk)
+                logger.debug(
+                    "Lean REPL stderr: %s",
+                    chunk.decode("utf-8", errors="replace").rstrip(),
+                )
 
         while True:
             remaining = end_time - time.monotonic()
@@ -520,28 +536,34 @@ class LeanRepl:
             if not ready:
                 raise TimeoutError(f"REPL command timed out after {timeout} seconds")
 
+            # Drain diagnostics before handling stdout EOF so a crashing Lean
+            # process cannot lose stderr that became readable at the same time.
+            if stderr_fd in ready:
+                drain_stderr()
+
             if stdout_fd in ready:
-                chunk_bytes = os.read(stdout_fd, self.chunk_size)
-                if not chunk_bytes:
-                    raise ReplProcessExited(f"REPL process exited. stderr: {stderr_buffer}")
-                chunk = chunk_bytes.decode("utf-8", errors="replace")
-                response_buffer += chunk
+                try:
+                    chunk = os.read(stdout_fd, self.chunk_size)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    drain_stderr()
+                    stderr_text = stderr_buffer.decode("utf-8", errors="replace")
+                    raise ReplProcessExited(f"REPL process exited. stderr: {stderr_text}")
+                response_buffer.extend(chunk)
 
                 if len(response_buffer) > max_buffer:
+                    tail = bytes(response_buffer[-200:]).decode(
+                        "utf-8",
+                        errors="replace",
+                    )
                     raise RuntimeError(
-                        f"REPL response exceeded {max_buffer} bytes. Tail: {response_buffer[-200:]!r}"
+                        f"REPL response exceeded {max_buffer} bytes. Tail: {tail!r}"
                     )
 
-                if "\n\n" in response_buffer:
-                    response_str, _ = response_buffer.split("\n\n", 1)
-                    response_str = response_str.strip()
+                separator = response_buffer.find(b"\n\n")
+                if separator >= 0:
+                    response_bytes = bytes(response_buffer[:separator]).strip()
                     break
 
-            if stderr_fd in ready:
-                err_chunk_bytes = os.read(stderr_fd, self.chunk_size)
-                if err_chunk_bytes:
-                    err_chunk = err_chunk_bytes.decode("utf-8", errors="replace")
-                    stderr_buffer += err_chunk
-                    logger.debug("Lean REPL stderr: %s", err_chunk.rstrip())
-
-        return json.loads(response_str)
+        return json.loads(response_bytes.decode("utf-8"))
