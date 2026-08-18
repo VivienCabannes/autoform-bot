@@ -520,6 +520,15 @@ class LeanRepl:
             if not ready:
                 raise TimeoutError(f"REPL command timed out after {timeout} seconds")
 
+            # Drain diagnostics before handling stdout EOF so a crashing Lean
+            # process cannot lose stderr that became readable at the same time.
+            if stderr_fd in ready:
+                err_chunk_bytes = os.read(stderr_fd, self.chunk_size)
+                if err_chunk_bytes:
+                    err_chunk = err_chunk_bytes.decode("utf-8", errors="replace")
+                    stderr_buffer += err_chunk
+                    logger.debug("Lean REPL stderr: %s", err_chunk.rstrip())
+
             if stdout_fd in ready:
                 chunk_bytes = os.read(stdout_fd, self.chunk_size)
                 if not chunk_bytes:
@@ -536,12 +545,5 @@ class LeanRepl:
                     response_str, _ = response_buffer.split("\n\n", 1)
                     response_str = response_str.strip()
                     break
-
-            if stderr_fd in ready:
-                err_chunk_bytes = os.read(stderr_fd, self.chunk_size)
-                if err_chunk_bytes:
-                    err_chunk = err_chunk_bytes.decode("utf-8", errors="replace")
-                    stderr_buffer += err_chunk
-                    logger.debug("Lean REPL stderr: %s", err_chunk.rstrip())
 
         return json.loads(response_str)
