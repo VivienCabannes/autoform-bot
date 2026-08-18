@@ -8,9 +8,10 @@ instead of adding host-specific workflow copies.
 Read `docs/full-parity-architecture.md` before changing orchestration, provider
 adapters, permissions, or plugin packaging.
 
-The plugin intentionally replaces the former standalone Python application.
-Do not restore a legacy module, command, dependency, or run format without an
-explicit artifact boundary; that would create a second orchestration stack.
+Version 2 intentionally replaces the former standalone Python application.
+Read `docs/migration-v2.md` before restoring a v1 module, command, dependency,
+or run format; compatibility work must define an explicit artifact boundary
+rather than silently creating a second orchestration stack.
 
 ## Current surfaces
 
@@ -21,15 +22,15 @@ explicit artifact boundary; that would create a second orchestration stack.
 | Generated Codex agents | `scripts/install_host_agents.py` | Implemented |
 | Durable plan/queue/review control plane | `scripts/` | Implemented |
 | Unified prover and verification gate | `servers/prover/` | Implemented |
-| Mathlib and Zulip stateless helpers | `servers/mathlib/`, `servers/zulip/` | Implemented; invoked on demand, not MCP servers |
-| Aristotle prover backend | `servers/aristotle/`, `servers/prover/aristotle_adapter.py` | Implemented inside the unified prover |
-| Lean LSP | external `lean-lsp-mcp` | Stateful MCP dependency installed by Setup |
-| Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json` | Implemented |
+| Mathlib and Zulip MCP servers | `servers/mathlib/`, `servers/zulip/` | Implemented |
+| Aristotle MCP/server adapter | `servers/aristotle/` | Implemented, optional dependency |
+| REPL and LSP MCP servers | `servers/repl/`, `servers/lsp/` | Stubs; reference implementations are under `examples/servers/` |
+| Claude/Codex packaging | `.claude-plugin/`, `.codex-plugin/`, `.mcp.json`, `hooks/hooks.json` | Implemented |
 | Distributed worker CLI (claims, rounds, auto-merge gate, role registry) | `autoform_worker/`, `./autoform` | Implemented; design contract in `docs/worker-cli.md` |
 
-Useful next contributions include an OpenAI Responses transport beside Chat
-Completions, live opt-in provider contract tests, and additional adversarial
-verification fixtures.
+Useful next contributions include production REPL/LSP implementations, an
+OpenAI Responses transport beside Chat Completions, live opt-in provider
+contract tests, and additional adversarial verification fixtures.
 
 ## Compatibility rules
 

@@ -33,29 +33,12 @@ jobs:
           ref: __AUTOFORM_REVISION__
           path: .autoform-tooling
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
-        with:
-          version: "0.12.1"
-
-      - name: Validate Markdown article graph
+      - name: Export read-only dashboard
         run: >-
-          uv run --directory .autoform-tooling autoform-blueprint check
-          "$GITHUB_WORKSPACE/__BLUEPRINT_PATH__" --lean-root "$GITHUB_WORKSPACE"
-
-      - name: Render book, progress, and dependency views
-        run: >-
-          uv run --directory .autoform-tooling autoform-blueprint render
-          "$GITHUB_WORKSPACE/__BLUEPRINT_PATH__"
-          --output "$GITHUB_WORKSPACE/site-src"
-          --lean-root "$GITHUB_WORKSPACE"
-          --require-declarations
-
-      - name: Build static site
-        run: >-
-          uvx --from mkdocs==1.6.1 --with pymdown-extensions==10.21.3
-          mkdocs build --strict --config-file "$GITHUB_WORKSPACE/mkdocs.yml"
-          --site-dir "$GITHUB_WORKSPACE/__SITE_PATH__"
+          python .autoform-tooling/scripts/export_github_dashboard.py
+          --repo-root "$GITHUB_WORKSPACE"
+          --graph __GRAPH_PATH__
+          --output __SITE_PATH__
 
       - name: Configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b
@@ -63,7 +46,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa
         with:
-          path: "__SITE_PATH__"
+          path: __SITE_PATH__
 
       - name: Deploy Pages
         id: deployment

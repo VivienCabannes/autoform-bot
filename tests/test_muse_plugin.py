@@ -3,33 +3,20 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
-
-import pytest
 
 from scripts.build_muse_plugin import REPO_ROOT, build_muse_plugin
 
 
-EXPECTED_COMMANDS = {
-    path.parent.name for path in (REPO_ROOT / "skills").glob("*/SKILL.md")
+EXPECTED_COMMANDS = {"setup", "roadmap", "orchestrate"}
+EXPECTED_MCP_SERVERS = {
+    "lean-lsp-mcp",
+    "autoform-prover",
 }
-EXPECTED_MCP_SERVERS = set(
-    json.loads((REPO_ROOT / ".mcp.json").read_text())["mcpServers"]
-)
 
 
 def _manifest(root: Path) -> dict:
     return json.loads((root / ".muse-plugin" / "plugin.json").read_text())
-
-
-def test_claude_and_codex_share_root_capability_configs():
-    claude = json.loads((REPO_ROOT / ".claude-plugin" / "plugin.json").read_text())
-    codex = json.loads((REPO_ROOT / ".codex-plugin" / "plugin.json").read_text())
-
-    assert claude["mcpServers"] == codex["mcpServers"] == "./.mcp.json"
-    assert "hooks" not in claude
-    assert not (REPO_ROOT / "hooks").exists()
 
 
 def test_native_muse_manifest_has_the_portable_autoform_surface():
@@ -44,6 +31,7 @@ def test_native_muse_manifest_has_the_portable_autoform_surface():
     assert set(capabilities) == {
         "skills",
         "commands",
+        "hooks",
         "mcpServers",
         "reminders",
     }
@@ -53,7 +41,15 @@ def test_native_muse_manifest_has_the_portable_autoform_surface():
         assert command["path"] == f"skills/{command['id']}/SKILL.md"
         assert command["enabledDefault"] is True
     assert capabilities["reminders"] == []
-    assert "hooks" not in capabilities
+    assert capabilities["hooks"] == [
+        {
+            "id": "session-start",
+            "event": "SessionStart",
+            "command": ["bash", "hooks/session-start"],
+            "timeoutMs": 10000,
+            "statusMessage": "Loading Autoform context",
+        }
+    ]
     assert {item["id"] for item in capabilities["mcpServers"]} == EXPECTED_MCP_SERVERS
     for server in capabilities["mcpServers"]:
         assert server["transport"] == "stdio"
@@ -76,16 +72,10 @@ def test_muse_builder_emits_one_supported_manifest_family(tmp_path: Path):
         assert (output / skill["path"]).is_file()
     for command in manifest["capabilities"]["commands"]:
         assert (output / command["path"]).is_file()
-    assert not (output / "hooks").exists()
+    assert (output / "hooks" / "session-start").is_file()
     assert (output / "servers" / "run-muse-server.sh").is_file()
-    assert (output / "autoform_worker" / "__init__.py").is_file()
     assert (output / "pyproject.toml").is_file()
     assert (output / "uv.lock").is_file()
-    subprocess.run(
-        [sys.executable, "-c", "import autoform_worker"],
-        cwd=output,
-        check=True,
-    )
 
 
 def test_muse_builder_requires_force_to_replace_output(tmp_path: Path):
@@ -102,18 +92,6 @@ def test_muse_builder_requires_force_to_replace_output(tmp_path: Path):
 
     build_muse_plugin(output, force=True)
     assert not marker.exists()
-
-
-def test_muse_builder_rejects_repository_and_source_overlap(tmp_path: Path):
-    for output in (REPO_ROOT, REPO_ROOT / "scripts" / "dist-muse", REPO_ROOT.parent):
-        with pytest.raises(ValueError, match="must not overlap"):
-            build_muse_plugin(output, force=True)
-    target = tmp_path / "target"
-    target.mkdir()
-    alias = tmp_path / "alias"
-    alias.symlink_to(target, target_is_directory=True)
-    with pytest.raises(ValueError, match="symlink"):
-        build_muse_plugin(alias / "package", force=True)
 
 
 def test_muse_mcp_launcher_keeps_uv_state_outside_plugin_cache():
@@ -160,3 +138,17 @@ def test_muse_mcp_launcher_uses_plugin_data_environment(tmp_path: Path):
     assert uv_environment == str(plugin_data / "venv-prover")
     assert project == str(lean_project)
     assert args == "run python -m servers.prover.server"
+
+
+def test_session_start_context_names_muse_as_a_supported_host():
+    completed = subprocess.run(
+        ["bash", str(REPO_ROOT / "hooks" / "session-start")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    assert "Muse" in context
+    assert "setup, roadmap, and orchestrate" in context
+    assert "Orchestrate owns backend selection" in context

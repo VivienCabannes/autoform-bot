@@ -23,11 +23,11 @@ against the installed toolchain and runs the real kernel axiom probe. Without
 Lake, those tests skip. Provider tests use an in-process loopback HTTP server;
 they never contact an external model.
 
-The workspace fixture is deliberately incomplete, so `lake build` succeeds with
+The bundled demo is deliberately incomplete, so `lake build` succeeds with
 expected `sorry` warnings. A true cold start also downloads the Mathlib cache:
 
 ```bash
-cp -R tests/fixtures/demo-project /tmp/autoform-demo-pilot
+cp -R examples/demo-project /tmp/autoform-demo-pilot
 cd /tmp/autoform-demo-pilot
 LC_ALL=C LANG=C lake update
 LC_ALL=C LANG=C lake exe cache get
@@ -62,7 +62,7 @@ subagent delegation needs a registered parent thread. Judge the probe from the
 JSONL event stream, not from the model's final self-report. Success requires an
 actual spawned child id, a non-empty receiver set while waiting, and a terminal
 child result. A missing/failed spawn followed by a plausible statement such as
-`"used_agent": "autoform_source_searcher"` is a failed pilot, not evidence of delegation.
+`"used_agent": "autoform_reader"` is a failed pilot, not evidence of delegation.
 
 ## 3. API-provider preflight
 
@@ -104,8 +104,8 @@ LC_ALL=C LANG=C uv run python scripts/dispatch_runner.py <plan-dir> \
 
 Claude worker uses `--backend max`. A forced-timeout recovery check uses the
 same disposable node with `--timeout 1`; it must fail, mention that the child
-was killed, raise exactly one proof-recovery task, and leave no host child
-running. An unchanged retry must be rejected by the recovery fingerprint gate.
+was killed, raise exactly one escalation, and leave no host child running.
+Claim and resolve that escalation before retrying the node.
 
 For the three-axis jury:
 
@@ -152,6 +152,7 @@ These drills are automated in the default test suite. The live steps above
 verify host authentication, CLI schema behavior, subscription permissions, and
 real Lean-version compatibility that injected tests cannot establish.
 
-Record release-candidate outcomes in the release or pull-request record,
-including the commit, host versions, permission profile, and any billing or
-data-egress path. Do not commit transient local pilot transcripts to `docs/`.
+Record release-candidate outcomes in a dated result file. The current local
+hardening run is [pilot-results-2026-07-27.md](pilot-results-2026-07-27.md);
+open gates in that record remain release blockers until a later result
+supersedes them.

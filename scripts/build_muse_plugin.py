@@ -15,8 +15,9 @@ MANIFEST = Path("packaging/muse/.muse-plugin/plugin.json")
 DIRECTORIES = (
     "agents",
     "assets",
-    "autoform_worker",
     "docs",
+    "examples",
+    "hooks",
     "internal",
     "scripts",
     "servers",
@@ -54,17 +55,7 @@ def _ignore(_directory: str, names: list[str]) -> set[str]:
 
 
 def build_muse_plugin(output: Path, *, force: bool = False) -> Path:
-    raw_output = output.expanduser().absolute()
-    current = raw_output
-    while current != current.parent:
-        if current.is_symlink():
-            raise ValueError("output path must not contain a symlink")
-        current = current.parent
-    output = raw_output.resolve()
-    sources = [REPO_ROOT, *(REPO_ROOT / relative for relative in DIRECTORIES)]
-    if any(output == source or output in source.parents or source in output.parents
-           for source in sources):
-        raise ValueError("output must not overlap the Autoform repository or package sources")
+    output = output.expanduser().resolve()
     if output.exists() and not force:
         raise FileExistsError(f"output already exists: {output}; pass --force to rebuild")
 

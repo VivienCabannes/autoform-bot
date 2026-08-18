@@ -1,16 +1,16 @@
 # Usage guide
 
-Autoform runs the same durable formalization workflow from Claude Code, Codex,
-or Muse. The host handles interactive planning, review, and proof recovery
-through native subagents; a deterministic dispatcher owns proof workers, jury
-runs, queue transitions, and persisted verdicts.
+Autoform runs the same durable formalization workflow from Claude Code or
+Codex. The host handles interactive planning, review, and escalation through
+native subagents; a deterministic dispatcher owns proof workers, jury runs,
+queue transitions, and persisted verdicts.
 
 ## User command surface
 
-AutoformBot exposes exactly four user workflows: `setup`, `roadmap`,
-`orchestrate`, and `evaluate`. Supporting functions such as installation,
-workspace inspection, planning, visualization, review, and Zulip search are
-internal to those workflows and do not appear as separate commands.
+AutoformBot exposes exactly three user workflows: `setup`, `roadmap`, and
+`orchestrate`. Supporting functions such as installation, workspace
+inspection, planning, visualization, review, and Zulip search are internal to
+those workflows and do not appear as separate commands.
 
 ## 1. Install prerequisites
 
@@ -40,14 +40,6 @@ Setup:
 - starts the loopback-only review dashboard; and
 - prepares GitHub readiness (CI, Pages, distributed mode) with explicit
   approval for each outward-facing action.
-
-If the project already contains a Lean formalization but no roadmap, `roadmap`
-can bootstrap a draft graph from the code itself
-(`scripts/import_lean_repo.py`): every Lean module becomes a tier-1 cluster and
-every declaration a tier-2 node carrying `lean_file`, so incomplete proofs are
-immediately prove-eligible and complete ones review-eligible. The result has
-the shape of the code, not of the mathematics — run the graph/content reviewers
-over it and attach sources before treating its structure as authoritative.
 
 Then run `roadmap` with the source material and desired chapters. Roadmap
 confirms sources and scope, builds or resumes the source-grounded dependency
@@ -107,7 +99,7 @@ then continuously drains interactive-host tasks:
 | `worker` | deterministic engine + selected prover |
 | `reviewer` | deterministic engine + selected judge |
 | `planner`, `mathcheck`, graph/content/holistic review | native host subagents |
-| `escalation` (proof recovery) | interactive host |
+| `escalation` | interactive host |
 
 Prover and judge backends are independent. For example, Avocado may prove while
 Codex judges. When either side uses an API provider, orchestration checks every
@@ -135,21 +127,7 @@ they never synthesize a passing score.
 Ask Orchestrate for a text review packet or the local dashboard. Human
 verdicts are immutable and override AI verdicts.
 
-## 6. Evaluate a corpus or prover
-
-Run `evaluate` for work outside the durable roadmap queue:
-
-- `audit` performs read-only static statement checks, optional Lean
-  compilation, and an optional structured faithfulness judgment;
-- `benchmark` copies each task into a disposable Lean project, runs the unified
-  prover and kernel gate, and rejects changed theorem headers.
-
-Both model-backed modes require explicit approval. Direct OpenAI or Avocado
-use also requires explicit API-egress approval. Benchmark outputs results,
-summaries, and proof artifacts under a caller-selected directory; it never
-blanks or edits the source corpus.
-
-## 7. Publish a read-only snapshot
+## 6. Publish a read-only snapshot
 
 The local dashboard remains the only operational surface. GitHub Pages is an
 optional snapshot of committed graph structure, theorem content, proof status,

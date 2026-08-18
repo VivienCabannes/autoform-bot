@@ -10,7 +10,7 @@ Two write paths, matching what the artifact is:
 
 * **Lean proofs** (the ``prove`` unit) go through a PR, get a jury scoreboard,
   and auto-merge — code deserves review.
-* **Roadmap curation** (the Markdown articles under ``blueprint/``) is committed and
+* **Roadmap curation** (graph.json, ``informal_content/``) is committed and
   CAS-pushed straight to the default branch under a claim. It is frequent,
   conflict-rare, and humans watch it on the dashboards rather than in PRs;
   a lost CAS simply retries next round.
@@ -18,7 +18,6 @@ Two write paths, matching what the artifact is:
 from __future__ import annotations
 
 import contextlib
-import re
 from dataclasses import dataclass
 
 from . import agents, gitutil
@@ -47,19 +46,6 @@ KIND_PRIORITY = ("escalation", "planner", "mathcheck", "graphreview",
                  "contentreview", "counterexample", "priorart", "holistic")
 
 
-def _recovery_outcome(log_path) -> str | None:
-    """Read the recovery coordinator's machine-readable final marker."""
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    for line in reversed(text.splitlines()):
-        match = re.match(r"^\s*RECOVERY:\s*(RETRY|REFUTED|PARK)\b", line)
-        if match:
-            return match.group(1)
-    return None
-
-
 def _changed_paths(repo, base_ref: str = "HEAD") -> set[str]:
     tracked = gitutil.run_git(["diff", "--name-only", "-z", base_ref], cwd=repo).stdout
     untracked = gitutil.run_git(
@@ -77,17 +63,12 @@ def _agent_paths_allowed(role: AgentRole, cfg: WorkerConfig, paths: set[str]) ->
     except ValueError:
         return False
     prefix = "" if str(project_rel) == "." else f"{project_rel.as_posix()}/"
-    markdown_roadmap = (cfg.project / "blueprint" / "roadmap").is_dir()
-    content_prefix = f"{prefix}{'blueprint/' if markdown_roadmap else 'informal_content/'}"
-    legacy_graph = f"{prefix}graph.json"
-    content = all(
-        path.startswith(content_prefix) or (not markdown_roadmap and path == legacy_graph)
-        for path in paths
-    )
+    content_prefix = f"{prefix}informal_content/"
+    content = all(path.startswith(content_prefix) for path in paths)
     if role.writes == "content":
         return content
     if role.writes == "graph":
-        return content
+        return all(path == f"{prefix}graph.json" or path.startswith(content_prefix) for path in paths)
     return role.writes == "none" and not paths
 
 
@@ -98,7 +79,6 @@ class QueuedTask:
     node: str
     node_label: str
     note: str = ""
-    recovery: dict | None = None
 
 
 def queued_agent_tasks(cfg: WorkerConfig, registry: Registry) -> list[QueuedTask]:
@@ -114,7 +94,6 @@ def queued_agent_tasks(cfg: WorkerConfig, registry: Registry) -> list[QueuedTask
             task_id=str(t.get("id")), kind=str(t.get("agent")),
             node=str(t.get("node") or ""), node_label=str(t.get("node_label") or t.get("node") or ""),
             note=str(t.get("note") or ""),
-            recovery=t.get("recovery") if isinstance(t.get("recovery"), dict) else None,
         )
         for t in tasks
         if t.get("agent") in kinds and t.get("status") == "queued"
@@ -136,55 +115,38 @@ def build_prompt(role: AgentRole, task: QueuedTask, cfg: WorkerConfig, survey: S
     through verbatim — the registry never paraphrases a role.
     """
     sources = ""
-    blueprint_path = cfg.blueprint_path
+    graph_path = cfg.graph_path
     with contextlib.suppress(Exception):
-        if blueprint_path.is_dir():
-            from autoform_cli.runtime import load_runtime_model
-            _nodes, meta = load_runtime_model(
-                blueprint_path, project_root=cfg.project, lean_root=cfg.lean_root
-            )
-        else:
-            import json
-            meta = json.loads(blueprint_path.read_text(encoding="utf-8")).get("metadata", {})
+        import json
+
+        meta = json.loads(graph_path.read_text(encoding="utf-8")).get("metadata", {})
         listed = [s.get("file", "") for s in (meta.get("sources") or []) if s.get("file")]
         if listed:
             sources = "\n".join(f"  - {s}" for s in listed)
 
-    markdown_roadmap = (cfg.project / "blueprint" / "roadmap").is_dir()
     context = [
         "# Your assignment",
         "",
         f"- role: `{role.name}` (queue kind `{role.kind}`)",
         f"- target node: `{task.node}` ({task.node_label})",
         f"- dispatch project: {cfg.project}",
-        f"- authoritative blueprint: {blueprint_path}",
+        f"- graph: {graph_path}",
         f"- Lean project: {cfg.lean_root}",
-        (
-            f"- roadmap articles: {blueprint_path / 'roadmap'}"
-            if markdown_roadmap
-            else f"- legacy node prose: {cfg.project / 'informal_content'}"
-        ),
+        f"- node prose lives in: {cfg.project / 'informal_content'}/<node>.md",
     ]
     if sources:
         context += ["- sources:", sources]
     if task.note:
         context += ["", "## Task note (verbatim — often a worker's own words)", "",
                     "```", task.note[:2400], "```"]
-    context += ["", "## How to finish", ""]
-    if markdown_roadmap:
-        context += [
-            "- Edit only Markdown under `blueprint/`. Every roadmap article is a node; nested "
-            "`README.md` articles define containment and dependency headings define DAG edges.",
-            "- Run `autoform-blueprint check blueprint --lean-root .` before finishing.",
-        ]
-    else:
-        context += [
-            "- This is a legacy project. Make structural edits through "
-            f"`python {cfg.plugin_root}/scripts/merge_node.py {blueprint_path} --payload <file>`; "
-            "it is the only writer of graph.json.",
-            "- Write prose to `informal_content/<node>.md`; migrate the repository with Setup when possible.",
-        ]
     context += [
+        "",
+        "## How to finish",
+        "",
+        "- Make every graph edit through "
+        f"`python {cfg.plugin_root}/scripts/merge_node.py {graph_path} --payload <file>` — "
+        "it is the only writer of graph.json.",
+        "- Write node prose directly to `informal_content/<node>.md`.",
         "- Do NOT run `git push` and do NOT open PRs; the worker harness commits and "
         "pushes what you leave in the tree, under a lease.",
         "- Do not edit `lean-toolchain`, `lakefile.*`, CI workflows, or anything under "
@@ -235,10 +197,8 @@ def do_agent_task(
         with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
 
             counters.bump(counter_key)
-            claimed = dq.main([str(cfg.project), "claim", task.task_id, "--detail",
-                               f"{role.name} via autoform worker {cfg.worker_id}"])
-            if claimed != 0:
-                return UnitResult(False, f"{task.kind} {task.node}: queue task was claimed meanwhile")
+            dq.main([str(cfg.project), "claim", task.task_id, "--detail",
+                     f"{role.name} via autoform worker {cfg.worker_id}"])
             feed_name = f"worker-cli:{task.kind}:{task.node}"
             _feed_start(cfg, task.kind, feed_name, task.node)
             try:
@@ -251,42 +211,19 @@ def do_agent_task(
                 infra = agents.classify_infra_failure(log_path)
                 if infra and counters.refund(counter_key):
                     dq.main([str(cfg.project), "fail", task.task_id, "--reason",
-                             f"{infra} (attempt refunded)", "--report-file", str(log_path)])
+                             f"{infra} (attempt refunded)"])
                     return UnitResult(False, f"{task.kind} {task.node}: {infra}", infra_failure=infra)
                 dq.main([str(cfg.project), "fail", task.task_id, "--reason",
-                         f"agent rc={rc} (log: {log_path})", "--report-file", str(log_path)])
+                         f"agent rc={rc} (log: {log_path})"])
                 return UnitResult(False, f"{task.kind} {task.node}: agent failed rc={rc}")
 
             pushed = False
             changed = _changed_paths(work_cfg.lean_root, base_oid)
-            recovery_outcome = _recovery_outcome(log_path) if task.kind == "escalation" else None
-            recovery_fingerprint = ""
-            if task.kind == "escalation" and task.recovery:
-                recovery_fingerprint = scripts_modules()["recovery_state"].proof_fingerprint(
-                    work_cfg.blueprint_path,
-                    task.node,
-                    work_cfg.lean_root,
-                    str(task.recovery.get("backend") or ""),
-                )
-            invalid_recovery = task.kind == "escalation" and (
-                recovery_outcome is None
-                or (recovery_outcome in {"RETRY", "REFUTED"} and not changed)
-            )
             if not _agent_paths_allowed(role, work_cfg, changed):
                 paths = ", ".join(sorted(changed)[:8]) or "(none)"
                 dq.main([str(cfg.project), "fail", task.task_id, "--reason",
                          f"role write contract rejected: {paths}"])
                 return UnitResult(False, f"{task.kind} {task.node}: rejected out-of-contract paths: {paths}")
-            if invalid_recovery:
-                reason = ("recovery produced no outcome marker" if recovery_outcome is None
-                          else "recovery requested action without durable evidence")
-                args = [str(cfg.project), "park", task.task_id, "--reason", reason]
-                if log_path.is_file():
-                    args += ["--report-file", str(log_path)]
-                if recovery_fingerprint:
-                    args += ["--fingerprint", recovery_fingerprint]
-                dq.main(args)
-                return UnitResult(True, f"{task.kind} {task.node}: parked; {reason}")
             if changed:
                 if not gitutil.clean_tree(work_cfg.lean_root):
                     gitutil.run_git(["add", "-A"], cwd=work_cfg.lean_root)
@@ -303,22 +240,8 @@ def do_agent_task(
                              "CAS lost — base moved; will retry"])
                     return UnitResult(False, f"{task.kind} {task.node}: CAS lost, retry next round")
 
-            if task.kind == "escalation" and recovery_outcome in {"PARK", "REFUTED"}:
-                parked_reason = ("statement refuted; correct it before retry"
-                                 if recovery_outcome == "REFUTED"
-                                 else "recovery wave exhausted; evidence ledger preserved")
-                args = [str(cfg.project), "park", task.task_id, "--reason", parked_reason]
-                if log_path.is_file():
-                    args += ["--report-file", str(log_path)]
-                if recovery_fingerprint:
-                    args += ["--fingerprint", recovery_fingerprint]
-                dq.main(args)
-            else:
-                done_args = [str(cfg.project), "done", task.task_id, "--result",
-                             f"{role.name} completed" + (" (pushed)" if pushed else "")]
-                if log_path.is_file():
-                    done_args += ["--report-file", str(log_path)]
-                dq.main(done_args)
+            dq.main([str(cfg.project), "done", task.task_id, "--result",
+                     f"{role.name} completed" + (" (pushed)" if pushed else "")])
             counters.clear(counter_key)
             detail = "; ".join([f"{task.kind} {task.node}: {role.name} done"
                                 + (" + pushed" if pushed else " (no durable change)"), *notes])

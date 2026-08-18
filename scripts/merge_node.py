@@ -5,15 +5,13 @@ This is the one writer of graph.json. Splitters return their structural node
 records and write only their own content files; the orchestrator routes every
 structural change through here. An exclusive file lock serializes concurrent
 callers, and the file is replaced atomically, so concurrent splitters never race
-and a crash mid-write cannot corrupt the file. Mission targets are validated
-against the post-mutation graph on every merge.
+and a crash mid-write cannot corrupt the file.
 
 Payload (JSON, from --payload FILE or stdin):
 
     {
       "upsert": {"<id>": {<node record>}, ...},   # or a list of node records
-      "delete": ["<id>", ...],                     # optional
-      "metadata": {"targets": ["<id>", ...]}      # optional
+      "delete": ["<id>", ...]                      # optional
     }
 
 A node record is a structural node object as described in
@@ -168,9 +166,6 @@ def merge(graph_path: str, payload: dict) -> dict:
     # reachability clause read them), so they go through the single writer like
     # every other structural change. Each entry must resolve to a node that
     # exists after this payload's upserts/deletes.
-    metadata = graph.setdefault("metadata", {})
-    if not isinstance(metadata, dict):
-        raise ValueError("graph.json metadata must be an object")
     meta_patch = payload.get("metadata")
     targets_set = None
     if meta_patch is not None:
@@ -179,24 +174,19 @@ def merge(graph_path: str, payload: dict) -> dict:
         raw_targets = meta_patch.get("targets")
         if not isinstance(raw_targets, list):
             raise ValueError("'metadata.targets' must be a list")
-        metadata["targets"] = raw_targets
-        targets_set = len(raw_targets)
+        normalized: list = []
+        for entry in raw_targets:
+            node_id = entry if isinstance(entry, str) else (
+                entry.get("node") if isinstance(entry, dict) else None)
+            if not isinstance(node_id, str) or not node_id:
+                raise ValueError(f"invalid targets entry {entry!r}")
+            if node_id not in nodes:
+                raise ValueError(f"targets entry {node_id!r} does not resolve to a node")
+            normalized.append(entry)
+        graph.setdefault("metadata", {})["targets"] = normalized
+        targets_set = len(normalized)
 
-    # Validate both newly supplied and existing targets against the post-mutation
-    # graph. Deleting a mission target therefore requires a replacement target in
-    # the same locked payload instead of leaving durable state dangling.
-    raw_targets = metadata.get("targets", [])
-    if not isinstance(raw_targets, list):
-        raise ValueError("'metadata.targets' must be a list")
-    for entry in raw_targets:
-        node_id = entry if isinstance(entry, str) else (
-            entry.get("node") if isinstance(entry, dict) else None)
-        if not isinstance(node_id, str) or not node_id:
-            raise ValueError(f"invalid targets entry {entry!r}")
-        if node_id not in nodes:
-            raise ValueError(f"targets entry {node_id!r} does not resolve to a node")
-
-    metadata["last_updated"] = _now()
+    graph.setdefault("metadata", {})["last_updated"] = _now()
 
     _atomic_write(graph_path, graph)
     result = {
@@ -228,7 +218,7 @@ def main(argv=None) -> int:
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         print(f"merge rejected: {error}", file=sys.stderr)
         return 2
-    if not payload.get("upsert") and not payload.get("delete") and "metadata" not in payload:
+    if not payload.get("upsert") and not payload.get("delete"):
         print("nothing to merge (empty payload)", file=sys.stderr)
         return 0
 

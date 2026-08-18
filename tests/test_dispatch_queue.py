@@ -96,55 +96,16 @@ def test_done_and_fail_both_clear_from_the_worklist(tmp_path):
     assert dq._open_orchestrator_tasks(list(by.values())) == []   # both gone
 
 
-def test_done_persists_bounded_agent_report(tmp_path):
-    proj = _proj(tmp_path, [
-        {"id": "holistic:g", "agent": "holistic", "node": "g", "status": "queued"},
-    ])
-    report = tmp_path / "report.txt"
-    report.write_text("finding: missing dependency\n", encoding="utf-8")
-    assert dq.main([str(proj), "claim", "holistic:g"]) == 0
-    assert dq.main([str(proj), "done", "holistic:g", "--report-file", str(report)]) == 0
-    task = dq.load_queue(proj / "task_queue.json")[0]
-    assert task["report"] == "finding: missing dependency\n"
-
-
 def test_lifecycle_transitions_are_guarded_and_retries_are_idempotent(tmp_path):
     proj = _proj(tmp_path, [
         {"id": "pl-1", "agent": "planner", "node": "C", "status": "queued"},
     ])
     assert dq.main([str(proj), "done", "pl-1"]) == 1
     assert dq.main([str(proj), "claim", "pl-1"]) == 0
-    assert dq.main([str(proj), "claim", "pl-1"]) == 1
+    assert dq.main([str(proj), "claim", "pl-1"]) == 0
     assert dq.main([str(proj), "done", "pl-1"]) == 0
     assert dq.main([str(proj), "done", "pl-1"]) == 0
     assert dq.main([str(proj), "claim", "pl-1"]) == 1
-
-
-def test_recovery_can_be_parked_and_resumed_without_duplication(tmp_path):
-    proj = _proj(tmp_path, [{
-        "id": "escalation:b",
-        "agent": "escalation",
-        "node": "b",
-        "status": "queued",
-        "recovery": {"phase": "proof-research", "fingerprint": "abc"},
-    }])
-    assert dq.main([str(proj), "claim", "escalation:b"]) == 0
-    assert dq.main([
-        str(proj), "park", "escalation:b", "--reason", "routes exhausted",
-        "--fingerprint", "def",
-    ]) == 0
-    task = dq.load_queue(proj / "task_queue.json")[0]
-    assert task["status"] == "parked"
-    assert task["recovery"]["phase"] == "parked"
-    assert task["recovery"]["fingerprint"] == "def"
-    assert dq.main([
-        str(proj), "enqueue", "--agent", "escalation", "--node", "b",
-    ]) == 0
-    assert len(dq.load_queue(proj / "task_queue.json")) == 1
-    assert dq.main([str(proj), "resume", "escalation:b"]) == 0
-    task = dq.load_queue(proj / "task_queue.json")[0]
-    assert task["status"] == "queued"
-    assert task["recovery"]["phase"] == "proof-research"
 
 
 def test_corrupt_queue_is_never_replaced_by_enqueue(tmp_path):

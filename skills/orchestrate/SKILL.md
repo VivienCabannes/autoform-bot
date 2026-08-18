@@ -3,7 +3,7 @@ name: orchestrate
 description: >-
   Run or resume Autoform's durable formalization workflow: launch the
   deterministic jury/prover engine, drive native planning and review subagents,
-  coordinate proof recovery, and advance the dependency graph to a clean trust
+  triage escalations, and advance the dependency graph to a clean trust
   frontier. Use when the user asks to orchestrate, run, resume, automate, prove,
   review, score, choose or inspect a prover backend, search Lean Zulip for prior
   art, inspect progress, or finish an Autoform plan.
@@ -15,7 +15,7 @@ Operate one durable queue with two cooperating actors:
 
 - `scripts/dispatch_runner.py` deterministically drains `reviewer` and `worker`
   tasks.
-- The current interactive host drains planning, review, and proof-recovery tasks with
+- The current interactive host drains planning/review/escalation tasks with
   native subagents.
 
 Do not review or prove a queued Lean node in the parent session. Do not shell out
@@ -65,10 +65,10 @@ backend as Claude; let validation fail closed.
 
 Resolve:
 
-- dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then
-  the nearest repository containing `blueprint/roadmap/`;
-- Lean project: that repository, unless `AUTOFORM_LEAN_ROOT` explicitly points
-  at a separate checkout;
+- dispatch project: explicit argument, then `AUTOFORM_DISPATCH_PROJECT`, then a
+  running dashboard's graph parent;
+- Lean project: `graph.json` metadata `lean_root`, otherwise the dispatch
+  project's repository parent;
 - proof backend: explicit choice for this run, otherwise run `backend_config.py get
   --fallback codex` on Codex, `--fallback max` on Claude, or `--fallback muse`
   on Muse. A persisted choice wins over the host fallback;
@@ -81,15 +81,6 @@ if it is not installed/authenticated, stop and ask the user to select another
 available backend or install Claude. The `muse` prover or judge requires the
 `tbh` CLI and its configured provider authentication. Never silently override a
 resolved choice.
-
-Validate the Markdown hierarchy and dependency DAG before starting the engine:
-
-```bash
-uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform-blueprint check \
-  "$DISPATCH_PROJECT/blueprint" --lean-root "$LEAN_PROJECT"
-```
-
-Fix validation failures in their Markdown articles before dispatching work.
 
 For every distinct API provider (`openai` or `avocado`) used by either prover or
 judge, run the local configuration check before launching:
@@ -182,7 +173,7 @@ the roadmap site will show — rather than asking the user to merge.
 |---|---|---|
 | `reviewer` | engine | Parallel rubric jury; writes only the AI review slot. |
 | `worker` | engine | Proves through the selected adapter and shared kernel gate. |
-| `escalation` | interactive host | Run ordered proof recovery after a failed attempt. |
+| `escalation` | interactive host | Triage a worker's concrete blocker. |
 | `mathcheck` | interactive host | Spawn native `mathlib-checker`. |
 | `graphreview` | interactive host | Spawn native `graph-reviewer`. |
 | `contentreview` | interactive host | Spawn native `content-reviewer`. |
@@ -198,13 +189,13 @@ task.
 
 Use the host's native parallel subagent interface and these canonical roles:
 
+- `autoform_reader`
 - `autoform_splitter`
 - `autoform_mathlib_checker`
 - `autoform_graph_reviewer`
 - `autoform_content_reviewer`
 - `autoform_holistic_reviewer`
 - `autoform_source_searcher`
-- `autoform_proof_strategy_researcher`
 
 Claude may display canonical hyphenated plugin role names. Codex project TOMLs
 use the namespaced underscore names above. If Codex role files are missing, run:
@@ -230,97 +221,57 @@ Loogle, LeanExplore, and `scripts/mathlib_search.py` for stateless Mathlib searc
 
 ## Planner pipeline
 
-For a container article whose leaves have not been decomposed:
+For a tier-1 cluster:
 
 1. Claim the planner task.
 2. Spawn the canonical `splitter` role with the cluster, sources, existing prerequisite node index,
    and output paths.
-3. Write or update the cluster's `kind: article` Markdown pages and typed dependency links.
-4. Spawn one canonical `mathlib-checker` per new node in parallel; record only
-   checked `mathlib`, `lean`, and source facts in the corresponding pages.
+3. Upsert returned node records through `scripts/merge_node.py`.
+4. Spawn one canonical `mathlib-checker` per new tier-2 node in parallel; merge its
+   structured result through `merge_node.py`.
 5. Spawn canonical `graph-reviewer` and `content-reviewer` roles in parallel over the cluster.
-   Structural and prose edits both land in the Markdown pages; keep each role
-   inside its assigned files.
+   Route structural edits through `merge_node.py`; the content role owns only its
+   prose files.
 6. Enqueue jury review for the new nodes.
-7. Validate the Markdown hierarchy and DAG. Mark the planner task
-   done only after all earlier steps have durable output.
-
-## Proof recovery pipeline
-
-The queue keeps the historical kind name `escalation` for compatibility, but
-it means proof recovery. Claim the task and run these waves in order:
-
-1. Spawn at least two independent `proof-strategy-researcher` agents, plus
-   prior-art and source search. Require a complete informal route tied to exact
-   Mathlib declarations or named intermediate claims.
-2. If no viable proof route survives comparison, spawn at least two independent
-   counterexample hunters. A verified disproof stops proof attempts until the
-   statement is corrected; park the recovery in the meantime.
-3. If neither proof nor disproof succeeds, spawn independent decomposition
-   agents. Accept sublemmas only with an explicit reconstruction of the target,
-   then add them as roadmap node pages with explicit dependency links and
-   schedule them foundations-first.
-4. If the decomposition is not viable, broaden exploration with distinct
-   mathematical methods and sources. Record checked routes so later recovery
-   work does not repeat them.
-
-Child research agents return findings without editing project files. The recovery
-coordinator records the selected mathematical route, counterexample, or
-reconstruction in the target's Markdown proof notes; raw operational search
-logs remain local. Revalidate the Markdown graph after structural edits.
-Mark the recovery `done` and
-enqueue a worker only after a durable input or strategy change. If a complete
-wave finds no defensible next route, use
-`dispatch_queue.py <project> park <task-id> --reason <evidence>`.
-A parked recovery stays visible and can be resumed with `resume <task-id>` when
-new evidence appears. It is not a request for human proof work.
-
-## Pipeline position
-
-Publish ``--stage prove`` (via ``dispatch_queue.py <project> orchestrator``)
-while the engine/worker rounds run, and ``--stage publish`` during progress
-folds and site publication, so the dashboard stepper tracks the run. Keep
-``--phase``/``--detail`` in plain language.
+7. Mark the planner task done only after all earlier steps have durable output.
 
 ## Autonomy loop
 
 Unless manual/drop-only mode was requested:
 
-1. Read graph, reviews, queue, and open proof recoveries.
-2. Drain interactive-host work first, proof recoveries first.
+1. Read graph, reviews, queue, and open escalations.
+2. Drain interactive-host work first, escalations first.
 3. Traverse foundations-first (with declared targets, critical path first):
-   - roadmap gaps → run `scripts/roadmap_audit.py "$DISPATCH_PROJECT/blueprint"
+   - roadmap gaps → run `scripts/roadmap_audit.py "$DISPATCH_PROJECT/graph.json"
      --enqueue` once per pass; it turns every completeness failure (status,
      grounding, unverified in-Mathlib claims, missing prose, target
      reachability) into a queued role task the loop drains;
    - unreviewed node → enqueue `reviewer`;
-   - defective or unproved node with clean prerequisites and no open recovery
+   - defective or unproved node with clean prerequisites and no open escalation
      → enqueue `worker`;
-   - undecomposed container article → planner pipeline;
+   - unsplit tier-1 cluster → planner pipeline;
    - stale or guessed Mathlib status → `mathcheck`.
 4. Enqueue a bounded wave. Queue operations deduplicate; never double-run engine
    tasks as subagents.
 5. Poll the queue and log. As soon as `mine` is non-empty, stop waiting and
    handle it.
 6. Continue until the trust frontier is clean, the explicit task limit is hit,
-   or every remaining theorem has a parked recovery with a durable evidence
-   ledger.
+   or a blocker genuinely requires the user.
 
-Proof recovery may add a real missing prerequisite to the Markdown DAG,
-start a cluster-level planner pass, or establish a false statement or toolchain
-failure. Do not grow the DAG repeatedly to disguise an unresolved proof. The
-engine has no arbitrary attempt cap; its fingerprint gate blocks unchanged
-retries.
+An escalation may add a real missing prerequisite through `merge_node.py`, start
+a cluster-level planner pass, or surface a false statement/toolchain failure.
+Do not grow the DAG repeatedly to disguise an unresolved proof. Respect the
+engine's escalation cap.
 
 ## Completion
 
 Before reporting completion:
 
 - `dispatch_queue.py <project> mine` is empty;
-- every claimed task is terminal or explicitly parked;
+- every claimed task is terminal;
 - no proof was accepted without the shared verification gate;
 - the activity feed mirrors actual state;
-- the remaining parked frontier and provider-specific failures are explicit.
+- remaining blocked frontier and provider-specific failures are explicit.
 
 When the user asks for a node packet, review UI, or a fresh score without a
 full autonomous run, follow `internal/runbooks/review.md` directly and perform

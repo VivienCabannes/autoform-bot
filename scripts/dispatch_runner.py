@@ -18,7 +18,7 @@ Usage::
       [--repo <lean-repo>] [--jobs 9] [--judge-backend claude|codex|muse|openai|avocado]
       [--model <provider-model>] [--limit N] [--dry-run]
 
-``<project-dir>`` holds ``blueprint/`` plus local queue and review sidecars.
+``<project-dir>`` holds graph.json + task_queue.json + review_status.json.
 """
 from __future__ import annotations
 
@@ -45,8 +45,6 @@ import review_model as rm  # noqa: E402  # load_sidecar / save_sidecar / jury_ve
 import dispatch_queue as dq  # noqa: E402  # _save / _feed_for / _now
 import backend_config  # noqa: E402  # user-facing backend selection
 import judge_runtime  # noqa: E402  # structured jury across CLI/API providers
-import recovery_state  # noqa: E402  # evidence gate for proof retries
-import spend_governor  # noqa: E402  # atomic pacing immediately before paid work
 try:
     from servers.prover.driver import prove as _prove
     from servers.prover.claude_adapter import ClaudeAdapter as _ClaudeAdapter
@@ -273,29 +271,28 @@ def _escalation_note(reason: str, detail: str, cap: int = _ESC_NOTE_CAP) -> str:
 
 
 def _raise_escalation(queue: list, node_id: str, label: str, note: str,
-                      recovery: dict | None = None) -> bool:
-    """Append a proof-recovery task for the orchestrator.
+                      max_escalations: int = 3) -> bool:
+    """Append an ``escalation`` task for the orchestrator to triage, with two
+    engine-side circuit breakers so safety never rests on LLM prose alone:
+      * **dedup** — at most one *open* (queued/running) escalation per node;
+      * **cap** — at most ``max_escalations`` escalations per node *ever* (``done``
+        ones count too). Past the cap the engine stops raising: a node still failing
+        after N grow-the-DAG rounds is a human's call, not an infinite Max-billed
+        retry loop. Returns True iff a new task was added.
 
-    At most one queued, running, or parked recovery may exist per node. There is
-    deliberately no attempt cap: retries are controlled by durable evidence,
-    not by declaring a theorem exhausted after an arbitrary number of calls.
-    Returns True iff a new task was added.
-
-    The engine never mutates the Markdown roadmap from a prover result — whether a wall is a
+    The engine NEVER mutates ``graph.json`` from a worker result — whether a wall is a
     real new prerequisite, a duplicate, a cluster-level gap, or a non-DAG failure
     (toolchain / false statement / honest give-up) is a judgment call. It only raises
     the flag + the worker's own words (``note``); ``/autoform:orchestrate`` decides."""
-    escs = _node_escalations(queue, node_id)
-    if any(e.get("status") in ("queued", "running", "parked") for e in escs):
-        return False
-    entry = {
+    escs = [x for x in queue if x.get("agent") == "escalation" and x.get("node") == node_id]
+    if any(e.get("status") in ("queued", "running") for e in escs):
+        return False                      # an open escalation is already pending
+    if len(escs) >= max_escalations:
+        return False                      # cap hit — stop the retry/escalate cycle
+    queue.append({
         "id": dq.new_task_id("escalation", node_id, queue),
         "agent": "escalation", "node": node_id, "node_label": (label or node_id),
-        "status": "queued", "at": dq._now(), "source": "engine", "note": note,
-    }
-    if recovery:
-        entry["recovery"] = recovery
-    queue.append(entry)
+        "status": "queued", "at": dq._now(), "source": "engine", "note": note})
     return True
 
 
@@ -335,8 +332,8 @@ def sweep_stale_running(queue_path: Path, feed_path: Path) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Deterministic parallel review dispatcher.")
-    ap.add_argument("project", type=Path, help="repository holding blueprint/ + task_queue.json")
-    ap.add_argument("--repo", type=Path, default=None, help="Lean repo and judge cwd (default: project)")
+    ap.add_argument("project", type=Path, help="dir holding graph.json + task_queue.json")
+    ap.add_argument("--repo", type=Path, default=None, help="Lean repo = judge cwd (default: graph metadata.lean_root, else <project>/../..)")
     ap.add_argument("--jobs", type=int, default=max(3, 3 * len(AXES)), help=f"max concurrent judges (default = 3 nodes x {len(AXES)} axes)")
     ap.add_argument("--judge-backend", choices=judge_runtime.SUPPORTED_JUDGES,
                     default=os.environ.get("AUTOFORM_JUDGE_BACKEND", "claude"),
@@ -370,6 +367,7 @@ def main(argv=None) -> int:
             "repeat when prover and judge use different providers"
         ),
     )
+    ap.add_argument("--max-escalations", type=int, default=3, help="worker: engine-side bound — stop re-proving/re-escalating a node after this many escalations (default 3), so a hard node can't loop forever")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     if a.timeout <= 0:
@@ -380,6 +378,8 @@ def main(argv=None) -> int:
         ap.error("--poll must be greater than zero")
     if a.max_steers < 0:
         ap.error("--max-steers cannot be negative")
+    if a.max_escalations < 0:
+        ap.error("--max-escalations cannot be negative")
     if a.backend is None:
         try:
             a.backend = backend_config.get_backend()
@@ -427,14 +427,12 @@ def _run_dispatch(a) -> int:
     _ACTIVE_JUDGE_BACKEND = a.judge_backend
 
     proj = a.project
-    source = proj / "blueprint"
-    if not (source / "roadmap").is_dir():
-        source = proj / "graph.json"  # legacy project migration support
-    nodes, metadata = rm.load_graph(source)
+    graph = json.loads((proj / "graph.json").read_text())
+    nodes = graph.get("nodes", {})
     sidecar_path = proj / "review_status.json"
     queue_path = proj / "task_queue.json"
     feed_path = proj / "agents_status.json"
-    repo = str(a.repo or proj)
+    repo = str(a.repo or graph.get("metadata", {}).get("lean_root") or proj.parent.parent)
 
     try:
         dq.load_queue(queue_path)
@@ -599,7 +597,7 @@ def _run_dispatch(a) -> int:
 
     def _drain_one_worker(t: dict) -> int:
         """Claim + prove one queued worker task; returns 1 when it was handled
-        (proved, failed, or parked), 0 when skipped for active recovery."""
+        (proved / failed / blocked), 0 when skipped (open escalation)."""
         with fslock.locked(queue_path):     # re-read (new drops/escalations) + claim
             c = dq.load_queue(queue_path)
             current = next((x for x in c if x.get("id") == t.get("id")), None)
@@ -608,59 +606,29 @@ def _run_dispatch(a) -> int:
             escs = _node_escalations(c, t["node"])
             # Engine-side enforcement of the doc's guard — don't rely on LLM prose:
             if any(e.get("status") in ("queued", "running") for e in escs):
-                return 0                  # recovery owns this node until it finds a route
-            # A parked recovery blocks the node only while its inputs are
-            # unchanged; once they move, the evidence gate below re-admits it.
-            if any(e.get("status") == "parked" for e in escs) and not recovery_state.resumable_park(
-                    c, t["node"], source, Path(repo),
-                    backend_config.prover_of(a.backend)):
-                return 0
-            adapter = backend_config.prover_of(a.backend)
-            if recovery_state.unchanged_recovery(
-                    c, t["node"], source, Path(repo), adapter):
+                return 0                  # an open escalation on this node — leave it queued, skip
+            if len(escs) >= a.max_escalations:        # cap hit — stop re-proving a hard node
                 for x in c:
                     if x["id"] == t["id"]:
                         x["status"], x["finished_at"] = "failed", dq._now()
-                        x["result"] = "retry rejected: proof recovery produced no new prover input"
-                latest = recovery_state.latest_recovery(c, t["node"])
-                if latest is not None:
-                    latest["status"] = "parked"
-                    latest["finished_at"] = dq._now()
-                    latest["result"] = "parked: no new prover input"
-                    latest["recovery"]["phase"] = "parked"
+                        x["result"] = f"blocked: {len(escs)} escalations exhausted — needs human"
                 dq._save(queue_path, c)
                 dq.sync_feed(feed_path, c)
-                print(f"  worker {t['node']:24} → PARKED (no new recovery evidence)", flush=True)
+                print(f"  ⛔ worker {t['node']:24} → BLOCKED ({len(escs)} escalations, capped)", flush=True)
                 return 1
-            # A changed-input retry consumes the old park. Leaving it active would
-            # suppress the next recovery task if this retry also fails.
-            for esc in escs:
-                if esc.get("status") == "parked":
-                    esc["status"] = "done"
-                    esc["finished_at"] = dq._now()
-                    esc["result"] = "resumed after prover inputs changed"
-                    if isinstance(esc.get("recovery"), dict):
-                        esc["recovery"]["phase"] = "resumed"
-            reservation = spend_governor.reserve(Path(repo), adapter)
-            if not reservation["allowed"]:
-                print(f"  worker {t['node']:24} → PACED ({reservation['reason']})", flush=True)
-                return 0
             for x in c:                                                 # claim
                 if x["id"] == t["id"]:
                     x["status"], x["started_at"] = "running", dq._now()
             dq._save(queue_path, c)
             dq.sync_feed(feed_path, c)
         print(f"  ⛏ worker → {t['node']} (proving…)", flush=True)
-        try:
-            status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
-                                                str(source), repo, a.max_steers,
-                                                backend=adapter,
-                                                judge_backend=a.judge_backend,
-                                                judge_model=a.model,
-                                                judge_timeout=min(a.timeout, 180),
-                                                worker_timeout=a.timeout)
-        finally:
-            spend_governor.release(Path(repo), reservation.get("reservation_id"))
+        status, reason, detail = run_worker(t["node"], nodes.get(t["node"], {}), proj,
+                                            str(proj / "graph.json"), repo, a.max_steers,
+                                            backend=backend_config.prover_of(a.backend),
+                                            judge_backend=a.judge_backend,
+                                            judge_model=a.model,
+                                            judge_timeout=min(a.timeout, 180),
+                                            worker_timeout=a.timeout)
         with fslock.locked(queue_path):     # finish (re-read for new drops)
             c = dq.load_queue(queue_path)
             for x in c:
@@ -668,24 +636,14 @@ def _run_dispatch(a) -> int:
                     x["status"] = "done" if status == "proved" else "failed"
                     x["finished_at"], x["result"] = dq._now(), f"{status}: {reason[:160]}"
             escalated = False
-            if status != "proved":      # open ordered proof recovery; do not blindly retry
+            if status != "proved":      # hand the worker's wall to the orchestrator — it decides, not us
                 lbl = (nodes.get(t["node"], {}).get("description") or t["node"])[:60]
-                fingerprint = recovery_state.proof_fingerprint(
-                    source, t["node"], Path(repo), adapter
-                )
-                recovery = {
-                    "version": 1,
-                    "phase": "proof-research",
-                    "round": len(_node_escalations(c, t["node"])) + 1,
-                    "fingerprint": fingerprint,
-                    "backend": adapter,
-                }
                 escalated = _raise_escalation(c, t["node"], lbl,
-                                              _escalation_note(reason, detail), recovery)
+                                              _escalation_note(reason, detail), a.max_escalations)
             dq._save(queue_path, c)
             dq.sync_feed(feed_path, c)
         print(f"  {'✓' if status == 'proved' else '✗'} worker {t['node']:24} → {status.upper()}"
-              + ("  proof recovery raised" if escalated else ""), flush=True)
+              + ("  ⚑ escalation raised" if escalated else ""), flush=True)
         return 1
 
     if a.watch:

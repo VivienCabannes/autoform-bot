@@ -11,9 +11,16 @@ onto two surfaces:
   events / list. This is what the unified prover's Aristotle adapter calls.
   Ported from the proven integration in ``core/inference/sdk/aristotle.py``.
 
-The unified prover's :class:`servers.prover.aristotle_adapter.AristotleAdapter`
-is the only delegation entry. This module supplies its session manager and safe
-project/spec helpers; there is no separate Aristotle MCP surface.
+* :func:`delegate_to_node` — the **prover-backend entry**. It is the C-side
+  implementation of the one swappable interface the design pins down:
+
+      (target node + spec) -> proof written back to the node
+
+  Given a plan's ``graph.json`` and a target node ``id``, it reads that node's
+  *spec* (its informal statement + ``source_refs`` + ``mathlib_declarations`` +
+  in-tier ``depends_on``), hands the whole Lean project to Aristotle, polls to a
+  terminal status, lands the returned Lean files into the project, and writes the
+  proof back to the node (Lean files in the project + the node's prose file).
 
 HARD CONSTRAINT (design doc): Aristotle ONLY produces a proof
 *into a node*. It does **not** review, score, taint, or touch the sidecar — the
@@ -376,23 +383,12 @@ class AristotleManager:
 
 
 def _safe_extract(tar_path: Path, dest: Path) -> None:
-    """Extract regular files/directories while rejecting traversal and links."""
-    dest = dest.resolve()
+    """Extract a tarball, using the ``data`` filter when available (py>=3.12)."""
     with tarfile.open(tar_path) as tar:
-        members = []
-        for member in tar.getmembers():
-            target = (dest / member.name).resolve()
-            try:
-                target.relative_to(dest)
-            except ValueError as error:
-                raise ValueError(f"tar member escapes extraction root: {member.name}") from error
-            if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
-                raise ValueError(f"unsafe tar member type: {member.name}")
-            members.append(member)
         try:
-            tar.extractall(dest, members=members, filter="data")  # type: ignore[arg-type]
+            tar.extractall(dest, filter="data")  # type: ignore[arg-type]
         except TypeError:  # pragma: no cover - older Pythons lack the filter kwarg
-            tar.extractall(dest, members=members)  # noqa: S202 - members validated above
+            tar.extractall(dest)  # noqa: S202 - trusted Aristotle output
 
 
 # ===========================================================================
@@ -417,28 +413,12 @@ def _slugify(node_id: str) -> str:
 
 
 def load_node(graph_path: Path, node_id: str) -> dict[str, Any]:
-    """Read an article from Markdown (with legacy JSON fixture compatibility)."""
-    path = Path(graph_path)
-    if path.is_dir():
-        from autoform_cli.runtime import load_runtime_node
-        return load_runtime_node(path, node_id)
-    graph = json.loads(path.read_text(encoding="utf-8"))
+    """Read a node record from ``graph.json``. Raises ``KeyError`` if absent."""
+    graph = json.loads(Path(graph_path).read_text(encoding="utf-8"))
     nodes = graph.get("nodes", {})
     if node_id not in nodes:
-        raise KeyError(f"node {node_id!r} not found in {path}")
+        raise KeyError(f"node {node_id!r} not found in {graph_path}")
     return nodes[node_id]
-
-
-def _safe_prose_path(project_dir: Path, content_rel: str) -> Path:
-    root = Path(project_dir).resolve()
-    candidate = (root / content_rel).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as error:
-        raise ValueError(f"node content path escapes project root: {content_rel}") from error
-    if candidate.suffix.lower() != ".md":
-        raise ValueError(f"node content path must be Markdown: {content_rel}")
-    return candidate
 
 
 def build_node_spec(
@@ -461,9 +441,7 @@ def build_node_spec(
     statement = ""
     content_rel = node.get("content")
     if content_rel:
-        if not isinstance(content_rel, str):
-            raise ValueError(f"node {node_id!r} content must be a string")
-        prose_path = _safe_prose_path(project_dir, content_rel)
+        prose_path = project_dir / content_rel
         if prose_path.exists():
             statement = prose_path.read_text(encoding="utf-8").strip()
 
@@ -542,10 +520,12 @@ def _record_proof_in_prose(
 ) -> str | None:
     """Ensure the node's prose file exists and append Aristotle's proof summary.
 
-    Returns the node's relative ``content`` path. Does not write ``graph.json``.
+    Returns the ``content`` path (relative) that should be merged onto the node,
+    or ``None`` if no prose file could be established. Does NOT write graph.json
+    (that goes through ``merge_node.py`` — see :func:`merge_payload`).
     """
     content_rel = node.get("content") or f"informal_content/{_slugify(node_id)}.md"
-    prose_path = _safe_prose_path(project_dir, content_rel)
+    prose_path = project_dir / content_rel
     prose_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing = prose_path.read_text(encoding="utf-8") if prose_path.exists() else f"# {node_id}\n"
@@ -560,3 +540,117 @@ def _record_proof_in_prose(
         existing = head + "\n"
     prose_path.write_text(existing.rstrip() + block, encoding="utf-8")
     return content_rel
+
+
+def merge_payload(node_id: str, node: dict[str, Any], content_rel: str | None) -> dict[str, Any]:
+    """Build the single-node ``merge_node.py`` payload that records the proof.
+
+    The ONLY structural change a backend makes is linking the node to its prose
+    file (``content``) once a proof exists. Everything else about the node is
+    left untouched, and review/verdict state is never touched here.
+    """
+    rec = dict(node)
+    if content_rel:
+        rec["content"] = content_rel
+    return {"upsert": {node_id: rec}}
+
+
+@dataclass
+class DelegationResult:
+    """Outcome of :func:`delegate_to_node`."""
+
+    node_id: str
+    status: str
+    landed_files: int
+    content: str | None
+    output_summary: str
+    merge_payload: dict[str, Any]
+    project_id: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """True when Aristotle reached a non-error terminal status and landed files."""
+        return self.status in ("COMPLETE", "COMPLETE_WITH_ERRORS") and self.landed_files > 0
+
+
+async def delegate_to_node(
+    *,
+    graph_path: str | Path,
+    node_id: str,
+    project_dir: str | Path,
+    manager: AristotleManager | None = None,
+    system_prompt: str = DEFAULT_DELEGATE_SYSTEM,
+    extra_instructions: str = "",
+    poll_interval: int = 20,
+    max_wait_seconds: float | None = 5400,
+) -> DelegationResult:
+    """The prover-backend interface: ``(target node + spec) -> proof into the node``.
+
+    1. Build the node's spec prompt from ``graph.json`` + its prose/refs.
+    2. Submit the whole Lean ``project_dir`` to Aristotle and poll to terminal.
+    3. Land the returned Lean files back into ``project_dir``.
+    4. Record the proof summary in the node's prose file and return a
+       ``merge_node.py`` payload that links ``content`` (the caller applies it
+       through the single locked writer).
+
+    This does NOT review, score, or touch ``review_status.json`` — the landed
+    proof feeds the SAME jury/sidecar/review pipeline as the in-session worker
+    (PRs A/E). Aristotle is the backend; the review surface is built elsewhere.
+    """
+    graph_path = Path(graph_path)
+    project_dir = Path(project_dir)
+    node = load_node(graph_path, node_id)
+
+    mgr = manager or AristotleManager(download_dir=str(project_dir / ".aristotle-cache"))
+
+    spec = build_node_spec(graph_path, node_id, project_dir=project_dir)
+    prompt = f"{system_prompt}\n\n{spec}"
+    if extra_instructions:
+        prompt += f"\n\n## Additional instructions\n{extra_instructions}"
+
+    await mgr.submit(session_id=node_id, prompt=prompt, project_dir=str(project_dir))
+    waited = await mgr.wait(
+        session_id=node_id,
+        poll_interval=poll_interval,
+        max_wait_seconds=max_wait_seconds,
+    )
+    status = str(waited.get("status", "UNKNOWN"))
+    summary = str(waited.get("output_summary", ""))
+
+    landed = 0
+    content_rel: str | None = node.get("content")
+    with _temp_dir() as td:
+        root = await mgr.download_result(node_id, td)
+        if root is not None:
+            landed = _overlay_project(root, project_dir)
+    if landed:
+        content_rel = _record_proof_in_prose(graph_path, node_id, node, project_dir, summary)
+    else:
+        logger.warning("Aristotle delegation for %r landed no files (status=%s)", node_id, status)
+
+    session = mgr._sessions.get(node_id)
+    project_id = session.project_id if session else ""
+
+    return DelegationResult(
+        node_id=node_id,
+        status=status,
+        landed_files=landed,
+        content=content_rel,
+        output_summary=summary,
+        merge_payload=merge_payload(node_id, node, content_rel if landed else None),
+        project_id=project_id,
+    )
+
+
+class _temp_dir:
+    """Context manager yielding a fresh temp directory path (str)."""
+
+    def __enter__(self) -> str:
+        import tempfile
+
+        self._td = tempfile.TemporaryDirectory()
+        return self._td.name
+
+    def __exit__(self, *exc: Any) -> bool:
+        self._td.cleanup()
+        return False

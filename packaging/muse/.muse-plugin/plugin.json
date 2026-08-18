@@ -27,6 +27,18 @@
         "enabledDefault": true
       }
     ],
+    "hooks": [
+      {
+        "id": "session-start",
+        "event": "SessionStart",
+        "command": [
+          "bash",
+          "hooks/session-start"
+        ],
+        "timeoutMs": 10000,
+        "statusMessage": "Loading Autoform context"
+      }
+    ],
     "mcpServers": [
       {
         "id": "lean-lsp-mcp",

@@ -124,17 +124,16 @@ def _grep_with_rg(
     literal: bool,
 ) -> str:
     """Search using the ripgrep binary (fast path)."""
-    cmd = [rg, "--line-number"]
+    cmd = [rg, "--line-number", "-m", str(max_results)]
 
     if context_lines > 0:
         cmd.extend(["-C", str(context_lines)])
-    if literal and not kind:
+    if literal:
         cmd.append("-F")
     if kind:
-        searched = re.escape(pattern) if literal else pattern
-        cmd.extend(["--regexp", f"^{re.escape(kind)}\\s+.*{searched}"])
+        cmd.extend(["--regexp", f"^{kind}\\s+.*{pattern}"])
     else:
-        cmd.extend(["--regexp", pattern])
+        cmd.append(pattern)
 
     cmd.extend(["-g", "*.lean", str(search_path)])
 
@@ -143,16 +142,9 @@ def _grep_with_rg(
         output = result.stdout
         if not output:
             return "No matches found"
-        selected: list[str] = []
-        count = 0
-        match_line = re.compile(r"^.*:\d+:")
-        for line in output.rstrip().split("\n"):
-            if match_line.match(line):
-                if count >= max_results:
-                    break
-                count += 1
-            selected.append(line)
-        return f"Found {count} matches:\n\n" + "\n".join(selected) + "\n"
+        lines = output.strip().split("\n")
+        count = len([line for line in lines if line and not line.startswith("--")])
+        return f"Found {count} matches:\n\n{output}"
     except subprocess.TimeoutExpired:
         return "Error: Search timed out"
 

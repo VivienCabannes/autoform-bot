@@ -418,7 +418,8 @@ class ClaudeAdapter(ProverAdapter):
                 # VERIFY-LIVE: this SUMS across resumed turns on the reasoning
                 # that each `claude -p` invocation reports its own turn. If any
                 # CLI version reports session-cumulative usage/cost on
-                # --resume, this overstates; confirm with two live turns.
+                # --resume, this overstates — confirm with two live turns
+                # (docs/avocado-handoff.md documents the 2-minute probe).
                 usage = obj.get("usage") or {}
                 state.input_tokens += int(usage.get("input_tokens") or 0)
                 state.output_tokens += int(usage.get("output_tokens") or 0)

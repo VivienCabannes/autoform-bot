@@ -165,12 +165,12 @@ def test_discover_excludes_non_queue_subroles(tmp_path):
 def test_discover_includes_subrole_when_it_declares_kind_or_drained_by(tmp_path):
     agents_dir = tmp_path / "plugin" / "agents"
     write_role(agents_dir, "splitter.md", "name: splitter\ndescription: splits\nkind: split")
-    write_role(agents_dir, "source-searcher.md",
-               "name: source-searcher\ndescription: searches sources\ndrained_by: agent")
+    write_role(agents_dir, "faithfulness-reviewer.md",
+               "name: faithfulness-reviewer\ndescription: judges faithfulness\ndrained_by: agent")
     roles = registry.discover(tmp_path / "plugin")
     assert "split" in roles and roles["split"].name == "splitter"
-    assert "source-searcher" in roles
-    assert roles["source-searcher"].drained_by == "agent"
+    assert "faithfulness-reviewer" in roles
+    assert roles["faithfulness-reviewer"].drained_by == "agent"
 
 
 def test_engine_kinds_exist_with_empty_agents_dir(tmp_path):
@@ -331,20 +331,12 @@ def test_every_shipped_role_declaring_a_kind_has_a_body():
 
 def test_shipped_sub_roles_are_not_queue_kinds():
     roles = registry.discover(REPO_ROOT)
+    assert "faithfulness-reviewer" not in roles
+    assert "proof-integrity-reviewer" not in roles
+    assert "code-quality-reviewer" not in roles
     assert "splitter" not in roles
     assert "source-searcher" not in roles
-    assert "proof-strategy-researcher" not in roles
-
-
-def test_recovery_outcome_reads_final_marker(tmp_path):
-    log = tmp_path / "agent.log"
-    log.write_text(
-        "considered RECOVERY: RETRY in the instructions\n"
-        "RECOVERY: RETRY - provisional\n"
-        "RECOVERY: PARK - no defensible route\n",
-        encoding="utf-8",
-    )
-    assert agent_work._recovery_outcome(log) == "PARK"
+    assert "autoform-reader" not in roles
 
 
 # -- agent_work.queued_agent_tasks ------------------------------------------
@@ -489,23 +481,6 @@ def test_build_prompt_states_the_write_protocol(tmp_path, monkeypatch):
     assert "Do NOT run `git push`" in prompt
     assert "do NOT open PRs" in prompt
     assert "FAILED:" in prompt
-
-
-def test_build_prompt_uses_markdown_protocol_when_blueprint_exists(tmp_path, monkeypatch):
-    cfg, role, _prompt = make_prompt(tmp_path, monkeypatch, "# Role\n")
-    (cfg.project / "blueprint" / "roadmap").mkdir(parents=True)
-    task = agent_work.QueuedTask(
-        task_id="numerics:n1", kind="numerics", node="n1", node_label="Node one"
-    )
-    prompt = agent_work.build_prompt(
-        role, task, cfg, Survey(canonical="o/r", default_branch="main", me="me")
-    )
-
-    assert str(cfg.project / "blueprint" / "roadmap") in prompt
-    assert "Every roadmap article is a node" in prompt
-    assert "dependency headings define DAG edges" in prompt
-    assert "graph.json" not in prompt
-    assert "merge_node.py" not in prompt
 
 
 def test_build_prompt_includes_task_note_verbatim(tmp_path, monkeypatch):

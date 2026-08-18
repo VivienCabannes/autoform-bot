@@ -121,9 +121,7 @@ def _lease_ok(heartbeat) -> bool:
     return heartbeat is None or not heartbeat.lost.is_set()
 
 
-def _enqueue_escalation(
-    cfg: WorkerConfig, node_id: str, note: str, backend: str = ""
-) -> None:
+def _enqueue_escalation(cfg: WorkerConfig, node_id: str, note: str) -> None:
     """Mirror the engine's escalation contract into the local queue so the
     orchestrator (and the dashboard) see the wall this worker hit."""
     mods = scripts_modules()
@@ -136,27 +134,13 @@ def _enqueue_escalation(
         except dq.QueueStateError:
             return  # a corrupt queue is the orchestrator's problem, not ours to overwrite
         if any(t.get("agent") == "escalation" and t.get("node") == node_id
-               and t.get("status") in ("queued", "running", "parked") for t in tasks):
+               and t.get("status") in ("queued", "running") for t in tasks):
             return
-        recovery_state = mods["recovery_state"]
-        rounds = sum(
-            1 for task in tasks
-            if task.get("agent") == "escalation" and task.get("node") == node_id
-        )
         tasks.append({
             "id": dq.new_task_id("escalation", node_id, tasks),
             "agent": "escalation", "node": node_id, "node_label": node_id,
             "status": "queued", "at": _now_iso(), "source": "engine",
             "note": note[:2400],
-            "recovery": {
-                "version": 1,
-                "phase": "proof-research",
-                "round": rounds + 1,
-                "fingerprint": recovery_state.proof_fingerprint(
-                    cfg.blueprint_path, node_id, cfg.lean_root, backend
-                ),
-                "backend": backend,
-            },
         })
         dq._save(qp, tasks)
         dq.sync_feed(fp, tasks)
@@ -210,7 +194,7 @@ def do_prove(
             f"backend {backend!r} sends project data to a configured API endpoint; "
             f"re-run with --allow-api-egress {adapter} after explicit user approval"
         )
-    nodes, _meta = rm.load_graph(cfg.blueprint_path)
+    nodes, _meta = rm.load_graph(cfg.graph_path)
     node = nodes.get(node_id)
     if node is None:
         return UnitResult(False, f"prove {node_id}: node vanished from graph")
@@ -229,35 +213,23 @@ def do_prove(
     with _cooperative_claim(board, cfg.respect_claims, author_claim_key(node_id), notes) as (acquired, hb):
         if not acquired:
             return UnitResult(False, f"prove {node_id}: claimed by a live peer meanwhile")
-        governor = mods["spend_governor"]
-        reservation = governor.reserve(cfg.lean_root, adapter)
-        if not reservation["allowed"]:
-            return UnitResult(False, f"prove {node_id}: paced — {reservation['reason']}")
         gitutil.fetch(cfg.lean_root, gitutil.slug_url(survey.canonical), survey.default_branch)
         with _isolated_worktree(cfg, "FETCH_HEAD") as work_cfg:
 
             counters.bump(f"prove-{node_id}")
             _feed_start(cfg, "worker", feed_name, node_id)
-            started = time.monotonic()
-            status = "failed"
             try:
                 status, reason, detail = prover(
-                    node_id, node, work_cfg.project, str(work_cfg.blueprint_path), str(work_cfg.lean_root),
+                    node_id, node, work_cfg.project, str(work_cfg.graph_path), str(work_cfg.lean_root),
                     PROVE_MAX_STEERS, backend=adapter, judge_backend=judge_backend,
                     worker_timeout=PROVE_TIMEOUT_S,
                 )
             finally:
                 _feed_done(cfg, feed_name)
-                if reservation.get("paced"):
-                    governor.record_run(cfg.lean_root, adapter, status,
-                                        time.monotonic() - started, node=node_id)
-                governor.release(cfg.lean_root, reservation.get("reservation_id"))
 
             if status != "proved":
                 note = f"{reason}\n\n{detail}".strip()[:2400]
-                _enqueue_escalation(
-                    cfg, node_id, note or "prove failed without detail", adapter
-                )
+                _enqueue_escalation(cfg, node_id, note or "prove failed without detail")
                 return UnitResult(False, f"prove {node_id}: FAILED — {reason[:200]}",
                                   infra_failure="prover error" if "prover error" in (reason or "") else None)
 
@@ -333,7 +305,7 @@ def do_review(
 
     import dispatch_runner  # noqa: PLC0415
 
-    nodes, _meta = rm.load_graph(cfg.blueprint_path)
+    nodes, _meta = rm.load_graph(cfg.graph_path)
     node = nodes.get(pr.node)
     if node is None:
         counters.bump(f"review-err-{pr.number}")
@@ -723,7 +695,7 @@ def _record_folded(path: Path, numbers: set[int]) -> None:
 
 
 def _sync_escalation_issues(cfg: WorkerConfig, host: GitHost, canonical: str) -> int:
-    """Proof recoveries ↔ issues: active ones stay open, resolved ones close."""
+    """Escalations ↔ issues: open ones get an issue, resolved ones get closed."""
     mods = scripts_modules()
     dq = mods["dispatch_queue"]
     try:
@@ -731,8 +703,7 @@ def _sync_escalation_issues(cfg: WorkerConfig, host: GitHost, canonical: str) ->
     except Exception:
         return 0
     open_nodes = {t.get("node"): t for t in tasks
-                  if t.get("agent") == "escalation"
-                  and t.get("status") in ("queued", "running", "parked")}
+                  if t.get("agent") == "escalation" and t.get("status") in ("queued", "running")}
     existing = host.issue_list(canonical, LABEL_ESCALATION)
     by_node = {}
     for issue in existing:
@@ -744,10 +715,10 @@ def _sync_escalation_issues(cfg: WorkerConfig, host: GitHost, canonical: str) ->
     host.ensure_labels(canonical, [LABEL_ESCALATION])
     for node, task in open_nodes.items():
         if node and node not in by_node:
-            body = (f"A proof attempt failed on `{node}` and opened ordered proof recovery.\n\n"
+            body = (f"The deterministic engine hit a wall on `{node}` and raised an escalation.\n\n"
                     f"```\n{str(task.get('note', ''))[:1500]}\n```\n\n"
-                    f"Run research, disproof, and decomposition waves via `/autoform:orchestrate`. "
-                    f"The issue stays open while recovery is parked and closes after resolution.\n\n"
+                    f"Resolve via `/autoform:orchestrate` on any machine, then this issue closes on the "
+                    f"next progress round.\n\n"
                     f'<!--autoform-escalation:v1 {json.dumps({"node": node})}-->')
             if host.create_issue(canonical, f"escalation: {node}", body, [LABEL_ESCALATION]):
                 changed += 1

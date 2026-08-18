@@ -21,7 +21,6 @@
     "defaultPrompt": [
       "Set up an Autoform Lean formalization project from my sources.",
       "Run or resume the Autoform orchestration workflow.",
-      "Review this formalization or benchmark an Autoform prover through Orchestrate.",
       "Help me formalize this theorem in Lean 4."
     ],
     "brandColor": "#2563EB",

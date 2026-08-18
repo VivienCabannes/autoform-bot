@@ -16,7 +16,7 @@ from . import survey as survey_mod
 from . import work_units
 from .registry import Registry
 from .claims import ClaimBoard
-from .config import WorkerConfig, scripts_modules
+from .config import WorkerConfig
 from .constants import GH_MIN_BUDGET, STAGES
 from .counters import Counters
 from .errors import Die, NoProgress
@@ -116,8 +116,7 @@ def build_survey(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps):
     picture = survey_mod.collect(cfg, host, board, counters, canonical, default_branch,
                                  extra_identities=list(opts.extra_identities),
                                  allow_foreign_review=opts.review_foreign,
-                                 allow_unchecked_merge=opts.merge_without_ci,
-                                 proof_backend=opts.backend)
+                                 allow_unchecked_merge=opts.merge_without_ci)
     return picture, host, board, counters
 
 
@@ -131,22 +130,6 @@ def run_round(cfg: WorkerConfig, opts: RoundOpts, deps: RoundDeps | None = None)
         raise NoProgress(f"GitHub REST budget too low ({core_left} left) — backing off")
 
     picture, host, board, counters = build_survey(cfg, opts, deps)
-
-    # Revive parked recoveries whose durable inputs moved (a merged sibling, a
-    # Mathlib bump, a re-plan). Parking must never be permanent — an unattended
-    # fleet has no one to un-park by hand. The revived recovery is re-queued and
-    # owns its node again, so it runs (and can then hand the node back to the
-    # prover) rather than the node becoming prove-eligible on this same pass.
-    if picture.resumable_parks and not opts.dry_run:
-        dq = scripts_modules()["dispatch_queue"]
-        for node_id, task_id in picture.resumable_parks:
-            if not task_id:
-                continue
-            try:
-                dq.main([str(cfg.project), "resume", task_id])
-            except Exception:
-                continue
-        picture, host, board, counters = build_survey(cfg, opts, deps)
 
     for stage in opts.stages():
         for candidate in picture.actionable(stage):

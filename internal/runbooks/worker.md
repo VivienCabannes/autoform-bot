@@ -43,7 +43,7 @@ progress → agents → prove`. Exit 0 = progressed, 75 = nothing actionable
 
 `agents` is not a single role — it drains **every** queue kind the role
 registry knows (planner, mathcheck, graphreview, contentreview, counterexample,
-priorart, holistic, proof recovery, plus any project-local role), spawning the host
+priorart, holistic, escalation, plus any project-local role), spawning the host
 CLI with that role's own Markdown body. It sits before `prove` so a cluster is
 planned, Mathlib-checked, and refutation-tested before compute goes into
 proving it. Run `python -m autoform_worker agents` to see what is registered.
@@ -121,12 +121,11 @@ run two loops for one worker id.
 - Human verdicts recorded in the local dashboard remain immutable; folds only
   write the `ai` slot.
 
-## Proof recovery and GitHub issues
+## Escalations ↔ GitHub issues
 
 When the canonical repo has Issues enabled, `progress` (or `autoform issues
-sync`) mirrors active proof recoveries to issues labeled `autoform:escalation`
-and closes resolved ones. The historical label remains for compatibility.
-Humans register intent with assigned
+sync`) mirrors open engine escalations to issues labeled `autoform:escalation`
+and closes resolved ones. Humans register intent with assigned
 `autoform:intention` issues titled `intention: <node-id>`; assigned intentions
 join every worker's prove avoid-list. With Issues disabled, both degrade to
 local-only — say so rather than silently losing the sync.
@@ -139,33 +138,4 @@ local-only — say so rather than silently losing the sync.
 - Agent-driven pushes go ONLY through `autoform push` (CAS + lease check) and
   PRs through `autoform pr-create` (marker + lease gate). Raw `git push` from
   a spawned agent is a defect.
-- Merging follows the worker's verified auto-merge gate; dashboard verdicts and
-  hold labels remain the human override.
-
-## Unattended operation
-
-Two mechanisms keep a loop running without a human in the room.
-
-**Parking is never permanent.** A proof recovery that produces no new prover
-input parks its node instead of retrying. The evidence gate is symmetric: the
-moment the node's durable inputs change — a merged sibling proof, a Mathlib
-bump, a re-planned cluster, an edited statement — the round resumes the parked
-recovery automatically and the node becomes prove-eligible again on that same
-pass. Never treat a parked node as finished; `autoform status --json` lists
-`resumable_parks` when inputs have moved.
-
-**Spend is paced, judgment is not.** Recovery retries are deliberately uncapped
-in count, so the only bound is resources. `scripts/spend_governor.py` reads the
-project's own append-only prover ledger (`.autoform/usage.jsonl`) against an
-optional `.autoform/budget.json`:
-
-```json
-{"window_hours": 5, "max_runs": 40, "max_wall_seconds": 14400,
- "backends": {"aristotle": {"max_runs": 10}}}
-```
-
-With no budget file, nothing is paced. When a rolling window's budget is spent,
-the prove stage is suppressed with a `paced — …` reason and the loop keeps
-tending PRs, reviewing, and draining role tasks; prove work resumes by itself
-as entries age out of the window. Pacing never ends work and never asks a human
-anything — a paced fleet is still fully autonomous, just solvent.
+- Merging stays human (or explicit repo policy) — the worker never merges.

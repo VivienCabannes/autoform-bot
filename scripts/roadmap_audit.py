@@ -34,7 +34,7 @@ Enqueue mapping (``--enqueue``, deduplicated by the queue itself):
 
 Exit code: 0 = no offenders, 1 = offenders found, 2 = cannot audit.
 Usage:
-    roadmap_audit.py <blueprint/> [--json] [--enqueue] [--verify-decls]
+    roadmap_audit.py <graph.json> [--json] [--enqueue] [--verify-decls]
                      [--stamp-verified] [--mathlib PATH]
 """
 from __future__ import annotations
@@ -85,13 +85,6 @@ def _offender(node: str, detail: str) -> dict:
 
 def audit_structural(graph_path: Path) -> list[dict]:
     """check_invariants' structural gates, captured instead of printed."""
-    if graph_path.is_dir():
-        try:
-            from autoform_cli.graph import load_graph
-            load_graph(graph_path)
-            return []
-        except ValueError as error:
-            return [_offender("(blueprint)", str(error))]
     buffer = io.StringIO()
     with redirect_stdout(buffer):
         structural_ok, _grounded_ok = check_invariants.check(str(graph_path))
@@ -135,7 +128,7 @@ def audit_grounding(nodes: dict) -> list[dict]:
 
     return [_offender(nid, "missing node with no in-mathlib root in its dependency closure")
             for nid, node in nodes.items()
-            if node.get("formalizable", eb.node_tier(node) == 2)
+            if eb.node_tier(node) == 2
             and rm.normalize_status(node.get("mathlib_status")) == "missing"
             and not grounds(nid, frozenset())]
 
@@ -162,8 +155,6 @@ def audit_verified(nodes: dict, lean_root: Path | None, verify_decls: bool,
         decls = [d for d in (node.get("mathlib_declarations") or []) if isinstance(d, str) and d]
         if not decls:
             offenders.append(_offender(nid, "in-mathlib with no mathlib_declarations — unverifiable claim"))
-            continue
-        if node.get("blueprint_article") and not verify_decls:
             continue
         if node.get("mathlib_verified"):
             continue
@@ -201,7 +192,7 @@ def audit_content(nodes: dict, project: Path) -> list[dict]:
     out = []
     referenced: set[str] = set()
     for nid, node in nodes.items():
-        if not node.get("formalizable", eb.node_tier(node) == 2):
+        if eb.node_tier(node) != 2:
             continue
         content = node.get("content")
         if not content:
@@ -220,39 +211,12 @@ def audit_content(nodes: dict, project: Path) -> list[dict]:
     return out
 
 
-_ORIGINS = ("cited", "bridged", "background")
-
-
 def audit_provenance(nodes: dict) -> list[dict]:
-    """Provenance = declared ORIGIN, not mandatory citations.
-
-    The blueprint is a unified argument its agents AUTHOR (leanblueprint-style):
-    gap-bridging and standard background written from the agent's own
-    mathematical knowledge are legitimate — what is never legitimate is
-    ambiguity about which kind a statement is, or a citation that doesn't
-    resolve. ``origin``: ``cited`` (from the corpus — needs ``source_refs``),
-    ``bridged`` (agent-authored connective mathematics — gets extra adversarial
-    review), ``background`` (standard material). A node with ``source_refs``
-    and no explicit origin is treated as ``cited``.
-    """
-    out = []
-    for nid, node in nodes.items():
-        if (not node.get("formalizable", eb.node_tier(node) == 2)
-                or rm.normalize_status(node.get("mathlib_status")) == "in-mathlib"):
-            continue
-        origin = node.get("origin")
-        refs = node.get("source_refs") or []
-        if origin is None:
-            origin = "cited" if refs else None
-        if origin is None:
-            out.append(_offender(
-                nid, "no origin declared and no source_refs — say whether this is cited, "
-                     "bridged (agent-authored), or background"))
-        elif origin not in _ORIGINS:
-            out.append(_offender(nid, f"unknown origin {origin!r} (cited|bridged|background)"))
-        elif origin == "cited" and not refs:
-            out.append(_offender(nid, "origin 'cited' but no source_refs — cite it or mark it bridged"))
-    return out
+    return [_offender(nid, "no source_refs — statement has no provenance to review against")
+            for nid, node in nodes.items()
+            if eb.node_tier(node) == 2
+            and rm.normalize_status(node.get("mathlib_status")) != "in-mathlib"
+            and not (node.get("source_refs") or [])]
 
 
 def audit_slugs(nodes: dict) -> list[dict]:
@@ -311,7 +275,7 @@ def run_audit(graph_path: Path, verify_decls: bool = False,
               mathlib_override: str | None = None) -> tuple[dict, dict]:
     nodes, meta = rm.load_graph(graph_path)
     project = graph_path.parent
-    lean_root = project if graph_path.is_dir() else None
+    lean_root = None
     raw_root = (meta or {}).get("lean_root")
     if raw_root and Path(raw_root).is_dir():
         lean_root = Path(raw_root)
@@ -329,7 +293,7 @@ def run_audit(graph_path: Path, verify_decls: bool = False,
         "leanpaths": audit_leanpaths(nodes, lean_root),
     }
     report = {
-        "blueprint": str(graph_path),
+        "graph": str(graph_path),
         "at": _now(),
         "clauses": clauses,
         "summary": {name: len(offs) for name, offs in clauses.items()},

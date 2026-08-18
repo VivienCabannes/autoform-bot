@@ -5,7 +5,7 @@ identical regardless of backend**. These tests prove the driver's steering loop
 against FAKE adapters and a FAKE steer-judge — **no live network, no live
 ``claude`` process**. The Claude adapter is exercised with an injected stream
 ``runner`` (synthetic stream-json), and the Aristotle adapter with an injected
-``AristotleManager`` ``lib`` using an in-memory fake.
+``AristotleManager`` ``lib`` (the same in-memory fake the C-side tests use).
 """
 
 from __future__ import annotations

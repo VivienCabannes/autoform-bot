@@ -47,12 +47,12 @@ and points there.
 
 ## When you're blocked
 
-A failed proof opens ordered recovery; it does not justify an unchanged retry
-or immediately force a new DAG node. Report the exact Lean goal, attempted
-routes, and any specific missing lemma or definition with its full statement
-and types. Recovery first researches an informal route and prior art, then
-seeks a disproof, then accepts sublemmas only when they reconstruct the target.
-Pair the report with `FAILED`, never a disguised partial result.
+A blocked worker is not a dead end — it is a **signal that grows the DAG**. When you cannot
+finish because a specific lemma or definition is missing, **name that missing prerequisite
+precisely** (statement + types) and report it. The orchestrator turns that named gap into a new
+node with an edge into the one you were proving. Pair it with an honest `FAILED` status — never a
+disguised partial result. See
+`internal/references/proving/task-management.md`.
 
 ## Commit and submit
 
@@ -73,6 +73,7 @@ delivered as "done." See
 | `internal/references/proving/sorry-handling.md` | Net-reduction rules, spec-phase sorrys, the FAILED rule |
 | `internal/references/proving/axiom-policy.md` | Kernel-axiom policy + audited-ledger discharge protocol |
 | `internal/references/proving/false-statements.md` | Detecting and reporting false / unprovable statements |
+| `internal/references/proving/task-management.md` | Escalation — naming the missing lemma to grow the DAG |
 | `internal/references/proving/commit-and-submit.md` | Atomic commits, honest gap-listed reporting |
 
 ## Related

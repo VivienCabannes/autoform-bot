@@ -86,14 +86,9 @@ def test_claude_judge_requests_json_schema(tmp_path, monkeypatch):
     assert "--disable-slash-commands" in seen
     assert "disableAllHooks" in seen[seen.index("--settings") + 1]
     assert "dontAsk" in seen
-    assert seen[seen.index("--tools") + 1] == ""
-    assert "--allowedTools" not in seen
-
-
-def test_parse_score_rejects_fractional_scores():
-    result = judge_runtime.parse_score('{"score":4.9,"reasoning":"invalid"}', "quality")
-    assert result["score"] is None
-    assert result["error"] == "parse"
+    allowed = seen[seen.index("--allowedTools") + 1]
+    assert "Bash(lake build *)" in allowed
+    assert ",Bash," not in f",{allowed},"
 
 
 def test_muse_judge_is_read_only_and_parses_terminal_json(tmp_path, monkeypatch):

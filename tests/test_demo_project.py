@@ -1,4 +1,4 @@
-"""Regression checks for the cold-start Lean workspace fixture."""
+"""Regression checks for the bundled cold-start demo project."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = ROOT / "tests" / "fixtures" / "demo-project"
+DEMO = ROOT / "examples" / "demo-project"
 
 
 def test_demo_lake_manifest_is_explicit_and_buildable():
@@ -70,7 +70,7 @@ def test_project_bootstrap_commands_use_a_portable_locale():
 def test_project_creation_is_internal_to_setup():
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     assert not (ROOT / "skills" / "make-project" / "SKILL.md").exists()
-    assert "buildable Lean project" in setup
+    assert "scripts/make_project.sh" in setup
     assert (ROOT / "scripts" / "make_project.sh").is_file()
 
 
@@ -84,11 +84,8 @@ def test_public_skill_surface_is_exact_and_internal_workflows_are_preserved():
     setup = (ROOT / "skills" / "setup" / "SKILL.md").read_text()
     roadmap = (ROOT / "skills" / "roadmap" / "SKILL.md").read_text()
     orchestrate = (ROOT / "skills" / "orchestrate" / "SKILL.md").read_text()
-    assert "autoform-blueprint check" in roadmap
-    assert "autoform-blueprint check" in setup
-    assert "graph.json" not in roadmap
-    assert "graph.json" not in setup
-    assert "Markdown as the sole source of truth" in roadmap
+    assert "internal/runbooks/planning.md" in roadmap
+    assert "scripts/workspace_inspector.py" in setup
     assert "internal/runbooks/proving.md" in orchestrate
     assert "internal/runbooks/review.md" in orchestrate
     assert "scripts/backend_config.py" in orchestrate

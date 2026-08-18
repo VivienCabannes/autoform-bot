@@ -39,29 +39,14 @@ code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; }
 /* --- header --- */
 .rv-header {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 14px;
   padding: 10px 22px;
   border-bottom: 1px solid var(--line);
   background: #fff;
 }
-.rv-home {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--accent);
-  font-weight: 700;
-  text-decoration: none;
-}
-.rv-brand-mark { display: block; width: 24px; height: 24px; flex: 0 0 24px; }
-.rv-title {
-  min-width: 0;
-  overflow: hidden;
-  color: #6c665a;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.rv-home { font-weight: 700; color: var(--accent); }
+.rv-title { color: #6c665a; font-size: 13px; }
 .rv-main { padding: 18px 22px; max-width: 1180px; margin: 0 auto; }
 
 /* --- home: header bar (coverage + frontier + dial) --- */
@@ -472,9 +457,6 @@ a.rv-tt:hover { text-decoration: none; background: #f1ede4; border-color: var(--
   font: inherit; font-size: 13px; padding: 3px 8px; border-radius: 8px;
   border: 1.5px solid var(--accent); background: #fff; color: var(--accent);
   font-weight: 600; cursor: pointer;
-  /* A <select> sizes to its widest <option> ("Claude Code (Max subscription)")
-     and would overflow the sidebar card — clamp it to its container. */
-  max-width: 100%; box-sizing: border-box; text-overflow: ellipsis;
 }
 .rv-be-select:disabled { opacity: .6; cursor: progress; }
 .rv-be-billing { flex-basis: 100%; font-size: 11px; color: #8a8575; font-style: italic; }
@@ -552,8 +534,6 @@ body.rv-drag-active .rv-graph .node { cursor: copy; }
 .rv-chip-running { color: var(--clean); border-color: var(--clean);
   background: #eaf4ee; }
 .rv-chip-running { animation: rv-blink 1.6s ease-in-out infinite; }
-.rv-chip-parked { color: #6c665a; border-color: #8a8575;
-  background: #f2f0eb; }
 .rv-task-cancel {
   border: 1px solid var(--line); background: #fff; color: #8a8575;
   width: 20px; height: 20px; border-radius: 50%; line-height: 1;
@@ -746,25 +726,3 @@ body.rv-drag-active .rv-graph .node { cursor: copy; }
 }
 .rv-nb-link:hover { background: #15407a; text-decoration: none; }
 .rv-nb-link-sub { font-size: 11.5px; color: #8a8575; }
-
-/* Empty-graph overlay: an empty canvas must never read as a hang. */
-.rv-graph-empty {
-  position: absolute; inset: 0; display: flex; align-items: center;
-  justify-content: center; text-align: center; padding: 32px;
-  color: #8a8575; font-style: italic; font-size: 14px; pointer-events: none;
-}
-
-/* Pipeline stepper — where the run sits in setup ▸ plan ▸ approve ▸ split ▸
-   prove ▸ publish. Position must be legible at a glance, without parsing the
-   free-text phase line below it. */
-.rv-pipeline {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
-  margin: 8px 0 2px; font-size: 11px; letter-spacing: .02em;
-}
-.rv-pl-step { padding: 1px 7px; border-radius: 9px; }
-.rv-pl-done { color: var(--clean); }
-.rv-pl-now {
-  color: #fff; background: var(--accent); font-weight: 600;
-}
-.rv-pl-todo { color: #b3ac9d; }
-.rv-pl-sep { color: #d3cdbf; font-size: 9px; }

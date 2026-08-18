@@ -7,11 +7,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import recovery_state  # noqa: E402
 
 from autoform_worker import scoreboard, survey
 from autoform_worker.claims import ClaimBoard, author_claim_key
@@ -293,7 +288,7 @@ def test_collect_prove_suppressed_by_assigned_intention(tmp_path, monkeypatch):
     assert set(prove_map(s)) == {"no-lean", "sorried"}  # unassigned intention is informational
 
 
-def test_collect_review_budget_does_not_cap_proof_recovery(tmp_path, monkeypatch):
+def test_collect_budget_counters_suppress(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, monkeypatch)
     cfg.counters_path.write_text(json.dumps({"prove-no-lean": 3, "review-err-11": 3}),
                                  encoding="utf-8")
@@ -301,29 +296,8 @@ def test_collect_review_budget_does_not_cap_proof_recovery(tmp_path, monkeypatch
     s = run_collect(cfg, make_runner(open_prs=[pr], comments={11: []}))
     assert s.actionable("review") == []
     assert [c.reason for c in s.suppressed["review"]] == ["review error budget spent"]
-    assert prove_map(s, actionable=False) == {}
-    assert set(prove_map(s)) == {"no-lean", "sorried", "rejected"}
-
-
-def test_collect_suppresses_proof_while_recovery_is_parked(tmp_path, monkeypatch):
-    cfg = make_cfg(tmp_path, monkeypatch)
-    (cfg.project / "task_queue.json").write_text(json.dumps([{
-        "id": "escalation:no-lean",
-        "agent": "escalation",
-        "node": "no-lean",
-        "status": "parked",
-        "recovery": {
-            # The CURRENT fingerprint: parking suppresses the node only while
-            # its durable inputs are unchanged. A stale fingerprint means new
-            # evidence arrived and the recovery is resumable instead — covered
-            # in tests/test_recovery_resume.py.
-            "fingerprint": recovery_state.proof_fingerprint(
-                cfg.graph_path, "no-lean", cfg.lean_root, "claude"),
-            "backend": "claude",
-        },
-    }]), encoding="utf-8")
-    s = run_collect(cfg, make_runner())
-    assert prove_map(s, actionable=False)["no-lean"] == "proof recovery parked"
+    assert prove_map(s, actionable=False) == {"no-lean": "attempt budget spent"}
+    assert set(prove_map(s)) == {"sorried", "rejected"}
 
 
 # -- collect: progress -------------------------------------------------------

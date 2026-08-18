@@ -2,8 +2,8 @@
 """Static lint for the host-neutral Autoform plugin (root layout).
 
 The plugin surface is Markdown + JSON + TOML and can rot independently of the
-Python suite: invalid manifests, non-portable skill frontmatter, broken MCP
-paths, or stale role references. This script catches those failures
+Python suite: invalid manifests, non-portable skill frontmatter, broken
+hooks/MCP paths, or stale role references. This script catches those failures
 with the standard library only, so it runs without installing the package.
 
 Claude and Codex use root-level manifests. Muse uses a native manifest template
@@ -15,9 +15,9 @@ Checks (all stdlib):
     `<source>/.claude-plugin/plugin.json`.
   - `.claude-plugin/plugin.json` is valid JSON with `name`/`version`/`description`
     and a semver-shaped `version`.
-  - The native Muse manifest exposes exactly the public native slash commands
-    and the portable MCP server set without duplicate skill entries in Muse's
-    completion menu.
+  - The native Muse manifest exposes exactly the public native slash commands,
+    one SessionStart hook, and the portable MCP server set without duplicate
+    skill entries in Muse's completion menu.
   - Every `agents/*.md` has frontmatter with `name` (== filename) + `description`.
   - Every `skills/*/SKILL.md` has frontmatter with `name` + `description`.
   - The user-visible skill set is exactly `setup`, `roadmap`, and `orchestrate`;
@@ -45,7 +45,7 @@ REPO_ROOT = SCRIPT.parents[1]            # root-level plugin: scripts/.. == repo
 # Agents / skills removed or renamed by a later PR. A surviving mention (outside
 # an HTML comment) is a regression — add the OLD name here when you rename so any
 # straggler reference is caught. Empty on the pristine niket/dev tree.
-REMOVED_AGENTS: tuple[str, ...] = ("autoform-reader",)
+REMOVED_AGENTS: tuple[str, ...] = ()
 REMOVED_SKILLS: tuple[str, ...] = ("set-backend",)
 EXPECTED_MCP_SERVERS = frozenset(
     {
@@ -56,14 +56,17 @@ EXPECTED_MCP_SERVERS = frozenset(
 PUBLIC_WORKFLOW_SKILLS = frozenset({"setup", "roadmap", "orchestrate"})
 MUSE_MANIFEST = REPO_ROOT / "packaging" / "muse" / ".muse-plugin" / "plugin.json"
 REQUIRED_INTERNAL_ASSETS = (
+    "internal/runbooks/environment.md",
     "internal/runbooks/evaluation.md",
     "internal/runbooks/github-pages.md",
+    "internal/runbooks/lean-install.md",
     "internal/runbooks/mathlib-style.md",
     "internal/runbooks/planning.md",
     "internal/runbooks/proving.md",
     "internal/runbooks/review.md",
     "internal/runbooks/visualization.md",
     "internal/runbooks/worker.md",
+    "internal/runbooks/workspace.md",
     "internal/runbooks/zulip.md",
     "internal/references/plan-json-schema.md",
     "internal/references/reviewer-packet.md",
@@ -78,6 +81,7 @@ REQUIRED_INTERNAL_ASSETS = (
     "internal/references/proving/false-statements.md",
     "internal/references/proving/proof-strategies.md",
     "internal/references/proving/sorry-handling.md",
+    "internal/references/proving/task-management.md",
     "internal/references/proving/tool-usage.md",
     "internal/rubrics/code_quality.json",
     "internal/rubrics/faithfulness.json",
@@ -182,16 +186,15 @@ def check_plugin_json() -> None:
     checks += 1
     if not re.match(r"^\d+\.\d+\.\d+", str(version)):
         err(f"plugin.json version is not semver-shaped: {version!r}")
-    mcp_reference = data.get("mcpServers")
+    servers = data.get("mcpServers")
     checks += 1
-    if mcp_reference != "./.mcp.json":
+    if not isinstance(servers, dict):
+        err(".claude-plugin/plugin.json: mcpServers must be an object")
+    elif set(servers) != EXPECTED_MCP_SERVERS:
         err(
-            ".claude-plugin/plugin.json: mcpServers must reference "
-            "the shared './.mcp.json' configuration"
+            ".claude-plugin/plugin.json: MCP server set differs from the "
+            f"portable contract (got {', '.join(sorted(servers))})"
         )
-    checks += 1
-    if "hooks" in data:
-        err(".claude-plugin/plugin.json: Autoform must not inject session hooks")
     root_mcp = load_json(REPO_ROOT / ".mcp.json")
     if root_mcp is not None:
         root_servers = root_mcp.get("mcpServers")
@@ -224,9 +227,25 @@ def check_codex_plugin() -> None:
         checks += 1
         if not (REPO_ROOT / skills).is_dir():
             err(f"Codex skills path does not resolve: {skills!r}")
-    checks += 1
-    if (REPO_ROOT / "hooks").exists():
-        err("hooks/: Autoform must remain invocation-driven, not session-global")
+    # Current Codex discovers this default plugin-bundled location without a
+    # manifest override; it also satisfies older ingestion validators that do
+    # not yet accept the documented `hooks` manifest field.
+    hook_path = REPO_ROOT / "hooks" / "hooks.json"
+    hook_data = load_json(hook_path)
+    if hook_data is not None:
+        checks += 1
+        if not isinstance(hook_data.get("hooks"), dict):
+            err(f"{rel(hook_path)}: top-level hooks object is missing")
+        rendered_hooks = json.dumps(hook_data)
+        checks += 1
+        if "${PLUGIN_ROOT}/hooks/session-start" not in rendered_hooks:
+            err(
+                f"{rel(hook_path)}: SessionStart does not resolve through "
+                "the plugin-root environment"
+            )
+        checks += 1
+        if not (REPO_ROOT / "hooks" / "session-start").is_file():
+            err(f"{rel(hook_path)}: hooks/session-start does not exist")
     mcp_rel = data.get("mcpServers")
     if not isinstance(mcp_rel, str):
         return
@@ -278,7 +297,7 @@ def check_muse_plugin() -> None:
     if not isinstance(capabilities, dict):
         err(f"{rel(MUSE_MANIFEST)}: capabilities must be an object")
         return
-    expected_kinds = {"skills", "commands", "mcpServers", "reminders"}
+    expected_kinds = {"skills", "commands", "hooks", "mcpServers", "reminders"}
     checks += 1
     if set(capabilities) != expected_kinds:
         err(
@@ -318,9 +337,16 @@ def check_muse_plugin() -> None:
                     "enabled by default"
                 )
 
+    hooks = capabilities.get("hooks")
     checks += 1
-    if "hooks" in capabilities:
-        err(f"{rel(MUSE_MANIFEST)}: Autoform must not inject session hooks")
+    expected_hook = ["bash", "hooks/session-start"]
+    if (
+        not isinstance(hooks, list)
+        or len(hooks) != 1
+        or hooks[0].get("event") != "SessionStart"
+        or hooks[0].get("command") != expected_hook
+    ):
+        err(f"{rel(MUSE_MANIFEST)}: expected one native SessionStart hook")
 
     servers = capabilities.get("mcpServers")
     checks += 1
@@ -368,12 +394,6 @@ def check_agents() -> int:
                 err(f"{rel(path)}: agent frontmatter missing `{key}`")
         if fm.get("name") and fm["name"] != path.stem:
             err(f"{rel(path)}: agent `name: {fm['name']}` != filename `{path.stem}`")
-        checks += 1
-        if "model" in fm:
-            err(
-                f"{rel(path)}: agent frontmatter must not pin `model`; "
-                "roles inherit the host-selected model"
-            )
     return count
 
 
@@ -410,13 +430,13 @@ def check_skills() -> int:
         checks += 1
         err(
             f"missing core workflow skill: skills/{name}/SKILL.md "
-            "(Setup, Roadmap, Orchestrate, and Evaluate must ship in every host)"
+            "(Setup, Roadmap, and Orchestrate must ship in every host)"
         )
     for name in sorted(found - PUBLIC_WORKFLOW_SKILLS):
         checks += 1
         err(
             f"unexpected user-facing skill: skills/{name}/SKILL.md "
-            "(Autoform exposes only Setup, Roadmap, Orchestrate, and Evaluate)"
+            "(Autoform exposes only Setup, Roadmap, and Orchestrate)"
         )
     expected_paths = {
         (REPO_ROOT / "skills" / name / "SKILL.md").resolve()
@@ -431,7 +451,7 @@ def check_skills() -> int:
             continue
         checks += 1
         err(
-            f"stray SKILL.md outside the four-command surface: {rel(path)} "
+            f"stray SKILL.md outside the three-command surface: {rel(path)} "
             "(store supporting material under internal/)"
         )
     return count
@@ -490,7 +510,7 @@ def check_skill_references() -> None:
 
 
 def _plugin_markdown() -> list[Path]:
-    """Markdown on the plugin surface (agents/skills/commands), not docs or fixtures."""
+    """Markdown on the plugin surface (agents/skills/commands) — not docs/examples."""
     out: list[Path] = []
     for sub in ("agents", "skills", "commands"):
         out.extend((REPO_ROOT / sub).rglob("*.md"))

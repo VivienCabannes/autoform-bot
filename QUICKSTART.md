@@ -1,7 +1,7 @@
 # Quickstart
 
 Autoform turns your AI coding assistant into a **Lean 4 formalization agent**.
-It exposes four workflow commands backed by role agents, internal runbooks,
+It exposes three workflow commands backed by role agents, internal runbooks,
 and MCP servers for Lean and Mathlib.
 
 > For the full formalization workflow and command reference, see [docs/usage.md](docs/usage.md).
@@ -47,7 +47,8 @@ Set `LEAN_PROJECT_DIR` so the skills and servers know which project to work on, 
 LEAN_PROJECT_DIR=/path/to/your/lean-project claude --plugin-dir /path/to/autoform-bot
 ```
 
-No Lean project yet? Setup creates one from the LeanProject template.
+No Lean project yet? Setup creates one from the LeanProject template, or you
+can try Autoform against the bundled sample at `examples/demo-project/`.
 
 ## 3. Use it — slash commands
 
@@ -58,13 +59,11 @@ Type these in the assistant. This is the complete user-visible surface:
 | `/autoform:setup` | Install or repair prerequisites, create or inspect a project, and open the dashboard |
 | `/autoform:roadmap` | Plan sources and build or review the blueprint |
 | `/autoform:orchestrate` | Choose a backend, prove, review, score, search prior art, handle escalations, and advance the plan |
-| `/autoform:evaluate` | Audit formalization corpora or benchmark a prover in disposable project copies |
 
 A good first move is `/autoform:setup`. Natural-language requests such as
 “inspect this workspace” or “install Lean” stay inside Setup; “show the graph”
 stays inside Roadmap. Requests such as “review this node,” “prove this theorem,”
-“choose a prover,” or “search Zulip” stay inside Orchestrate. Bulk corpus QA and
-prover regression runs stay inside Evaluate.
+“choose a prover,” or “search Zulip” stay inside Orchestrate.
 
 ## 4. Optional unlocks
 
@@ -87,7 +86,7 @@ Then `chmod 600 ~/.zuliprc`. Setup verifies connectivity.
 If you're **hacking on Autoform itself** (not just using it), there's a `Makefile`:
 
 ```bash
-make demo      # run the workspace scanner on its regression fixture (no deps)
+make demo      # run the workspace scanner on the sample project (no deps)
 make test      # smoke tests — every MCP server constructs
 make lint      # ruff over the Python implementation
 make help      # all targets

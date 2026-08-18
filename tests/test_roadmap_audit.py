@@ -12,7 +12,6 @@ Covers:
   * --stamp-verified against a fake Mathlib checkout (incl. MATHLIB_PATH);
   * merge_node's metadata.targets support.
 """
-import io
 import json
 import sys
 from pathlib import Path
@@ -462,27 +461,3 @@ def test_targets_survive_later_plain_upsert(tmp_path):
     graph = json.loads(gp.read_text())
     assert graph["metadata"]["targets"] == ["s2"]
     assert "s3" in graph["nodes"]
-
-
-def test_cli_applies_metadata_only_payload_from_stdin(tmp_path, monkeypatch):
-    gp = _merge_graph(tmp_path)
-    monkeypatch.setattr(sys, "stdin", io.StringIO('{"metadata":{"targets":["s2"]}}'))
-    assert merge_node.main([str(gp)]) == 0
-    assert json.loads(gp.read_text())["metadata"]["targets"] == ["s2"]
-
-
-def test_deleting_target_requires_retargeting_in_same_payload(tmp_path):
-    gp = _merge_graph(tmp_path)
-    merge_node.merge(str(gp), {"metadata": {"targets": ["s2"]}})
-    with pytest.raises(ValueError, match="does not resolve"):
-        merge_node.merge(str(gp), {"delete": ["s2"]})
-    unchanged = json.loads(gp.read_text())
-    assert "s2" in unchanged["nodes"]
-    assert unchanged["metadata"]["targets"] == ["s2"]
-
-    merge_node.merge(
-        str(gp), {"delete": ["s2"], "metadata": {"targets": ["s1"]}}
-    )
-    updated = json.loads(gp.read_text())
-    assert "s2" not in updated["nodes"]
-    assert updated["metadata"]["targets"] == ["s1"]

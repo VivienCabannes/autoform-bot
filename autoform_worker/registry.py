@@ -44,10 +44,11 @@ _FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 ENGINE_KINDS = ("reviewer", "worker")
 
 #: Roles that exist as prompts but are invoked *inside* another role's pipeline
-#: rather than dropped on the queue themselves.
+#: rather than dropped on the queue themselves (the jury's three axes are run by
+#: the engine; splitter/reader/searcher are sub-steps of planner and escalation).
 _NON_QUEUE_ROLES = frozenset({
-    "splitter", "autoform-worker", "source-searcher",
-    "proof-strategy-researcher",
+    "faithfulness-reviewer", "proof-integrity-reviewer", "code-quality-reviewer",
+    "splitter", "autoform-reader", "autoform-worker", "source-searcher",
 })
 
 

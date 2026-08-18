@@ -1,0 +1,42 @@
+# Workspace inspection runbook
+
+Resolve an absolute plugin root from a valid host variable or
+`Path(<this loaded SKILL.md>).resolve().parents[2]`.
+
+Run the inspection script to get a structured overview of the Lean project:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" [path]
+```
+
+If no path is given, it uses `$LEAN_PROJECT_DIR` or the current directory.
+
+The script reports:
+- Lakefile and toolchain version
+- Targets file and book/source file locations
+- Lean file count and declaration count
+- Sorry count and axiom count
+- Available tools (lake, lean, rg)
+- Recommended next steps
+
+For searching `.lean` files:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" --search "pattern" [path]
+```
+
+For listing declarations:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" --declarations [path]
+```
+
+For reading targets:
+
+```bash
+uv run --directory "<AUTOFORM_PLUGIN_ROOT>" python \
+  "<AUTOFORM_PLUGIN_ROOT>/scripts/workspace_inspector.py" --targets [path]
+```

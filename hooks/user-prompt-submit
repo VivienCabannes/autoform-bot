@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Legacy UserPromptSubmit hook.
+#
+# Autoform workflows are Agent Skills on both Claude and Codex. Executing
+# slash-command arguments from a prompt hook duplicated skill behavior and made
+# shell-argument handling part of the trust boundary. Keep this file as a
+# harmless pass-through for old installations whose cached manifest still
+# references it.
+
+set -euo pipefail
+
+cat >/dev/null
+printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit"}}\n'

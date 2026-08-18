@@ -15,22 +15,8 @@
   background: #fff;
 }
 
-.af-brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: #1a4b8c;
-  font-weight: 700;
-  text-decoration: none;
-}
-.af-brand-mark { display: block; width: 24px; height: 24px; flex: 0 0 24px; }
-.af-site-title {
-  min-width: 0;
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.af-site-header a { color: #1a4b8c; font-weight: 700; text-decoration: none; }
+.af-site-header span { flex: 1; }
 .af-site-header strong { color: #5f5a50; font-size: 12px; font-weight: 600; }
 .af-site-main { width: min(1180px, calc(100% - 32px)); margin: 28px auto 64px; }
 

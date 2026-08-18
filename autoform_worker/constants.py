@@ -36,8 +36,7 @@ _MERGE_PATH_ALLOW = (
     r"^[^/]+\.lean$",            # top-level lean (rare)
     r"^[A-Za-z0-9_./-]+\.lean$",  # library lean files
     r"^kernel/",                  # kernel evidence
-    r"^blueprint/",               # Markdown roadmap and mathematical sources
-    r"^informal_content/",        # legacy node prose during migration
+    r"^informal_content/",        # node prose
     r"^review_status\.json$",     # sidecar folds
 )
 _MERGE_PATH_DENY = (
@@ -90,6 +89,7 @@ MAX_CI_ATTEMPTS = 3         # per PR head
 MAX_CI_PR_ATTEMPTS = 5      # per PR lifetime
 MAX_REBASE_ATTEMPTS = 3     # per PR
 MAX_REVIEW_ERRORS = 3       # per PR
+MAX_PROVE_ATTEMPTS = 3      # per node
 MAX_INFRA_REFUNDS = 20      # per counter — a refund cap so outages still terminate
 
 # ---------------------------------------------------------------------------

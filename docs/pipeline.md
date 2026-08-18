@@ -96,15 +96,15 @@ Both phases review in **two waves** — an editing wave that fixes the graph in 
 
 ## 6. Subagent roster
 
-| Subagent | Phase | Role | Edits or flags |
-|---|---|---|---|
-| **`mathlib-checker`** | both | Classifies one concept against local Mathlib. | Returns data (orchestrator merges) |
-| **`splitter`** | 2 | Splits one cluster into tier-2 nodes; writes their prose. | **Edits** `informal_content/`; returns structure |
-| **`graph-reviewer`** | both | Reviews/corrects dependency structure over its partition. | **Edits** `graph.json` (via `merge_node.py`); flags the rest |
-| **`content-reviewer`** | 2 | Reviews/corrects one cluster's prose. | **Edits** `informal_content/`; flags structural issues |
-| **`holistic-reviewer`** | both | Whole-graph quality; ≥3 run in parallel. | **Flags only** |
-| **`source-searcher`** | both | Fetches a specific result from a book, so whole books stay out of the orchestrator's context. | Returns extract |
-| **orchestrator** | both | Drives phases; dispatches and threads subagents; merges structure; applies/reverts; talks to the user. | Writes `graph.json` via `merge_node.py` |
+| Subagent | Phase | Role | Edits or flags | Model |
+|---|---|---|---|---|
+| **`mathlib-checker`** | both | Classifies one concept against local Mathlib. | Returns data (orchestrator merges) | sonnet |
+| **`splitter`** | 2 | Splits one cluster into tier-2 nodes; writes their prose. | **Edits** `informal_content/`; returns structure | opus |
+| **`graph-reviewer`** | both | Reviews/corrects dependency structure over its partition. | **Edits** `graph.json` (via `merge_node.py`); flags the rest | opus |
+| **`content-reviewer`** | 2 | Reviews/corrects one cluster's prose. | **Edits** `informal_content/`; flags structural issues | opus |
+| **`holistic-reviewer`** | both | Whole-graph quality; ≥3 run in parallel. | **Flags only** | opus |
+| **`source-searcher`** | both | Fetches a specific result from a book, so whole books stay out of the orchestrator's context. | Returns extract | sonnet |
+| **orchestrator** | both | Drives phases; dispatches and threads subagents; merges structure; applies/reverts; talks to the user. | Writes `graph.json` via `merge_node.py` | — |
 
 In short: **splitter**, **graph-reviewer**, and **content-reviewer** change the plan (prose, or structure via the writer); **mathlib-checker**, **holistic-reviewer**, and **source-searcher** only return findings; and every write to `graph.json` — by the orchestrator or an editing `graph-reviewer` — goes through `merge_node.py`.
 

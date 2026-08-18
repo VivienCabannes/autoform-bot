@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# SessionStart hook — describe Autoform's portable workflow.
+# Silent-fails on all errors (never blocks session start).
+
+set -euo pipefail
+
+context="Autoform is active. It turns mathematical sources into a durable Lean 4 formalization graph, proves nodes through explicitly selected backends, independently verifies every proof, and records a three-axis review jury. Its only user workflows are setup, roadmap, and orchestrate. Setup owns installation, workspace inspection, repository readiness, and the dashboard; Roadmap owns sources, scope, planning, the tiered DAG, and visualization; Orchestrate owns backend selection, proving, review, prior-art search, escalation, and progress, including distributed multi-machine progress through the worker CLI (python -m autoform_worker: claim leases, PR rounds, scoreboard reviews). Supporting runbooks are internal and must not be presented as additional commands. Claude, Codex, and Muse use their native skills, MCP servers, and subagents against the same graph and queue. Muse can also run proof and jury workers through the tbh CLI. Ask for source files and scope before beginning a new plan."
+
+escape_for_json() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+escaped_context="$(escape_for_json "$context")"
+printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$escaped_context"

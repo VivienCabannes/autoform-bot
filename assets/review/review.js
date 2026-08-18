@@ -295,38 +295,12 @@
   // Render `dot` into the mount via d3-graphviz. `transition` => animate from the
   // current layout to the new one (used on expand/collapse). On first paint we skip
   // the transition (nothing to morph from) but still fit.
-  // A graph with no real nodes renders as a silent white void — indistinguishable
-  // from a hang. Overlay a message that tracks the live orchestrator state, so an
-  // empty canvas during planning reads as "loading", not "broken".
-  function dotHasNodes(dot) {
-    return /"[^"]+"\s*\[[^\]]*label/.test(String(dot || ""));
-  }
-
-  function syncEmptyOverlay(mount, hasNodes) {
-    var overlay = mount.querySelector(".rv-graph-empty");
-    if (hasNodes) {
-      if (overlay) overlay.remove();
-      return;
-    }
-    if (!overlay) {
-      overlay = document.createElement("div");
-      overlay.className = "rv-graph-empty";
-      mount.appendChild(overlay);
-    }
-    var orch = (dispatch.live || {}).orchestrator || {};
-    overlay.textContent = orch.state === "working"
-      ? "Roadmap planning is in progress — nodes appear here as they merge. "
-        + (orch.phase ? "(" + orch.phase + ")" : "")
-      : "No roadmap yet — run /autoform:roadmap to build the dependency graph.";
-  }
-
   function renderGraph(dot, transition) {
     var mount = home.mount;
     if (!mount) return;
     home.rendering = true;
     var loading = mount.querySelector(".rv-graph-loading");
     if (loading) loading.remove();
-    syncEmptyOverlay(mount, dotHasNodes(dot));
     // The d3-graphviz rendering (fresh-stage-per-render + settle/timeout backstop) is
     // the shared DepGraphCore.renderDot — the SAME renderer the leanblueprint dep-graph
     // page uses, so the two viewers don't duplicate it. We pass our own stage class
@@ -519,34 +493,25 @@
     var k = Number(ANCHOR.radius) || 1;
     // "‹ back" drops the anchor → the flat tier-N view (no anchor/radius).
     var back = "/?tier=" + encodeURIComponent(TIER);
-    var anchorHref = function (radius) {
-      return "/?tier=" + encodeURIComponent(TIER)
-        + "&anchor=" + encodeURIComponent(id) + "&radius=" + radius;
-    };
+    var canExpand = k < NB_MAX_RADIUS;
+    var nextK = Math.min(k + 1, NB_MAX_RADIUS);
+    var expandHref = "/?tier=" + encodeURIComponent(TIER)
+      + "&anchor=" + encodeURIComponent(id) + "&radius=" + nextK;
 
-    // Symmetric radius controls: "+1 hop" grows the ball, "−1 hop" shrinks it
-    // back (the old label said "±1 hop" but only ever grew — the ± belongs to
-    // the NEIGHBORHOOD, which walks deps and dependents both ways, not to the
-    // control). "‹ back" stays the exit to the flat tier view.
     var html =
       "<span class='rv-fb-ico'>⊚</span>"
       + "<span class='rv-fb-text'>Neighborhood of <strong>" + escapeHtml(id)
       + "</strong> <span class='rv-fb-count'>(±" + k + " hop"
       + (k === 1 ? "" : "s") + ")</span></span>"
       + "<span class='rv-nb-controls'>";
-    if (k > 1) {
-      html += "<a class='rv-nb-expand rv-nb-shrink' href='" + anchorHref(k - 1) + "' "
-        + "title='narrow to ±" + (k - 1) + " hop" + (k - 1 === 1 ? "" : "s")
-        + " (closest neighbors only)'>◂ −1 hop</a>";
-    }
-    if (k < NB_MAX_RADIUS) {
-      html += "<a class='rv-nb-expand' href='" + anchorHref(k + 1) + "' "
-        + "title='widen to ±" + (k + 1) + " hops (more neighbors, still bounded)'>"
-        + "+1 hop ▸</a>";
+    if (canExpand) {
+      html += "<a class='rv-nb-expand' href='" + expandHref + "' "
+        + "title='widen to ±" + nextK + " hops (more neighbors, still bounded)'>"
+        + "expand ±1 hop ▸</a>";
     } else {
       html += "<span class='rv-nb-expand rv-nb-maxed' "
         + "title='already at the maximum radius (±" + NB_MAX_RADIUS + ")'>"
-        + "max ±" + NB_MAX_RADIUS + "</span>";
+        + "max radius (±" + NB_MAX_RADIUS + ")</span>";
     }
     html += "</span>"
       + "<a class='rv-fb-back' href='" + back + "'>‹ back</a>";
@@ -991,11 +956,11 @@
       applyPulse();
     }
 
-    // Pending marker: every node carrying a queued/running/parked task.
+    // Pending marker: every node carrying a queued/running task (from the queue).
     var nextPending = dispatch.queue
       .filter(function (t) {
         var s = String(t && t.status || "");
-        return s === "queued" || s === "running" || s === "parked";
+        return s === "queued" || s === "running";
       })
       .map(function (t) { return t && t.node; })
       .filter(Boolean);
@@ -1028,54 +993,6 @@
       + "<span class='rv-pill rv-pill-" + escapeHtml(ostate) + "'>"
       + "<span class='rv-pill-dot'></span>" + escapeHtml(ostate) + "</span>"
       + "</div>";
-
-    // --- pipeline stepper: WHERE the run is in the overall flow. Prefers the
-    //     structured `stage` the skills publish; falls back to a heuristic on
-    //     the free-text phase so older sessions still get positioned. ---
-    var STAGES = ["setup", "plan", "approve", "split", "prove", "publish"];
-    var STAGE_LABEL = { setup: "setup", plan: "plan", approve: "approve",
-                        split: "split", prove: "prove", publish: "publish" };
-    var stage = orch.stage || "";
-    if (!stage && ostate !== "idle") {
-      var ph = String(orch.phase || "").toLowerCase();
-      if (/approv|checkpoint/.test(ph)) stage = "approve";
-      else if (/phase 2|splitt|tier-2|tier 2/.test(ph)) stage = "split";
-      else if (/phase 1|coarse|extract|holistic|review wave|mathlib check|correction|convergence/.test(ph)) stage = "plan";
-      else if (/prov|worker|dispatch|orchestr|jury|escalat/.test(ph)) stage = "prove";
-      else if (/publish|pages|progress|fold/.test(ph)) stage = "publish";
-      else if (/setup|install|environment|repository/.test(ph)) stage = "setup";
-    }
-    if (stage) {
-      var idx = STAGES.indexOf(stage);
-      html += "<div class='rv-pipeline' title='pipeline position'>";
-      STAGES.forEach(function (s, i) {
-        var cls = i < idx ? "rv-pl-done" : (i === idx ? "rv-pl-now" : "rv-pl-todo");
-        if (i) html += "<span class='rv-pl-sep'>▸</span>";
-        html += "<span class='rv-pl-step " + cls + "'>" + STAGE_LABEL[s] + "</span>";
-      });
-      html += "</div>";
-    }
-
-    // --- orchestrator phase/detail — DIRECTLY under the pill, never below the
-    //     palette fold: a "working" badge with no visible reason reads as a
-    //     hang. This is the instant-feedback line ("Phase 1: coarse
-    //     extraction — reading source"), and it explains a working state even
-    //     while no subagent has registered yet. ---
-    html += "<div class='rv-act-orch'>";
-    if (orch.phase) {
-      html += "<div class='rv-orch-phase'>" + escapeHtml(orch.phase) + "</div>";
-    }
-    if (orch.detail) {
-      html += "<div class='rv-orch-detail'>" + escapeHtml(orch.detail) + "</div>";
-    }
-    if (!orch.phase && !orch.detail) {
-      html += "<div class='rv-orch-detail'>"
-        + (ostate === "working"
-            ? "working — waiting for the first status report…"
-            : "orchestrator " + escapeHtml(ostate))
-        + "</div>";
-    }
-    html += "</div>";
 
     // --- backend selector: which prover backend the agents run on (shared with
     //     Orchestrate via ~/.autoform/config.json; also the billing path) ---
@@ -1116,6 +1033,20 @@
         + "</div></div>";
     });
     html += "</div></div>";
+
+    // --- orchestrator phase/detail (the existing live feed chrome) ---
+    html += "<div class='rv-act-orch'>";
+    if (orch.phase) {
+      html += "<div class='rv-orch-phase'>" + escapeHtml(orch.phase) + "</div>";
+    }
+    if (orch.detail) {
+      html += "<div class='rv-orch-detail'>" + escapeHtml(orch.detail) + "</div>";
+    }
+    if (!orch.phase && !orch.detail) {
+      html += "<div class='rv-orch-detail'>orchestrator " + escapeHtml(ostate)
+        + "</div>";
+    }
+    html += "</div>";
 
     // --- the live agent cards (running agents from the live feed) ---
     if (agents.length) {
@@ -1163,8 +1094,7 @@
       tasks.forEach(function (t) {
         var status = String(t.status || "queued");
         var statusClass = (status === "running") ? "running"
-          : (status === "queued") ? "queued"
-          : (status === "parked") ? "parked" : "other";
+          : (status === "queued") ? "queued" : "other";
         var nodeLbl = t.node_label || t.node || "";
         html += "<li class='rv-task rv-task-" + escapeHtml(statusClass) + "'>"
           + "<div class='rv-task-main'>"
@@ -1223,13 +1153,13 @@
   // authoritative for queued + running tasks the orchestrator owns; we ADD a live
   // agent only if it has a target not already represented by a queue row (so a node
   // an agent is working on shows as "running" even before/without a queue entry).
-  // Never invents a status: queue rows retain queued, running, or parked.
+  // Never invents a status — queued rows stay queued, running rows/agents stay running.
   function buildTasks(queue, agents) {
     var tasks = [];
     var seenNodeAgent = {};
     (queue || []).forEach(function (t) {
       var status = String(t && t.status || "");
-      if (status !== "queued" && status !== "running" && status !== "parked") return;
+      if (status !== "queued" && status !== "running") return;
       tasks.push(t);
       if (t.agent && t.node) seenNodeAgent[t.agent + "\u0000" + t.node] = true;
       if (t.node) seenNodeAgent["\u0000" + t.node] = true;

@@ -7,7 +7,6 @@ dist/
 __pycache__/
 *.pyc
 .venv/
-.lake/
 traces/
 
 # Review surface runtime data (the verdict sidecar — single source of truth,

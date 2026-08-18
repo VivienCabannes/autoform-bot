@@ -1,7 +1,7 @@
 """Aristotle adapter — wraps the existing Aristotle integration as a prover backend.
 
-A thin :class:`~servers.prover.base.ProverAdapter` over the shared Aristotle
-integration in :mod:`servers.aristotle.core`. It exposes the
+A thin :class:`~servers.prover.base.ProverAdapter` over the proven Aristotle
+integration in :mod:`servers.aristotle.core` (the C-side work). It exposes the
 SAME four-method surface as the Claude adapter, so the SHARED driver + steerer
 drive Aristotle with no change:
 
@@ -89,7 +89,7 @@ class AristotleAdapter(ProverAdapter):
     """Drive Harmonic's Aristotle as a swappable prover backend.
 
     Args:
-        graph_path: Path to the Markdown blueprint (the article spec source).
+        graph_path: Path to the plan's ``graph.json`` (the node spec source).
         manager: An :class:`AristotleManager`; when ``None`` one is built lazily
             (constructing it does NOT import ``aristotlelib``).
         system_prompt: The no-cheating delegate contract (defaults to

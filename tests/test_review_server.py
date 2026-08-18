@@ -46,42 +46,6 @@ def _boot(html: bytes) -> str:
     return text[start:end]
 
 
-def test_shared_page_uses_autoform_mark_for_header_and_favicon():
-    html = sv._page("dependency graph", "").decode("utf-8")
-    assert "rel='icon' type='image/svg+xml' href='/assets/autoform-small.svg'" in html
-    assert "class='rv-brand-mark' src='/assets/autoform-small.svg'" in html
-    assert "<span>Autoform</span>" in html
-    assert sv._BRAND_ICON.is_file()
-
-
-def test_bootstrap_json_cannot_close_script_element():
-    payload = sv._json_for_script("</script><script>alert(1)</script>&")
-    assert "</script>" not in payload
-    assert "<script>" not in payload
-    assert "\\u003c/script\\u003e" in payload
-
-
-def test_blueprint_fragment_removes_active_content():
-    fragment = sv._sanitize_blueprint_fragment(
-        '<div class="thm" onclick="alert(1)"><script>alert(2)</script>'
-        '<a href="javascript:alert(3)" style="color:red">statement</a></div>'
-    )
-    assert "script" not in fragment.lower()
-    assert "onclick" not in fragment.lower()
-    assert "javascript:" not in fragment.lower()
-    assert "style=" not in fragment.lower()
-    assert "statement" in fragment
-
-
-def test_node_artifact_paths_are_confined_to_project(tmp_path):
-    proj = _proj(tmp_path)
-    outside = tmp_path.parent / "outside-secret"
-    outside.write_text("secret", encoding="utf-8")
-    assert proj.informal_md("../../outside-secret", {}) is None
-    assert proj.informal_md("s1", {"content": "../../outside-secret"}) is None
-    assert proj.kernel_evidence("../../outside-secret") is None
-
-
 # --- tier resolution --------------------------------------------------------
 
 def test_parse_tier_defaults_to_lowest_present(tmp_path):

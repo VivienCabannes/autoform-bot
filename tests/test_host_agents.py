@@ -20,7 +20,7 @@ from scripts.install_host_agents import (
 def test_codex_agents_cover_canonical_roles():
     agents = discover_agents()
     assert len(agents) >= 10
-    assert {"autoform-worker", "splitter", "graph-reviewer"} <= {
+    assert {"autoform-worker", "splitter", "faithfulness-reviewer"} <= {
         agent.name for agent in agents
     }
 
@@ -34,16 +34,10 @@ def test_rendered_agent_has_required_codex_contract():
     assert "developer_instructions =" in rendered
     assert "do not launch another agent host" in rendered
 
-    read_only_role = next(
-        agent for agent in discover_agents() if agent.name == "holistic-reviewer"
+    reviewer = next(
+        agent for agent in discover_agents() if agent.name == "faithfulness-reviewer"
     )
-    assert 'sandbox_mode = "read-only"' in render_codex_agent(read_only_role)
-    strategy = next(
-        agent for agent in discover_agents() if agent.name == "proof-strategy-researcher"
-    )
-    checker = next(agent for agent in discover_agents() if agent.name == "mathlib-checker")
-    assert 'sandbox_mode = "read-only"' in render_codex_agent(strategy)
-    assert 'sandbox_mode = "workspace-write"' in render_codex_agent(checker)
+    assert 'sandbox_mode = "read-only"' in render_codex_agent(reviewer)
 
 
 def test_install_is_idempotent_and_checkable(tmp_path: Path):

@@ -31,15 +31,6 @@ def test_read_only_tools_do_not_expose_write(tmp_path: Path):
         tools.execute("write_lean_file", {"path": "X.lean", "content": "x"})
 
 
-def test_nonexecuting_tools_offer_reads_but_no_lean_commands(tmp_path: Path):
-    tools = ProjectTools(tmp_path, allow_execution=False)
-    names = {item["function"]["name"] for item in tools.definitions()}
-    assert {"read_file", "list_files", "search_text"} <= names
-    assert {"run_lean", "check_axioms"}.isdisjoint(names)
-    with pytest.raises(ToolPolicyError, match="execution is disabled"):
-        tools.execute("run_lean", {"command": "lake", "args": ["build"]})
-
-
 def test_project_tools_hide_secret_like_project_files(tmp_path: Path):
     (tmp_path / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
     (tmp_path / "client.pem").write_text("private\n", encoding="utf-8")

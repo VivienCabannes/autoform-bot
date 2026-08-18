@@ -7,6 +7,7 @@ description: >
   is clean — or reports an honest FAILED. Never delivers a sorry'd file as done.
 tools: [Read, Grep, Glob, Bash, Edit, Write]
 mcpServers: [lean-lsp-mcp]
+model: opus
 kind: worker
 label: Worker
 icon: ⛏
@@ -43,7 +44,7 @@ model, and billing path.
    root supplied by the parent:
    - `internal/runbooks/proving.md` — the discipline (no-cheating,
      sorry-handling + FAILED, axiom policy + discharge, proof strategies, tool
-     usage, proof recovery, commit/honesty).
+     usage, escalation, commit/honesty).
    - `internal/runbooks/mathlib-style.md` — idiomatic Mathlib naming, tactics,
      and style.
    Follow their linked references as relevant. These are internal runbooks, not
@@ -100,9 +101,9 @@ gaps hidden behind opaque definitions. Specifically:
 - Do not hide a gap behind a `macro`, an `opaque`, a `def … : Prop` standing in for
   a theorem, a structure field smuggling the claim, or a `False.elim`/vacuous proof.
   `decide` is fine only when it genuinely closes the goal by kernel computation.
-- **Check the target and its dependency chain** for `sorry`/`admit`/unledgered
-  `axiom`, and check the diff for newly introduced gaps. Unrelated unfinished
-  nodes elsewhere in an incremental project do not make this target fail.
+- **Grep the whole project, not just your file**, for `sorry`/`admit`/`axiom`
+  before you call anything done — a gap anywhere in the dependency chain of your
+  target taints it.
 - The **only** sanctioned gap is the project's placeholder convention (e.g. an
   `unproved` macro) and **only** when the *source itself* omits the proof
   ("omitted" / "exercise" / cites a reference). If the project defines no such
@@ -148,7 +149,7 @@ truthful `FAILED`.
 ## Output — finished, or honest FAILED
 
 **On success** — the target `sorry`/`axiom`/open goal is gone, the touched file
-compiles cleanly through the REPL, and a target/dependency scan plus the diff show no new
+compiles cleanly through the REPL, and a project-wide grep shows no new
 `sorry`/`admit`/unledgered `axiom` — write the proof back into the node's file and
 return:
 
@@ -179,8 +180,8 @@ followed by the **concrete blocker** and the honest current state:
 - whether the file currently has a `sorry`/placeholder still in it, and where;
 - if you can name a **specific** missing piece (a named helper lemma, a type
   equivalence, an instance that needs 100+ lines to build) that blocks you, report
-  it as proof-recovery evidence with exact lemma names and statements. Recovery
-  decides whether it is a genuine reconstructing sublemma before growing the DAG.
+  it as an escalation/decomposition with the exact lemma names and statements — a
+  blocked worker naming the precise missing lemma is the signal that *grows the DAG*.
   Never just "this is hard".
 
 Reporting `FAILED` honestly is a correct outcome and the one self-report that is

@@ -19,19 +19,15 @@ zulip = [
     "zulip>=0.9.0",
 ]
 dev = [
-    "mkdocs>=1.6,<2",
-    "pymdown-extensions>=10,<11",
     "pytest>=7.0",
     "ruff>=0.4",
 ]
 
 [project.scripts]
 autoform = "autoform_worker.cli:cli_main"
-autoform-blueprint = "autoform_cli.__main__:main"
-autoform-visualize = "autoform_cli.visualize:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["autoform_cli", "servers", "autoform_worker"]
+packages = ["servers", "autoform_worker"]
 
 [tool.ruff]
 line-length = 120

@@ -52,8 +52,7 @@ OPERATIONAL_FILENAMES = frozenset(
         "formalization.yaml",
     }
 )
-ASSET_NAMES = ("review.css", "static_dashboard.css", "static_dashboard.js")
-BRAND_ASSET = REPO_ROOT / "assets" / "autoform-small.svg"
+ASSET_NAMES = ("static_dashboard.css", "static_dashboard.js")
 _INCOMPLETE = re.compile(r"\b(?:sorry|admit|sorryAx)\b")
 
 
@@ -386,16 +385,11 @@ def _page(title: str, body: str, *, depth: int, mathjax: bool = False, state_url
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{html.escape(title)}</title>"
-        f"<link rel='icon' type='image/svg+xml' href='{prefix}assets/{BRAND_ASSET.name}'>"
         f"<link rel='stylesheet' href='{prefix}assets/review.css'>"
         f"<link rel='stylesheet' href='{prefix}assets/static_dashboard.css'>"
         f"{scripts}</head><body class='af-static'>"
-        f"<header class='af-site-header'><a class='af-brand' href='{prefix}' "
-        "aria-label='Autoform dashboard'>"
-        f"<img class='af-brand-mark' src='{prefix}assets/{BRAND_ASSET.name}' "
-        "width='24' height='24' alt=''><span>Autoform</span></a>"
-        f"<span class='af-site-title'>{html.escape(title)}</span>"
-        "<strong>read-only snapshot</strong></header>"
+        f"<header class='af-site-header'><a href='{prefix}'>Autoform</a>"
+        f"<span>{html.escape(title)}</span><strong>read-only snapshot</strong></header>"
         f"<main class='af-site-main'>{body}</main></body></html>"
     ).encode("utf-8")
 
@@ -413,7 +407,7 @@ def _node_href(node_id: str, node_by_id: dict[str, dict], *, depth: int) -> str:
     return "../" * depth + target
 
 
-def _render_index(snapshot: dict, blueprint: bool = False) -> bytes:
+def _render_index(snapshot: dict) -> bytes:
     node_by_id = {node["id"]: node for node in snapshot["nodes"]}
     coverage = snapshot["coverage"]
     frontier = snapshot["trust_frontier"]
@@ -453,11 +447,7 @@ def _render_index(snapshot: dict, blueprint: bool = False) -> bytes:
         "</section>"
         "<section class='af-frontier'><h2>Trust frontier</h2>"
         f"<ul>{frontier_html}</ul></section>"
-        + ("<section class='af-blueprint'><h2>Blueprint</h2><p>"
-           "<a href='blueprint/'>Read the informal blueprint</a> — the project's "
-           "unified mathematical argument, with its dependency graph.</p></section>"
-           if blueprint else "")
-        + "<section class='af-graph-section'><div class='af-graph-tools'>"
+        "<section class='af-graph-section'><div class='af-graph-tools'>"
         "<h2>Dependency graph</h2>"
         "<label>Filter <input id='af-filter' type='search' autocomplete='off'></label>"
         f"<div class='af-tier-filter'><button type='button' data-tier='all'>all</button>{tier_buttons}</div>"
@@ -526,35 +516,11 @@ def _write(path: Path, payload: bytes) -> None:
     path.write_bytes(payload)
 
 
-def _path_uses_symlink(path: Path, stop: Path) -> bool:
-    current = path
-    stop = stop.resolve()
-    while current != current.parent:
-        if current.is_symlink():
-            return True
-        if current == stop:
-            return False
-        current = current.parent
-    return False
-
-
-def export_site(graph_path: Path, output: Path, repo_root: Path, *, git_commit: str,
-                blueprint: Path | None = None) -> Path:
+def export_site(graph_path: Path, output: Path, repo_root: Path, *, git_commit: str) -> Path:
     repo_root = repo_root.resolve()
-    raw_output = output if output.is_absolute() else repo_root / output
-    if _path_uses_symlink(raw_output, repo_root):
-        raise ExportError("output path must not contain a symlink")
     output = _safe_path(repo_root, output, label="output")
-    graph_path = _safe_path(repo_root, graph_path, label="graph")
-    protected = {repo_root, graph_path, graph_path.parent}
-    if output in protected:
-        raise ExportError("output must be a dedicated directory separate from repository inputs")
-    if any(output in path.parents for path in protected):
-        raise ExportError("output must not contain the repository or dashboard inputs")
-    if blueprint is not None:
-        blueprint_path = _safe_path(repo_root, blueprint, label="blueprint")
-        if output == blueprint_path or output in blueprint_path.parents or blueprint_path in output.parents:
-            raise ExportError("output and blueprint directories must not overlap")
+    if output.is_symlink():
+        raise ExportError("output directory must not be a symlink")
     snapshot, content, kernel = build_snapshot(graph_path, repo_root, git_commit)
     node_by_id = {node["id"]: node for node in snapshot["nodes"]}
 
@@ -564,7 +530,7 @@ def export_site(graph_path: Path, output: Path, repo_root: Path, *, git_commit: 
         for directory in ("nodes", "clusters", "assets", "data"):
             (stage / directory).mkdir()
         _write(stage / ".nojekyll", b"")
-        _write(stage / "index.html", _render_index(snapshot, blueprint=blueprint is not None))
+        _write(stage / "index.html", _render_index(snapshot))
         _write(stage / "data" / "state.json", _pretty_json(snapshot))
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -586,37 +552,11 @@ def export_site(graph_path: Path, output: Path, repo_root: Path, *, git_commit: 
                 _render_cluster_page(cluster, node_by_id),
             )
         asset_root = REPO_ROOT / "assets" / "review"
-        for name in ASSET_NAMES:
+        for name in ("review.css", *ASSET_NAMES):
             source = asset_root / name
             if not source.is_file():
                 raise ExportError(f"required dashboard asset is missing: {name}")
             _write(stage / "assets" / name, source.read_bytes())
-        if not BRAND_ASSET.is_file():
-            raise ExportError(f"required dashboard asset is missing: {BRAND_ASSET.name}")
-        _write(stage / "assets" / BRAND_ASSET.name, BRAND_ASSET.read_bytes())
-
-        # The blueprint is the SHARED informal argument — it belongs on the
-        # published site next to the dashboard, not on one operator's laptop.
-        # It is copied only when already built (the LaTeX toolchain is the
-        # caller's business), and it is static HTML like everything else here.
-        if blueprint is not None:
-            source = _safe_path(repo_root, blueprint, label="blueprint")
-            if source.is_symlink() or not source.is_dir():
-                raise ExportError("blueprint must be an existing directory, not a symlink")
-            copied = 0
-            for item in sorted(source.rglob("*")):
-                if item.is_symlink():
-                    continue          # never follow links out of the build tree
-                relative = item.relative_to(source)
-                target = stage / "blueprint" / relative
-                if item.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-                elif item.is_file():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(item.read_bytes())
-                    copied += 1
-            if not copied:
-                raise ExportError(f"blueprint directory {blueprint} contains no files")
 
         if output.exists():
             if not output.is_dir():
@@ -685,8 +625,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--graph", type=Path, default=Path(".autoform/graph.json"))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--blueprint", type=Path, default=None,
-                        help="a BUILT leanblueprint web directory to publish at /blueprint/")
     parser.add_argument("--git-commit", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -697,8 +635,7 @@ def main(argv: list[str] | None = None) -> int:
         commit = args.git_commit or _git_commit(repo_root)
         if args.git_commit is None:
             _require_committed(repo_root, graph_path)
-        result = export_site(graph_path, output, repo_root, git_commit=commit,
-                             blueprint=args.blueprint)
+        result = export_site(graph_path, output, repo_root, git_commit=commit)
     except (ExportError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
     print(result)

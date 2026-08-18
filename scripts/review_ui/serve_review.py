@@ -27,13 +27,13 @@ API:
                                   delta (new effective verdicts + tainted set).
   * ``GET  /assets/*``          — review.css / review.js (+ any static asset).
 
-Inputs (read-only): Markdown under ``blueprint/``, the built
+Inputs (read-only): ``graph.json``, ``informal_content/<id>.md``, the built
 blueprint (``dep_graph_document.html`` for the ``div.thm#<slug>`` fragments), an
 optional ``kernel/<id>.txt`` (``#print axioms`` dump), and the sidecar.
 
 Run:
-    python serve_review.py --blueprint path/to/blueprint
-    python serve_review.py --blueprint blueprint --port 8765 --open
+    python serve_review.py --graph path/to/graph.json
+    python serve_review.py --graph graph.json --port 8765 --open
 """
 from __future__ import annotations
 
@@ -48,7 +48,6 @@ import tempfile
 import urllib.parse
 import webbrowser
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -65,87 +64,12 @@ import dispatch_queue as dq  # noqa: E402 — shared durable queue validation/id
 # Repo root = .../scripts/review_ui -> up two. Assets live at <root>/assets/review/.
 _REPO_ROOT = _HERE.parent.parent
 _ASSETS_DIR = _REPO_ROOT / "assets" / "review"
-_BRAND_ICON = _REPO_ROOT / "assets" / "autoform-small.svg"
 
 # Regex to pull a single built blueprint fragment <div class="thm" id="slug" ...>
 # ... </div> out of dep_graph_document.html. The exported template renders each
 # tier-2 node as `<div class="thm" id="{{ slug }}" ...>` (MathJax already run), so
 # we inject that fragment verbatim — never regenerating the informalization.
 _THM_OPEN = '<div class="thm"'
-_SCRIPT_NONCE = secrets.token_urlsafe(24)
-_MAX_REQUEST_BODY = 1_000_000
-
-
-def _json_for_script(value) -> str:
-    """Serialize JSON without allowing an inline script element to be closed."""
-    return (json.dumps(value, ensure_ascii=False)
-            .replace("&", "\\u0026")
-            .replace("<", "\\u003c")
-            .replace(">", "\\u003e")
-            .replace("\u2028", "\\u2028")
-            .replace("\u2029", "\\u2029"))
-
-
-class _BlueprintSanitizer(HTMLParser):
-    _DROP_WITH_CONTENT = {"script", "style", "iframe", "object", "embed", "template"}
-    _DROP_TAG = _DROP_WITH_CONTENT | {"base", "link", "meta", "form", "input", "button"}
-    _URL_ATTRS = {"href", "src", "xlink:href", "action", "formaction"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=False)
-        self.parts: list[str] = []
-        self._drop_depth = 0
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag in self._DROP_WITH_CONTENT:
-            self._drop_depth += 1
-            return
-        if self._drop_depth or tag in self._DROP_TAG:
-            return
-        safe_attrs = []
-        for name, value in attrs:
-            lowered = name.lower()
-            value = value or ""
-            if lowered.startswith("on") or lowered == "srcdoc" or lowered == "style":
-                continue
-            if lowered in self._URL_ATTRS:
-                scheme = urllib.parse.urlsplit(value.strip()).scheme.lower()
-                if scheme not in {"", "http", "https"}:
-                    continue
-            safe_attrs.append(f' {htmllib.escape(name, quote=True)}="{htmllib.escape(value, quote=True)}"')
-        self.parts.append(f"<{tag}{''.join(safe_attrs)}>")
-
-    def handle_startendtag(self, tag, attrs):
-        self.handle_starttag(tag, attrs)
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag in self._DROP_WITH_CONTENT:
-            if self._drop_depth:
-                self._drop_depth -= 1
-            return
-        if not self._drop_depth and tag not in self._DROP_TAG:
-            self.parts.append(f"</{tag}>")
-
-    def handle_data(self, data):
-        if not self._drop_depth:
-            self.parts.append(data)
-
-    def handle_entityref(self, name):
-        if not self._drop_depth:
-            self.parts.append(f"&{name};")
-
-    def handle_charref(self, name):
-        if not self._drop_depth:
-            self.parts.append(f"&#{name};")
-
-
-def _sanitize_blueprint_fragment(fragment: str) -> str:
-    sanitizer = _BlueprintSanitizer()
-    sanitizer.feed(fragment)
-    sanitizer.close()
-    return "".join(sanitizer.parts)
 
 def _lean_has_sorry(text: str) -> bool:
     return rm.lean_has_incomplete_proof(text)
@@ -177,9 +101,10 @@ AGENT_PALETTE = [
      "blurb": "big-picture pass over the whole graph", "applies": "any"},
     {"id": "mathcheck", "label": "Mathlib check", "icon": "🔎",
      "blurb": "is this concept already in Mathlib?", "applies": "any"},
-    # Raised after a failed proof; Orchestrate runs the ordered recovery waves.
-    {"id": "escalation", "label": "Proof recovery", "icon": "⚑",
-     "blurb": "research, refute, or decompose before another proof attempt", "applies": "any"},
+    # Raised by the engine when a worker hits a wall; the orchestrate agent triages it
+    # (a human may also drop it to ask the orchestrator to look at a node).
+    {"id": "escalation", "label": "Escalation", "icon": "⚑",
+     "blurb": "a worker hit a wall here — the orchestrator triages (grow the DAG / fix / surface)", "applies": "any"},
 ]
 
 def _registry_palette() -> list | None:
@@ -237,8 +162,8 @@ def _backend_payload() -> dict:
 TASK_QUEUE_CAP = 200
 
 # Statuses an entry may carry; only a *queued* task may be cancelled, and a
-# queued/running/parked task with the same agent+node blocks a duplicate enqueue.
-_ACTIVE_STATUSES = {"queued", "running", "parked"}
+# queued/running task with the same agent+node blocks a duplicate enqueue.
+_ACTIVE_STATUSES = {"queued", "running"}
 
 # Sentinel returned by the body reader on un-parseable JSON (distinct from a valid
 # ``{}`` body) so a POST handler answers 400 rather than treating it as empty.
@@ -305,7 +230,7 @@ def _bounded_queue(queue: List[dict]) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# project context — resolves all inputs around the Markdown blueprint
+# project context — resolves all the read-only inputs around graph.json
 # ---------------------------------------------------------------------------
 
 class Project:
@@ -315,17 +240,16 @@ class Project:
     correct if the graph or a re-run of the jury changes the files under it).
     """
 
-    def __init__(self, blueprint_path: Path):
-        self.blueprint_path = blueprint_path.resolve()
-        legacy = self.blueprint_path.is_file()
-        self.root = self.blueprint_path.parent
-        self.content_dir = self.root / "informal_content" if legacy else self.blueprint_path / "roadmap"
+    def __init__(self, graph_path: Path):
+        self.graph_path = graph_path.resolve()
+        self.root = self.graph_path.parent
+        self.content_dir = self.root / "informal_content"
         self.kernel_dir = self.root / "kernel"
         self.sidecar_path = self.root / "review_status.json"
-        # Live activity feed, read-only, sitting next to blueprint/. The orchestrator
+        # Live activity feed, read-only, sitting next to graph.json. The orchestrator
         # may write it while a run is in flight; this server only ever reads it.
         self.agents_path = self.root / "agents_status.json"
-        # Dispatch queue, sitting next to blueprint/. This is the SECOND deliberate
+        # Dispatch queue, sitting next to graph.json. This is the SECOND deliberate
         # write this server performs (beyond review_status.json): an append-only-ish
         # list of task requests an external orchestrator consumes. The server writes
         # it but NEVER spawns an agent / runs claude — it only dispatches.
@@ -343,11 +267,11 @@ class Project:
 
     # --- graph + sidecar ---
     def nodes(self):
-        nodes, _meta = rm.load_graph(self.blueprint_path)
+        nodes, _meta = rm.load_graph(self.graph_path)
         return nodes
 
     def metadata(self):
-        _nodes, meta = rm.load_graph(self.blueprint_path)
+        _nodes, meta = rm.load_graph(self.graph_path)
         return meta
 
     def sidecar(self) -> dict:
@@ -364,7 +288,7 @@ class Project:
 
     # --- the dispatch queue (the second deliberate write) ---
     def task_queue(self, *, strict: bool = False) -> List[dict]:
-        """The current dispatch queue, read from project-local ``task_queue.json``.
+        """The current dispatch queue, read from ``task_queue.json`` next to graph.json.
 
         Read-only dashboard rendering is best-effort: malformed state degrades
         to an empty list instead of taking down the UI. Every mutation passes
@@ -446,24 +370,19 @@ class Project:
                 return None
             open_tag = text[open_at:tag_end]
             if needle in open_tag:
-                return _sanitize_blueprint_fragment(_extract_balanced_div(text, open_at))
+                return _extract_balanced_div(text, open_at)
             idx = tag_end + 1
 
     def informal_md(self, node_id: str, node: dict) -> Optional[str]:
         """Raw informal_content markdown for a node (fallback when no blueprint)."""
         cand = []
         cpath = node.get("content")
-        if isinstance(cpath, str):
+        if cpath:
             cand.append(self.root / cpath)
         cand.append(self.content_dir / f"{node_id}.md")
         for c in cand:
-            try:
-                resolved = c.resolve()
-                resolved.relative_to(self.root)
-            except (OSError, ValueError):
-                continue
-            if resolved.is_file():
-                return resolved.read_text(errors="replace")
+            if c.is_file():
+                return c.read_text(errors="replace")
         return None
 
     def lean_source(self, node_id: str, node: dict,
@@ -563,7 +482,7 @@ class Project:
 
         # Explicit pins: lean_file (relative, as resolved against root) -> node id.
         # An explicit lean_file wins over the path-derived module id for that file.
-        explicit: Dict[Path, set[str]] = {}
+        explicit: Dict[Path, str] = {}
         for nid, node in nodes.items():
             rel = (node or {}).get("lean_file")
             if not rel:
@@ -573,18 +492,11 @@ class Project:
                 tgt.relative_to(root)            # ignore any ../ escape
             except (OSError, ValueError):
                 continue
-            explicit.setdefault(tgt, set()).add(nid)
+            explicit[tgt] = nid
 
         flagged: set = set()
-        lean_files = []
         try:
-            for directory, dirnames, filenames in os.walk(root, followlinks=False):
-                dirnames[:] = sorted(
-                    name for name in dirnames
-                    if name not in {".git", ".lake", ".venv", "build", "node_modules"}
-                )
-                base = Path(directory)
-                lean_files.extend(base / name for name in sorted(filenames) if name.endswith(".lean"))
+            lean_files = sorted(root.rglob("*.lean"))
         except OSError:
             lean_files = []
         for f in lean_files:
@@ -597,15 +509,16 @@ class Project:
             fr = f.resolve()
             # Map this file to a module id: an explicit lean_file pin wins, else the
             # dotted path relative to lean_root (A/B/C.lean -> A.B.C).
-            node_ids = explicit.get(fr)
-            if node_ids is None:
+            nid = explicit.get(fr)
+            if nid is None:
                 try:
                     relpath = fr.relative_to(root)
                 except ValueError:
                     continue
-                node_ids = {".".join(relpath.with_suffix("").parts)}
+                nid = ".".join(relpath.with_suffix("").parts)
             # Only a real graph node counts (no phantom ids from stray .lean files).
-            flagged.update(nid for nid in node_ids if nid in nodes)
+            if nid in nodes:
+                flagged.add(nid)
 
         # Propagate each flagged module to its ancestors (parent unit, cluster, …) by
         # walking node['parent'] up the topology, bounded against a malformed cycle.
@@ -622,11 +535,7 @@ class Project:
 
     def kernel_evidence(self, node_id: str) -> Optional[str]:
         """The ``#print axioms`` dump for a node, if a ``kernel/<id>.txt`` exists."""
-        p = (self.kernel_dir / f"{node_id}.txt").resolve()
-        try:
-            p.relative_to(self.kernel_dir.resolve())
-        except ValueError:
-            return None
+        p = self.kernel_dir / f"{node_id}.txt"
         if p.is_file():
             return p.read_text(errors="replace")
         return None
@@ -670,22 +579,19 @@ def _page(title: str, body: str, bootstrap: str = "") -> bytes:
 
     Every page carries the per-process CSRF token (``window.__RV_TOKEN__``) so
     the client JS can send it back as ``X-Review-Token`` on its POSTs."""
-    boot = (f"<script nonce='{_SCRIPT_NONCE}'>window.__RV_TOKEN__ = {_json_for_script(_API_TOKEN)};"
+    boot = (f"<script>window.__RV_TOKEN__ = {json.dumps(_API_TOKEN)};"
             f"{bootstrap}</script>")
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{_E(title)}</title>"
-        "<link rel='icon' type='image/svg+xml' href='/assets/autoform-small.svg'>"
         "<link rel='stylesheet' href='/assets/review.css'>"
-        f"<script nonce='{_SCRIPT_NONCE}'>window.MathJax={{tex:{{inlineMath:[['$','$'],['\\\\(','\\\\)']],"
+        "<script>window.MathJax={tex:{inlineMath:[['$','$'],['\\\\(','\\\\)']],"
         "displayMath:[['$$','$$'],['\\\\[','\\\\]']]},"
         "options:{skipHtmlTags:['script','noscript','style','textarea','pre','code']}};</script>"
         "<script async src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'></script>"
         "</head><body>"
-        "<header class='rv-header'><a class='rv-home' href='/' aria-label='Autoform dashboard'>"
-        "<img class='rv-brand-mark' src='/assets/autoform-small.svg' width='24' height='24' alt=''>"
-        "<span>Autoform</span></a>"
+        "<header class='rv-header'><a class='rv-home' href='/'>review</a>"
         f"<span class='rv-title'>{_E(title)}</span></header>"
         f"<main class='rv-main'>{body}</main>"
         f"{boot}"
@@ -930,42 +836,42 @@ def render_home(proj: Project, tier: Optional[int] = None,
     kinds = {nid: (node.get("kind") or "theorem") for nid, node in nodes.items()}
 
     boot = (
-        f"window.__RV_DOT__ = {_json_for_script(dot)};"
-        f"window.__RV_STATE__ = {_json_for_script(state)};"
-        f"window.__RV_IDBYSLUG__ = {_json_for_script(id_by_slug)};"
-        f"window.__RV_KINDS__ = {_json_for_script(kinds)};"
-        f"window.__RV_PALETTE__ = {_json_for_script(rm.PALETTE)};"
+        f"window.__RV_DOT__ = {json.dumps(dot)};"
+        f"window.__RV_STATE__ = {json.dumps(state)};"
+        f"window.__RV_IDBYSLUG__ = {json.dumps(id_by_slug)};"
+        f"window.__RV_KINDS__ = {json.dumps(kinds)};"
+        f"window.__RV_PALETTE__ = {json.dumps(rm.PALETTE)};"
         f"window.__RV_TIER__ = {tier};"
         # The tiers actually present (drives the tier toggle + valid jump targets).
-        f"window.__RV_TIERS__ = {_json_for_script(present)};"
+        f"window.__RV_TIERS__ = {json.dumps(present)};"
         # Focus mode: {parent, label, members:[child ids one tier down]} or null.
         # In a too-large flat tier `focus` is still null; focus implies a local view.
         # The client adds a steady focus ring to the members + a "back" banner.
-        f"window.__RV_FOCUS__ = {_json_for_script(focus_payload)};"
+        f"window.__RV_FOCUS__ = {json.dumps(focus_payload)};"
         # Local-view flags. __RV_NEIGHBORHOOD__ is true for a focus/anchor view (the
         # `only` subgraph is bounded, so it renders normally). __RV_ANCHOR__ is
         # {id, radius} for an anchor view (drives the "±K hops · ‹ back" banner and
         # the "expand ±1 hop" control), else null.
-        f"window.__RV_NEIGHBORHOOD__ = {_json_for_script(neighborhood_view)};"
-        f"window.__RV_ANCHOR__ = {_json_for_script(anchor_payload)};"
+        f"window.__RV_NEIGHBORHOOD__ = {json.dumps(neighborhood_view)};"
+        f"window.__RV_ANCHOR__ = {json.dumps(anchor_payload)};"
         # Too-large flat guard: when set, the client renders a placeholder card +
         # entry-point picker (from __RV_NODES__) INSTEAD of the d3 graph — the DOT
         # is an empty placeholder, never the full N-node graph.
         #   __RV_TOO_LARGE__ = {tier, count, threshold} | null
         #   __RV_NODES__     = [{id,label,parent}] (the tier's nodes, for the picker)
-        f"window.__RV_TOO_LARGE__ = {_json_for_script(too_large)};"
-        f"window.__RV_NODES__ = {_json_for_script(tier_nodes)};"
+        f"window.__RV_TOO_LARGE__ = {json.dumps(too_large)};"
+        f"window.__RV_NODES__ = {json.dumps(tier_nodes)};"
         # The client owns the `expanded` set; it starts empty (home = collapsed).
         f"window.__RV_EXPANDED__ = [];"
         # Tier-agnostic parent/children topology so the client can tell a parent
         # (click → unroll) from a leaf (click → packet) at ANY tier, and map a
         # tier-(N+1) child to its (collapsed) parent box for the pulse.
-        f"window.__RV_TOPO__ = {_json_for_script(_topology(nodes))};"
+        f"window.__RV_TOPO__ = {json.dumps(_topology(nodes))};"
         # Tells the client an /api/agents feed exists and where to poll it. The
         # Activity-panel HTML/JS is built client-side (Frontend phase), not here —
         # we only expose the data hooks + the container div below.
-        f"window.__RV_AGENTS_URL__ = {_json_for_script('/api/agents')};"
-        f"window.__RV_DOT_URL__ = {_json_for_script('/api/dot')};"
+        f"window.__RV_AGENTS_URL__ = {json.dumps('/api/agents')};"
+        f"window.__RV_DOT_URL__ = {json.dumps('/api/dot')};"
     )
     cov = state["coverage"]
     frontier = state["trust_frontier"]
@@ -1136,11 +1042,11 @@ def render_node(proj: Project, node_id: str) -> bytes:
     node_tier = eb.node_tier(node)
     present = rm.tiers_present(nodes)
     boot = (
-        f"window.__RV_NODE__ = {_json_for_script(node_id)};"
-        f"window.__RV_SCORECARD__ = {_json_for_script(scorecard)};"
+        f"window.__RV_NODE__ = {json.dumps(node_id)};"
+        f"window.__RV_SCORECARD__ = {json.dumps(scorecard)};"
         # Drives the packet's "view neighborhood ▸" link (→ /?tier=<tier>&anchor=<id>).
-        f"window.__RV_NODE_TIER__ = {_json_for_script(node_tier)};"
-        f"window.__RV_TIERS__ = {_json_for_script(present)};"
+        f"window.__RV_NODE_TIER__ = {json.dumps(node_tier)};"
+        f"window.__RV_TIERS__ = {json.dumps(present)};"
     )
     # Real Lean source for a module node (tier-3), read live from lean_root.
     lean = proj.lean_source(node_id, node)
@@ -1285,16 +1191,6 @@ def make_handler(proj: Project):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header(
-                "Content-Security-Policy",
-                "default-src 'self'; object-src 'none'; base-uri 'none'; "
-                "frame-ancestors 'none'; connect-src 'self'; img-src 'self' data:; "
-                "style-src 'self' 'unsafe-inline'; font-src 'self' https://cdn.jsdelivr.net data:; "
-                f"script-src 'self' https://cdn.jsdelivr.net 'nonce-{_SCRIPT_NONCE}'",
-            )
             self.end_headers()
             self.wfile.write(body)
 
@@ -1303,9 +1199,6 @@ def make_handler(proj: Project):
 
         # --- GET ---
         def do_GET(self):
-            deny = _host_denied(self.headers.get("Host"), self.server.server_address[1])
-            if deny:
-                return self._json(403, {"ok": False, "error": deny})
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             if path == "/":
@@ -1435,9 +1328,9 @@ def make_handler(proj: Project):
             })
 
         def _serve_asset(self, name):
-            # Only serve files under assets/review/ plus the canonical brand mark.
+            # Only serve files under assets/review/ (no traversal).
             safe = Path(name).name
-            f = _BRAND_ICON if safe == _BRAND_ICON.name else _ASSETS_DIR / safe
+            f = _ASSETS_DIR / safe
             if not f.is_file():
                 return self._send(404, b"asset not found")
             ctype = {
@@ -1451,17 +1344,11 @@ def make_handler(proj: Project):
             """Read + parse the request's JSON body, or (None) on bad JSON. Returns the
             parsed object, or the sentinel ``_BAD_JSON`` when the body is not valid JSON
             (so the caller can answer 400 rather than crash)."""
+            length = int(self.headers.get("Content-Length", "0"))
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except (TypeError, ValueError):
+                return json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
                 return _BAD_JSON
-            if length < 0 or length > _MAX_REQUEST_BODY:
-                return _BAD_JSON
-            try:
-                parsed = json.loads(self.rfile.read(length) or b"{}")
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return _BAD_JSON
-            return parsed if isinstance(parsed, dict) else _BAD_JSON
 
         def _csrf_denied(self) -> Optional[str]:
             """Why this POST fails the CSRF gate (Host allowlist + token), or None."""
@@ -1644,9 +1531,7 @@ def make_handler(proj: Project):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Local DAG review server (127.0.0.1)")
-    source = ap.add_mutually_exclusive_group(required=True)
-    source.add_argument("--blueprint", type=Path, help="path to blueprint directory")
-    source.add_argument("--graph", type=Path, help=argparse.SUPPRESS)
+    ap.add_argument("--graph", type=Path, required=True, help="path to graph.json")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--open", action="store_true",
                     help="open the home screen in a browser")
@@ -1656,12 +1541,10 @@ def main(argv=None) -> int:
                          "module packets. Overrides graph metadata.lean_root.")
     args = ap.parse_args(argv)
 
-    blueprint_path = (args.blueprint or args.graph).resolve()
-    if args.blueprint is not None and not (blueprint_path / "roadmap").is_dir():
-        ap.error(f"blueprint/roadmap not found: {blueprint_path}")
-    if args.graph is not None and not blueprint_path.is_file():
-        ap.error(f"legacy graph not found: {blueprint_path}")
-    proj = Project(blueprint_path)
+    graph_path = args.graph.resolve()
+    if not graph_path.is_file():
+        ap.error(f"graph.json not found: {graph_path}")
+    proj = Project(graph_path)
     if args.lean_root is not None:
         proj.lean_root = args.lean_root.resolve()
 
@@ -1669,7 +1552,7 @@ def main(argv=None) -> int:
     actual_port = int(server.server_address[1])
     url = f"http://127.0.0.1:{actual_port}/"
     print(f"review server → {url}  (Ctrl-C to stop)")
-    print(f"  blueprint: {blueprint_path}")
+    print(f"  graph:   {graph_path}")
     print(f"  sidecar: {proj.sidecar_path}")
     if not proj.blueprint_html.is_file():
         print(f"  note: blueprint not built at {proj.blueprint_html}\n"
