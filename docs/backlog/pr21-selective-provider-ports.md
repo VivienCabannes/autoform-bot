@@ -1,25 +1,25 @@
 # PR #21 selective provider ports
 
-PR [#21](https://github.com/VivienCabannes/autoform-bot/pull/21) explored full Claude, Codex, Muse, OpenAI-compatible, and Avocado provider parity. Its exact head is preserved at `archive/pr21-full-parity-59fb7956` (`59fb7956e3b139c0440c0daea1acb565ce9d577d`).
+PR [#21](https://github.com/VivienCabannes/autoform-bot/pull/21) explored Claude, Codex, Aristotle, and OpenAI-compatible/Avocado provider parity. Its exact head is preserved at `archive/pr21-full-parity-59fb7956` (`59fb7956e3b139c0440c0daea1acb565ce9d577d`). Muse support was developed later on the separate 0.6.1 line, preserved at `archive/rework-exact-20260818` (`58867a2843964d25baa9c52a0e7fccf829ef5a81`).
 
-Do not merge or cherry-pick that branch wholesale. It is built around the retired `graph.json`, dispatcher, dashboard, and v2 migration architecture. Current Autoform uses Markdown roadmap articles, Git-ref claims, portable workflow skills, and the shared Lean LSP/REPL runtime.
+Do not merge or cherry-pick either archive wholesale. PR #21 is built around the retired `graph.json`, dispatcher, stateful queue/dashboard control plane, and v2 migration architecture. Current Autoform retains rendered publication dashboards, but derives them from Markdown roadmap articles rather than mutable dispatcher state.
 
 ## Already integrated or superseded
 
-- Portable Setup, Roadmap, Orchestrate, review, and plugin-development skills.
-- Claude, Codex, and Muse plugin manifests.
-- Native LSP and REPL MCP exposure.
-- Claim-backed worker coordination.
-- Host-neutral agent definitions and review workflows.
-- Minimal package and CI contracts.
+- Main provides portable Setup, Roadmap, review, and plugin-development skills.
+- The separate Deicyde overlay provides Orchestrate and worker execution; main intentionally excludes them.
+- Main provides Git-ref claim primitives, but this does not imply that every Deicyde worker path enforces coordinated failure handling.
+- Current host packages provide Claude, Codex, and Muse manifests independently of PR #21.
+- Main exposes native LSP and REPL MCP services through the shared Lean runtime.
+- Current branches provide host-neutral agent definitions, review workflows, and minimal package/CI contracts.
 
 ## Selective ports
 
 Each item below requires an independent current-architecture design and implementation PR.
 
-### Provider adapters
+### Provider interface and adapters
 
-Define bounded headless adapters for Claude, Codex, and Muse behind the current prover interface. Preserve provider-neutral requests and results; do not revive the old dispatcher or task schema.
+First design a new provider-neutral request, result, cancellation, and error interface for the current architecture. Main has no prover interface today; do not adopt the archived `servers/prover` contract by default. After that design is reviewed, implement bounded headless adapters for the selected hosts without reviving the old dispatcher or task schema.
 
 Required gates:
 
@@ -42,11 +42,12 @@ Required gates:
 
 ### Provider-neutral jury execution
 
-Design a jury layer over current proof artifacts and review rubrics. A provider must not judge its own unverified output as the sole acceptance signal.
+Design a jury layer over current proof artifacts and review rubrics. A provider must not judge its own output as the sole acceptance signal.
 
 Required gates:
 
-- Independent provider or deterministic verifier separation.
+- Deterministic verification may establish compilation and proof integrity only.
+- Source faithfulness, statement equivalence, and code-quality judgments require an independent reviewer or provider.
 - Stable evidence bundles and score schemas.
 - Bounded fan-out and cost accounting.
 - Adversarial tests for prompt injection in candidate proofs and source material.
@@ -75,7 +76,7 @@ Required gates:
 
 ### Muse staging
 
-Build Muse packages in an isolated staging directory rather than directly from a mutable checkout.
+This concept comes from the later archived 0.6.1 line, not PR #21. Build Muse packages in an isolated staging directory rather than directly from a mutable checkout.
 
 Required gates:
 
@@ -86,22 +87,22 @@ Required gates:
 
 ### Independent proof verification
 
-A provider-written Lean proof must be checked outside the provider trust boundary before it can be accepted.
+A provider-written Lean proof must be checked outside the provider's trust boundary before it can be accepted. Process separation alone is not a security boundary: Lean elaboration and metaprogramming can execute with the invoking user's privileges.
 
 Required gates:
 
-- Kernel-backed Lean verification through the current shared runtime or CI.
-- Reject unsafe or partial declarations where the workflow requires kernel trust.
-- Record the exact source, toolchain, imports, and verification result.
-- Never treat provider self-report, successful text generation, or an untrusted HTTP response as proof validity.
+- Evaluate provider-originated Lean in a sandbox with least privilege, restricted inputs, explicit command/tool allowlists, destination confinement, and bounded CPU, memory, process, filesystem, and network access.
+- Perform kernel-backed verification and an explicit axiom audit; reject `sorryAx`, unauthorized axioms, unsafe declarations, and partial declarations regardless of whether verification runs through the shared runtime or CI.
+- Record the exact source, toolchain, imports, allowed axioms, and verification result.
+- Never treat provider self-report, successful text generation, compilation alone, or an untrusted HTTP response as proof validity.
 
 ## Security prerequisites
 
 Before any port:
 
-- Write a threat model covering credentials, untrusted repository content, model output, tool execution, and artifact publication.
+- Write a threat model covering credentials, untrusted repository content, model output, tool execution, Lean metaprogramming, and artifact publication.
 - Require explicit egress consent per provider and endpoint.
 - Validate all user-controlled provider, model, URL, command, and filesystem configuration.
-- Keep Lean and shell execution outside provider-controlled processes.
-- Add credential-leak, prompt-injection, path-traversal, timeout, and resource-exhaustion tests.
-- Collect fresh pilot evidence; PR #21's July 2026 pilot results are historical only.
+- Run every provider-originated Lean or shell operation with sandboxing, least privilege, explicit tool and argument allowlists, restricted inputs, and destination confinement.
+- Add credential-leak, prompt-injection, path-traversal, unauthorized-axiom, unsafe-declaration, timeout, and resource-exhaustion tests.
+- Collect fresh pilot evidence. PR #21 contains only a pilot procedure; the later, incomplete historical result record is preserved at [`docs/pilot-results-2026-07-27.md`](https://github.com/VivienCabannes/autoform-bot/blob/58867a2843964d25baa9c52a0e7fccf829ef5a81/docs/pilot-results-2026-07-27.md) and must not be treated as a current release gate.
