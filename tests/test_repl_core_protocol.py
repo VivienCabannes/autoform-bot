@@ -173,11 +173,21 @@ def _repl_with_process(process: _PipeProcess, *, chunk_size: int = 4096, max_buf
 def _patch_pipe_reads(monkeypatch, process: _PipeProcess):
     real_read = os.read
 
+    def take_chunk(chunks: list[bytes], size: int) -> bytes:
+        if not chunks:
+            return b""
+        result = chunks[0][:size]
+        chunks[0] = chunks[0][size:]
+        if not chunks[0]:
+            chunks.pop(0)
+        return result
+
     def fake_read(fd: int, size: int) -> bytes:
         if fd == process.stdout.fileno():
-            return process.stdout_chunks.pop(0) if process.stdout_chunks else b""
+            return take_chunk(process.stdout_chunks, size)
         if fd == process.stderr.fileno():
-            result, process.stderr_bytes = process.stderr_bytes, b""
+            result = process.stderr_bytes[:size]
+            process.stderr_bytes = process.stderr_bytes[size:]
             return result
         return real_read(fd, size)
 
@@ -207,17 +217,34 @@ def test_wire_protocol_accepts_response_split_across_reads(monkeypatch):
         assert json.loads(request.decode().strip()) == {"cmd": "#check Nat", "env": 3}
 
 
-def test_wire_protocol_reports_stderr_on_premature_eof(monkeypatch):
+def test_wire_protocol_preserves_utf8_split_across_reads(monkeypatch):
+    response = json.dumps({"messages": [{"data": "Nat → Nat"}]}, ensure_ascii=False).encode()
+    arrow = "→".encode()
+    split = response.index(arrow) + 1
     with ExitStack() as stack:
-        process = _PipeProcess(stack, [b""], stderr=b"lean crashed")
+        process = _PipeProcess(
+            stack,
+            [response[:split], response[split:] + b"\n\n"],
+        )
+        repl = _repl_with_process(process, chunk_size=7)
+        _patch_pipe_reads(monkeypatch, process)
+
+        result = repl._run("#check Nat", env_id=None, timeout=1)
+
+    assert result["messages"][0]["data"] == "Nat → Nat"
+
+
+def test_wire_protocol_reports_complete_stderr_on_premature_eof(monkeypatch):
+    stderr = (b"x" * 5000) + b"lean crashed"
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b""], stderr=stderr)
         repl = _repl_with_process(process)
         _patch_pipe_reads(monkeypatch, process)
 
-        with pytest.raises(
-            repl_core.ReplProcessExited,
-            match="lean crashed",
-        ):
+        with pytest.raises(repl_core.ReplProcessExited) as error:
             repl._run("#check Nat", env_id=None, timeout=1)
+
+    assert str(error.value).endswith(stderr.decode())
 
 
 def test_wire_protocol_rejects_invalid_json(monkeypatch):
