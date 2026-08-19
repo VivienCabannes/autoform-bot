@@ -214,9 +214,18 @@ def _audit(args: argparse.Namespace) -> int:
     result = audit_blueprint(args.blueprint_dir, lean_root=args.lean_root)
     if args.json:
         print(result.to_json())
-    elif result.clean:
-        print("OK: roadmap audit passed")
     else:
+        if result.clean:
+            print("OK: roadmap audit passed")
+        if result.coverage is not None:
+            counts = result.coverage.counts
+            print(
+                "    coverage: "
+                f"{counts['MAPPED']} mapped · "
+                f"{counts['DECOMPOSED']} decomposed · "
+                f"{counts['DEFERRED']} deferred · "
+                f"{counts['OUT']} out"
+            )
         for finding in result.findings:
             print(f"error: {finding.article_path}: {finding.code}: {finding.reason}")
     return 0 if result.clean else 1
