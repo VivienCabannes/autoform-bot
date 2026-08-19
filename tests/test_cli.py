@@ -19,7 +19,11 @@ def _clean_blueprint(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (coverage / "README.md").write_text(
-        "# Coverage\n\nEvery declared target is represented.\n", encoding="utf-8"
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | No formalization target |\n",
+        encoding="utf-8",
     )
     return blueprint
 
@@ -69,7 +73,26 @@ def test_audit_cli_reports_clean_human_output(tmp_path: Path, capsys) -> None:
     blueprint = _clean_blueprint(tmp_path)
 
     assert main(["audit", str(blueprint)]) == 0
-    assert capsys.readouterr().out == "OK: roadmap audit passed\n"
+    assert capsys.readouterr().out == (
+        "OK: roadmap audit passed\n"
+        "    coverage: 0 mapped · 0 decomposed · 0 deferred · 1 out\n"
+    )
+
+
+def test_audit_cli_prints_coverage_summary_with_findings(tmp_path: Path, capsys) -> None:
+    blueprint = _clean_blueprint(tmp_path)
+    (blueprint / "coverage/README.md").write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main theorem | MAPPED | Source audit pending |\n",
+        encoding="utf-8",
+    )
+
+    assert main(["audit", str(blueprint)]) == 1
+    output = capsys.readouterr().out
+    assert "coverage: 1 mapped · 0 decomposed · 0 deferred · 0 out" in output
+    assert "declared-coverage-gap" in output
 
 
 def test_audit_cli_reports_stable_json_and_failure(tmp_path: Path, capsys) -> None:
@@ -80,6 +103,7 @@ def test_audit_cli_reports_stable_json_and_failure(tmp_path: Path, capsys) -> No
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "clean": False,
+        "coverage": None,
         "findings": [
             {
                 "article_path": "coverage/README.md",

@@ -44,7 +44,13 @@ def _clean_project(tmp_path: Path, *, metadata: tuple[str, ...] = ("declaration:
     _article(project, metadata=metadata)
     coverage = project / "blueprint" / "coverage" / "README.md"
     coverage.parent.mkdir(parents=True)
-    coverage.write_text("# Coverage\n\nEvery declared target is represented.\n", encoding="utf-8")
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | No formalization target |\n",
+        encoding="utf-8",
+    )
     return project
 
 
@@ -115,7 +121,11 @@ def test_graph_errors_redact_absolute_authored_paths(tmp_path: Path, directory: 
 def test_audit_findings_fail_only_the_audit_check(tmp_path: Path) -> None:
     project = _clean_project(tmp_path)
     (project / "blueprint" / "coverage" / "README.md").write_text(
-        "# Coverage\n\nStatus: PARTIAL\n", encoding="utf-8"
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main theorem | MAPPED | Source audit pending |\n",
+        encoding="utf-8",
     )
 
     result = diagnose_project(project)
@@ -236,11 +246,11 @@ def test_doctor_is_byte_for_byte_read_only_and_uses_no_network_or_subprocess(
     assert not (project / "state").exists()
 
 
-def test_bundled_example_truthfully_reports_partial_coverage(repo_root: Path) -> None:
+def test_bundled_example_truthfully_reports_incomplete_coverage(repo_root: Path) -> None:
     project = repo_root / "skills" / "setup" / "assets" / "cabannes-thesis-project"
 
     result = diagnose_project(project, lean_root=project)
 
     assert not result.clean
-    assert _checks(result)["audit"] == (False, "1 finding(s): declared-coverage-gap")
+    assert _checks(result)["audit"] == (False, "5 finding(s): declared-coverage-gap")
     assert _checks(result)["lean targets"][0]

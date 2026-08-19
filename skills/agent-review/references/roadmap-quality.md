@@ -16,8 +16,10 @@ scope against the sources, then inspect the fine DAG and its coarse roadmap.
 
 - Every planned main result has a stable source location and preserves its
   objects, hypotheses, quantifiers, and conclusion.
-- Coverage notes distinguish mapped material, decomposed material, deferred
-  material, and material explicitly out of scope.
+- The machine-checkable `Area | Coverage | Evidence` table uses `MAPPED`,
+  `DECOMPOSED`, `DEFERRED`, and `OUT` to distinguish known material, roadmap
+  nodes, explicit later work, and material outside formalization scope.
+- Every row has concrete evidence, and no `MAPPED` row is described as complete.
 - The fine nodes and coarse roadmap agree; discoveries made during decomposition
   are reflected in the milestones and coverage contract.
 
