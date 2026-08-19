@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from . import status
+from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project
 
@@ -24,17 +25,6 @@ _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 _INLINE_CODE = re.compile(r"(`+).*?\1")
 _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
-_COVERAGE_GAP = re.compile(
-    r"(?:"
-    r"`(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)`"
-    r"|\|\s*(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\s*\|"
-    r"|^\s*#{1,6}\s+(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\b"
-    r"|^\s*(?:[-*+]\s+)?(?:status|coverage)\s*:\s*"
-    r"(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\b"
-    r"|^\s*[-*+]\s+(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\b"
-    r")",
-    re.I,
-)
 _EXTERNAL_SCHEMES = frozenset({"http", "https"})
 _MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
 #: The trailing attr-list block and an explicit `#id` within it. MkDocs allows
@@ -84,6 +74,7 @@ class AuditResult:
     """The complete, canonically ordered result of one audit."""
 
     findings: tuple[AuditFinding, ...] = ()
+    coverage: CoverageSummary | None = None
 
     @property
     def clean(self) -> bool:
@@ -96,6 +87,7 @@ class AuditResult:
 
         return {
             "clean": self.clean,
+            "coverage": self.coverage.as_dict() if self.coverage is not None else None,
             "findings": [asdict(finding) for finding in self.findings],
         }
 
@@ -117,6 +109,10 @@ def audit_blueprint(
     """
 
     blueprint = Path(blueprint_dir).expanduser().resolve()
+    if blueprint.is_dir():
+        coverage, coverage_findings = _coverage_findings(blueprint)
+    else:
+        coverage, coverage_findings = None, []
     try:
         graph = load_graph(blueprint)
     except GraphValidationError as error:
@@ -128,11 +124,22 @@ def audit_blueprint(
             )
             for issue in error.issues
         ]
-        return _result(findings)
-    return audit_graph(graph, lean_root=lean_root)
+        return _result([*findings, *coverage_findings], coverage=coverage)
+    return audit_graph(
+        graph,
+        lean_root=lean_root,
+        coverage=coverage,
+        coverage_findings=coverage_findings,
+    )
 
 
-def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditResult:
+def audit_graph(
+    graph: Graph,
+    *,
+    lean_root: str | Path | None = None,
+    coverage: CoverageSummary | None = None,
+    coverage_findings: list[AuditFinding] | None = None,
+) -> AuditResult:
     """Audit an already loaded graph without modifying it or its source files."""
 
     findings: list[AuditFinding] = []
@@ -226,11 +233,15 @@ def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditRe
 
         findings.extend(_source_findings(graph, node, article_path))
 
-    findings.extend(_coverage_findings(graph.blueprint_dir))
+    if coverage_findings is None:
+        coverage, coverage_findings = _coverage_findings(graph.blueprint_dir)
+    findings.extend(coverage_findings)
     if lean_root is not None:
         findings.extend(_lean_findings(graph, lean_root))
-    return _result(findings)
+    return _result(findings, coverage=coverage)
 
+
+@dataclass
 
 @dataclass(frozen=True, slots=True)
 class _ArticleShape:
@@ -389,54 +400,45 @@ def _markdown_anchors(path: Path) -> set[str]:
     return anchors
 
 
-def _coverage_findings(blueprint: Path) -> list[AuditFinding]:
-    coverage_root = blueprint / "coverage"
-    contract = coverage_root / "README.md"
-    if not contract.is_file():
-        return [
-            AuditFinding(
-                "coverage/README.md",
-                "missing-coverage-contract",
-                "coverage contract is missing",
-            )
-        ]
+def _coverage_findings(
+    blueprint: Path,
+) -> tuple[CoverageSummary | None, list[AuditFinding]]:
+    contract = blueprint / "coverage" / "README.md"
+    coverage, issues = load_coverage(blueprint)
+    findings = [
+        AuditFinding(
+            "coverage/README.md",
+            (
+                "missing-coverage-contract"
+                if issue.reason == "coverage contract is missing"
+                else "invalid-coverage-contract"
+            ),
+            f"{issue.reason}{f' (line {issue.line})' if issue.line else ''}",
+        )
+        for issue in issues
+    ]
+    if coverage is None:
+        return None, findings
 
-    findings: list[AuditFinding] = []
-    coverage_files = sorted(path for path in coverage_root.rglob("*.md") if path.is_file())
-    for path in coverage_files:
-        article_path = _relative_path(path, blueprint)
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            findings.append(
-                AuditFinding(article_path, "unreadable-coverage-file", "coverage file cannot be read as UTF-8")
-            )
-            continue
-
-        if path == contract and not _has_substantive_markdown(text):
+    for entry in coverage.entries:
+        if entry.disposition == "MAPPED":
             findings.append(
                 AuditFinding(
-                    article_path,
-                    "empty-coverage-contract",
-                    "coverage contract has no substantive content",
-                )
-            )
-
-        for line_number, marker in _coverage_gap_markers(text):
-            findings.append(
-                AuditFinding(
-                    article_path,
+                    "coverage/README.md",
                     "declared-coverage-gap",
-                    f"coverage contract declares {marker} at line {line_number}",
+                    f"coverage area {entry.area!r} is mapped but not dispositioned (line {entry.line})",
                 )
             )
 
-        for line_number, target in _markdown_links(text):
-            issue = _local_target_issue(path, target, blueprint, label="coverage")
-            if issue is not None:
-                code, reason = issue
-                findings.append(AuditFinding(article_path, code, f"{reason} (line {line_number})"))
-    return findings
+    text = contract.read_text(encoding="utf-8")
+    for line_number, target in _markdown_links(text):
+        issue = _local_target_issue(contract, target, blueprint, label="coverage")
+        if issue is not None:
+            code, reason = issue
+            findings.append(
+                AuditFinding("coverage/README.md", code, f"{reason} (line {line_number})")
+            )
+    return coverage, findings
 
 
 def _has_substantive_markdown(text: str) -> bool:
@@ -448,31 +450,6 @@ def _has_substantive_markdown(text: str) -> bool:
         if line.strip():
             return True
     return False
-
-
-def _coverage_gap_markers(text: str) -> list[tuple[int, str]]:
-    markers: list[tuple[int, str]] = []
-    fence: tuple[str, int] | None = None
-    in_comment = False
-    for line_number, raw in enumerate(text.splitlines(), start=1):
-        line, in_comment = _strip_line_comments(raw, in_comment)
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        seen: set[str] = set()
-        for match in _COVERAGE_GAP.finditer(line):
-            marker = next(group for group in match.groups() if group is not None).upper()
-            if marker not in seen:
-                markers.append((line_number, marker))
-                seen.add(marker)
-    return markers
 
 
 def _markdown_links(text: str) -> list[tuple[int, str]]:
@@ -667,8 +644,12 @@ def _is_within(path: Path, directory: Path) -> bool:
     return True
 
 
-def _result(findings: list[AuditFinding]) -> AuditResult:
-    return AuditResult(tuple(sorted(set(findings))))
+def _result(
+    findings: list[AuditFinding],
+    *,
+    coverage: CoverageSummary | None = None,
+) -> AuditResult:
+    return AuditResult(tuple(sorted(set(findings))), coverage)
 
 
 __all__ = ["AuditFinding", "AuditResult", "audit_blueprint", "audit_graph"]

@@ -77,10 +77,14 @@ mathematics.
    their intended reading order. The renderer derives bottom-of-page previous
    and next chapter links from this Markdown structure, so do not maintain a
    second navigation manifest.
-3. Define project-specific coverage targets and completion rules under
-   `blueprint/coverage/`. Distinguish material that is merely mapped from
-   material decomposed into nodes; never report whole-source completion from a
-   partial theorem slice.
+3. Define project-specific coverage targets and completion rules in
+   `blueprint/coverage/README.md`. Include exactly one
+   `Area | Coverage | Evidence` table. Use `MAPPED` when an area is known but
+   not yet dispositioned, `DECOMPOSED` when it is represented by roadmap
+   nodes, `DEFERRED` for an explicit later milestone, and `OUT` for material
+   outside formalization scope. Evidence may link to current roadmap paths;
+   optional `article_id` metadata is not required. Never report whole-source
+   completion while any row remains `MAPPED`.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
 5. After approval, create one file per pull-request-sized unit beside its
@@ -91,8 +95,10 @@ mathematics.
    it will take, so "pull-request-sized" cannot be checked up front;
    `autoform audit --lean-root` reports `node-too-large` afterwards, against
    the project's own median. Read that finding as a decomposition bug in this
-   roadmap rather than a Lean problem, and split the node. Its path relative to `roadmap/`, without `.md`, is its
-   stable ID. Give it exactly one H1, a `declaration` naming the kind of Lean
+   roadmap rather than a Lean problem, and split the node. Its path relative to
+   `roadmap/`, without `.md`, is its current graph ID; add optional durable
+   `article_id` metadata only when a long-lived external artifact needs stable
+   identity. Give it exactly one H1, a `declaration` naming the kind of Lean artifact,
    artifact, a source-grounded statement or proof sketch, and a
    `## Depends on` section.
 6. Put only genuine prerequisite links under `## Depends on`; those relative

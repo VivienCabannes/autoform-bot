@@ -154,7 +154,13 @@ autoform audit blueprint --lean-root .
 provenance, coverage, checked-fact, and optional Lean-target checks. It is local
 and read-only: it neither contacts network services nor writes findings back
 into the blueprint. Pass `--json` for stable machine-readable output; a nonzero
-exit status means the audit found at least one issue.
+exit status means the audit found at least one issue. The machine-checkable
+`coverage/README.md` contract contains one `Area | Coverage | Evidence` table
+with `MAPPED`, `DECOMPOSED`, `DEFERRED`, or `OUT` dispositions. `MAPPED` is
+nonterminal; the other three explicitly disposition an area. Audit JSON includes
+canonical rows, counts, and the exact coverage source hash, while
+`publication.json` records aggregate counts without duplicating the authored
+rows.
 
 Plan durable article identity metadata without changing the blueprint:
 

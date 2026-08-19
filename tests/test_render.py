@@ -547,6 +547,7 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
     manifest = json.loads(first[PUBLICATION_MANIFEST])
     assert manifest == {
         "complete": True,
+        "coverage": None,
         "dependencies": 1,
         "git_ref": "a" * 40,
         "nodes": 3,
@@ -557,6 +558,34 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
     }
     assert re.fullmatch(r"[0-9a-f]{64}", manifest["source_revision"])
     assert str(tmp_path).encode() not in b"".join(first.values())
+
+
+def test_manifest_records_machine_checkable_coverage_aggregates(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.parent.mkdir()
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main result | DECOMPOSED | [Roadmap](../roadmap/README.md) |\n"
+        "| Corollaries | MAPPED | Source audit pending |\n"
+        "| Experiments | OUT | Narrative only |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    manifest = json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))
+    assert manifest["coverage"] == {
+        "complete": False,
+        "counts": {"DECOMPOSED": 1, "DEFERRED": 0, "MAPPED": 1, "OUT": 1},
+        "schema": "autoform-coverage/v1",
+        "source_path": "coverage/README.md",
+        "source_sha256": manifest["coverage"]["source_sha256"],
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", manifest["coverage"]["source_sha256"])
 
 
 def test_render_cleans_only_an_owned_publication(tmp_path: Path) -> None:

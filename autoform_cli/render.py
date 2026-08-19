@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
+from .coverage import load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
 from .status import is_definition
@@ -558,8 +559,20 @@ def _write_publication_manifest(
     *,
     complete: bool,
 ) -> None:
+    coverage, _coverage_issues = load_coverage(blueprint)
     manifest = {
         "complete": complete,
+        "coverage": (
+            {
+                "complete": coverage.complete,
+                "counts": coverage.counts,
+                "schema": coverage.schema,
+                "source_path": coverage.source_path,
+                "source_sha256": coverage.source_sha256,
+            }
+            if coverage is not None
+            else None
+        ),
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
         "source_revision": _source_revision(blueprint),
