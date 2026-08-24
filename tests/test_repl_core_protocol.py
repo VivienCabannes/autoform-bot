@@ -238,13 +238,269 @@ def test_wire_protocol_reports_complete_stderr_on_premature_eof(monkeypatch):
     stderr = (b"x" * 5000) + b"lean crashed"
     with ExitStack() as stack:
         process = _PipeProcess(stack, [b""], stderr=stderr)
-        repl = _repl_with_process(process)
+        repl = _repl_with_process(process, max_buffer_bytes=len(stderr))
         _patch_pipe_reads(monkeypatch, process)
 
         with pytest.raises(repl_core.ReplProcessExited) as error:
             repl._run("#check Nat", env_id=None, timeout=1)
 
     assert str(error.value).endswith(stderr.decode())
+
+
+def test_wire_protocol_services_stdout_while_stderr_remains_readable(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"x")
+        repl = _repl_with_process(process, chunk_size=8)
+        _patch_pipe_reads(monkeypatch, process)
+
+        real_read = repl_core.os.read
+
+        def fake_read(fd: int, size: int) -> bytes:
+            if fd == process.stderr.fileno():
+                return b"x" * size
+            return real_read(fd, size)
+
+        monkeypatch.setattr(repl_core.os, "read", fake_read)
+
+        # Endlessly readable stderr never starves stdout, so the response is
+        # captured. It cannot be drained to a boundary though, so the process is
+        # reported as unusable rather than silently reused.
+        with pytest.raises(repl_core.ReplStderrBacklog) as error:
+            repl._run("#check Nat", env_id=None, timeout=1)
+
+    assert error.value.response == {"messages": []}
+
+
+def test_wire_protocol_times_out_while_stderr_remains_readable(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [], stderr=b"x")
+        repl = _repl_with_process(process)
+        _patch_pipe_reads(monkeypatch, process)
+
+        real_read = repl_core.os.read
+
+        def fake_read(fd: int, size: int) -> bytes:
+            if fd == process.stderr.fileno():
+                return b"x"
+            return real_read(fd, size)
+
+        now = 0.0
+
+        def fake_monotonic() -> float:
+            nonlocal now
+            now += 0.25
+            return now
+
+        monkeypatch.setattr(repl_core.os, "read", fake_read)
+        monkeypatch.setattr(repl_core.time, "monotonic", fake_monotonic)
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            repl._run("#check Nat", env_id=None, timeout=1)
+
+
+def test_wire_protocol_rejects_oversized_stderr_even_when_stdout_is_ready(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"0123456789")
+        repl = _repl_with_process(process, chunk_size=10, max_buffer_bytes=8)
+        _patch_pipe_reads(monkeypatch, process)
+
+        with pytest.raises(RuntimeError, match="stderr exceeded 8 bytes") as error:
+            repl._run("#check Nat", env_id=None, timeout=1)
+
+    # The diagnostic that explains the failure survives the rejection.
+    assert "Tail: " in str(error.value)
+    assert "0123456789" in str(error.value)
+
+
+def test_wire_protocol_drains_queued_stderr_after_the_response_frame_completes(monkeypatch):
+    # One stdout read completes the frame while stderr still holds several chunks.
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=1024)
+        _patch_pipe_reads(monkeypatch, process)
+
+        assert repl._run("#check Nat", env_id=None, timeout=5) == {"messages": []}
+
+        # Nothing is left to be charged against, or misattributed to, the next command.
+        assert process.stderr_bytes == b""
+
+
+def test_wire_protocol_reports_a_backlog_when_the_cap_ends_the_post_response_drain(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
+        _patch_pipe_reads(monkeypatch, process)
+
+        with pytest.raises(repl_core.ReplStderrBacklog) as error:
+            repl._run("#check Nat", env_id=None, timeout=5)
+
+    # The response survives, so the caller need not recompute it...
+    assert error.value.response == {"messages": []}
+    # ...but this command's stderr is still in the pipe, which is exactly why the
+    # process must not serve another request.
+    assert process.stderr_bytes == b"e" * 4
+
+
+def test_wire_protocol_keeps_the_response_when_the_deadline_ends_the_stderr_drain(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"x")
+        repl = _repl_with_process(process, max_buffer_bytes=1_000_000)
+        _patch_pipe_reads(monkeypatch, process)
+
+        real_read = repl_core.os.read
+
+        def fake_read(fd: int, size: int) -> bytes:
+            if fd == process.stderr.fileno():
+                return b"x" * size
+            return real_read(fd, size)
+
+        now = 0.0
+
+        def fake_monotonic() -> float:
+            nonlocal now
+            now += 0.25
+            return now
+
+        monkeypatch.setattr(repl_core.os, "read", fake_read)
+        monkeypatch.setattr(repl_core.time, "monotonic", fake_monotonic)
+
+        # Endlessly readable stderr must not hang the post-response drain, and the
+        # deadline must not discard a response that was already captured.
+        with pytest.raises(repl_core.ReplStderrBacklog) as error:
+            repl._run("#check Nat", env_id=None, timeout=1)
+
+    assert error.value.response == {"messages": []}
+
+
+def _patch_reads_across_processes(monkeypatch, processes: list[_PipeProcess]):
+    """Serve reads and readiness for several processes, keyed by descriptor."""
+    real_read = os.read
+
+    def take_chunk(chunks: list[bytes], size: int) -> bytes:
+        if not chunks:
+            return b""
+        result = chunks[0][:size]
+        chunks[0] = chunks[0][size:]
+        if not chunks[0]:
+            chunks.pop(0)
+        return result
+
+    def fake_read(fd: int, size: int) -> bytes:
+        for process in processes:
+            if fd == process.stdout.fileno():
+                return take_chunk(process.stdout_chunks, size)
+            if fd == process.stderr.fileno():
+                result = process.stderr_bytes[:size]
+                process.stderr_bytes = process.stderr_bytes[size:]
+                return result
+        return real_read(fd, size)
+
+    def fake_select(readable, writable, exceptional, timeout=None):
+        if writable:
+            return [], writable, []
+        ready = []
+        for process in processes:
+            if process.stderr_bytes:
+                ready.append(process.stderr.fileno())
+            if process.stdout_chunks:
+                ready.append(process.stdout.fileno())
+        return [fd for fd in ready if fd in readable], [], []
+
+    monkeypatch.setattr(repl_core.os, "read", fake_read)
+    monkeypatch.setattr(repl_core.select, "select", fake_select)
+
+
+def test_backlog_recycles_the_process_so_two_commands_cannot_share_stderr(monkeypatch):
+    with ExitStack() as stack:
+        first = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        second = _PipeProcess(stack, [b'{"env": 1}\n\n'])
+        repl = _repl_with_process(first, chunk_size=18, max_buffer_bytes=20)
+        _patch_reads_across_processes(monkeypatch, [first, second])
+
+        # Command one completes, but its stderr cannot be drained within budget.
+        assert repl.run("#check Nat", timeout=5) == {"messages": []}
+
+        # The process holding the remainder is gone, so nothing can inherit it.
+        assert repl.process is None
+        assert first.stderr_bytes == b"e" * 4
+
+        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
+
+        # Command two runs on a clean process and sees only its own streams.
+        assert repl.run("#check Nat", timeout=5) == {"env": 1}
+
+        assert second.stderr_bytes == b""
+        # Command one's stderr was never consumed by, or charged against, command two.
+        assert first.stderr_bytes == b"e" * 4
+
+
+def test_env_scoped_request_refuses_to_outlive_the_recycled_process(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
+        _patch_pipe_reads(monkeypatch, process)
+
+        # An explicit environment cannot transparently survive the recycle, so the
+        # caller is told rather than handed a response tied to a dead process.
+        with pytest.raises(repl_core.ReplProcessRestarted):
+            repl.run("#check Nat", env_id=7, timeout=5)
+
+        assert repl.process is None
+
+
+def test_deadline_ended_drain_recycles_the_process_so_two_commands_cannot_share_stderr(monkeypatch):
+    with ExitStack() as stack:
+        first = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"x")
+        second = _PipeProcess(stack, [b'{"env": 1}\n\n'])
+        # A ceiling far out of reach, so the deadline is what ends the drain.
+        repl = _repl_with_process(first, max_buffer_bytes=1_000_000)
+        _patch_reads_across_processes(monkeypatch, [first, second])
+
+        real_read = repl_core.os.read
+
+        def fake_read(fd: int, size: int) -> bytes:
+            # first's stderr never empties, so no clean boundary is ever reached.
+            if fd == first.stderr.fileno():
+                return b"x" * size
+            return real_read(fd, size)
+
+        now = 0.0
+
+        def fake_monotonic() -> float:
+            nonlocal now
+            now += 0.25
+            return now
+
+        monkeypatch.setattr(repl_core.os, "read", fake_read)
+        monkeypatch.setattr(repl_core.time, "monotonic", fake_monotonic)
+
+        # Command one still gets its response: the deadline must not starve stdout.
+        assert repl.run("#check Nat", timeout=5) == {"messages": []}
+
+        # But the process that still holds unread stderr is out of service.
+        assert repl.process is None
+        assert first.stderr_bytes
+
+        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
+        monkeypatch.setattr(repl_core.os, "read", real_read)
+
+        # Command two runs on a clean process, unaffected by command one's stderr.
+        assert repl.run("#check Nat", timeout=5) == {"env": 1}
+        assert second.stderr_bytes == b""
+
+
+def test_run_never_leaves_a_reusable_process_when_a_backlog_stops_the_drain(monkeypatch):
+    # The invariant holds at the source, so no caller of _run() can skip it.
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
+        _patch_pipe_reads(monkeypatch, process)
+
+        with pytest.raises(repl_core.ReplStderrBacklog):
+            repl._run("#check Nat", env_id=None, timeout=5)
+
+        assert repl.process is None
+        assert repl.is_alive() is False
 
 
 def test_wire_protocol_rejects_invalid_json(monkeypatch):

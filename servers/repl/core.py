@@ -129,6 +129,8 @@ class LeanReplConfig:
 
     repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
 
+    # Per-stream ceiling applied independently to stdout and stderr for a single
+    # command, not a combined budget across both.
     max_buffer_bytes: int = 10 * 1024 * 1024
     mem_restart_ratio: float = 0.9
     validate_imports: bool = True
@@ -252,6 +254,19 @@ class ReplProcessExited(RuntimeError):
 
 class ReplProcessRestarted(RuntimeError):
     """Raised when the REPL restarts and env_id state is lost."""
+
+
+class ReplStderrBacklog(RuntimeError):
+    """Raised when a response was captured but its stderr could not be drained.
+
+    The response is valid and travels on ``response`` so a caller need not
+    recompute it, but the undrained stderr belongs to this command, so the
+    process is desynchronized and must not serve another request.
+    """
+
+    def __init__(self, message: str, response: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.response = response
 
 
 class LeanRepl:
@@ -414,6 +429,18 @@ class LeanRepl:
                     resp = self._run(code=code, env_id=env_id, timeout=remaining())
                     _adjust_line_numbers(resp, header_line_count)
                     return resp
+                except ReplStderrBacklog as e:
+                    # _run() already retired the process, so nothing can inherit the
+                    # undrained stderr; close() here is an idempotent assertion of
+                    # that. The response is valid, so a plain request still receives
+                    # it. An env-scoped request cannot transparently outlive the
+                    # process that held its environment, so it is told loudly.
+                    logger.error("%s", e)
+                    self.close()
+                    if run_from_env:
+                        raise ReplProcessRestarted(str(e)) from e
+                    _adjust_line_numbers(e.response, header_line_count)
+                    return e.response
                 except ReplProcessExited as e:
                     last_exception = e
                     logger.error("REPL process exited: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
@@ -512,20 +539,53 @@ class LeanRepl:
         response_buffer = bytearray()
         stderr_buffer = bytearray()
         max_buffer = self.config.max_buffer_bytes
+        stderr_drained = True
 
-        def drain_stderr() -> None:
-            while True:
+        def drain_stderr(*, max_reads: int | None = None, after_response: bool = False) -> bool:
+            """Move currently readable stderr into ``stderr_buffer``.
+
+            ``max_reads`` bounds a single fairness cycle so a process that writes
+            diagnostics continuously cannot starve stdout.
+
+            ``after_response`` marks the drain that runs once the response frame is
+            complete. It is unbounded in reads because no stdout read is left to
+            starve, but it must not destroy a response already captured, so the
+            deadline and the memory ceiling stop it rather than fail the command.
+
+            Returns whether stderr reached a clean boundary. Only the
+            ``after_response`` result is meaningful: a bounded fairness cycle
+            reports ``True`` because the main loop reads again. ``False`` means a
+            bound stopped the drain with this command's stderr still in the pipe.
+            """
+            reads = 0
+            while max_reads is None or reads < max_reads:
+                # ``max_buffer_bytes`` is a per-stream ceiling: stdout and stderr are
+                # each bounded by it independently, so one command can hold up to
+                # twice that much.
+                if after_response and len(stderr_buffer) >= max_buffer:
+                    return False
+                if time.monotonic() >= end_time:
+                    if after_response:
+                        return False
+                    raise TimeoutError(f"REPL command timed out after {timeout} seconds while reading stderr")
                 try:
                     chunk = os.read(stderr_fd, self.chunk_size)
                 except BlockingIOError:
-                    return
+                    return True
                 if not chunk:
-                    return
+                    return True
                 stderr_buffer.extend(chunk)
+                # Crossing the ceiling while stdout still owes us a response
+                # invalidates the command.
+                if len(stderr_buffer) > max_buffer and not after_response:
+                    tail = bytes(stderr_buffer[-200:]).decode("utf-8", errors="replace")
+                    raise RuntimeError(f"REPL stderr exceeded {max_buffer} bytes. Tail: {tail!r}")
+                reads += 1
                 logger.debug(
                     "Lean REPL stderr: %s",
                     chunk.decode("utf-8", errors="replace").rstrip(),
                 )
+            return True
 
         while True:
             remaining = end_time - time.monotonic()
@@ -539,7 +599,7 @@ class LeanRepl:
             # Drain diagnostics before handling stdout EOF so a crashing Lean
             # process cannot lose stderr that became readable at the same time.
             if stderr_fd in ready:
-                drain_stderr()
+                drain_stderr(max_reads=1)
 
             if stdout_fd in ready:
                 try:
@@ -564,6 +624,26 @@ class LeanRepl:
                 separator = response_buffer.find(b"\n\n")
                 if separator >= 0:
                     response_bytes = bytes(response_buffer[:separator]).strip()
+                    # The frame is complete, so this command's remaining queued
+                    # stderr can be drained without starving stdout. Leaving it in
+                    # the pipe would let a command exceed the stderr ceiling
+                    # unnoticed, misattribute diagnostics to the next command, and
+                    # eventually block the child on a full stderr pipe.
+                    stderr_drained = drain_stderr(after_response=True)
                     break
 
-        return json.loads(response_bytes.decode("utf-8"))
+        response = json.loads(response_bytes.decode("utf-8"))
+        if not stderr_drained:
+            # A bound stopped the drain, so stderr for this command is still in the
+            # pipe. The next command would consume it or be charged for it, and a
+            # large enough remainder can block the child before it reads another
+            # request. The response is valid and travels with the error, but the
+            # process is retired here rather than by the caller: this must hold for
+            # every caller, so it cannot depend on each one handling the error.
+            self.close()
+            raise ReplStderrBacklog(
+                f"REPL stderr for this command could not be drained within its budget "
+                f"(per-stream ceiling {max_buffer} bytes); the process was recycled",
+                response,
+            )
+        return response
