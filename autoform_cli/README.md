@@ -10,7 +10,7 @@ Every Markdown file below `blueprint/roadmap/` is an article node. A
 `README.md` represents its directory and strictly contains the articles below
 it; the nearest ancestor `README.md` is the single parent. This supports any
 number of levels, from book to chapter to section to declaration. Ordinary
-files use their path without `.md` as a stable ID; `README.md` uses its
+files use their path without `.md` as the current graph ID; `README.md` uses its
 directory path, with the root article named `roadmap`.
 
 The H1 is the article's human title. Container

@@ -14,15 +14,16 @@ description: >-
 
 Turn an agreed mathematical specification into a human-editable roadmap and a
 DAG of pull-request-sized formalization units. Keep Markdown as the sole source
-of truth. Use `internal/runbooks/planning.md` for the preserved detailed planning
-workflow when this concise skill needs deeper operational guidance.
+of truth. This skill is the authoritative planning workflow; its references are
+worked examples and review guidance, not a second procedure.
 
 ## Discover prior work and sources
 
 Before fixing the architecture, search the pinned Mathlib checkout for existing
-primitives and gaps. When network access is available, also make targeted,
-read-only searches of relevant GitHub pull requests and issues, Zulip topics,
-and authoritative mathematical literature. Report overlapping work, active
+primitives and gaps. When the host separately provides network/search tools,
+also make targeted, read-only searches of relevant
+GitHub pull requests and issues, Zulip topics, and authoritative mathematical
+literature. Autoform ships no general search or Zulip client. Report overlapping work, active
 contributors, design rationale, and candidate references; never contact people
 or post externally without explicit user approval.
 
@@ -162,7 +163,8 @@ already asked you to push.
 
 Report roadmap and coverage status, node and edge
 counts, the derived state summary, unresolved source questions, and the
-vault/graph paths. Hand nodes that are ready to state or prove to Orchestrate;
-hand the draft to Agent Review for mathematical-plan judgment or Human Review
+vault/graph paths. Return nodes that are ready to state or prove to the user or
+a separately installed execution workflow; `main` does not ship autonomous
+orchestration. Hand the draft to Agent Review for mathematical-plan judgment or Human Review
 for visual inspection; hand CI, Pages, Lean-project, or vault infrastructure
 changes back to Setup.

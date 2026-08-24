@@ -4,9 +4,9 @@ description: >-
   Set up, inspect, or repair repository infrastructure for an Autoform Lean
   project, including the Lean/Mathlib shell, an in-repository
   Obsidian-compatible blueprint vault, ignore rules, MkDocs, GitHub Pages, and
-  verification CI, with optional Zulip community synchronization. Use for new
-  repositories, environment repair, publication setup, infrastructure checks,
-  or an explicitly requested Zulip project sync; do not choose mathematical
+  verification CI, with guidance for separately authorized Zulip coordination.
+  Use for new repositories, environment repair, publication setup,
+  infrastructure checks, or an explicitly requested Zulip project sync; do not choose mathematical
   scope or build the roadmap and theorem DAG.
 ---
 
@@ -16,9 +16,10 @@ Setup prepares the Lean toolchain, an empty blueprint vault, ignore rules,
 MkDocs, CI, and optionally publication. It does not scope sources, choose
 theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
-Inspect before writing and preserve existing Lean, Markdown, workflow, and
-ignore files. Use `scripts/workspace_inspector.py` when auditing an existing
-Lean workspace. Infer safe local defaults from the request and repository. If a
+Inspect existing Lean, Lake, Markdown, workflow, and ignore files before
+writing, and preserve them. When a blueprint already exists, use the read-only
+`autoform doctor` command alongside direct repository inspection. Infer safe
+local defaults from the request and repository. If a
 material choice is missing, ask once for the run type (new, repair, or inspect),
 UpperCamelCase package name, target directory, and whether publication is
 wanted. Without explicit publication approval, make no remote changes. Setup
@@ -31,13 +32,10 @@ package, check the current matching stable Lean/Mathlib release, update branch
 and immutable workflow pins, and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 
-For a new repository, require a target directory that does not already exist and
-bootstrap the Lean/Mathlib shell with the plugin's internal helper:
-
-```bash
-bash "<AUTOFORM_PLUGIN_ROOT>/scripts/make_project.sh" \
-  <ProjectName> [target-dir]
-```
+For a new repository, require a target directory that does not already exist.
+Create its Lean/Mathlib shell from the project's selected upstream toolchain and
+matching release before invoking Autoform. Do not invent version pairs or copy
+the populated example as a project generator.
 
 For a new or incomplete repository:
 
@@ -47,19 +45,19 @@ For a new or incomplete repository:
 
 `autoform init` is the whole vault: `blueprint/` with its landing page,
 `roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
-override, both workflows, and ignore rules. Do not hand-build any of it and do
-not copy the bundled example: the layout is fixed, and a chapter written as a
-sibling file instead of `<chapter>/README.md` still validates while publishing
-a book with no chapters. `init` never overwrites an existing file, so it is
+override, ignore rules, and both workflows when an immutable Autoform pin is
+available. Do not hand-build any of it and do not copy the bundled example: the
+layout is fixed, and `autoform check` rejects a chapter directory whose chapter
+was written as a sibling file instead of `<chapter>/README.md`. `init` never overwrites an existing file, so it is
 also the repair path; it reports what it left alone. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
-`init` pins the generated workflows to the Autoform commit that ran it, but it
-can only do that when Autoform is running from a Git checkout. Installed as a
-plugin it is a plain directory copy, so there is nothing to read and `init`
-writes no CI rather than guess a ref: guessing produced projects whose first
-push failed with nothing in the workflow to explain why. When it reports that,
-find the commit the plugin was installed from and pass
+`init` pins generated workflows to the Autoform commit that ran it. It first
+uses the plugin checkout and may recover provenance from a supported marketplace
+checkout. If neither location yields a safe immutable pin, `init` writes no CI
+rather than guess a ref: guessing produced projects whose first push failed with
+nothing in the workflow to explain why. When it reports that, find the commit
+the plugin was installed from and pass
 `--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
 Never invent a ref. It must be a full 40-character commit sha: `init` refuses a
 branch, a tag, or an abbreviated sha, because CI would silently reinstall a
@@ -112,9 +110,10 @@ leave the workflow inert.
 If credentials, hosting, or repository settings block publication, report the
 minimal owner action required.
 
-Zulip synchronization is a separate opt-in outward-facing action. When the user
-asks to discover community context or announce and coordinate the project, read
-and follow [the shared Zulip workflow](references/zulip.md). Do not infer consent
+Zulip synchronization is a separate opt-in outward-facing action and requires
+host-provided authenticated tooling; Autoform does not ship a Zulip client. When
+the user asks to discover community context or announce and coordinate the
+project, read and follow [the shared Zulip workflow](references/zulip.md). Do not infer consent
 to post from repository setup, roadmap work, or permission to search.
 
 Report the Lean toolchain, vault path, CI and Pages files, validation results,

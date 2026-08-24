@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import unquote, urlsplit
 
 
 def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
@@ -60,6 +62,64 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
     ]
     for command in muse["capabilities"]["commands"]:
         assert (repo_root / command["path"]).is_file()
+
+
+def test_shipped_skill_links_resolve_within_the_plugin(repo_root):
+    link_pattern = re.compile(r"(?<!!)\[[^\]]+\]\((?P<target>[^)]+)\)")
+    documents = sorted((repo_root / "skills").glob("*/SKILL.md"))
+    documents += sorted((repo_root / "skills").glob("*/references/**/*.md"))
+    for document in documents:
+        text = document.read_text(encoding="utf-8")
+        if document.name == "SKILL.md":
+            assert "Orchestrate" not in text, (
+                f"{document.relative_to(repo_root)} names an unshipped skill"
+            )
+        for match in link_pattern.finditer(text):
+            target = match.group("target").strip().strip("<>")
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            resolved = (document.parent / unquote(parsed.path)).resolve()
+            assert resolved.is_relative_to(repo_root.resolve())
+            assert resolved.exists(), (
+                f"{document.relative_to(repo_root)} links missing {parsed.path}"
+            )
+
+
+def test_plugin_manifests_reference_shipped_paths_and_modules(repo_root):
+    root = repo_root.resolve()
+
+    def shipped_path(value: str) -> Path:
+        declared = Path(value)
+        assert not declared.is_absolute()
+        resolved = (root / declared).resolve()
+        assert resolved.is_relative_to(root)
+        return resolved
+
+    codex = json.loads((root / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    for key in ("skills", "mcpServers"):
+        assert shipped_path(codex[key]).exists()
+    for key in ("composerIcon", "logo"):
+        assert shipped_path(codex["interface"][key]).is_file()
+
+    marketplace = json.loads((root / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    for plugin in marketplace["plugins"]:
+        assert shipped_path(plugin["source"]) == root
+
+    manifests = [
+        json.loads((root / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"].values(),
+        json.loads((root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))[
+            "mcpServers"
+        ].values(),
+        json.loads((root / ".muse-plugin/plugin.json").read_text(encoding="utf-8"))[
+            "capabilities"
+        ]["mcpServers"],
+    ]
+    for servers in manifests:
+        for server in servers:
+            arguments = server.get("args", server.get("command", ()))
+            module = arguments[-1]
+            assert shipped_path(f"{module.replace('.', '/')}.py").is_file()
 
 
 def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
