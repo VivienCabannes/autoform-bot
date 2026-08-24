@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from autoform_cli import scaffold as scaffold_module
+from autoform_cli.coverage import load_coverage
 from autoform_cli.graph import load_graph
 from autoform_cli.scaffold import ScaffoldError, scaffold_project
 
@@ -72,6 +73,17 @@ def test_scaffolded_vault_validates_immediately(tmp_path: Path) -> None:
 
     assert set(graph.nodes) == {"roadmap"}
     assert graph.nodes["roadmap"].parent is None
+
+
+def test_scaffolded_vault_has_a_valid_incomplete_coverage_contract(tmp_path: Path) -> None:
+    scaffold_project(tmp_path, title="Finite Flat")
+
+    coverage, issues = load_coverage(tmp_path / "blueprint")
+
+    assert issues == ()
+    assert coverage is not None
+    assert coverage.counts == {"MAPPED": 1, "DECOMPOSED": 0, "DEFERRED": 0, "OUT": 0}
+    assert not coverage.complete
 
 
 def test_user_values_are_not_reinterpreted_as_template_tokens(tmp_path: Path) -> None:
@@ -234,7 +246,7 @@ def test_an_empty_vault_reads_as_empty_not_as_a_tutorial(tmp_path: Path) -> None
 
     for relative, expected in (
         ("blueprint/roadmap/README.md", "No chapters yet."),
-        ("blueprint/coverage/README.md", "Not yet defined."),
+        ("blueprint/coverage/README.md", "| Project scope | `MAPPED` |"),
         ("blueprint/sources/README.md", "No sources recorded yet."),
     ):
         text = (tmp_path / relative).read_text(encoding="utf-8")

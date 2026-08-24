@@ -1,14 +1,12 @@
 # Coverage contract
 
-Not yet defined.
+| Area | Coverage | Evidence |
+| --- | --- | --- |
+| Project scope | `MAPPED` | Replace this row with the source areas this roadmap must disposition |
 
 <!-- AUTHORING NOTES — these comments are not published.
 
-     Replace the line above with what this project claims to cover, so partial
-     progress is never reported as completion. Add these sections once each has
-     real content; an empty heading publishes as an empty section.
-
-       ## In scope      the results this project intends to formalize
-       ## Out of scope  material deliberately excluded, and why
-       ## Done means    the condition under which a chapter counts as finished
+     Keep one row per source area. Use MAPPED while an area still needs roadmap
+     articles, DECOMPOSED only with links to existing roadmap articles, DEFERRED
+     with a concrete later milestone, or OUT with a reason for exclusion.
 -->

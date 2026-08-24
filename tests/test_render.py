@@ -45,6 +45,15 @@ def _project(tmp_path: Path) -> Path:
         "## Depends on\n\n- [Base](base.md)\n",
         encoding="utf-8",
     )
+    coverage = project / "blueprint" / "coverage" / "README.md"
+    coverage.parent.mkdir(exist_ok=True)
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Project scope | MAPPED | Source audit pending |\n",
+        encoding="utf-8",
+    )
     return project
 
 
@@ -144,6 +153,13 @@ def test_the_structure_page_names_a_vault_with_no_chapters(tmp_path: Path) -> No
     roadmap.mkdir(parents=True)
     (project / "blueprint" / "README.md").write_text("---\n---\n\n# Flat\n", encoding="utf-8")
     (roadmap / "README.md").write_text("---\n---\n\n# Roadmap\n", encoding="utf-8")
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.parent.mkdir(exist_ok=True)
+    coverage.write_text(
+        "# Coverage\n\n| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
+        "| Project scope | MAPPED | Source audit pending |\n",
+        encoding="utf-8",
+    )
     for name in ("a", "b", "c", "d"):
         (roadmap / f"{name}.md").write_text(
             f"---\ndeclaration: theorem\n---\n\n# Result {name}\n", encoding="utf-8"
@@ -379,9 +395,10 @@ def test_links_naming_a_node_file_follow_it_onto_the_chapter(tmp_path: Path) -> 
     """
     project = _project(tmp_path)
     coverage = project / "blueprint" / "coverage"
-    coverage.mkdir()
     (coverage / "README.md").write_text(
-        "---\n---\n\n# Coverage\n\nIn scope: [Top](../roadmap/top.md).\n", encoding="utf-8"
+        "# Coverage\n\n| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
+        "| Top | MAPPED | In scope: [Top](../roadmap/top.md). |\n",
+        encoding="utf-8",
     )
     render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
@@ -403,8 +420,11 @@ def test_coverage_is_reachable_once_the_landing_page_stops_listing_it(
     """
     project = _project(tmp_path)
     coverage = project / "blueprint" / "coverage"
-    coverage.mkdir()
-    (coverage / "README.md").write_text("---\n---\n\n# Coverage\n\nWhat counts.\n", "utf-8")
+    (coverage / "README.md").write_text(
+        "# Coverage\n\n| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
+        "| Project scope | MAPPED | What counts. |\n",
+        encoding="utf-8",
+    )
 
     render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
@@ -547,7 +567,13 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
     manifest = json.loads(first[PUBLICATION_MANIFEST])
     assert manifest == {
         "complete": True,
-        "coverage": None,
+        "coverage": {
+            "complete": False,
+            "counts": {"DECOMPOSED": 0, "DEFERRED": 0, "MAPPED": 1, "OUT": 0},
+            "schema": "autoform-coverage/v1",
+            "source_path": "coverage/README.md",
+            "source_sha256": manifest["coverage"]["source_sha256"],
+        },
         "dependencies": 1,
         "git_ref": "a" * 40,
         "nodes": 3,
@@ -563,7 +589,6 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
 def test_manifest_records_machine_checkable_coverage_aggregates(tmp_path: Path) -> None:
     project = _project(tmp_path)
     coverage = project / "blueprint/coverage/README.md"
-    coverage.parent.mkdir()
     coverage.write_text(
         "# Coverage\n\n"
         "| Area | Coverage | Evidence |\n"
@@ -586,6 +611,22 @@ def test_manifest_records_machine_checkable_coverage_aggregates(tmp_path: Path) 
         "source_sha256": manifest["coverage"]["source_sha256"],
     }
     assert re.fullmatch(r"[0-9a-f]{64}", manifest["coverage"]["source_sha256"])
+
+
+def test_render_rejects_invalid_coverage_before_touching_output(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.write_text("# Coverage\n\nNo table.\n", encoding="utf-8")
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("owned by user\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match="coverage contract has no"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert sentinel.read_text(encoding="utf-8") == "owned by user\n"
+    assert not (output / PUBLICATION_MANIFEST).exists()
 
 
 def test_render_cleans_only_an_owned_publication(tmp_path: Path) -> None:

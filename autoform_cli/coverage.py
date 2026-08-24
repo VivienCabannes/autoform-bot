@@ -8,11 +8,16 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 COVERAGE_SCHEMA = "autoform-coverage/v1"
 COVERAGE_DISPOSITIONS = ("MAPPED", "DECOMPOSED", "DEFERRED", "OUT")
 _EXPECTED_HEADER = ("Area", "Coverage", "Evidence")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
+_MARKDOWN_LINK = re.compile(
+    r"(?<!!)\[[^\]]+\]\(\s*(?P<target><[^>\r\n]+>|[^)\s]+)"
+)
+_PLACEHOLDER_EVIDENCE = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -84,6 +89,7 @@ def load_coverage(blueprint_dir: str | Path) -> tuple[CoverageSummary | None, tu
         return None, (CoverageIssue(0, "coverage contract cannot be read"),)
 
     rows, issues = _parse_table(text)
+    issues.extend(_validate_evidence(rows, blueprint=blueprint, coverage_path=path))
     if issues:
         return None, tuple(issues)
     return (
@@ -156,6 +162,63 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     if not entries and not issues:
         issues.append(CoverageIssue(header_index + 1, "coverage table has no rows"))
     return entries, issues
+
+
+def _validate_evidence(
+    entries: list[CoverageEntry],
+    *,
+    blueprint: Path,
+    coverage_path: Path,
+) -> list[CoverageIssue]:
+    issues: list[CoverageIssue] = []
+    roadmap = (blueprint / "roadmap").resolve()
+    for entry in entries:
+        visible_evidence = _visible_markdown(entry.evidence)
+        normalized_evidence = re.sub(r"[*_~`]", "", visible_evidence).strip(" \t\r\n.!?:;").casefold()
+        if normalized_evidence in _PLACEHOLDER_EVIDENCE:
+            issues.append(CoverageIssue(entry.line, "coverage evidence is a placeholder"))
+            continue
+        if entry.disposition != "DECOMPOSED":
+            continue
+
+        targets = tuple(match.group("target") for match in _MARKDOWN_LINK.finditer(visible_evidence))
+        if not targets:
+            issues.append(
+                CoverageIssue(
+                    entry.line,
+                    "DECOMPOSED coverage evidence must link to at least one roadmap article",
+                )
+            )
+            continue
+        if not any(_is_roadmap_article(target, coverage_path=coverage_path, roadmap=roadmap) for target in targets):
+            issues.append(
+                CoverageIssue(
+                    entry.line,
+                    "DECOMPOSED coverage evidence has no link to an existing roadmap article",
+                )
+            )
+    return issues
+
+
+def _visible_markdown(value: str) -> str:
+    without_comments = re.sub(r"<!--.*?-->", "", value, flags=re.DOTALL)
+    return re.sub(r"(`+)[^`]*?\1", "", without_comments)
+
+
+def _is_roadmap_article(target: str, *, coverage_path: Path, roadmap: Path) -> bool:
+    normalized = target[1:-1] if target.startswith("<") and target.endswith(">") else target
+    parsed = urlsplit(normalized)
+    if parsed.scheme or parsed.netloc:
+        return False
+    try:
+        raw_path = unquote(parsed.path)
+        if not raw_path or "\x00" in raw_path:
+            return False
+        candidate = (coverage_path.parent / raw_path).resolve()
+        candidate.relative_to(roadmap)
+        return candidate.is_file() and candidate.suffix.casefold() == ".md"
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _fenced_lines(lines: list[str]) -> set[int]:

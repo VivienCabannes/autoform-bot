@@ -6,6 +6,12 @@ from pathlib import Path
 from autoform_cli.coverage import COVERAGE_SCHEMA, load_coverage
 
 
+def _article(blueprint: Path, relative: str) -> None:
+    path = blueprint / "roadmap" / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Roadmap article\n", encoding="utf-8")
+
+
 def _contract(blueprint: Path, rows: str) -> Path:
     path = blueprint / "coverage" / "README.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,6 +27,7 @@ def _contract(blueprint: Path, rows: str) -> Path:
 
 def test_loads_canonical_coverage_summary_with_stable_json(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
+    _article(blueprint, "main/README.md")
     path = _contract(
         blueprint,
         "| Main theorem | `DECOMPOSED` | [Nodes](../roadmap/main/README.md) |\n"
@@ -46,6 +53,7 @@ def test_loads_canonical_coverage_summary_with_stable_json(tmp_path: Path) -> No
 
 def test_complete_means_every_in_scope_area_has_a_terminal_disposition(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
+    _article(blueprint, "main/README.md")
     _contract(
         blueprint,
         "| Main theorem | DECOMPOSED | [Nodes](../roadmap/main/README.md) |\n"
@@ -93,7 +101,7 @@ def test_ignores_fenced_tables_and_accepts_escaped_pipes(tmp_path: Path) -> None
         "```\n\n"
         "| Area | Coverage | Evidence |\n"
         "| --- | --- | --- |\n"
-        "| Main theorem | DECOMPOSED | Case A \\| Case B |\n",
+        "| Main theorem | MAPPED | Case A \\| Case B |\n",
         encoding="utf-8",
     )
 
@@ -103,6 +111,61 @@ def test_ignores_fenced_tables_and_accepts_escaped_pipes(tmp_path: Path) -> None
     assert summary is not None
     assert len(summary.entries) == 1
     assert summary.entries[0].evidence == "Case A | Case B"
+
+
+def test_rejects_placeholder_and_unresolved_decomposed_evidence(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    source = blueprint / "sources" / "README.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Source\n", encoding="utf-8")
+    _contract(
+        blueprint,
+        "| Placeholder | DEFERRED | TODO |\n"
+        "| Missing | DECOMPOSED | [Missing](../roadmap/missing.md) |\n"
+        "| Source only | DECOMPOSED | [Source](../sources/README.md) |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    reasons = [issue.reason for issue in issues]
+    assert "coverage evidence is a placeholder" in reasons
+    assert reasons.count("DECOMPOSED coverage evidence has no link to an existing roadmap article") == 2
+
+
+def test_evidence_validation_ignores_decorated_placeholders_and_fake_links(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _article(blueprint, "encoded article.md")
+    _contract(
+        blueprint,
+        "| Decorated placeholder | DEFERRED | **TODO.** |\n"
+        "| Inline code | DECOMPOSED | `[Fake](../roadmap/encoded%20article.md)` |\n"
+        "| Comment | DECOMPOSED | <!-- [Fake](../roadmap/encoded%20article.md) --> |\n"
+        "| Encoded | DECOMPOSED | [Real](<../roadmap/encoded%20article.md>) |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    reasons = [issue.reason for issue in issues]
+    assert "coverage evidence is a placeholder" in reasons
+    assert reasons.count("DECOMPOSED coverage evidence must link to at least one roadmap article") == 2
+    assert "DECOMPOSED coverage evidence has no link to an existing roadmap article" not in reasons
+
+
+def test_malformed_evidence_paths_are_reported_without_raising(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _contract(
+        blueprint,
+        "| Malformed | DECOMPOSED | [Bad](../roadmap/bad%00path.md) |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "DECOMPOSED coverage evidence has no link to an existing roadmap article"
+    ]
 
 
 def test_reports_stable_unreadable_contract_issue(tmp_path: Path) -> None:
