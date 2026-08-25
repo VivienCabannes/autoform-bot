@@ -127,6 +127,33 @@ autoform init . --title "Finite Flat Group Schemes" \
 Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
 commit, `--force` to overwrite, and `--json` for machine-readable output.
 
+Inspect a Lean project and list Autoform's bundled known-good release pairs:
+
+```bash
+autoform project inspect .
+autoform project inspect path/inside/project --json
+autoform project versions
+autoform project versions --json
+```
+
+`project inspect` is deterministic, local, and read-only. It discovers the
+nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and
+known Autoform paths; records configuration hashes; and reports whether the
+configured Lean/Mathlib pair exactly matches the bundled catalog. It does not
+run Lake, Lean, Git, subprocesses, or network operations. A `lakefile.lean` is
+reported as present but unevaluated because executing it would violate that
+boundary. Symlinked decision-bearing configuration and malformed consumed
+fields fail inspection. Reports contain only project-relative paths, never the
+host's absolute project location.
+
+`project versions` reads the catalog packaged with the installed wheel. The
+catalog is an explicit known-good allowlist, not a resolver: the command never
+contacts a registry, selects a version, or mutates a project. An unlisted but
+structurally valid pair is advisory; absence from this catalog does not prove a
+project is incompatible. It is a snapshot refreshed when Autoform is released;
+its single recommended entry is the newest stable Lean and Mathlib pair
+validated at that time.
+
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.
 

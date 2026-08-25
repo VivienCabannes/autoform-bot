@@ -21,6 +21,7 @@ dependencies = [
     # construction, not tokenising: browsers repair malformed markup rather than
     # reject it, and the repair decides what stays hidden.
     "html5lib>=1.1,<2",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]
