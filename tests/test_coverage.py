@@ -34,6 +34,51 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_unrendered_rows_cannot_borrow_another_published_table(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The source table renders as a paragraph, but a raw-HTML table further down
+    # publishes the same headers. Matching on headers alone would let the
+    # unpublished rows stand as the contract.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "Intro with no blank line\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n\n"
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+        "<tbody><tr><td>Other</td><td>OUT</td><td>reason</td></tr></tbody></table>\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert "do not match the table the page publishes" in issues[0].reason
+
+
+def test_a_self_closing_hidden_element_still_hides_what_follows(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # Self-closing syntax does not apply to non-void elements, so a browser keeps
+    # the span open and never draws the text after it.
+    _contract(blueprint, "| Appendix | OUT | <span hidden />Reason |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == ["coverage evidence has no substantive content"]
+
+
+def test_an_implicitly_closed_hidden_paragraph_stops_hiding(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # A second <p> implicitly closes the first, so the reader does see this.
+    _contract(blueprint, "| Appendix | OUT | <p hidden>aside<p>Genuinely out of scope |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+
+
 def test_a_table_with_no_blank_line_above_it_is_rejected(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # Both structural lines are canonical, but a paragraph runs straight into the

@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlsplit
 from .markdown import (
     INLINE_CODE,
     Content,
+    PublishedTable,
     content,
     link_targets,
     local_target_issue,
@@ -160,10 +161,11 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     # it publishes. Whether a table renders depends on its surroundings as much
     # as on its own two structural lines -- a comment can break the delimiter row
     # while preserving its column count, and a paragraph directly above the
-    # header turns the whole thing into one lazy paragraph -- so ask about the
-    # document rather than about the lines in isolation.
-    published = published_tables(text).count(_EXPECTED_HEADER)
-    if header_indexes and not published:
+    # header turns the whole thing into one lazy paragraph.
+    contract_tables = [
+        table for table in published_tables(text) if table.headers == _EXPECTED_HEADER
+    ]
+    if header_indexes and not contract_tables:
         return [], [
             CoverageIssue(
                 header_indexes[0] + 1,
@@ -171,7 +173,7 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
                 "the header or separator, and for a missing blank line above it",
             )
         ]
-    if not header_indexes and published:
+    if not header_indexes and contract_tables:
         # The page shows a contract table we did not recognise, which means it is
         # not in the form the audit reads. Say so rather than report no table.
         return [], [
@@ -185,11 +187,18 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
         return [], [CoverageIssue(0, "coverage contract has no 'Area | Coverage | Evidence' table")]
     if len(header_indexes) > 1:
         return [], [CoverageIssue(header_indexes[1] + 1, "coverage contract has multiple coverage tables")]
+    if len(contract_tables) > 1:
+        # One source table but several on the page: which one carries the
+        # contract is ambiguous, and the reader cannot tell either.
+        return [], [
+            CoverageIssue(header_indexes[0] + 1, "coverage contract has multiple coverage tables")
+        ]
 
     header_index = header_indexes[0]
     entries: list[CoverageEntry] = []
     issues: list[CoverageIssue] = []
     seen_areas: dict[str, int] = {}
+    parsed_rows: list[tuple[str, ...]] = []
     for index in range(header_index + 2, len(lines)):
         raw = lines[index]
         if view.ends_block(index):
@@ -217,6 +226,7 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
             issues.append(CoverageIssue(line_number, "coverage row must have exactly three columns"))
             continue
         area, disposition_text, evidence = cells
+        parsed_rows.append(cells)
         disposition = _inline_code(disposition_text).upper()
         if not area:
             issues.append(CoverageIssue(line_number, "coverage area is empty"))
@@ -242,7 +252,49 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
 
     if not entries and not issues:
         issues.append(CoverageIssue(header_index + 1, "coverage table has no rows"))
+    if not issues:
+        issues.extend(_correlation_issues(contract_tables[0], parsed_rows, header_index))
     return entries, issues
+
+
+def _correlation_issues(
+    published: PublishedTable, parsed_rows: list[tuple[str, ...]], header_index: int
+) -> list[CoverageIssue]:
+    """Check the rows we validated are the rows the page actually shows.
+
+    A matching header somewhere on the page is not enough to conclude that these
+    source lines are what produced it. A canonical-looking table that renders as a
+    paragraph, sitting above an unrelated raw-HTML table with the same headers,
+    would otherwise let unpublished rows stand as the contract. Comparing the rows
+    themselves ties the source we read to the table a reader sees.
+    """
+
+    shown = [tuple(rendered_visible_text(cell) for cell in row) for row in parsed_rows]
+    if published.rows == tuple(shown):
+        return []
+    if len(published.rows) != len(shown):
+        detail = (
+            f"the page shows {len(published.rows)} row(s) and the contract declares {len(shown)}"
+        )
+    else:
+        differing = next(
+            (
+                position
+                for position, (page, source) in enumerate(zip(published.rows, shown))
+                if page != source
+            ),
+            0,
+        )
+        detail = (
+            f"row {differing + 1} reads {' | '.join(shown[differing])!r} here "
+            f"but {' | '.join(published.rows[differing])!r} on the page"
+        )
+    return [
+        CoverageIssue(
+            header_index + 1,
+            f"coverage rows do not match the table the page publishes; {detail}",
+        )
+    ]
 
 
 def _looks_like_row(line: str) -> bool:

@@ -14,6 +14,7 @@ from autoform_cli.markdown import (
     local_target_issue,
     markdown_anchors,
     markdown_links,
+    published_tables,
     rendered_visible_text,
 )
 
@@ -118,7 +119,30 @@ def test_rendered_visible_text_is_what_a_reader_sees() -> None:
     assert visible('<span title="hidden">real reason</span>') == "real reason"
     assert visible('<span aria-hidden="true">real reason</span>') == "real reason"
     # A nested copy of the tag must not close the suppression early.
-    assert visible("<div hidden>a<div>b</div>c</div>") == ''
+    assert visible("<div hidden>a<div>b</div>c</div>") == ""
+    # Browsers repair markup rather than reject it, and the repair decides what
+    # stays hidden. Self-closing syntax does not apply to a non-void element, so
+    # the span stays open; a second <p> implicitly closes the first, so it does not.
+    assert visible("<span hidden />Reason") == ""
+    assert visible("<p hidden>aside<p>Real reason") == "Real reason"
+    # A comment is markup, not content a reader sees.
+    assert visible("real <!-- aside --> reason") == "real reason"
+
+
+def test_published_tables_reports_rows_as_a_reader_sees_them() -> None:
+    tables = published_tables(
+        "| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
+        "| Main | OUT | [Node](node.md) |\n"
+    )
+
+    assert len(tables) == 1
+    assert tables[0].headers == ("Area", "Coverage", "Evidence")
+    # The link label, not its destination.
+    assert tables[0].rows == (("Main", "OUT", "Node"),)
+
+
+def test_a_paragraph_running_into_a_table_publishes_no_table() -> None:
+    assert published_tables("Intro\n| Area | Coverage |\n| --- | --- |\n| a | b |\n") == []
 
 
 def test_masking_blanks_code_blocks_and_comments_without_moving_lines() -> None:

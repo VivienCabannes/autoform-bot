@@ -30,10 +30,10 @@ import html
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import html5lib
 import markdown as pymarkdown
 from pymdownx.superfences import fence_div_format
 
@@ -91,10 +91,8 @@ _CODE_INDENT = 4
 #: is not evidence of anything.
 _NON_VISIBLE_TAGS = frozenset({"script", "style", "template", "noscript", "head", "title"})
 
-#: Elements with no content of their own, which therefore cannot hide any.
-_VOID_TAGS = frozenset(
-    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "wbr"}
-)
+#: Runs of whitespace, which HTML collapses when it draws them.
+_WHITESPACE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,79 +199,12 @@ def markdown_links(text: str) -> list[tuple[int, str]]:
     return links
 
 
-class _VisibleText(HTMLParser):
-    """Collects the text a browser would actually show for a fragment of HTML.
+@dataclass(frozen=True, slots=True)
+class PublishedTable:
+    """A table as the site publishes it, in the text a reader sees."""
 
-    Elements a browser never renders lose their contents, as does anything
-    carrying ``hidden``. Suppression runs to the element's closing tag, or to the
-    end of the fragment when it never closes, which is what a browser does with
-    an unclosed ``<span hidden>reason``. Attributes are parsed rather than
-    pattern-matched, so ``title="hidden"`` is not mistaken for the attribute
-    itself.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self._chunks: list[str] = []
-        self._suppressing: str | None = None
-        self._nested = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _VOID_TAGS:
-            # No content of its own, so it can neither show nor hide anything.
-            return
-        if self._suppressing is not None:
-            if tag == self._suppressing:
-                self._nested += 1
-            return
-        if tag in _NON_VISIBLE_TAGS or any(name == "hidden" for name, _ in attrs):
-            self._suppressing = tag
-            self._nested = 0
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._suppressing is None or tag != self._suppressing:
-            return
-        if self._nested:
-            self._nested -= 1
-        else:
-            self._suppressing = None
-
-    def handle_data(self, data: str) -> None:
-        if self._suppressing is None:
-            self._chunks.append(data)
-
-    @property
-    def text(self) -> str:
-        return "".join(self._chunks)
-
-
-class _TableHeaders(HTMLParser):
-    """Collects the header cells of every table in a rendered document."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.tables: list[tuple[str, ...]] = []
-        self._headers: list[str] | None = None
-        self._cell: list[str] | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == "table":
-            self._headers = []
-        elif tag == "th" and self._headers is not None:
-            self._cell = []
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "th" and self._cell is not None:
-            self._headers = self._headers or []
-            self._headers.append("".join(self._cell).strip())
-            self._cell = None
-        elif tag == "table" and self._headers is not None:
-            self.tables.append(tuple(self._headers))
-            self._headers = None
-
-    def handle_data(self, data: str) -> None:
-        if self._cell is not None:
-            self._cell.append(data)
+    headers: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
 
 
 @lru_cache(maxsize=1)
@@ -291,45 +222,101 @@ def render_html(text: str) -> str:
     return converter.convert(text)
 
 
-def rendered_visible_text(value: str) -> str:
-    """Return the text a reader sees once ``value`` is published.
+def render_tree(text: str) -> object | None:
+    """Render ``text`` and parse the result the way a browser would.
 
-    Deciding whether a fragment of Markdown *says* anything means looking at
-    what it renders to, not at its source: a URL is not prose, a tag is not
-    evidence, and text a browser hides is not either. Rendering and then reading
-    the visible text off the result is the only way to get that right for
-    malformed HTML, which browsers repair rather than reject.
-    """
-
-    try:
-        rendered = render_html(value)
-    except Exception:
-        # Content the renderer cannot process shows the reader nothing we can
-        # vouch for, so report no visible text rather than guess.
-        return ""
-    parser = _VisibleText()
-    parser.feed(rendered)
-    parser.close()
-    return parser.text
-
-
-def published_tables(text: str) -> list[tuple[str, ...]]:
-    """Return the header cells of each table ``text`` publishes.
-
-    Whether a table renders at all depends on its surroundings, not only on its
-    own two structural lines: a paragraph directly above the header makes the
-    whole thing one lazy paragraph instead. Asking the renderer about the
-    document, rather than about the lines in isolation, is what accounts for that.
+    HTML5 tree construction is the point, not tokenising. Browsers repair
+    malformed markup rather than reject it, and the repair is what decides what a
+    reader ends up seeing: ``<span hidden />`` opens an element that stays open,
+    because self-closing syntax does not apply to non-void elements, while a
+    second ``<p>`` implicitly closes the first. A tokeniser sees neither, so it
+    gets both the hiding and the showing wrong.
     """
 
     try:
         rendered = render_html(text)
     except Exception:
+        return None
+    try:
+        return html5lib.parse(rendered, treebuilder="etree", namespaceHTMLElements=False)
+    except Exception:
+        return None
+
+
+def rendered_visible_text(value: str) -> str:
+    """Return the text a reader sees once ``value`` is published.
+
+    Deciding whether a fragment of Markdown *says* anything means looking at what
+    it renders to, not at its source: a URL is not prose, a tag is not evidence,
+    and text a browser hides is not either.
+    """
+
+    tree = render_tree(value)
+    if tree is None:
+        # Content the renderer cannot process shows the reader nothing we can
+        # vouch for, so report no visible text rather than guess.
+        return ""
+    return _collapse("".join(_visible_parts(tree, hidden=False)))
+
+
+def published_tables(text: str) -> list[PublishedTable]:
+    """Return every table ``text`` publishes, in the text a reader sees.
+
+    Whether a table renders at all depends on its surroundings, not only on its
+    own two structural lines: a paragraph directly above the header makes the
+    whole thing one lazy paragraph instead. Rows come back alongside the headers
+    so a caller can tell *which* published table its source lines became, rather
+    than trusting that a matching header somewhere on the page is the same table.
+    """
+
+    tree = render_tree(text)
+    if tree is None:
         return []
-    parser = _TableHeaders()
-    parser.feed(rendered)
-    parser.close()
-    return parser.tables
+    tables: list[PublishedTable] = []
+    for element in tree.iter("table"):
+        headers: tuple[str, ...] = ()
+        rows: list[tuple[str, ...]] = []
+        for row in element.iter("tr"):
+            heading_cells = tuple(_cell_text(cell) for cell in row.iter("th"))
+            body_cells = tuple(_cell_text(cell) for cell in row.iter("td"))
+            if heading_cells and not headers:
+                headers = heading_cells
+            elif body_cells:
+                rows.append(body_cells)
+        tables.append(PublishedTable(headers, tuple(rows)))
+    return tables
+
+
+def _cell_text(cell: object) -> str:
+    return _collapse("".join(_visible_parts(cell, hidden=False)))
+
+
+def _collapse(text: str) -> str:
+    """Collapse whitespace the way HTML does when it draws text."""
+
+    return _WHITESPACE.sub(" ", text).strip()
+
+
+def _visible_parts(element: object, hidden: bool) -> list[str]:
+    """Walk a parsed tree, collecting only the text a browser would draw."""
+
+    if not isinstance(element.tag, str):
+        # A comment or processing instruction. Its text is markup, not content,
+        # and a reader never sees it. Any tail text belongs to the parent, which
+        # collects it below.
+        return []
+    tag = element.tag.rsplit("}", 1)[-1]
+    concealed = hidden or tag in _NON_VISIBLE_TAGS or "hidden" in element.attrib
+    parts: list[str] = []
+    if not concealed and element.text:
+        parts.append(element.text)
+    for child in element:
+        parts.extend(_visible_parts(child, concealed))
+        # Tail text sits in this element, not the child, so it is hidden only
+        # when this element is.
+        if not concealed and child.tail:
+            parts.append(child.tail)
+    return parts
 
 
 def frontmatter_end(lines: list[str]) -> int:
@@ -540,9 +527,11 @@ __all__ = [
     "link_targets",
     "local_target_issue",
     "markdown_anchors",
+    "PublishedTable",
     "markdown_links",
     "published_tables",
     "render_html",
+    "render_tree",
     "rendered_visible_text",
     "site_converter",
     "strip_line_comments",

@@ -186,21 +186,30 @@ so that contract stands. If the page publishes a contract table the audit does n
 recognise -- one written without outer pipes, say -- it says so rather than
 claiming there is no table.
 
+Finding a matching header on the page is not enough to conclude it came from the
+lines just read, so the rows are compared too. Otherwise a canonical-looking table
+that renders as a paragraph, sitting above an unrelated raw-HTML table with the
+same headers, would let unpublished rows stand as the contract. Tying the source
+to the specific table a reader sees is what closes that.
+
 Evidence must say something to a reader, judged on rendered text rather than
 Markdown source. A cell holding only a code span, only a comment, only emphasis,
 only an HTML tag, only an entity, or only an empty link such as `[ ](notes.md)`
 is rejected: each carries word characters in the source and shows the reader
-nothing. Text a browser hides is treated the same way. That check runs on parsed
-HTML rather than on a pattern, which is what makes it right about malformed
-markup: browsers repair `<span hidden>reason` and keep hiding it, while
-`title="hidden"` hides nothing at all. So is evidence that is nothing but `TODO`,
-`TBD`, `pending`, `placeholder`, or `unknown`, or that opens with one of those as
-a marker such as `TODO: choose a milestone`. A status word that merely begins a
-sentence is fine: "Pending Mathlib PR 1234" names something a reader can check.
-`DECOMPOSED` evidence must contain at least one complete inline link to an
-existing roadmap article, and *every* link it offers must resolve, fragments
-included, under the same rules the audit applies. A link missing its closing
-parenthesis does not render and does not count.
+nothing. Text a browser hides is treated the same way. That check runs on an
+HTML5 tree rather than on a pattern or a token stream, because what a reader ends
+up seeing is decided by the repair a browser performs on malformed markup:
+`<span hidden>reason` and `<span hidden />Reason` both stay hidden, since an
+unclosed non-void element stays open, while `<p hidden>aside<p>Real reason` shows
+its second paragraph, since that one implicitly closes the first. `title="hidden"`
+hides nothing at all. So is evidence that is nothing but `TODO`, `TBD`, `pending`,
+`placeholder`, or `unknown`, or that opens with one of those as a marker such as
+`TODO: choose a milestone`. A status word that merely begins a sentence is fine:
+"Pending Mathlib PR 1234" names something a reader can check. `DECOMPOSED`
+evidence must contain at least one complete inline link to an existing roadmap
+article, and *every* link it offers must resolve, fragments included, under the
+same rules the audit applies. A link missing its closing parenthesis does not
+render and does not count.
 
 Fragment checking uses the renderer rather than predicting it. Anchors come from
 running Python-Markdown with the extensions the generated `mkdocs.yml` enables
