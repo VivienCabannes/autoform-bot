@@ -22,8 +22,8 @@ from .markdown import (
     content,
     link_targets,
     local_target_issue,
-    site_converter,
-    visible_text,
+    published_tables,
+    rendered_visible_text,
 )
 
 COVERAGE_SCHEMA = "autoform-coverage/v1"
@@ -145,7 +145,6 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     lines = view.lines
     source_lines = text.splitlines()
     header_indexes: list[int] = []
-    layout_issues: list[CoverageIssue] = []
     for index in range(len(lines) - 1):
         if view.is_hidden(index) or view.is_hidden(index + 1):
             # The table is commented out or fenced, so it publishes nothing.
@@ -155,32 +154,41 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
         separator = _cells(lines[index + 1])
         if len(separator) != 3 or not all(_SEPARATOR.fullmatch(cell) for cell in separator):
             continue
-        # Masking shows what the cells *say*; only the renderer knows whether
-        # these two lines make a table at all. The `tables` extension decides
-        # that from the source, before inline processing removes comments, so a
-        # comment can leave the column count intact and still break the
-        # delimiter row -- and then the page shows a paragraph, not a contract.
-        if not _renders_as_table(source_lines[index], source_lines[index + 1]):
-            layout_issues.append(
-                CoverageIssue(
-                    index + 1,
-                    "coverage table header and separator do not render as a table; "
-                    "keep HTML comments out of them",
-                )
-            )
-            continue
         header_indexes.append(index)
 
+    # Masking shows what the cells *say*; only the renderer knows whether any of
+    # it publishes. Whether a table renders depends on its surroundings as much
+    # as on its own two structural lines -- a comment can break the delimiter row
+    # while preserving its column count, and a paragraph directly above the
+    # header turns the whole thing into one lazy paragraph -- so ask about the
+    # document rather than about the lines in isolation.
+    published = published_tables(text).count(_EXPECTED_HEADER)
+    if header_indexes and not published:
+        return [], [
+            CoverageIssue(
+                header_indexes[0] + 1,
+                "coverage table does not render as a table; check for an HTML comment in "
+                "the header or separator, and for a missing blank line above it",
+            )
+        ]
+    if not header_indexes and published:
+        # The page shows a contract table we did not recognise, which means it is
+        # not in the form the audit reads. Say so rather than report no table.
+        return [], [
+            CoverageIssue(
+                0,
+                "coverage table must be written with a leading and trailing pipe on every row",
+            )
+        ]
+
     if not header_indexes:
-        if layout_issues:
-            return [], layout_issues
         return [], [CoverageIssue(0, "coverage contract has no 'Area | Coverage | Evidence' table")]
     if len(header_indexes) > 1:
         return [], [CoverageIssue(header_indexes[1] + 1, "coverage contract has multiple coverage tables")]
 
     header_index = header_indexes[0]
     entries: list[CoverageEntry] = []
-    issues: list[CoverageIssue] = list(layout_issues)
+    issues: list[CoverageIssue] = []
     seen_areas: dict[str, int] = {}
     for index in range(header_index + 2, len(lines)):
         raw = lines[index]
@@ -235,16 +243,6 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     if not entries and not issues:
         issues.append(CoverageIssue(header_index + 1, "coverage table has no rows"))
     return entries, issues
-
-
-def _renders_as_table(header_line: str, separator_line: str) -> bool:
-    """Whether the site's renderer turns these two lines into a table."""
-
-    try:
-        rendered = site_converter().convert(f"{header_line}\n{separator_line}\n")
-    except Exception:
-        return False
-    return "<table>" in rendered
 
 
 def _looks_like_row(line: str) -> bool:
@@ -349,7 +347,7 @@ def _visible_markdown(value: str) -> str:
     publishes an empty link, not evidence.
     """
 
-    return visible_text(INLINE_CODE.sub("", value))
+    return rendered_visible_text(INLINE_CODE.sub("", value))
 
 
 def _has_substance(visible: str) -> bool:

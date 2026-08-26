@@ -34,6 +34,72 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_a_table_with_no_blank_line_above_it_is_rejected(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # Both structural lines are canonical, but a paragraph runs straight into the
+    # header, so the renderer publishes one lazy paragraph and no table at all.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "Intro without a separating blank line\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "coverage table does not render as a table; check for an HTML comment in "
+        "the header or separator, and for a missing blank line above it"
+    ]
+
+
+def test_a_table_written_without_outer_pipes_is_named(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The page does publish a contract table here, so reporting "no table" would
+    # be a lie. Name the form the audit needs instead.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\nArea | Coverage | Evidence\n--- | --- | ---\nMain | OUT | Not in scope\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "coverage table must be written with a leading and trailing pipe on every row"
+    ]
+
+
+def test_evidence_hidden_by_a_malformed_element_is_not_evidence(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # A browser closes the span and keeps hiding what follows it.
+    _contract(blueprint, "| Appendix | OUT | <span hidden>reason |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == ["coverage evidence has no substantive content"]
+
+
+def test_the_word_hidden_in_an_attribute_value_is_still_evidence(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # `title="hidden"` hides nothing, and neither does `aria-hidden` for a
+    # sighted reader. Matching the word rather than the attribute rejected both.
+    for evidence in (
+        '<span title="hidden">Out of scope for this thesis</span>',
+        '<span aria-hidden="true">Out of scope for this thesis</span>',
+    ):
+        _contract(blueprint, f"| Appendix | OUT | {evidence} |\n")
+
+        summary, issues = load_coverage(blueprint)
+
+        assert issues == (), evidence
+        assert summary is not None, evidence
+
+
 def test_a_comment_breaking_the_separator_is_rejected(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # The column count survives the comment but the delimiter syntax does not, so
@@ -50,8 +116,8 @@ def test_a_comment_breaking_the_separator_is_rejected(tmp_path: Path) -> None:
 
     assert summary is None
     assert [issue.reason for issue in issues] == [
-        "coverage table header and separator do not render as a table; "
-        "keep HTML comments out of them"
+        "coverage table does not render as a table; check for an HTML comment in "
+        "the header or separator, and for a missing blank line above it"
     ]
 
 
@@ -236,8 +302,8 @@ def test_a_comment_adding_a_pipe_to_the_header_is_rejected(tmp_path: Path) -> No
 
     assert summary is None
     assert [issue.reason for issue in issues] == [
-        "coverage table header and separator do not render as a table; "
-        "keep HTML comments out of them"
+        "coverage table does not render as a table; check for an HTML comment in "
+        "the header or separator, and for a missing blank line above it"
     ]
 
 
@@ -255,8 +321,8 @@ def test_a_comment_adding_a_pipe_to_the_separator_is_rejected(tmp_path: Path) ->
 
     assert summary is None
     assert [issue.reason for issue in issues] == [
-        "coverage table header and separator do not render as a table; "
-        "keep HTML comments out of them"
+        "coverage table does not render as a table; check for an HTML comment in "
+        "the header or separator, and for a missing blank line above it"
     ]
 
 

@@ -90,11 +90,11 @@ mathematics.
    HTML comment or an indented or fenced block is ignored rather than trusted.
    Keep comments and code blocks out of the table body: hidden content ends a
    table for every renderer, so a row written below one is reported rather than
-   quietly dropped, even when written without its outer pipes, and a header or
-   separator carrying a comment that stops the table rendering is rejected.
+   quietly dropped, even when written without its outer pipes. Leave a blank
+   line above the table: a paragraph running into the header publishes no table
+   at all, and neither does a comment that breaks the separator.
    Write evidence a reader can act on, judged on what it renders as: a bare
-   `TODO`, a lone code span, an empty link such as `[ ](notes.md)`, text inside
-   `hidden` or `<script>` elements, and a marker such as `TBD - pick a milestone`
+   `TODO`, a lone code span, an empty link such as `[ ](notes.md)`, text a browser hides, and a marker such as `TBD - pick a milestone`
    are all rejected, while "Pending Mathlib PR 1234" is fine because it names a
    real dependency. `DECOMPOSED` requires at least one complete link to an
    existing roadmap article, and every link in that cell must resolve, fragments

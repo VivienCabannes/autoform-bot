@@ -14,7 +14,7 @@ from autoform_cli.markdown import (
     local_target_issue,
     markdown_anchors,
     markdown_links,
-    visible_text,
+    rendered_visible_text,
 )
 
 #: Heading forms whose published anchors are easy to get subtly wrong, paired
@@ -100,13 +100,25 @@ def test_frontmatter_cannot_contribute_anchors(tmp_path: Path) -> None:
     assert markdown_anchors(article) == {"real-heading"}
 
 
-def test_visible_text_keeps_labels_and_drops_destinations() -> None:
-    assert visible_text("[Node](../roadmap/node.md)").strip() == "Node"
-    assert visible_text("[ ](missing.md)").strip() == ""
-    assert visible_text("<span></span>").strip() == ""
-    assert visible_text("&amp; &nbsp;").strip() == "&"
-    assert visible_text("`code`").strip() == "code"
-    assert visible_text("![alt](image.png)").strip() == ""
+def test_rendered_visible_text_is_what_a_reader_sees() -> None:
+    def visible(value: str) -> str:
+        return rendered_visible_text(value).strip()
+
+    assert visible("[Node](../roadmap/node.md)") == "Node"
+    assert visible("[ ](missing.md)") == ""
+    assert visible("<span></span>") == ""
+    assert visible("&amp; &nbsp;").startswith("&")
+    assert visible("![alt](image.png)") == ""
+    # Text a browser never shows is not text a reader sees.
+    assert visible("<script>reason</script>") == ""
+    assert visible("<span hidden>reason</span>") == ""
+    # Browsers close an unclosed element and keep hiding its contents.
+    assert visible("<span hidden>reason") == ""
+    # `hidden` has to be the attribute, not any occurrence of the word.
+    assert visible('<span title="hidden">real reason</span>') == "real reason"
+    assert visible('<span aria-hidden="true">real reason</span>') == "real reason"
+    # A nested copy of the tag must not close the suppression early.
+    assert visible("<div hidden>a<div>b</div>c</div>") == ''
 
 
 def test_masking_blanks_code_blocks_and_comments_without_moving_lines() -> None:

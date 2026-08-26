@@ -174,26 +174,33 @@ This holds for multi-line constructs too: a blank line inside a comment or fence
 belongs to that construct rather than ending the table. Any row-shaped line
 stranded below such a break is named, including malformed rows and rows written
 without their outer pipes, since Python-Markdown accepts `A | OUT | reason` as a
-row just as readily as the canonical form. A comment that changes the column
-layout of a row is rejected, and the header and separator are checked by asking
-the renderer whether those two lines make a table at all: a comment can leave the
-column count intact and still break the delimiter row, in which case the page
-shows a paragraph rather than a contract.
+row just as readily as the canonical form.
+
+Whether the table publishes at all is settled by rendering the document and
+looking for it, not by inspecting its two structural lines. That distinction
+matters because a table's fate depends on its surroundings: a comment can break
+the delimiter row while leaving its column count intact, and a paragraph running
+straight into the header makes the whole thing one lazy paragraph. Both publish
+nothing and both are rejected. A comment *inside* a header cell does still render,
+so that contract stands. If the page publishes a contract table the audit does not
+recognise -- one written without outer pipes, say -- it says so rather than
+claiming there is no table.
 
 Evidence must say something to a reader, judged on rendered text rather than
 Markdown source. A cell holding only a code span, only a comment, only emphasis,
 only an HTML tag, only an entity, or only an empty link such as `[ ](notes.md)`
 is rejected: each carries word characters in the source and shows the reader
-nothing. Text a browser never displays is treated the same way, so
-`<span hidden>reason</span>`, `<script>`, `<style>`, and `<template>` contents do
-not count either. So is evidence that is nothing but `TODO`, `TBD`, `pending`,
-`placeholder`, or `unknown`, or that opens with one of those as a marker such as
-`TODO: choose a milestone`. A status word that merely begins a sentence is fine:
-"Pending Mathlib PR 1234" names something a reader can check. `DECOMPOSED`
-evidence must contain at least one complete inline link to an existing roadmap
-article, and *every* link it offers must resolve, fragments included, under the
-same rules the audit applies. A link missing its closing parenthesis does not
-render and does not count.
+nothing. Text a browser hides is treated the same way. That check runs on parsed
+HTML rather than on a pattern, which is what makes it right about malformed
+markup: browsers repair `<span hidden>reason` and keep hiding it, while
+`title="hidden"` hides nothing at all. So is evidence that is nothing but `TODO`,
+`TBD`, `pending`, `placeholder`, or `unknown`, or that opens with one of those as
+a marker such as `TODO: choose a milestone`. A status word that merely begins a
+sentence is fine: "Pending Mathlib PR 1234" names something a reader can check.
+`DECOMPOSED` evidence must contain at least one complete inline link to an
+existing roadmap article, and *every* link it offers must resolve, fragments
+included, under the same rules the audit applies. A link missing its closing
+parenthesis does not render and does not count.
 
 Fragment checking uses the renderer rather than predicting it. Anchors come from
 running Python-Markdown with the extensions the generated `mkdocs.yml` enables

@@ -13,8 +13,8 @@
      Only the visible table above is the contract. A table written inside these
      notes, or inside a fenced or indented block, is ignored rather than trusted.
      Keep notes below the table: a comment between rows ends the table for every
-     renderer, so rows under it would not be published, and a comment that stops
-     the header or separator rendering as a table is rejected.
+     renderer, so rows under it would not be published. Leave a blank line above
+     the table too, since a paragraph running into the header publishes no table.
 
      Evidence must say something a reader can act on, judged on what it renders
      as rather than on the Markdown source. A bare TODO, a lone code span, an

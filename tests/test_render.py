@@ -688,7 +688,7 @@ def test_render_refuses_a_contract_whose_header_layout_is_hidden(tmp_path: Path)
     )
     output = tmp_path / "out"
 
-    with pytest.raises(PublicationError, match="do not render as a table"):
+    with pytest.raises(PublicationError, match="does not render as a table"):
         render_site(project / "blueprint", output, lean_root=project)
 
     assert not (output / PUBLICATION_MANIFEST).exists()

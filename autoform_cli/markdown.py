@@ -29,6 +29,8 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
+from functools import lru_cache
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -85,26 +87,13 @@ _LIST_ITEM = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
 #: CommonMark's indentation threshold for an indented code block.
 _CODE_INDENT = 4
 
-#: Inline constructs, in the order they have to be reduced to visible text.
-_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
-_AUTOLINK = re.compile(r"<((?:https?|ftp|mailto):[^>\s]+)>")
-_INLINE_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
-_REFERENCE_LINK = re.compile(r"\[([^\]]*)\]\[[^\]]*\]")
-_CODE_SPAN = re.compile(r"(`+)(.*?)\1", re.DOTALL)
-_HTML_TAG = re.compile(r"<!--.*?-->|</?[A-Za-z][^>]*>", re.DOTALL)
-_EMPHASIS = re.compile(r"[*_~]")
-_BACKSLASH_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+#: Elements whose contents a browser never shows the reader. Text inside these
+#: is not evidence of anything.
+_NON_VISIBLE_TAGS = frozenset({"script", "style", "template", "noscript", "head", "title"})
 
-#: Elements whose contents a browser never shows the reader, and the `hidden`
-#: attribute that does the same to any element carrying it. Text inside these is
-#: not evidence of anything.
-_NON_VISIBLE_ELEMENT = re.compile(
-    r"<(script|style|template|noscript|head|title)\b[^>]*>.*?</\1\s*>",
-    re.DOTALL | re.IGNORECASE,
-)
-_HIDDEN_ELEMENT = re.compile(
-    r"<([A-Za-z][\w-]*)\b[^>]*(?<![\w-])hidden(?![\w-])[^>]*>.*?</\1\s*>",
-    re.DOTALL | re.IGNORECASE,
+#: Elements with no content of their own, which therefore cannot hide any.
+_VOID_TAGS = frozenset(
+    {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "wbr"}
 )
 
 
@@ -212,31 +201,135 @@ def markdown_links(text: str) -> list[tuple[int, str]]:
     return links
 
 
-def visible_text(value: str) -> str:
-    """Reduce inline Markdown to the text a reader actually sees.
+class _VisibleText(HTMLParser):
+    """Collects the text a browser would actually show for a fragment of HTML.
 
-    Link labels replace their destinations, code spans become their contents,
-    and entities are decoded. Elements a browser never displays lose their
-    contents outright rather than only their tags: text inside ``<script>``,
-    ``<style>``, ``<template>``, or anything marked ``hidden`` is not shown to
-    anybody, so it cannot stand as evidence. A URL is not prose and a tag is not
-    evidence either, so anything deciding whether a fragment of Markdown *says*
-    something has to look at this rather than at the source.
+    Elements a browser never renders lose their contents, as does anything
+    carrying ``hidden``. Suppression runs to the element's closing tag, or to the
+    end of the fragment when it never closes, which is what a browser does with
+    an unclosed ``<span hidden>reason``. Attributes are parsed rather than
+    pattern-matched, so ``title="hidden"`` is not mistaken for the attribute
+    itself.
     """
 
-    text = _IMAGE.sub("", value)
-    text = _AUTOLINK.sub(r"\1", text)
-    text = _INLINE_LINK.sub(r"\1", text)
-    text = _REFERENCE_LINK.sub(r"\1", text)
-    text = _CODE_SPAN.sub(lambda match: match.group(2), text)
-    # Contents first, then the remaining tags: dropping tags first would leave
-    # the very text these elements hide.
-    text = _NON_VISIBLE_ELEMENT.sub("", text)
-    text = _HIDDEN_ELEMENT.sub("", text)
-    text = _HTML_TAG.sub("", text)
-    text = html.unescape(text)
-    text = _EMPHASIS.sub("", text)
-    return _BACKSLASH_ESCAPE.sub(r"\1", text)
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+        self._suppressing: str | None = None
+        self._nested = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _VOID_TAGS:
+            # No content of its own, so it can neither show nor hide anything.
+            return
+        if self._suppressing is not None:
+            if tag == self._suppressing:
+                self._nested += 1
+            return
+        if tag in _NON_VISIBLE_TAGS or any(name == "hidden" for name, _ in attrs):
+            self._suppressing = tag
+            self._nested = 0
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._suppressing is None or tag != self._suppressing:
+            return
+        if self._nested:
+            self._nested -= 1
+        else:
+            self._suppressing = None
+
+    def handle_data(self, data: str) -> None:
+        if self._suppressing is None:
+            self._chunks.append(data)
+
+    @property
+    def text(self) -> str:
+        return "".join(self._chunks)
+
+
+class _TableHeaders(HTMLParser):
+    """Collects the header cells of every table in a rendered document."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[tuple[str, ...]] = []
+        self._headers: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "table":
+            self._headers = []
+        elif tag == "th" and self._headers is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "th" and self._cell is not None:
+            self._headers = self._headers or []
+            self._headers.append("".join(self._cell).strip())
+            self._cell = None
+        elif tag == "table" and self._headers is not None:
+            self.tables.append(tuple(self._headers))
+            self._headers = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+@lru_cache(maxsize=1)
+def _converter() -> pymarkdown.Markdown:
+    """One converter, reused. Heading IDs are scoped per run, so this is safe."""
+
+    return site_converter()
+
+
+def render_html(text: str) -> str:
+    """Render ``text`` exactly as the generated site would."""
+
+    converter = _converter()
+    converter.reset()
+    return converter.convert(text)
+
+
+def rendered_visible_text(value: str) -> str:
+    """Return the text a reader sees once ``value`` is published.
+
+    Deciding whether a fragment of Markdown *says* anything means looking at
+    what it renders to, not at its source: a URL is not prose, a tag is not
+    evidence, and text a browser hides is not either. Rendering and then reading
+    the visible text off the result is the only way to get that right for
+    malformed HTML, which browsers repair rather than reject.
+    """
+
+    try:
+        rendered = render_html(value)
+    except Exception:
+        # Content the renderer cannot process shows the reader nothing we can
+        # vouch for, so report no visible text rather than guess.
+        return ""
+    parser = _VisibleText()
+    parser.feed(rendered)
+    parser.close()
+    return parser.text
+
+
+def published_tables(text: str) -> list[tuple[str, ...]]:
+    """Return the header cells of each table ``text`` publishes.
+
+    Whether a table renders at all depends on its surroundings, not only on its
+    own two structural lines: a paragraph directly above the header makes the
+    whole thing one lazy paragraph instead. Asking the renderer about the
+    document, rather than about the lines in isolation, is what accounts for that.
+    """
+
+    try:
+        rendered = render_html(text)
+    except Exception:
+        return []
+    parser = _TableHeaders()
+    parser.feed(rendered)
+    parser.close()
+    return parser.tables
 
 
 def frontmatter_end(lines: list[str]) -> int:
@@ -281,7 +374,7 @@ def markdown_anchors(path: Path) -> set[str]:
     # lines cannot contribute headings.
     body = "\n".join(lines[frontmatter_end(lines) :])
     try:
-        rendered = site_converter().convert(body)
+        rendered = render_html(body)
     except Exception:
         # A document the renderer cannot process publishes no anchors we can
         # promise, so report none rather than guess at them.
@@ -448,7 +541,9 @@ __all__ = [
     "local_target_issue",
     "markdown_anchors",
     "markdown_links",
+    "published_tables",
+    "render_html",
+    "rendered_visible_text",
     "site_converter",
     "strip_line_comments",
-    "visible_text",
 ]
