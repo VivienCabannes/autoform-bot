@@ -85,6 +85,19 @@ mathematics.
    outside formalization scope. Evidence may link to current roadmap paths;
    optional `article_id` metadata is not required. Never report whole-source
    completion while any row remains `MAPPED`.
+
+   Only published Markdown is read as the contract, so a table hidden in an
+   HTML comment or an indented or fenced block is ignored rather than trusted.
+   Write evidence a reader can act on: a bare `TODO`, a lone code span, and a
+   cell opening with `TBD` or `pending` are all rejected. `DECOMPOSED` requires
+   at least one complete link to an existing roadmap article, and every link in
+   that cell must resolve, fragments included.
+
+   `coverage.complete` means only that no declared row is still `MAPPED`. It is
+   not a claim that the table covers the source exhaustively, nor that the
+   linked articles are formalized or proved. Deciding the table is exhaustive is
+   the author's judgement and cannot be checked locally, so state what the rows
+   are meant to span rather than implying the tool verified it.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
 5. After approval, create one file per pull-request-sized unit beside its

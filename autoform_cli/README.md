@@ -162,6 +162,40 @@ canonical rows, counts, and the exact coverage source hash, while
 `publication.json` records aggregate counts without duplicating the authored
 rows.
 
+The contract is read as published Markdown and fails closed. A table inside an
+HTML comment, a fenced block, or a four-space-indented block is documentation
+rather than contract, and is not discovered at all. Evidence must carry visible
+substantive content, so a cell holding only a code span, only a comment, or only
+emphasis is rejected, as is evidence that opens with `TODO`, `TBD`, `pending`,
+`placeholder`, or `unknown`. A placeholder word later in the sentence is allowed:
+"Listed in the roadmap; source audit pending" says something a reader can check.
+`DECOMPOSED` evidence must contain at least one complete inline link to an
+existing roadmap article, and *every* link it offers must resolve, fragments
+included, under the same rules the audit applies. A link missing its closing
+parenthesis does not render and does not count.
+
+### What coverage completeness does and does not claim
+
+`coverage.complete` in audit and `publication.json` means exactly one thing:
+every row the author declared has reached a terminal disposition, so no row is
+still `MAPPED`. It is a statement about the contract, not a measurement of the
+project.
+
+It does **not** claim that the declared rows cover the source exhaustively, and
+it says nothing about whether the linked roadmap articles are formalized or
+proved. A project that declares one narrow area and disposes of it reports
+`complete` while most of its source remains undeclared. Exhaustiveness is an
+authoring judgement that no local check can make.
+
+Publication and audit are deliberately different gates. The generated
+`blueprint-pages.yml` runs `check` and `render`; it does not run `audit`. An
+invalid coverage contract fails `render` before any output is written, but a
+valid contract with `MAPPED` rows publishes normally even though `audit` reports
+each one as a `declared-coverage-gap`. That is intended: a roadmap is published
+while it is still being decomposed, and the published `coverage.complete: false`
+is how a reader sees that. Run `autoform audit` in CI when you want mapped rows
+to block a merge.
+
 Plan durable article identity metadata without changing the blueprint:
 
 ```bash
@@ -310,7 +344,7 @@ targets. It exits zero only when every required check passes. Omitting
 `--lean-root` records an explicit advisory pass; supplying it performs only a
 lexical local-source check, not a Lean build, kernel check, or proof-honesty
 review. The bundled example intentionally exits nonzero while its declared
-coverage remains `PARTIAL`.
+coverage still holds `MAPPED` rows.
 
 This command is strictly read-only and local. It does not invoke Git, GitHub,
 subprocesses, network services, claims, queues, reviews, recovery state,

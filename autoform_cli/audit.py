@@ -8,29 +8,20 @@ contacts a network service or writes generated state back into the blueprint.
 from __future__ import annotations
 
 import json
-import re
 import statistics
 from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
 from . import status
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project
-
-_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
-_INLINE_CODE = re.compile(r"(`+).*?\1")
-_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
-_EXTERNAL_SCHEMES = frozenset({"http", "https"})
-_MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
-#: The trailing attr-list block and an explicit `#id` within it. MkDocs allows
-#: the ID alongside classes and attributes, for example `{#result .highlight}`.
-_ATTR_LIST = re.compile(r"\{(?P<attributes>[^{}]*)\}\s*$")
-_ATTR_LIST_ID = re.compile(r"(?:^|\s)#(?P<id>[^\s#.={}]+)(?=\s|$)")
+from .markdown import FENCE as _FENCE
+from .markdown import HEADING as _HEADING
+from .markdown import HTML_COMMENT as _HTML_COMMENT
+from .markdown import local_target_issue as _local_target_issue
+from .markdown import markdown_links as _markdown_links
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -241,8 +232,6 @@ def audit_graph(
     return _result(findings, coverage=coverage)
 
 
-@dataclass
-
 @dataclass(frozen=True, slots=True)
 class _ArticleShape:
     statement_text: bool
@@ -312,94 +301,6 @@ def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditF
     return findings
 
 
-def _local_target_issue(
-    source_path: Path,
-    target: str,
-    boundary: Path,
-    *,
-    label: str,
-) -> tuple[str, str] | None:
-    split = urlsplit(target)
-    scheme = split.scheme.casefold()
-    if scheme in _EXTERNAL_SCHEMES:
-        return None
-    if scheme:
-        return f"unsupported-{label}-link", f"{label} link uses unsupported scheme: {target!r}"
-    if split.netloc:
-        return f"unsupported-{label}-link", f"{label} link uses a network location: {target!r}"
-
-    raw_path = unquote(split.path)
-    if "\x00" in raw_path:
-        return f"malformed-{label}-link", f"{label} link contains an invalid path: {target!r}"
-    if not raw_path:
-        candidate = source_path.resolve()
-    else:
-        relative = Path(raw_path)
-        if relative.is_absolute():
-            return f"{label}-escapes-blueprint", f"{label} link escapes the blueprint: {target!r}"
-        candidate = (source_path.parent / relative).resolve()
-
-    boundary = boundary.resolve()
-    if not _is_within(candidate, boundary):
-        return f"{label}-escapes-blueprint", f"{label} link escapes the blueprint: {target!r}"
-    try:
-        is_file = candidate.is_file()
-    except (OSError, ValueError):
-        return f"malformed-{label}-link", f"{label} link contains an invalid path: {target!r}"
-    if not is_file:
-        return f"{label}-not-found", f"{label} link does not resolve to a file: {target!r}"
-    if split.fragment and candidate.suffix.casefold() == ".md":
-        fragment = unquote(split.fragment)
-        if fragment not in _markdown_anchors(candidate):
-            return f"{label}-anchor-not-found", f"{label} link fragment does not resolve: {target!r}"
-    return None
-
-
-def _markdown_anchors(path: Path) -> set[str]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return set()
-    counts: dict[str, int] = {}
-    anchors: set[str] = set()
-    fence: tuple[str, int] | None = None
-    for line in text.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        heading = _HEADING.match(line)
-        if heading is None:
-            continue
-        title = heading.group(2).strip()
-        # `attr_list` is enabled in the generated mkdocs.yml, so an explicit
-        # `#id` in the trailing attribute block is what MkDocs renders and what
-        # a link must match. The ID may appear beside classes or attributes.
-        attributes = _ATTR_LIST.search(title)
-        explicit = (
-            _ATTR_LIST_ID.search(attributes.group("attributes"))
-            if attributes is not None
-            else None
-        )
-        if explicit is not None:
-            anchors.add(explicit.group("id"))
-            continue
-        base = _MARKDOWN_ANCHOR_PUNCTUATION.sub("", title.casefold())
-        base = re.sub(r"\s+", "-", base).strip("-")
-        if not base:
-            continue
-        index = counts.get(base, 0)
-        counts[base] = index + 1
-        anchors.add(base if index == 0 else f"{base}_{index}")
-    return anchors
-
-
 def _coverage_findings(
     blueprint: Path,
 ) -> tuple[CoverageSummary | None, list[AuditFinding]]:
@@ -450,51 +351,6 @@ def _has_substantive_markdown(text: str) -> bool:
         if line.strip():
             return True
     return False
-
-
-def _markdown_links(text: str) -> list[tuple[int, str]]:
-    links: list[tuple[int, str]] = []
-    fence: tuple[str, int] | None = None
-    in_comment = False
-    for line_number, raw in enumerate(text.splitlines(), start=1):
-        line, in_comment = _strip_line_comments(raw, in_comment)
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        for match in _LINK.finditer(_INLINE_CODE.sub("", line)):
-            target = match.group(1)
-            if target.startswith("<") and target.endswith(">"):
-                target = target[1:-1]
-            links.append((line_number, target))
-    return links
-
-
-def _strip_line_comments(line: str, in_comment: bool) -> tuple[str, bool]:
-    output: list[str] = []
-    index = 0
-    while index < len(line):
-        if in_comment:
-            end = line.find("-->", index)
-            if end < 0:
-                return "".join(output), True
-            index = end + 3
-            in_comment = False
-            continue
-        start = line.find("<!--", index)
-        if start < 0:
-            output.append(line[index:])
-            break
-        output.append(line[index:start])
-        index = start + 4
-        in_comment = True
-    return "".join(output), in_comment
 
 
 def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
@@ -634,14 +490,6 @@ def _relative_path(path: Path, root: Path) -> str:
         return path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         return "."
-
-
-def _is_within(path: Path, directory: Path) -> bool:
-    try:
-        path.relative_to(directory)
-    except ValueError:
-        return False
-    return True
 
 
 def _result(

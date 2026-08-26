@@ -1,4 +1,10 @@
-"""Parse the machine-checkable source coverage contract."""
+"""Parse the machine-checkable source coverage contract.
+
+The contract is one Markdown table in ``coverage/README.md``. Because it is the
+only place a project states what its roadmap is supposed to cover, every rule
+here is written to fail closed: anything that does not visibly render, and any
+evidence that says nothing, is rejected rather than quietly accepted.
+"""
 
 from __future__ import annotations
 
@@ -10,13 +16,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .markdown import INLINE_CODE, content_lines, link_targets, local_target_issue
+
 COVERAGE_SCHEMA = "autoform-coverage/v1"
 COVERAGE_DISPOSITIONS = ("MAPPED", "DECOMPOSED", "DEFERRED", "OUT")
 _EXPECTED_HEADER = ("Area", "Coverage", "Evidence")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
-_MARKDOWN_LINK = re.compile(
-    r"(?<!!)\[[^\]]+\]\(\s*(?P<target><[^>\r\n]+>|[^)\s]+)"
-)
+#: Words that name the absence of a decision. Evidence that opens with one of
+#: these is a promise to decide later, not a disposition.
 _PLACEHOLDER_EVIDENCE = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
 
 
@@ -43,7 +50,12 @@ class CoverageEntry:
 
 @dataclass(frozen=True, slots=True)
 class CoverageSummary:
-    """Canonical coverage rows, counts, and source binding."""
+    """Canonical coverage rows, counts, and source binding.
+
+    The summary describes what the author *declared*. It is deliberately not a
+    measurement of the source tree: nothing here reads the Lean project or
+    counts proved declarations.
+    """
 
     schema: str
     source_path: str
@@ -57,6 +69,19 @@ class CoverageSummary:
 
     @property
     def complete(self) -> bool:
+        """Whether every author-declared row reached a terminal disposition.
+
+        Terminal means the row is no longer ``MAPPED`` -- the author has either
+        decomposed it into roadmap articles, deferred it to a named milestone,
+        or excluded it with a reason.
+
+        This is a claim about the *contract*, not about the project. It does not
+        establish that the declared rows cover the source exhaustively, and it
+        says nothing about whether the linked roadmap articles are formalized or
+        proved. A project that declares one narrow area and disposes of it
+        reports ``complete`` while most of its source remains undeclared.
+        """
+
         return bool(self.entries) and not self.counts["MAPPED"]
 
     def as_dict(self) -> dict[str, object]:
@@ -104,31 +129,31 @@ def load_coverage(blueprint_dir: str | Path) -> tuple[CoverageSummary | None, tu
 
 
 def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
-    lines = text.splitlines()
-    tables: list[tuple[int, tuple[str, ...]]] = []
-    fenced = _fenced_lines(lines)
+    # Only published Markdown can carry the contract. Commented-out and
+    # code-block tables are masked to blank lines first, which keeps every
+    # surviving index aligned with the author's own line numbering.
+    lines = content_lines(text)
+    header_indexes: list[int] = []
     for index in range(len(lines) - 1):
-        if index in fenced or index + 1 in fenced:
-            continue
         header = _cells(lines[index])
         separator = _cells(lines[index + 1])
         if header == _EXPECTED_HEADER and len(separator) == 3 and all(
             _SEPARATOR.fullmatch(cell) for cell in separator
         ):
-            tables.append((index, header))
+            header_indexes.append(index)
 
-    if not tables:
+    if not header_indexes:
         return [], [CoverageIssue(0, "coverage contract has no 'Area | Coverage | Evidence' table")]
-    if len(tables) > 1:
-        return [], [CoverageIssue(tables[1][0] + 1, "coverage contract has multiple coverage tables")]
+    if len(header_indexes) > 1:
+        return [], [CoverageIssue(header_indexes[1] + 1, "coverage contract has multiple coverage tables")]
 
-    header_index, _header = tables[0]
+    header_index = header_indexes[0]
     entries: list[CoverageEntry] = []
     issues: list[CoverageIssue] = []
     seen_areas: dict[str, int] = {}
     for index in range(header_index + 2, len(lines)):
         raw = lines[index]
-        if index in fenced or not raw.strip():
+        if not raw.strip():
             break
         cells = _cells(raw)
         line_number = index + 1
@@ -174,14 +199,16 @@ def _validate_evidence(
     roadmap = (blueprint / "roadmap").resolve()
     for entry in entries:
         visible_evidence = _visible_markdown(entry.evidence)
-        normalized_evidence = re.sub(r"[*_~`]", "", visible_evidence).strip(" \t\r\n.!?:;").casefold()
-        if normalized_evidence in _PLACEHOLDER_EVIDENCE:
+        if not _has_substance(visible_evidence):
+            issues.append(CoverageIssue(entry.line, "coverage evidence has no substantive content"))
+            continue
+        if _is_placeholder(visible_evidence):
             issues.append(CoverageIssue(entry.line, "coverage evidence is a placeholder"))
             continue
         if entry.disposition != "DECOMPOSED":
             continue
 
-        targets = tuple(match.group("target") for match in _MARKDOWN_LINK.finditer(visible_evidence))
+        targets = link_targets(entry.evidence)
         if not targets:
             issues.append(
                 CoverageIssue(
@@ -189,6 +216,17 @@ def _validate_evidence(
                     "DECOMPOSED coverage evidence must link to at least one roadmap article",
                 )
             )
+            continue
+        # Every link offered as proof of decomposition must resolve, using the
+        # audit's rules so `render` cannot publish evidence the audit rejects.
+        # One good link beside a broken one is a broken claim.
+        broken: list[str] = []
+        for target in targets:
+            problem = local_target_issue(coverage_path, target, blueprint, label="coverage")
+            if problem is not None:
+                broken.append(problem[1])
+        if broken:
+            issues.extend(CoverageIssue(entry.line, reason) for reason in broken)
             continue
         if not any(_is_roadmap_article(target, coverage_path=coverage_path, roadmap=roadmap) for target in targets):
             issues.append(
@@ -201,13 +239,41 @@ def _validate_evidence(
 
 
 def _visible_markdown(value: str) -> str:
-    without_comments = re.sub(r"<!--.*?-->", "", value, flags=re.DOTALL)
-    return re.sub(r"(`+)[^`]*?\1", "", without_comments)
+    """Return evidence with inline code removed.
+
+    HTML comments are already masked before the table is parsed. Inline code is
+    illustration rather than justification, so a cell whose only content is a
+    code span states no reason at all.
+    """
+
+    return INLINE_CODE.sub("", value)
+
+
+def _has_substance(visible: str) -> bool:
+    """Whether anything a reader could act on survives emphasis and punctuation."""
+
+    return bool(re.search(r"\w", re.sub(r"[*_~\\]", "", visible)))
+
+
+def _is_placeholder(visible: str) -> bool:
+    """Whether the evidence only announces that a decision is still outstanding.
+
+    A cell is rejected when its first word is a placeholder, however decorated:
+    ``TBD``, ``**TODO.**``, and ``TODO: choose a milestone`` all lead with a
+    marker that declares the row unfinished, so nothing after it is a reason.
+
+    A placeholder word later in the sentence is deliberately allowed. Evidence
+    such as "Listed in the roadmap; source audit pending" tells a reader
+    something they can check, and rejecting it would fail closed on ordinary
+    authoring -- the bundled thesis example writes exactly that.
+    """
+
+    words = re.findall(r"\w+", re.sub(r"[*_~\\]", "", visible).casefold())
+    return bool(words) and words[0] in _PLACEHOLDER_EVIDENCE
 
 
 def _is_roadmap_article(target: str, *, coverage_path: Path, roadmap: Path) -> bool:
-    normalized = target[1:-1] if target.startswith("<") and target.endswith(">") else target
-    parsed = urlsplit(normalized)
+    parsed = urlsplit(target)
     if parsed.scheme or parsed.netloc:
         return False
     try:
@@ -219,24 +285,6 @@ def _is_roadmap_article(target: str, *, coverage_path: Path, roadmap: Path) -> b
         return candidate.is_file() and candidate.suffix.casefold() == ".md"
     except (OSError, RuntimeError, ValueError):
         return False
-
-
-def _fenced_lines(lines: list[str]) -> set[int]:
-    fenced: set[int] = set()
-    marker: tuple[str, int] | None = None
-    for index, line in enumerate(lines):
-        match = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-        if match is not None:
-            token = match.group(1)
-            fenced.add(index)
-            if marker is None:
-                marker = (token[0], len(token))
-            elif token[0] == marker[0] and len(token) >= marker[1]:
-                marker = None
-            continue
-        if marker is not None:
-            fenced.add(index)
-    return fenced
 
 
 def _cells(line: str) -> tuple[str, ...]:

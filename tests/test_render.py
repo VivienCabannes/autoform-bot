@@ -629,6 +629,58 @@ def test_render_rejects_invalid_coverage_before_touching_output(tmp_path: Path) 
     assert not (output / PUBLICATION_MANIFEST).exists()
 
 
+def test_render_refuses_decomposition_evidence_with_one_broken_link(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    # One link resolves and one does not. Publishing this would report
+    # `coverage.complete: true` over evidence the audit rejects.
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main result | DECOMPOSED | "
+        "[Roadmap](../roadmap/README.md) and [Absent](../roadmap/absent.md) |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+
+    with pytest.raises(PublicationError, match="does not resolve to a file"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert not (output / PUBLICATION_MANIFEST).exists()
+
+
+def test_render_refuses_decomposition_evidence_with_a_missing_anchor(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main result | DECOMPOSED | [Results](../roadmap/README.md#absent-section) |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+
+    with pytest.raises(PublicationError, match="fragment does not resolve"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert not (output / PUBLICATION_MANIFEST).exists()
+
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main result | DECOMPOSED | [Results](../roadmap/README.md#results) |\n",
+        encoding="utf-8",
+    )
+
+    render_site(project / "blueprint", output, lean_root=project)
+
+    manifest = json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))
+    assert manifest["coverage"]["complete"]
+
+
 def test_render_cleans_only_an_owned_publication(tmp_path: Path) -> None:
     project = _project(tmp_path)
     output = tmp_path / "out"
