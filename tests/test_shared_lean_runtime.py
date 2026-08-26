@@ -226,6 +226,72 @@ def test_project_slot_admission_stops_before_the_response_budget(tmp_path):
     cache.close()
 
 
+def test_cache_close_stops_waiting_for_an_active_lease(tmp_path):
+    project = make_lake_project(tmp_path, "active-close")
+    leased = threading.Event()
+    release = threading.Event()
+    closed = []
+    errors = []
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    def hold_lease():
+        try:
+            with cache.lease(str(project)):
+                leased.set()
+                release.wait(timeout=2)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=hold_lease)
+    thread.start()
+    assert leased.wait(timeout=1)
+    started = time.monotonic()
+    try:
+        cache.close(timeout=0.05)
+        assert time.monotonic() - started < 0.5
+        assert closed == [project.resolve()]
+    finally:
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
+def test_cache_close_bounds_resource_cleanup(tmp_path):
+    project = make_lake_project(tmp_path, "blocked-cleanup")
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    def close_resource(resource):
+        cleanup_started.set()
+        release_cleanup.wait(timeout=2)
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+
+    started = time.monotonic()
+    try:
+        cache.close(timeout=0.05)
+        assert time.monotonic() - started < 0.5
+        assert cleanup_started.is_set()
+    finally:
+        release_cleanup.set()
+
+
 def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
     project = make_lake_project(tmp_path, "slow-startup")
     clock = {"now": 0.0}
@@ -359,12 +425,10 @@ def test_lsp_diagnostic_formatting_remains_stable():
             }
         ]
     )
-    assert formatted == (
-        "Diagnostics: 1 error(s), 0 warning(s)\n"
-        "3:4: error: unknown identifier"
-    )
+    assert formatted == ("Diagnostics: 1 error(s), 0 warning(s)\n3:4: error: unknown identifier")
 
 
+@pytest.mark.daemon
 def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "lean.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -413,6 +477,7 @@ def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_di
     assert not socket_path.exists()
 
 
+@pytest.mark.daemon
 def test_daemon_outlives_the_separate_process_that_started_it(
     tmp_path,
     runtime_dir,
@@ -455,13 +520,12 @@ def test_daemon_outlives_the_separate_process_that_started_it(
             autostart=False,
         )
         assert repl_status["state"] == "cold"
-        assert client.request("daemon.status", autostart=False)["repl_projects"][
-            "resident"
-        ] == []
+        assert client.request("daemon.status", autostart=False)["repl_projects"]["resident"] == []
     finally:
         client.stop()
 
 
+@pytest.mark.daemon
 def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "restart.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -476,6 +540,7 @@ def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
         client.stop()
 
 
+@pytest.mark.daemon
 def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, monkeypatch):
     monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -492,6 +557,7 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
         current.stop()
 
 
+@pytest.mark.daemon
 def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsys):
     from servers import lean_runtime
 
@@ -508,6 +574,7 @@ def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsy
     assert not old_socket.exists()
 
 
+@pytest.mark.daemon
 def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "silent.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -536,6 +603,22 @@ def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
         silent.close()
         if thread.is_alive():
             thread.join(timeout=3)
+
+
+def test_stop_uses_the_configured_response_deadline(runtime_dir, monkeypatch):
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "bounded-stop.sock",
+        response_timeout=0.05,
+    )
+    observed = []
+
+    def request(method, params=None, *, autostart=None, response_timeout=None):
+        observed.append((method, autostart, response_timeout))
+        return {"stopping": True}
+
+    monkeypatch.setattr(client, "request", request)
+    assert client.stop() == {"stopping": True}
+    assert observed == [("daemon.shutdown", False, 0.05)]
 
 
 def test_connected_send_failure_is_never_retried(runtime_dir, monkeypatch):

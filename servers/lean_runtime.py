@@ -66,6 +66,7 @@ DEFAULT_REPL_REQUEST_TIMEOUT = 30.0
 DEFAULT_MAX_REPL_REQUEST_SECONDS = 240.0
 DEFAULT_RPC_READ_TIMEOUT = 10.0
 DEFAULT_MAX_CONNECTIONS = 64
+DEFAULT_SHUTDOWN_GRACE_SECONDS = 10.0
 RUNTIME_SAFETY_SECONDS = 30.0
 # Conservative bounds for cleanup/startup work that surrounds one tool call.
 # They keep the daemon's work inside the client's response deadline even when
@@ -160,22 +161,15 @@ class LeanRuntimeConfig:
         try:
             legacy_workers = int(legacy_raw)
         except ValueError as error:
-            raise ValueError(
-                f"LEAN_NUM_REPLS must be a nonnegative integer, got {legacy_raw!r}"
-            ) from error
+            raise ValueError(f"LEAN_NUM_REPLS must be a nonnegative integer, got {legacy_raw!r}") from error
         if legacy_workers < 0:
-            raise ValueError(
-                f"LEAN_NUM_REPLS must be a nonnegative integer, got {legacy_workers}"
-            )
+            raise ValueError(f"LEAN_NUM_REPLS must be a nonnegative integer, got {legacy_workers}")
         workers_per_project = _positive_int(
             "AUTOFORM_REPL_WORKERS_PER_PROJECT",
             legacy_workers or 1,
         )
         if workers_per_project > total_workers:
-            raise ValueError(
-                "AUTOFORM_REPL_WORKERS_PER_PROJECT cannot exceed "
-                "AUTOFORM_REPL_TOTAL_WORKERS"
-            )
+            raise ValueError("AUTOFORM_REPL_WORKERS_PER_PROJECT cannot exceed AUTOFORM_REPL_TOTAL_WORKERS")
         repl_project_limit = min(max_projects, total_workers // workers_per_project)
         repl_command = tuple(shlex.split(os.environ.get("LEAN_REPL_CMD", "lake exe repl")))
         lsp_command = tuple(shlex.split(os.environ.get("LEAN_LSP_CMD", "lake serve")))
@@ -192,45 +186,26 @@ class LeanRuntimeConfig:
             DEFAULT_MAX_REPL_REQUEST_SECONDS,
         )
         if repl_request_timeout > max_repl_request_seconds:
-            raise ValueError(
-                "AUTOFORM_REPL_REQUEST_TIMEOUT cannot exceed "
-                "AUTOFORM_MAX_REPL_REQUEST_SECONDS"
-            )
+            raise ValueError("AUTOFORM_REPL_REQUEST_TIMEOUT cannot exceed AUTOFORM_MAX_REPL_REQUEST_SECONDS")
         lsp_timeout = _positive_float("LEAN_LSP_TIMEOUT", DEFAULT_LSP_TIMEOUT)
         max_lsp_request_seconds = _positive_float(
             "AUTOFORM_MAX_LSP_REQUEST_SECONDS",
             DEFAULT_MAX_LSP_REQUEST_SECONDS,
         )
         if lsp_timeout > max_lsp_request_seconds:
-            raise ValueError(
-                "LEAN_LSP_TIMEOUT cannot exceed AUTOFORM_MAX_LSP_REQUEST_SECONDS"
-            )
+            raise ValueError("LEAN_LSP_TIMEOUT cannot exceed AUTOFORM_MAX_LSP_REQUEST_SECONDS")
         response_timeout = _positive_float(
             "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT",
             DEFAULT_RESPONSE_TIMEOUT,
         )
         repl_creation_budget = _repl_creation_budget(workers_per_project)
-        if (
-            repl_creation_budget
-            + max_repl_request_seconds
-            + RUNTIME_SAFETY_SECONDS
-            > response_timeout
-        ):
+        if repl_creation_budget + max_repl_request_seconds + RUNTIME_SAFETY_SECONDS > response_timeout:
             raise ValueError(
                 "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT is too small for the configured "
                 "REPL worker startup and request limits"
             )
-        if (
-            LSP_CLOSE_BUDGET
-            + LSP_STARTUP_BUDGET
-            + max_lsp_request_seconds
-            + RUNTIME_SAFETY_SECONDS
-            > response_timeout
-        ):
-            raise ValueError(
-                "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT is too small for "
-                "AUTOFORM_MAX_LSP_REQUEST_SECONDS"
-            )
+        if LSP_CLOSE_BUDGET + LSP_STARTUP_BUDGET + max_lsp_request_seconds + RUNTIME_SAFETY_SECONDS > response_timeout:
+            raise ValueError("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT is too small for AUTOFORM_MAX_LSP_REQUEST_SECONDS")
         return cls(
             max_projects=max_projects,
             idle_seconds=idle_seconds,
@@ -369,9 +344,7 @@ class ProjectResourceCache(Generic[T]):
                         "valid": not entry.invalid,
                         "idle_seconds": round(max(0.0, now - entry.last_used), 3),
                     }
-                    for root, entry in sorted(
-                        self._entries.items(), key=lambda item: str(item[0])
-                    )
+                    for root, entry in sorted(self._entries.items(), key=lambda item: str(item[0]))
                 ],
                 "creating": sorted(str(root) for root in self._creating),
             }
@@ -412,19 +385,28 @@ class ProjectResourceCache(Generic[T]):
         self._close_many(resources)
         return len(resources)
 
-    def close(self) -> None:
-        """Stop admission, wait for active leases, then close all resources."""
+    def close(self, *, timeout: float | None = None) -> None:
+        """Stop admission, drain leases up to ``timeout``, then force cleanup."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("close timeout must be nonnegative")
+        deadline = time.monotonic() + timeout if timeout is not None else None
         self._stop_sweeper.set()
         with self._condition:
             self._closed = True
             while self._creating or any(entry.active for entry in self._entries.values()):
-                self._condition.wait(timeout=0.5)
+                wait_seconds = 0.5
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    wait_seconds = min(wait_seconds, remaining)
+                self._condition.wait(timeout=wait_seconds)
             resources = [entry.resource for entry in self._entries.values()]
             self._entries.clear()
             self._condition.notify_all()
-        self._close_many(resources)
         if self._sweeper and self._sweeper is not threading.current_thread():
-            self._sweeper.join()
+            self._sweeper.join(timeout=self._remaining(deadline))
+        self._close_many_bounded(resources, deadline=deadline)
 
     def _acquire(
         self,
@@ -435,17 +417,11 @@ class ProjectResourceCache(Generic[T]):
         creation_budget: float,
     ) -> T | None:
         if acquisition_timeout is not None and acquisition_timeout <= 0:
-            raise ProjectResourceBusyError(
-                "no response budget remains for a shared Lean project slot"
-            )
+            raise ProjectResourceBusyError("no response budget remains for a shared Lean project slot")
         if creation_budget < 0:
             raise ValueError("creation_budget must be nonnegative")
         fingerprint = lean_project_fingerprint(root)
-        deadline = (
-            self._clock() + acquisition_timeout
-            if acquisition_timeout is not None
-            else None
-        )
+        deadline = self._clock() + acquisition_timeout if acquisition_timeout is not None else None
         resources_to_close: list[T] = []
         reserved = False
 
@@ -456,16 +432,10 @@ class ProjectResourceCache(Generic[T]):
                     raise RuntimeError("project resource cache is closed")
 
                 entry = self._entries.get(root)
-                entry_is_stale = (
-                    entry is not None
-                    and (
-                        entry.invalid
-                        or entry.fingerprint != fingerprint
-                        or (
-                            self._is_valid is not None
-                            and not self._is_valid(entry.resource)
-                        )
-                    )
+                entry_is_stale = entry is not None and (
+                    entry.invalid
+                    or entry.fingerprint != fingerprint
+                    or (self._is_valid is not None and not self._is_valid(entry.resource))
                 )
                 if entry_is_stale:
                     assert entry is not None
@@ -491,9 +461,7 @@ class ProjectResourceCache(Generic[T]):
 
                 if not wait and entry is not None:
                     if deadline is not None and self._clock() >= deadline:
-                        raise ProjectResourceBusyError(
-                            f"timed out waiting for a shared Lean project slot: {root}"
-                        )
+                        raise ProjectResourceBusyError(f"timed out waiting for a shared Lean project slot: {root}")
                     entry.active += 1
                     entry.last_used = self._clock()
                     resource = entry.resource
@@ -536,9 +504,7 @@ class ProjectResourceCache(Generic[T]):
                 if deadline is not None:
                     remaining = deadline - self._clock()
                     if remaining <= 0:
-                        raise ProjectResourceBusyError(
-                            f"timed out waiting for a shared Lean project slot: {root}"
-                        )
+                        raise ProjectResourceBusyError(f"timed out waiting for a shared Lean project slot: {root}")
                     wait_seconds = min(wait_seconds, remaining)
                 self._condition.wait(timeout=wait_seconds)
 
@@ -580,9 +546,7 @@ class ProjectResourceCache(Generic[T]):
         if close_created:
             self._safe_close(created)
             if startup_expired:
-                raise ProjectResourceBusyError(
-                    f"shared Lean project startup exceeded its response budget: {root}"
-                )
+                raise ProjectResourceBusyError(f"shared Lean project startup exceeded its response budget: {root}")
             raise RuntimeError("project resource cache closed during startup")
         return created
 
@@ -596,14 +560,14 @@ class ProjectResourceCache(Generic[T]):
         if deadline is None:
             return
         if deadline - self._clock() < creation_budget:
-            raise ProjectResourceBusyError(
-                f"not enough response budget to start a shared Lean project slot: {root}"
-            )
+            raise ProjectResourceBusyError(f"not enough response budget to start a shared Lean project slot: {root}")
 
     def _release(self, root: Path, resource: T) -> None:
         with self._condition:
             entry = self._entries.get(root)
             if entry is None or entry.resource is not resource:
+                if self._closed:
+                    return
                 raise RuntimeError("project resource lease is no longer registered")
             entry.active -= 1
             entry.last_used = self._clock()
@@ -619,6 +583,35 @@ class ProjectResourceCache(Generic[T]):
     def _close_many(self, resources: list[T]) -> None:
         for resource in resources:
             self._safe_close(resource)
+
+    def _close_many_bounded(
+        self,
+        resources: list[T],
+        *,
+        deadline: float | None,
+    ) -> None:
+        if deadline is None:
+            self._close_many(resources)
+            return
+        threads = [
+            threading.Thread(
+                target=self._safe_close,
+                args=(resource,),
+                name="autoform-project-cleanup",
+                daemon=True,
+            )
+            for resource in resources
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=self._remaining(deadline))
+
+    @staticmethod
+    def _remaining(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
 
     def _safe_close(self, resource: T) -> None:
         try:
@@ -640,9 +633,7 @@ class LeanRuntimeServices:
     ) -> None:
         self.config = config or LeanRuntimeConfig.from_environment()
         self.started_at = time.monotonic()
-        self.repl_creation_budget = _repl_creation_budget(
-            self.config.repl_workers_per_project
-        )
+        self.repl_creation_budget = _repl_creation_budget(self.config.repl_workers_per_project)
         self.lsp_creation_budget = LSP_STARTUP_BUDGET + LSP_CLOSE_BUDGET
 
         def default_repl_factory(project_dir: Path) -> LeanReplPool:
@@ -704,8 +695,7 @@ class LeanRuntimeServices:
                 effective_timeout = float(timeout)
             if effective_timeout > self.config.max_repl_request_seconds:
                 raise ValueError(
-                    "timeout exceeds the node-wide limit of "
-                    f"{self.config.max_repl_request_seconds:g} seconds"
+                    f"timeout exceeds the node-wide limit of {self.config.max_repl_request_seconds:g} seconds"
                 )
             with self.repl_projects.lease(
                 project_dir,
@@ -720,14 +710,8 @@ class LeanRuntimeServices:
                 state = "warm" if pool is not None else self.repl_projects.state(project_dir)
                 return {
                     "state": state,
-                    "capacity": (
-                        pool.capacity
-                        if pool is not None
-                        else self.config.repl_workers_per_project
-                    ),
-                    "memory_usage_gb": (
-                        round(pool.get_memory_usage(), 2) if pool is not None else 0.0
-                    ),
+                    "capacity": (pool.capacity if pool is not None else self.config.repl_workers_per_project),
+                    "memory_usage_gb": (round(pool.get_memory_usage(), 2) if pool is not None else 0.0),
                     "shutdown": pool._shutdown if pool is not None else False,
                     "daemon_pid": os.getpid(),
                     "node_total_workers": self.config.total_repl_workers,
@@ -791,17 +775,31 @@ class LeanRuntimeServices:
             result["lsp_projects"] = self.lsp_projects.stats()
         return result
 
-    def close(self) -> None:
-        self.repl_projects.close()
-        self.lsp_projects.close()
+    def close(self, *, timeout: float | None = None) -> None:
+        if timeout is None:
+            self.repl_projects.close()
+            self.lsp_projects.close()
+            return
+        if timeout < 0:
+            raise ValueError("close timeout must be nonnegative")
+        threads = [
+            threading.Thread(
+                target=cache.close,
+                kwargs={"timeout": timeout},
+                name="autoform-cache-shutdown",
+                daemon=True,
+            )
+            for cache in (self.repl_projects, self.lsp_projects)
+        ]
+        deadline = time.monotonic() + timeout
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def _acquisition_timeout(self, operation_timeout: float) -> float:
         """Reserve enough of the RPC deadline for the admitted tool operation."""
-        return (
-            self.config.response_timeout
-            - operation_timeout
-            - RUNTIME_SAFETY_SECONDS
-        )
+        return self.config.response_timeout - operation_timeout - RUNTIME_SAFETY_SECONDS
 
     @staticmethod
     def _string_param(
@@ -824,8 +822,8 @@ class LeanRuntimeServices:
 
 
 class _ThreadingUnixServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
+    block_on_close = False
 
 
 class LeanRuntimeServer(_ThreadingUnixServer):
@@ -839,9 +837,7 @@ class LeanRuntimeServer(_ThreadingUnixServer):
         self.socket_path = socket_path
         self.services = services
         self._shutdown_started = threading.Event()
-        self._connection_slots = threading.BoundedSemaphore(
-            services.config.max_connections
-        )
+        self._connection_slots = threading.BoundedSemaphore(services.config.max_connections)
         super().__init__(str(socket_path), LeanRuntimeRequestHandler)
         socket_path.chmod(0o600)
 
@@ -893,9 +889,7 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
                 raise ValueError("request must be a JSON object")
             request_id = request.get("id")
             if request.get("v") != PROTOCOL_VERSION:
-                raise ValueError(
-                    f"protocol mismatch: expected {PROTOCOL_VERSION}, got {request.get('v')!r}"
-                )
+                raise ValueError(f"protocol mismatch: expected {PROTOCOL_VERSION}, got {request.get('v')!r}")
             method = request.get("method")
             params = request.get("params")
             if not isinstance(method, str) or not method:
@@ -928,18 +922,21 @@ class LeanRuntimeRequestHandler(socketserver.StreamRequestHandler):
 
         encoded = json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
         if len(encoded) > MAX_MESSAGE_BYTES:
-            encoded = json.dumps(
-                {
-                    "v": PROTOCOL_VERSION,
-                    "id": request_id,
-                    "ok": False,
-                    "error": {
-                        "type": "ValueError",
-                        "message": "response exceeds the message limit",
+            encoded = (
+                json.dumps(
+                    {
+                        "v": PROTOCOL_VERSION,
+                        "id": request_id,
+                        "ok": False,
+                        "error": {
+                            "type": "ValueError",
+                            "message": "response exceeds the message limit",
+                        },
                     },
-                },
-                separators=(",", ":"),
-            ).encode("utf-8") + b"\n"
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
         try:
             self.wfile.write(encoded)
             self.wfile.flush()
@@ -988,9 +985,7 @@ def serve(paths: RuntimePaths) -> None:
             pass
         else:
             kind = "socket" if stat.S_ISSOCK(info.st_mode) else "non-socket"
-            raise LeanRuntimeError(
-                f"runtime {kind} already exists at {paths.socket}; use start/status/stop"
-            )
+            raise LeanRuntimeError(f"runtime {kind} already exists at {paths.socket}; use start/status/stop")
 
         services = LeanRuntimeServices()
         server = LeanRuntimeServer(paths.socket, services)
@@ -1014,7 +1009,7 @@ def serve(paths: RuntimePaths) -> None:
         finally:
             try:
                 if services is not None:
-                    services.close()
+                    services.close(timeout=DEFAULT_SHUTDOWN_GRACE_SECONDS)
             finally:
                 try:
                     info = paths.socket.lstat()
@@ -1030,11 +1025,7 @@ def serve(paths: RuntimePaths) -> None:
 
 
 def _paths_from_args(socket_path: str | None, log_path: str | None) -> RuntimePaths:
-    paths = (
-        runtime_paths_for_socket(socket_path)
-        if socket_path is not None
-        else default_runtime_paths()
-    )
+    paths = runtime_paths_for_socket(socket_path) if socket_path is not None else default_runtime_paths()
     if log_path is None:
         return paths
     log = Path(log_path).expanduser()

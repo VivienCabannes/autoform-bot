@@ -11,6 +11,8 @@ from tempfile import TemporaryDirectory
 
 from autoform_cli.markdown import local_target_issue, markdown_links
 
+import pytest
+
 
 def _shipped_path(repo_root: Path, value: str) -> Path:
     root = repo_root.resolve()
@@ -69,9 +71,7 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
         "agent-review",
         "develop-plugin",
     ]
-    assert _shipped_path(repo_root, muse["compat"]["manifestDir"]) == (
-        repo_root / ".muse-plugin"
-    ).resolve()
+    assert _shipped_path(repo_root, muse["compat"]["manifestDir"]) == (repo_root / ".muse-plugin").resolve()
     for command in muse["capabilities"]["commands"]:
         assert _shipped_path(repo_root, command["path"]).is_file()
 
@@ -111,9 +111,7 @@ def test_plugin_manifests_reference_shipped_paths_and_modules(repo_root):
 
     mappings = [
         json.loads((root / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"],
-        json.loads((root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))[
-            "mcpServers"
-        ],
+        json.loads((root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["mcpServers"],
     ]
     for servers in mappings:
         assert set(servers) == set(expected_modules)
@@ -142,6 +140,7 @@ def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
         assert "LEAN_PROJECT_DIR" not in json.dumps(server)
 
 
+@pytest.mark.installed_wheel
 def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
     dist = tmp_path / "dist"
     result = subprocess.run(
@@ -152,7 +151,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
     )
     assert result.returncode == 0, result.stderr
 
-    wheel, = dist.glob("*.whl")
+    (wheel,) = dist.glob("*.whl")
     site = tmp_path / "site"
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
@@ -179,9 +178,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
         ).decode()
         assert "autoform-lean-runtime = servers.lean_runtime:main" in entry_points
-        metadata = archive.read(
-            next(name for name in names if name.endswith(".dist-info/METADATA"))
-        ).decode()
+        metadata = archive.read(next(name for name in names if name.endswith(".dist-info/METADATA"))).decode()
         assert "Requires-Dist: psutil>=5.9" in metadata
         assert "Requires-Dist: tomli>=2.0; python_version < '3.11'" in metadata
         assert "Provides-Extra: repl" in metadata

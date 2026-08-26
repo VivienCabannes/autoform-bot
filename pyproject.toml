@@ -44,5 +44,13 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["autoform_cli", "servers"]
 
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = [
+    "daemon: detached shared Lean runtime lifecycle and process tests",
+    "installed_wheel: built-wheel installation and console-entry-point tests",
+    "real_lean: integration tests that require the pinned Lean/Lake toolchain",
+]
+
 [tool.ruff]
 line-length = 120

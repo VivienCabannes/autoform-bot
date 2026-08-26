@@ -97,13 +97,9 @@ def _response_timeout_from_environment() -> float:
     try:
         value = float(raw)
     except ValueError as error:
-        raise LeanRuntimeError(
-            f"AUTOFORM_RUNTIME_RESPONSE_TIMEOUT must be a number, got {raw!r}"
-        ) from error
+        raise LeanRuntimeError(f"AUTOFORM_RUNTIME_RESPONSE_TIMEOUT must be a number, got {raw!r}") from error
     if not math.isfinite(value) or value <= 0:
-        raise LeanRuntimeError(
-            "AUTOFORM_RUNTIME_RESPONSE_TIMEOUT must be a finite positive number"
-        )
+        raise LeanRuntimeError("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT must be a finite positive number")
     return value
 
 
@@ -130,9 +126,7 @@ def _private_runtime_directory(path: Path) -> Path:
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise LeanRuntimeError(f"runtime directory is not owned by this user: {path}")
     if info.st_mode & 0o077:
-        raise LeanRuntimeError(
-            f"runtime directory must not be accessible by group or other users: {path}"
-        )
+        raise LeanRuntimeError(f"runtime directory must not be accessible by group or other users: {path}")
     return path
 
 
@@ -171,9 +165,7 @@ def default_runtime_paths() -> RuntimePaths:
         # build-wide, so two plugin versions cannot race to launch parallel
         # daemons while replacing one another after an in-place upgrade.
         lock=directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}.lock",
-        lifetime_lock=(
-            directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}.lifetime.lock"
-        ),
+        lifetime_lock=(directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_PATH_ID}.lifetime.lock"),
         log=directory / f"lean-v{PROTOCOL_VERSION}-{INSTALL_ID}.log",
     )
 
@@ -208,18 +200,10 @@ class LeanRuntimeClient:
         startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
     ) -> None:
         self._uses_default_paths = socket_path is None
-        self.paths = (
-            runtime_paths_for_socket(socket_path)
-            if socket_path is not None
-            else default_runtime_paths()
-        )
+        self.paths = runtime_paths_for_socket(socket_path) if socket_path is not None else default_runtime_paths()
         self.autostart = autostart
         self.connect_timeout = connect_timeout
-        self.response_timeout = (
-            _response_timeout_from_environment()
-            if response_timeout is None
-            else response_timeout
-        )
+        self.response_timeout = _response_timeout_from_environment() if response_timeout is None else response_timeout
         self.startup_timeout = startup_timeout
 
     @property
@@ -263,9 +247,7 @@ class LeanRuntimeClient:
         if not isinstance(result, dict):
             raise LeanRuntimeProtocolError("daemon.ping returned a non-object result")
         if result.get("install_id") != INSTALL_ID:
-            raise LeanRuntimeProtocolError(
-                "Lean runtime belongs to a different Autoform installation"
-            )
+            raise LeanRuntimeProtocolError("Lean runtime belongs to a different Autoform installation")
         return result
 
     def ensure_running(self) -> dict[str, Any]:
@@ -320,15 +302,10 @@ class LeanRuntimeClient:
                     time.sleep(delay)
                     delay = min(delay * 1.7, 0.25)
 
-                exit_detail = (
-                    f" (exit code {process.returncode})"
-                    if process.poll() is not None
-                    else ""
-                )
+                exit_detail = f" (exit code {process.returncode})" if process.poll() is not None else ""
                 detail = f": {last_error}" if last_error else ""
                 raise LeanRuntimeUnavailable(
-                    f"Lean runtime did not become ready{exit_detail}; "
-                    f"log: {self.paths.log}{detail}"
+                    f"Lean runtime did not become ready{exit_detail}; log: {self.paths.log}{detail}"
                 )
             except BaseException:
                 self._terminate_failed_start(process)
@@ -337,12 +314,13 @@ class LeanRuntimeClient:
             os.close(lock_fd)
 
     def stop(self) -> dict[str, Any]:
-        """Ask a running daemon to finish active calls and shut down."""
+        """Ask a running daemon to finish active calls within one deadline."""
+        deadline = time.monotonic() + self.response_timeout
         try:
             result = self.request(
                 "daemon.shutdown",
                 autostart=False,
-                response_timeout=10.0,
+                response_timeout=min(self.response_timeout, 10.0),
             )
         except LeanRuntimeUnavailable:
             stopped = self._stop_previous_builds()
@@ -351,13 +329,10 @@ class LeanRuntimeClient:
             raise
         if not isinstance(result, dict):
             raise LeanRuntimeProtocolError("daemon.shutdown returned a non-object result")
-        deadline = time.monotonic() + self.response_timeout
         while self.paths.socket.exists() and time.monotonic() < deadline:
             time.sleep(0.025)
         if self.paths.socket.exists():
-            raise LeanRuntimeError(
-                f"Lean runtime is still draining requests at {self.paths.socket}"
-            )
+            raise LeanRuntimeError(f"Lean runtime is still draining requests at {self.paths.socket}")
         return result
 
     def _stop_previous_builds(self) -> list[int]:
@@ -380,9 +355,7 @@ class LeanRuntimeClient:
                 status = previous.request("daemon.ping", autostart=False)
             except LeanRuntimeUnavailable:
                 continue
-            generation = (
-                status.get("build_generation") if isinstance(status, dict) else None
-            )
+            generation = status.get("build_generation") if isinstance(status, dict) else None
             if isinstance(generation, int) and generation > BUILD_GENERATION:
                 raise LeanRuntimeProtocolError(
                     "a newer Autoform runtime build is already active; "
@@ -422,13 +395,9 @@ class LeanRuntimeClient:
         except FileNotFoundError:
             return
         if not stat.S_ISSOCK(info.st_mode):
-            raise LeanRuntimeError(
-                f"refusing to replace non-socket runtime path: {self.paths.socket}"
-            )
+            raise LeanRuntimeError(f"refusing to replace non-socket runtime path: {self.paths.socket}")
         if info.st_uid != os.getuid():
-            raise LeanRuntimeError(
-                f"refusing to replace socket owned by another user: {self.paths.socket}"
-            )
+            raise LeanRuntimeError(f"refusing to replace socket owned by another user: {self.paths.socket}")
         self.paths.socket.unlink()
 
     @staticmethod
@@ -450,15 +419,18 @@ class LeanRuntimeClient:
         response_timeout: float | None = None,
     ) -> Any:
         request_id = uuid.uuid4().hex
-        payload = json.dumps(
-            {
-                "v": PROTOCOL_VERSION,
-                "id": request_id,
-                "method": method,
-                "params": params,
-            },
-            separators=(",", ":"),
-        ).encode("utf-8") + b"\n"
+        payload = (
+            json.dumps(
+                {
+                    "v": PROTOCOL_VERSION,
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
         if len(payload) > MAX_MESSAGE_BYTES:
             raise LeanRuntimeProtocolError("Lean runtime request exceeds the message limit")
 
@@ -469,14 +441,10 @@ class LeanRuntimeClient:
             try:
                 connection.connect(str(self.paths.socket))
             except (FileNotFoundError, ConnectionRefusedError) as error:
-                raise LeanRuntimeUnavailable(
-                    f"Lean runtime is not listening at {self.paths.socket}"
-                ) from error
+                raise LeanRuntimeUnavailable(f"Lean runtime is not listening at {self.paths.socket}") from error
             except OSError as error:
                 if error.errno in {2, 61, 111}:
-                    raise LeanRuntimeUnavailable(
-                        f"Lean runtime is not listening at {self.paths.socket}"
-                    ) from error
+                    raise LeanRuntimeUnavailable(f"Lean runtime is not listening at {self.paths.socket}") from error
                 raise LeanRuntimeError(f"cannot connect to Lean runtime: {error}") from error
 
             connection.settimeout(response_timeout or self.response_timeout)
@@ -492,9 +460,7 @@ class LeanRuntimeClient:
             raise
         except OSError as error:
             if not dispatched:
-                raise LeanRuntimeUnavailable(
-                    f"Lean runtime is not listening at {self.paths.socket}"
-                ) from error
+                raise LeanRuntimeUnavailable(f"Lean runtime is not listening at {self.paths.socket}") from error
             raise LeanRuntimeError(
                 "connection to Lean runtime closed after request dispatch; the request was not retried"
             ) from error
