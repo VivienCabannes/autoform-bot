@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from autoform_cli.markdown import (
+    SITE_EXTENSION_CONFIGS,
+    SITE_EXTENSIONS,
     content,
     content_lines,
     link_targets,
@@ -15,48 +17,78 @@ from autoform_cli.markdown import (
     visible_text,
 )
 
-#: Heading forms whose published anchors are easy to get subtly wrong.
+#: Heading forms whose published anchors are easy to get subtly wrong, paired
+#: with what the configured MkDocs renderer actually publishes for them. Several
+#: of these depend on block context or on a specific extension setting rather
+#: than on the heading line alone, which is why anchors are taken from the
+#: renderer instead of predicted.
 ANCHOR_CORPUS = [
-    "# Depends on",
-    "# Café",
-    "# Naïve Bayes — dashes",
-    "# [Linked result](other.md)",
-    "# `Code` heading",
-    "# *Emphasised* result",
-    "# Heading with &amp; entity",
-    "# Title {.class}",
-    "# Result {#custom-id}",
-    "# Trailing hashes ###",
-    "# 1. Numbered",
-    "# Depends on\n\n## Depends on\n\n### Depends on",
-    "# A {#dup}\n\n# B {#dup}",
-    "# Depends on\n\n# B {#depends-on}",
-    "# A {#depends-on}\n\n# Depends on",
-    "# ***",
-    "Setext one\n===",
-    "Setext two\n---",
-    "# Sources\n\nParagraph.\n\n## Sources",
+    ("# Depends on", ["depends-on"]),
+    ("# Café", ["cafe"]),
+    ("# Naïve Bayes — dashes", ["naive-bayes-dashes"]),
+    ("# [Linked result](other.md)", ["linked-result"]),
+    ("# `Code` heading", ["code-heading"]),
+    ("# *Emphasised* result", ["emphasised-result"]),
+    ("# Heading with &amp; entity", ["heading-with-entity"]),
+    ("# Title {.class}", ["title"]),
+    (r"# Title \{.class\}", ["title-class"]),
+    ("# Result {#custom-id}", ["custom-id"]),
+    ("# Trailing hashes ###", ["trailing-hashes"]),
+    ("# 1. Numbered", ["1-numbered"]),
+    ("# Depends on\n\n## Depends on\n\n### Depends on", ["depends-on", "depends-on_1", "depends-on_2"]),
+    # An explicit ID is emitted verbatim and never uniquified, but it is
+    # reserved before any heading is slugged.
+    ("# A {#dup}\n\n# B {#dup}", ["dup"]),
+    ("# Depends on\n\n# B {#depends-on}", ["depends-on", "depends-on_1"]),
+    ("# ***", ["_1"]),
+    ("Setext one\n===", ["setext-one"]),
+    ("Setext two\n---", ["setext-two"]),
+    # `arithmatex` in generic mode leaves one copy of the maths for the slugger.
+    ("# $x + y$", ["x-y"]),
+    # Block context: these headings publish anchors even though they do not
+    # start their line, and the raw HTML block suppresses one that does.
+    ("> # Quoted heading", ["quoted-heading"]),
+    ("- # Item heading", ["item-heading"]),
+    ("<div>\n# Not a heading\n</div>", []),
+    ("```\n# Fenced heading\n```", []),
+    ("<!-- # Commented heading -->", []),
+    ("    # Indented heading", []),
 ]
 
 
-def _renderer_anchors(text: str) -> set[str]:
-    """The anchors Python-Markdown itself publishes, for differential testing."""
-
-    markdown = pytest.importorskip("markdown")
-    # The extensions the generated mkdocs.yml enables that can affect heading IDs.
-    html = markdown.Markdown(extensions=["attr_list", "toc", "tables", "md_in_html"]).convert(text)
-    return set(re.findall(r'<h[1-6][^>]*\bid="([^"]+)"', html))
-
-
-@pytest.mark.parametrize("source", ANCHOR_CORPUS)
-def test_anchors_match_the_configured_renderer(tmp_path: Path, source: str) -> None:
-    # An anchor rule that only approximates the renderer fails in both
-    # directions: it rejects fragments that resolve and accepts fragments that
-    # never appear on the page. Pin it to the renderer itself.
+@pytest.mark.parametrize(("source", "expected"), ANCHOR_CORPUS)
+def test_anchors_are_what_the_configured_renderer_publishes(
+    tmp_path: Path, source: str, expected: list[str]
+) -> None:
     article = tmp_path / "article.md"
     article.write_text(source + "\n", encoding="utf-8")
 
-    assert markdown_anchors(article) == _renderer_anchors(source + "\n")
+    assert markdown_anchors(article) == set(expected)
+
+
+def test_the_extension_config_matches_the_scaffolded_mkdocs_yml() -> None:
+    """The checker's idea of the site config must be the site's config.
+
+    Anchor prediction is only as good as the extension list it runs, and that
+    list lives in the template MkDocs actually builds with. Enabling a new
+    heading-affecting extension there without telling this module would make the
+    audit disagree with the published page, so bind the two together.
+    """
+
+    template = (
+        Path(__file__).resolve().parents[1] / "autoform_cli/templates/mkdocs.yml"
+    ).read_text(encoding="utf-8")
+    block = template[template.index("markdown_extensions:") :]
+    block = block[: block.index("\nextra_css:")]
+
+    declared = set(re.findall(r"^  - ([\w.]+):?(?:\s+#.*)?$", block, re.MULTILINE))
+
+    assert declared == set(SITE_EXTENSIONS)
+    # Settings that change heading IDs have to agree too, not just the names.
+    assert "toc_depth: 2-3" in block
+    assert SITE_EXTENSION_CONFIGS["toc"] == {"toc_depth": "2-3"}
+    assert "generic: true" in block
+    assert SITE_EXTENSION_CONFIGS["pymdownx.arithmatex"] == {"generic": True}
 
 
 def test_frontmatter_cannot_contribute_anchors(tmp_path: Path) -> None:

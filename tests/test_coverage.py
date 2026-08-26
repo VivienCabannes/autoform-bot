@@ -34,6 +34,109 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_a_comment_breaking_the_separator_is_rejected(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The column count survives the comment but the delimiter syntax does not, so
+    # the renderer publishes a paragraph rather than a table.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --<!-- note -->- |\n"
+        "| Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "coverage table header and separator do not render as a table; "
+        "keep HTML comments out of them"
+    ]
+
+
+def test_a_comment_inside_a_header_cell_still_renders_a_table(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # This one the renderer does accept, so the contract stands. The rule is
+    # about what publishes, not about banning comments near the table.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage <!-- note --> | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+    assert [entry.area for entry in summary.entries] == ["Main"]
+
+
+def test_a_stranded_row_without_outer_pipes_is_reported(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # Python-Markdown accepts rows written without either outer pipe, so a
+    # stranded one has to be reported even though it fails the canonical form.
+    for row in (
+        "| B | MAPPED | needs roadmap",
+        "B | MAPPED | needs roadmap |",
+        "B | MAPPED | needs roadmap",
+    ):
+        _raw_contract(
+            blueprint,
+            "# Coverage\n\n"
+            "| Area | Coverage | Evidence |\n"
+            "| --- | --- | --- |\n"
+            "| A | OUT | Not in scope |\n"
+            "<!-- reviewer note -->\n"
+            f"{row}\n",
+        )
+
+        summary, issues = load_coverage(blueprint)
+
+        assert summary is None, row
+        assert [issue.line for issue in issues] == [7], row
+
+
+def test_prose_after_a_comment_is_not_mistaken_for_a_row(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| A | OUT | Not in scope |\n"
+        "<!-- reviewer note -->\n"
+        "See the roadmap | for details.\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+
+
+def test_evidence_hidden_from_the_reader_is_not_evidence(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # Each of these renders no text a browser will show, so none of them is a
+    # reason for a disposition.
+    for evidence in (
+        "<span hidden>reason</span>",
+        "<script>reason</script>",
+        "<style>reason</style>",
+        "<template>reason</template>",
+    ):
+        _contract(blueprint, f"| Appendix | OUT | {evidence} |\n")
+
+        summary, issues = load_coverage(blueprint)
+
+        assert summary is None, evidence
+        assert [issue.reason for issue in issues] == [
+            "coverage evidence has no substantive content"
+        ], evidence
+
+
 def test_a_blank_line_inside_a_comment_cannot_shrink_the_contract(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # The blank line belongs to the comment, so it must not be mistaken for the
@@ -119,7 +222,7 @@ def test_a_table_left_inside_a_fence_is_not_a_contract(tmp_path: Path) -> None:
     ]
 
 
-def test_a_comment_changing_the_header_layout_is_rejected(tmp_path: Path) -> None:
+def test_a_comment_adding_a_pipe_to_the_header_is_rejected(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _raw_contract(
         blueprint,
@@ -133,11 +236,12 @@ def test_a_comment_changing_the_header_layout_is_rejected(tmp_path: Path) -> Non
 
     assert summary is None
     assert [issue.reason for issue in issues] == [
-        "an HTML comment changes the coverage table's column layout"
+        "coverage table header and separator do not render as a table; "
+        "keep HTML comments out of them"
     ]
 
 
-def test_a_comment_changing_the_separator_layout_is_rejected(tmp_path: Path) -> None:
+def test_a_comment_adding_a_pipe_to_the_separator_is_rejected(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _raw_contract(
         blueprint,
@@ -151,7 +255,8 @@ def test_a_comment_changing_the_separator_layout_is_rejected(tmp_path: Path) -> 
 
     assert summary is None
     assert [issue.reason for issue in issues] == [
-        "an HTML comment changes the coverage table's column layout"
+        "coverage table header and separator do not render as a table; "
+        "keep HTML comments out of them"
     ]
 
 

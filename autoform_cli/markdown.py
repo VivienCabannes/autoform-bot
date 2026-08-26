@@ -28,10 +28,37 @@ from __future__ import annotations
 
 import html
 import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+import markdown as pymarkdown
+from pymdownx.superfences import fence_div_format
+
+#: The Markdown extensions the generated `mkdocs.yml` enables, and their
+#: settings. Anchor prediction builds a real converter from these, so the site's
+#: configuration and the checker's idea of it cannot be two different things.
+#: `tests/test_markdown.py` asserts this matches the shipped template.
+SITE_EXTENSIONS: tuple[str, ...] = (
+    "attr_list",
+    "toc",
+    "md_in_html",
+    "tables",
+    "pymdownx.arithmatex",
+    "pymdownx.superfences",
+)
+SITE_EXTENSION_CONFIGS: dict[str, dict[str, object]] = {
+    "toc": {"toc_depth": "2-3"},
+    "pymdownx.arithmatex": {"generic": True},
+    "pymdownx.superfences": {
+        "custom_fences": [
+            {"name": "mermaid", "class": "mermaid", "format": fence_div_format},
+        ]
+    },
+}
+
+#: A published heading's ID, read back out of the rendered HTML.
+_HEADING_ID = re.compile(r"<h[1-6][^>]*\bid=\"([^\"]*)\"", re.IGNORECASE)
 
 #: Link schemes that are resolved by the reader's browser, not by this checker.
 EXTERNAL_SCHEMES = frozenset({"http", "https"})
@@ -51,15 +78,6 @@ FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 #: let unrendered evidence satisfy a coverage disposition.
 LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 
-#: The trailing attr-list block and an explicit `#id` within it. MkDocs allows
-#: the ID alongside classes and attributes, for example `{#result .highlight}`.
-ATTR_LIST = re.compile(r"\{(?P<attributes>[^{}]*)\}\s*$")
-ATTR_LIST_ID = re.compile(r"(?:^|\s)#(?P<id>[^\s#.={}]+)(?=\s|$)")
-
-#: A setext underline. Python-Markdown gives these headings IDs too, so ignoring
-#: them would leave valid fragments unresolvable.
-SETEXT = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
-
 #: An unordered or ordered list marker. Content indented under a list item is a
 #: continuation of that item, not an indented code block.
 _LIST_ITEM = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
@@ -77,8 +95,17 @@ _HTML_TAG = re.compile(r"<!--.*?-->|</?[A-Za-z][^>]*>", re.DOTALL)
 _EMPHASIS = re.compile(r"[*_~]")
 _BACKSLASH_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 
-#: Python-Markdown appends ``_1``, ``_2`` and so on to make an ID unique.
-_ID_COUNT = re.compile(r"^(.*_)(\d+)$")
+#: Elements whose contents a browser never shows the reader, and the `hidden`
+#: attribute that does the same to any element carrying it. Text inside these is
+#: not evidence of anything.
+_NON_VISIBLE_ELEMENT = re.compile(
+    r"<(script|style|template|noscript|head|title)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_HIDDEN_ELEMENT = re.compile(
+    r"<([A-Za-z][\w-]*)\b[^>]*(?<![\w-])hidden(?![\w-])[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,9 +216,12 @@ def visible_text(value: str) -> str:
     """Reduce inline Markdown to the text a reader actually sees.
 
     Link labels replace their destinations, code spans become their contents,
-    HTML tags are dropped, and entities are decoded. A URL is not prose and a
-    tag is not evidence, so anything deciding whether a fragment of Markdown
-    *says* something has to look at this rather than at the source.
+    and entities are decoded. Elements a browser never displays lose their
+    contents outright rather than only their tags: text inside ``<script>``,
+    ``<style>``, ``<template>``, or anything marked ``hidden`` is not shown to
+    anybody, so it cannot stand as evidence. A URL is not prose and a tag is not
+    evidence either, so anything deciding whether a fragment of Markdown *says*
+    something has to look at this rather than at the source.
     """
 
     text = _IMAGE.sub("", value)
@@ -199,6 +229,10 @@ def visible_text(value: str) -> str:
     text = _INLINE_LINK.sub(r"\1", text)
     text = _REFERENCE_LINK.sub(r"\1", text)
     text = _CODE_SPAN.sub(lambda match: match.group(2), text)
+    # Contents first, then the remaining tags: dropping tags first would leave
+    # the very text these elements hide.
+    text = _NON_VISIBLE_ELEMENT.sub("", text)
+    text = _HIDDEN_ELEMENT.sub("", text)
     text = _HTML_TAG.sub("", text)
     text = html.unescape(text)
     text = _EMPHASIS.sub("", text)
@@ -216,92 +250,43 @@ def frontmatter_end(lines: list[str]) -> int:
     return len(lines)
 
 
+def site_converter() -> pymarkdown.Markdown:
+    """Return a converter configured exactly as the generated site is."""
+
+    return pymarkdown.Markdown(
+        extensions=list(SITE_EXTENSIONS),
+        extension_configs=SITE_EXTENSION_CONFIGS,
+    )
+
+
 def markdown_anchors(path: Path) -> set[str]:
     """Return the heading anchors MkDocs will publish for ``path``.
 
-    This mirrors Python-Markdown's ``toc`` extension, which the generated
-    ``mkdocs.yml`` configures: the heading's *rendered* text is folded to ASCII
-    and slugged, an ``attr_list`` block supplies an explicit ID when it carries
-    one, and a collision gains a ``_1`` suffix. Reproducing the renderer matters
-    in both directions, since an approximation rejects fragments that do resolve
-    and accepts fragments that never appear on the page.
+    The anchors come from running the configured renderer and reading the IDs
+    back out of its HTML, rather than from predicting what it would do. Heading
+    IDs depend on far more than the heading line: whether the heading sits in a
+    blockquote or a list item, whether a raw HTML block swallows it, how
+    ``attr_list`` treats an escaped brace, and what ``arithmatex`` leaves behind
+    for the slugger. Every approximation of that got some of them wrong in both
+    directions, rejecting fragments that resolve and accepting fragments absent
+    from the page.
     """
 
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return set()
-    lines = list(content(text).lines)
+    lines = text.splitlines()
     # MkDocs strips YAML frontmatter before Markdown ever sees it, so those
     # lines cannot contribute headings.
-    body = lines[frontmatter_end(lines) :]
-    # Python-Markdown reserves every explicit ID in the document before it slugs
-    # a single heading. That ordering is observable: given `# Depends on` above
-    # `# B {#depends-on}`, the explicit one keeps `depends-on` and the heading
-    # above it becomes `depends-on_1`.
-    published = {found for found in (_explicit_id(line) for line in body) if found}
-    for title in _heading_titles(body):
-        explicit, heading = _split_attr_list(title)
-        if explicit is not None:
-            # Already reserved above, and emitted verbatim: an explicit ID is
-            # never uniquified, so duplicates render as duplicates.
-            continue
-        _add_unique(_slug(visible_text(heading)), published)
-    return published
-
-
-def _explicit_id(line: str) -> str | None:
-    attributes = ATTR_LIST.search(line)
-    if attributes is None:
-        return None
-    explicit = ATTR_LIST_ID.search(attributes.group("attributes"))
-    return explicit.group("id") if explicit is not None else None
-
-
-def _heading_titles(lines: list[str]) -> list[str]:
-    titles: list[str] = []
-    for index, line in enumerate(lines):
-        atx = HEADING.match(line)
-        if atx is not None:
-            titles.append(atx.group(2).strip())
-            continue
-        # A setext underline turns the paragraph line above it into a heading.
-        # Table rows and existing headings cannot be underlined this way.
-        if index == 0 or SETEXT.match(line) is None:
-            continue
-        previous = lines[index - 1].strip()
-        if previous and not previous.startswith("|") and HEADING.match(previous) is None:
-            titles.append(previous)
-    return titles
-
-
-def _split_attr_list(title: str) -> tuple[str | None, str]:
-    attributes = ATTR_LIST.search(title)
-    if attributes is None:
-        return None, title
-    # The block is consumed by `attr_list` whether or not it carries an ID, so it
-    # never reaches the slug. Leaving it in produced anchors such as
-    # `title-class`.
-    return _explicit_id(title), title[: attributes.start()].strip()
-
-
-def _slug(text: str) -> str:
-    """Slug ``text`` the way Python-Markdown's default ``slugify`` does."""
-
-    folded = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    stripped = re.sub(r"[^\w\s-]", "", folded).strip().lower()
-    return re.sub(r"[-\s]+", "-", stripped)
-
-
-def _add_unique(candidate: str, published: set[str]) -> None:
-    """Record ``candidate``, resolving collisions as Python-Markdown does."""
-
-    while candidate in published or not candidate:
-        match = _ID_COUNT.match(candidate)
-        candidate = (
-            f"{match.group(1)}{int(match.group(2)) + 1}" if match is not None else f"{candidate}_1"
-        )
-    published.add(candidate)
+    body = "\n".join(lines[frontmatter_end(lines) :])
+    try:
+        rendered = site_converter().convert(body)
+    except Exception:
+        # A document the renderer cannot process publishes no anchors we can
+        # promise, so report none rather than guess at them.
+        return set()
+    return {html.unescape(found) for found in _HEADING_ID.findall(rendered)}
 
 
 def local_target_issue(
@@ -446,8 +431,6 @@ def _is_within(path: Path, directory: Path) -> bool:
 
 
 __all__ = [
-    "ATTR_LIST",
-    "ATTR_LIST_ID",
     "EXTERNAL_SCHEMES",
     "FENCE",
     "FENCE_CLOSE",
@@ -455,7 +438,8 @@ __all__ = [
     "HTML_COMMENT",
     "INLINE_CODE",
     "LINK",
-    "SETEXT",
+    "SITE_EXTENSIONS",
+    "SITE_EXTENSION_CONFIGS",
     "Content",
     "content",
     "content_lines",
@@ -464,6 +448,7 @@ __all__ = [
     "local_target_issue",
     "markdown_anchors",
     "markdown_links",
+    "site_converter",
     "strip_line_comments",
     "visible_text",
 ]

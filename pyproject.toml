@@ -12,6 +12,11 @@ requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=3.4.5,<4",
     "psutil>=5.9",
+    # The blueprint checks predict what the generated MkDocs site publishes.
+    # Anchor prediction runs the configured renderer itself rather than
+    # approximating it, so these are runtime requirements, not build extras.
+    "markdown>=3.4,<4",
+    "pymdown-extensions>=10,<11",
 ]
 
 [project.scripts]

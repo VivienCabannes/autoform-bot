@@ -22,6 +22,7 @@ from .markdown import (
     content,
     link_targets,
     local_target_issue,
+    site_converter,
     visible_text,
 )
 
@@ -146,26 +147,25 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     header_indexes: list[int] = []
     layout_issues: list[CoverageIssue] = []
     for index in range(len(lines) - 1):
-        header = _cells(lines[index])
+        if view.is_hidden(index) or view.is_hidden(index + 1):
+            # The table is commented out or fenced, so it publishes nothing.
+            continue
+        if _cells(lines[index]) != _EXPECTED_HEADER:
+            continue
         separator = _cells(lines[index + 1])
-        if header != _EXPECTED_HEADER or len(separator) != 3:
+        if len(separator) != 3 or not all(_SEPARATOR.fullmatch(cell) for cell in separator):
             continue
-        if not all(_SEPARATOR.fullmatch(cell) for cell in separator):
-            continue
-        # A renderer splits cells before it strips comments, so a comment
-        # carrying a pipe gives the header or separator a different shape than
-        # the one masking reveals. The contract we would validate is not the
-        # table the page publishes, so refuse it by name rather than discover it.
-        distorted = [
-            offset
-            for offset in (0, 1)
-            if len(_cells(source_lines[index + offset])) != len(_cells(lines[index + offset]))
-        ]
-        if distorted:
+        # Masking shows what the cells *say*; only the renderer knows whether
+        # these two lines make a table at all. The `tables` extension decides
+        # that from the source, before inline processing removes comments, so a
+        # comment can leave the column count intact and still break the
+        # delimiter row -- and then the page shows a paragraph, not a contract.
+        if not _renders_as_table(source_lines[index], source_lines[index + 1]):
             layout_issues.append(
                 CoverageIssue(
-                    index + distorted[0] + 1,
-                    "an HTML comment changes the coverage table's column layout",
+                    index + 1,
+                    "coverage table header and separator do not render as a table; "
+                    "keep HTML comments out of them",
                 )
             )
             continue
@@ -237,23 +237,48 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     return entries, issues
 
 
+def _renders_as_table(header_line: str, separator_line: str) -> bool:
+    """Whether the site's renderer turns these two lines into a table."""
+
+    try:
+        rendered = site_converter().convert(f"{header_line}\n{separator_line}\n")
+    except Exception:
+        return False
+    return "<table>" in rendered
+
+
+def _looks_like_row(line: str) -> bool:
+    """Whether ``line`` is the shape of a table row the renderer would accept.
+
+    Deliberately looser than :func:`_cells`, which demands both outer pipes.
+    Python-Markdown accepts ``A | OUT | reason`` and ``| A | OUT | reason`` as
+    rows just as readily, so a stranded row written either way has to be
+    reported rather than passed over for failing the canonical form.
+    """
+
+    bare = INLINE_CODE.sub("", line).strip()
+    if not bare:
+        return False
+    return bare.startswith("|") or bare.count("|") >= 2
+
+
 def _unpublished_row_issues(view: Content, start: int) -> list[CoverageIssue]:
     """Report rows written after hidden content inside the table body.
 
     The table has already ended at ``start``. Anything shaped like a table row
     between there and the next blank line the author actually typed looks like a
     declaration they expected to count, so name each one rather than let the
-    contract shrink in silence. Malformed rows are included: a row with the
-    wrong number of columns is still a row somebody meant to declare, and
-    reporting it as unpublished beats ignoring it. Trailing notes with no rows
-    after them are left alone.
+    contract shrink in silence. Row shape is judged loosely, by
+    :func:`_looks_like_row`: a row with the wrong column count, or written
+    without its outer pipes, is still a row somebody meant to declare.
+    Trailing notes with no rows after them are left alone.
     """
 
     issues: list[CoverageIssue] = []
     for index in range(start, len(view.lines)):
         if view.ends_block(index):
             break
-        if _cells(view.lines[index]):
+        if _looks_like_row(view.lines[index]):
             issues.append(
                 CoverageIssue(
                     index + 1,

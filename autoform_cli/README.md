@@ -172,16 +172,21 @@ Because hidden content ends a table for every renderer, a comment or code block
 written *between* rows is reported rather than silently truncating the contract.
 This holds for multi-line constructs too: a blank line inside a comment or fence
 belongs to that construct rather than ending the table. Any row-shaped line
-stranded below such a break is named, malformed ones included, since a row with
-the wrong number of columns is still a row somebody meant to declare. A comment
-that changes the column layout of a row, the header, or the separator is rejected
-rather than parsed as a different table than the one published.
+stranded below such a break is named, including malformed rows and rows written
+without their outer pipes, since Python-Markdown accepts `A | OUT | reason` as a
+row just as readily as the canonical form. A comment that changes the column
+layout of a row is rejected, and the header and separator are checked by asking
+the renderer whether those two lines make a table at all: a comment can leave the
+column count intact and still break the delimiter row, in which case the page
+shows a paragraph rather than a contract.
 
 Evidence must say something to a reader, judged on rendered text rather than
 Markdown source. A cell holding only a code span, only a comment, only emphasis,
 only an HTML tag, only an entity, or only an empty link such as `[ ](notes.md)`
 is rejected: each carries word characters in the source and shows the reader
-nothing. So is evidence that is nothing but `TODO`, `TBD`, `pending`,
+nothing. Text a browser never displays is treated the same way, so
+`<span hidden>reason</span>`, `<script>`, `<style>`, and `<template>` contents do
+not count either. So is evidence that is nothing but `TODO`, `TBD`, `pending`,
 `placeholder`, or `unknown`, or that opens with one of those as a marker such as
 `TODO: choose a milestone`. A status word that merely begins a sentence is fine:
 "Pending Mathlib PR 1234" names something a reader can check. `DECOMPOSED`
@@ -190,14 +195,15 @@ article, and *every* link it offers must resolve, fragments included, under the
 same rules the audit applies. A link missing its closing parenthesis does not
 render and does not count.
 
-Fragment checking follows the renderer rather than approximating it. Anchors are
-generated the way Python-Markdown's `toc` extension generates them, which is what
-the emitted `mkdocs.yml` configures: heading text is reduced to what it renders
-as, folded to ASCII, and slugged, an `attr_list` block supplies an explicit ID
-when it carries one, and collisions take a `_1` suffix. `# Café` publishes `cafe`
-and `# [Linked result](other.md)` publishes `linked-result`. A differential test
-compares this module against Python-Markdown directly, so the two cannot drift
-apart without a test failing.
+Fragment checking uses the renderer rather than predicting it. Anchors come from
+running Python-Markdown with the extensions the generated `mkdocs.yml` enables
+and reading the heading IDs back out of its HTML. Heading IDs turn out to depend
+on much more than the heading line -- whether it sits in a blockquote or a list
+item, whether a raw HTML block swallows it, how `attr_list` treats an escaped
+brace, what `arithmatex` leaves behind for the slugger -- and every attempt to
+predict that got some cases wrong in both directions. The extension list lives in
+one place in Python, and a test binds it to the shipped `mkdocs.yml` so enabling
+a heading-affecting extension cannot silently invalidate the audit.
 
 ### What coverage completeness does and does not claim
 
