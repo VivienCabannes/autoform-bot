@@ -25,6 +25,164 @@ def _contract(blueprint: Path, rows: str) -> Path:
     return path
 
 
+def _raw_contract(blueprint: Path, body: str) -> Path:
+    """Write a coverage file verbatim, for cases about the table's own shape."""
+
+    path = blueprint / "coverage" / "README.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_a_blank_line_inside_a_comment_cannot_shrink_the_contract(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The blank line belongs to the comment, so it must not be mistaken for the
+    # blank line that ends a table -- otherwise the MAPPED row below vanishes.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not in scope |\n"
+        "<!-- reviewer note\n"
+        "\n"
+        "more note -->\n"
+        "| Main theorem | MAPPED | Needs roadmap articles |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.line for issue in issues] == [9]
+
+
+def test_a_blank_line_inside_a_fence_cannot_shrink_the_contract(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not in scope |\n"
+        "```\n"
+        "\n"
+        "example\n"
+        "```\n"
+        "| Main theorem | MAPPED | Needs roadmap articles |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.line for issue in issues] == [10]
+
+
+def test_a_malformed_row_after_hidden_content_is_still_reported(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # A four-column row is malformed, but it is still a row somebody declared.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| A | OUT | Not in scope |\n"
+        "<!-- reviewer note -->\n"
+        "| B | MAPPED | needs roadmap | accidental extra cell |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.line for issue in issues] == [7]
+
+
+def test_a_table_left_inside_a_fence_is_not_a_contract(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # ```` trailing` is not a closing fence for pymdownx.superfences, so the
+    # table below it renders inside the code block and publishes nothing.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "```\n"
+        "not a contract\n"
+        "``` trailing\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "coverage contract has no 'Area | Coverage | Evidence' table"
+    ]
+
+
+def test_a_comment_changing_the_header_layout_is_rejected(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence <!-- | hidden --> |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "an HTML comment changes the coverage table's column layout"
+    ]
+
+
+def test_a_comment_changing_the_separator_layout_is_rejected(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- <!-- | --> |\n"
+        "| Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "an HTML comment changes the coverage table's column layout"
+    ]
+
+
+def test_evidence_that_renders_nothing_is_not_evidence(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # Each of these carries word characters in the Markdown source and shows the
+    # reader nothing at all.
+    for evidence in ("[ ](missing.md)", "<span></span>", "&nbsp;", "[]()"):
+        _contract(blueprint, f"| Appendix | OUT | {evidence} |\n")
+
+        summary, issues = load_coverage(blueprint)
+
+        assert summary is None, evidence
+        assert [issue.reason for issue in issues] == [
+            "coverage evidence has no substantive content"
+        ], evidence
+
+
+def test_an_empty_link_cannot_certify_decomposition(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _article(blueprint, "main/README.md")
+    # The destination resolves, but the link publishes no label, so the cell
+    # tells a reader nothing about where the work went.
+    _contract(blueprint, "| Main theorem | DECOMPOSED | [ ](../roadmap/main/README.md) |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == ["coverage evidence has no substantive content"]
+
+
 def test_loads_canonical_coverage_summary_with_stable_json(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _article(blueprint, "main/README.md")

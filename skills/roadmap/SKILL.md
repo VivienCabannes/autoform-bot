@@ -89,12 +89,14 @@ mathematics.
    Only published Markdown is read as the contract, so a table hidden in an
    HTML comment or an indented or fenced block is ignored rather than trusted.
    Keep comments and code blocks out of the table body: hidden content ends a
-   table for every renderer, so a row written below it is reported rather than
-   quietly dropped. Write evidence a reader can act on: a bare `TODO`, a lone
-   code span, and a marker such as `TBD - pick a milestone` are all rejected,
-   while "Pending Mathlib PR 1234" is fine because it names a real dependency.
-   `DECOMPOSED` requires at least one complete link to an existing roadmap
-   article, and every link in that cell must resolve, fragments included.
+   table for every renderer, so a row written below one is reported rather than
+   quietly dropped, and a comment that changes a row's column layout is
+   rejected. Write evidence a reader can act on, judged on what it renders as:
+   a bare `TODO`, a lone code span, an empty link such as `[ ](notes.md)`, and a
+   marker such as `TBD - pick a milestone` are all rejected, while "Pending
+   Mathlib PR 1234" is fine because it names a real dependency. `DECOMPOSED`
+   requires at least one complete link to an existing roadmap article, and every
+   link in that cell must resolve, fragments included.
 
    `coverage.complete` means only that no declared row is still `MAPPED`. It is
    not a claim that the table covers the source exhaustively, nor that the

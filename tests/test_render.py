@@ -629,6 +629,71 @@ def test_render_rejects_invalid_coverage_before_touching_output(tmp_path: Path) 
     assert not (output / PUBLICATION_MANIFEST).exists()
 
 
+def test_render_refuses_a_contract_truncated_by_a_multiline_comment(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    # The blank line inside the comment used to end the table, so this published
+    # `MAPPED: 0` and `complete: true` while the author had declared a MAPPED row.
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not in scope |\n"
+        "<!-- reviewer note\n"
+        "\n"
+        "more note -->\n"
+        "| Main result | MAPPED | Needs roadmap articles |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+
+    with pytest.raises(PublicationError, match="follows hidden content"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert not (output / PUBLICATION_MANIFEST).exists()
+
+
+def test_render_refuses_a_contract_truncated_by_a_fenced_block(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not in scope |\n"
+        "```\n"
+        "\n"
+        "example\n"
+        "```\n"
+        "| Main result | MAPPED | Needs roadmap articles |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+
+    with pytest.raises(PublicationError, match="follows hidden content"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert not (output / PUBLICATION_MANIFEST).exists()
+
+
+def test_render_refuses_a_contract_whose_header_layout_is_hidden(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence <!-- | hidden --> |\n"
+        "| --- | --- | --- |\n"
+        "| Main result | OUT | Not in scope |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out"
+
+    with pytest.raises(PublicationError, match="column layout"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert not (output / PUBLICATION_MANIFEST).exists()
+
+
 def test_render_refuses_decomposition_evidence_with_one_broken_link(tmp_path: Path) -> None:
     project = _project(tmp_path)
     coverage = project / "blueprint/coverage/README.md"

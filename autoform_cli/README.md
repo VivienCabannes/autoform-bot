@@ -164,19 +164,40 @@ rows.
 
 The contract is read as published Markdown and fails closed. A table inside an
 HTML comment, a fenced block, or a four-space-indented block is documentation
-rather than contract, and is not discovered at all. Because hidden content ends
-a table for every renderer, a comment or code block written *between* rows is
-reported rather than silently truncating the contract, and a comment that
-changes a row's column layout is rejected rather than parsed differently than it
-renders. Evidence must carry visible substantive content, so a cell holding only
-a code span, only a comment, or only emphasis is rejected, as is evidence that is
-nothing but `TODO`, `TBD`, `pending`, `placeholder`, or `unknown`, or that opens
-with one of those as a marker such as `TODO: choose a milestone`. A status word
-that merely begins a sentence is fine: "Pending Mathlib PR 1234" names something
-a reader can check. `DECOMPOSED` evidence must contain at least one complete
-inline link to an existing roadmap article, and *every* link it offers must
-resolve, fragments included, under the same rules the audit applies. A link
-missing its closing parenthesis does not render and does not count.
+rather than contract, and is not discovered at all. A closing fence must carry
+nothing but its marker, so a table below ```` ``` trailing ```` stays inside the
+code block for the checker exactly as it does for the reader.
+
+Because hidden content ends a table for every renderer, a comment or code block
+written *between* rows is reported rather than silently truncating the contract.
+This holds for multi-line constructs too: a blank line inside a comment or fence
+belongs to that construct rather than ending the table. Any row-shaped line
+stranded below such a break is named, malformed ones included, since a row with
+the wrong number of columns is still a row somebody meant to declare. A comment
+that changes the column layout of a row, the header, or the separator is rejected
+rather than parsed as a different table than the one published.
+
+Evidence must say something to a reader, judged on rendered text rather than
+Markdown source. A cell holding only a code span, only a comment, only emphasis,
+only an HTML tag, only an entity, or only an empty link such as `[ ](notes.md)`
+is rejected: each carries word characters in the source and shows the reader
+nothing. So is evidence that is nothing but `TODO`, `TBD`, `pending`,
+`placeholder`, or `unknown`, or that opens with one of those as a marker such as
+`TODO: choose a milestone`. A status word that merely begins a sentence is fine:
+"Pending Mathlib PR 1234" names something a reader can check. `DECOMPOSED`
+evidence must contain at least one complete inline link to an existing roadmap
+article, and *every* link it offers must resolve, fragments included, under the
+same rules the audit applies. A link missing its closing parenthesis does not
+render and does not count.
+
+Fragment checking follows the renderer rather than approximating it. Anchors are
+generated the way Python-Markdown's `toc` extension generates them, which is what
+the emitted `mkdocs.yml` configures: heading text is reduced to what it renders
+as, folded to ASCII, and slugged, an `attr_list` block supplies an explicit ID
+when it carries one, and collisions take a `_1` suffix. `# Café` publishes `cafe`
+and `# [Linked result](other.md)` publishes `linked-result`. A differential test
+compares this module against Python-Markdown directly, so the two cannot drift
+apart without a test failing.
 
 ### What coverage completeness does and does not claim
 

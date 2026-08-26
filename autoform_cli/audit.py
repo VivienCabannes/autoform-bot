@@ -18,6 +18,7 @@ from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project
 from .markdown import FENCE as _FENCE
+from .markdown import frontmatter_end as _frontmatter_end
 from .markdown import HEADING as _HEADING
 from .markdown import HTML_COMMENT as _HTML_COMMENT
 from .markdown import local_target_issue as _local_target_issue
@@ -280,15 +281,6 @@ def _read_article(path: Path) -> _ArticleShape:
             statement_text = True
 
     return _ArticleShape(statement_text, has_depends_section)
-
-
-def _frontmatter_end(lines: list[str]) -> int:
-    if not lines or lines[0].strip() != "---":
-        return 0
-    for index in range(1, len(lines)):
-        if lines[index].strip() == "---":
-            return index + 1
-    return len(lines)
 
 
 def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditFinding]:

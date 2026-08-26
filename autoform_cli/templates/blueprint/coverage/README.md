@@ -13,12 +13,14 @@
      Only the visible table above is the contract. A table written inside these
      notes, or inside a fenced or indented block, is ignored rather than trusted.
      Keep notes below the table: a comment between rows ends the table for every
-     renderer, so rows under it would not be published.
+     renderer, so rows under it would not be published, and a comment that
+     changes a row's column layout is rejected.
 
-     Evidence must say something a reader can act on. A bare TODO, a lone code
-     span, and a marker such as "TBD - pick a milestone" are rejected. A status
-     word that opens a real sentence is fine. Every link in a DECOMPOSED cell
-     must resolve, fragments included.
+     Evidence must say something a reader can act on, judged on what it renders
+     as rather than on the Markdown source. A bare TODO, a lone code span, an
+     empty link such as [ ](notes.md), and a marker such as "TBD - pick a
+     milestone" are rejected. A status word that opens a real sentence is fine.
+     Every link in a DECOMPOSED cell must resolve, fragments included.
 
      Reaching a terminal disposition on every row means no row is still MAPPED.
      It does not mean the rows cover the source exhaustively; that judgement is

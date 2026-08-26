@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+import pytest
 
 from autoform_cli.markdown import (
     content,
@@ -9,7 +12,69 @@ from autoform_cli.markdown import (
     local_target_issue,
     markdown_anchors,
     markdown_links,
+    visible_text,
 )
+
+#: Heading forms whose published anchors are easy to get subtly wrong.
+ANCHOR_CORPUS = [
+    "# Depends on",
+    "# Café",
+    "# Naïve Bayes — dashes",
+    "# [Linked result](other.md)",
+    "# `Code` heading",
+    "# *Emphasised* result",
+    "# Heading with &amp; entity",
+    "# Title {.class}",
+    "# Result {#custom-id}",
+    "# Trailing hashes ###",
+    "# 1. Numbered",
+    "# Depends on\n\n## Depends on\n\n### Depends on",
+    "# A {#dup}\n\n# B {#dup}",
+    "# Depends on\n\n# B {#depends-on}",
+    "# A {#depends-on}\n\n# Depends on",
+    "# ***",
+    "Setext one\n===",
+    "Setext two\n---",
+    "# Sources\n\nParagraph.\n\n## Sources",
+]
+
+
+def _renderer_anchors(text: str) -> set[str]:
+    """The anchors Python-Markdown itself publishes, for differential testing."""
+
+    markdown = pytest.importorskip("markdown")
+    # The extensions the generated mkdocs.yml enables that can affect heading IDs.
+    html = markdown.Markdown(extensions=["attr_list", "toc", "tables", "md_in_html"]).convert(text)
+    return set(re.findall(r'<h[1-6][^>]*\bid="([^"]+)"', html))
+
+
+@pytest.mark.parametrize("source", ANCHOR_CORPUS)
+def test_anchors_match_the_configured_renderer(tmp_path: Path, source: str) -> None:
+    # An anchor rule that only approximates the renderer fails in both
+    # directions: it rejects fragments that resolve and accepts fragments that
+    # never appear on the page. Pin it to the renderer itself.
+    article = tmp_path / "article.md"
+    article.write_text(source + "\n", encoding="utf-8")
+
+    assert markdown_anchors(article) == _renderer_anchors(source + "\n")
+
+
+def test_frontmatter_cannot_contribute_anchors(tmp_path: Path) -> None:
+    # MkDocs strips frontmatter before Markdown sees it, so a setext-looking
+    # closing delimiter must not turn a YAML key into a heading.
+    article = tmp_path / "article.md"
+    article.write_text("---\nkind: blueprint\n---\n\n# Real heading\n", encoding="utf-8")
+
+    assert markdown_anchors(article) == {"real-heading"}
+
+
+def test_visible_text_keeps_labels_and_drops_destinations() -> None:
+    assert visible_text("[Node](../roadmap/node.md)").strip() == "Node"
+    assert visible_text("[ ](missing.md)").strip() == ""
+    assert visible_text("<span></span>").strip() == ""
+    assert visible_text("&amp; &nbsp;").strip() == "&"
+    assert visible_text("`code`").strip() == "code"
+    assert visible_text("![alt](image.png)").strip() == ""
 
 
 def test_masking_blanks_code_blocks_and_comments_without_moving_lines() -> None:
@@ -88,8 +153,38 @@ def test_content_distinguishes_hidden_lines_from_blank_ones() -> None:
     assert view.lines == ("visible", "", "")
     assert view.hidden == frozenset({2})
     assert not view.is_hidden(1)
-    assert view.was_written(2)
-    assert not view.was_written(1)
+    # Line 1 is a blank the author typed and ends a block; line 2 only looks
+    # blank because a comment covers it.
+    assert view.ends_block(1)
+    assert not view.ends_block(2)
+
+
+def test_blank_lines_inside_a_comment_belong_to_the_comment() -> None:
+    view = content("visible\n<!-- note\n\nmore note -->\nafter\n")
+
+    assert view.hidden == frozenset({1, 2, 3})
+    assert not view.ends_block(2)
+
+
+def test_blank_lines_inside_a_fence_belong_to_the_fence() -> None:
+    view = content("visible\n```\n\nexample\n```\nafter\n")
+
+    assert view.hidden == frozenset({1, 2, 3, 4})
+    assert not view.ends_block(2)
+
+
+def test_a_closing_fence_may_not_carry_trailing_text() -> None:
+    # pymdownx.superfences keeps this inside the code block, so anything after
+    # it is still fenced and must stay masked.
+    view = content("```\nfenced\n``` trailing\nstill fenced\n")
+
+    assert [line for line in view.lines if line.strip()] == []
+
+
+def test_a_bare_closing_fence_ends_the_block() -> None:
+    view = content("```\nfenced\n```\npublished\n")
+
+    assert [line for line in view.lines if line.strip()] == ["published"]
 
 
 def test_link_extraction_requires_a_closing_parenthesis() -> None:

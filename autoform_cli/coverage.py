@@ -16,7 +16,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .markdown import INLINE_CODE, Content, content, link_targets, local_target_issue
+from .markdown import (
+    INLINE_CODE,
+    Content,
+    content,
+    link_targets,
+    local_target_issue,
+    visible_text,
+)
 
 COVERAGE_SCHEMA = "autoform-coverage/v1"
 COVERAGE_DISPOSITIONS = ("MAPPED", "DECOMPOSED", "DEFERRED", "OUT")
@@ -135,33 +142,55 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     # surviving index aligned with the author's own line numbering.
     view = content(text)
     lines = view.lines
+    source_lines = text.splitlines()
     header_indexes: list[int] = []
+    layout_issues: list[CoverageIssue] = []
     for index in range(len(lines) - 1):
         header = _cells(lines[index])
         separator = _cells(lines[index + 1])
-        if header == _EXPECTED_HEADER and len(separator) == 3 and all(
-            _SEPARATOR.fullmatch(cell) for cell in separator
-        ):
-            header_indexes.append(index)
+        if header != _EXPECTED_HEADER or len(separator) != 3:
+            continue
+        if not all(_SEPARATOR.fullmatch(cell) for cell in separator):
+            continue
+        # A renderer splits cells before it strips comments, so a comment
+        # carrying a pipe gives the header or separator a different shape than
+        # the one masking reveals. The contract we would validate is not the
+        # table the page publishes, so refuse it by name rather than discover it.
+        distorted = [
+            offset
+            for offset in (0, 1)
+            if len(_cells(source_lines[index + offset])) != len(_cells(lines[index + offset]))
+        ]
+        if distorted:
+            layout_issues.append(
+                CoverageIssue(
+                    index + distorted[0] + 1,
+                    "an HTML comment changes the coverage table's column layout",
+                )
+            )
+            continue
+        header_indexes.append(index)
 
     if not header_indexes:
+        if layout_issues:
+            return [], layout_issues
         return [], [CoverageIssue(0, "coverage contract has no 'Area | Coverage | Evidence' table")]
     if len(header_indexes) > 1:
         return [], [CoverageIssue(header_indexes[1] + 1, "coverage contract has multiple coverage tables")]
 
     header_index = header_indexes[0]
-    source_lines = text.splitlines()
     entries: list[CoverageEntry] = []
-    issues: list[CoverageIssue] = []
+    issues: list[CoverageIssue] = list(layout_issues)
     seen_areas: dict[str, int] = {}
     for index in range(header_index + 2, len(lines)):
         raw = lines[index]
+        if view.ends_block(index):
+            # A blank line the author typed ends the table. Hidden content also
+            # ends it, for every renderer as well as for us, so any row written
+            # below it is published by nobody and must be reported.
+            break
         if not raw.strip():
-            # A blank line ends the table. Hidden content also ends it, for
-            # every renderer as well as for us, so any row written below it is
-            # published by nobody and must be reported rather than dropped.
-            if view.is_hidden(index):
-                issues.extend(_unpublished_row_issues(view, index))
+            issues.extend(_unpublished_row_issues(view, index))
             break
         cells = _cells(raw)
         line_number = index + 1
@@ -211,17 +240,20 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
 def _unpublished_row_issues(view: Content, start: int) -> list[CoverageIssue]:
     """Report rows written after hidden content inside the table body.
 
-    The table has already ended at ``start``. Anything row-shaped between there
-    and the next genuinely blank line looks like a declaration the author
-    expected to count, so name each one instead of letting the contract shrink
-    in silence. Trailing notes with no rows after them are left alone.
+    The table has already ended at ``start``. Anything shaped like a table row
+    between there and the next blank line the author actually typed looks like a
+    declaration they expected to count, so name each one rather than let the
+    contract shrink in silence. Malformed rows are included: a row with the
+    wrong number of columns is still a row somebody meant to declare, and
+    reporting it as unpublished beats ignoring it. Trailing notes with no rows
+    after them are left alone.
     """
 
     issues: list[CoverageIssue] = []
     for index in range(start, len(view.lines)):
-        if not view.was_written(index):
+        if view.ends_block(index):
             break
-        if len(_cells(view.lines[index])) == 3:
+        if _cells(view.lines[index]):
             issues.append(
                 CoverageIssue(
                     index + 1,
@@ -282,14 +314,17 @@ def _validate_evidence(
 
 
 def _visible_markdown(value: str) -> str:
-    """Return evidence with inline code removed.
+    """Return the text of ``value`` a reader would actually see as evidence.
 
-    HTML comments are already masked before the table is parsed. Inline code is
-    illustration rather than justification, so a cell whose only content is a
-    code span states no reason at all.
+    Inline code is removed outright rather than unwrapped: it is illustration
+    rather than justification, so a cell whose only content is a code span
+    states no reason at all. Everything else is reduced the way a renderer
+    reduces it, which matters because a URL, an HTML tag, and an entity all
+    carry word characters while showing the reader nothing. ``[ ](missing.md)``
+    publishes an empty link, not evidence.
     """
 
-    return INLINE_CODE.sub("", value)
+    return visible_text(INLINE_CODE.sub("", value))
 
 
 def _has_substance(visible: str) -> bool:
