@@ -85,7 +85,9 @@ def _archive(path: Path, members: list[tuple[str, bytes | None]]) -> Path:
     return path
 
 
-def test_root_package_comes_from_top_level_evaluated_config(helper: ModuleType, tmp_path: Path) -> None:
+def test_root_package_comes_from_top_level_evaluated_config(
+    helper: ModuleType, tmp_path: Path
+) -> None:
     config = tmp_path / "evaluated.toml"
     _write(
         config,
@@ -98,13 +100,15 @@ def test_root_package_comes_from_top_level_evaluated_config(helper: ModuleType, 
 @pytest.mark.parametrize(
     "text",
     [
-        'version = "0.1.0"\n',
+        "version = \"0.1.0\"\n",
         'name = "One"\nname = "Two"\n',
         'name = "bad name"\n',
         '[[lean_lib]]\nname = "OnlyTarget"\n',
     ],
 )
-def test_invalid_evaluated_config_fails_closed(helper: ModuleType, tmp_path: Path, text: str) -> None:
+def test_invalid_evaluated_config_fails_closed(
+    helper: ModuleType, tmp_path: Path, text: str
+) -> None:
     config = tmp_path / "evaluated.toml"
     _write(config, text)
 
@@ -112,7 +116,9 @@ def test_invalid_evaluated_config_fails_closed(helper: ModuleType, tmp_path: Pat
         helper.root_package_from_config(config)
 
 
-def test_archive_modules_are_sorted_and_probe_fails_on_zero_declarations(helper: ModuleType, tmp_path: Path) -> None:
+def test_archive_modules_are_sorted_and_probe_fails_on_zero_declarations(
+    helper: ModuleType, tmp_path: Path
+) -> None:
     archive = _archive(
         tmp_path / "root.tgz",
         [*_module_members("Fixture.Basic"), *_module_members("Fixture")],
@@ -231,13 +237,15 @@ def _run(project: Path, *command: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.real_lean
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
-def test_real_toml_build_uses_target_src_dir_globs_and_import_closure(helper: ModuleType, tmp_path: Path) -> None:
+def test_real_toml_build_uses_target_src_dir_globs_and_import_closure(
+    helper: ModuleType, tmp_path: Path
+) -> None:
     project = tmp_path / "toml-project"
     project.mkdir()
     _write(project / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
     _write(
         project / "lakefile.toml",
-        """name = "TomlFixture"
+        '''name = "TomlFixture"
 version = "0.1.0"
 defaultTargets = ["runner"]
 srcDir = "package-src"
@@ -251,7 +259,7 @@ globs = ["Chosen.+"]
 name = "runner"
 root = "Main"
 srcDir = "app-src"
-""",
+''',
     )
     _write(project / "package-src/library-src/Chosen/Entry.lean", "import Chosen.Helper\n")
     _write(
@@ -287,19 +295,21 @@ srcDir = "app-src"
 
 @pytest.mark.real_lean
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
-def test_root_package_clean_excludes_stale_custom_artifacts(helper: ModuleType, tmp_path: Path) -> None:
+def test_root_package_clean_excludes_stale_custom_artifacts(
+    helper: ModuleType, tmp_path: Path
+) -> None:
     project = tmp_path / "stale-project"
     project.mkdir()
     _write(project / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
     _write(
         project / "lakefile.lean",
-        """import Lake
+        '''import Lake
 open Lake DSL
 package «StaleFixture» where
   buildDir := "custom-output"
 @[default_target]
 lean_lib «Fresh»
-""",
+''',
     )
     _write(project / "Fresh.lean", "theorem fresh_ok : True := by trivial\n")
     stale = project / "custom-output/lib/lean"
@@ -329,11 +339,11 @@ def test_real_lean_manifest_supports_custom_build_dir(helper: ModuleType, tmp_pa
     _write(dependency / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
     _write(
         dependency / "lakefile.lean",
-        """import Lake
+        '''import Lake
 open Lake DSL
 package «Dependency»
 lean_lib «Dependency»
-""",
+''',
     )
     _write(dependency / "Dependency.lean", "theorem dependency_ok : True := by trivial\n")
 
@@ -342,7 +352,7 @@ lean_lib «Dependency»
     _write(project / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
     _write(
         project / "lakefile.lean",
-        """import Lake
+        '''import Lake
 open Lake DSL
 
 package «LeanFixture» where
@@ -355,7 +365,7 @@ require «Dependency» from "../dependency"
 lean_lib «PublicApi» where
   srcDir := "sources"
   globs := #[.submodules `PublicApi]
-""",
+''',
     )
     _write(
         project / "package-src/sources/PublicApi/Entry.lean",

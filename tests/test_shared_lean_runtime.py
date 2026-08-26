@@ -425,7 +425,10 @@ def test_lsp_diagnostic_formatting_remains_stable():
             }
         ]
     )
-    assert formatted == ("Diagnostics: 1 error(s), 0 warning(s)\n3:4: error: unknown identifier")
+    assert formatted == (
+        "Diagnostics: 1 error(s), 0 warning(s)\n"
+        "3:4: error: unknown identifier"
+    )
 
 
 @pytest.mark.daemon
@@ -520,7 +523,9 @@ def test_daemon_outlives_the_separate_process_that_started_it(
             autostart=False,
         )
         assert repl_status["state"] == "cold"
-        assert client.request("daemon.status", autostart=False)["repl_projects"]["resident"] == []
+        assert client.request("daemon.status", autostart=False)["repl_projects"][
+            "resident"
+        ] == []
     finally:
         client.stop()
 
