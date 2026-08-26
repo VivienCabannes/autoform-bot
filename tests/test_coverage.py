@@ -197,6 +197,55 @@ def test_accepts_a_trailing_status_note_beside_real_evidence(tmp_path: Path) -> 
     assert not summary.complete
 
 
+def test_a_placeholder_used_as_a_marker_is_rejected(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    for evidence in ("TODO: choose a milestone", "TBD - pick a milestone", "**TODO.**", "Pending"):
+        _contract(blueprint, f"| Appendix | DEFERRED | {evidence} |\n")
+
+        summary, issues = load_coverage(blueprint)
+
+        assert summary is None, evidence
+        assert [issue.reason for issue in issues] == ["coverage evidence is a placeholder"], evidence
+
+
+def test_a_status_word_opening_a_sentence_is_not_a_placeholder(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # These name something a reader can check. Rejecting them on the first word
+    # alone pushed authors toward vaguer wording to satisfy the checker.
+    for evidence in ("Pending Mathlib PR 1234", "Unknown provenance, excluded by agreement"):
+        _contract(blueprint, f"| Appendix | DEFERRED | {evidence} |\n")
+
+        summary, issues = load_coverage(blueprint)
+
+        assert issues == (), evidence
+        assert summary is not None, evidence
+
+
+def test_a_comment_that_changes_a_rows_columns_is_rejected(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # A renderer splits cells before stripping comments, so it sees four columns
+    # here while masking leaves three. Parse neither; report the disagreement.
+    _contract(blueprint, "| Appendix | OUT <!-- | --> | narrative only |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "an HTML comment changes this coverage row's column layout"
+    ]
+
+
+def test_a_comment_that_leaves_the_columns_alone_is_accepted(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _contract(blueprint, "| Appendix | OUT | narrative only <!-- agreed with the author --> |\n")
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+    assert summary.entries[0].evidence == "narrative only"
+
+
 def test_malformed_evidence_paths_are_reported_without_raising(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _contract(
@@ -324,6 +373,73 @@ def test_masking_preserves_the_authors_line_numbers(tmp_path: Path) -> None:
 
     assert summary is None
     assert [(issue.line, issue.reason) for issue in issues] == [(9, "coverage evidence is empty")]
+
+
+def test_a_comment_between_rows_cannot_shrink_the_contract(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The comment ends the table for every renderer, so the MAPPED row below it
+    # is published by nobody. Dropping it silently would report the contract as
+    # complete over a narrower claim than the author wrote.
+    _write(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not a formalization target |\n"
+        "<!-- reviewer note -->\n"
+        "| Main theorem | MAPPED | Needs roadmap articles |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [(issue.line, issue.reason) for issue in issues] == [
+        (
+            7,
+            "coverage row follows hidden content and would not be published; "
+            "move the comment or code block below the table",
+        )
+    ]
+
+
+def test_a_comment_that_swallows_rows_reports_each_survivor(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not a formalization target |\n"
+        "<!--\n"
+        "| Hidden | MAPPED | Inside the comment |\n"
+        "-->\n"
+        "| Visible | MAPPED | Below the comment |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    # Only the row that survives masking is actionable; the one inside the
+    # comment is already understood to be an example.
+    assert [issue.line for issue in issues] == [9]
+
+
+def test_notes_after_the_table_do_not_need_to_move(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _write(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | Not a formalization target |\n"
+        "<!-- AUTHORING NOTES, no rows below this point -->\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+    assert [entry.area for entry in summary.entries] == ["Narrative"]
 
 
 def test_an_unclosed_markdown_link_cannot_certify_decomposition(tmp_path: Path) -> None:

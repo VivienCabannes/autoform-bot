@@ -19,6 +19,7 @@ Two ideas run through everything here:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -49,6 +50,33 @@ _LIST_ITEM = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
 _CODE_INDENT = 4
 
 
+@dataclass(frozen=True, slots=True)
+class Content:
+    """A line-preserving view of the publishable Markdown in a document.
+
+    ``lines`` holds one entry per source line with unpublished spans blanked.
+    ``hidden`` holds the indexes of lines that had content and now show none.
+
+    That distinction matters to any caller that ends a construct at a blank
+    line. A comment sitting between two table rows truncates the table for
+    every renderer, so treating it as an ordinary blank would silently discard
+    the rows below it.
+    """
+
+    lines: tuple[str, ...]
+    hidden: frozenset[int]
+
+    def is_hidden(self, index: int) -> bool:
+        """Whether line ``index`` held content that does not publish."""
+
+        return index in self.hidden
+
+    def was_written(self, index: int) -> bool:
+        """Whether the author put anything on line ``index``, visible or not."""
+
+        return bool(self.lines[index].strip()) or index in self.hidden
+
+
 def strip_line_comments(line: str, in_comment: bool) -> tuple[str, bool]:
     """Remove HTML comment spans from one line, carrying state across lines.
 
@@ -77,15 +105,28 @@ def strip_line_comments(line: str, in_comment: bool) -> tuple[str, bool]:
     return "".join(output), in_comment
 
 
-def content_lines(text: str) -> list[str]:
-    """Return ``text`` line by line with everything unpublished masked out.
+def content(text: str) -> Content:
+    """Return the publishable view of ``text``, recording what was hidden.
 
     Fenced code blocks, indented code blocks, and HTML comments are blanked.
-    The result always has exactly as many entries as ``text`` has lines, so
-    index ``i`` still describes line ``i + 1`` of the source document.
+    The result always has exactly as many lines as ``text``, so index ``i``
+    still describes line ``i + 1`` of the source document.
     """
 
-    return _mask_indented_code(_mask_fences_and_comments(text.splitlines()))
+    raw = text.splitlines()
+    masked = _mask_indented_code(_mask_fences_and_comments(raw))
+    hidden = frozenset(
+        index
+        for index, line in enumerate(masked)
+        if raw[index].strip() and not line.strip()
+    )
+    return Content(tuple(masked), hidden)
+
+
+def content_lines(text: str) -> list[str]:
+    """Return ``text`` line by line with everything unpublished masked out."""
+
+    return list(content(text).lines)
 
 
 def link_targets(value: str) -> tuple[str, ...]:
@@ -222,22 +263,23 @@ def _mask_fences_and_comments(lines: list[str]) -> list[str]:
 
 def _mask_indented_code(lines: list[str]) -> list[str]:
     masked = list(lines)
-    previous: str | None = None
+    in_list = False
     index = 0
     while index < len(masked):
         line = masked[index]
         if not line.strip():
             index += 1
             continue
-        # An indented code block can only begin after a blank line, and never
-        # inside a list, where the same indentation continues the list item.
-        starts_block = (
-            _indent(line) >= _CODE_INDENT
-            and (index == 0 or not masked[index - 1].strip())
-            and (previous is None or _LIST_ITEM.match(previous) is None)
-        )
-        if not starts_block:
-            previous = line
+        if _indent(line) < _CODE_INDENT:
+            # This line sets the context every following indented line is read
+            # against, and it stays set across the blank lines that separate a
+            # list item from its continuation paragraphs.
+            in_list = _LIST_ITEM.match(line) is not None
+            index += 1
+            continue
+        # Indented content is a code block only outside a list, and only where
+        # it does not continue the paragraph directly above it.
+        if in_list or (index > 0 and masked[index - 1].strip()):
             index += 1
             continue
         while index < len(masked) and (
@@ -245,7 +287,6 @@ def _mask_indented_code(lines: list[str]) -> list[str]:
         ):
             masked[index] = ""
             index += 1
-        previous = None
     return masked
 
 
@@ -278,6 +319,8 @@ __all__ = [
     "HTML_COMMENT",
     "INLINE_CODE",
     "LINK",
+    "Content",
+    "content",
     "content_lines",
     "link_targets",
     "local_target_issue",

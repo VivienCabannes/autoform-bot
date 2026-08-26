@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from autoform_cli.markdown import (
+    content,
     content_lines,
     link_targets,
     local_target_issue,
@@ -62,6 +63,33 @@ def test_indented_content_under_a_list_item_is_not_code() -> None:
         "- item",
         "continuation of the item",
     ]
+
+
+def test_every_continuation_paragraph_in_a_list_stays_visible() -> None:
+    # List context has to survive the blank lines between paragraphs, or the
+    # second one is mistaken for a code block and its links go unchecked.
+    text = "- item\n\n    first continuation\n\n    second continuation\n\ntail\n"
+
+    assert [line.strip() for line in content_lines(text) if line.strip()] == [
+        "- item",
+        "first continuation",
+        "second continuation",
+        "tail",
+    ]
+
+
+def test_indented_code_at_the_start_of_a_document_is_masked() -> None:
+    assert content_lines("    indented code\n\nvisible\n") == ["", "", "visible"]
+
+
+def test_content_distinguishes_hidden_lines_from_blank_ones() -> None:
+    view = content("visible\n\n<!-- hidden -->\n")
+
+    assert view.lines == ("visible", "", "")
+    assert view.hidden == frozenset({2})
+    assert not view.is_hidden(1)
+    assert view.was_written(2)
+    assert not view.was_written(1)
 
 
 def test_link_extraction_requires_a_closing_parenthesis() -> None:

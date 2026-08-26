@@ -164,15 +164,19 @@ rows.
 
 The contract is read as published Markdown and fails closed. A table inside an
 HTML comment, a fenced block, or a four-space-indented block is documentation
-rather than contract, and is not discovered at all. Evidence must carry visible
-substantive content, so a cell holding only a code span, only a comment, or only
-emphasis is rejected, as is evidence that opens with `TODO`, `TBD`, `pending`,
-`placeholder`, or `unknown`. A placeholder word later in the sentence is allowed:
-"Listed in the roadmap; source audit pending" says something a reader can check.
-`DECOMPOSED` evidence must contain at least one complete inline link to an
-existing roadmap article, and *every* link it offers must resolve, fragments
-included, under the same rules the audit applies. A link missing its closing
-parenthesis does not render and does not count.
+rather than contract, and is not discovered at all. Because hidden content ends
+a table for every renderer, a comment or code block written *between* rows is
+reported rather than silently truncating the contract, and a comment that
+changes a row's column layout is rejected rather than parsed differently than it
+renders. Evidence must carry visible substantive content, so a cell holding only
+a code span, only a comment, or only emphasis is rejected, as is evidence that is
+nothing but `TODO`, `TBD`, `pending`, `placeholder`, or `unknown`, or that opens
+with one of those as a marker such as `TODO: choose a milestone`. A status word
+that merely begins a sentence is fine: "Pending Mathlib PR 1234" names something
+a reader can check. `DECOMPOSED` evidence must contain at least one complete
+inline link to an existing roadmap article, and *every* link it offers must
+resolve, fragments included, under the same rules the audit applies. A link
+missing its closing parenthesis does not render and does not count.
 
 ### What coverage completeness does and does not claim
 

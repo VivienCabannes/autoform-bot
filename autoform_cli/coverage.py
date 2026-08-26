@@ -16,15 +16,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .markdown import INLINE_CODE, content_lines, link_targets, local_target_issue
+from .markdown import INLINE_CODE, Content, content, link_targets, local_target_issue
 
 COVERAGE_SCHEMA = "autoform-coverage/v1"
 COVERAGE_DISPOSITIONS = ("MAPPED", "DECOMPOSED", "DEFERRED", "OUT")
 _EXPECTED_HEADER = ("Area", "Coverage", "Evidence")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
-#: Words that name the absence of a decision. Evidence that opens with one of
-#: these is a promise to decide later, not a disposition.
+#: Words that name the absence of a decision.
 _PLACEHOLDER_EVIDENCE = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
+#: Punctuation that turns a leading placeholder into a marker, as in ``TODO:``.
+_MARKER_PUNCTUATION = re.compile(r"^[\s]*[:\-\u2013\u2014]")
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -132,7 +133,8 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     # Only published Markdown can carry the contract. Commented-out and
     # code-block tables are masked to blank lines first, which keeps every
     # surviving index aligned with the author's own line numbering.
-    lines = content_lines(text)
+    view = content(text)
+    lines = view.lines
     header_indexes: list[int] = []
     for index in range(len(lines) - 1):
         header = _cells(lines[index])
@@ -148,15 +150,32 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
         return [], [CoverageIssue(header_indexes[1] + 1, "coverage contract has multiple coverage tables")]
 
     header_index = header_indexes[0]
+    source_lines = text.splitlines()
     entries: list[CoverageEntry] = []
     issues: list[CoverageIssue] = []
     seen_areas: dict[str, int] = {}
     for index in range(header_index + 2, len(lines)):
         raw = lines[index]
         if not raw.strip():
+            # A blank line ends the table. Hidden content also ends it, for
+            # every renderer as well as for us, so any row written below it is
+            # published by nobody and must be reported rather than dropped.
+            if view.is_hidden(index):
+                issues.extend(_unpublished_row_issues(view, index))
             break
         cells = _cells(raw)
         line_number = index + 1
+        # A renderer splits cells before it strips comments, so a comment that
+        # contains a pipe changes the column layout a reader sees. Reject the
+        # disagreement rather than parse a different table than the one shown.
+        if len(_cells(source_lines[index])) != len(cells):
+            issues.append(
+                CoverageIssue(
+                    line_number,
+                    "an HTML comment changes this coverage row's column layout",
+                )
+            )
+            continue
         if len(cells) != 3:
             issues.append(CoverageIssue(line_number, "coverage row must have exactly three columns"))
             continue
@@ -187,6 +206,30 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     if not entries and not issues:
         issues.append(CoverageIssue(header_index + 1, "coverage table has no rows"))
     return entries, issues
+
+
+def _unpublished_row_issues(view: Content, start: int) -> list[CoverageIssue]:
+    """Report rows written after hidden content inside the table body.
+
+    The table has already ended at ``start``. Anything row-shaped between there
+    and the next genuinely blank line looks like a declaration the author
+    expected to count, so name each one instead of letting the contract shrink
+    in silence. Trailing notes with no rows after them are left alone.
+    """
+
+    issues: list[CoverageIssue] = []
+    for index in range(start, len(view.lines)):
+        if not view.was_written(index):
+            break
+        if len(_cells(view.lines[index])) == 3:
+            issues.append(
+                CoverageIssue(
+                    index + 1,
+                    "coverage row follows hidden content and would not be published; "
+                    "move the comment or code block below the table",
+                )
+            )
+    return issues
 
 
 def _validate_evidence(
@@ -258,18 +301,31 @@ def _has_substance(visible: str) -> bool:
 def _is_placeholder(visible: str) -> bool:
     """Whether the evidence only announces that a decision is still outstanding.
 
-    A cell is rejected when its first word is a placeholder, however decorated:
-    ``TBD``, ``**TODO.**``, and ``TODO: choose a milestone`` all lead with a
-    marker that declares the row unfinished, so nothing after it is a reason.
+    Two shapes are rejected. A cell whose every word is a placeholder, however
+    decorated -- ``TBD``, ``**TODO.**`` -- and a cell that opens with one used as
+    a marker, where punctuation separates it from the rest: ``TODO: choose a
+    milestone``.
 
-    A placeholder word later in the sentence is deliberately allowed. Evidence
-    such as "Listed in the roadmap; source audit pending" tells a reader
-    something they can check, and rejecting it would fail closed on ordinary
-    authoring -- the bundled thesis example writes exactly that.
+    A status word that merely begins a sentence is left alone, because it is
+    usually carrying real information: "Pending Mathlib PR 1234" and "Unknown
+    provenance, excluded by agreement" both name something a reader can check.
+    Rejecting those pushed authors toward vaguer wording to satisfy the checker.
+
+    The gap this leaves is a marker written without punctuation, as in "TODO
+    choose a milestone". That reads as prose to any rule cheap enough to trust,
+    so it is left to human review rather than guessed at.
     """
 
-    words = re.findall(r"\w+", re.sub(r"[*_~\\]", "", visible).casefold())
-    return bool(words) and words[0] in _PLACEHOLDER_EVIDENCE
+    stripped = re.sub(r"[*_~\\]", "", visible)
+    words = re.findall(r"\w+", stripped.casefold())
+    if not words:
+        return False
+    if all(word in _PLACEHOLDER_EVIDENCE for word in words):
+        return True
+    if words[0] not in _PLACEHOLDER_EVIDENCE:
+        return False
+    _, _, remainder = stripped.casefold().partition(words[0])
+    return _MARKER_PUNCTUATION.match(remainder) is not None
 
 
 def _is_roadmap_article(target: str, *, coverage_path: Path, roadmap: Path) -> bool:
