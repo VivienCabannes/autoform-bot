@@ -187,10 +187,19 @@ recognise -- one written without outer pipes, say -- it says so rather than
 claiming there is no table.
 
 Finding a matching header on the page is not enough to conclude it came from the
-lines just read, so the rows are compared too. Otherwise a canonical-looking table
-that renders as a paragraph, sitting above an unrelated raw-HTML table with the
-same headers, would let unpublished rows stand as the contract. Tying the source
-to the specific table a reader sees is what closes that.
+lines just read, and neither is finding matching rows. A canonical-looking table
+that renders as a paragraph, sitting above an unrelated raw-HTML table with
+identical rows, satisfies any comparison of values while publishing nothing
+itself. So provenance is established rather than inferred: the source rows are
+rendered again carrying a marker no document would contain, and the published
+table has to be the one that marker turns up in. Comparing the values then
+confirms a reader sees what was validated.
+
+Only tables a reader can see count. Visibility propagates from ancestors, so a
+table inside `<div hidden>` is no more published than one carrying `hidden`
+itself, and a hidden row drops out while its siblings remain. Without that, a
+page with one visible contract and one hidden table looked ambiguous when a
+reader saw a single contract.
 
 Evidence must say something to a reader, judged on rendered text rather than
 Markdown source. A cell holding only a code span, only a comment, only emphasis,

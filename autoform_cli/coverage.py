@@ -31,6 +31,10 @@ COVERAGE_SCHEMA = "autoform-coverage/v1"
 COVERAGE_DISPOSITIONS = ("MAPPED", "DECOMPOSED", "DEFERRED", "OUT")
 _EXPECTED_HEADER = ("Area", "Coverage", "Evidence")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
+
+#: Stands in for a row's cells when tracing which published table those source
+#: lines became. Deliberately unlike anything a contract would contain.
+_ROW_MARKER = "autoformcoveragerowmarker"
 #: Words that name the absence of a decision.
 _PLACEHOLDER_EVIDENCE = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
 #: Punctuation that turns a leading placeholder into a marker, as in ``TODO:``.
@@ -199,6 +203,7 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     issues: list[CoverageIssue] = []
     seen_areas: dict[str, int] = {}
     parsed_rows: list[tuple[str, ...]] = []
+    row_indexes: list[int] = []
     for index in range(header_index + 2, len(lines)):
         raw = lines[index]
         if view.ends_block(index):
@@ -227,6 +232,7 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
             continue
         area, disposition_text, evidence = cells
         parsed_rows.append(cells)
+        row_indexes.append(index)
         disposition = _inline_code(disposition_text).upper()
         if not area:
             issues.append(CoverageIssue(line_number, "coverage area is empty"))
@@ -253,21 +259,53 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     if not entries and not issues:
         issues.append(CoverageIssue(header_index + 1, "coverage table has no rows"))
     if not issues:
-        issues.extend(_correlation_issues(contract_tables[0], parsed_rows, header_index))
+        issues.extend(
+            _correlation_issues(
+                source_lines, contract_tables[0], row_indexes, parsed_rows, header_index
+            )
+        )
     return entries, issues
 
 
 def _correlation_issues(
-    published: PublishedTable, parsed_rows: list[tuple[str, ...]], header_index: int
+    source_lines: list[str],
+    published: PublishedTable,
+    row_indexes: list[int],
+    parsed_rows: list[tuple[str, ...]],
+    header_index: int,
 ) -> list[CoverageIssue]:
     """Check the rows we validated are the rows the page actually shows.
 
-    A matching header somewhere on the page is not enough to conclude that these
-    source lines are what produced it. A canonical-looking table that renders as a
-    paragraph, sitting above an unrelated raw-HTML table with the same headers,
-    would otherwise let unpublished rows stand as the contract. Comparing the rows
-    themselves ties the source we read to the table a reader sees.
+    Equal content is not proof of provenance. A canonical-looking table that
+    renders as a paragraph, sitting above an unrelated raw-HTML table with the
+    same rows, would satisfy any comparison of values while publishing nothing
+    itself. So the source rows are rendered again carrying a marker no document
+    would contain, and the published table has to be the one that marker turns up
+    in. That establishes these lines produced that table; comparing the values
+    then confirms the reader sees what we validated.
     """
+
+    marked = list(source_lines)
+    markers = []
+    for position, index in enumerate(row_indexes):
+        marker = f"{_ROW_MARKER}{position}"
+        markers.append(marker)
+        # Row content cannot affect whether a table renders, so replacing it
+        # leaves every structural question exactly as it was.
+        marked[index] = f"| {marker} | {marker} | {marker} |"
+    traced = [
+        table
+        for table in published_tables("\n".join(marked))
+        if table.headers == _EXPECTED_HEADER and [row[0] for row in table.rows] == markers
+    ]
+    if len(traced) != 1:
+        return [
+            CoverageIssue(
+                header_index + 1,
+                "coverage rows are not the rows the page publishes; the table a reader "
+                "sees was not produced by these lines",
+            )
+        ]
 
     shown = [tuple(rendered_visible_text(cell) for cell in row) for row in parsed_rows]
     if published.rows == tuple(shown):

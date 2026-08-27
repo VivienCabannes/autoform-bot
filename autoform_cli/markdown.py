@@ -267,24 +267,75 @@ def published_tables(text: str) -> list[PublishedTable]:
     whole thing one lazy paragraph instead. Rows come back alongside the headers
     so a caller can tell *which* published table its source lines became, rather
     than trusting that a matching header somewhere on the page is the same table.
+
+    Only tables a reader can actually see are returned. Hiding propagates down
+    from ancestors, so a table inside ``<div hidden>`` counts no more than one
+    carrying ``hidden`` itself, and a hidden row inside a visible table drops out
+    while its siblings remain.
     """
 
     tree = render_tree(text)
     if tree is None:
         return []
     tables: list[PublishedTable] = []
-    for element in tree.iter("table"):
-        headers: tuple[str, ...] = ()
-        rows: list[tuple[str, ...]] = []
-        for row in element.iter("tr"):
-            heading_cells = tuple(_cell_text(cell) for cell in row.iter("th"))
-            body_cells = tuple(_cell_text(cell) for cell in row.iter("td"))
-            if heading_cells and not headers:
-                headers = heading_cells
-            elif body_cells:
-                rows.append(body_cells)
-        tables.append(PublishedTable(headers, tuple(rows)))
+    _collect_tables(tree, hidden=False, tables=tables)
     return tables
+
+
+def _collect_tables(element: object, hidden: bool, tables: list[PublishedTable]) -> None:
+    if not isinstance(element.tag, str):
+        return
+    concealed = _conceals(element, hidden)
+    if _local_name(element) == "table":
+        if not concealed:
+            tables.append(_read_table(element))
+        # Recurse regardless: a nested table inherits this one's visibility.
+    for child in element:
+        _collect_tables(child, concealed, tables)
+
+
+def _read_table(element: object) -> PublishedTable:
+    headers: tuple[str, ...] = ()
+    rows: list[tuple[str, ...]] = []
+    for row in _visible_rows(element, hidden=False):
+        cells = [child for child in row if isinstance(child.tag, str)]
+        heading_cells = tuple(_cell_text(cell) for cell in cells if _local_name(cell) == "th")
+        body_cells = tuple(_cell_text(cell) for cell in cells if _local_name(cell) == "td")
+        if heading_cells and not headers:
+            headers = heading_cells
+        elif body_cells:
+            rows.append(body_cells)
+    return PublishedTable(headers, tuple(rows))
+
+
+def _visible_rows(element: object, hidden: bool) -> list[object]:
+    """Return the rows of one table that a reader can see, skipping nested ones."""
+
+    rows: list[object] = []
+    for child in element:
+        if not isinstance(child.tag, str):
+            continue
+        tag = _local_name(child)
+        if tag == "table":
+            # A nested table's rows belong to it, not to this one.
+            continue
+        concealed = _conceals(child, hidden)
+        if tag == "tr":
+            if not concealed:
+                rows.append(child)
+            continue
+        rows.extend(_visible_rows(child, concealed))
+    return rows
+
+
+def _conceals(element: object, hidden: bool) -> bool:
+    """Whether ``element`` and its contents are kept from the reader."""
+
+    return hidden or _local_name(element) in _NON_VISIBLE_TAGS or "hidden" in element.attrib
+
+
+def _local_name(element: object) -> str:
+    return str(element.tag).rsplit("}", 1)[-1]
 
 
 def _cell_text(cell: object) -> str:
@@ -305,8 +356,7 @@ def _visible_parts(element: object, hidden: bool) -> list[str]:
         # and a reader never sees it. Any tail text belongs to the parent, which
         # collects it below.
         return []
-    tag = element.tag.rsplit("}", 1)[-1]
-    concealed = hidden or tag in _NON_VISIBLE_TAGS or "hidden" in element.attrib
+    concealed = _conceals(element, hidden)
     parts: list[str] = []
     if not concealed and element.text:
         parts.append(element.text)

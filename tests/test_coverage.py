@@ -34,6 +34,56 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_identical_rows_cannot_borrow_a_published_table(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The source table renders as a paragraph, and the raw-HTML table below it
+    # publishes byte-identical rows. Comparing values alone cannot tell these
+    # apart, so provenance has to be established rather than inferred.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "Intro with no blank line\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n\n"
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+        "<tbody><tr><td>Main</td><td>OUT</td><td>Not in scope</td></tr></tbody></table>\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == [
+        "coverage rows are not the rows the page publishes; "
+        "the table a reader sees was not produced by these lines"
+    ]
+
+
+def test_a_hidden_table_does_not_make_the_contract_ambiguous(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # A reader sees one contract table, so there is nothing ambiguous here even
+    # though the source holds two.
+    hidden = (
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+        "<tbody><tr><td>Other</td><td>OUT</td><td>reason</td></tr></tbody></table>"
+    )
+    for wrapper in (f"<div hidden>\n{hidden}\n</div>", hidden.replace("<table>", "<table hidden>")):
+        _raw_contract(
+            blueprint,
+            "# Coverage\n\n"
+            "| Area | Coverage | Evidence |\n"
+            "| --- | --- | --- |\n"
+            "| Main | OUT | Not in scope |\n\n"
+            f"{wrapper}\n",
+        )
+
+        summary, issues = load_coverage(blueprint)
+
+        assert issues == (), wrapper
+        assert summary is not None, wrapper
+        assert [entry.area for entry in summary.entries] == ["Main"], wrapper
+
+
 def test_unrendered_rows_cannot_borrow_another_published_table(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # The source table renders as a paragraph, but a raw-HTML table further down
@@ -53,7 +103,9 @@ def test_unrendered_rows_cannot_borrow_another_published_table(tmp_path: Path) -
     summary, issues = load_coverage(blueprint)
 
     assert summary is None
-    assert "do not match the table the page publishes" in issues[0].reason
+    # Provenance is the more fundamental failure: whatever the rows say, these
+    # lines did not produce the table on the page.
+    assert "not the rows the page publishes" in issues[0].reason
 
 
 def test_a_self_closing_hidden_element_still_hides_what_follows(tmp_path: Path) -> None:

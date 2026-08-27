@@ -145,6 +145,19 @@ def test_a_paragraph_running_into_a_table_publishes_no_table() -> None:
     assert published_tables("Intro\n| Area | Coverage |\n| --- | --- |\n| a | b |\n") == []
 
 
+def test_published_tables_skips_what_a_reader_cannot_see() -> None:
+    table = "<table><tr><th>A</th></tr><tr><td>b</td></tr></table>"
+
+    # Hiding propagates from an ancestor, not just from the table itself.
+    assert published_tables(f"<div hidden>\n{table}\n</div>\n") == []
+    assert published_tables(table.replace("<table>", "<table hidden>")) == []
+    # A hidden row drops out while its visible siblings remain.
+    rows = published_tables(
+        "<table><tr><th>A</th></tr><tr hidden><td>gone</td></tr><tr><td>kept</td></tr></table>"
+    )
+    assert [row for table_ in rows for row in table_.rows] == [("kept",)]
+
+
 def test_masking_blanks_code_blocks_and_comments_without_moving_lines() -> None:
     text = (
         "# Title\n"
