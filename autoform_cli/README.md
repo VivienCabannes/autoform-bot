@@ -197,7 +197,18 @@ published cell contains it. Checking the source alone is not enough, because
 rendering synthesises text the source never held literally: `&#97;utoform...`
 and `autoform<span></span>...` both normalise to the same cell a reader sees. The
 comparison is against published cell text, so that is what the marker has to be
-absent from. Comparing the values then confirms a reader sees what was validated.
+absent from.
+
+Substituting rows is only sound if it changes nothing else, which is not
+something to assume: an unclosed `<style>` inside a row swallows the rest of the
+document, so removing that row *exposes* tables the page never published, and one
+of those can then supply the marker. So the trace has to leave the page's
+topology intact -- same tables in the same order, same headers, identical rows
+everywhere except the one position being traced. A row that fails this is
+refused, and named as such, because the trace says nothing about a document the
+substitution changed. One honest consequence: evidence that itself contains a raw
+`<table>` disappears along with the row and is refused for the same reason. That
+is fail-closed on a cell no contract needs, which is the right side to err on.
 
 Only what a reader can see counts. Visibility propagates from ancestors, so a
 table inside `<div hidden>` is no more published than one carrying `hidden`

@@ -34,6 +34,32 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_a_row_that_exposes_a_table_cannot_supply_its_own_proof(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # The unclosed <style> in the candidate row swallows the table below it, so a
+    # reader sees only the first table and the candidate's values match it.
+    # Replacing the row removes the <style>, exposing a table that then offers the
+    # marker. Substituting rows is only sound if it changes nothing else.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+        "<tbody><tr><td>A</td><td>OUT</td><td>reason</td></tr></tbody></table>\n\n"
+        "Intro with no blank line\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| A<style> | OUT | reason |\n\n"
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+        "<tbody><tr><td>&#97;utoformcoveragerowmarker0</td><td>OUT</td>"
+        "<td>reason</td></tr></tbody></table>\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert "changes what else the page renders" in issues[0].reason
+
+
 def test_a_synthesised_marker_cannot_defeat_provenance(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # None of these contain the marker literally; rendering produces it. Checking

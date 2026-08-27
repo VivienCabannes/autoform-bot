@@ -286,10 +286,17 @@ def _correlation_issues(
     Equal content is not proof of provenance. A canonical-looking table that
     renders as a paragraph, sitting above an unrelated raw-HTML table with the
     same rows, would satisfy any comparison of values while publishing nothing
-    itself. So the source rows are rendered again carrying a marker no document
-    would contain, and the published table has to be the one that marker turns up
-    in. That establishes these lines produced that table; comparing the values
-    then confirms the reader sees what we validated.
+    itself. So the source rows are rendered again carrying a marker, and the
+    published table has to be the one that marker turns up in.
+
+    Substituting rows is only sound if it changes nothing else, and that is not
+    something to assume: an unclosed ``<style>`` inside a row swallows the rest of
+    the document, so removing that row *exposes* tables the page never published,
+    one of which can then supply the marker. The trace therefore has to leave the
+    page's topology intact -- same tables, same order, same headers, identical
+    rows everywhere except the one position being traced. Anything else means the
+    substitution changed the document rather than only the rows, and the trace
+    says nothing about the original.
     """
 
     marked = list(source_lines)
@@ -298,22 +305,42 @@ def _correlation_issues(
     for position, index in enumerate(row_indexes):
         token = f"{marker}{position}"
         markers.append(token)
-        # Row content cannot affect whether a table renders, so replacing it
-        # leaves every structural question exactly as it was.
         marked[index] = f"| {token} | {token} | {token} |"
-    traced = [
-        table
-        for table in published_tables("\n".join(marked))
-        if table.headers == _EXPECTED_HEADER and [row[0] for row in table.rows] == markers
+    untraceable = [
+        CoverageIssue(
+            header_index + 1,
+            "coverage rows are not the rows the page publishes; the table a reader "
+            "sees was not produced by these lines",
+        )
     ]
-    if len(traced) != 1:
-        return [
-            CoverageIssue(
-                header_index + 1,
-                "coverage rows are not the rows the page publishes; the table a reader "
-                "sees was not produced by these lines",
-            )
-        ]
+    unstable = [
+        CoverageIssue(
+            header_index + 1,
+            "coverage rows cannot be traced to the table the page publishes because a "
+            "row here changes what else the page renders; check for an unclosed element "
+            "or a table inside a cell",
+        )
+    ]
+    marked_tables = published_tables("\n".join(marked))
+    if len(marked_tables) != len(page_tables):
+        return unstable
+    moved = [
+        position
+        for position, (before, after) in enumerate(zip(page_tables, marked_tables))
+        if before != after
+    ]
+    if not moved:
+        # Substituting the rows changed nothing a reader sees, so these lines
+        # published nothing.
+        return untraceable
+    if len(moved) > 1:
+        return unstable
+    position = moved[0]
+    traced = marked_tables[position]
+    if page_tables[position] != published or traced.headers != page_tables[position].headers:
+        return unstable
+    if [row[0] for row in traced.rows] != markers:
+        return untraceable
 
     shown = [tuple(rendered_visible_text(cell) for cell in row) for row in parsed_rows]
     if published.rows == tuple(shown):
@@ -359,11 +386,11 @@ def _unique_marker(text: str, page_tables: list[PublishedTable]) -> str:
     contains it.
     """
 
-    published = [
-        cell for table in page_tables for row in (table.headers, *table.rows) for cell in row
-    ]
+    corpus = "\n".join(
+        [text, *(cell for table in page_tables for row in (table.headers, *table.rows) for cell in row)]
+    )
     marker = _ROW_MARKER
-    while marker in text or any(marker in cell for cell in published):
+    while marker in corpus:
         marker += "x"
     return marker
 
