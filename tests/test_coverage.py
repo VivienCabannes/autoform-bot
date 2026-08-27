@@ -34,6 +34,33 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_a_synthesised_marker_cannot_defeat_provenance(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # None of these contain the marker literally; rendering produces it. Checking
+    # the marker against the source alone would miss every one of them, because
+    # the comparison provenance performs is against published cell text.
+    for area in (
+        "&#97;utoformcoveragerowmarker0",
+        "autoform<span></span>coveragerowmarker0",
+        "autoform<!--x-->coveragerowmarker0",
+    ):
+        _raw_contract(
+            blueprint,
+            "# Coverage\n\n"
+            "Intro with no blank line\n"
+            "| Area | Coverage | Evidence |\n"
+            "| --- | --- | --- |\n"
+            f"| {area} | OUT | Not in scope |\n\n"
+            "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+            f"<tbody><tr><td>{area}</td><td>OUT</td><td>Not in scope</td></tr></tbody></table>\n",
+        )
+
+        summary, issues = load_coverage(blueprint)
+
+        assert summary is None, area
+        assert "not the rows the page publishes" in issues[0].reason, area
+
+
 def test_a_marker_collision_cannot_defeat_provenance(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # An author who writes the provenance marker as an area would otherwise let

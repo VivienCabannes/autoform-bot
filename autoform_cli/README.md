@@ -192,10 +192,12 @@ that renders as a paragraph, sitting above an unrelated raw-HTML table with
 identical rows, satisfies any comparison of values while publishing nothing
 itself. So provenance is established rather than inferred: the source rows are
 rendered again carrying a marker, and the published table has to be the one that
-marker turns up in. The marker is grown until the document does not contain it,
-because a fixed one is only a convention and an author who writes it as an area
-would otherwise let an unrelated table answer for their own. Comparing the values
-then confirms a reader sees what was validated.
+marker turns up in. The marker is grown until neither the source nor any
+published cell contains it. Checking the source alone is not enough, because
+rendering synthesises text the source never held literally: `&#97;utoform...`
+and `autoform<span></span>...` both normalise to the same cell a reader sees. The
+comparison is against published cell text, so that is what the marker has to be
+absent from. Comparing the values then confirms a reader sees what was validated.
 
 Only what a reader can see counts. Visibility propagates from ancestors, so a
 table inside `<div hidden>` is no more published than one carrying `hidden`

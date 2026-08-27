@@ -33,8 +33,9 @@ _EXPECTED_HEADER = ("Area", "Coverage", "Evidence")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
 
 #: Stem of the marker that stands in for a row's cells when tracing which
-#: published table those source lines became. Grown by `_unique_marker` until the
-#: document cannot contain it, so provenance never rests on a coincidence.
+#: published table those source lines became. Grown by `_unique_marker` until
+#: neither the source nor the rendered page can produce it, so provenance never
+#: rests on a coincidence.
 _ROW_MARKER = "autoformcoveragerowmarker"
 #: Words that name the absence of a decision.
 _PLACEHOLDER_EVIDENCE = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
@@ -167,9 +168,8 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     # as on its own two structural lines -- a comment can break the delimiter row
     # while preserving its column count, and a paragraph directly above the
     # header turns the whole thing into one lazy paragraph.
-    contract_tables = [
-        table for table in published_tables(text) if table.headers == _EXPECTED_HEADER
-    ]
+    page_tables = published_tables(text)
+    contract_tables = [table for table in page_tables if table.headers == _EXPECTED_HEADER]
     if header_indexes and not contract_tables:
         return [], [
             CoverageIssue(
@@ -262,7 +262,12 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
     if not issues:
         issues.extend(
             _correlation_issues(
-                source_lines, contract_tables[0], row_indexes, parsed_rows, header_index
+                source_lines,
+                contract_tables[0],
+                page_tables,
+                row_indexes,
+                parsed_rows,
+                header_index,
             )
         )
     return entries, issues
@@ -271,6 +276,7 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
 def _correlation_issues(
     source_lines: list[str],
     published: PublishedTable,
+    page_tables: list[PublishedTable],
     row_indexes: list[int],
     parsed_rows: list[tuple[str, ...]],
     header_index: int,
@@ -287,7 +293,7 @@ def _correlation_issues(
     """
 
     marked = list(source_lines)
-    marker = _unique_marker("\n".join(source_lines))
+    marker = _unique_marker("\n".join(source_lines), page_tables)
     markers = []
     for position, index in enumerate(row_indexes):
         token = f"{marker}{position}"
@@ -337,19 +343,27 @@ def _correlation_issues(
     ]
 
 
-def _unique_marker(text: str) -> str:
-    """Return a marker ``text`` cannot already contain.
+def _unique_marker(text: str, page_tables: list[PublishedTable]) -> str:
+    """Return a marker neither the source nor the published page can produce.
 
     A fixed marker is only a convention, and provenance that rests on a
-    convention can be arranged around: an author who writes the marker as an
-    area lets an unrelated table answer for their own. Growing the candidate
-    until the document does not contain it keeps the check deterministic while
-    making the collision impossible rather than unlikely. Testing the stem is
-    enough, since every per-row token contains it.
+    convention can be arranged around: an author who writes the marker as an area
+    lets an unrelated table answer for their own. Checking the source alone is not
+    enough either, because rendering *synthesises* text that the source never
+    contained literally -- ``&#97;utoformcoveragerowmarker0`` and
+    ``autoform<span></span>coveragerowmarker0`` both normalise to the marker. The
+    comparison the check performs is against published cell text, so that is what
+    the marker has to be absent from. Growing the candidate until it appears in
+    neither keeps the check deterministic while making the collision impossible
+    rather than unlikely. Testing the stem is enough, since every per-row token
+    contains it.
     """
 
+    published = [
+        cell for table in page_tables for row in (table.headers, *table.rows) for cell in row
+    ]
     marker = _ROW_MARKER
-    while marker in text:
+    while marker in text or any(marker in cell for cell in published):
         marker += "x"
     return marker
 
