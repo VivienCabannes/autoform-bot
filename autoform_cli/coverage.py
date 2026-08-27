@@ -32,8 +32,9 @@ COVERAGE_DISPOSITIONS = ("MAPPED", "DECOMPOSED", "DEFERRED", "OUT")
 _EXPECTED_HEADER = ("Area", "Coverage", "Evidence")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
 
-#: Stands in for a row's cells when tracing which published table those source
-#: lines became. Deliberately unlike anything a contract would contain.
+#: Stem of the marker that stands in for a row's cells when tracing which
+#: published table those source lines became. Grown by `_unique_marker` until the
+#: document cannot contain it, so provenance never rests on a coincidence.
 _ROW_MARKER = "autoformcoveragerowmarker"
 #: Words that name the absence of a decision.
 _PLACEHOLDER_EVIDENCE = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
@@ -286,13 +287,14 @@ def _correlation_issues(
     """
 
     marked = list(source_lines)
+    marker = _unique_marker("\n".join(source_lines))
     markers = []
     for position, index in enumerate(row_indexes):
-        marker = f"{_ROW_MARKER}{position}"
-        markers.append(marker)
+        token = f"{marker}{position}"
+        markers.append(token)
         # Row content cannot affect whether a table renders, so replacing it
         # leaves every structural question exactly as it was.
-        marked[index] = f"| {marker} | {marker} | {marker} |"
+        marked[index] = f"| {token} | {token} | {token} |"
     traced = [
         table
         for table in published_tables("\n".join(marked))
@@ -333,6 +335,23 @@ def _correlation_issues(
             f"coverage rows do not match the table the page publishes; {detail}",
         )
     ]
+
+
+def _unique_marker(text: str) -> str:
+    """Return a marker ``text`` cannot already contain.
+
+    A fixed marker is only a convention, and provenance that rests on a
+    convention can be arranged around: an author who writes the marker as an
+    area lets an unrelated table answer for their own. Growing the candidate
+    until the document does not contain it keeps the check deterministic while
+    making the collision impossible rather than unlikely. Testing the stem is
+    enough, since every per-row token contains it.
+    """
+
+    marker = _ROW_MARKER
+    while marker in text:
+        marker += "x"
+    return marker
 
 
 def _looks_like_row(line: str) -> bool:

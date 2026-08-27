@@ -298,7 +298,15 @@ def _read_table(element: object) -> PublishedTable:
     headers: tuple[str, ...] = ()
     rows: list[tuple[str, ...]] = []
     for row in _visible_rows(element, hidden=False):
-        cells = [child for child in row if isinstance(child.tag, str)]
+        # A concealed cell is not an empty column, it is no column at all. Keeping
+        # it as an empty string invents a phantom column, which both hides a
+        # table whose visible headers match and invents mismatches in one whose
+        # rows do.
+        cells = [
+            child
+            for child in row
+            if isinstance(child.tag, str) and not _conceals(child, hidden=False)
+        ]
         heading_cells = tuple(_cell_text(cell) for cell in cells if _local_name(cell) == "th")
         body_cells = tuple(_cell_text(cell) for cell in cells if _local_name(cell) == "td")
         if heading_cells and not headers:

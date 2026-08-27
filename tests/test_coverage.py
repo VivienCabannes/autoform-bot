@@ -34,6 +34,50 @@ def _raw_contract(blueprint: Path, body: str) -> Path:
     return path
 
 
+def test_a_marker_collision_cannot_defeat_provenance(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # An author who writes the provenance marker as an area would otherwise let
+    # an unrelated table answer for their own unrendered one.
+    marker = "autoformcoveragerowmarker0"
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "Intro with no blank line\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        f"| {marker} | OUT | Not in scope |\n\n"
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th></tr></thead>"
+        f"<tbody><tr><td>{marker}</td><td>OUT</td><td>Not in scope</td></tr></tbody></table>\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert "not the rows the page publishes" in issues[0].reason
+
+
+def test_a_hidden_column_does_not_disguise_a_second_contract(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    # A reader sees two contract tables here: the hidden fourth column is not a
+    # column at all, so it cannot excuse the second table from the count.
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Main | OUT | Not in scope |\n\n"
+        "<table><thead><tr><th>Area</th><th>Coverage</th><th>Evidence</th>"
+        "<th hidden>Notes</th></tr></thead>"
+        "<tbody><tr><td>Other</td><td>OUT</td><td>reason</td>"
+        "<td hidden>aside</td></tr></tbody></table>\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.reason for issue in issues] == ["coverage contract has multiple coverage tables"]
+
+
 def test_identical_rows_cannot_borrow_a_published_table(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # The source table renders as a paragraph, and the raw-HTML table below it

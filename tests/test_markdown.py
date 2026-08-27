@@ -14,6 +14,7 @@ from autoform_cli.markdown import (
     local_target_issue,
     markdown_anchors,
     markdown_links,
+    PublishedTable,
     published_tables,
     rendered_visible_text,
 )
@@ -156,6 +157,20 @@ def test_published_tables_skips_what_a_reader_cannot_see() -> None:
         "<table><tr><th>A</th></tr><tr hidden><td>gone</td></tr><tr><td>kept</td></tr></table>"
     )
     assert [row for table_ in rows for row in table_.rows] == [("kept",)]
+
+
+def test_a_hidden_cell_is_not_an_empty_column() -> None:
+    # Keeping a concealed cell as an empty string invents a column no reader
+    # sees, which both disguises a table whose visible headers match and
+    # manufactures mismatches in one whose rows do.
+    tables = published_tables(
+        "<table><tr><th>Area</th><th>Coverage</th><th>Evidence</th><th hidden>Notes</th></tr>"
+        "<tr><td>a</td><td>b</td><td>c</td><td hidden>aside</td></tr></table>"
+    )
+
+    assert tables == [
+        PublishedTable(headers=("Area", "Coverage", "Evidence"), rows=(("a", "b", "c"),))
+    ]
 
 
 def test_masking_blanks_code_blocks_and_comments_without_moving_lines() -> None:

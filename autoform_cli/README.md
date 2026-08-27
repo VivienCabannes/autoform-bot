@@ -191,15 +191,22 @@ lines just read, and neither is finding matching rows. A canonical-looking table
 that renders as a paragraph, sitting above an unrelated raw-HTML table with
 identical rows, satisfies any comparison of values while publishing nothing
 itself. So provenance is established rather than inferred: the source rows are
-rendered again carrying a marker no document would contain, and the published
-table has to be the one that marker turns up in. Comparing the values then
-confirms a reader sees what was validated.
+rendered again carrying a marker, and the published table has to be the one that
+marker turns up in. The marker is grown until the document does not contain it,
+because a fixed one is only a convention and an author who writes it as an area
+would otherwise let an unrelated table answer for their own. Comparing the values
+then confirms a reader sees what was validated.
 
-Only tables a reader can see count. Visibility propagates from ancestors, so a
+Only what a reader can see counts. Visibility propagates from ancestors, so a
 table inside `<div hidden>` is no more published than one carrying `hidden`
-itself, and a hidden row drops out while its siblings remain. Without that, a
-page with one visible contract and one hidden table looked ambiguous when a
-reader saw a single contract.
+itself; a hidden row drops out while its siblings remain; and a hidden cell is
+treated as no column rather than an empty one, since keeping it invents a column
+that both disguises a table whose visible headers match and manufactures
+mismatches in one whose rows do. The boundary here is deliberate: hiding is read
+from HTML, not from CSS. An element hidden by a stylesheet class or an inline
+`display: none` still counts as published, because following that faithfully
+would mean resolving the site's stylesheets, and a check that resolves them
+badly is worse than one whose limit is written down.
 
 Evidence must say something to a reader, judged on rendered text rather than
 Markdown source. A cell holding only a code span, only a comment, only emphasis,
