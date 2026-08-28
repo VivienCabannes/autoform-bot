@@ -54,9 +54,8 @@ uv run autoform init /path/to/lean-project \
 
 This creates `blueprint/`, `mkdocs.yml`, and `requirements-docs.txt`. GitHub
 workflows are created only when Autoform has an immutable commit pin. The Setup
-skill can inspect and repair this infrastructure, but its new-project Lean
-bootstrap helper is not packaged on `main`; start from an existing Lean project
-and use `autoform init` for the blueprint and publication files.
+skill guides repository inspection, Lean/Mathlib shell preparation, and this
+non-destructive `autoform init` flow.
 
 Next use the host skills from the Lean project:
 
