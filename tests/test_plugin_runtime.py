@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.parse import unquote, urlsplit
+
+from autoform_cli.markdown import local_target_issue, markdown_links
 
 
 def _shipped_path(repo_root: Path, value: str) -> Path:
@@ -77,7 +77,6 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
 
 
 def test_shipped_skill_links_resolve_within_the_plugin(repo_root):
-    link_pattern = re.compile(r"(?<!!)\[[^\]]+\]\((?P<target>[^)]+)\)")
     documents = sorted((repo_root / "skills").glob("*/SKILL.md"))
     documents += sorted((repo_root / "skills").glob("*/references/**/*.md"))
     for document in documents:
@@ -86,15 +85,10 @@ def test_shipped_skill_links_resolve_within_the_plugin(repo_root):
             assert "Orchestrate" not in text, (
                 f"{document.relative_to(repo_root)} names an unshipped skill"
             )
-        for match in link_pattern.finditer(text):
-            target = match.group("target").strip().strip("<>")
-            parsed = urlsplit(target)
-            if parsed.scheme or parsed.netloc or not parsed.path:
-                continue
-            resolved = (document.parent / unquote(parsed.path)).resolve()
-            assert resolved.is_relative_to(repo_root.resolve())
-            assert resolved.exists(), (
-                f"{document.relative_to(repo_root)} links missing {parsed.path}"
+        for line_number, target in markdown_links(text):
+            issue = local_target_issue(document, target, repo_root, label="skill")
+            assert issue is None, (
+                f"{document.relative_to(repo_root)}:{line_number}: {issue[1]}"
             )
 
 
