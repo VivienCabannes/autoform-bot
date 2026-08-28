@@ -259,9 +259,10 @@ class ReplProcessRestarted(RuntimeError):
 class ReplStderrBacklog(RuntimeError):
     """Raised when a response was captured but its stderr could not be drained.
 
-    The response is valid and travels on ``response`` so a caller need not
-    recompute it, but the undrained stderr belongs to this command, so the
-    process is desynchronized and must not serve another request.
+    The response data is valid and travels on ``response`` so a caller need not
+    recompute it, but any ``env`` belongs to the process being retired and must
+    not escape. The undrained stderr belongs to this command, so the process is
+    desynchronized and must not serve another request.
     """
 
     def __init__(self, message: str, response: dict[str, Any]) -> None:
@@ -290,6 +291,9 @@ class LeanRepl:
         self.mem_limit_gb: int = config.instance_mem_limit_gb
 
         self._process_lock = threading.Lock()
+        # A completed response establishes the point after which newly readable
+        # stderr is stale: it cannot belong to a command that has not been sent.
+        self._command_completed = False
 
         self._allowed_import_roots: frozenset[str] | None = None
         if config.validate_imports and config.allowed_imports:
@@ -320,6 +324,7 @@ class LeanRepl:
             stderr=subprocess.PIPE,
             env=env,
         )
+        self._command_completed = False
 
         try:
             if self.config.warmup_imports:
@@ -362,6 +367,7 @@ class LeanRepl:
         finally:
             self.process = None
             self._base_env_id = None
+            self._command_completed = False
 
     def restart(self, timeout: float | None = None) -> None:
         """Restart the Lean REPL process within an optional total timeout."""
@@ -439,8 +445,12 @@ class LeanRepl:
                     self.close()
                     if run_from_env:
                         raise ReplProcessRestarted(str(e)) from e
-                    _adjust_line_numbers(e.response, header_line_count)
-                    return e.response
+                    # The command's diagnostics remain valid, but any environment
+                    # identifier belongs to the process _run() just retired.
+                    response = dict(e.response)
+                    response.pop("env", None)
+                    _adjust_line_numbers(response, header_line_count)
+                    return response
                 except ReplProcessExited as e:
                     last_exception = e
                     logger.error("REPL process exited: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
@@ -507,6 +517,35 @@ class LeanRepl:
         end_time = time.monotonic() + timeout
         stdin_fd = self.process.stdin.fileno()
         os.set_blocking(stdin_fd, False)
+
+        if self._command_completed:
+            stderr_fd = self.process.stderr.fileno()
+            os.set_blocking(stderr_fd, False)
+            # stdout and stderr are independent pipes. A command may finish just
+            # before its final stderr write becomes visible, so check the idle gap
+            # again immediately before sending the next command. If anything is
+            # present, retire the process: those bytes cannot belong to a command
+            # that has not yet been written.
+            readable, _, _ = select.select([stderr_fd], [], [], 0)
+            if readable:
+                try:
+                    stale = os.read(stderr_fd, 1)
+                except BlockingIOError:
+                    stale = None
+                if stale:
+                    tail = stale.decode("utf-8", errors="replace")
+                    self.close()
+                    raise ReplProcessExited(
+                        "REPL emitted stderr after the previous response; "
+                        f"the process was recycled. Tail: {tail!r}"
+                    )
+                if stale == b"" and self.process is not None:
+                    self.close()
+                    raise ReplProcessExited(
+                        "REPL closed stderr after the previous response; "
+                        "the process was recycled"
+                    )
+
         payload = memoryview(command.encode("utf-8"))
         offset = 0
         while offset < len(payload):
@@ -562,14 +601,21 @@ class LeanRepl:
                 # ``max_buffer_bytes`` is a per-stream ceiling: stdout and stderr are
                 # each bounded by it independently, so one command can hold up to
                 # twice that much.
-                if after_response and len(stderr_buffer) >= max_buffer:
-                    return False
-                if time.monotonic() >= end_time:
-                    if after_response:
-                        return False
+                if after_response:
+                    remaining_budget = max_buffer - len(stderr_buffer)
+                    if remaining_budget <= 0 or time.monotonic() >= end_time:
+                        # A zero-time readiness probe distinguishes a clean pipe at
+                        # the exact cap/deadline from a real backlog without reading
+                        # or storing a byte beyond the configured ceiling.
+                        readable, _, _ = select.select([stderr_fd], [], [], 0)
+                        return not readable
+                    read_size = min(self.chunk_size, remaining_budget)
+                else:
+                    read_size = self.chunk_size
+                if not after_response and time.monotonic() >= end_time:
                     raise TimeoutError(f"REPL command timed out after {timeout} seconds while reading stderr")
                 try:
-                    chunk = os.read(stderr_fd, self.chunk_size)
+                    chunk = os.read(stderr_fd, read_size)
                 except BlockingIOError:
                     return True
                 if not chunk:
@@ -632,7 +678,6 @@ class LeanRepl:
                     stderr_drained = drain_stderr(after_response=True)
                     break
 
-        response = json.loads(response_bytes.decode("utf-8"))
         if not stderr_drained:
             # A bound stopped the drain, so stderr for this command is still in the
             # pipe. The next command would consume it or be charged for it, and a
@@ -641,6 +686,13 @@ class LeanRepl:
             # process is retired here rather than by the caller: this must hold for
             # every caller, so it cannot depend on each one handling the error.
             self.close()
+        else:
+            self._command_completed = True
+
+        # Retire a desynchronized process before parsing. Malformed JSON must not
+        # bypass the stream-safety invariant and leave stale stderr reusable.
+        response = json.loads(response_bytes.decode("utf-8"))
+        if not stderr_drained:
             raise ReplStderrBacklog(
                 f"REPL stderr for this command could not be drained within its budget "
                 f"(per-stream ceiling {max_buffer} bytes); the process was recycled",

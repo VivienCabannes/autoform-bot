@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import ExitStack
 
 import pytest
@@ -338,7 +339,19 @@ def test_wire_protocol_reports_a_backlog_when_the_cap_ends_the_post_response_dra
     assert error.value.response == {"messages": []}
     # ...but this command's stderr is still in the pipe, which is exactly why the
     # process must not serve another request.
-    assert process.stderr_bytes == b"e" * 4
+    assert process.stderr_bytes == b"e" * 20
+
+
+def test_wire_protocol_accepts_stderr_that_ends_exactly_at_the_cap(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 20)
+        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
+        _patch_pipe_reads(monkeypatch, process)
+
+        assert repl._run("#check Nat", env_id=None, timeout=5) == {"messages": []}
+
+        assert repl.process is process
+        assert process.stderr_bytes == b""
 
 
 def test_wire_protocol_keeps_the_response_when_the_deadline_ends_the_stderr_drain(monkeypatch):
@@ -422,7 +435,7 @@ def test_backlog_recycles_the_process_so_two_commands_cannot_share_stderr(monkey
 
         # The process holding the remainder is gone, so nothing can inherit it.
         assert repl.process is None
-        assert first.stderr_bytes == b"e" * 4
+        assert first.stderr_bytes == b"e" * 20
 
         monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
 
@@ -431,7 +444,23 @@ def test_backlog_recycles_the_process_so_two_commands_cannot_share_stderr(monkey
 
         assert second.stderr_bytes == b""
         # Command one's stderr was never consumed by, or charged against, command two.
-        assert first.stderr_bytes == b"e" * 4
+        assert first.stderr_bytes == b"e" * 20
+
+
+def test_backlog_response_drops_environment_owned_by_the_recycled_process(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(
+            stack,
+            [b'{"env":9,"messages":[]}\n\n'],
+            stderr=b"e" * 64,
+        )
+        repl = _repl_with_process(process, chunk_size=30, max_buffer_bytes=32)
+        _patch_pipe_reads(monkeypatch, process)
+
+        response = repl.run("#check Nat", timeout=5)
+
+        assert response == {"messages": []}
+        assert repl.process is None
 
 
 def test_env_scoped_request_refuses_to_outlive_the_recycled_process(monkeypatch):
@@ -501,6 +530,49 @@ def test_run_never_leaves_a_reusable_process_when_a_backlog_stops_the_drain(monk
 
         assert repl.process is None
         assert repl.is_alive() is False
+
+
+def test_delayed_stderr_is_rejected_before_the_next_command_is_written():
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _repl_with_process(process)
+        release_stderr = threading.Event()
+        stderr_written = threading.Event()
+
+        def serve_first_command() -> None:
+            request = bytearray()
+            while b"\n\n" not in request:
+                request.extend(os.read(process._stdin_read.fileno(), 4096))
+            os.write(process._stdout_write.fileno(), b'{"env": 1}\n\n')
+            release_stderr.wait()
+            os.write(process._stderr_write.fileno(), b"late diagnostic")
+            stderr_written.set()
+
+        worker = threading.Thread(target=serve_first_command, daemon=True)
+        worker.start()
+
+        assert repl._run("first", env_id=None, timeout=1) == {"env": 1}
+        release_stderr.set()
+        assert stderr_written.wait(timeout=1)
+
+        with pytest.raises(repl_core.ReplProcessRestarted, match="after the previous response"):
+            repl.run("second", env_id=1, timeout=1)
+
+        assert repl.process is None
+        worker.join(timeout=1)
+
+
+def test_invalid_json_with_a_stderr_backlog_retires_the_process(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [b"not-json\n\n"], stderr=b"e" * 40)
+        repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
+        _patch_pipe_reads(monkeypatch, process)
+
+        with pytest.raises(json.JSONDecodeError):
+            repl._run("#check Nat", env_id=None, timeout=5)
+
+        assert repl.process is None
+        assert process.stderr_bytes == b"e" * 20
 
 
 def test_wire_protocol_rejects_invalid_json(monkeypatch):
