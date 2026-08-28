@@ -48,7 +48,14 @@ def _article(
     return path
 
 
-def _coverage(blueprint: Path, text: str = "The roadmap covers every declared target.") -> Path:
+def _coverage(
+    blueprint: Path,
+    text: str = (
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Narrative | OUT | No formalization target |"
+    ),
+) -> Path:
     path = blueprint / "coverage" / "README.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"# Coverage\n\n{text}\n", encoding="utf-8")
@@ -94,8 +101,10 @@ def test_clean_audit_has_stable_machine_readable_representation(tmp_path: Path) 
 
     assert first.clean
     assert first.findings == ()
-    assert first.as_dict() == {"clean": True, "findings": []}
-    assert first.to_json() == '{"clean":true,"findings":[]}'
+    assert first.clean
+    assert first.coverage is not None
+    assert first.coverage.counts == {"MAPPED": 0, "DECOMPOSED": 0, "DEFERRED": 0, "OUT": 1}
+    assert first.as_dict()["findings"] == []
     assert second.to_json() == first.to_json()
     assert str(tmp_path) not in first.to_json()
 
@@ -274,17 +283,22 @@ def test_audit_reports_coverage_gaps_provable_from_files(tmp_path: Path) -> None
 
     _coverage(
         blueprint,
-        "| Area | Coverage |\n| --- | --- |\n| Completed result | MAPPED |\n| Main result | PARTIAL |\n\n- TODO: map the corollaries\n\n[Missing](../roadmap/nope.md)\n\n[Remote](//example.invalid/coverage)",
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Completed result | MAPPED | [Missing](../roadmap/nope.md) |\n"
+        "| Experiments | OUT | [Remote](//example.invalid/coverage) |",
     )
     findings = _finding_map(blueprint)["coverage/README.md"]
 
     assert findings == [
-        ("coverage-not-found", "coverage link does not resolve to a file: '../roadmap/nope.md' (line 10)"),
-        ("declared-coverage-gap", "coverage contract declares PARTIAL at line 6"),
-        ("declared-coverage-gap", "coverage contract declares TODO at line 8"),
+        ("coverage-not-found", "coverage link does not resolve to a file: '../roadmap/nope.md' (line 5)"),
+        (
+            "declared-coverage-gap",
+            "coverage area 'Completed result' is mapped but not dispositioned (line 5)",
+        ),
         (
             "unsupported-coverage-link",
-            "coverage link uses a network location: '//example.invalid/coverage' (line 12)",
+            "coverage link uses a network location: '//example.invalid/coverage' (line 6)",
         ),
     ]
 
@@ -297,9 +311,57 @@ def test_unreadable_coverage_reason_is_stable(tmp_path: Path) -> None:
 
     result = audit_blueprint(blueprint)
 
-    finding = next(item for item in result.findings if item.code == "unreadable-coverage-file")
-    assert finding.reason == "coverage file cannot be read as UTF-8"
+    finding = next(item for item in result.findings if item.code == "invalid-coverage-contract")
+    assert finding.reason == "coverage contract cannot be read as UTF-8"
+    assert not any(item.code == "unreadable-coverage-file" for item in result.findings)
     assert str(tmp_path) not in result.to_json()
+
+
+def test_audit_checks_all_supplemental_coverage_markdown(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _article(blueprint, "result.md", declaration="theorem")
+    _coverage(blueprint)
+    notes = blueprint / "coverage" / "notes" / "details.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("[Missing](../../roadmap/absent.md)\n", encoding="utf-8")
+    (blueprint / "coverage" / "binary.md").write_bytes(b"\xff")
+
+    findings = _finding_map(blueprint)
+
+    assert findings["coverage/binary.md"] == [
+        ("unreadable-coverage-file", "coverage file cannot be read as UTF-8")
+    ]
+    assert findings["coverage/notes/details.md"] == [
+        (
+            "coverage-not-found",
+            "coverage link does not resolve to a file: '../../roadmap/absent.md' (line 1)",
+        )
+    ]
+
+
+def test_supplemental_coverage_checks_run_when_contract_is_invalid(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _article(blueprint, "result.md", declaration="theorem")
+    _coverage(blueprint, "not a contract")
+    notes = blueprint / "coverage" / "notes.md"
+    notes.write_text(
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Supplemental | OUT | [Missing](../roadmap/absent.md) |\n",
+        encoding="utf-8",
+    )
+
+    findings = _finding_map(blueprint)
+
+    assert [code for code, _ in findings["coverage/README.md"]] == [
+        "invalid-coverage-contract"
+    ]
+    assert findings["coverage/notes.md"] == [
+        (
+            "coverage-not-found",
+            "coverage link does not resolve to a file: '../roadmap/absent.md' (line 3)",
+        )
+    ]
 
 
 def test_invalid_blueprint_result_does_not_leak_host_path(tmp_path: Path) -> None:
@@ -310,6 +372,19 @@ def test_invalid_blueprint_result_does_not_leak_host_path(tmp_path: Path) -> Non
     assert len(result.findings) == 1
     assert result.findings[0].article_path == "."
     assert result.findings[0].reason == "blueprint directory does not exist: ."
+
+
+def test_audit_preserves_valid_coverage_when_graph_is_invalid(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "bad.md", declaration="theorem")
+    (blueprint / "roadmap/bad.md").write_text("# First\n# Second\n", encoding="utf-8")
+
+    result = audit_blueprint(blueprint)
+
+    assert result.coverage is not None
+    assert result.coverage.counts["OUT"] == 1
+    assert any(finding.code == "invalid-graph" for finding in result.findings)
 
 
 def test_audit_returns_graph_validation_errors_with_article_paths(tmp_path: Path) -> None:

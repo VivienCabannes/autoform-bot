@@ -8,39 +8,21 @@ contacts a network service or writes generated state back into the blueprint.
 from __future__ import annotations
 
 import json
-import re
 import statistics
 from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
 from . import status
+from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project
-
-_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
-_INLINE_CODE = re.compile(r"(`+).*?\1")
-_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
-_COVERAGE_GAP = re.compile(
-    r"(?:"
-    r"`(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)`"
-    r"|\|\s*(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\s*\|"
-    r"|^\s*#{1,6}\s+(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\b"
-    r"|^\s*(?:[-*+]\s+)?(?:status|coverage)\s*:\s*"
-    r"(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\b"
-    r"|^\s*[-*+]\s+(PARTIAL|PENDING|INCOMPLETE|TODO|TBD|GAP)\b"
-    r")",
-    re.I,
-)
-_EXTERNAL_SCHEMES = frozenset({"http", "https"})
-_MARKDOWN_ANCHOR_PUNCTUATION = re.compile(r"[^\w\- ]", re.UNICODE)
-#: The trailing attr-list block and an explicit `#id` within it. MkDocs allows
-#: the ID alongside classes and attributes, for example `{#result .highlight}`.
-_ATTR_LIST = re.compile(r"\{(?P<attributes>[^{}]*)\}\s*$")
-_ATTR_LIST_ID = re.compile(r"(?:^|\s)#(?P<id>[^\s#.={}]+)(?=\s|$)")
+from .markdown import FENCE as _FENCE
+from .markdown import frontmatter_end as _frontmatter_end
+from .markdown import HEADING as _HEADING
+from .markdown import HTML_COMMENT as _HTML_COMMENT
+from .markdown import local_target_issue as _local_target_issue
+from .markdown import markdown_links as _markdown_links
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -84,6 +66,7 @@ class AuditResult:
     """The complete, canonically ordered result of one audit."""
 
     findings: tuple[AuditFinding, ...] = ()
+    coverage: CoverageSummary | None = None
 
     @property
     def clean(self) -> bool:
@@ -96,6 +79,7 @@ class AuditResult:
 
         return {
             "clean": self.clean,
+            "coverage": self.coverage.as_dict() if self.coverage is not None else None,
             "findings": [asdict(finding) for finding in self.findings],
         }
 
@@ -117,6 +101,10 @@ def audit_blueprint(
     """
 
     blueprint = Path(blueprint_dir).expanduser().resolve()
+    if blueprint.is_dir():
+        coverage, coverage_findings = _coverage_findings(blueprint)
+    else:
+        coverage, coverage_findings = None, []
     try:
         graph = load_graph(blueprint)
     except GraphValidationError as error:
@@ -128,11 +116,22 @@ def audit_blueprint(
             )
             for issue in error.issues
         ]
-        return _result(findings)
-    return audit_graph(graph, lean_root=lean_root)
+        return _result([*findings, *coverage_findings], coverage=coverage)
+    return audit_graph(
+        graph,
+        lean_root=lean_root,
+        coverage=coverage,
+        coverage_findings=coverage_findings,
+    )
 
 
-def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditResult:
+def audit_graph(
+    graph: Graph,
+    *,
+    lean_root: str | Path | None = None,
+    coverage: CoverageSummary | None = None,
+    coverage_findings: list[AuditFinding] | None = None,
+) -> AuditResult:
     """Audit an already loaded graph without modifying it or its source files."""
 
     findings: list[AuditFinding] = []
@@ -226,10 +225,12 @@ def audit_graph(graph: Graph, *, lean_root: str | Path | None = None) -> AuditRe
 
         findings.extend(_source_findings(graph, node, article_path))
 
-    findings.extend(_coverage_findings(graph.blueprint_dir))
+    if coverage_findings is None:
+        coverage, coverage_findings = _coverage_findings(graph.blueprint_dir)
+    findings.extend(coverage_findings)
     if lean_root is not None:
         findings.extend(_lean_findings(graph, lean_root))
-    return _result(findings)
+    return _result(findings, coverage=coverage)
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,15 +283,6 @@ def _read_article(path: Path) -> _ArticleShape:
     return _ArticleShape(statement_text, has_depends_section)
 
 
-def _frontmatter_end(lines: list[str]) -> int:
-    if not lines or lines[0].strip() != "---":
-        return 0
-    for index in range(1, len(lines)):
-        if lines[index].strip() == "---":
-            return index + 1
-    return len(lines)
-
-
 def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditFinding]:
     findings: list[AuditFinding] = []
     for target in node.sources:
@@ -301,223 +293,62 @@ def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditF
     return findings
 
 
-def _local_target_issue(
-    source_path: Path,
-    target: str,
-    boundary: Path,
-    *,
-    label: str,
-) -> tuple[str, str] | None:
-    split = urlsplit(target)
-    scheme = split.scheme.casefold()
-    if scheme in _EXTERNAL_SCHEMES:
-        return None
-    if scheme:
-        return f"unsupported-{label}-link", f"{label} link uses unsupported scheme: {target!r}"
-    if split.netloc:
-        return f"unsupported-{label}-link", f"{label} link uses a network location: {target!r}"
-
-    raw_path = unquote(split.path)
-    if "\x00" in raw_path:
-        return f"malformed-{label}-link", f"{label} link contains an invalid path: {target!r}"
-    if not raw_path:
-        candidate = source_path.resolve()
-    else:
-        relative = Path(raw_path)
-        if relative.is_absolute():
-            return f"{label}-escapes-blueprint", f"{label} link escapes the blueprint: {target!r}"
-        candidate = (source_path.parent / relative).resolve()
-
-    boundary = boundary.resolve()
-    if not _is_within(candidate, boundary):
-        return f"{label}-escapes-blueprint", f"{label} link escapes the blueprint: {target!r}"
-    try:
-        is_file = candidate.is_file()
-    except (OSError, ValueError):
-        return f"malformed-{label}-link", f"{label} link contains an invalid path: {target!r}"
-    if not is_file:
-        return f"{label}-not-found", f"{label} link does not resolve to a file: {target!r}"
-    if split.fragment and candidate.suffix.casefold() == ".md":
-        fragment = unquote(split.fragment)
-        if fragment not in _markdown_anchors(candidate):
-            return f"{label}-anchor-not-found", f"{label} link fragment does not resolve: {target!r}"
-    return None
-
-
-def _markdown_anchors(path: Path) -> set[str]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return set()
-    counts: dict[str, int] = {}
-    anchors: set[str] = set()
-    fence: tuple[str, int] | None = None
-    for line in text.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        heading = _HEADING.match(line)
-        if heading is None:
-            continue
-        title = heading.group(2).strip()
-        # `attr_list` is enabled in the generated mkdocs.yml, so an explicit
-        # `#id` in the trailing attribute block is what MkDocs renders and what
-        # a link must match. The ID may appear beside classes or attributes.
-        attributes = _ATTR_LIST.search(title)
-        explicit = (
-            _ATTR_LIST_ID.search(attributes.group("attributes"))
-            if attributes is not None
-            else None
-        )
-        if explicit is not None:
-            anchors.add(explicit.group("id"))
-            continue
-        base = _MARKDOWN_ANCHOR_PUNCTUATION.sub("", title.casefold())
-        base = re.sub(r"\s+", "-", base).strip("-")
-        if not base:
-            continue
-        index = counts.get(base, 0)
-        counts[base] = index + 1
-        anchors.add(base if index == 0 else f"{base}_{index}")
-    return anchors
-
-
-def _coverage_findings(blueprint: Path) -> list[AuditFinding]:
+def _coverage_findings(
+    blueprint: Path,
+) -> tuple[CoverageSummary | None, list[AuditFinding]]:
     coverage_root = blueprint / "coverage"
     contract = coverage_root / "README.md"
-    if not contract.is_file():
-        return [
-            AuditFinding(
-                "coverage/README.md",
-                "missing-coverage-contract",
-                "coverage contract is missing",
-            )
-        ]
+    coverage, issues = load_coverage(blueprint)
+    findings = [
+        AuditFinding(
+            "coverage/README.md",
+            (
+                "missing-coverage-contract"
+                if issue.reason == "coverage contract is missing"
+                else "invalid-coverage-contract"
+            ),
+            f"{issue.reason}{f' (line {issue.line})' if issue.line else ''}",
+        )
+        for issue in issues
+    ]
 
-    findings: list[AuditFinding] = []
+    if coverage is not None:
+        for entry in coverage.entries:
+            if entry.disposition == "MAPPED":
+                findings.append(
+                    AuditFinding(
+                        "coverage/README.md",
+                        "declared-coverage-gap",
+                        f"coverage area {entry.area!r} is mapped but not dispositioned (line {entry.line})",
+                    )
+                )
+
     coverage_files = sorted(path for path in coverage_root.rglob("*.md") if path.is_file())
     for path in coverage_files:
         article_path = _relative_path(path, blueprint)
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
-            findings.append(
-                AuditFinding(article_path, "unreadable-coverage-file", "coverage file cannot be read as UTF-8")
-            )
+            # load_coverage already gives the canonical contract its more precise
+            # invalid-coverage-contract diagnostic.
+            if path != contract:
+                findings.append(
+                    AuditFinding(
+                        article_path,
+                        "unreadable-coverage-file",
+                        "coverage file cannot be read as UTF-8",
+                    )
+                )
             continue
-
-        if path == contract and not _has_substantive_markdown(text):
-            findings.append(
-                AuditFinding(
-                    article_path,
-                    "empty-coverage-contract",
-                    "coverage contract has no substantive content",
-                )
-            )
-
-        for line_number, marker in _coverage_gap_markers(text):
-            findings.append(
-                AuditFinding(
-                    article_path,
-                    "declared-coverage-gap",
-                    f"coverage contract declares {marker} at line {line_number}",
-                )
-            )
 
         for line_number, target in _markdown_links(text):
             issue = _local_target_issue(path, target, blueprint, label="coverage")
             if issue is not None:
                 code, reason = issue
-                findings.append(AuditFinding(article_path, code, f"{reason} (line {line_number})"))
-    return findings
-
-
-def _has_substantive_markdown(text: str) -> bool:
-    lines = text.splitlines()
-    body = _HTML_COMMENT.sub("", "\n".join(lines[_frontmatter_end(lines) :]))
-    for line in body.splitlines():
-        if _HEADING.match(line):
-            continue
-        if line.strip():
-            return True
-    return False
-
-
-def _coverage_gap_markers(text: str) -> list[tuple[int, str]]:
-    markers: list[tuple[int, str]] = []
-    fence: tuple[str, int] | None = None
-    in_comment = False
-    for line_number, raw in enumerate(text.splitlines(), start=1):
-        line, in_comment = _strip_line_comments(raw, in_comment)
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        seen: set[str] = set()
-        for match in _COVERAGE_GAP.finditer(line):
-            marker = next(group for group in match.groups() if group is not None).upper()
-            if marker not in seen:
-                markers.append((line_number, marker))
-                seen.add(marker)
-    return markers
-
-
-def _markdown_links(text: str) -> list[tuple[int, str]]:
-    links: list[tuple[int, str]] = []
-    fence: tuple[str, int] | None = None
-    in_comment = False
-    for line_number, raw in enumerate(text.splitlines(), start=1):
-        line, in_comment = _strip_line_comments(raw, in_comment)
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        for match in _LINK.finditer(_INLINE_CODE.sub("", line)):
-            target = match.group(1)
-            if target.startswith("<") and target.endswith(">"):
-                target = target[1:-1]
-            links.append((line_number, target))
-    return links
-
-
-def _strip_line_comments(line: str, in_comment: bool) -> tuple[str, bool]:
-    output: list[str] = []
-    index = 0
-    while index < len(line):
-        if in_comment:
-            end = line.find("-->", index)
-            if end < 0:
-                return "".join(output), True
-            index = end + 3
-            in_comment = False
-            continue
-        start = line.find("<!--", index)
-        if start < 0:
-            output.append(line[index:])
-            break
-        output.append(line[index:start])
-        index = start + 4
-        in_comment = True
-    return "".join(output), in_comment
+                findings.append(
+                    AuditFinding(article_path, code, f"{reason} (line {line_number})")
+                )
+    return coverage, findings
 
 
 def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
@@ -659,16 +490,12 @@ def _relative_path(path: Path, root: Path) -> str:
         return "."
 
 
-def _is_within(path: Path, directory: Path) -> bool:
-    try:
-        path.relative_to(directory)
-    except ValueError:
-        return False
-    return True
-
-
-def _result(findings: list[AuditFinding]) -> AuditResult:
-    return AuditResult(tuple(sorted(set(findings))))
+def _result(
+    findings: list[AuditFinding],
+    *,
+    coverage: CoverageSummary | None = None,
+) -> AuditResult:
+    return AuditResult(tuple(sorted(set(findings))), coverage)
 
 
 __all__ = ["AuditFinding", "AuditResult", "audit_blueprint", "audit_graph"]

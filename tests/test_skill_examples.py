@@ -126,6 +126,13 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert manifest["nodes"] == 10
     assert manifest["dependencies"] == 9
     assert manifest["git_ref"] == "0" * 40
+    assert manifest["coverage"]["complete"] is False
+    assert manifest["coverage"]["counts"] == {
+        "DECOMPOSED": 1,
+        "DEFERRED": 0,
+        "MAPPED": 5,
+        "OUT": 1,
+    }
     assert str(example) not in json.dumps(manifest)
     graph = load_graph(example / "blueprint")
     formalizable = {node.id for node in graph.nodes.values() if node.formalizable}

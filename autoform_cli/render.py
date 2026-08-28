@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
+from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
 from .status import is_definition
@@ -252,6 +253,18 @@ def render_site(
     _validate_publication_tree(blueprint)
 
     graph = load_graph(blueprint)
+    coverage, coverage_issues = load_coverage(blueprint)
+    if coverage_issues:
+        raise PublicationError(
+            [
+                f"coverage contract line {issue.line}: {issue.reason}"
+                if issue.line
+                else f"coverage contract: {issue.reason}"
+                for issue in coverage_issues
+            ]
+        )
+    if coverage is None:
+        raise PublicationError(["coverage contract could not be loaded"])
     statuses = status.derive(graph)
     # The repository root, not the vault's parent. A blueprint nested at
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
@@ -263,7 +276,14 @@ def render_site(
     sources_base = _sources_base(blueprint, repo_root, linker)
 
     _prepare_destination(destination, clean=clean)
-    _write_publication_manifest(destination, blueprint, graph, linker, complete=False)
+    _write_publication_manifest(
+        destination,
+        blueprint,
+        graph,
+        linker,
+        coverage=coverage,
+        complete=False,
+    )
 
     report = RenderReport(output_dir=destination)
     node_paths = {node.path.resolve(): node for node in graph.nodes.values()}
@@ -415,7 +435,14 @@ def render_site(
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
-    _write_publication_manifest(destination, blueprint, graph, linker, complete=True)
+    _write_publication_manifest(
+        destination,
+        blueprint,
+        graph,
+        linker,
+        coverage=coverage,
+        complete=True,
+    )
     return report
 
 
@@ -556,10 +583,18 @@ def _write_publication_manifest(
     graph: Graph,
     linker: SourceLinker,
     *,
+    coverage: CoverageSummary,
     complete: bool,
 ) -> None:
     manifest = {
         "complete": complete,
+        "coverage": {
+            "complete": coverage.complete,
+            "counts": coverage.counts,
+            "schema": coverage.schema,
+            "source_path": coverage.source_path,
+            "source_sha256": coverage.source_sha256,
+        },
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
         "source_revision": _source_revision(blueprint),

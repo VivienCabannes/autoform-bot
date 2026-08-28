@@ -12,6 +12,15 @@ requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=3.4.5,<4",
     "psutil>=5.9",
+    # The blueprint checks predict what the generated MkDocs site publishes.
+    # Anchor prediction runs the configured renderer itself rather than
+    # approximating it, so these are runtime requirements, not build extras.
+    "markdown>=3.4,<4",
+    "pymdown-extensions>=10,<11",
+    # Evidence is judged on what a browser shows. That needs HTML5 tree
+    # construction, not tokenising: browsers repair malformed markup rather than
+    # reject it, and the repair decides what stays hidden.
+    "html5lib>=1.1,<2",
 ]
 
 [project.scripts]

@@ -10,6 +10,17 @@ from autoform_cli.render import render_site
 from autoform_cli.status import derive
 
 
+def _render(blueprint: Path, output: Path) -> None:
+    coverage = blueprint / "coverage/README.md"
+    coverage.parent.mkdir(exist_ok=True)
+    coverage.write_text(
+        "# Coverage\n\n| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
+        "| Project scope | MAPPED | Source audit pending |\n",
+        encoding="utf-8",
+    )
+    render_site(blueprint, output)
+
+
 def test_project_view_maps_top_level_container_dependencies_to_its_chapter(tmp_path: Path) -> None:
     roadmap = tmp_path / "blueprint" / "roadmap"
     nodes = {
@@ -72,7 +83,7 @@ def test_render_publishes_dependencies_between_the_roadmap_root_and_a_chapter(
     )
 
     output = tmp_path / "site-src"
-    render_site(blueprint, output)
+    _render(blueprint, output)
 
     project_map = (output / "dependencies.md").read_text(encoding="utf-8")
     chapter_map = (output / "dependencies/chapters/chapter.md").read_text(encoding="utf-8")
@@ -105,7 +116,7 @@ def test_nested_container_keeps_its_own_narrative_and_statements(tmp_path: Path)
     )
 
     output = tmp_path / "site-src"
-    render_site(blueprint, output)
+    _render(blueprint, output)
 
     chapter = (output / "roadmap/chapter/README.md").read_text(encoding="utf-8")
     rendered_section = (output / "roadmap/chapter/section/README.md").read_text(encoding="utf-8")
@@ -128,7 +139,7 @@ def test_prose_only_leaf_article_remains_a_book_page(tmp_path: Path) -> None:
     (roadmap / "epilogue.md").write_text("# Epilogue\n\nClosing prose.\n", encoding="utf-8")
 
     output = tmp_path / "site-src"
-    render_site(blueprint, output)
+    _render(blueprint, output)
 
     epilogue = (output / "roadmap/epilogue.md").read_text(encoding="utf-8")
     assert "Closing prose." in epilogue
@@ -158,7 +169,7 @@ def test_same_named_leaf_slots_are_scoped_to_their_container(tmp_path: Path) -> 
     (roadmap / "README.md").write_text("# Roadmap\n\n- [A](a/README.md)\n- [B](b/README.md)\n", encoding="utf-8")
 
     output = tmp_path / "site-src"
-    render_site(blueprint, output)
+    _render(blueprint, output)
 
     for chapter in ("a", "b"):
         rendered = (output / f"roadmap/{chapter}/README.md").read_text(encoding="utf-8")
@@ -182,7 +193,7 @@ def test_render_preserves_fragment_on_container_article_link(tmp_path: Path) -> 
     )
 
     output = tmp_path / "site-src"
-    render_site(blueprint, output)
+    _render(blueprint, output)
 
     rendered = (output / "README.md").read_text(encoding="utf-8")
     rendered_chapter = (output / "roadmap/chapter/README.md").read_text(encoding="utf-8")

@@ -154,7 +154,123 @@ autoform audit blueprint --lean-root .
 provenance, coverage, checked-fact, and optional Lean-target checks. It is local
 and read-only: it neither contacts network services nor writes findings back
 into the blueprint. Pass `--json` for stable machine-readable output; a nonzero
-exit status means the audit found at least one issue.
+exit status means the audit found at least one issue. The machine-checkable
+`coverage/README.md` contract contains one `Area | Coverage | Evidence` table
+with `MAPPED`, `DECOMPOSED`, `DEFERRED`, or `OUT` dispositions. `MAPPED` is
+nonterminal; the other three explicitly disposition an area. Audit JSON includes
+canonical rows, counts, and the exact coverage source hash, while
+`publication.json` records aggregate counts without duplicating the authored
+rows.
+
+The contract is read as published Markdown and fails closed. A table inside an
+HTML comment, a fenced block, or a four-space-indented block is documentation
+rather than contract, and is not discovered at all. A closing fence must carry
+nothing but its marker, so a table below ```` ``` trailing ```` stays inside the
+code block for the checker exactly as it does for the reader.
+
+Because hidden content ends a table for every renderer, a comment or code block
+written *between* rows is reported rather than silently truncating the contract.
+This holds for multi-line constructs too: a blank line inside a comment or fence
+belongs to that construct rather than ending the table. Any row-shaped line
+stranded below such a break is named, including malformed rows and rows written
+without their outer pipes, since Python-Markdown accepts `A | OUT | reason` as a
+row just as readily as the canonical form.
+
+Whether the table publishes at all is settled by rendering the document and
+looking for it, not by inspecting its two structural lines. That distinction
+matters because a table's fate depends on its surroundings: a comment can break
+the delimiter row while leaving its column count intact, and a paragraph running
+straight into the header makes the whole thing one lazy paragraph. Both publish
+nothing and both are rejected. A comment *inside* a header cell does still render,
+so that contract stands. If the page publishes a contract table the audit does not
+recognise -- one written without outer pipes, say -- it says so rather than
+claiming there is no table.
+
+Finding a matching header on the page is not enough to conclude it came from the
+lines just read, and neither is finding matching rows. A canonical-looking table
+that renders as a paragraph, sitting above an unrelated raw-HTML table with
+identical rows, satisfies any comparison of values while publishing nothing
+itself. So provenance is established rather than inferred: the source rows are
+rendered again carrying a marker, and the published table has to be the one that
+marker turns up in. The marker is grown until neither the source nor any
+published cell contains it. Checking the source alone is not enough, because
+rendering synthesises text the source never held literally: `&#97;utoform...`
+and `autoform<span></span>...` both normalise to the same cell a reader sees. The
+comparison is against published cell text, so that is what the marker has to be
+absent from.
+
+Substituting rows is only sound if it changes nothing else, which is not
+something to assume: an unclosed `<style>` inside a row swallows the rest of the
+document, so removing that row *exposes* tables the page never published, and one
+of those can then supply the marker. So the trace has to leave the page's
+topology intact -- same tables in the same order, same headers, identical rows
+everywhere except the one position being traced. A row that fails this is
+refused, and named as such, because the trace says nothing about a document the
+substitution changed. One honest consequence: evidence that itself contains a raw
+`<table>` disappears along with the row and is refused for the same reason. That
+is fail-closed on a cell no contract needs, which is the right side to err on.
+
+Only what a reader can see counts. Visibility propagates from ancestors, so a
+table inside `<div hidden>` is no more published than one carrying `hidden`
+itself; a hidden row drops out while its siblings remain; and a hidden cell is
+treated as no column rather than an empty one, since keeping it invents a column
+that both disguises a table whose visible headers match and manufactures
+mismatches in one whose rows do. The boundary here is deliberate: hiding is read
+from HTML, not from CSS. An element hidden by a stylesheet class or an inline
+`display: none` still counts as published, because following that faithfully
+would mean resolving the site's stylesheets, and a check that resolves them
+badly is worse than one whose limit is written down.
+
+Evidence must say something to a reader, judged on rendered text rather than
+Markdown source. A cell holding only a code span, only a comment, only emphasis,
+only an HTML tag, only an entity, or only an empty link such as `[ ](notes.md)`
+is rejected: each carries word characters in the source and shows the reader
+nothing. Text a browser hides is treated the same way. That check runs on an
+HTML5 tree rather than on a pattern or a token stream, because what a reader ends
+up seeing is decided by the repair a browser performs on malformed markup:
+`<span hidden>reason` and `<span hidden />Reason` both stay hidden, since an
+unclosed non-void element stays open, while `<p hidden>aside<p>Real reason` shows
+its second paragraph, since that one implicitly closes the first. `title="hidden"`
+hides nothing at all. So is evidence that is nothing but `TODO`, `TBD`, `pending`,
+`placeholder`, or `unknown`, or that opens with one of those as a marker such as
+`TODO: choose a milestone`. A status word that merely begins a sentence is fine:
+"Pending Mathlib PR 1234" names something a reader can check. `DECOMPOSED`
+evidence must contain at least one complete inline link to an existing roadmap
+article, and *every* link it offers must resolve, fragments included, under the
+same rules the audit applies. A link missing its closing parenthesis does not
+render and does not count.
+
+Fragment checking uses the renderer rather than predicting it. Anchors come from
+running Python-Markdown with the extensions the generated `mkdocs.yml` enables
+and reading the heading IDs back out of its HTML. Heading IDs turn out to depend
+on much more than the heading line -- whether it sits in a blockquote or a list
+item, whether a raw HTML block swallows it, how `attr_list` treats an escaped
+brace, what `arithmatex` leaves behind for the slugger -- and every attempt to
+predict that got some cases wrong in both directions. The extension list lives in
+one place in Python, and a test binds it to the shipped `mkdocs.yml` so enabling
+a heading-affecting extension cannot silently invalidate the audit.
+
+### What coverage completeness does and does not claim
+
+`coverage.complete` in audit and `publication.json` means exactly one thing:
+every row the author declared has reached a terminal disposition, so no row is
+still `MAPPED`. It is a statement about the contract, not a measurement of the
+project.
+
+It does **not** claim that the declared rows cover the source exhaustively, and
+it says nothing about whether the linked roadmap articles are formalized or
+proved. A project that declares one narrow area and disposes of it reports
+`complete` while most of its source remains undeclared. Exhaustiveness is an
+authoring judgement that no local check can make.
+
+Publication and audit are deliberately different gates. The generated
+`blueprint-pages.yml` runs `check` and `render`; it does not run `audit`. An
+invalid coverage contract fails `render` before any output is written, but a
+valid contract with `MAPPED` rows publishes normally even though `audit` reports
+each one as a `declared-coverage-gap`. That is intended: a roadmap is published
+while it is still being decomposed, and the published `coverage.complete: false`
+is how a reader sees that. Run `autoform audit` in CI when you want mapped rows
+to block a merge.
 
 Plan durable article identity metadata without changing the blueprint:
 
@@ -304,7 +420,7 @@ targets. It exits zero only when every required check passes. Omitting
 `--lean-root` records an explicit advisory pass; supplying it performs only a
 lexical local-source check, not a Lean build, kernel check, or proof-honesty
 review. The bundled example intentionally exits nonzero while its declared
-coverage remains `PARTIAL`.
+coverage still holds `MAPPED` rows.
 
 This command is strictly read-only and local. It does not invoke Git, GitHub,
 subprocesses, network services, claims, queues, reviews, recovery state,
