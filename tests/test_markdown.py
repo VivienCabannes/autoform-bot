@@ -312,6 +312,34 @@ def test_anchors_follow_headings_and_explicit_ids(tmp_path: Path) -> None:
     }
 
 
+def test_anchor_rendering_is_cached_by_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import autoform_cli.markdown as markdown_module
+
+    path = tmp_path / "article.md"
+    path.write_text("# Alpha\n", encoding="utf-8")
+    markdown_module._anchors_from_body.cache_clear()
+    original = markdown_module.render_html
+    calls = 0
+
+    def counted_render(text: str) -> str:
+        nonlocal calls
+        calls += 1
+        return original(text)
+
+    monkeypatch.setattr(markdown_module, "render_html", counted_render)
+
+    first = markdown_anchors(path)
+    first.add("mutated")
+    assert markdown_anchors(path) == {"alpha"}
+    assert calls == 1
+
+    # Equal-sized edits must invalidate naturally; path, size, and timestamps are
+    # deliberately not part of the cache contract.
+    path.write_text("# Bravo\n", encoding="utf-8")
+    assert markdown_anchors(path) == {"bravo"}
+    assert calls == 2
+
+
 def test_local_targets_are_resolved_against_the_boundary(tmp_path: Path) -> None:
     article = tmp_path / "roadmap" / "node.md"
     article.parent.mkdir(parents=True)

@@ -94,8 +94,9 @@ mathematics.
    line above the table: a paragraph running into the header publishes no table
    at all, and neither does a comment that breaks the separator.
    Write evidence a reader can act on, judged on what it renders as: a bare
-   `TODO`, a lone code span, an empty link such as `[ ](notes.md)`, text a browser hides, and a marker such as `TBD - pick a milestone`
-   are all rejected, while "Pending Mathlib PR 1234" is fine because it names a
+   `TODO`, a lone code span, an empty link such as `[ ](notes.md)`, text a browser
+   hides, and a marker such as `TBD - pick a milestone` are all rejected, while
+   "Pending Mathlib PR 1234" is fine because it names a
    real dependency. `DECOMPOSED` requires at least one complete link to an
    existing roadmap article, and every link in that cell must resolve, fragments
    included.
@@ -118,9 +119,9 @@ mathematics.
    roadmap rather than a Lean problem, and split the node. Its path relative to
    `roadmap/`, without `.md`, is its current graph ID; add optional durable
    `article_id` metadata only when a long-lived external artifact needs stable
-   identity. Give it exactly one H1, a `declaration` naming the kind of Lean artifact,
-   artifact, a source-grounded statement or proof sketch, and a
-   `## Depends on` section.
+   identity. Give it exactly one H1, a `declaration` naming the kind of Lean
+   artifact, a source-grounded statement or proof sketch, and a `## Depends on`
+   section.
 6. Put only genuine prerequisite links under `## Depends on`; those relative
    Markdown links are the machine-read DAG edges. Use `## Proof depends on` for
    a prerequisite the proof needs but the statement does not. Keep roadmap,

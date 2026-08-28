@@ -267,6 +267,24 @@ def test_a_table_written_without_outer_pipes_is_named(tmp_path: Path) -> None:
     ]
 
 
+def test_a_blockquoted_table_has_an_actionable_diagnostic(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _raw_contract(
+        blueprint,
+        "# Coverage\n\n"
+        "> | Area | Coverage | Evidence |\n"
+        "> | --- | --- | --- |\n"
+        "> | Main | OUT | Not in scope |\n",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [(issue.line, issue.reason) for issue in issues] == [
+        (3, "coverage table must be a top-level table; remove the blockquote markers")
+    ]
+
+
 def test_evidence_hidden_by_a_malformed_element_is_not_evidence(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     # A browser closes the span and keeps hiding what follows it.

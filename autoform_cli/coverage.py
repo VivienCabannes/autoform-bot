@@ -180,7 +180,16 @@ def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:
         ]
     if not header_indexes and contract_tables:
         # The page shows a contract table we did not recognise, which means it is
-        # not in the form the audit reads. Say so rather than report no table.
+        # not in the top-level form the audit reads. Name a quoted table directly;
+        # otherwise retain the canonical outer-pipe guidance.
+        blockquote_index = _blockquoted_header_index(lines, view)
+        if blockquote_index is not None:
+            return [], [
+                CoverageIssue(
+                    blockquote_index + 1,
+                    "coverage table must be a top-level table; remove the blockquote markers",
+                )
+            ]
         return [], [
             CoverageIssue(
                 0,
@@ -393,6 +402,22 @@ def _unique_marker(text: str, page_tables: list[PublishedTable]) -> str:
     while marker in corpus:
         marker += "x"
     return marker
+
+
+def _blockquoted_header_index(lines: tuple[str, ...], view: Content) -> int | None:
+    for index in range(len(lines) - 1):
+        if view.is_hidden(index) or view.is_hidden(index + 1):
+            continue
+        header = re.sub(r"^ {0,3}>[ \t]?", "", lines[index], count=1)
+        separator_line = re.sub(r"^ {0,3}>[ \t]?", "", lines[index + 1], count=1)
+        if header == lines[index] or separator_line == lines[index + 1]:
+            continue
+        separator = _cells(separator_line)
+        if _cells(header) == _EXPECTED_HEADER and len(separator) == 3 and all(
+            _SEPARATOR.fullmatch(cell) for cell in separator
+        ):
+            return index
+    return None
 
 
 def _looks_like_row(line: str) -> bool:

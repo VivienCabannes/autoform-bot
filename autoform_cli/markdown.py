@@ -416,15 +416,21 @@ def markdown_anchors(path: Path) -> set[str]:
         return set()
     lines = text.splitlines()
     # MkDocs strips YAML frontmatter before Markdown ever sees it, so those
-    # lines cannot contribute headings.
+    # lines cannot contribute headings. Caching by this exact content observes
+    # edits immediately without relying on filesystem timestamp resolution.
     body = "\n".join(lines[frontmatter_end(lines) :])
+    return set(_anchors_from_body(body))
+
+
+@lru_cache(maxsize=128)
+def _anchors_from_body(body: str) -> frozenset[str]:
     try:
         rendered = render_html(body)
     except Exception:
         # A document the renderer cannot process publishes no anchors we can
         # promise, so report none rather than guess at them.
-        return set()
-    return {html.unescape(found) for found in _HEADING_ID.findall(rendered)}
+        return frozenset()
+    return frozenset(html.unescape(found) for found in _HEADING_ID.findall(rendered))
 
 
 def local_target_issue(

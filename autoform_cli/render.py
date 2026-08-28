@@ -263,7 +263,8 @@ def render_site(
                 for issue in coverage_issues
             ]
         )
-    assert coverage is not None
+    if coverage is None:
+        raise PublicationError(["coverage contract could not be loaded"])
     statuses = status.derive(graph)
     # The repository root, not the vault's parent. A blueprint nested at
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
@@ -587,17 +588,13 @@ def _write_publication_manifest(
 ) -> None:
     manifest = {
         "complete": complete,
-        "coverage": (
-            {
-                "complete": coverage.complete,
-                "counts": coverage.counts,
-                "schema": coverage.schema,
-                "source_path": coverage.source_path,
-                "source_sha256": coverage.source_sha256,
-            }
-            if coverage is not None
-            else None
-        ),
+        "coverage": {
+            "complete": coverage.complete,
+            "counts": coverage.counts,
+            "schema": coverage.schema,
+            "source_path": coverage.source_path,
+            "source_sha256": coverage.source_sha256,
+        },
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
         "source_revision": _source_revision(blueprint),

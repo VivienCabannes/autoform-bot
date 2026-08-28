@@ -296,7 +296,8 @@ def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditF
 def _coverage_findings(
     blueprint: Path,
 ) -> tuple[CoverageSummary | None, list[AuditFinding]]:
-    contract = blueprint / "coverage" / "README.md"
+    coverage_root = blueprint / "coverage"
+    contract = coverage_root / "README.md"
     coverage, issues = load_coverage(blueprint)
     findings = [
         AuditFinding(
@@ -310,39 +311,44 @@ def _coverage_findings(
         )
         for issue in issues
     ]
-    if coverage is None:
-        return None, findings
 
-    for entry in coverage.entries:
-        if entry.disposition == "MAPPED":
-            findings.append(
-                AuditFinding(
-                    "coverage/README.md",
-                    "declared-coverage-gap",
-                    f"coverage area {entry.area!r} is mapped but not dispositioned (line {entry.line})",
+    if coverage is not None:
+        for entry in coverage.entries:
+            if entry.disposition == "MAPPED":
+                findings.append(
+                    AuditFinding(
+                        "coverage/README.md",
+                        "declared-coverage-gap",
+                        f"coverage area {entry.area!r} is mapped but not dispositioned (line {entry.line})",
+                    )
                 )
-            )
 
-    text = contract.read_text(encoding="utf-8")
-    for line_number, target in _markdown_links(text):
-        issue = _local_target_issue(contract, target, blueprint, label="coverage")
-        if issue is not None:
-            code, reason = issue
-            findings.append(
-                AuditFinding("coverage/README.md", code, f"{reason} (line {line_number})")
-            )
-    return coverage, findings
-
-
-def _has_substantive_markdown(text: str) -> bool:
-    lines = text.splitlines()
-    body = _HTML_COMMENT.sub("", "\n".join(lines[_frontmatter_end(lines) :]))
-    for line in body.splitlines():
-        if _HEADING.match(line):
+    coverage_files = sorted(path for path in coverage_root.rglob("*.md") if path.is_file())
+    for path in coverage_files:
+        article_path = _relative_path(path, blueprint)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            # load_coverage already gives the canonical contract its more precise
+            # invalid-coverage-contract diagnostic.
+            if path != contract:
+                findings.append(
+                    AuditFinding(
+                        article_path,
+                        "unreadable-coverage-file",
+                        "coverage file cannot be read as UTF-8",
+                    )
+                )
             continue
-        if line.strip():
-            return True
-    return False
+
+        for line_number, target in _markdown_links(text):
+            issue = _local_target_issue(path, target, blueprint, label="coverage")
+            if issue is not None:
+                code, reason = issue
+                findings.append(
+                    AuditFinding(article_path, code, f"{reason} (line {line_number})")
+                )
+    return coverage, findings
 
 
 def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:

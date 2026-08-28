@@ -313,7 +313,55 @@ def test_unreadable_coverage_reason_is_stable(tmp_path: Path) -> None:
 
     finding = next(item for item in result.findings if item.code == "invalid-coverage-contract")
     assert finding.reason == "coverage contract cannot be read as UTF-8"
+    assert not any(item.code == "unreadable-coverage-file" for item in result.findings)
     assert str(tmp_path) not in result.to_json()
+
+
+def test_audit_checks_all_supplemental_coverage_markdown(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _article(blueprint, "result.md", declaration="theorem")
+    _coverage(blueprint)
+    notes = blueprint / "coverage" / "notes" / "details.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("[Missing](../../roadmap/absent.md)\n", encoding="utf-8")
+    (blueprint / "coverage" / "binary.md").write_bytes(b"\xff")
+
+    findings = _finding_map(blueprint)
+
+    assert findings["coverage/binary.md"] == [
+        ("unreadable-coverage-file", "coverage file cannot be read as UTF-8")
+    ]
+    assert findings["coverage/notes/details.md"] == [
+        (
+            "coverage-not-found",
+            "coverage link does not resolve to a file: '../../roadmap/absent.md' (line 1)",
+        )
+    ]
+
+
+def test_supplemental_coverage_checks_run_when_contract_is_invalid(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _article(blueprint, "result.md", declaration="theorem")
+    _coverage(blueprint, "not a contract")
+    notes = blueprint / "coverage" / "notes.md"
+    notes.write_text(
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Supplemental | OUT | [Missing](../roadmap/absent.md) |\n",
+        encoding="utf-8",
+    )
+
+    findings = _finding_map(blueprint)
+
+    assert [code for code, _ in findings["coverage/README.md"]] == [
+        "invalid-coverage-contract"
+    ]
+    assert findings["coverage/notes.md"] == [
+        (
+            "coverage-not-found",
+            "coverage link does not resolve to a file: '../roadmap/absent.md' (line 3)",
+        )
+    ]
 
 
 def test_invalid_blueprint_result_does_not_leak_host_path(tmp_path: Path) -> None:
