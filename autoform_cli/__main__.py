@@ -6,7 +6,7 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
-from . import status
+from . import status, worker as worker_runtime
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
@@ -36,12 +36,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
 
+    worker = subparsers.add_parser(
+        "worker",
+        help="reconcile one unattended Codex worker (Linux only)",
+    )
+    worker.add_argument("repository", type=Path, help="formalization repository root")
+
     args = parser.parse_args(argv)
 
     if args.command == "check":
         return _check(args)
     if args.command == "render":
         return _render(args)
+    if args.command == "worker":
+        return worker_runtime.reconcile(args.repository)
     return 2
 
 

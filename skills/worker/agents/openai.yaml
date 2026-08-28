@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Autoform Worker"
+  short_description: "Execute one unattended orchestration turn"
+  default_prompt: "Use $worker and $orchestrate to make one verified unattended unit of progress and report whether to continue."

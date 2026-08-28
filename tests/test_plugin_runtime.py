@@ -10,12 +10,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-def test_plugin_surface_is_six_skills_and_two_servers(repo_root):
+def test_plugin_surface_is_seven_skills_and_two_servers(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
     assert skills == {
         "setup",
         "roadmap",
         "orchestrate",
+        "worker",
         "human-review",
         "agent-review",
         "develop-plugin",
@@ -50,12 +51,16 @@ def test_plugin_surface_is_six_skills_and_two_servers(repo_root):
             assert config["mcpServers"][name]["args"][-2:] == ["-m", module]
 
     codex_manifest = json.loads((repo_root / ".codex-plugin/plugin.json").read_text())
-    assert len(codex_manifest["interface"]["defaultPrompt"]) == 6
+    prompts = codex_manifest["interface"]["defaultPrompt"]
+    assert len(prompts) == 3
+    assert all(len(prompt) <= 128 for prompt in prompts)
+    assert "Linux worker" in prompts[-1]
     muse = json.loads((repo_root / ".muse-plugin/plugin.json").read_text())
     assert [command["id"] for command in muse["capabilities"]["commands"]] == [
         "setup",
         "roadmap",
         "orchestrate",
+        "worker",
         "human-review",
         "agent-review",
         "develop-plugin",
@@ -94,6 +99,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
         assert {
             "autoform_cli/__main__.py",
             "autoform_cli/graph.py",
+            "autoform_cli/worker.py",
             "autoform_cli/visualize.py",
             "servers/lean_client.py",
             "servers/lean_runtime.py",

@@ -1,7 +1,7 @@
 {
   "name": "autoform",
-  "version": "0.5.0+codex.20260806102126",
-  "description": "Set up Lean repositories, build source-grounded Markdown roadmaps, prove ready nodes, and support human or agent review.",
+  "version": "0.5.0+codex.20260807150417",
+  "description": "Set up Lean repositories, build source-grounded Markdown roadmaps, prove ready nodes, supervise unattended work, and support human or agent review.",
   "author": {
     "name": "Vivien Cabannes"
   },
@@ -10,8 +10,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "AutoForm Bot",
-    "shortDescription": "Lean setup, roadmaps, review, LSP, and REPL",
-    "longDescription": "AutoForm separates repository setup from source-grounded roadmap construction, keeps the plan in an Obsidian-compatible Markdown vault, publishes it with GitHub Pages, checks proofs through two public Lean MCP servers, and provides distinct visual human-review and rubric-driven agent-review workflows.",
+    "shortDescription": "Lean setup, roadmaps, workers, review, LSP, and REPL",
+    "longDescription": "AutoForm separates repository setup from source-grounded roadmap construction, keeps the plan in an Obsidian-compatible Markdown vault, supervises unattended orchestration from cron, publishes the blueprint with GitHub Pages, checks proofs through two public Lean MCP servers, and provides distinct visual human-review and rubric-driven agent-review workflows.",
     "developerName": "Vivien Cabannes",
     "category": "Coding",
     "capabilities": [
@@ -19,12 +19,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Set up this Lean repository with an Autoform vault, verification CI, and GitHub Pages without planning the mathematics.",
-      "Build or refine an Autoform roadmap from my mathematical sources.",
-      "Work through the ready nodes in my Autoform blueprint.",
-      "Prepare the visual blueprint surfaces so I can review this formalization.",
-      "Judge this roadmap or Lean formalization with evidence-based review rubrics.",
-      "Develop Autoform itself through its executable formalization example."
+      "Set up this Lean repository with Autoform infrastructure.",
+      "Build or refine a source-grounded Autoform roadmap.",
+      "Work through ready Autoform nodes interactively or under the Linux worker."
     ],
     "brandColor": "#2563EB",
     "composerIcon": "./assets/autoform-small.svg",

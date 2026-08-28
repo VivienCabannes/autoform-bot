@@ -37,12 +37,14 @@ and MCP servers are reloaded. The installed package and commands retain the
 ## Plugin surface
 
 Invoke a skill from your coding agent with `/autoform:setup`,
-`/autoform:roadmap`, `/autoform:orchestrate`, `/autoform:human-review`,
-`/autoform:agent-review`, or `/autoform:develop-plugin`.
+`/autoform:roadmap`, `/autoform:orchestrate`, `/autoform:worker`,
+`/autoform:human-review`, `/autoform:agent-review`, or
+`/autoform:develop-plugin`.
 
 - `setup` creates or repairs the Lean repository, Markdown blueprint, CI, and Pages infrastructure.
 - `roadmap` confirms sources and scope, then builds milestones, coverage, and pull-request-sized DAG nodes.
 - `orchestrate` works ready nodes with native subagents and Lean tools.
+- `worker` adds the completion and safety contract for a supervisor-managed unattended orchestration turn.
 - `human-review` prepares graph, progress, source, and Lean-code views for a person's judgment.
 - `agent-review` independently scores roadmap quality or Lean faithfulness, integrity, and code quality from evidence.
 - `develop-plugin` maintains Autoform itself through its executable formalization example.
@@ -113,6 +115,41 @@ uv run autoform render blueprint \
 ```
 
 `render` never writes into the vault; point `mkdocs.yml` at its output.
+
+### Unattended Linux worker
+
+On Linux, one idempotent command can keep a Codex orchestration session making
+progress. Create `.aiworker` at the formalization repository root and ignore it
+locally with `.git/info/exclude` so machine-local objectives cannot be
+committed:
+
+```toml
+version = 1
+objective = "Continue the approved Autoform roadmap."
+stale_after_minutes = 15
+tool_stale_after_minutes = 60
+max_restarts_per_hour = 3
+```
+
+Run the same command manually or directly from cron. Use absolute executable
+and repository paths because cron normally has a minimal `PATH`:
+
+```cron
+* * * * * /absolute/path/to/autoform worker /absolute/path/to/repository >> /tmp/autoform-worker.log 2>&1
+```
+
+Each invocation exits quickly. It starts a detached Codex turn when none is
+running, leaves a healthy turn alone, resumes a completed session whose result
+is `continue`, and stops on `complete`, `blocked`, or `needs_input`. A process
+with no structured progress is restarted only after two cron observations;
+restart backoff and an hourly circuit breaker prevent retry loops. Private PID,
+session, JSONL, and result state lives under
+`$XDG_STATE_HOME/autoform/workers/`, or `~/.local/state/autoform/workers/` when
+`XDG_STATE_HOME` is unset. Set `AUTOFORM_CODEX_BIN` to an absolute Codex path
+when it is not available on cron's `PATH`. Removing `.aiworker` safely stops
+and disables an existing worker; recreating it starts a new session, so no
+separate stop or start command is needed. Worker turns may read external
+sources but never push, merge, publish, post, or message people.
 
 Node status is asserted only where it was checked — statement formalized, proof
 formalized, upstreamed, not ready — and everything else is derived from the
