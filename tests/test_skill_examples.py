@@ -88,8 +88,8 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert "structure.md" not in ignored
 
     overview = (blueprint / "README.md").read_text(encoding="utf-8")
-    assert "kind: blueprint" in overview
-    assert "status: active" in overview
+    assert "kind:" not in overview
+    assert "status:" not in overview
     assert "[Thesis roadmap](roadmap/README.md)" in overview
     assert "[coverage notes](coverage/README.md)" in overview
 
@@ -426,9 +426,14 @@ def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
         for stale in ("kind: node", "kind: article", "kind: roadmap", "status: active"):
             assert stale not in text, f"{skill.relative_to(repo_root)} still teaches `{stale}`"
 
-    example = repo_root / _EXAMPLE / "blueprint/roadmap"
-    for article in sorted(example.rglob("*.md")):
-        assert "kind:" not in article.read_text(encoding="utf-8")
+    example = repo_root / _EXAMPLE / "blueprint"
+    authored = [example / "README.md", example / "coverage/README.md"]
+    authored += sorted((example / "roadmap").rglob("*.md"))
+    authored += sorted((example / "sources").rglob("*.md"))
+    for article in authored:
+        text = article.read_text(encoding="utf-8")
+        assert "kind:" not in text
+        assert not re.search(r"^status:", text, flags=re.MULTILINE)
 
 
 def _documented_invocations(reference: str) -> set[tuple[str, ...]]:

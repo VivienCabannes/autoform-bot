@@ -9,6 +9,17 @@ import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from autoform_cli.markdown import local_target_issue, markdown_links
+
+
+def _shipped_path(repo_root: Path, value: str) -> Path:
+    root = repo_root.resolve()
+    declared = Path(value)
+    assert not declared.is_absolute()
+    resolved = (root / declared).resolve()
+    assert resolved.is_relative_to(root)
+    return resolved
+
 
 def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
     skills = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
@@ -58,8 +69,64 @@ def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
         "agent-review",
         "develop-plugin",
     ]
+    assert _shipped_path(repo_root, muse["compat"]["manifestDir"]) == (
+        repo_root / ".muse-plugin"
+    ).resolve()
     for command in muse["capabilities"]["commands"]:
-        assert (repo_root / command["path"]).is_file()
+        assert _shipped_path(repo_root, command["path"]).is_file()
+
+
+def test_shipped_skill_links_resolve_within_the_plugin(repo_root):
+    documents = sorted((repo_root / "skills").glob("*/SKILL.md"))
+    documents += sorted((repo_root / "skills").glob("*/references/**/*.md"))
+    for document in documents:
+        text = document.read_text(encoding="utf-8")
+        if document.name == "SKILL.md":
+            assert "Orchestrate" not in text, (
+                f"{document.relative_to(repo_root)} names an unshipped skill"
+            )
+        for line_number, target in markdown_links(text):
+            issue = local_target_issue(document, target, repo_root, label="skill")
+            assert issue is None, (
+                f"{document.relative_to(repo_root)}:{line_number}: {issue[1]}"
+            )
+
+
+def test_plugin_manifests_reference_shipped_paths_and_modules(repo_root):
+    root = repo_root.resolve()
+    expected_modules = {
+        "autoform-lsp": "servers.lsp.server",
+        "autoform-repl": "servers.repl.server",
+    }
+
+    codex = json.loads((root / ".codex-plugin/plugin.json").read_text(encoding="utf-8"))
+    for key in ("skills", "mcpServers"):
+        assert _shipped_path(root, codex[key]).exists()
+    for key in ("composerIcon", "logo"):
+        assert _shipped_path(root, codex["interface"][key]).is_file()
+
+    marketplace = json.loads((root / ".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    for plugin in marketplace["plugins"]:
+        assert _shipped_path(root, plugin["source"]) == root
+
+    mappings = [
+        json.loads((root / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"],
+        json.loads((root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))[
+            "mcpServers"
+        ],
+    ]
+    for servers in mappings:
+        assert set(servers) == set(expected_modules)
+        for server_id, module in expected_modules.items():
+            assert servers[server_id]["args"][-2:] == ["-m", module]
+            assert _shipped_path(root, f"{module.replace('.', '/')}.py").is_file()
+
+    muse = json.loads((root / ".muse-plugin/plugin.json").read_text(encoding="utf-8"))
+    muse_servers = {server["id"]: server for server in muse["capabilities"]["mcpServers"]}
+    assert set(muse_servers) == set(expected_modules)
+    for server_id, module in expected_modules.items():
+        assert muse_servers[server_id]["command"][-3:] == ["python", "-m", module]
+        assert _shipped_path(root, f"{module.replace('.', '/')}.py").is_file()
 
 
 def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
