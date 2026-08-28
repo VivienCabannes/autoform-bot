@@ -3,13 +3,18 @@
 AutoformBot is a coding-agent plugin and Python CLI for Lean 4 formalization
 projects. It builds source-grounded Markdown roadmaps, validates dependencies,
 publishes progress views, and prepares human or agent review. The plugin and
-CLI use the identifier `autoform`.
+CLI use the identifier `autoform`; the canonical repository is
+[`facebookresearch/autoform-bot`](https://github.com/facebookresearch/autoform-bot).
 
-`main` provides planning, publication, review, and shared Lean LSP/REPL tools.
-It does **not** include autonomous orchestration. Execution work lives on
-[`deicyde/main`](https://github.com/VivienCabannes/autoform-bot/tree/deicyde/main),
-which currently trails `main` and is not a compatible overlay until rebased and
-validated.
+The default `main` branch provides repository setup, roadmap planning,
+publication, human and agent review, and shared Lean LSP/REPL tools. It does
+**not** include autonomous orchestration.
+
+Autonomous execution is an opt-in overlay on the
+[`execution`](https://github.com/facebookresearch/autoform-bot/tree/execution)
+branch. It adds orchestration, claim-backed workers, specialist agents, and
+prover adapters on top of `main`. Use `main` unless you are explicitly
+evaluating that execution stack.
 
 ## Prerequisites
 
@@ -23,14 +28,14 @@ validated.
 Claude Code:
 
 ```bash
-claude plugin marketplace add VivienCabannes/autoform-bot
+claude plugin marketplace add facebookresearch/autoform-bot
 claude plugin install autoform@autoform
 ```
 
 Codex:
 
 ```bash
-codex plugin marketplace add VivienCabannes/autoform-bot --ref main
+codex plugin marketplace add facebookresearch/autoform-bot --ref main
 codex plugin add autoform@autoform
 ```
 
@@ -49,9 +54,9 @@ uv run autoform init /path/to/lean-project \
 
 This creates `blueprint/`, `mkdocs.yml`, and `requirements-docs.txt`. GitHub
 workflows are created only when Autoform has an immutable commit pin. The Setup
-skill is a guided wrapper around this flow, but it still refers to legacy
-project helpers that are not packaged on `main`; use `autoform init` when those
-helpers are unavailable.
+skill can inspect and repair this infrastructure, but its new-project Lean
+bootstrap helper is not packaged on `main`; start from an existing Lean project
+and use `autoform init` for the blueprint and publication files.
 
 Next use the host skills from the Lean project:
 
@@ -136,7 +141,7 @@ deploys from `main` only after GitHub Pages is enabled in repository settings.
 Development also requires Make:
 
 ```bash
-git clone https://github.com/VivienCabannes/autoform-bot.git
+git clone https://github.com/facebookresearch/autoform-bot.git
 cd autoform-bot
 make setup
 make lint

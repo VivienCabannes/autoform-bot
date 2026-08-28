@@ -19,6 +19,21 @@ _HREF = re.compile(r'href="([^"]+)"')
 _EXAMPLE = Path("skills/setup/assets/cabannes-thesis-project")
 
 
+def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+
+    assert "claude plugin marketplace add facebookresearch/autoform-bot" in readme
+    assert (
+        "codex plugin marketplace add facebookresearch/autoform-bot --ref main"
+        in readme
+    )
+    assert "git clone https://github.com/facebookresearch/autoform-bot.git" in readme
+    assert (
+        "https://github.com/facebookresearch/autoform-bot/tree/execution" in readme
+    )
+    assert "VivienCabannes/autoform-bot" not in readme
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"
