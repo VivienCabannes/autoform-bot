@@ -129,6 +129,8 @@ class LeanReplConfig:
 
     repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
 
+    # stdout is capped per response. stderr has no protocol framing, so its
+    # ceiling applies to the entire process generation and resets on restart.
     max_buffer_bytes: int = 10 * 1024 * 1024
     mem_restart_ratio: float = 0.9
     validate_imports: bool = True
@@ -254,6 +256,24 @@ class ReplProcessRestarted(RuntimeError):
     """Raised when the REPL restarts and env_id state is lost."""
 
 
+class ReplOutcomeUnknown(ReplProcessRestarted):
+    """Raised when stderr poisoning leaves a sent command's outcome unknown."""
+
+
+class ReplStderrBacklog(RuntimeError):
+    """Raised when a response was captured but process stderr is no longer safe.
+
+    The response data is valid and travels on ``response`` so a caller need not
+    recompute it, but any ``env`` belongs to the process being retired and must
+    not escape. stderr is unframed process output rather than command output, so
+    an over-budget or undrainable process must not serve another request.
+    """
+
+    def __init__(self, message: str, response: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.response = response
+
+
 class LeanRepl:
     """Lean REPL process manager.
 
@@ -275,6 +295,10 @@ class LeanRepl:
         self.mem_limit_gb: int = config.instance_mem_limit_gb
 
         self._process_lock = threading.Lock()
+        # stderr has no command boundary. Account for it monotonically across one
+        # process generation and retain only a bounded tail for diagnostics.
+        self._stderr_bytes = 0
+        self._stderr_tail = bytearray()
 
         self._allowed_import_roots: frozenset[str] | None = None
         if config.validate_imports and config.allowed_imports:
@@ -305,6 +329,8 @@ class LeanRepl:
             stderr=subprocess.PIPE,
             env=env,
         )
+        self._stderr_bytes = 0
+        self._stderr_tail.clear()
 
         try:
             if self.config.warmup_imports:
@@ -347,6 +373,8 @@ class LeanRepl:
         finally:
             self.process = None
             self._base_env_id = None
+            self._stderr_bytes = 0
+            self._stderr_tail.clear()
 
     def restart(self, timeout: float | None = None) -> None:
         """Restart the Lean REPL process within an optional total timeout."""
@@ -397,23 +425,65 @@ class LeanRepl:
                         )
                     }
 
-            env_id = self._base_env_id
-
         last_exception: Exception | None = None
         with self._process_lock:
+            if run_from_env and not self.is_alive():
+                self.close()
+                raise ReplProcessRestarted(
+                    "REPL process restarted before the request; environment state was lost"
+                )
+
+            process_before_memory_check = self.process
             try:
                 if not self.is_alive():
                     self.restart(timeout=remaining())
                 self._check_memory_and_maybe_restart(timeout=remaining())
             except (TimeoutError, RuntimeError) as error:
                 self.close()
+                if run_from_env:
+                    raise ReplProcessRestarted(str(error)) from error
                 return {"repl_error": str(error)}
+
+            if run_from_env and self.process is not process_before_memory_check:
+                raise ReplProcessRestarted(
+                    "REPL process restarted before the request; environment state was lost"
+                )
 
             for i in range(max_retries + 1):
                 try:
-                    resp = self._run(code=code, env_id=env_id, timeout=remaining())
+                    dispatch_env_id = env_id if run_from_env else self._base_env_id
+                    resp = self._run(
+                        code=code,
+                        env_id=dispatch_env_id,
+                        timeout=remaining(),
+                    )
                     _adjust_line_numbers(resp, header_line_count)
                     return resp
+                except ReplStderrBacklog as e:
+                    # _run() already retired the process, so nothing can inherit the
+                    # undrained stderr; close() here is an idempotent assertion of
+                    # that. The response is valid, so a plain request still receives
+                    # it. An env-scoped request cannot transparently outlive the
+                    # process that held its environment, so it is told loudly.
+                    logger.error("%s", e)
+                    self.close()
+                    if run_from_env:
+                        raise ReplProcessRestarted(str(e)) from e
+                    # The command's diagnostics remain valid, but any environment
+                    # identifier belongs to the process _run() just retired.
+                    response = dict(e.response)
+                    response.pop("env", None)
+                    _adjust_line_numbers(response, header_line_count)
+                    return response
+                except ReplOutcomeUnknown as e:
+                    # The request was fully written, so replay could execute it
+                    # twice. Retire the process and report the unknown outcome
+                    # without entering the ordinary retry path.
+                    logger.error("%s", e)
+                    self.close()
+                    if run_from_env:
+                        raise
+                    return {"repl_error": str(e), "outcome_unknown": True}
                 except ReplProcessExited as e:
                     last_exception = e
                     logger.error("REPL process exited: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
@@ -479,20 +549,144 @@ class LeanRepl:
 
         end_time = time.monotonic() + timeout
         stdin_fd = self.process.stdin.fileno()
+        stdout_fd = self.process.stdout.fileno()
+        stderr_fd = self.process.stderr.fileno()
         os.set_blocking(stdin_fd, False)
+        os.set_blocking(stdout_fd, False)
+        os.set_blocking(stderr_fd, False)
+        response_buffer = bytearray()
+        max_buffer = self.config.max_buffer_bytes
+        stderr_drained = True
+        stderr_open = True
+        stderr_poison_reason: str | None = None
+
+        def stderr_details() -> tuple[int, str]:
+            stderr_bytes = self._stderr_bytes
+            stderr_tail = bytes(self._stderr_tail[-200:]).decode("utf-8", errors="replace")
+            return stderr_bytes, stderr_tail
+
+        def raise_unknown_stderr_outcome() -> None:
+            stderr_bytes, stderr_tail = stderr_details()
+            reason = stderr_poison_reason or "stderr could not be drained"
+            self.close()
+            raise ReplOutcomeUnknown(
+                f"REPL process-generation stderr became unsafe after the request "
+                f"was sent ({reason}; {stderr_bytes} bytes observed); "
+                f"the execution outcome is unknown and was not retried. Tail: {stderr_tail!r}"
+            )
+
+        def retire_before_request() -> None:
+            stderr_bytes, stderr_tail = stderr_details()
+            reason = stderr_poison_reason or "stderr became unsafe"
+            self.close()
+            raise ReplProcessExited(
+                f"REPL process-generation stderr became unsafe before the request "
+                f"frame was fully sent ({reason}; {stderr_bytes} bytes observed); "
+                f"the process was recycled. Tail: {stderr_tail!r}"
+            )
+
+        def drain_stderr(*, max_reads: int | None = None, after_response: bool = False) -> bool:
+            """Drain process stderr fairly while retaining a bounded tail.
+
+            ``max_reads`` bounds a single fairness cycle so a process that writes
+            diagnostics continuously cannot starve stdout.
+
+            ``after_response`` marks the drain that runs once the response frame is
+            complete. It is unbounded in reads because no stdout read is left to
+            starve, but the deadline and process-generation stderr ceiling stop it
+            without destroying a response already captured.
+
+            Returns whether stderr is currently empty and the process generation
+            remains within budget. EAGAIN is never treated as a command boundary;
+            the byte count and tail persist until the process is replaced.
+            """
+            nonlocal stderr_open, stderr_poison_reason
+
+            if not stderr_open:
+                return False
+
+            reads = 0
+            while max_reads is None or reads < max_reads:
+                if after_response:
+                    if stderr_poison_reason is not None:
+                        return False
+                    if time.monotonic() >= end_time:
+                        readable, _, _ = select.select([stderr_fd], [], [], 0)
+                        if not readable:
+                            return True
+                        stderr_poison_reason = "stderr remained readable at the command deadline"
+                        return False
+                if max_reads is None and not after_response and time.monotonic() >= end_time:
+                    if stderr_poison_reason is not None:
+                        raise_unknown_stderr_outcome()
+                    raise TimeoutError(f"REPL command timed out after {timeout} seconds while reading stderr")
+                try:
+                    chunk = os.read(stderr_fd, self.chunk_size)
+                except BlockingIOError:
+                    return stderr_poison_reason is None
+                except OSError as error:
+                    stderr_open = False
+                    stderr_poison_reason = f"stderr read failed: {error}"
+                    return False
+                if not chunk:
+                    stderr_open = False
+                    stderr_poison_reason = "stderr closed unexpectedly"
+                    return False
+                self._stderr_bytes += len(chunk)
+                tail_limit = max(0, max_buffer)
+                if tail_limit:
+                    if len(chunk) >= tail_limit:
+                        self._stderr_tail[:] = chunk[-tail_limit:]
+                    else:
+                        overflow = len(self._stderr_tail) + len(chunk) - tail_limit
+                        if overflow > 0:
+                            del self._stderr_tail[:overflow]
+                        self._stderr_tail.extend(chunk)
+                reads += 1
+                logger.debug(
+                    "Lean REPL stderr: %s",
+                    chunk.decode("utf-8", errors="replace").rstrip(),
+                )
+                if self._stderr_bytes > max_buffer and stderr_poison_reason is None:
+                    stderr_poison_reason = (
+                        f"stderr exceeded the {max_buffer}-byte process-generation ceiling"
+                    )
+                if after_response and stderr_poison_reason is not None:
+                    return False
+            return stderr_poison_reason is None
+
+        # stdout and stderr are independent pipes. A child blocked on a full
+        # stderr pipe may be unable to read its stdin, so service stderr fairly
+        # while writing instead of waiting on stdin alone. Any stderr observed
+        # here remains process-scoped; it is never assigned to this command.
         payload = memoryview(command.encode("utf-8"))
         offset = 0
         while offset < len(payload):
             remaining = end_time - time.monotonic()
             if remaining <= 0:
+                if stderr_poison_reason is not None:
+                    retire_before_request()
                 raise TimeoutError(
                     f"REPL command timed out after {timeout} seconds while writing"
                 )
-            _, writable, _ = select.select([], [stdin_fd], [], remaining)
-            if not writable:
+            readable, writable, _ = select.select(
+                [stderr_fd] if stderr_open else [],
+                [stdin_fd],
+                [],
+                remaining,
+            )
+            if not readable and not writable:
+                if stderr_poison_reason is not None:
+                    retire_before_request()
                 raise TimeoutError(
                     f"REPL command timed out after {timeout} seconds while writing"
                 )
+            if stderr_fd in readable:
+                drain_stderr(max_reads=1)
+                if stderr_poison_reason is not None:
+                    retire_before_request()
+            if stdin_fd not in writable:
+                continue
             try:
                 written = os.write(stdin_fd, payload[offset:])
             except BlockingIOError:
@@ -505,41 +699,26 @@ class LeanRepl:
                 raise ReplProcessExited("REPL process closed stdin while writing")
             offset += written
 
-        stdout_fd = self.process.stdout.fileno()
-        stderr_fd = self.process.stderr.fileno()
-        os.set_blocking(stdout_fd, False)
-        os.set_blocking(stderr_fd, False)
-        response_buffer = bytearray()
-        stderr_buffer = bytearray()
-        max_buffer = self.config.max_buffer_bytes
-
-        def drain_stderr() -> None:
-            while True:
-                try:
-                    chunk = os.read(stderr_fd, self.chunk_size)
-                except BlockingIOError:
-                    return
-                if not chunk:
-                    return
-                stderr_buffer.extend(chunk)
-                logger.debug(
-                    "Lean REPL stderr: %s",
-                    chunk.decode("utf-8", errors="replace").rstrip(),
-                )
-
         while True:
             remaining = end_time - time.monotonic()
             if remaining <= 0:
+                if stderr_poison_reason is not None:
+                    raise_unknown_stderr_outcome()
                 raise TimeoutError(f"REPL command timed out after {timeout} seconds")
 
-            ready, _, _ = select.select([stdout_fd, stderr_fd], [], [], remaining)
+            readable_fds = [stdout_fd]
+            if stderr_open:
+                readable_fds.append(stderr_fd)
+            ready, _, _ = select.select(readable_fds, [], [], remaining)
             if not ready:
+                if stderr_poison_reason is not None:
+                    raise_unknown_stderr_outcome()
                 raise TimeoutError(f"REPL command timed out after {timeout} seconds")
 
             # Drain diagnostics before handling stdout EOF so a crashing Lean
             # process cannot lose stderr that became readable at the same time.
             if stderr_fd in ready:
-                drain_stderr()
+                drain_stderr(max_reads=1)
 
             if stdout_fd in ready:
                 try:
@@ -547,12 +726,17 @@ class LeanRepl:
                 except BlockingIOError:
                     continue
                 if not chunk:
-                    drain_stderr()
-                    stderr_text = stderr_buffer.decode("utf-8", errors="replace")
+                    if stderr_open:
+                        drain_stderr()
+                    if stderr_poison_reason is not None:
+                        raise_unknown_stderr_outcome()
+                    stderr_text = self._stderr_tail.decode("utf-8", errors="replace")
                     raise ReplProcessExited(f"REPL process exited. stderr: {stderr_text}")
                 response_buffer.extend(chunk)
 
                 if len(response_buffer) > max_buffer:
+                    if stderr_poison_reason is not None:
+                        raise_unknown_stderr_outcome()
                     tail = bytes(response_buffer[-200:]).decode(
                         "utf-8",
                         errors="replace",
@@ -564,6 +748,41 @@ class LeanRepl:
                 separator = response_buffer.find(b"\n\n")
                 if separator >= 0:
                     response_bytes = bytes(response_buffer[:separator]).strip()
+                    # The frame is complete, so this command's remaining queued
+                    # stderr can be drained without starving stdout. Leaving it in
+                    # the pipe would let a command exceed the stderr ceiling
+                    # unnoticed, misattribute diagnostics to the next command, and
+                    # eventually block the child on a full stderr pipe.
+                    stderr_drained = drain_stderr(after_response=True)
                     break
 
-        return json.loads(response_bytes.decode("utf-8"))
+        if not stderr_drained:
+            stderr_bytes = self._stderr_bytes
+            stderr_tail = bytes(self._stderr_tail[-200:]).decode("utf-8", errors="replace")
+            stderr_reason = stderr_poison_reason or "stderr could not be drained"
+            # stderr is accounted to the process generation, never to whichever
+            # command happened to observe it. Once that generation exceeds its
+            # quota or cannot be drained, retire it before another request.
+            self.close()
+
+        # Retire a desynchronized process before parsing. Malformed JSON must not
+        # bypass the stream-safety invariant and leave stale stderr reusable.
+        try:
+            response = json.loads(response_bytes.decode("utf-8"))
+        except json.JSONDecodeError as error:
+            if not stderr_drained:
+                raise ReplOutcomeUnknown(
+                    f"REPL process-generation stderr became unsafe after the request "
+                    f"was sent ({stderr_reason}; {stderr_bytes} bytes observed), and "
+                    "the response frame was malformed; the execution outcome is "
+                    f"unknown and was not retried. Tail: {stderr_tail!r}"
+                ) from error
+            raise
+        if not stderr_drained:
+            raise ReplStderrBacklog(
+                f"REPL process-generation stderr became unsafe ({stderr_reason}; "
+                f"{stderr_bytes} bytes observed); "
+                f"the process was recycled. Tail: {stderr_tail!r}",
+                response,
+            )
+        return response

@@ -122,6 +122,8 @@ def test_repl_retry_recovery_uses_the_original_deadline(monkeypatch):
 
 def test_repl_request_write_uses_the_operation_deadline():
     read_fd, write_fd = os.pipe()
+    stdout_read_fd, stdout_write_fd = os.pipe()
+    stderr_read_fd, stderr_write_fd = os.pipe()
     os.set_blocking(write_fd, False)
     while True:
         try:
@@ -140,10 +142,8 @@ def test_repl_request_write_uses_the_operation_deadline():
 
     process = StalledProcess()
     process.stdin = stdin
-    # These streams are checked before the bounded write but never read in
-    # this test because the deliberately full stdin pipe times out first.
-    process.stdout = object()
-    process.stderr = object()
+    process.stdout = os.fdopen(stdout_read_fd, "rb", buffering=0)
+    process.stderr = os.fdopen(stderr_read_fd, "rb", buffering=0)
 
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -157,4 +157,8 @@ def test_repl_request_write_uses_the_operation_deadline():
             repl._run("#check Nat", env_id=None, timeout=0.02)
     finally:
         stdin.close()
+        process.stdout.close()
+        process.stderr.close()
         os.close(read_fd)
+        os.close(stdout_write_fd)
+        os.close(stderr_write_fd)
