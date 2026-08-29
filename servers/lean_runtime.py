@@ -8,6 +8,7 @@ this process through a private Unix-domain socket.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import json
 import logging
 import math
@@ -66,6 +67,7 @@ DEFAULT_REPL_REQUEST_TIMEOUT = 30.0
 DEFAULT_MAX_REPL_REQUEST_SECONDS = 240.0
 DEFAULT_RPC_READ_TIMEOUT = 10.0
 DEFAULT_MAX_CONNECTIONS = 64
+DEFAULT_SHUTDOWN_GRACE_SECONDS = 10.0
 RUNTIME_SAFETY_SECONDS = 30.0
 # Conservative bounds for cleanup/startup work that surrounds one tool call.
 # They keep the daemon's work inside the client's response deadline even when
@@ -273,24 +275,44 @@ class LeanRuntimeConfig:
         }
 
 
-def lean_project_fingerprint(project_dir: Path) -> tuple[tuple[str, int, int], ...]:
+@dataclass(frozen=True, slots=True)
+class ProjectFingerprint:
+    root: tuple[int, int, int]
+    files: tuple[tuple[str, int, int, int, int, int, int], ...]
+
+
+def lean_project_fingerprint(project_dir: Path) -> ProjectFingerprint:
     """Return the project metadata that makes a resident Lean process stale."""
     files = ("lean-toolchain", "lake-manifest.json", "lakefile.toml", "lakefile.lean")
-    fingerprint: list[tuple[str, int, int]] = []
+    root = project_dir.stat()
+    fingerprint: list[tuple[str, int, int, int, int, int, int]] = []
     for name in files:
         path = project_dir / name
         try:
             info = path.stat()
         except FileNotFoundError:
             continue
-        fingerprint.append((name, info.st_mtime_ns, info.st_size))
-    return tuple(fingerprint)
+        fingerprint.append(
+            (
+                name,
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+        )
+    return ProjectFingerprint(
+        root=(root.st_dev, root.st_ino, root.st_mode),
+        files=tuple(fingerprint),
+    )
 
 
 @dataclass
 class _CacheEntry(Generic[T]):
     resource: T
-    fingerprint: tuple[tuple[str, int, int], ...]
+    fingerprint: ProjectFingerprint
     last_used: float
     active: int = 0
     invalid: bool = False
@@ -320,8 +342,11 @@ class ProjectResourceCache(Generic[T]):
         self._clock = clock
         self._entries: dict[Path, _CacheEntry[T]] = {}
         self._creating: set[Path] = set()
+        self._active_leases = 0
         self._condition = threading.Condition()
         self._closed = False
+        self._closing = False
+        self._close_complete = False
         self._stop_sweeper = threading.Event()
         self._sweeper: threading.Thread | None = None
         if start_sweeper and idle_seconds > 0:
@@ -412,19 +437,53 @@ class ProjectResourceCache(Generic[T]):
         self._close_many(resources)
         return len(resources)
 
-    def close(self) -> None:
-        """Stop admission, wait for active leases, then close all resources."""
+    def close(self, *, timeout: float | None = None) -> None:
+        """Stop admission, give leases ``timeout`` to drain, then own cleanup."""
+        if timeout is not None and timeout < 0:
+            raise ValueError("close timeout must be nonnegative")
+        deadline = time.monotonic() + timeout if timeout is not None else None
         self._stop_sweeper.set()
         with self._condition:
             self._closed = True
-            while self._creating or any(entry.active for entry in self._entries.values()):
-                self._condition.wait(timeout=0.5)
+            if self._close_complete:
+                return
+            if self._closing:
+                while not self._close_complete:
+                    self._condition.wait()
+                return
+            self._closing = True
+        try:
+            self._close_owned_resources(deadline)
+        finally:
+            with self._condition:
+                self._close_complete = True
+                self._closing = False
+                self._condition.notify_all()
+
+    def _close_owned_resources(self, deadline: float | None) -> None:
+        with self._condition:
+            while self._creating or self._active_leases:
+                wait_seconds = 0.5
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    wait_seconds = min(wait_seconds, remaining)
+                self._condition.wait(timeout=wait_seconds)
             resources = [entry.resource for entry in self._entries.values()]
             self._entries.clear()
             self._condition.notify_all()
-        self._close_many(resources)
         if self._sweeper and self._sweeper is not threading.current_thread():
             self._sweeper.join()
+        # The grace period bounds admission and lease draining. Once resources
+        # have been detached from the cache, finish closing them before the
+        # daemon releases its lifetime lock. Letting cleanup continue in daemon
+        # threads would permit a replacement runtime to start while the old
+        # Lean children are still alive.
+        self._close_many(resources)
+        with self._condition:
+            while self._creating or self._active_leases:
+                self._condition.wait()
 
     def _acquire(
         self,
@@ -440,7 +499,6 @@ class ProjectResourceCache(Generic[T]):
             )
         if creation_budget < 0:
             raise ValueError("creation_budget must be nonnegative")
-        fingerprint = lean_project_fingerprint(root)
         deadline = (
             self._clock() + acquisition_timeout
             if acquisition_timeout is not None
@@ -450,7 +508,14 @@ class ProjectResourceCache(Generic[T]):
         reserved = False
 
         while True:
+            if deadline is not None and self._clock() >= deadline:
+                raise ProjectResourceBusyError(
+                    f"timed out waiting for a shared Lean project slot: {root}"
+                )
+            fingerprint = lean_project_fingerprint(root)
             wait = False
+            creation_budget_checked = False
+            reserve_creation_budget = False
             with self._condition:
                 if self._closed:
                     raise RuntimeError("project resource cache is closed")
@@ -479,22 +544,37 @@ class ProjectResourceCache(Generic[T]):
                             creation_budget=creation_budget,
                         )
                         wait = True
+                        reserve_creation_budget = True
                     else:
                         self._require_creation_budget(
                             root,
                             deadline=deadline,
                             creation_budget=creation_budget,
                         )
+                        creation_budget_checked = True
                         resources_to_close.append(self._entries.pop(root).resource)
                         self._condition.notify_all()
                         entry = None
 
                 if not wait and entry is not None:
+                    if lean_project_fingerprint(root) != fingerprint:
+                        wait_seconds = 0.01
+                        if deadline is not None:
+                            remaining = deadline - self._clock()
+                            if remaining <= 0:
+                                raise ProjectResourceBusyError(
+                                    "timed out waiting for a shared Lean project "
+                                    f"slot: {root}"
+                                )
+                            wait_seconds = min(wait_seconds, remaining)
+                        self._condition.wait(timeout=wait_seconds)
+                        continue
                     if deadline is not None and self._clock() >= deadline:
                         raise ProjectResourceBusyError(
                             f"timed out waiting for a shared Lean project slot: {root}"
                         )
                     entry.active += 1
+                    self._active_leases += 1
                     entry.last_used = self._clock()
                     resource = entry.resource
                     break
@@ -507,11 +587,12 @@ class ProjectResourceCache(Generic[T]):
                     wait = True
 
                 if not wait:
-                    self._require_creation_budget(
-                        root,
-                        deadline=deadline,
-                        creation_budget=creation_budget,
-                    )
+                    if not creation_budget_checked:
+                        self._require_creation_budget(
+                            root,
+                            deadline=deadline,
+                            creation_budget=creation_budget,
+                        )
                     occupied = len(self._entries) + len(self._creating)
                     if occupied >= self._max_entries:
                         inactive = [
@@ -524,6 +605,7 @@ class ProjectResourceCache(Generic[T]):
                             resources_to_close.append(self._entries.pop(victim).resource)
                         else:
                             wait = True
+                            reserve_creation_budget = True
 
                 if not wait:
                     self._creating.add(root)
@@ -535,7 +617,15 @@ class ProjectResourceCache(Generic[T]):
                 wait_seconds = 0.5
                 if deadline is not None:
                     remaining = deadline - self._clock()
+                    if reserve_creation_budget:
+                        remaining -= creation_budget
                     if remaining <= 0:
+                        if reserve_creation_budget:
+                            self._require_creation_budget(
+                                root,
+                                deadline=deadline,
+                                creation_budget=creation_budget,
+                            )
                         raise ProjectResourceBusyError(
                             f"timed out waiting for a shared Lean project slot: {root}"
                         )
@@ -552,36 +642,90 @@ class ProjectResourceCache(Generic[T]):
         if not reserved:
             return resource
 
+        late_creation = False
         try:
-            created = self._factory(root)
+            if deadline is None:
+                created = self._factory(root)
+            else:
+                future: Future[T] = Future()
+
+                def create_resource() -> None:
+                    try:
+                        future.set_result(self._factory(root))
+                    except BaseException as error:
+                        future.set_exception(error)
+
+                creator = threading.Thread(
+                    target=create_resource,
+                    name="autoform-project-startup",
+                    daemon=False,
+                )
+                creator.start()
+                try:
+                    created = future.result(
+                        timeout=max(0.0, deadline - self._clock())
+                    )
+                except FutureTimeoutError:
+                    if future.done():
+                        created = future.result()
+                    else:
+                        def discard_late_result(completed: Future[T]) -> None:
+                            try:
+                                late_resource = completed.result()
+                            except BaseException:
+                                with self._condition:
+                                    self._creating.discard(root)
+                                    self._condition.notify_all()
+                            else:
+                                self._discard_created_resource(root, late_resource)
+
+                        future.add_done_callback(discard_late_result)
+                        late_creation = True
         except BaseException:
             with self._condition:
                 self._creating.discard(root)
                 self._condition.notify_all()
             raise
+        if late_creation:
+            raise ProjectResourceBusyError(
+                f"shared Lean project startup exceeded its response budget: {root}"
+            ) from None
 
+        try:
+            current_fingerprint = lean_project_fingerprint(root)
+        except OSError:
+            current_fingerprint = None
         close_created = False
         startup_expired = False
+        project_changed = False
         with self._condition:
-            self._creating.discard(root)
             if self._closed:
                 close_created = True
             elif deadline is not None and self._clock() >= deadline:
                 close_created = True
                 startup_expired = True
+            elif current_fingerprint != fingerprint:
+                close_created = True
+                project_changed = True
             else:
+                self._creating.discard(root)
                 self._entries[root] = _CacheEntry(
                     resource=created,
                     fingerprint=fingerprint,
                     last_used=self._clock(),
                     active=1,
                 )
+                self._active_leases += 1
             self._condition.notify_all()
         if close_created:
-            self._safe_close(created)
+            self._discard_created_resource(root, created)
             if startup_expired:
                 raise ProjectResourceBusyError(
                     f"shared Lean project startup exceeded its response budget: {root}"
+                )
+            if project_changed:
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed during startup: {root}"
                 )
             raise RuntimeError("project resource cache closed during startup")
         return created
@@ -595,7 +739,7 @@ class ProjectResourceCache(Generic[T]):
     ) -> None:
         if deadline is None:
             return
-        if deadline - self._clock() < creation_budget:
+        if deadline - self._clock() <= creation_budget:
             raise ProjectResourceBusyError(
                 f"not enough response budget to start a shared Lean project slot: {root}"
             )
@@ -604,8 +748,13 @@ class ProjectResourceCache(Generic[T]):
         with self._condition:
             entry = self._entries.get(root)
             if entry is None or entry.resource is not resource:
+                if self._closed:
+                    self._active_leases -= 1
+                    self._condition.notify_all()
+                    return
                 raise RuntimeError("project resource lease is no longer registered")
             entry.active -= 1
+            self._active_leases -= 1
             entry.last_used = self._clock()
             self._condition.notify_all()
 
@@ -619,6 +768,26 @@ class ProjectResourceCache(Generic[T]):
     def _close_many(self, resources: list[T]) -> None:
         for resource in resources:
             self._safe_close(resource)
+
+    def _discard_created_resource(self, root: Path, resource: T) -> None:
+        def discard() -> None:
+            try:
+                self._safe_close(resource)
+            finally:
+                with self._condition:
+                    self._creating.discard(root)
+                    self._condition.notify_all()
+
+        cleanup = threading.Thread(
+            target=discard,
+            name="autoform-project-cleanup",
+            daemon=False,
+        )
+        try:
+            cleanup.start()
+        except BaseException:
+            discard()
+            raise
 
     def _safe_close(self, resource: T) -> None:
         try:
@@ -791,9 +960,28 @@ class LeanRuntimeServices:
             result["lsp_projects"] = self.lsp_projects.stats()
         return result
 
-    def close(self) -> None:
-        self.repl_projects.close()
-        self.lsp_projects.close()
+    def close(self, *, timeout: float | None = None) -> None:
+        if timeout is None:
+            self.repl_projects.close()
+            self.lsp_projects.close()
+            return
+        if timeout < 0:
+            raise ValueError("close timeout must be nonnegative")
+        # Drain the independent caches concurrently, then wait for synchronous
+        # resource cleanup. `serve` retains the lifetime lock until this method
+        # returns, preventing overlapping Lean process generations.
+        threads = [
+            threading.Thread(
+                target=cache.close,
+                kwargs={"timeout": timeout},
+                name="autoform-cache-shutdown",
+            )
+            for cache in (self.repl_projects, self.lsp_projects)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
     def _acquisition_timeout(self, operation_timeout: float) -> float:
         """Reserve enough of the RPC deadline for the admitted tool operation."""
@@ -824,8 +1012,8 @@ class LeanRuntimeServices:
 
 
 class _ThreadingUnixServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = False
-    block_on_close = True
+    daemon_threads = True
+    block_on_close = False
 
 
 class LeanRuntimeServer(_ThreadingUnixServer):
@@ -1014,7 +1202,7 @@ def serve(paths: RuntimePaths) -> None:
         finally:
             try:
                 if services is not None:
-                    services.close()
+                    services.close(timeout=DEFAULT_SHUTDOWN_GRACE_SECONDS)
             finally:
                 try:
                     info = paths.socket.lstat()

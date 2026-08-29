@@ -51,6 +51,10 @@ class LeanReplPool:
         self._workers: list[LeanRepl] = []
         self._idle: queue.Queue[LeanRepl] = queue.Queue()
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._active_calls = 0
+        self._closing = False
+        self._closed = False
 
         try:
             for i in range(self.capacity):
@@ -94,14 +98,33 @@ class LeanReplPool:
         """Run code on an idle REPL within one queue-and-execution timeout."""
         timeout = kwargs.pop("timeout", None)
         deadline = time.monotonic() + timeout if timeout is not None else None
-        try:
-            repl = self._idle.get(timeout=timeout)
-        except queue.Empty as error:
-            raise TimeoutError(
-                f"timed out after {timeout:g}s waiting for an idle Lean REPL"
-            ) from error
+        with self._condition:
+            if self._shutdown:
+                raise RuntimeError("Lean REPL pool is shut down")
+            self._active_calls += 1
+        repl: LeanRepl | None = None
 
-        def run_once() -> dict[str, Any]:
+        try:
+            while repl is None:
+                with self._condition:
+                    if self._shutdown:
+                        raise RuntimeError("Lean REPL pool is shut down")
+                wait = 0.1
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"timed out after {timeout:g}s waiting for an idle Lean REPL"
+                        )
+                    wait = min(wait, remaining)
+                try:
+                    repl = self._idle.get(timeout=wait)
+                except queue.Empty:
+                    continue
+            with self._condition:
+                if self._shutdown:
+                    raise RuntimeError("Lean REPL pool is shut down")
+
             call_kwargs = dict(kwargs)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -111,11 +134,14 @@ class LeanReplPool:
                     )
                 call_kwargs["timeout"] = remaining
             return repl.run(code, **call_kwargs)
-
-        try:
-            return run_once()
         finally:
-            self._idle.put(repl)
+            if repl is not None:
+                with self._condition:
+                    if not self._shutdown:
+                        self._idle.put(repl)
+            with self._condition:
+                self._active_calls -= 1
+                self._condition.notify_all()
 
     def get_memory_usage(self) -> float:
         """Total memory usage across all REPL instances in GB."""
@@ -123,5 +149,20 @@ class LeanReplPool:
 
     def shutdown(self) -> None:
         """Shut down all REPL instances."""
-        self._shutdown = True
-        self._close_workers()
+        with self._condition:
+            self._shutdown = True
+            self._condition.notify_all()
+            while self._active_calls:
+                self._condition.wait()
+            while self._closing:
+                self._condition.wait()
+            if self._closed:
+                return
+            self._closing = True
+        try:
+            self._close_workers()
+        finally:
+            with self._condition:
+                self._closing = False
+                self._closed = True
+                self._condition.notify_all()
