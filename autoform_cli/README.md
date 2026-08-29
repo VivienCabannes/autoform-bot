@@ -146,6 +146,9 @@ autoform project new . \
   --autoform-ref <full-commit-sha>
 autoform project inspect .
 autoform project inspect path/inside/project --json
+autoform project repair . --dry-run --json
+autoform project repair . --title "Finite Flat Group Schemes" \
+  --repository-url https://github.com/owner/repo
 autoform project versions --json
 ```
 
@@ -166,6 +169,26 @@ and compares the installed plugin and importable packages with that commit.
 It reports a credential-free HTTPS source and full SHA only after all checks
 pass. A plain wheel cannot infer provenance. Run it before creating the
 consumer target, then pass both returned values to `project new`.
+
+`project repair` operates only on an explicitly named project root that already
+has a clean, supported Lake/Lean configuration. It preserves every existing
+managed path byte-for-byte and adds only absent Autoform overlay files whose
+content is canonical and unambiguous. Missing parameterized files require their
+exact inputs: `--title`, `--repository-url` (use an explicit empty value when
+that is intended), and the `--autoform-source`/`--autoform-ref` pair for
+workflows. A project whose workflows were deliberately omitted remains valid;
+a partial workflow pair does not. Repair never writes when preflight finds a
+symlink, unsafe or missing parent, stale repair temporary, malformed
+configuration, unsupported release, or missing input. `--dry-run` performs the
+same plan without mutation. Calls serialize on the project root, and
+publication is atomic per file without replacing a concurrent writer. After an
+interrupted multi-file repair, inspect any reported retained path, then retry
+with the same inputs; there is no operation-wide transaction. If the project
+changes after a file is published, repair retains that file and reports it for
+manual recovery rather than risk unlinking a concurrent replacement. A failed
+pre-publication attempt likewise retains and reports its exact temporary path
+rather than deleting by pathname after a separate identity check. Like creation
+and inspection, repair runs no Git, Lake, Lean, subprocess, or network operation.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and
