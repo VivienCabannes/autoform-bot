@@ -11,6 +11,8 @@ from tempfile import TemporaryDirectory
 
 from autoform_cli.markdown import local_target_issue, markdown_links
 
+import pytest
+
 
 def _shipped_path(repo_root: Path, value: str) -> Path:
     root = repo_root.resolve()
@@ -142,6 +144,7 @@ def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
         assert "LEAN_PROJECT_DIR" not in json.dumps(server)
 
 
+@pytest.mark.installed_wheel
 def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
     dist = tmp_path / "dist"
     result = subprocess.run(

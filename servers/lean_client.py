@@ -337,12 +337,13 @@ class LeanRuntimeClient:
             os.close(lock_fd)
 
     def stop(self) -> dict[str, Any]:
-        """Ask a running daemon to finish active calls and shut down."""
+        """Ask a running daemon to finish active calls within one deadline."""
+        deadline = time.monotonic() + self.response_timeout
         try:
             result = self.request(
                 "daemon.shutdown",
                 autostart=False,
-                response_timeout=10.0,
+                response_timeout=min(self.response_timeout, 10.0),
             )
         except LeanRuntimeUnavailable:
             stopped = self._stop_previous_builds()
@@ -351,7 +352,6 @@ class LeanRuntimeClient:
             raise
         if not isinstance(result, dict):
             raise LeanRuntimeProtocolError("daemon.shutdown returned a non-object result")
-        deadline = time.monotonic() + self.response_timeout
         while self.paths.socket.exists() and time.monotonic() < deadline:
             time.sleep(0.025)
         if self.paths.socket.exists():
