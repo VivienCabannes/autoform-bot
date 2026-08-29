@@ -2,6 +2,7 @@ name: tests
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -84,7 +85,7 @@ jobs:
   real-lean:
     name: real Lean (pinned v4.32.2)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -129,4 +130,4 @@ jobs:
           grep -Fq "Lean (version 4.32.2" <<<"$version"
           command -v lake
       - name: Run mandatory real-Lean tests
-        run: timeout --signal=TERM --kill-after=30s 15m make test-real-lean
+        run: timeout --signal=TERM --kill-after=30s 25m make test-real-lean

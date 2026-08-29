@@ -231,8 +231,12 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _run(project: Path, *command: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=project, capture_output=True, text=True, timeout=180)
+def _run(
+    project: Path, *command: str, timeout: float = 180
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command, cwd=project, capture_output=True, text=True, timeout=timeout
+    )
 
 
 @pytest.mark.real_lean
@@ -395,6 +399,28 @@ lean_lib «PublicApi» where
     probe.write_text(helper.render_probe(modules), encoding="utf-8")
     audited = _run(project, "lake", "env", "lean", str(probe))
     assert audited.returncode == 0, audited.stdout + audited.stderr
+
+
+@pytest.mark.real_lean
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
+def test_bundled_project_builds_against_pinned_mathlib(
+    repo_root: Path, tmp_path: Path
+) -> None:
+    source = repo_root / "skills/setup/assets/cabannes-thesis-project"
+    project = tmp_path / "cabannes-thesis-project"
+    shutil.copytree(
+        source,
+        project,
+        ignore=shutil.ignore_patterns(".lake", "site", "site-src", "__pycache__"),
+    )
+
+    cached = _run(project, "lake", "exe", "cache", "get", timeout=900)
+    assert cached.returncode == 0, cached.stdout + cached.stderr
+    built = _run(project, "lake", "build", "CabannesThesis", timeout=900)
+
+    assert built.returncode == 0, built.stdout + built.stderr
+    assert (project / ".lake/packages/mathlib/Mathlib.lean").is_file()
+    assert (project / ".lake/build/lib/lean/CabannesThesis.olean").is_file()
 
 
 def test_example_and_template_helpers_are_identical(repo_root: Path) -> None:
