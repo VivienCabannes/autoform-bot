@@ -39,18 +39,20 @@ manifest is included, but Muse installation is not covered here.
 
 ## Quick start
 
-Work from an existing Lean repository. First scaffold the blueprint and site
-configuration from an Autoform checkout:
+Work from an existing Lean repository. First verify the loaded plugin's source
+and exact commit, then pass that pair into the scaffold command:
 
 ```bash
-uv run autoform init /path/to/lean-project \
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform project provenance --json
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform init /path/to/lean-project \
+  --autoform-source <credential-free-https-git-url> \
   --autoform-ref <full-commit-sha>
 ```
 
 This creates `blueprint/`, `mkdocs.yml`, and `requirements-docs.txt`. GitHub
-workflows are created only when Autoform has an immutable commit pin. The Setup
-skill guides repository inspection, Lean/Mathlib shell preparation, and this
-non-destructive `autoform init` flow.
+workflows are created only when both values are present. A plain wheel cannot
+infer them. The Setup skill guides repository inspection, Lean/Mathlib shell
+preparation, and this non-destructive `autoform init` flow.
 
 Next use the host skills from the Lean project:
 
@@ -98,6 +100,8 @@ complete frontmatter, hierarchy, status, and validation rules.
 | `autoform check` | Validate Markdown structure and dependencies. |
 | `autoform audit` | Audit completeness and checked facts. |
 | `autoform doctor` | Diagnose the local blueprint contract. |
+| `autoform project new` | Atomically create a complete Lean and Autoform project. |
+| `autoform project provenance` | Verify the loaded plugin's immutable source and commit. |
 | `autoform claim` | Coordinate temporary ownership through Git refs. |
 | `autoform render` | Generate publishable MkDocs source. |
 | `autoform-visualize` | Generate the Mermaid dependency graph. |

@@ -124,17 +124,48 @@ autoform init . --title "Finite Flat Group Schemes" \
   --repository-url https://github.com/owner/repo
 ```
 
-Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
-commit, `--force` to overwrite, and `--json` for machine-readable output.
+Pass `--autoform-source <credential-free-https-git-url>` and
+`--autoform-ref <sha>` together to pin the generated workflows at an immutable
+commit. Passing only one is an error. Use `--force` to overwrite and `--json`
+for machine-readable output.
 
-Inspect a Lean project and list Autoform's bundled known-good release pairs:
+Create or inspect a Lean project and list Autoform's bundled known-good release pairs:
 
 ```bash
+autoform project versions
+autoform project provenance --json
+autoform project new ./FiniteFlat \
+  --package FiniteFlat \
+  --release lean-v4.32.2-mathlib-v4.32.2 \
+  --autoform-source https://github.com/facebookresearch/autoform-bot.git \
+  --autoform-ref <full-commit-sha>
+autoform project new . \
+  --package FiniteFlat \
+  --release lean-v4.32.2-mathlib-v4.32.2 \
+  --autoform-source https://github.com/facebookresearch/autoform-bot.git \
+  --autoform-ref <full-commit-sha>
 autoform project inspect .
 autoform project inspect path/inside/project --json
-autoform project versions
 autoform project versions --json
 ```
+
+`project new` requires an absent target, or the literal target `.` when the
+current directory is empty, plus an explicit release ID. An absent target uses
+one atomic no-replace rename. The `.` form preserves the directory inode and
+mode and uses a durable, recoverable transaction to publish each top-level
+entry without replacement. It never overwrites an existing path. Exactly one
+cooperative concurrent creator can win; ambiguous recovery state is preserved
+for inspection rather than deleted.
+The command does not run Git, Lake, Lean, subprocesses, or network operations.
+It accepts an already verified Autoform source and full commit together, and
+omits generated workflows when neither is supplied.
+
+`project provenance` is the online step. It accepts only the exact plugin-root
+checkout or the bounded Codex installer record, fetches the recorded commit,
+and compares the installed plugin and importable packages with that commit.
+It reports a credential-free HTTPS source and full SHA only after all checks
+pass. A plain wheel cannot infer provenance. Run it before creating the
+consumer target, then pass both returned values to `project new`.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and
