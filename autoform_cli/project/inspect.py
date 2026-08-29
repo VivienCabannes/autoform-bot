@@ -34,11 +34,11 @@ from .model import (
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_STRUCTURAL_DEPTH = 128
 _PROJECT_MARKERS = ("lakefile.toml", "lakefile.lean", "lean-toolchain", "blueprint")
-_TOOLCHAIN = re.compile(r"leanprover/lean4:(?P<version>v\d+\.\d+\.\d+)")
+_TOOLCHAIN = re.compile(r"leanprover/lean4:(?P<version>v[0-9]+\.[0-9]+\.[0-9]+)")
 _RESERVOIR_SCOPE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 # Lake's StdVer: a major.minor.patch triple with an optional `-` suffix that
 # runs to the end of the string.
-_LAKE_VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[^ \t\r\n]+)?")
+_LAKE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[^ \t\r\n]+)?")
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 _LEAN_ID_BEGIN_ESCAPE = "«"
 _LEAN_ID_END_ESCAPE = "»"
@@ -144,6 +144,12 @@ def _discover_root(target: str | Path, diagnostics: list[ProjectDiagnostic]) -> 
         parts = candidate.parts[1:]
         for index, part in enumerate(parts):
             last = index == len(parts) - 1
+            if part == ".":
+                continue
+            if part == "..":
+                if len(descriptors) > 1:
+                    os.close(descriptors.pop())
+                continue
             status = _entry_status(descriptors[-1], part)
             if status == "missing":
                 _issue(
@@ -311,7 +317,7 @@ def _parse_lake_toml(
         default_targets = _string_list(payload.get("defaultTargets", []), "defaultTargets")
         package_src_dir = _portable_path(payload.get("srcDir"), "srcDir")
         targets: list[LakeTarget] = []
-        canonical_target_names: list[str | None] = []
+        canonical_target_names: list[str] = []
         for kind in ("lean_lib", "lean_exe"):
             entries = payload.get(kind, [])
             if not isinstance(entries, list):
@@ -320,7 +326,7 @@ def _parse_lake_toml(
                 if not isinstance(entry, dict):
                     raise _InvalidLakeField(kind)
                 target_name = _required_string(entry.get("name"), f"{kind}.name")
-                canonical_name = _canonical_module_name(target_name)
+                canonical_name = _canonical_target_name(target_name)
                 if kind == "lean_lib" and "root" in entry:
                     raise _InvalidLakeField("lean_lib.root")
                 if kind == "lean_exe" and "roots" in entry:
@@ -329,7 +335,7 @@ def _parse_lake_toml(
                     roots = (
                         _module_list(entry["roots"], "lean_lib.roots")
                         if "roots" in entry
-                        else ((canonical_name,) if canonical_name is not None else None)
+                        else (canonical_name,)
                     )
                 else:
                     roots = ()
@@ -351,16 +357,7 @@ def _parse_lake_toml(
                     )
                 )
                 canonical_target_names.append(canonical_name)
-        known_names = [name for name in canonical_target_names if name is not None]
-        if len(known_names) != len(canonical_target_names):
-            _issue(
-                diagnostics,
-                "warning",
-                "lake-target-names-indeterminate",
-                "Some Lake target names cannot be canonicalized without evaluating Lake.",
-                "lakefile.toml",
-            )
-        if len(set(known_names)) != len(known_names):
+        if len(set(canonical_target_names)) != len(canonical_target_names):
             raise _InvalidLakeField("duplicate target name")
         exe_roots = [target.root for target in targets if target.kind == "lean_exe" and target.root]
         if len(set(exe_roots)) != len(exe_roots):
@@ -857,6 +854,12 @@ def _canonical_module_name(value: str) -> str | None:
     return ".".join(_render_lean_component(kind, text) for kind, text in components)
 
 
+def _canonical_target_name(value: str) -> str:
+    """Apply Lake's `stringToLegalOrSimpleName` fallback for target names."""
+    canonical = _canonical_module_name(value)
+    return canonical if canonical is not None else _render_lean_component("str", value)
+
+
 def _split_lean_name(value: str) -> list[tuple[str, str]] | None:
     components: list[tuple[str, str]] = []
     index = 0
@@ -880,7 +883,8 @@ def _split_lean_name(value: str) -> list[tuple[str, str]] | None:
             start = index
             while index < len(value) and _lean_is_digit(value[index]):
                 index += 1
-            components.append(("num", str(int(value[start:index]))))
+            digits = value[start:index]
+            components.append(("num", digits.lstrip("0") or "0"))
         else:
             return None
         if index == len(value):

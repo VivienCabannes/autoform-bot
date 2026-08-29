@@ -284,7 +284,7 @@ def test_default_target_roots_are_effective(tmp_path: Path) -> None:
     assert result.lake.targets[1].root == "Runner"
 
 
-def test_noncanonical_target_name_remains_valid_but_indeterminate(tmp_path: Path) -> None:
+def test_noncanonical_target_name_uses_lake_simple_name_fallback(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "lakefile.toml").write_text(
         'name = "Example"\n[[lean_lib]]\nname = "my-module"\n',
@@ -293,14 +293,16 @@ def test_noncanonical_target_name_remains_valid_but_indeterminate(tmp_path: Path
     result = inspect_project(root)
     assert result.ok
     assert result.lake is not None
-    assert result.lake.targets[0].roots is None
-    assert any(
+    assert result.lake.targets[0].roots == ("«my-module»",)
+    assert not any(
         diagnostic.code == "lake-target-names-indeterminate"
         for diagnostic in result.diagnostics
     )
 
 
-@pytest.mark.parametrize("version", ["wat", "v1.2.3", "1.2", "1.2.3.4", "1.2.3+build"])
+@pytest.mark.parametrize(
+    "version", ["wat", "v1.2.3", "1.2", "1.2.3.4", "1.2.3+build", "١.٢.٣"]
+)
 def test_invalid_lake_versions_are_rejected(tmp_path: Path, version: str) -> None:
     root = _project(tmp_path)
     (root / "lakefile.toml").write_text(
@@ -334,6 +336,30 @@ def test_numeric_roots_are_canonicalized_before_duplicate_detection(tmp_path: Pa
     assert any(diagnostic.code == "invalid-lake-field" for diagnostic in result.diagnostics)
 
 
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        ('[[lean_lib]]\nname = "{numeric}"\n', ("1",)),
+        ('[[lean_exe]]\nname = "Runner"\nroot = "{numeric}"\n', "1"),
+    ],
+)
+def test_large_numeric_lean_names_are_normalized_lexically(
+    tmp_path: Path, declaration: str, expected: str | tuple[str, ...]
+) -> None:
+    root = _project(tmp_path)
+    numeric = "0" * 4_999 + "1"
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\n' + declaration.format(numeric=numeric), encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.lake is not None
+    target = result.lake.targets[0]
+    assert (target.roots if target.kind == "lean_lib" else target.root) == expected
+
+
 def test_letter_like_unicode_target_names_are_canonical(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "lakefile.toml").write_text(
@@ -359,6 +385,21 @@ def test_duplicate_target_names_are_rejected(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     result = inspect_project(root)
+    assert not result.ok
+    assert any(diagnostic.code == "invalid-lake-field" for diagnostic in result.diagnostics)
+
+
+def test_duplicate_simple_fallback_target_names_are_rejected(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\n'
+        '[[lean_lib]]\nname = "my-module"\n'
+        '[[lean_exe]]\nname = "«my-module»"\n',
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
     assert not result.ok
     assert any(diagnostic.code == "invalid-lake-field" for diagnostic in result.diagnostics)
 
@@ -816,6 +857,55 @@ def test_root_discovery_stays_bound_to_the_directory_it_opened(
     assert swapped
     assert result.ok
     assert result.lake is not None and result.lake.name == "Example"
+
+
+def test_root_discovery_resolves_parent_components_from_retained_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli.project import inspect as inspect_module
+
+    base = tmp_path / "base"
+    base.mkdir()
+    _project(base)
+    child = base / "child"
+    child.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_root = _project(outside)
+    (outside_root / "lakefile.toml").write_text('name = "Outside"\n', encoding="utf-8")
+    swapped = False
+    original_open = inspect_module._open_directory
+
+    def moving_open(name: str, parent_descriptor: int | None) -> int:
+        nonlocal swapped
+        descriptor = original_open(name, parent_descriptor)
+        if name == "child" and not swapped:
+            swapped = True
+            child.rename(outside / "child")
+        return descriptor
+
+    monkeypatch.setattr(inspect_module, "_open_directory", moving_open)
+    result = inspect_project(child / ".." / "project")
+
+    assert swapped
+    assert result.ok
+    assert result.lake is not None and result.lake.name == "Example"
+
+
+def test_non_ascii_digits_do_not_match_stable_toolchain_versions(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "lean-toolchain").write_text(
+        "leanprover/lean4:v١.٢.٣\n", encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.lean is not None and result.lean.version is None
+    assert any(
+        diagnostic.code == "unrecognized-lean-toolchain"
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_tilde_expansion_failure_is_a_stable_diagnostic() -> None:
