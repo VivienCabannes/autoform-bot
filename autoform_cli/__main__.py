@@ -22,9 +22,11 @@ from .lean import build_linker, declaration_names
 from .project import (
     ProjectCatalogError,
     ProjectCreateError,
+    ProjectRepairError,
     create_project,
     inspect_project,
     load_release_catalog,
+    repair_project,
 )
 from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
@@ -93,6 +95,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="full 40-character Autoform commit for generated workflows",
     )
     project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    project_repair = project_subparsers.add_parser(
+        "repair", help="conservatively add unambiguous missing project files"
+    )
+    project_repair.add_argument("target", help="existing project directory")
+    project_repair.add_argument(
+        "--title", help="exact human project title for missing generated files"
+    )
+    project_repair.add_argument(
+        "--repository-url",
+        help="exact project URL for a missing site configuration (empty is allowed)",
+    )
+    project_repair.add_argument(
+        "--autoform-source",
+        help="exact Autoform Git source for missing workflows",
+    )
+    project_repair.add_argument(
+        "--autoform-ref",
+        help="exact immutable Autoform commit for missing workflows",
+    )
+    project_repair.add_argument("--dry-run", action="store_true", help="report without writing")
+    project_repair.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_inspect = project_subparsers.add_parser(
         "inspect", help="inspect a project without running Lake, Git, or network operations"
     )
@@ -312,6 +335,23 @@ def _project(args: argparse.Namespace) -> int:
                 if not result.workflows_pinned:
                     print("warning: workflows were omitted because no immutable Autoform pin was available")
             return 0
+        if args.project_command == "repair":
+            result = repair_project(
+                args.target,
+                dry_run=args.dry_run,
+                title=args.title,
+                repository_url=args.repository_url,
+                autoform_source=args.autoform_source,
+                autoform_ref=args.autoform_ref,
+            )
+            if args.json:
+                print(result.to_json())
+            else:
+                action = "Would add" if result.dry_run else "Added"
+                print(f"{action} {len(result.planned if result.dry_run else result.written)} file(s)")
+                for path in result.planned if result.dry_run else result.written:
+                    print(f"  {path}")
+            return 0
         if args.project_command == "inspect":
             result = inspect_project(args.target)
             if args.json:
@@ -339,6 +379,19 @@ def _project(args: argparse.Namespace) -> int:
                 print(f"Source: {result.source}")
                 print(f"Revision: {result.revision}")
             return 0
+    except ProjectRepairError as error:
+        if getattr(args, "json", False):
+            print(error.to_json())
+        else:
+            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+            for conflict in error.conflicts:
+                location = f" {conflict.path}" if conflict.path else ""
+                print(f"  {conflict.code}{location}: {conflict.message}", file=sys.stderr)
+            if error.written:
+                print("  files already published:", file=sys.stderr)
+                for path in error.written:
+                    print(f"    {path}", file=sys.stderr)
+        return 1
     except ProjectCreateError as error:
         if getattr(args, "json", False):
             print(error.to_json())
