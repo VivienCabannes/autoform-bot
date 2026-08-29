@@ -415,6 +415,23 @@ def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
     assert "../setup/references/zulip.md" in roadmap
 
 
+def test_setup_resolves_provenance_before_creating_a_consumer(repo_root: Path) -> None:
+    setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+
+    provenance = setup.index("autoform project provenance --json")
+    creation = setup.index("autoform project new <TARGET>")
+    assert provenance < creation
+    for required in (
+        "<AUTOFORM_PLUGIN_ROOT>",
+        "plain wheel cannot infer provenance",
+        "single\nrecommended release",
+        "--autoform-source <VERIFIED_HTTPS_GIT_SOURCE>",
+        "--autoform-ref <VERIFIED_40_CHAR_SHA>",
+        "without running Git, Lake, Lean, or\nnetwork operations",
+    ):
+        assert required in setup
+
+
 def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
     """Agent instructions must match what `autoform_cli.graph` actually parses.
 
@@ -494,6 +511,14 @@ def test_skills_delegate_the_command_line_to_the_reference(repo_root: Path) -> N
         if "autoform_cli/README.md" in text:
             citing += 1
     assert citing >= 3
+
+
+def test_setup_uses_the_packaged_in_place_project_creator(repo_root: Path) -> None:
+    setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+
+    assert "autoform project new ." in setup
+    assert "preserves the current directory inode and mode" in setup
+    assert "scripts/make_project.sh" not in setup
 
 
 def test_roadmap_reconciles_the_pages_setup_wrote(repo_root: Path) -> None:
