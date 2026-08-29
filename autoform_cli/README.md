@@ -136,7 +136,9 @@ Create or inspect a Lean project and list Autoform's bundled known-good release 
 autoform project versions
 autoform project new ./FiniteFlat \
   --package FiniteFlat \
-  --release lean-v4.32.2-mathlib-v4.32.2
+  --release lean-v4.32.2-mathlib-v4.32.2 \
+  --autoform-source https://github.com/facebookresearch/autoform-bot.git \
+  --autoform-ref <full-commit-sha>
 autoform project inspect .
 autoform project inspect path/inside/project --json
 autoform project versions --json
@@ -149,8 +151,8 @@ validates the staged project, then publishes the directory with an atomic
 no-replace rename. It never overwrites an existing path. Failed and concurrent
 creations leave no partial target, and exactly one concurrent creator can win.
 The command does not run Git, Lake, Lean, subprocesses, or network operations.
-Generated workflows are omitted unless creation can use an explicit immutable
-Autoform pin in a future interface; the local project remains complete.
+Pass both provenance flags to include pinned CI workflows; without them the
+local project is complete but the workflows are omitted.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and

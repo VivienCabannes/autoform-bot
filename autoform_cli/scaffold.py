@@ -34,6 +34,7 @@ DEFAULT_AUTOFORM_SOURCE = "https://github.com/facebookresearch/autoform-bot.git"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}")
 
+
 def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -> str | None:
     """Compatibility wrapper for explicit workflow-source validation."""
 
@@ -74,6 +75,13 @@ class ScaffoldResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _ScaffoldFile:
+    relative: str
+    content: bytes
+    mode: int
+
+
 def _destination(relative: str) -> str:
     for template_prefix, real_prefix in _DOTTED.items():
         if relative == template_prefix:
@@ -109,6 +117,48 @@ def _render(text: str, substitutions: dict[str, str]) -> str:
     )
 
 
+def _scaffold_plan(
+    *,
+    title: str,
+    repository_url: str,
+    autoform_source: str,
+    autoform_ref: str,
+) -> tuple[tuple[_ScaffoldFile, ...], tuple[str, ...]]:
+    substitutions = {
+        "PROJECT_TITLE_YAML": _yaml_scalar(title),
+        "REPO_URL_YAML": _yaml_scalar(repository_url),
+        "PROJECT_TITLE": title,
+        "REPO_URL": repository_url,
+        "AUTOFORM_SOURCE": autoform_source,
+        "AUTOFORM_REF": autoform_ref,
+        "AUTOFORM_SOURCE_YAML": _yaml_scalar(autoform_source),
+        "AUTOFORM_REF_YAML": _yaml_scalar(autoform_ref),
+    }
+    files: list[_ScaffoldFile] = []
+    skipped: list[str] = []
+    for template in sorted(_TEMPLATES.rglob("*")):
+        relative_path = template.relative_to(_TEMPLATES)
+        if not template.is_file() or "__pycache__" in relative_path.parts or template.suffix == ".pyc":
+            continue
+        relative = relative_path.as_posix()
+        destination = _destination(relative)
+        if not autoform_ref and relative.startswith("github/"):
+            skipped.append(destination)
+            continue
+        if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
+            content = template.read_bytes()
+        else:
+            content = _render(template.read_text(encoding="utf-8"), substitutions).encode("utf-8")
+        files.append(
+            _ScaffoldFile(
+                relative=destination,
+                content=content,
+                mode=stat.S_IMODE(template.stat().st_mode),
+            )
+        )
+    return tuple(files), tuple(skipped)
+
+
 def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
     """Replace *destination* from a same-directory temporary file.
 
@@ -116,9 +166,7 @@ def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
     has hard links: ``--force`` must not modify another path to the old inode.
     """
 
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
-    )
+    descriptor, temporary_name = tempfile.mkstemp(dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp")
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as output:
@@ -154,7 +202,6 @@ def scaffold_project(
     autoform_source: str = "",
     autoform_ref: str = "",
     force: bool = False,
-    discover_plugin_pin: bool = True,
 ) -> ScaffoldResult:
     """Write the blueprint vault, site config, and CI into *target*.
 
@@ -187,19 +234,13 @@ def scaffold_project(
     if autoform_source:
         normalized = _normalize_autoform_source(autoform_source)
         if normalized is None:
-            issues.append(
-                "--autoform-source must be a safe credential-free HTTPS Git URL ending in .git"
-            )
+            issues.append("--autoform-source must be a safe credential-free HTTPS Git URL ending in .git")
         else:
             given_source = normalized
     if issues:
         raise ScaffoldError(issues)
 
-    pinned_source, pinned_ref = (
-        plugin_pin()
-        if discover_plugin_pin and not (given_source or given_ref)
-        else ("", "")
-    )
+    pinned_source, pinned_ref = plugin_pin() if not (given_source or given_ref) else ("", "")
     safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
     if safe_pinned_source is None or not _FULL_SHA.fullmatch(pinned_ref.lower()):
         pinned_source, pinned_ref = "", ""
@@ -216,54 +257,32 @@ def scaffold_project(
     # project whose first CI step fails for a reason no file in it explains. So
     # the ref alone decides: without one the workflows are skipped and reported.
     unpinned = not ref
-    substitutions = {
-        "PROJECT_TITLE_YAML": _yaml_scalar(title.strip()),
-        "REPO_URL_YAML": _yaml_scalar(repository_url.strip()),
-        "PROJECT_TITLE": title.strip(),
-        "REPO_URL": repository_url.strip(),
-        "AUTOFORM_SOURCE": source,
-        "AUTOFORM_REF": ref,
-        "AUTOFORM_SOURCE_YAML": _yaml_scalar(source),
-        "AUTOFORM_REF_YAML": _yaml_scalar(ref),
-    }
+    planned, omitted = _scaffold_plan(
+        title=title.strip(),
+        repository_url=repository_url.strip(),
+        autoform_source=source,
+        autoform_ref=ref,
+    )
 
     written: list[str] = []
-    skipped: list[str] = []
-    for template in sorted(_TEMPLATES.rglob("*")):
-        relative_path = template.relative_to(_TEMPLATES)
-        if (
-            not template.is_file()
-            or "__pycache__" in relative_path.parts
-            or template.suffix == ".pyc"
-        ):
-            continue
-        relative = relative_path.as_posix()
-        if unpinned and relative.startswith("github/"):
-            skipped.append(_destination(relative))
-            continue
-        destination = root / _destination(relative)
+    skipped = list(omitted)
+    for planned_file in planned:
+        destination = root / planned_file.relative
         # Confine every write, not just the root. Reject links outright before
         # checking whether the destination should be skipped: `exists()` is
         # false for a dangling symlink, but opening that path still follows the
         # link and can create a file outside the project.
         probe = root
-        for part in Path(_destination(relative)).parts:
+        for part in Path(planned_file.relative).parts:
             probe = probe / part
             if probe.is_symlink() or (probe.exists() and not _within(probe, root)):
-                raise ScaffoldError(
-                    [f"refusing to write outside the project through a link: {probe}"]
-                )
+                raise ScaffoldError([f"refusing to write outside the project through a link: {probe}"])
         if destination.exists() and not force:
-            skipped.append(_destination(relative))
+            skipped.append(planned_file.relative)
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
-            content = template.read_bytes()
-        else:
-            rendered = _render(template.read_text(encoding="utf-8"), substitutions)
-            content = rendered.encode("utf-8")
-        _atomic_write(destination, content, mode=stat.S_IMODE(template.stat().st_mode))
-        written.append(_destination(relative))
+        _atomic_write(destination, planned_file.content, mode=planned_file.mode)
+        written.append(planned_file.relative)
 
     return ScaffoldResult(title.strip(), tuple(written), tuple(skipped), unpinned)
 

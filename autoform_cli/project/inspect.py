@@ -58,15 +58,20 @@ def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None
     if root_descriptor is None:
         return _inspection(diagnostics, release_catalog)
     try:
-        lake, mathlib = _inspect_lake(root_descriptor, diagnostics)
-        lean = _inspect_toolchain(root_descriptor, diagnostics)
-        manifest_path, manifest_digest = _optional_digest(
-            root_descriptor, "lake-manifest.json", diagnostics
-        )
-        autoform = _inspect_autoform(root_descriptor, diagnostics)
-        git_path = _inspect_git(root_descriptor, diagnostics)
+        return _inspect_project_root(root_descriptor, release_catalog)
     finally:
         os.close(root_descriptor)
+
+
+def _inspect_project_root(root_descriptor: int, release_catalog: ReleaseCatalog) -> ProjectInspection:
+    """Inspect an already-bound project root without taking ownership of it."""
+
+    diagnostics: list[ProjectDiagnostic] = []
+    lake, mathlib = _inspect_lake(root_descriptor, diagnostics)
+    lean = _inspect_toolchain(root_descriptor, diagnostics)
+    manifest_path, manifest_digest = _optional_digest(root_descriptor, "lake-manifest.json", diagnostics)
+    autoform = _inspect_autoform(root_descriptor, diagnostics)
+    git_path = _inspect_git(root_descriptor, diagnostics)
     compatibility = _compatibility(release_catalog, lean, mathlib, diagnostics)
     return ProjectInspection(
         schema=PROJECT_INSPECTION_SCHEMA,
@@ -156,9 +161,7 @@ def _discover_root(target: str | Path, diagnostics: list[ProjectDiagnostic]) -> 
                 return None
             if status == "symlink":
                 if last:
-                    _issue(
-                        diagnostics, "error", "target-is-symlink", "The inspection target is a symlink."
-                    )
+                    _issue(diagnostics, "error", "target-is-symlink", "The inspection target is a symlink.")
                 else:
                     _issue(
                         diagnostics,
@@ -198,9 +201,7 @@ def _discover_root(target: str | Path, diagnostics: list[ProjectDiagnostic]) -> 
             return None
 
         for descriptor in reversed(descriptors):
-            if any(
-                _relative_status(descriptor, marker) != "missing" for marker in _PROJECT_MARKERS
-            ):
+            if any(_relative_status(descriptor, marker) != "missing" for marker in _PROJECT_MARKERS):
                 chosen = descriptor
                 return chosen
         _issue(diagnostics, "error", "project-not-found", "No enclosing Lean or Autoform project was found.")
@@ -308,9 +309,7 @@ def _parse_lake_toml(
         name = _required_string(payload.get("name"), "name")
         version = _lake_version(payload.get("version"))
         default_targets = _string_list(payload.get("defaultTargets", []), "defaultTargets")
-        package_src_dir = _portable_path(
-            payload.get("srcDir"), "srcDir", allow_empty=True
-        )
+        package_src_dir = _portable_path(payload.get("srcDir"), "srcDir", allow_empty=True)
         targets: list[LakeTarget] = []
         canonical_target_names: list[str] = []
         for kind in ("lean_lib", "lean_exe"):
@@ -327,11 +326,7 @@ def _parse_lake_toml(
                 if kind == "lean_exe" and "roots" in entry:
                     raise _InvalidLakeField("lean_exe.roots")
                 if kind == "lean_lib":
-                    roots = (
-                        _module_list(entry["roots"], "lean_lib.roots")
-                        if "roots" in entry
-                        else (canonical_name,)
-                    )
+                    roots = _module_list(entry["roots"], "lean_lib.roots") if "roots" in entry else (canonical_name,)
                 else:
                     roots = ()
                 targets.append(
@@ -339,11 +334,7 @@ def _parse_lake_toml(
                         kind=kind,
                         name=target_name,
                         root=(
-                            (
-                                _module(entry["root"], "lean_exe.root")
-                                if "root" in entry
-                                else canonical_name
-                            )
+                            (_module(entry["root"], "lean_exe.root") if "root" in entry else canonical_name)
                             if kind == "lean_exe"
                             else None
                         ),
@@ -418,7 +409,13 @@ def _inspect_toolchain(root_descriptor: int, diagnostics: list[ProjectDiagnostic
         or decoded not in {text, f"{text}\n", f"{text}\r\n"}
         or any(ord(character) < 32 or ord(character) == 127 for character in text)
     ):
-        _issue(diagnostics, "error", "invalid-lean-toolchain", "lean-toolchain must contain one UTF-8 value.", "lean-toolchain")
+        _issue(
+            diagnostics,
+            "error",
+            "invalid-lean-toolchain",
+            "lean-toolchain must contain one UTF-8 value.",
+            "lean-toolchain",
+        )
         return None
     match = _TOOLCHAIN.fullmatch(text)
     if match is None:
@@ -523,10 +520,7 @@ def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]
             values[field] = None
         else:
             values[field] = relative
-    workflow_count = sum(
-        values[field] is not None
-        for field in ("verification_workflow_path", "pages_workflow_path")
-    )
+    workflow_count = sum(values[field] is not None for field in ("verification_workflow_path", "pages_workflow_path"))
     if values["blueprint_path"] is not None and values["mkdocs_path"] is None:
         _issue(diagnostics, "warning", "autoform-mkdocs-missing", "The blueprint has no mkdocs.yml.")
     if workflow_count == 1:
@@ -587,9 +581,7 @@ def _optional_digest(
 ) -> tuple[str | None, str | None]:
     if _relative_status(root_descriptor, relative) == "missing":
         return None, None
-    content = _read_file(
-        root_descriptor, relative, "lake-manifest", diagnostics, severity="warning"
-    )
+    content = _read_file(root_descriptor, relative, "lake-manifest", diagnostics, severity="warning")
     if content is None:
         return None, None
     try:
@@ -626,11 +618,7 @@ def _read_file(
     try:
         descriptor = os.open(name, flags, dir_fd=parent)
     except OSError as error:
-        code = (
-            f"{kind}-is-symlink"
-            if error.errno in {errno.ELOOP, errno.ENOTDIR}
-            else f"{kind}-unreadable"
-        )
+        code = f"{kind}-is-symlink" if error.errno in {errno.ELOOP, errno.ENOTDIR} else f"{kind}-unreadable"
         message = (
             "A decision-bearing project file cannot be opened without following links."
             if code.endswith("-is-symlink")
@@ -684,9 +672,7 @@ def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
     for entry in requirements:
         if not isinstance(entry, dict):
             raise _InvalidLakeField("require")
-        canonical_names.append(
-            _canonical_target_name(_required_string(entry.get("name"), "require.name"))
-        )
+        canonical_names.append(_canonical_target_name(_required_string(entry.get("name"), "require.name")))
     matches = [
         entry
         for entry, canonical_name in zip(requirements, canonical_names, strict=True)
@@ -709,9 +695,7 @@ def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
             _validate_dependency_source(entry["source"])
 
 
-def _parse_mathlib(
-    payload: dict[str, Any], diagnostics: list[ProjectDiagnostic]
-) -> MathlibProject | None:
+def _parse_mathlib(payload: dict[str, Any], diagnostics: list[ProjectDiagnostic]) -> MathlibProject | None:
     requirements = payload.get("require", [])
     if not isinstance(requirements, list):
         return None
@@ -725,11 +709,7 @@ def _parse_mathlib(
     if len(matches) != 1:
         return None
     entry = matches[0]
-    if (
-        "path" in entry
-        or "source" in entry
-        or entry.get("subDir") not in (None, "", ".")
-    ):
+    if "path" in entry or "source" in entry or entry.get("subDir") not in (None, "", "."):
         return None
     revision = entry.get("rev")
     if not isinstance(revision, str):
@@ -792,9 +772,7 @@ def _validate_dependency_source(value: Any) -> None:
         if "rev" in value:
             _required_string(value["rev"], "mathlib.source.rev")
         if "subDir" in value:
-            _portable_path(
-                value["subDir"], "mathlib.source.subDir", allow_empty=True
-            )
+            _portable_path(value["subDir"], "mathlib.source.subDir", allow_empty=True)
     else:
         raise _InvalidLakeField("mathlib.source.type")
 
@@ -866,14 +844,8 @@ def _canonical_module_name(value: str) -> str | None:
     if components is None:
         return None
     root_kind, root_text = components[0]
-    escape = not (
-        root_kind == "str"
-        and (root_text.startswith("#") or root_text.startswith("?"))
-    )
-    return ".".join(
-        _render_lean_component(kind, text, escape=escape)
-        for kind, text in components
-    )
+    escape = not (root_kind == "str" and (root_text.startswith("#") or root_text.startswith("?")))
+    return ".".join(_render_lean_component(kind, text, escape=escape) for kind, text in components)
 
 
 def _canonical_target_name(value: str) -> str:
@@ -971,17 +943,10 @@ def _lean_is_letter_like(character: str) -> bool:
 
 def _lean_is_subscript_alnum(character: str) -> bool:
     code = ord(character)
-    return (
-        0x2080 <= code <= 0x2089
-        or 0x2090 <= code <= 0x209C
-        or 0x1D62 <= code <= 0x1D6A
-        or code == 0x2C7C
-    )
+    return 0x2080 <= code <= 0x2089 or 0x2090 <= code <= 0x209C or 0x1D62 <= code <= 0x1D6A or code == 0x2C7C
 
 
-def _portable_path(
-    value: Any, field: str, *, allow_empty: bool = False
-) -> str | None:
+def _portable_path(value: Any, field: str, *, allow_empty: bool = False) -> str | None:
     if value is None:
         return None
     if isinstance(value, str) and value in {"", "."} and allow_empty:

@@ -44,8 +44,16 @@ manifest is included, but Muse installation is not covered here.
 
 ## Quick start
 
-Work from an existing Lean repository. Verify the Autoform checkout, then
-scaffold the blueprint and site configuration:
+Create a new Lean and Autoform project from a bundled compatible release:
+
+```bash
+uv run autoform project versions
+uv run autoform project new /path/to/NewProject \
+  --package NewProject --release lean-v4.32.2-mathlib-v4.32.2
+```
+
+To add Autoform to an existing Lean repository, verify the Autoform checkout,
+then scaffold the blueprint and site configuration:
 
 ```bash
 uv run autoform project provenance --json
@@ -55,10 +63,7 @@ uv run autoform init /path/to/lean-project
 This creates `blueprint/`, `mkdocs.yml`, and `requirements-docs.txt`. GitHub
 workflows are created only when Autoform has a verified immutable source and
 commit. To override discovery, pass both `--autoform-source` and
-`--autoform-ref`; a ref alone is resolved against the canonical repository. The Setup
-skill can inspect and repair this infrastructure, but its new-project Lean
-bootstrap helper is not packaged on `main`; start from an existing Lean project
-and use `autoform init` for the blueprint and publication files.
+`--autoform-ref`; a ref alone is resolved against the canonical repository.
 
 Next use the host skills from the Lean project:
 
@@ -102,6 +107,8 @@ complete frontmatter, hierarchy, status, and validation rules.
 
 | Command | Purpose |
 | --- | --- |
+| `autoform project new` | Atomically create a compatible Lean and Autoform project. |
+| `autoform project inspect` | Inspect local project configuration without executing it. |
 | `autoform init` | Scaffold the blueprint and site; add CI when immutably pinned. |
 | `autoform check` | Validate Markdown structure and dependencies. |
 | `autoform audit` | Audit completeness and checked facts. |

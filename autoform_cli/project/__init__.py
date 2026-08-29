@@ -1,4 +1,4 @@
-"""Offline Lean project inspection and supported release data."""
+"""Lean project creation, inspection, and supported release data."""
 
 from .catalog import ProjectCatalogError, load_release_catalog, parse_release_catalog
 from .create import ProjectCreateError, ProjectCreateResult, create_project

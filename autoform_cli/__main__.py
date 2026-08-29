@@ -80,6 +80,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     project_new.add_argument("--package", help="UpperCamelCase Lean package name")
     project_new.add_argument("--release", help="release id from 'project versions'")
+    project_new.add_argument(
+        "--autoform-source",
+        default="",
+        help="trusted Autoform Git source for generated workflows",
+    )
+    project_new.add_argument(
+        "--autoform-ref",
+        default="",
+        help="full 40-character Autoform commit for generated workflows",
+    )
     project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_inspect = project_subparsers.add_parser(
         "inspect", help="inspect a project without running Lake, Git, or network operations"
@@ -285,7 +295,13 @@ def _doctor(args: argparse.Namespace) -> int:
 def _project(args: argparse.Namespace) -> int:
     try:
         if args.project_command == "new":
-            result = create_project(args.target, package=args.package, release_id=args.release)
+            result = create_project(
+                args.target,
+                package=args.package,
+                release_id=args.release,
+                autoform_source=args.autoform_source,
+                autoform_ref=args.autoform_ref,
+            )
             if args.json:
                 print(result.to_json())
             else:
