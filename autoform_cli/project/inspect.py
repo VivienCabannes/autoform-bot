@@ -676,11 +676,18 @@ def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
     requirements = payload.get("require", [])
     if not isinstance(requirements, list):
         raise _InvalidLakeField("require")
+    canonical_names: list[str] = []
     for entry in requirements:
         if not isinstance(entry, dict):
             raise _InvalidLakeField("require")
-        _required_string(entry.get("name"), "require.name")
-    matches = [entry for entry in requirements if entry["name"] == "mathlib"]
+        canonical_names.append(
+            _canonical_target_name(_required_string(entry.get("name"), "require.name"))
+        )
+    matches = [
+        entry
+        for entry, canonical_name in zip(requirements, canonical_names, strict=True)
+        if canonical_name == "mathlib"
+    ]
     if len(matches) > 1:
         raise _DuplicateMathlibRequirement("duplicate mathlib")
     for entry in matches:
@@ -704,7 +711,13 @@ def _parse_mathlib(
     requirements = payload.get("require", [])
     if not isinstance(requirements, list):
         return None
-    matches = [entry for entry in requirements if isinstance(entry, dict) and entry.get("name") == "mathlib"]
+    matches = [
+        entry
+        for entry in requirements
+        if isinstance(entry, dict)
+        and isinstance(entry.get("name"), str)
+        and _canonical_target_name(entry["name"]) == "mathlib"
+    ]
     if len(matches) != 1:
         return None
     entry = matches[0]
@@ -851,13 +864,24 @@ def _canonical_module_name(value: str) -> str | None:
     components = _split_lean_name(value)
     if components is None:
         return None
-    return ".".join(_render_lean_component(kind, text) for kind, text in components)
+    root_kind, root_text = components[0]
+    escape = not (
+        root_kind == "str"
+        and (root_text.startswith("#") or root_text.startswith("?"))
+    )
+    return ".".join(
+        _render_lean_component(kind, text, escape=escape)
+        for kind, text in components
+    )
 
 
 def _canonical_target_name(value: str) -> str:
     """Apply Lake's `stringToLegalOrSimpleName` fallback for target names."""
     canonical = _canonical_module_name(value)
-    return canonical if canonical is not None else _render_lean_component("str", value)
+    if canonical is not None:
+        return canonical
+    escape = not (value.startswith("#") or value.startswith("?"))
+    return _render_lean_component("str", value, escape=escape)
 
 
 def _split_lean_name(value: str) -> list[tuple[str, str]] | None:
@@ -894,8 +918,14 @@ def _split_lean_name(value: str) -> list[tuple[str, str]] | None:
         index += 1
 
 
-def _render_lean_component(kind: str, text: str) -> str:
+def _render_lean_component(kind: str, text: str, *, escape: bool = True) -> str:
     if kind == "num":
+        return text
+    if not escape:
+        return text
+    # Lean's `Name.escapePart` cannot round-trip a closing guillemet, so it
+    # leaves the complete simple component unescaped in that case.
+    if _LEAN_ID_END_ESCAPE in text:
         return text
     if text and _lean_is_id_first(text[0]) and all(_lean_is_id_rest(c) for c in text[1:]):
         return text

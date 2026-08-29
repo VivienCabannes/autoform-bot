@@ -301,6 +301,31 @@ def test_noncanonical_target_name_uses_lake_simple_name_fallback(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
+    ("name", "root"),
+    [
+        ("foo«", "«foo«»"),
+        ("foo»", "foo»"),
+        ("#foo", "#foo"),
+        ("?foo", "?foo"),
+        ("«#foo».«my-module»", "#foo.my-module"),
+    ],
+)
+def test_target_name_rendering_matches_lake_escape_fallback(
+    tmp_path: Path, name: str, root: str
+) -> None:
+    project = _project(tmp_path)
+    (project / "lakefile.toml").write_text(
+        f'name = "Example"\n[[lean_lib]]\nname = "{name}"\n', encoding="utf-8"
+    )
+
+    result = inspect_project(project)
+
+    assert result.ok
+    assert result.lake is not None
+    assert result.lake.targets[0].roots == (root,)
+
+
+@pytest.mark.parametrize(
     "version", ["wat", "v1.2.3", "1.2", "1.2.3.4", "1.2.3+build", "١.٢.٣"]
 )
 def test_invalid_lake_versions_are_rejected(tmp_path: Path, version: str) -> None:
@@ -426,6 +451,44 @@ def test_duplicate_mathlib_requirements_are_rejected(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     result = inspect_project(root)
+    assert not result.ok
+    assert any(
+        diagnostic.code == "duplicate-mathlib-requirement"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_escaped_mathlib_requirement_matches_catalog(tmp_path: Path) -> None:
+    recommended = load_release_catalog().recommended
+    root = _project(tmp_path)
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\n[[require]]\nname = "«mathlib»"\n'
+        f'git = "{recommended.mathlib.git}"\n'
+        f'rev = "{recommended.mathlib.revision}"\n',
+        encoding="utf-8",
+    )
+    (root / "lean-toolchain").write_text(
+        f"{recommended.lean.toolchain}\n", encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.compatibility.release == recommended.id
+
+
+def test_equivalent_mathlib_requirement_spellings_are_duplicates(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\n'
+        '[[require]]\nname = "mathlib"\nrev = "v4.33.1"\n'
+        '[[require]]\nname = "«mathlib»"\nrev = "v4.33.1"\n',
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
     assert not result.ok
     assert any(
         diagnostic.code == "duplicate-mathlib-requirement"
