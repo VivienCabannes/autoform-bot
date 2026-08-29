@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import socket
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import time
 
 import pytest
 
+from servers import lean_runtime as lean_runtime_module
 from servers.lean_client import (
     INSTALL_PATH_ID,
     PROTOCOL_VERSION,
@@ -199,6 +201,132 @@ def test_lru_limit_never_evicts_an_active_project(tmp_path):
     assert closed == [first.resolve(), second.resolve()]
 
 
+def test_root_replacement_invalidates_a_warm_project_resource(tmp_path):
+    project = make_lake_project(tmp_path, "replace-root")
+    created = []
+    closed = []
+
+    def factory(root):
+        resource = object()
+        created.append((root, resource))
+        return resource
+
+    cache = ProjectResourceCache(
+        factory,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)) as first:
+        pass
+
+    moved = project.with_name("replaced-root")
+    project.rename(moved)
+    project.mkdir()
+    (project / "lakefile.toml").write_bytes((moved / "lakefile.toml").read_bytes())
+
+    with cache.lease(str(project)) as second:
+        assert second is not first
+
+    assert len(created) == 2
+    assert closed == [first]
+    cache.close()
+    assert closed == [first, second]
+
+
+def test_root_replacement_during_startup_discards_the_resource(tmp_path):
+    project = make_lake_project(tmp_path, "replace-during-startup")
+    moved = project.with_name("startup-original")
+    resource = object()
+    closed = []
+
+    def factory(root):
+        root.rename(moved)
+        root.mkdir()
+        (root / "lakefile.toml").write_bytes(
+            (moved / "lakefile.toml").read_bytes()
+        )
+        return resource
+
+    cache = ProjectResourceCache(
+        factory,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(ProjectResourceBusyError, match="changed during startup"):
+        with cache.lease(str(project)):
+            pytest.fail("a resource bound to the replaced root must not be leased")
+
+    cache.close()
+    assert closed == [resource]
+    assert cache.state(str(project)) == "cold"
+
+
+def test_factory_created_derived_directory_does_not_invalidate_startup(tmp_path):
+    project = make_lake_project(tmp_path, "derived-during-startup")
+    resource = object()
+    closed = []
+
+    def factory(root):
+        (root / ".lake").mkdir()
+        return resource
+
+    cache = ProjectResourceCache(
+        factory,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with cache.lease(str(project)) as leased:
+        assert leased is resource
+
+    assert closed == []
+    cache.close()
+    assert closed == [resource]
+
+
+def test_continuous_fingerprint_churn_honors_the_acquisition_deadline(
+    tmp_path, monkeypatch
+):
+    project = make_lake_project(tmp_path, "fingerprint-churn")
+    created = []
+    cache = ProjectResourceCache(
+        lambda root: created.append(root) or root,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+    stable = cache._entries[project.resolve()].fingerprint
+    fingerprints = iter((stable, object()) * 100_000)
+    monkeypatch.setattr(
+        lean_runtime_module,
+        "lean_project_fingerprint",
+        lambda root: next(fingerprints),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProjectResourceBusyError, match="timed out waiting"):
+        with cache.lease(
+            str(project),
+            acquisition_timeout=0.05,
+            creation_budget=0,
+        ):
+            pytest.fail("unstable project fingerprint reached the request")
+
+    assert time.monotonic() - started < 0.5
+    assert len(created) == 1
+    cache.close()
+
+
 def test_project_slot_admission_stops_before_the_response_budget(tmp_path):
     first = make_lake_project(tmp_path, "busy-first")
     second = make_lake_project(tmp_path, "busy-second")
@@ -226,18 +354,297 @@ def test_project_slot_admission_stops_before_the_response_budget(tmp_path):
     cache.close()
 
 
+def test_cache_close_forces_cleanup_then_waits_for_an_active_lease(tmp_path):
+    project = make_lake_project(tmp_path, "active-close")
+    leased = threading.Event()
+    release = threading.Event()
+    cleanup_started = threading.Event()
+    closed = []
+    errors = []
+
+    def close_resource(resource):
+        closed.append(resource)
+        cleanup_started.set()
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    def hold_lease():
+        try:
+            with cache.lease(str(project)):
+                leased.set()
+                release.wait(timeout=2)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=hold_lease)
+    thread.start()
+    assert leased.wait(timeout=1)
+    cache_closed = threading.Event()
+
+    def close_cache():
+        cache.close(timeout=0.05)
+        cache_closed.set()
+
+    closer = threading.Thread(target=close_cache)
+    closer.start()
+    try:
+        assert cleanup_started.wait(timeout=1)
+        assert not cache_closed.wait(timeout=0.1)
+        assert closed == [project.resolve()]
+    finally:
+        release.set()
+        thread.join(timeout=2)
+        closer.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert not closer.is_alive()
+    assert cache_closed.is_set()
+    assert errors == []
+
+
+def test_cache_close_retains_ownership_until_resource_cleanup_finishes(tmp_path):
+    project = make_lake_project(tmp_path, "blocked-cleanup")
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    def close_resource(resource):
+        cleanup_started.set()
+        release_cleanup.wait(timeout=2)
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+
+    closed = threading.Event()
+
+    def close_cache():
+        cache.close(timeout=0.05)
+        closed.set()
+
+    thread = threading.Thread(target=close_cache)
+    thread.start()
+    try:
+        assert cleanup_started.wait(timeout=1)
+        assert not closed.wait(timeout=0.1)
+    finally:
+        release_cleanup.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert closed.is_set()
+
+
+def test_concurrent_cache_close_waits_for_single_owned_cleanup(tmp_path):
+    project = make_lake_project(tmp_path, "concurrent-close")
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    second_started = threading.Event()
+    close_calls = []
+
+    def close_resource(resource):
+        close_calls.append(resource)
+        cleanup_started.set()
+        release_cleanup.wait(timeout=2)
+
+    cache = ProjectResourceCache(
+        lambda root: root,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(project)):
+        pass
+
+    first = threading.Thread(target=cache.close, kwargs={"timeout": 0.05})
+
+    def close_second():
+        second_started.set()
+        cache.close(timeout=0.05)
+
+    second = threading.Thread(target=close_second)
+    first.start()
+    assert cleanup_started.wait(timeout=1)
+    second.start()
+    assert second_started.wait(timeout=1)
+    release_cleanup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert close_calls == [project.resolve()]
+
+
+def test_cache_close_with_sweeper_honors_a_timeout(tmp_path):
+    project = make_lake_project(tmp_path, "sweeper-close")
+    closed = []
+    cache = ProjectResourceCache(
+        lambda root: root,
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+    )
+    with cache.lease(str(project)):
+        pass
+
+    cache.close(timeout=0.05)
+
+    assert closed == [project.resolve()]
+
+
+def test_cache_close_waits_for_inflight_startup_cleanup(tmp_path):
+    project = make_lake_project(tmp_path, "startup-close")
+    startup_started = threading.Event()
+    release_startup = threading.Event()
+    cleanup_finished = threading.Event()
+    caller_errors = []
+
+    def factory(root):
+        startup_started.set()
+        release_startup.wait(timeout=2)
+        return root
+
+    def close_resource(resource):
+        cleanup_finished.set()
+
+    cache = ProjectResourceCache(
+        factory,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    def acquire():
+        try:
+            with cache.lease(str(project)):
+                pytest.fail("startup completed after cache shutdown")
+        except RuntimeError as error:
+            caller_errors.append(error)
+
+    caller = threading.Thread(target=acquire)
+    caller.start()
+    assert startup_started.wait(timeout=1)
+
+    cache_closed = threading.Event()
+
+    def close_cache():
+        cache.close(timeout=0.05)
+        cache_closed.set()
+
+    closer = threading.Thread(target=close_cache)
+    closer.start()
+    try:
+        assert not cache_closed.wait(timeout=0.1)
+    finally:
+        release_startup.set()
+        caller.join(timeout=2)
+        closer.join(timeout=2)
+
+    assert not caller.is_alive()
+    assert not closer.is_alive()
+    assert cache_closed.is_set()
+    assert cleanup_finished.is_set()
+    assert len(caller_errors) == 1
+    assert "closed during startup" in str(caller_errors[0])
+
+
+def test_cold_startup_returns_at_the_acquisition_deadline(tmp_path):
+    project = make_lake_project(tmp_path, "deadline-startup")
+    startup_started = threading.Event()
+    release_startup = threading.Event()
+    cleanup_finished = threading.Event()
+
+    def factory(root):
+        startup_started.set()
+        release_startup.wait(timeout=2)
+        return root
+
+    cache = ProjectResourceCache(
+        factory,
+        lambda resource: cleanup_finished.set(),
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProjectResourceBusyError, match="startup exceeded"):
+        with cache.lease(
+            str(project),
+            acquisition_timeout=0.05,
+            creation_budget=0,
+        ):
+            pytest.fail("late startup reached the request")
+    assert time.monotonic() - started < 0.5
+    assert startup_started.is_set()
+
+    release_startup.set()
+    assert cleanup_finished.wait(timeout=2)
+    cache.close()
+
+
+def test_stale_victim_is_closed_when_startup_crosses_its_budget(tmp_path):
+    project = make_lake_project(tmp_path, "stale-budget")
+    created = []
+    closed = []
+    cache = ProjectResourceCache(
+        lambda root: created.append(object()) or created[-1],
+        closed.append,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+        clock=lambda: 0.0,
+    )
+    with cache.lease(str(project)) as first:
+        pass
+    cache.invalidate(str(project), first)
+
+    ticks = iter((0.0, 0.0, 0.0, 1.0))
+    cache._clock = lambda: next(ticks, 1.0)
+    with pytest.raises(ProjectResourceBusyError, match="startup exceeded"):
+        with cache.lease(
+            str(project),
+            acquisition_timeout=1.0,
+            creation_budget=0.5,
+        ):
+            pytest.fail("late startup reached the request")
+
+    cache.close()
+    assert len(created) == 2
+    assert closed == created
+
+
 def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
     project = make_lake_project(tmp_path, "slow-startup")
     clock = {"now": 0.0}
     closed = []
+    cleanup_finished = threading.Event()
 
     def slow_factory(root):
         clock["now"] = 11.0
         return root
 
+    def close_resource(resource):
+        closed.append(resource)
+        cleanup_finished.set()
+
     cache = ProjectResourceCache(
         slow_factory,
-        closed.append,
+        close_resource,
         max_entries=1,
         idle_seconds=1800,
         start_sweeper=False,
@@ -252,7 +659,137 @@ def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
         ):
             pytest.fail("late project startup must never execute a tool request")
 
+    assert cleanup_finished.wait(timeout=2)
     assert closed == [project.resolve()]
+    assert cache.state(str(project)) == "cold"
+    cache.close()
+
+
+def test_boundary_timeout_never_runs_cleanup_on_the_request_thread(
+    tmp_path, monkeypatch
+):
+    project = make_lake_project(tmp_path, "boundary-timeout")
+    factory_released = threading.Event()
+    future_completed = threading.Event()
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    class BoundaryFuture(Future):
+        def __init__(self):
+            super().__init__()
+            self._reported_not_done = False
+
+        def result(self, timeout=None):
+            if timeout is not None:
+                factory_released.set()
+                assert future_completed.wait(timeout=1)
+                raise FutureTimeoutError
+            return super().result(timeout=timeout)
+
+        def done(self):
+            if not self._reported_not_done:
+                self._reported_not_done = True
+                return False
+            return super().done()
+
+        def set_result(self, result):
+            super().set_result(result)
+            future_completed.set()
+
+    def factory(root):
+        assert factory_released.wait(timeout=1)
+        return root
+
+    def close_resource(resource):
+        cleanup_started.set()
+        release_cleanup.wait(timeout=2)
+
+    monkeypatch.setattr(lean_runtime_module, "Future", BoundaryFuture)
+    cache = ProjectResourceCache(
+        factory,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProjectResourceBusyError, match="startup exceeded"):
+        with cache.lease(
+            str(project),
+            acquisition_timeout=0.05,
+            creation_budget=0,
+        ):
+            pytest.fail("late project startup reached the request")
+    elapsed = time.monotonic() - started
+
+    assert cleanup_started.wait(timeout=1)
+    assert elapsed < 0.5
+    release_cleanup.set()
+    cache.close()
+
+
+def test_expired_startup_cleanup_does_not_extend_the_response_deadline(tmp_path):
+    project = make_lake_project(tmp_path, "expired-cleanup")
+    clock = {"now": 0.0}
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    def factory(root):
+        clock["now"] = 2.0
+        return root
+
+    def close_resource(resource):
+        cleanup_started.set()
+        release_cleanup.wait(timeout=2)
+
+    cache = ProjectResourceCache(
+        factory,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+        clock=lambda: clock["now"],
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProjectResourceBusyError, match="startup exceeded"):
+        with cache.lease(
+            str(project),
+            acquisition_timeout=1.0,
+            creation_budget=0,
+        ):
+            pytest.fail("expired project startup reached the request")
+    elapsed = time.monotonic() - started
+
+    assert cleanup_started.wait(timeout=1)
+    assert elapsed < 0.5
+    release_cleanup.set()
+    cache.close()
+
+
+def test_factory_timeout_is_not_misreported_as_acquisition_timeout(tmp_path):
+    project = make_lake_project(tmp_path, "factory-timeout")
+
+    def fail_factory(root):
+        raise TimeoutError("factory timed out early")
+
+    cache = ProjectResourceCache(
+        fail_factory,
+        lambda resource: None,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+
+    with pytest.raises(TimeoutError, match="factory timed out early"):
+        with cache.lease(
+            str(project),
+            acquisition_timeout=1,
+            creation_budget=0,
+        ):
+            pytest.fail("failed startup reached the request")
+
     assert cache.state(str(project)) == "cold"
     cache.close()
 
@@ -365,6 +902,7 @@ def test_lsp_diagnostic_formatting_remains_stable():
     )
 
 
+@pytest.mark.daemon
 def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "lean.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -413,6 +951,7 @@ def test_concurrent_clients_boot_one_daemon_that_outlives_each_client(runtime_di
     assert not socket_path.exists()
 
 
+@pytest.mark.daemon
 def test_daemon_outlives_the_separate_process_that_started_it(
     tmp_path,
     runtime_dir,
@@ -462,6 +1001,7 @@ def test_daemon_outlives_the_separate_process_that_started_it(
         client.stop()
 
 
+@pytest.mark.daemon
 def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "restart.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -476,6 +1016,7 @@ def test_stop_then_immediate_start_is_serialized(runtime_dir, monkeypatch):
         client.stop()
 
 
+@pytest.mark.daemon
 def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, monkeypatch):
     monkeypatch.setenv("AUTOFORM_RUNTIME_DIR", str(runtime_dir))
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -492,6 +1033,7 @@ def test_new_build_replaces_previous_runtime_at_same_install_path(runtime_dir, m
         current.stop()
 
 
+@pytest.mark.daemon
 def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsys):
     from servers import lean_runtime
 
@@ -508,6 +1050,7 @@ def test_default_cli_stop_finds_a_previous_build(runtime_dir, monkeypatch, capsy
     assert not old_socket.exists()
 
 
+@pytest.mark.daemon
 def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
     socket_path = runtime_dir / "silent.sock"
     monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
@@ -536,6 +1079,22 @@ def test_silent_connection_cannot_block_graceful_stop(runtime_dir, monkeypatch):
         silent.close()
         if thread.is_alive():
             thread.join(timeout=3)
+
+
+def test_stop_uses_the_configured_response_deadline(runtime_dir, monkeypatch):
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "bounded-stop.sock",
+        response_timeout=0.05,
+    )
+    observed = []
+
+    def request(method, params=None, *, autostart=None, response_timeout=None):
+        observed.append((method, autostart, response_timeout))
+        return {"stopping": True}
+
+    monkeypatch.setattr(client, "request", request)
+    assert client.stop() == {"stopping": True}
+    assert observed == [("daemon.shutdown", False, 0.05)]
 
 
 def test_connected_send_failure_is_never_retried(runtime_dir, monkeypatch):
