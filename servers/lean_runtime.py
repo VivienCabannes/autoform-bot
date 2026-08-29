@@ -26,7 +26,12 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from servers import resolve_lean_file, resolve_lean_project_dir
+from servers import (
+    ProjectFingerprint,
+    lean_project_fingerprint,
+    resolve_lean_file,
+    resolve_lean_project_dir,
+)
 from servers.lean_client import (
     BUILD_GENERATION,
     INSTALL_ID,
@@ -48,6 +53,7 @@ from servers.lsp.server import (
     format_lsp_diagnostics,
 )
 from servers.repl.core import DEFAULT_REPL_STARTUP_TIMEOUT, format_repl_response
+from servers.repl.imports import resolve_project_imports, validate_imports
 from servers.repl.pool import (
     DEFAULT_RAM_FRACTION,
     DEFAULT_STARTUP_STAGGER_SECONDS,
@@ -79,6 +85,10 @@ LSP_CLOSE_BUDGET = 65.0
 
 class ProjectResourceBusyError(TimeoutError):
     """A shared project slot could not be admitted within the RPC budget."""
+
+
+class _DeferredResourceCleanup(ProjectResourceBusyError):
+    """Victim cleanup continues while the expired request returns."""
 
 
 def _repl_creation_budget(worker_count: int) -> float:
@@ -275,40 +285,6 @@ class LeanRuntimeConfig:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class ProjectFingerprint:
-    root: tuple[int, int, int]
-    files: tuple[tuple[str, int, int, int, int, int, int], ...]
-
-
-def lean_project_fingerprint(project_dir: Path) -> ProjectFingerprint:
-    """Return the project metadata that makes a resident Lean process stale."""
-    files = ("lean-toolchain", "lake-manifest.json", "lakefile.toml", "lakefile.lean")
-    root = project_dir.stat()
-    fingerprint: list[tuple[str, int, int, int, int, int, int]] = []
-    for name in files:
-        path = project_dir / name
-        try:
-            info = path.stat()
-        except FileNotFoundError:
-            continue
-        fingerprint.append(
-            (
-                name,
-                info.st_dev,
-                info.st_ino,
-                info.st_mode,
-                info.st_size,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
-            )
-        )
-    return ProjectFingerprint(
-        root=(root.st_dev, root.st_ino, root.st_mode),
-        files=tuple(fingerprint),
-    )
-
-
 @dataclass
 class _CacheEntry(Generic[T]):
     resource: T
@@ -366,15 +342,21 @@ class ProjectResourceCache(Generic[T]):
         *,
         create: bool = True,
         acquisition_timeout: float | None = None,
+        deadline: float | None = None,
         creation_budget: float = 0.0,
+        required_fingerprint: ProjectFingerprint | None = None,
     ) -> Iterator[T | None]:
         """Keep a project resource alive for the complete operation."""
+        if deadline is not None and acquisition_timeout is not None:
+            raise TypeError("pass acquisition_timeout or deadline, not both")
         root = resolve_lean_project_dir(project_dir)
         resource = self._acquire(
             root,
             create=create,
             acquisition_timeout=acquisition_timeout,
+            deadline=deadline,
             creation_budget=creation_budget,
+            required_fingerprint=required_fingerprint,
         )
         try:
             yield resource
@@ -432,9 +414,16 @@ class ProjectResourceCache(Generic[T]):
                 if entry.active == 0 and now - entry.last_used >= self._idle_seconds
             ]
             resources = [self._entries.pop(root).resource for root in victims]
+            self._creating.update(victims)
             if victims:
                 self._condition.notify_all()
-        self._close_many(resources)
+        try:
+            self._close_many(resources)
+        finally:
+            with self._condition:
+                for root in victims:
+                    self._creating.discard(root)
+                self._condition.notify_all()
         return len(resources)
 
     def close(self, *, timeout: float | None = None) -> None:
@@ -491,7 +480,9 @@ class ProjectResourceCache(Generic[T]):
         *,
         create: bool,
         acquisition_timeout: float | None,
+        deadline: float | None,
         creation_budget: float,
+        required_fingerprint: ProjectFingerprint | None,
     ) -> T | None:
         if acquisition_timeout is not None and acquisition_timeout <= 0:
             raise ProjectResourceBusyError(
@@ -499,20 +490,33 @@ class ProjectResourceCache(Generic[T]):
             )
         if creation_budget < 0:
             raise ValueError("creation_budget must be nonnegative")
-        deadline = (
-            self._clock() + acquisition_timeout
-            if acquisition_timeout is not None
-            else None
-        )
-        resources_to_close: list[T] = []
+        if deadline is None and acquisition_timeout is not None:
+            deadline = self._clock() + acquisition_timeout
+        resources_to_close: list[tuple[Path, T]] = []
+        closing_paths: set[Path] = set()
         reserved = False
 
         while True:
             if deadline is not None and self._clock() >= deadline:
                 raise ProjectResourceBusyError(
-                    f"timed out waiting for a shared Lean project slot: {root}"
+                    "timed out waiting for a shared Lean project slot because the "
+                    f"response budget expired: {root}"
                 )
-            fingerprint = lean_project_fingerprint(root)
+            try:
+                fingerprint = lean_project_fingerprint(root)
+            except OSError as error:
+                if required_fingerprint is not None:
+                    raise ProjectResourceBusyError(
+                        f"shared Lean project changed after import discovery: {root}"
+                    ) from error
+                raise
+            if (
+                required_fingerprint is not None
+                and fingerprint != required_fingerprint
+            ):
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed after import discovery: {root}"
+                )
             wait = False
             creation_budget_checked = False
             reserve_creation_budget = False
@@ -552,12 +556,33 @@ class ProjectResourceCache(Generic[T]):
                             creation_budget=creation_budget,
                         )
                         creation_budget_checked = True
-                        resources_to_close.append(self._entries.pop(root).resource)
+                        resources_to_close.append(
+                            (root, self._entries.pop(root).resource)
+                        )
+                        self._creating.add(root)
+                        closing_paths.add(root)
                         self._condition.notify_all()
                         entry = None
 
                 if not wait and entry is not None:
-                    if lean_project_fingerprint(root) != fingerprint:
+                    try:
+                        current_fingerprint = lean_project_fingerprint(root)
+                    except OSError as error:
+                        if required_fingerprint is not None:
+                            raise ProjectResourceBusyError(
+                                "shared Lean project changed after import discovery: "
+                                f"{root}"
+                            ) from error
+                        raise
+                    if (
+                        required_fingerprint is not None
+                        and current_fingerprint != required_fingerprint
+                    ):
+                        raise ProjectResourceBusyError(
+                            "shared Lean project changed after import discovery: "
+                            f"{root}"
+                        )
+                    if current_fingerprint != fingerprint:
                         wait_seconds = 0.01
                         if deadline is not None:
                             remaining = deadline - self._clock()
@@ -583,7 +608,11 @@ class ProjectResourceCache(Generic[T]):
                     resource = None
                     break
 
-                if not wait and root in self._creating:
+                if (
+                    not wait
+                    and root in self._creating
+                    and root not in closing_paths
+                ):
                     wait = True
 
                 if not wait:
@@ -593,7 +622,9 @@ class ProjectResourceCache(Generic[T]):
                             deadline=deadline,
                             creation_budget=creation_budget,
                         )
-                    occupied = len(self._entries) + len(self._creating)
+                    occupied = len(self._entries) + len(
+                        self._creating - closing_paths
+                    )
                     if occupied >= self._max_entries:
                         inactive = [
                             (candidate.last_used, path)
@@ -602,7 +633,11 @@ class ProjectResourceCache(Generic[T]):
                         ]
                         if inactive:
                             _, victim = min(inactive)
-                            resources_to_close.append(self._entries.pop(victim).resource)
+                            resources_to_close.append(
+                                (victim, self._entries.pop(victim).resource)
+                            )
+                            self._creating.add(victim)
+                            closing_paths.add(victim)
                         else:
                             wait = True
                             reserve_creation_budget = True
@@ -632,18 +667,47 @@ class ProjectResourceCache(Generic[T]):
                     wait_seconds = min(wait_seconds, remaining)
                 self._condition.wait(timeout=wait_seconds)
 
-            if resources_to_close:
-                self._close_many(resources_to_close)
-                resources_to_close.clear()
-
-        if resources_to_close:
-            self._close_many(resources_to_close)
-
         if not reserved:
+            self._close_many([resource for _, resource in resources_to_close])
+            with self._condition:
+                for path in closing_paths:
+                    self._creating.discard(path)
+                self._condition.notify_all()
             return resource
 
         late_creation = False
+        cleanup_deferred = False
         try:
+            try:
+                self._close_before_factory(
+                    root,
+                    resources_to_close,
+                    closing_paths,
+                    deadline,
+                )
+            except _DeferredResourceCleanup:
+                cleanup_deferred = True
+                raise
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError("project resource cache closed during startup")
+            if deadline is not None and self._clock() >= deadline:
+                raise ProjectResourceBusyError(
+                    f"shared Lean project startup exceeded its response budget: {root}"
+                )
+            try:
+                pre_factory_fingerprint = lean_project_fingerprint(root)
+            except OSError as error:
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed before startup: {root}"
+                ) from error
+            if pre_factory_fingerprint != fingerprint or (
+                required_fingerprint is not None
+                and pre_factory_fingerprint != required_fingerprint
+            ):
+                raise ProjectResourceBusyError(
+                    f"shared Lean project changed before startup: {root}"
+                )
             if deadline is None:
                 created = self._factory(root)
             else:
@@ -682,9 +746,12 @@ class ProjectResourceCache(Generic[T]):
                         future.add_done_callback(discard_late_result)
                         late_creation = True
         except BaseException:
-            with self._condition:
-                self._creating.discard(root)
-                self._condition.notify_all()
+            if not cleanup_deferred:
+                with self._condition:
+                    self._creating.discard(root)
+                    for path in closing_paths:
+                        self._creating.discard(path)
+                    self._condition.notify_all()
             raise
         if late_creation:
             raise ProjectResourceBusyError(
@@ -704,7 +771,10 @@ class ProjectResourceCache(Generic[T]):
             elif deadline is not None and self._clock() >= deadline:
                 close_created = True
                 startup_expired = True
-            elif current_fingerprint != fingerprint:
+            elif current_fingerprint != fingerprint or (
+                required_fingerprint is not None
+                and current_fingerprint != required_fingerprint
+            ):
                 close_created = True
                 project_changed = True
             else:
@@ -743,6 +813,71 @@ class ProjectResourceCache(Generic[T]):
             raise ProjectResourceBusyError(
                 f"not enough response budget to start a shared Lean project slot: {root}"
             )
+
+    def _close_before_factory(
+        self,
+        root: Path,
+        resources: list[tuple[Path, T]],
+        closing_paths: set[Path],
+        deadline: float | None,
+    ) -> None:
+        if not resources:
+            return
+
+        values = [resource for _, resource in resources]
+        if deadline is None:
+            self._close_many(values)
+        else:
+            future: Future[None] = Future()
+
+            def close_resources() -> None:
+                try:
+                    self._close_many(values)
+                except BaseException as error:
+                    future.set_exception(error)
+                else:
+                    future.set_result(None)
+
+            cleanup = threading.Thread(
+                target=close_resources,
+                name="autoform-project-victim-cleanup",
+                daemon=False,
+            )
+            try:
+                cleanup.start()
+            except BaseException:
+                self._close_many(values)
+                raise
+            try:
+                future.result(timeout=max(0.0, deadline - self._clock()))
+            except FutureTimeoutError:
+                if future.done():
+                    future.result()
+                else:
+                    release_paths = closing_paths | {root}
+
+                    def release_after_cleanup(completed: Future[None]) -> None:
+                        try:
+                            completed.result()
+                        except BaseException:
+                            logger.exception("failed to close a displaced Lean project")
+                        finally:
+                            with self._condition:
+                                for path in release_paths:
+                                    self._creating.discard(path)
+                                self._condition.notify_all()
+
+                    future.add_done_callback(release_after_cleanup)
+                    raise _DeferredResourceCleanup(
+                        "response budget expired while closing a displaced Lean "
+                        f"project before startup: {root}"
+                    ) from None
+
+        with self._condition:
+            for path in closing_paths:
+                if path != root:
+                    self._creating.discard(path)
+            self._condition.notify_all()
 
     def _release(self, root: Path, resource: T) -> None:
         with self._condition:
@@ -859,6 +994,7 @@ class LeanRuntimeServices:
         if method == "repl.run":
             project_dir = self._string_param(params, "project_dir")
             code = self._string_param(params, "code", allow_empty=True)
+            imports = validate_imports(params.get("imports")) or None
             timeout = params.get("timeout")
             if timeout is None:
                 effective_timeout = self.config.repl_request_timeout
@@ -876,13 +1012,35 @@ class LeanRuntimeServices:
                     "timeout exceeds the node-wide limit of "
                     f"{self.config.max_repl_request_seconds:g} seconds"
                 )
+            deadline = time.monotonic() + effective_timeout
+            root = resolve_lean_project_dir(project_dir)
+            resolved_imports = None
+            if imports is not None:
+                resolved_imports = resolve_project_imports(
+                    root,
+                    imports,
+                    deadline=deadline,
+                )
             with self.repl_projects.lease(
-                project_dir,
-                acquisition_timeout=self._acquisition_timeout(effective_timeout),
-                creation_budget=self.repl_creation_budget,
+                str(root),
+                deadline=deadline,
+                creation_budget=0,
+                required_fingerprint=(
+                    resolved_imports.project_fingerprint
+                    if resolved_imports is not None
+                    else None
+                ),
             ) as pool:
                 assert pool is not None
-                return format_repl_response(pool.run(code, timeout=effective_timeout))
+                if resolved_imports is None:
+                    response = pool.run(code, deadline=deadline)
+                else:
+                    response = pool.run(
+                        code,
+                        imports=resolved_imports,
+                        deadline=deadline,
+                    )
+                return format_repl_response(response)
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
             with self.repl_projects.lease(project_dir, create=False) as pool:
