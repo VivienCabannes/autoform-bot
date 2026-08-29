@@ -10,6 +10,7 @@ from logging import getLogger
 from typing import Any
 
 from .core import LeanRepl, LeanReplConfig
+from .imports import ResolvedImports
 
 logger = getLogger(__name__)
 
@@ -26,6 +27,7 @@ class LeanReplPoolConfig(LeanReplConfig):
     startup_stagger: float = DEFAULT_STARTUP_STAGGER_SECONDS
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.num_repls is None:
             try:
                 import psutil
@@ -94,10 +96,19 @@ class LeanReplPool:
             except queue.Empty:
                 break
 
-    def run(self, code: str, **kwargs: Any) -> dict[str, Any]:
+    def run(
+        self,
+        code: str,
+        *,
+        imports: ResolvedImports | None = None,
+        timeout: float | None = None,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Run code on an idle REPL within one queue-and-execution timeout."""
-        timeout = kwargs.pop("timeout", None)
-        deadline = time.monotonic() + timeout if timeout is not None else None
+        if deadline is None and timeout is not None:
+            deadline = time.monotonic() + timeout
+        elif deadline is not None and timeout is not None:
+            raise TypeError("pass timeout or deadline, not both")
         with self._condition:
             if self._shutdown:
                 raise RuntimeError("Lean REPL pool is shut down")
@@ -113,9 +124,7 @@ class LeanReplPool:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise TimeoutError(
-                            f"timed out after {timeout:g}s waiting for an idle Lean REPL"
-                        )
+                        raise TimeoutError("timed out waiting for an idle Lean REPL")
                     wait = min(wait, remaining)
                 try:
                     repl = self._idle.get(timeout=wait)
@@ -125,15 +134,17 @@ class LeanReplPool:
                 if self._shutdown:
                     raise RuntimeError("Lean REPL pool is shut down")
 
-            call_kwargs = dict(kwargs)
             if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"timed out after {timeout:g}s waiting for an idle Lean REPL"
-                    )
-                call_kwargs["timeout"] = remaining
-            return repl.run(code, **call_kwargs)
+                if deadline - time.monotonic() <= 0:
+                    raise TimeoutError("timed out waiting for an idle Lean REPL")
+            try:
+                return repl.run(code, imports=imports, deadline=deadline)
+            except BaseException:
+                try:
+                    repl.close()
+                except BaseException:
+                    logger.exception("failed to retire REPL worker after request error")
+                raise
         finally:
             if repl is not None:
                 with self._condition:
