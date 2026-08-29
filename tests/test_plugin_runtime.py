@@ -161,6 +161,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/graph.py",
             "autoform_cli/visualize.py",
             "autoform_cli/project/create.py",
+            "autoform_cli/project/repair.py",
             "autoform_cli/project/releases.json",
             "servers/lean_client.py",
             "servers/lean_runtime.py",
@@ -268,6 +269,40 @@ finally:
     )
     assert creation.returncode == 0, creation.stderr
     assert json.loads(creation.stdout)["package"] == "WheelProject"
+    (project / "mkdocs.yml").unlink()
+    repair_inputs = ["--title", "WheelProject", "--repository-url", ""]
+    repair_preview = subprocess.run(
+        [
+            str(command),
+            "project",
+            "repair",
+            str(project),
+            *repair_inputs,
+            "--dry-run",
+            "--json",
+        ],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+    )
+    assert repair_preview.returncode == 0, repair_preview.stderr
+    assert json.loads(repair_preview.stdout)["planned"] == ["mkdocs.yml"]
+    repaired = subprocess.run(
+        [str(command), "project", "repair", str(project), *repair_inputs, "--json"],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+    )
+    assert repaired.returncode == 0, repaired.stderr
+    assert json.loads(repaired.stdout)["written"] == ["mkdocs.yml"]
+    repaired_again = subprocess.run(
+        [str(command), "project", "repair", str(project), *repair_inputs, "--json"],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+    )
+    assert repaired_again.returncode == 0, repaired_again.stderr
+    assert json.loads(repaired_again.stdout)["planned"] == []
     inspection = subprocess.run(
         [str(command), "project", "inspect", str(project), "--json"],
         cwd=outside,

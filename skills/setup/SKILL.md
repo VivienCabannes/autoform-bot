@@ -67,17 +67,34 @@ preserves the current directory inode and mode and fails closed when an
 interrupted transaction cannot prove ownership. Do not invent version pairs or
 copy the populated example as a project generator.
 
-For an incomplete existing repository, preserve its authored configuration and
-use `autoform init` only for the Autoform vault/site overlay until the dedicated
-repair command is available.
+For an incomplete existing repository, inspect first, preview the conservative
+repair, then apply it only when the plan contains solely the intended missing
+Autoform files:
+
+```bash
+autoform project inspect <TARGET>
+autoform project repair <TARGET> --dry-run --json
+autoform project repair <TARGET>
+```
+
+`project repair` requires the explicit project root and a clean supported
+Lean/Mathlib configuration. It preserves every existing managed file
+byte-for-byte, adds only unambiguous missing Autoform overlay files, and stops
+with zero writes when preflight finds a conflict. Supply exact title,
+repository URL, or immutable workflow provenance only when the CLI reports
+that a missing parameterized file needs it; an explicitly empty repository URL
+is different from an omitted value. Never infer these values. Reuse the same
+inputs after an interrupted multi-file repair, and inspect any reported stale
+temporary or retained published file before removing it. Never substitute
+`init --force` for repair.
 
 `autoform init` is the whole vault: `blueprint/` with its landing page,
 `roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
 override, ignore rules, and both workflows when an immutable Autoform pin is
 available. Do not hand-build any of it and do not copy the bundled example: the
 layout is fixed, and `autoform check` rejects a chapter directory whose chapter
-was written as a sibling file instead of `<chapter>/README.md`. `init` never overwrites an existing file, so it is
-also the repair path; it reports what it left alone. See the
+was written as a sibling file instead of `<chapter>/README.md`. Use `project
+repair` for an incomplete existing project; `init` is not a repair command. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
 `init` pins generated workflows to an explicitly supplied verified source and
