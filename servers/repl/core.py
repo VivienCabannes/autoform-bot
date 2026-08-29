@@ -13,9 +13,21 @@ import select
 import subprocess
 import threading
 import time
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from logging import getLogger
+from pathlib import Path
 from typing import Any
+
+from servers import ProjectFingerprint, lean_project_fingerprint
+
+from .imports import (
+    ResolvedImports,
+    StaleResolvedImportsError,
+    clean_lake_environment,
+    split_imports_and_body as _split_imports_and_body,
+)
 
 logger = getLogger(__name__)
 
@@ -25,6 +37,7 @@ DEFAULT_REPL_STARTUP_TIMEOUT = 180.0
 
 ALLOWED_IMPORTS = frozenset({"Mathlib", "Aesop", "Batteries", "LeanSearchClient"})
 WARMUP_IMPORTS = frozenset({"Mathlib"})
+_VALID_DIAGNOSTIC_SEVERITIES = frozenset({"trace", "info", "warning", "error"})
 
 
 # ---------------------------------------------------------------------------
@@ -74,34 +87,96 @@ def _kill_subprocesses(process: subprocess.Popen) -> None:
 
 
 def _inherit_clean_env() -> dict[str, str]:
-    """Return a copy of the current environment without PYTHONPATH noise."""
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    return env
+    """Return the host environment without ambient Python or Lean paths."""
+    return clean_lake_environment()
 
 
-def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
-    """Split Lean code into import statements and body.
+def _is_natural_number(value: Any) -> bool:
+    """Return whether a JSON value is a Lean ``Nat`` rather than a boolean."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
-    Returns (import_names, body, header_line_count).
-    """
-    lines = code.split("\n")
-    imports: list[str] = []
-    body_start = 0
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("import "):
-            imports.append(stripped[7:].strip())
-            body_start = i + 1
-        elif stripped == "" or stripped.startswith("--"):
-            if imports:
-                body_start = i + 1
-        else:
-            break
+def _valid_diagnostic_position(value: Any) -> bool:
+    """Return whether a JSON value has the REPL's source-position shape."""
+    return (
+        isinstance(value, dict)
+        and _is_natural_number(value.get("line"))
+        and _is_natural_number(value.get("column"))
+    )
 
-    body = "\n".join(lines[body_start:])
-    return imports, body, body_start
+
+def _validate_command_response(
+    response: Any,
+    *,
+    context: str,
+    require_environment: bool = True,
+) -> tuple[int | None, list[dict[str, Any]]]:
+    """Validate the protocol fields needed before retaining a REPL environment."""
+    if not isinstance(response, dict):
+        raise ReplProtocolError(
+            f"Lean REPL returned a malformed response for {context}."
+        )
+    if "message" in response:
+        if set(response) == {"message"} and isinstance(response["message"], str):
+            raise ReplCommandError(response["message"])
+        raise ReplProtocolError(
+            f"Lean REPL returned a malformed error response for {context}."
+        )
+
+    messages = response.get("messages", [])
+    if not isinstance(messages, list):
+        raise ReplProtocolError(
+            f"Lean REPL returned malformed diagnostics for {context}."
+        )
+    for message in messages:
+        severity = message.get("severity") if isinstance(message, dict) else None
+        if (
+            not isinstance(message, dict)
+            or not isinstance(severity, str)
+            or severity not in _VALID_DIAGNOSTIC_SEVERITIES
+            or not isinstance(message.get("data"), str)
+            or not _valid_diagnostic_position(message.get("pos"))
+        ):
+            raise ReplProtocolError(
+                f"Lean REPL returned malformed diagnostics for {context}."
+            )
+        end_pos = message.get("endPos")
+        if end_pos is not None and not _valid_diagnostic_position(end_pos):
+            raise ReplProtocolError(
+                f"Lean REPL returned malformed diagnostics for {context}."
+            )
+
+    sorries = response.get("sorries", [])
+    if not isinstance(sorries, list):
+        raise ReplProtocolError(
+            f"Lean REPL returned malformed sorries for {context}."
+        )
+    for sorry in sorries:
+        pos = sorry.get("pos") if isinstance(sorry, dict) else None
+        end_pos = sorry.get("endPos") if isinstance(sorry, dict) else None
+        proof_state = sorry.get("proofState") if isinstance(sorry, dict) else None
+        if (
+            not isinstance(sorry, dict)
+            or not isinstance(sorry.get("goal"), str)
+            or "proofState" not in sorry
+            or (pos is not None and not _valid_diagnostic_position(pos))
+            or (end_pos is not None and not _valid_diagnostic_position(end_pos))
+            or (proof_state is not None and not _is_natural_number(proof_state))
+        ):
+            raise ReplProtocolError(
+                f"Lean REPL returned malformed sorries for {context}."
+            )
+
+    env_id = response.get("env")
+    if require_environment and not _is_natural_number(env_id):
+        raise ReplProtocolError(
+            f"Lean REPL did not return a valid environment for {context}."
+        )
+    if not require_environment and env_id is not None and not _is_natural_number(env_id):
+        raise ReplProtocolError(
+            f"Lean REPL returned an invalid environment for {context}."
+        )
+    return env_id, messages
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +209,9 @@ class LeanReplConfig:
     max_buffer_bytes: int = 10 * 1024 * 1024
     mem_restart_ratio: float = 0.9
     validate_imports: bool = True
+
+    def __post_init__(self) -> None:
+        """Allow derived pool configs to extend validation consistently."""
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +259,11 @@ def format_message(msg: dict) -> str:
 def format_repl_response(response: dict[str, Any]) -> str:
     """Parse a raw REPL response and format it as readable diagnostics."""
     if response.get("repl_error") is not None:
+        if response.get("outcome_unknown") is True:
+            return (
+                "REPL error (execution outcome unknown; request not retried): "
+                f"{response['repl_error']}"
+            )
         return f"REPL error: {response['repl_error']}"
 
     messages = response.get("messages", [])
@@ -248,6 +331,14 @@ def format_repl_response(response: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+class ReplProtocolError(RuntimeError):
+    """Raised when a REPL response violates the pinned JSON protocol."""
+
+
+class ReplCommandError(RuntimeError):
+    """Raised for the pinned REPL's explicit error-response variant."""
+
+
 class ReplProcessExited(RuntimeError):
     """Raised when the REPL process dies unexpectedly."""
 
@@ -269,7 +360,7 @@ class ReplStderrBacklog(RuntimeError):
     an over-budget or undrainable process must not serve another request.
     """
 
-    def __init__(self, message: str, response: dict[str, Any]) -> None:
+    def __init__(self, message: str, response: Any) -> None:
         super().__init__(message)
         self.response = response
 
@@ -284,17 +375,20 @@ class LeanRepl:
     def __init__(self, config: LeanReplConfig) -> None:
         self.config = config
         self.cwd = config.cwd
+        self._project_identity = Path(config.cwd).resolve()
         self.process: subprocess.Popen | None = None
 
         self.request_timeout = config.request_timeout
         self.max_retries = config.max_retries
 
         self._base_env_id: int | None = None
+        self._project_fingerprint: ProjectFingerprint | None = None
         self.chunk_size: int = config.chunk_size
 
         self.mem_limit_gb: int = config.instance_mem_limit_gb
 
         self._process_lock = threading.Lock()
+        self._request_deadline: float | None = None
         # stderr has no command boundary. Account for it monotonically across one
         # process generation and retain only a bounded tail for diagnostics.
         self._stderr_bytes = 0
@@ -306,11 +400,15 @@ class LeanRepl:
 
     def start(self, startup_timeout: float | None = None) -> None:
         """Start and warm the Lean REPL within one startup deadline."""
+        self._base_env_id = None
+        self._project_fingerprint = None
         timeout = self.config.startup_timeout if startup_timeout is None else min(
             self.config.startup_timeout,
             startup_timeout,
         )
         deadline = time.monotonic() + timeout
+        if self._request_deadline is not None:
+            deadline = min(deadline, self._request_deadline)
 
         def remaining() -> float:
             value = deadline - time.monotonic()
@@ -320,6 +418,7 @@ class LeanRepl:
 
         env = _inherit_clean_env()
         env.update(self.config.env)
+        startup_fingerprint = lean_project_fingerprint(self._project_identity)
 
         self.process = subprocess.Popen(
             self.config.repl_command,
@@ -333,33 +432,43 @@ class LeanRepl:
         self._stderr_tail.clear()
 
         try:
+            base_env_id: int | None = None
             if self.config.warmup_imports:
                 header = "\n".join(f"import {root}" for root in self.config.warmup_imports)
                 logger.info("Loading imports at startup: %s", self.config.warmup_imports)
                 resp = self._run(code=header, env_id=None, timeout=remaining())
-                if "env" not in resp:
-                    raise RuntimeError(f"Failed to preload imports: {resp}")
-
-                errors = [m for m in resp.get("messages", []) if isinstance(m, dict) and m.get("severity") == "error"]
+                base_env_id, messages = _validate_command_response(
+                    resp,
+                    context="startup imports",
+                )
+                errors = [m for m in messages if m["severity"] == "error"]
                 if errors:
-                    error_details = "\n".join(m.get("data", str(m)) for m in errors)
+                    error_details = "\n".join(m["data"] for m in errors)
                     raise RuntimeError(f"Import preloading failed:\n{error_details}")
 
-                self._base_env_id = resp["env"]
-
-                smoke = self._run(
-                    code="#check Nat",
-                    env_id=self._base_env_id,
-                    timeout=min(DEFAULT_SMOKE_TEST_TIMEOUT, remaining()),
+            # A retained Init-derived environment keeps every later source request
+            # in command mode. Otherwise a header-scanner miss sent without an
+            # environment could execute imports in the REPL's fresh-file mode.
+            smoke = self._run(
+                code="#check Nat",
+                env_id=base_env_id,
+                timeout=min(DEFAULT_SMOKE_TEST_TIMEOUT, remaining()),
+            )
+            smoke_env_id, smoke_messages = _validate_command_response(
+                smoke,
+                context="the startup smoke test",
+            )
+            smoke_errors = [m for m in smoke_messages if m["severity"] == "error"]
+            if smoke_errors:
+                error_details = "; ".join(m["data"] for m in smoke_errors)
+                raise RuntimeError(
+                    "REPL smoke test failed, LEAN_PATH may be misconfigured. "
+                    f"Errors: {error_details}"
                 )
-                smoke_errors = [
-                    m for m in smoke.get("messages", []) if isinstance(m, dict) and m.get("severity") == "error"
-                ]
-                if smoke_errors:
-                    error_details = "; ".join(m.get("data", str(m)) for m in smoke_errors)
-                    raise RuntimeError(
-                        f"REPL smoke test failed — LEAN_PATH may be misconfigured. Errors: {error_details}"
-                    )
+            if lean_project_fingerprint(self._project_identity) != startup_fingerprint:
+                raise RuntimeError("Lean project changed during REPL startup")
+            self._base_env_id = smoke_env_id if base_env_id is None else base_env_id
+            self._project_fingerprint = startup_fingerprint
         except Exception:
             self.close()
             raise
@@ -373,12 +482,19 @@ class LeanRepl:
         finally:
             self.process = None
             self._base_env_id = None
+            self._project_fingerprint = None
             self._stderr_bytes = 0
             self._stderr_tail.clear()
 
     def restart(self, timeout: float | None = None) -> None:
         """Restart the Lean REPL process within an optional total timeout."""
         deadline = time.monotonic() + timeout if timeout is not None else None
+        if self._request_deadline is not None:
+            deadline = (
+                self._request_deadline
+                if deadline is None
+                else min(deadline, self._request_deadline)
+            )
         self.close()
         if deadline is None:
             self.start()
@@ -396,37 +512,85 @@ class LeanRepl:
         """Return memory usage in GB."""
         return _get_process_memory_gb(self.process)
 
-    def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
+    def run(
+        self,
+        code: str,
+        env_id: int | None = None,
+        timeout: float | None = None,
+        imports: ResolvedImports | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Send code to the REPL within one deadline across recovery attempts."""
+        if deadline is not None and timeout is not None:
+            raise TypeError("pass timeout or deadline, not both")
+        absolute_deadline = deadline is not None
         timeout = self.request_timeout if timeout is None else timeout
-        deadline = time.monotonic() + timeout
+        if deadline is None:
+            deadline = time.monotonic() + timeout
+
+        def deadline_error() -> TimeoutError:
+            if absolute_deadline:
+                return TimeoutError("REPL command deadline exceeded")
+            return TimeoutError(f"REPL command timed out after {timeout:g} seconds")
 
         def remaining() -> float:
             value = deadline - time.monotonic()
             if value <= 0:
-                raise TimeoutError(f"REPL command timed out after {timeout:g} seconds")
+                raise deadline_error()
             return value
 
         run_from_env = env_id is not None
-        max_retries = 0 if run_from_env else self.max_retries
+        if imports is not None and type(imports) is not ResolvedImports:
+            raise TypeError("imports must be a ResolvedImports descriptor or None")
+        descriptor = imports
+        if descriptor is not None and descriptor.project_root != self._project_identity:
+            return {
+                "repl_error": "Resolved imports belong to a different Lean project root."
+            }
+        structured_imports = None if descriptor is None else descriptor.modules
+        if run_from_env and descriptor is not None:
+            return {
+                "repl_error": (
+                    "Structured imports cannot be combined with an explicit "
+                    "environment identifier."
+                )
+            }
+        max_retries = 0 if run_from_env or descriptor is not None else self.max_retries
 
         header_line_count = 0
         if not run_from_env:
-            imports, code, header_line_count = _split_imports_and_body(code)
-
-            if self.config.validate_imports and self._allowed_import_roots is not None:
-                submitted_roots = {stmt.split(".")[0] for stmt in imports}
-                disallowed = submitted_roots - self._allowed_import_roots
-                if disallowed:
-                    return {
-                        "repl_error": (
-                            f"Disallowed imports: {', '.join(sorted(disallowed))}. "
-                            f"Allowed roots: {', '.join(sorted(self._allowed_import_roots))}."
-                        )
-                    }
+            inline_imports, code, header_line_count = _split_imports_and_body(code)
+            if structured_imports is not None and inline_imports:
+                return {
+                    "repl_error": (
+                        "Structured imports cannot be combined with import statements "
+                        "at the start of code."
+                    )
+                }
+            if structured_imports is None:
+                if self.config.validate_imports and self._allowed_import_roots is not None:
+                    submitted_roots = {stmt.split(".")[0] for stmt in inline_imports}
+                    disallowed = submitted_roots - self._allowed_import_roots
+                    if disallowed:
+                        return {
+                            "repl_error": (
+                                f"Disallowed imports: {', '.join(sorted(disallowed))}. "
+                                f"Allowed roots: {', '.join(sorted(self._allowed_import_roots))}."
+                            )
+                        }
+            else:
+                header_line_count = 0
 
         last_exception: Exception | None = None
-        with self._process_lock:
+        with self._process_lock, self._deadline_scope(deadline):
+            if descriptor is not None:
+                self._assert_resolved_imports_current(
+                    descriptor,
+                    deadline,
+                    require_worker=False,
+                )
+
             if run_from_env and not self.is_alive():
                 self.close()
                 raise ReplProcessRestarted(
@@ -438,11 +602,15 @@ class LeanRepl:
                 if not self.is_alive():
                     self.restart(timeout=remaining())
                 self._check_memory_and_maybe_restart(timeout=remaining())
+                self._assert_project_current(deadline)
             except (TimeoutError, RuntimeError) as error:
                 self.close()
                 if run_from_env:
                     raise ReplProcessRestarted(str(error)) from error
                 return {"repl_error": str(error)}
+
+            if descriptor is not None:
+                self._assert_resolved_imports_current(descriptor, deadline)
 
             if run_from_env and self.process is not process_before_memory_check:
                 raise ReplProcessRestarted(
@@ -450,13 +618,47 @@ class LeanRepl:
                 )
 
             for i in range(max_retries + 1):
+                body_dispatched = False
                 try:
-                    dispatch_env_id = env_id if run_from_env else self._base_env_id
+                    request_env_id = env_id if run_from_env else self._base_env_id
+                    if descriptor is not None and structured_imports:
+                        header = "\n".join(
+                            f"import {module}" for module in structured_imports
+                        )
+                        self._assert_resolved_imports_current(descriptor, deadline)
+                        imported = self._run(
+                            code=header,
+                            env_id=None,
+                            timeout=remaining(),
+                        )
+                        request_env_id, messages = _validate_command_response(
+                            imported,
+                            context="the requested imports",
+                        )
+                        self._assert_resolved_imports_current(descriptor, deadline)
+                        if any(message["severity"] == "error" for message in messages):
+                            return imported
+                    self._assert_project_current(deadline)
+                    body_dispatched = True
                     resp = self._run(
                         code=code,
-                        env_id=dispatch_env_id,
+                        env_id=request_env_id,
                         timeout=remaining(),
                     )
+                    _validate_command_response(
+                        resp,
+                        context="the requested command",
+                    )
+                    try:
+                        if descriptor is not None:
+                            self._assert_resolved_imports_current(descriptor, deadline)
+                        else:
+                            self._assert_project_current(deadline)
+                    except (StaleResolvedImportsError, TimeoutError, RuntimeError) as error:
+                        raise ReplOutcomeUnknown(
+                            "Lean project freshness changed while the requested "
+                            "command was executing; its outcome is unknown"
+                        ) from error
                     _adjust_line_numbers(resp, header_line_count)
                     return resp
                 except ReplStderrBacklog as e:
@@ -469,8 +671,27 @@ class LeanRepl:
                     self.close()
                     if run_from_env:
                         raise ReplProcessRestarted(str(e)) from e
+                    if structured_imports and not body_dispatched:
+                        return {
+                            "repl_error": (
+                                "REPL import setup failed before the requested code ran: "
+                                f"{e}"
+                            )
+                        }
                     # The command's diagnostics remain valid, but any environment
                     # identifier belongs to the process _run() just retired.
+                    try:
+                        _validate_command_response(
+                            e.response,
+                            context="the requested command",
+                        )
+                    except ReplCommandError as error:
+                        return {"repl_error": str(error)}
+                    except ReplProtocolError as error:
+                        return {
+                            "repl_error": str(error),
+                            "outcome_unknown": True,
+                        }
                     response = dict(e.response)
                     response.pop("env", None)
                     _adjust_line_numbers(response, header_line_count)
@@ -484,6 +705,16 @@ class LeanRepl:
                     if run_from_env:
                         raise
                     return {"repl_error": str(e), "outcome_unknown": True}
+                except ReplCommandError as e:
+                    logger.error("Lean REPL rejected the command: %s", e)
+                    return {"repl_error": str(e)}
+                except ReplProtocolError as e:
+                    logger.error("%s", e)
+                    self.close()
+                    response: dict[str, Any] = {"repl_error": str(e)}
+                    if body_dispatched:
+                        response["outcome_unknown"] = True
+                    return response
                 except ReplProcessExited as e:
                     last_exception = e
                     logger.error("REPL process exited: %s. Attempt %d/%d.", e, i + 1, max_retries + 1)
@@ -504,9 +735,7 @@ class LeanRepl:
                 backoff = min(2**i, 30) + random.uniform(0, 1)
                 try:
                     if backoff >= remaining():
-                        raise TimeoutError(
-                            f"REPL command timed out after {timeout:g} seconds"
-                        )
+                        raise deadline_error()
                     time.sleep(backoff)
                     self.restart(timeout=remaining())
                 except (TimeoutError, RuntimeError) as error:
@@ -515,6 +744,48 @@ class LeanRepl:
                     break
             logger.error("Exceeded maximum retries for Lean REPL command")
             return {"repl_error": str(last_exception)}
+
+    def _assert_resolved_imports_current(
+        self,
+        descriptor: ResolvedImports,
+        deadline: float,
+        *,
+        require_worker: bool = True,
+    ) -> None:
+        try:
+            descriptor.assert_current(deadline)
+            if (
+                require_worker
+                and self._project_fingerprint != descriptor.project_fingerprint
+            ):
+                raise StaleResolvedImportsError(
+                    "resolved Lean imports are stale: worker project configuration differs"
+                )
+        except StaleResolvedImportsError:
+            self.close()
+            raise
+
+    def _assert_project_current(self, deadline: float) -> None:
+        """Reject a worker whose project changed after process startup."""
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError("REPL command deadline exceeded")
+        try:
+            current = lean_project_fingerprint(self._project_identity)
+        except OSError as error:
+            self.close()
+            raise RuntimeError("Lean project changed after REPL startup") from error
+        if self._project_fingerprint != current:
+            self.close()
+            raise RuntimeError("Lean project changed after REPL startup")
+
+    @contextmanager
+    def _deadline_scope(self, deadline: float):
+        previous = self._request_deadline
+        self._request_deadline = deadline
+        try:
+            yield
+        finally:
+            self._request_deadline = previous
 
     def _check_memory_and_maybe_restart(self, timeout: float | None = None) -> None:
         """Proactively restart if memory usage is near the limit."""
@@ -532,6 +803,34 @@ class LeanRepl:
             logger.warning("Memory check failed, continuing", exc_info=True)
 
     def _run(self, code: str, env_id: int | None, timeout: float) -> dict[str, Any]:
+        """Run one frame and distinguish safe pre-send failures from unknown outcomes."""
+        request_sent = False
+
+        def mark_sent() -> None:
+            nonlocal request_sent
+            request_sent = True
+
+        try:
+            return self._run_io(code, env_id, timeout, mark_sent)
+        except (ReplOutcomeUnknown, ReplStderrBacklog):
+            raise
+        except Exception as error:
+            self.close()
+            if request_sent:
+                raise ReplOutcomeUnknown(
+                    "Lean REPL transport failed after the request was fully sent; "
+                    "its execution outcome is unknown and was not retried: "
+                    f"{error}"
+                ) from error
+            raise
+
+    def _run_io(
+        self,
+        code: str,
+        env_id: int | None,
+        timeout: float,
+        mark_sent: Callable[[], None],
+    ) -> dict[str, Any]:
         """Send code to the REPL via stdin JSON-RPC, read response via non-blocking I/O."""
         cmd_obj: dict[str, Any] = {"cmd": code}
         if env_id is not None:
@@ -548,6 +847,8 @@ class LeanRepl:
             raise ReplProcessExited("REPL process is not running.")
 
         end_time = time.monotonic() + timeout
+        if self._request_deadline is not None:
+            end_time = min(end_time, self._request_deadline)
         stdin_fd = self.process.stdin.fileno()
         stdout_fd = self.process.stdout.fileno()
         stderr_fd = self.process.stderr.fileno()
@@ -699,6 +1000,7 @@ class LeanRepl:
                 raise ReplProcessExited("REPL process closed stdin while writing")
             offset += written
 
+        mark_sent()
         while True:
             remaining = end_time - time.monotonic()
             if remaining <= 0:

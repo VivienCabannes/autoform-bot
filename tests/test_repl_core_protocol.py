@@ -4,12 +4,78 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from contextlib import ExitStack
 
 import pytest
 
 from servers.repl import core as repl_core
+from servers.repl import imports as repl_imports
+
+
+def _diagnostic(severity: str = "info") -> dict:
+    return {
+        "severity": severity,
+        "data": "diagnostic",
+        "pos": {"line": 1, "column": 0},
+        "endPos": {"line": 1, "column": 1},
+    }
+
+
+def _mark_ready(repl):
+    repl._project_fingerprint = repl_imports.lean_project_fingerprint(
+        repl._project_identity
+    )
+
+
+def _install_fake_process(repl, process):
+    repl.process = process
+    _mark_ready(repl)
+
+
+def _ready_repl_with_imports(tmp_path, monkeypatch):
+    project = tmp_path.resolve()
+    (project / "lakefile.toml").write_text('name = "Fixture"\n', encoding="utf-8")
+    (project / "lake-manifest.json").write_text(
+        '{"version": "1.1.0", "packages": []}\n',
+        encoding="utf-8",
+    )
+    discovery_root = project / "discovery"
+    source = discovery_root / "sources" / "Fixture.lean"
+    artifact = discovery_root / "artifacts" / "Fixture.olean"
+    source.parent.mkdir(parents=True)
+    artifact.parent.mkdir(parents=True)
+    source.write_text("theorem fixture : True := by trivial\n", encoding="utf-8")
+    artifact.write_bytes(b"olean")
+
+    def run_lake(command, project_root, *, deadline):
+        stdout = b""
+        if command[-1] == "env":
+            stdout = (
+                f"LEAN_PATH={artifact.parent}\nLEAN_SRC_PATH={source.parent}\n"
+            ).encode()
+        return subprocess.CompletedProcess(command, 0, stdout, b"")
+
+    monkeypatch.setattr(repl_imports, "_run_lake", run_lake)
+    descriptor = repl_imports.resolve_project_imports(
+        project,
+        ("Fixture",),
+        timeout=1,
+    )
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_retries=0,
+        )
+    )
+    repl._base_env_id = 11
+    repl._project_fingerprint = repl_imports.lean_project_fingerprint(project)
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    return repl, descriptor
 
 
 def test_split_imports_preserves_body_offset_after_comments_and_blank_lines():
@@ -23,8 +89,8 @@ import Mathlib.Data.Nat.Basic
     imports, body, offset = repl_core._split_imports_and_body(code)
 
     assert imports == ["Mathlib.Data.Nat.Basic"]
-    assert body == "#check Nat\n"
-    assert offset == 4
+    assert body == "\n-- body comment\n#check Nat\n"
+    assert offset == 2
 
 
 def test_split_imports_stops_at_the_first_body_statement():
@@ -35,6 +101,16 @@ def test_split_imports_stops_at_the_first_body_statement():
     assert imports == ["Mathlib"]
     assert body == "#check Nat\nimport Aesop\n"
     assert offset == 1
+
+
+def test_split_imports_preserves_an_unterminated_block_comment_for_lean():
+    code = "import Mathlib /- unterminated\n#check Missing"
+
+    imports, body, offset = repl_core._split_imports_and_body(code)
+
+    assert imports == ["Mathlib"]
+    assert body == code
+    assert offset == 0
 
 
 def test_run_rejects_disallowed_import_roots_before_touching_the_process():
@@ -53,6 +129,471 @@ def test_run_rejects_disallowed_import_roots_before_touching_the_process():
     assert repl.process is None
 
 
+@pytest.mark.parametrize("raw_imports", [("Fixture",), ["Fixture"]])
+def test_run_rejects_unresolved_structured_imports(raw_imports, monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("unresolved imports must not execute"),
+    )
+
+    with pytest.raises(TypeError, match="ResolvedImports descriptor"):
+        repl.run("#check Fixture", imports=raw_imports, timeout=1)
+
+
+def test_start_without_warmups_retains_an_init_environment_for_scanner_misses(
+    monkeypatch,
+):
+    class Process:
+        def poll(self):
+            return None
+
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    process = Process()
+    calls = []
+
+    monkeypatch.setattr(repl_core.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+
+    def run(code, env_id, timeout):
+        calls.append((code, env_id))
+        return {"env": len(calls)}
+
+    monkeypatch.setattr(repl, "_run", run)
+
+    repl.start()
+    scanner_miss = "/-! module documentation -/\nimport Mathlib\n#check Nat"
+    assert repl.run(scanner_miss, timeout=1) == {"env": 2}
+    assert calls == [
+        ("#check Nat", None),
+        (scanner_miss, 1),
+    ]
+
+
+def test_absolute_deadline_error_does_not_report_the_default_timeout(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            request_timeout=30,
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: 10.0)
+
+    assert repl.run("#check Nat", deadline=9.0) == {
+        "repl_error": "REPL command deadline exceeded"
+    }
+
+
+def test_resolved_imports_are_rechecked_immediately_before_dispatch(
+    tmp_path,
+    monkeypatch,
+):
+    repl, descriptor = _ready_repl_with_imports(tmp_path, monkeypatch)
+    checks = 0
+
+    def assert_current(self, deadline):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise repl_imports.StaleResolvedImportsError("descriptor changed")
+
+    monkeypatch.setattr(repl_imports.ResolvedImports, "assert_current", assert_current)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("stale imports must not be dispatched"),
+    )
+
+    with pytest.raises(repl_imports.StaleResolvedImportsError, match="changed"):
+        repl.run("#check Fixture", imports=descriptor, timeout=1)
+
+    assert checks == 2
+
+
+def test_stale_resolved_imports_retire_the_worker(tmp_path, monkeypatch):
+    repl, descriptor = _ready_repl_with_imports(tmp_path, monkeypatch)
+    retired = []
+    (tmp_path / "lakefile.toml").write_text('name = "Changed"\n', encoding="utf-8")
+    monkeypatch.setattr(repl, "close", lambda: retired.append(True))
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("stale imports must not execute"),
+    )
+
+    with pytest.raises(repl_imports.StaleResolvedImportsError, match="stale"):
+        repl.run("#check Fixture", imports=descriptor, timeout=1)
+
+    assert retired == [True]
+
+
+def test_closed_worker_restarts_for_current_resolved_imports(tmp_path, monkeypatch):
+    repl, descriptor = _ready_repl_with_imports(tmp_path, monkeypatch)
+    repl.process = None
+    repl._base_env_id = None
+    repl._project_fingerprint = None
+    calls = []
+    monkeypatch.setattr(repl, "is_alive", lambda: repl.process is not None)
+
+    def restart(timeout=None):
+        repl.process = object()
+        repl._base_env_id = 11
+        _mark_ready(repl)
+
+    def run(code, env_id, timeout):
+        calls.append((code, env_id))
+        if code.startswith("import "):
+            return {"env": 22}
+        return {"env": 23}
+
+    monkeypatch.setattr(repl, "restart", restart)
+    monkeypatch.setattr(repl, "_run", run)
+
+    assert repl.run("#check Fixture", imports=descriptor, timeout=1) == {"env": 23}
+    assert calls == [("import Fixture", None), ("#check Fixture", 22)]
+
+
+@pytest.mark.parametrize(
+    ("imported", "message"),
+    [
+        ([], "malformed response"),
+        ({"env": 1, "messages": {}}, "malformed diagnostics"),
+        ({"env": 1, "messages": ["error"]}, "malformed diagnostics"),
+        (
+            {"env": 1, "messages": [{**_diagnostic(), "severity": "fatal"}]},
+            "malformed diagnostics",
+        ),
+        (
+            {"env": 1, "messages": [{**_diagnostic(), "severity": []}]},
+            "malformed diagnostics",
+        ),
+        (
+            {"env": 1, "messages": [{**_diagnostic(), "data": None}]},
+            "malformed diagnostics",
+        ),
+        (
+            {
+                "env": 1,
+                "messages": [
+                    {**_diagnostic(), "pos": {"line": True, "column": 0}}
+                ],
+            },
+            "malformed diagnostics",
+        ),
+        ({"env": 1, "sorries": {}}, "malformed sorries"),
+        (
+            {
+                "env": 1,
+                "sorries": [{"goal": "False", "proofState": 0, "pos": 1}],
+            },
+            "malformed sorries",
+        ),
+        ({"env": 1, "sorries": [{"goal": "False"}]}, "malformed sorries"),
+        ({"env": True}, "valid environment"),
+        ({"env": -1}, "valid environment"),
+    ],
+)
+def test_malformed_import_responses_retire_the_worker(
+    tmp_path,
+    monkeypatch,
+    imported,
+    message,
+):
+    repl, descriptor = _ready_repl_with_imports(tmp_path, monkeypatch)
+    calls = []
+    retired = []
+
+    def run(code, env_id, timeout):
+        calls.append((code, env_id))
+        return imported
+
+    def close():
+        retired.append(True)
+        repl.process = None
+        repl._base_env_id = None
+
+    monkeypatch.setattr(repl, "_run", run)
+    monkeypatch.setattr(repl, "close", close)
+
+    response = repl.run("#check Fixture", imports=descriptor, timeout=1)
+
+    assert message in response["repl_error"]
+    assert calls == [("import Fixture", None)]
+    assert retired == [True]
+
+
+def test_import_response_accepts_zero_environment_and_trace_diagnostic(
+    tmp_path,
+    monkeypatch,
+):
+    repl, descriptor = _ready_repl_with_imports(tmp_path, monkeypatch)
+    calls = []
+
+    def run(code, env_id, timeout):
+        calls.append((code, env_id))
+        if code.startswith("import "):
+            return {"env": 0, "messages": [_diagnostic("trace")]}
+        return {"env": 1, "messages": []}
+
+    monkeypatch.setattr(repl, "_run", run)
+
+    assert repl.run("#check Fixture", imports=descriptor, timeout=1) == {
+        "env": 1,
+        "messages": []
+    }
+    assert calls == [
+        ("import Fixture", None),
+        ("#check Fixture", 0),
+    ]
+
+
+@pytest.mark.parametrize(
+    "sorry",
+    [
+        {
+            "goal": "False",
+            "proofState": 0,
+            "pos": {"line": 1, "column": 0},
+            "endPos": {"line": 1, "column": 5},
+        },
+        {"goal": "False", "proofState": None},
+    ],
+)
+def test_command_response_accepts_the_pinned_sorry_schema(sorry):
+    response = {"messages": [], "sorries": [sorry]}
+
+    assert repl_core._validate_command_response(
+        response,
+        context="a test command",
+        require_environment=False,
+    ) == (None, [])
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        [],
+        {"messages": {}},
+        {"messages": ["not-an-object"]},
+        {"messages": [{**_diagnostic(), "severity": "fatal"}]},
+        {"messages": [{**_diagnostic(), "data": None}]},
+        {"messages": [{**_diagnostic(), "endPos": {"line": -1, "column": 0}}]},
+        {"sorries": [1]},
+        {"sorries": [{"goal": None, "proofState": 0}]},
+        {"sorries": [{"goal": "False", "proofState": True}]},
+        {"env": True, "messages": []},
+        {"message": 1},
+    ],
+)
+def test_malformed_body_response_is_not_retried(monkeypatch, response):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_retries=2,
+        )
+    )
+    calls = []
+    retired = []
+    _mark_ready(repl)
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(
+        repl,
+        "_check_memory_and_maybe_restart",
+        lambda timeout: None,
+    )
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda code, env_id, timeout: calls.append((code, env_id)) or response,
+    )
+    monkeypatch.setattr(repl, "close", lambda: retired.append(True))
+
+    result = repl.run("#eval 1", timeout=1)
+
+    assert any(
+        fragment in result["repl_error"]
+        for fragment in ("malformed", "invalid", "valid environment")
+    )
+    assert result["outcome_unknown"] is True
+    assert calls == [("#eval 1", None)]
+    assert retired == [True]
+
+
+def test_pinned_repl_error_response_is_not_reported_as_success(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_retries=2,
+        )
+    )
+    _mark_ready(repl)
+    calls = []
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda code, env_id, timeout: calls.append((code, env_id))
+        or {"message": "Unknown environment."},
+    )
+
+    assert repl.run("#eval 1", timeout=1) == {
+        "repl_error": "Unknown environment."
+    }
+    assert calls == [("#eval 1", None)]
+
+
+@pytest.mark.parametrize(
+    ("raw_response", "message"),
+    [
+        ({"env": 0, "messages": [], "sorries": [1]}, "malformed sorries"),
+        ([["env", 0]], "malformed response"),
+    ],
+)
+def test_malformed_backlog_response_is_reported_as_unknown(
+    monkeypatch, raw_response, message
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_retries=2,
+        )
+    )
+    _mark_ready(repl)
+    retired = []
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+
+    def backlog(*args, **kwargs):
+        raise repl_core.ReplStderrBacklog(
+            "stderr backlog",
+            raw_response,
+        )
+
+    monkeypatch.setattr(repl, "_run", backlog)
+    monkeypatch.setattr(repl, "close", lambda: retired.append(True))
+
+    response = repl.run("#eval 1", timeout=1)
+
+    assert response["outcome_unknown"] is True
+    assert message in response["repl_error"]
+    assert retired == [True]
+
+
+def test_stale_worker_project_is_rejected_before_body_dispatch(tmp_path, monkeypatch):
+    (tmp_path / "lakefile.toml").write_text('name = "Fixture"\n', encoding="utf-8")
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_retries=0,
+        )
+    )
+    _mark_ready(repl)
+    (tmp_path / "lakefile.toml").write_text('name = "Changed"\n', encoding="utf-8")
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("a stale worker must not execute code"),
+    )
+
+    response = repl.run("#eval 1", timeout=1)
+
+    assert "project changed" in response["repl_error"]
+    assert repl._project_fingerprint is None
+
+
+def test_project_change_during_plain_body_is_not_retried(tmp_path, monkeypatch):
+    config = tmp_path / "lakefile.toml"
+    config.write_text('name = "Fixture"\n', encoding="utf-8")
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_retries=2,
+        )
+    )
+    _mark_ready(repl)
+    calls = []
+    retired = []
+    monkeypatch.setattr(repl, "is_alive", lambda: True)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+
+    def run(code, env_id, timeout):
+        calls.append((code, env_id))
+        config.write_text('name = "Changed"\n', encoding="utf-8")
+        return {"env": 12, "messages": []}
+
+    def close():
+        if repl._project_fingerprint is not None:
+            retired.append(True)
+        repl.process = None
+        repl._base_env_id = None
+        repl._project_fingerprint = None
+
+    monkeypatch.setattr(repl, "_run", run)
+    monkeypatch.setattr(repl, "close", close)
+
+    response = repl.run("#eval 1", timeout=1)
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+    assert calls == [("#eval 1", None)]
+    assert retired == [True]
+
+
+def test_project_change_during_structured_body_is_not_retried(
+    tmp_path, monkeypatch
+):
+    repl, descriptor = _ready_repl_with_imports(tmp_path, monkeypatch)
+    config = tmp_path / "lakefile.toml"
+    calls = []
+    retired = []
+
+    def run(code, env_id, timeout):
+        calls.append((code, env_id))
+        if code.startswith("import "):
+            return {"env": 22, "messages": []}
+        config.write_text('name = "Changed"\n', encoding="utf-8")
+        return {"env": 23, "messages": []}
+
+    def close():
+        if repl._project_fingerprint is not None:
+            retired.append(True)
+        repl.process = None
+        repl._base_env_id = None
+        repl._project_fingerprint = None
+
+    monkeypatch.setattr(repl, "_run", run)
+    monkeypatch.setattr(repl, "close", close)
+
+    response = repl.run("#eval 1", imports=descriptor, timeout=1)
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+    assert calls == [("import Fixture", None), ("#eval 1", 22)]
+    assert retired == [True]
+
+
 def test_run_offsets_diagnostics_after_stripping_import_header(monkeypatch):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -60,25 +601,28 @@ def test_run_offsets_diagnostics_after_stripping_import_header(monkeypatch):
             validate_imports=False,
         )
     )
+    _mark_ready(repl)
     monkeypatch.setattr(repl, "is_alive", lambda: True)
     monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
     monkeypatch.setattr(
         repl,
         "_run",
         lambda code, env_id, timeout: {
+            "env": 12,
             "messages": [
                 {
                     "severity": "error",
                     "data": "boom",
-                    "pos": {"line": 1, "column": 2},
-                    "endPos": {"line": 1, "column": 3},
+                    "pos": {"line": 2, "column": 2},
+                    "endPos": {"line": 2, "column": 3},
                 }
             ],
             "sorries": [
                 {
                     "goal": "False",
-                    "pos": {"line": 2, "column": 1},
-                    "endPos": {"line": 2, "column": 2},
+                    "proofState": None,
+                    "pos": {"line": 3, "column": 1},
+                    "endPos": {"line": 3, "column": 2},
                 }
             ],
         },
@@ -103,16 +647,17 @@ def test_run_resolves_the_base_environment_after_restart(monkeypatch):
     def restart(timeout=None):
         repl.process = object()
         repl._base_env_id = 73
+        _mark_ready(repl)
 
     monkeypatch.setattr(repl, "restart", restart)
     monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
     monkeypatch.setattr(
         repl,
         "_run",
-        lambda code, env_id, timeout: dispatched_envs.append(env_id) or {},
+        lambda code, env_id, timeout: dispatched_envs.append(env_id) or {"env": 74},
     )
 
-    assert repl.run("#check Nat", timeout=1) == {}
+    assert repl.run("#check Nat", timeout=1) == {"env": 74}
     assert dispatched_envs == [73]
 
 
@@ -145,6 +690,7 @@ def test_run_refreshes_the_base_environment_after_retry(monkeypatch):
     )
     repl.process = object()
     repl._base_env_id = 11
+    _mark_ready(repl)
     dispatched_envs = []
 
     monkeypatch.setattr(repl, "is_alive", lambda: True)
@@ -156,16 +702,17 @@ def test_run_refreshes_the_base_environment_after_retry(monkeypatch):
         dispatched_envs.append(env_id)
         if len(dispatched_envs) == 1:
             raise RuntimeError("retry me")
-        return {}
+        return {"env": 23}
 
     def restart(timeout=None):
         repl.process = object()
         repl._base_env_id = 22
+        _mark_ready(repl)
 
     monkeypatch.setattr(repl, "_run", run_once)
     monkeypatch.setattr(repl, "restart", restart)
 
-    assert repl.run("#check Nat", timeout=5) == {}
+    assert repl.run("#check Nat", timeout=5) == {"env": 23}
     assert dispatched_envs == [11, 22]
 
 
@@ -174,6 +721,7 @@ def test_explicit_environment_is_not_sent_after_a_memory_restart(monkeypatch):
         repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
     )
     repl.process = object()
+    _mark_ready(repl)
 
     monkeypatch.setattr(repl, "is_alive", lambda: True)
 
@@ -244,6 +792,15 @@ def test_format_repl_response_reports_explicit_repl_error():
     )
 
 
+def test_format_repl_response_preserves_unknown_outcome_warning():
+    assert repl_core.format_repl_response(
+        {"repl_error": "response was malformed", "outcome_unknown": True}
+    ) == (
+        "REPL error (execution outcome unknown; request not retried): "
+        "response was malformed"
+    )
+
+
 class _PipeProcess:
     def __init__(self, stack: ExitStack, stdout_chunks: list[bytes], stderr: bytes = b""):
         stdin_read, stdin_write = os.pipe()
@@ -272,6 +829,7 @@ def _repl_with_process(process: _PipeProcess, *, chunk_size: int = 4096, max_buf
         )
     )
     repl.process = process
+    _mark_ready(repl)
     return repl
 
 
@@ -312,6 +870,26 @@ def _patch_pipe_reads(monkeypatch, process: _PipeProcess):
     monkeypatch.setattr(repl_core.select, "select", fake_select)
 
 
+def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
+    with ExitStack() as stack:
+        process = _PipeProcess(stack, [])
+        repl = _repl_with_process(process)
+        _patch_pipe_reads(monkeypatch, process)
+        monkeypatch.setattr(
+            repl,
+            "restart",
+            lambda timeout=None: pytest.fail("a sent request must not be retried"),
+        )
+
+        response = repl.run("#eval 1", timeout=1)
+        request = process._stdin_read.read(4096)
+
+    assert response["outcome_unknown"] is True
+    assert "fully sent" in response["repl_error"]
+    assert request.count(b"\n\n") == 1
+    assert repl.process is None
+
+
 def test_wire_protocol_accepts_response_split_across_reads(monkeypatch):
     with ExitStack() as stack:
         process = _PipeProcess(stack, [b'{"messages":', b" []}\n", b"\n"])
@@ -348,7 +926,7 @@ def test_wire_protocol_reports_complete_stderr_on_premature_eof(monkeypatch):
         repl = _repl_with_process(process, max_buffer_bytes=len(stderr))
         _patch_pipe_reads(monkeypatch, process)
 
-        with pytest.raises(repl_core.ReplProcessExited) as error:
+        with pytest.raises(repl_core.ReplOutcomeUnknown) as error:
             repl._run("#check Nat", env_id=None, timeout=1)
 
     assert str(error.value).endswith(stderr.decode())
@@ -401,7 +979,7 @@ def test_wire_protocol_times_out_while_stderr_remains_readable(monkeypatch):
         monkeypatch.setattr(repl_core.os, "read", fake_read)
         monkeypatch.setattr(repl_core.time, "monotonic", fake_monotonic)
 
-        with pytest.raises(TimeoutError, match="timed out"):
+        with pytest.raises(repl_core.ReplOutcomeUnknown, match="timed out"):
             repl._run("#check Nat", env_id=None, timeout=1)
 
 
@@ -624,19 +1202,27 @@ def _patch_reads_across_processes(monkeypatch, processes: list[_PipeProcess]):
 
 def test_backlog_recycles_the_process_so_two_commands_cannot_share_stderr(monkeypatch):
     with ExitStack() as stack:
-        first = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        first = _PipeProcess(
+            stack,
+            [b'{"env":0}\n\n'],
+            stderr=b"e" * 40,
+        )
         second = _PipeProcess(stack, [b'{"env": 1}\n\n'])
         repl = _repl_with_process(first, chunk_size=18, max_buffer_bytes=20)
         _patch_reads_across_processes(monkeypatch, [first, second])
 
         # Command one completes, but its stderr cannot be drained within budget.
-        assert repl.run("#check Nat", timeout=5) == {"messages": []}
+        assert repl.run("#check Nat", timeout=5) == {}
 
         # The process holding the remainder is gone, so nothing can inherit it.
         assert repl.process is None
         assert first.stderr_bytes == b"e" * 4
 
-        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
+        monkeypatch.setattr(
+            repl,
+            "restart",
+            lambda timeout=None: _install_fake_process(repl, second),
+        )
 
         # Command two runs on a clean process and sees only its own streams.
         assert repl.run("#check Nat", timeout=5) == {"env": 1}
@@ -664,7 +1250,11 @@ def test_backlog_response_drops_environment_owned_by_the_recycled_process(monkey
 
 def test_env_scoped_request_refuses_to_outlive_the_recycled_process(monkeypatch):
     with ExitStack() as stack:
-        process = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"e" * 40)
+        process = _PipeProcess(
+            stack,
+            [b'{"env":0,"messages": []}\n\n'],
+            stderr=b"e" * 40,
+        )
         repl = _repl_with_process(process, chunk_size=18, max_buffer_bytes=20)
         _patch_pipe_reads(monkeypatch, process)
 
@@ -678,7 +1268,11 @@ def test_env_scoped_request_refuses_to_outlive_the_recycled_process(monkeypatch)
 
 def test_deadline_ended_drain_recycles_the_process_so_two_commands_cannot_share_stderr(monkeypatch):
     with ExitStack() as stack:
-        first = _PipeProcess(stack, [b'{"messages": []}\n\n'], stderr=b"x")
+        first = _PipeProcess(
+            stack,
+            [b'{"env":0,"messages": []}\n\n'],
+            stderr=b"x",
+        )
         second = _PipeProcess(stack, [b'{"env": 1}\n\n'])
         # A ceiling far out of reach, so the deadline is what ends the drain.
         repl = _repl_with_process(first, max_buffer_bytes=1_000_000)
@@ -709,7 +1303,11 @@ def test_deadline_ended_drain_recycles_the_process_so_two_commands_cannot_share_
         assert repl.process is None
         assert first.stderr_bytes
 
-        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
+        monkeypatch.setattr(
+            repl,
+            "restart",
+            lambda timeout=None: _install_fake_process(repl, second),
+        )
         monkeypatch.setattr(repl_core.os, "read", real_read)
 
         # Command two runs on a clean process, unaffected by command one's stderr.
@@ -782,7 +1380,11 @@ def test_stderr_arriving_during_the_next_write_is_process_scoped(monkeypatch):
         assert writes == 2
         assert repl.process is None
 
-        monkeypatch.setattr(repl, "restart", lambda timeout=None: setattr(repl, "process", second))
+        monkeypatch.setattr(
+            repl,
+            "restart",
+            lambda timeout=None: _install_fake_process(repl, second),
+        )
 
         # A third command starts on a clean process generation; command one's
         # delayed stderr was neither consumed nor charged as command-three output.
@@ -818,7 +1420,7 @@ def test_wire_protocol_rejects_invalid_json(monkeypatch):
         repl = _repl_with_process(process)
         _patch_pipe_reads(monkeypatch, process)
 
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(repl_core.ReplOutcomeUnknown, match="fully sent"):
             repl._run("#check Nat", env_id=None, timeout=1)
 
 
@@ -828,5 +1430,5 @@ def test_wire_protocol_rejects_oversized_response(monkeypatch):
         repl = _repl_with_process(process, max_buffer_bytes=8)
         _patch_pipe_reads(monkeypatch, process)
 
-        with pytest.raises(RuntimeError, match="response exceeded 8 bytes"):
+        with pytest.raises(repl_core.ReplOutcomeUnknown, match="response exceeded 8 bytes"):
             repl._run("#check Nat", env_id=None, timeout=1)

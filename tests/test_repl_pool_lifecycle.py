@@ -9,6 +9,20 @@ import pytest
 
 from servers.repl import core as repl_core
 from servers.repl import pool as repl_pool
+from servers.repl.imports import resolve_project_imports
+
+
+def test_pool_config_runs_base_post_init(monkeypatch):
+    configured = []
+
+    monkeypatch.setattr(
+        repl_pool.LeanReplConfig,
+        "__post_init__",
+        lambda config: configured.append(config),
+    )
+    config = repl_pool.LeanReplPoolConfig(num_repls=1)
+
+    assert configured == [config]
 
 
 def test_partial_pool_startup_closes_all_constructed_workers(monkeypatch):
@@ -88,6 +102,151 @@ def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch):
             pool.run("#check Nat", timeout=0.01)
     finally:
         pool._idle.put(borrowed)
+        pool.shutdown()
+
+
+def test_pool_forwards_resolved_imports_and_absolute_deadline(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def run(self, code, *, imports, deadline):
+            calls.append((code, imports, deadline))
+            return {"env": 0}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    monkeypatch.setattr(repl_pool.time, "monotonic", lambda: 10.0)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+    imports = resolve_project_imports(tmp_path, (), timeout=1)
+
+    try:
+        assert pool.run("#check Nat", imports=imports, deadline=13.0) == {"env": 0}
+    finally:
+        pool.shutdown()
+
+    assert calls == [("#check Nat", imports, 13.0)]
+
+
+def test_pool_retires_a_worker_before_requeue_after_request_exception(monkeypatch):
+    workers = []
+
+    class FakeRepl:
+        def __init__(self, config):
+            self.close_calls = 0
+            workers.append(self)
+
+        def start(self):
+            pass
+
+        def run(self, code, *, imports, deadline):
+            raise OSError("stdout failed")
+
+        def close(self):
+            self.close_calls += 1
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+    try:
+        with pytest.raises(OSError, match="stdout failed"):
+            pool.run("#check Nat")
+
+        assert workers[0].close_calls == 1
+        assert pool._idle.qsize() == 1
+    finally:
+        pool.shutdown()
+
+
+def test_pool_converts_relative_timeout_to_one_absolute_deadline(monkeypatch):
+    deadlines = []
+
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def run(self, code, *, imports, deadline):
+            deadlines.append(deadline)
+            return {"env": 0}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    monkeypatch.setattr(repl_pool.time, "monotonic", lambda: 10.0)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+
+    try:
+        pool.run("#check Nat", timeout=3.0)
+    finally:
+        pool.shutdown()
+
+    assert deadlines == [13.0]
+
+
+def test_pool_rejects_ambiguous_deadlines_before_worker_admission(monkeypatch):
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+
+    try:
+        with pytest.raises(TypeError, match="timeout or deadline"):
+            pool.run("#check Nat", timeout=1.0, deadline=2.0)
+        assert pool._active_calls == 0
+        assert pool._idle.qsize() == 1
+    finally:
+        pool.shutdown()
+
+
+@pytest.mark.parametrize("internal", [{"env_id": 1}, {"unexpected": True}])
+def test_pool_rejects_internal_worker_keywords(monkeypatch, internal):
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+
+    try:
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            pool.run("#check Nat", **internal)
+        assert pool._active_calls == 0
+        assert pool._idle.qsize() == 1
+    finally:
         pool.shutdown()
 
 
@@ -213,6 +372,7 @@ def test_repl_retry_recovery_uses_the_original_deadline(monkeypatch):
     monkeypatch.setattr(repl_core.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(repl, "is_alive", lambda: True)
     monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    monkeypatch.setattr(repl, "_assert_project_current", lambda deadline: None)
     monkeypatch.setattr(repl, "close", lambda: closed.append(True))
 
     def consume_deadline(code, env_id, timeout):
