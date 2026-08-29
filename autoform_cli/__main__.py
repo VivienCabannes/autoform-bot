@@ -19,7 +19,14 @@ from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_k
 from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
-from .project import ProjectCatalogError, inspect_project, load_release_catalog
+from .project import (
+    ProjectCatalogError,
+    ProjectCreateError,
+    create_project,
+    inspect_project,
+    load_release_catalog,
+)
+from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
 
@@ -35,12 +42,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     init.add_argument(
         "--autoform-source",
         default="",
-        help="Autoform Git source the generated workflows install from (default: this checkout's origin)",
+        help="Autoform Git source for generated workflows (default: verified installation source)",
     )
     init.add_argument(
         "--autoform-ref",
         default="",
-        help="immutable ref the workflows pin (default: this checkout's HEAD commit)",
+        help="full commit for generated workflows (default: verified installation revision)",
     )
     init.add_argument("--force", action="store_true", help="overwrite files that already exist")
     init.add_argument("--json", action="store_true", help="write stable machine-readable output")
@@ -65,6 +72,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     project = subparsers.add_parser("project", help="inspect local project configuration and releases")
     project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_new = project_subparsers.add_parser(
+        "new", help="atomically create a complete Lean and Autoform project"
+    )
+    project_new.add_argument(
+        "target",
+        nargs="?",
+        help="new absent directory, or '.' for the empty current directory",
+    )
+    project_new.add_argument("--package", help="UpperCamelCase Lean package name")
+    project_new.add_argument("--release", help="release id from 'project versions'")
+    project_new.add_argument(
+        "--autoform-source",
+        default="",
+        help="trusted Autoform Git source for generated workflows",
+    )
+    project_new.add_argument(
+        "--autoform-ref",
+        default="",
+        help="full 40-character Autoform commit for generated workflows",
+    )
+    project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_inspect = project_subparsers.add_parser(
         "inspect", help="inspect a project without running Lake, Git, or network operations"
     )
@@ -76,6 +104,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "versions", help="list bundled known-good Lean and Mathlib releases"
     )
     project_versions.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    project_provenance = project_subparsers.add_parser(
+        "provenance",
+        help="verify immutable provenance for this Autoform installation",
+    )
+    project_provenance.add_argument(
+        "--json", action="store_true", help="write stable machine-readable output"
+    )
 
     claim = subparsers.add_parser("claim", help="coordinate temporary node ownership through Git refs")
     claim_subparsers = claim.add_subparsers(dest="claim_command", required=True)
@@ -186,9 +221,10 @@ def _init(args: argparse.Namespace) -> int:
         sys.stdout.flush()
         print(
             "\nCI was not written: generated workflows install Autoform from a Git\n"
-            "ref, and this Autoform is not running from a checkout, so there is\n"
-            "nothing to pin. Re-run with the commit to add them:\n"
-            "  autoform init --autoform-ref <40-char-sha>",
+            "ref, and this installation has no verified source and commit.\n"
+            "Re-run with the complete pair to add them:\n"
+            "  autoform init --autoform-source <git-url> "
+            "--autoform-ref <40-char-sha>",
             file=sys.stderr,
         )
     return 0
@@ -261,6 +297,21 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def _project(args: argparse.Namespace) -> int:
     try:
+        if args.project_command == "new":
+            result = create_project(
+                args.target,
+                package=args.package,
+                release_id=args.release,
+                autoform_source=args.autoform_source,
+                autoform_ref=args.autoform_ref,
+            )
+            if args.json:
+                print(result.to_json())
+            else:
+                print(f"Created {result.package} at {result.target} ({result.release})")
+                if not result.workflows_pinned:
+                    print("warning: workflows were omitted because no immutable Autoform pin was available")
+            return 0
         if args.project_command == "inspect":
             result = inspect_project(args.target)
             if args.json:
@@ -280,6 +331,20 @@ def _project(args: argparse.Namespace) -> int:
                     print(f"    Lean: {release.lean.toolchain}")
                     print(f"    Mathlib: {release.mathlib.revision} ({release.mathlib.git})")
             return 0
+        if args.project_command == "provenance":
+            result = verify_plugin_provenance()
+            if args.json:
+                print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+            else:
+                print(f"Source: {result.source}")
+                print(f"Revision: {result.revision}")
+            return 0
+    except ProjectCreateError as error:
+        if getattr(args, "json", False):
+            print(error.to_json())
+        else:
+            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+        return 1
     except ProjectCatalogError:
         if getattr(args, "json", False):
             print(
@@ -297,6 +362,21 @@ def _project(args: argparse.Namespace) -> int:
             )
         else:
             print("error: bundled project release catalog is invalid", file=sys.stderr)
+        return 1
+    except ProvenanceError as error:
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "error": {"code": error.code, "message": error.message},
+                        "ok": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
         return 1
     return 2
 

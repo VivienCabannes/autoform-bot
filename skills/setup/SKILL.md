@@ -27,23 +27,49 @@ wanted. Without explicit publication approval, make no remote changes. Setup
 prepares the shell and stops before
 mathematical planning.
 
+Resolve the loaded `<AUTOFORM_PLUGIN_ROOT>` once and invoke every Autoform
+command through that root as the CLI reference specifies. Do not rely on an
+unrelated package or command already present on the consumer's `PATH`.
+
 Read the repo-shaped [Cabannes thesis project](assets/cabannes-thesis-project/README.md)
 as a concrete setup example. Reuse its structure selectively: rename the Lean
 package, check the current matching stable Lean/Mathlib release, update branch
 and immutable workflow pins, and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 
-For a new repository, require a target directory that does not already exist.
-Create its Lean/Mathlib shell from a release the user selects from
-`autoform project versions` before invoking Autoform. The catalog is a bundled
-known-good allowlist, not an automatic selection mechanism. Do not invent
-version pairs or copy the populated example as a project generator.
+For a new repository, use either an absent target directory or the literal
+target `.` from an empty current directory. Before writing it, run
+`autoform project provenance --json` through the loaded `<AUTOFORM_PLUGIN_ROOT>`. This
+online read verifies the exact plugin-root Git checkout or its Codex installer
+record against the recorded remote commit; a plain wheel cannot infer provenance.
+Stop before creating the target if this check fails. Read `autoform
+project versions --json`, select its single
+recommended release for this setup
+scenario, and pass both verified provenance values into the offline creation
+command:
 
-For a new or incomplete repository:
+```bash
+autoform project new <TARGET> --package <UpperCamelCaseName> \
+  --release <RECOMMENDED_RELEASE_ID> \
+  --autoform-source <VERIFIED_HTTPS_GIT_SOURCE> \
+  --autoform-ref <VERIFIED_40_CHAR_SHA>
+```
 
-- create or repair a buildable Lean project with matching `lean-toolchain` and
-  Mathlib revisions; and
-- write the blueprint vault, site configuration, and CI with `autoform init`.
+Use `.` for `<TARGET>` only when creating in the empty current directory; the
+command form is `autoform project new .` with the same explicit package,
+release, source, and ref flags shown above.
+
+The catalog is a bundled known-good allowlist, not an automatic selection
+mechanism. `project new` writes matching `lean-toolchain` and Mathlib revisions,
+the Lean shell, and the Autoform vault without running Git, Lake, Lean, or
+network operations; it never overwrites an existing entry. The `.` form
+preserves the current directory inode and mode and fails closed when an
+interrupted transaction cannot prove ownership. Do not invent version pairs or
+copy the populated example as a project generator.
+
+For an incomplete existing repository, preserve its authored configuration and
+use `autoform init` only for the Autoform vault/site overlay until the dedicated
+repair command is available.
 
 `autoform init` is the whole vault: `blueprint/` with its landing page,
 `roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
@@ -54,22 +80,19 @@ was written as a sibling file instead of `<chapter>/README.md`. `init` never ove
 also the repair path; it reports what it left alone. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
-`init` pins generated workflows to the Autoform commit that ran it. It first
-uses the plugin checkout and may recover provenance from a supported marketplace
-checkout. If neither location yields a safe immutable pin, `init` writes no CI
-rather than guess a ref: guessing produced projects whose first push failed with
-nothing in the workflow to explain why. When it reports that, find the commit
-the plugin was installed from and pass
-`--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
-Never invent a ref. It must be a full 40-character commit sha: `init` refuses a
-branch, a tag, or an abbreviated sha, because CI would silently reinstall a
-different Autoform later and break a project that was passing.
+`init` pins generated workflows to an explicitly supplied verified source and
+commit, or discovers the same pair from a verified exact-root checkout or Codex
+installer record. If neither source passes verification, `init` writes no CI
+rather than guess. Pass `--autoform-source <credential-free-https-git-url>` and
+`--autoform-ref <40-char-sha>` together; one without the other is an error.
+Never invent either value. `init` refuses a branch, tag, abbreviated SHA,
+credential-bearing URL, or mismatched pair.
 
 The two workflows it writes are `autoform-verify.yml`, which validates the
 Markdown DAG, builds Lean, rejects unfinished or unsafe proofs, and audits
 theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the
 DAG and its `lean:` declarations, renders the blueprint, builds MkDocs, and
-deploys GitHub Pages. Pass `--autoform-ref` to pin them at an immutable commit.
+deploys GitHub Pages. Pass the verified source and commit pair to pin them.
 
 After it runs, fill in what only a human or a source can supply: the project
 description in `blueprint/README.md`, the coverage contract, and a verified
