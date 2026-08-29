@@ -278,6 +278,8 @@ def _inspect_lake(
             if _toml_nesting_exceeds(text, _MAX_STRUCTURAL_DEPTH):
                 raise ValueError("TOML nesting limit exceeded")
             payload = tomllib.loads(text)
+            if _semantic_nesting_exceeds(payload, _MAX_STRUCTURAL_DEPTH):
+                raise ValueError("TOML nesting limit exceeded")
         except (UnicodeError, ValueError, tomllib.TOMLDecodeError, RecursionError, MemoryError):
             _issue(diagnostics, "error", "invalid-lake-toml", "lakefile.toml is not valid UTF-8 TOML.", "lakefile.toml")
             return None, None
@@ -1016,10 +1018,16 @@ def _toml_nesting_exceeds(text: str, limit: int) -> bool:
         if quote is not None:
             if escaped:
                 escaped = False
-            elif quote == '"' and character == "\\":
+            elif quote[0] == '"' and character == "\\":
                 escaped = True
-            elif text.startswith(quote, index):
-                index += len(quote) - 1
+            elif len(quote) == 3 and character == quote[0]:
+                run_end = index
+                while run_end < len(text) and text[run_end] == quote[0]:
+                    run_end += 1
+                if run_end - index >= 3:
+                    index = run_end - 1
+                    quote = None
+            elif len(quote) == 1 and character == quote:
                 quote = None
         elif character == "#":
             newline = text.find("\n", index)
@@ -1048,6 +1056,23 @@ def _toml_nesting_exceeds(text: str, limit: int) -> bool:
             if depth + key_components > limit:
                 return True
         index += 1
+    return False
+
+
+def _semantic_nesting_exceeds(value: Any, limit: int) -> bool:
+    """Check parsed container depth iteratively as a second depth boundary."""
+
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, dict):
+            if depth > limit:
+                return True
+            stack.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            if depth > limit:
+                return True
+            stack.extend((child, depth + 1) for child in current)
     return False
 
 

@@ -217,6 +217,22 @@ def test_dotted_keys_within_the_limit_still_parse(tmp_path: Path) -> None:
     assert result.lake is not None and result.lake.name == "Example"
 
 
+def test_multiline_string_terminator_cannot_hide_excessive_toml_depth(
+    tmp_path: Path,
+) -> None:
+    root = _project(tmp_path)
+    nested = "[" * 130 + "0" + "]" * 130
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\nx = """abc""""\ny = ' + nested + "\n",
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert any(diagnostic.code == "invalid-lake-toml" for diagnostic in result.diagnostics)
+
+
 def test_malformed_toml_is_a_path_free_failure(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "lakefile.toml").write_text("name = [\n", encoding="utf-8")
