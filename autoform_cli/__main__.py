@@ -10,7 +10,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import status
 from .article_identity import plan_article_ids
@@ -19,6 +19,7 @@ from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_k
 from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
+from .project import ProjectCatalogError, inspect_project, load_release_catalog
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
 
@@ -61,6 +62,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     doctor.add_argument("project_or_blueprint")
     doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
+    project = subparsers.add_parser("project", help="inspect local project configuration and releases")
+    project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_inspect = project_subparsers.add_parser(
+        "inspect", help="inspect a project without running Lake, Git, or network operations"
+    )
+    project_inspect.add_argument(
+        "target", nargs="?", default=".", help="a path inside the project (default: current directory)"
+    )
+    project_inspect.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    project_versions = project_subparsers.add_parser(
+        "versions", help="list bundled known-good Lean and Mathlib releases"
+    )
+    project_versions.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     claim = subparsers.add_parser("claim", help="coordinate temporary node ownership through Git refs")
     claim_subparsers = claim.add_subparsers(dest="claim_command", required=True)
@@ -115,6 +130,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _audit(args)
     if args.command == "doctor":
         return _doctor(args)
+    if args.command == "project":
+        return _project(args)
     if args.command == "claim":
         return _claim(args)
     if args.command == "migrate":
@@ -240,6 +257,81 @@ def _doctor(args: argparse.Namespace) -> int:
             marker = "PASS" if check.ok else "FAIL"
             print(f"{marker}: {check.name}: {check.detail}")
     return 0 if result.clean else 1
+
+
+def _project(args: argparse.Namespace) -> int:
+    try:
+        if args.project_command == "inspect":
+            result = inspect_project(args.target)
+            if args.json:
+                print(result.to_json())
+            else:
+                _print_project_inspection(result)
+            return 0 if result.ok else 1
+        if args.project_command == "versions":
+            catalog = load_release_catalog()
+            if args.json:
+                print(catalog.to_json())
+            else:
+                print("Supported Lean/Mathlib releases:")
+                for release in catalog.releases:
+                    suffix = " [recommended]" if release.recommended else ""
+                    print(f"  {release.id}{suffix}")
+                    print(f"    Lean: {release.lean.toolchain}")
+                    print(f"    Mathlib: {release.mathlib.revision} ({release.mathlib.git})")
+            return 0
+    except ProjectCatalogError:
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "project-catalog-invalid",
+                            "message": "The bundled project release catalog is invalid.",
+                        },
+                        "ok": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            print("error: bundled project release catalog is invalid", file=sys.stderr)
+        return 1
+    return 2
+
+
+def _print_project_inspection(result) -> None:
+    if result.project_root is not None:
+        print(f"Project: {result.project_root}")
+    if result.lake is not None:
+        package = result.lake.name or "unknown package"
+        version = f" {result.lake.version}" if result.lake.version else ""
+        print(f"Lake: {package}{version} ({result.lake.path})")
+        for target in result.lake.targets:
+            source_parts = [
+                part
+                for part in (result.lake.package_src_dir, target.src_dir)
+                if part is not None
+            ]
+            source = PurePosixPath(*source_parts).as_posix() if source_parts else "."
+            modules = target.roots or ((target.root,) if target.root is not None else ())
+            module_note = f", roots: {', '.join(modules)}" if modules else ""
+            print(f"  {target.kind} {target.name} (srcDir: {source}{module_note})")
+    if result.lean is not None:
+        print(f"Lean: {result.lean.toolchain}")
+    if result.mathlib is not None:
+        print(f"Mathlib: {result.mathlib.revision or 'none'} ({result.mathlib.git or 'none'})")
+    print(
+        f"Compatibility: {result.compatibility.status}"
+        + (f" ({result.compatibility.release})" if result.compatibility.release else "")
+    )
+    for diagnostic in result.diagnostics:
+        location = f" {diagnostic.path}" if diagnostic.path else ""
+        print(
+            f"{diagnostic.severity}[{diagnostic.code}]{location}: {diagnostic.message}",
+            file=sys.stderr,
+        )
 
 
 def _claim(args: argparse.Namespace) -> int:

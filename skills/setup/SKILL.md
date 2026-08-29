@@ -17,8 +17,9 @@ MkDocs, CI, and optionally publication. It does not scope sources, choose
 theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
 Inspect existing Lean, Lake, Markdown, workflow, and ignore files before
-writing, and preserve them. When a blueprint already exists, use the read-only
-`autoform doctor` command alongside direct repository inspection. Infer safe
+writing, and preserve them. Start with the offline, read-only
+`autoform project inspect <TARGET>` command; when a blueprint exists, also use
+`autoform doctor` for its runtime contract. Infer safe
 local defaults from the request and repository. If a
 material choice is missing, ask once for the run type (new, repair, or inspect),
 UpperCamelCase package name, target directory, and whether publication is
@@ -33,9 +34,10 @@ and immutable workflow pins, and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 
 For a new repository, require a target directory that does not already exist.
-Create its Lean/Mathlib shell from the project's selected upstream toolchain and
-matching release before invoking Autoform. Do not invent version pairs or copy
-the populated example as a project generator.
+Create its Lean/Mathlib shell from a release the user selects from
+`autoform project versions` before invoking Autoform. The catalog is a bundled
+known-good allowlist, not an automatic selection mechanism. Do not invent
+version pairs or copy the populated example as a project generator.
 
 For a new or incomplete repository:
 
