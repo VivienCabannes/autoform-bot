@@ -114,6 +114,17 @@ def test_v1_coverage_is_explicitly_refused_for_execution(tmp_path: Path) -> None
     assert [issue.code for issue in raised.value.issues] == ["coverage-v2-required"]
 
 
+def test_invalid_roadmap_is_reported_through_execution_input_error(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(article.read_text(encoding="utf-8") + "\n# Second title\n", encoding="utf-8")
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project)
+
+    assert [issue.code for issue in raised.value.issues] == ["runtime-invalid"]
+
+
 def test_concurrent_authority_change_is_not_snapshotted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

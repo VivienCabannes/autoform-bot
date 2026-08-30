@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .coverage import COVERAGE_V2_SCHEMA, CoverageSummary, load_coverage
+from .graph import GraphValidationError
 from .runtime import RuntimeGraph, RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
 
 EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v1"
@@ -111,7 +112,7 @@ def load_execution_input(
     try:
         paths = resolve_runtime_paths(project_or_blueprint)
         first_runtime = load_runtime_graph(project_or_blueprint, lean_root=lean_root)
-    except RuntimeProjectionError as error:
+    except (GraphValidationError, RuntimeProjectionError) as error:
         raise ExecutionInputError(
             [ExecutionInputIssue("runtime-invalid", reason) for reason in error.issues]
         ) from error
@@ -121,7 +122,7 @@ def load_execution_input(
     # becomes an explicit refusal instead of a runtime/coverage hybrid.
     try:
         second_runtime = load_runtime_graph(project_or_blueprint, lean_root=lean_root)
-    except RuntimeProjectionError as error:
+    except (GraphValidationError, RuntimeProjectionError) as error:
         raise ExecutionInputError(
             [
                 ExecutionInputIssue(
