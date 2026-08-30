@@ -128,8 +128,12 @@ mathematics.
    a prerequisite the proof needs but the statement does not. Keep roadmap,
    coverage, and source links under other headings.
 7. Search the pinned Mathlib checkout before planning new work. Set
-   `mathlib: true` only for an exact verified upstream result; record partial or
-   uncertain candidates as notes, never as formalization status.
+   `mathlib: true` only for an exact verified upstream result, and record both
+   its compiled name in `mathlib_declaration` and its exact declaring source
+   file as `mathlib_file: Mathlib/.../*.lean`. Generated CI checks the name,
+   declaration kind, and declaring module after the pinned Mathlib dependency
+   is loaded. Record partial or uncertain candidates as notes, never as
+   formalization status.
 8. Reconcile every page whose claims this work has just invalidated. That means
    the coarse milestone pages and the coverage contract, and also the two
    landing pages Setup wrote before any scope existed: `blueprint/README.md`
@@ -140,7 +144,8 @@ mathematics.
    stale either.
 
 Assert only what is checked: `statement: formalized`, `proof: formalized`,
-`mathlib: true`, `not_ready: true`, and the compiled name in `lean`. Ready,
+`mathlib: true` with its exact `mathlib_declaration` and `mathlib_file`,
+`not_ready: true`, and the compiled name in `lean`. Ready,
 blocked, and fully-proved are derived from the DAG — never hand-write them, and
 never start proof workers merely to advance a state. The
 [blueprint format reference](../../autoform_cli/README.md) has the full table.

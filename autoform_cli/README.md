@@ -60,9 +60,12 @@ relative to the current article and must point at another roadmap article.
 The optional `declaration` field marks a formalizable leaf and describes its
 intended Lean artifact, for example `def`, `theorem`, `lemma`, `structure`, or
 `instance`. Container and exposition articles omit it. Autoform records this
-hint but does not constrain the set of Lean declaration commands. Declarations
-that introduce data rather than a proposition carry no separate proof
-obligation.
+intent and generated CI checks it against the built declaration. The supported
+intents are `abbrev`, `axiom`, `class`, `corollary`, `def`, `definition`,
+`inductive`, `instance`, `lemma`, `opaque`, `proposition`, `structure`, and
+`theorem`; theorem-like aliases share Lean's kernel-level theorem kind.
+Declarations that introduce data rather than a proposition carry no separate
+proof obligation.
 
 `origin` records provenance for formalizable work: `cited` for a direct source
 target, `bridged` for a result introduced between source targets, and
@@ -79,7 +82,9 @@ An article asserts only facts a human or agent verified:
 | --- | --- |
 | `statement: formalized` | The Lean statement exists and compiles. |
 | `proof: formalized` | The Lean proof is complete. |
-| `mathlib: true` | The result is upstreamed into Mathlib. |
+| `mathlib: true` | The exact result exists in the pinned Mathlib dependency. Requires `mathlib_declaration` and `mathlib_file`. |
+| `mathlib_declaration: Ns.decl` | Exact upstream declaration name(s). |
+| `mathlib_file: Mathlib/Path/File.lean` | Exact Mathlib source file that declares the upstream name(s). |
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
@@ -219,6 +224,13 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
 uv run --with mkdocs --with mkdocs-material --with mkdocs-literate-nav \
   --with pymdown-extensions mkdocs build --strict
 ```
+
+Generated CI additionally rebuilds the root Lake package, then checks every
+local `lean:` target belongs to one of those built modules. Each
+`mathlib_declaration` must exist in the module named by `mathlib_file`, and a
+root-package declaration cannot impersonate a Mathlib result. Existence and
+declaration kind are read from Lean's environment, not inferred from source
+text.
 
 Drop `--require-declarations` when reviewing work in progress, where a
 statement may name a Lean declaration that does not exist yet.

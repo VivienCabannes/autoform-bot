@@ -147,9 +147,33 @@ def test_audit_requires_mathlib_declaration_and_declaration_intent_on_evidenced_
 
     upstream_codes = {code for code, _reason in findings["roadmap/upstream.md"]}
     local_codes = {code for code, _reason in findings["roadmap/local.md"]}
-    assert upstream_codes == {"mathlib-without-declaration", "missing-declaration-intent"}
+    assert upstream_codes == {
+        "mathlib-without-declaration",
+        "mathlib-without-file",
+        "missing-declaration-intent",
+    }
     assert local_codes == {"missing-declaration-intent"}
     assert "roadmap/exposition.md" not in findings
+
+
+def test_audit_requires_a_canonical_mathlib_source_path(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(
+        blueprint,
+        "upstream.md",
+        declaration="theorem",
+        mathlib="true",
+        mathlib_declaration="Nat.prime_def_lt",
+        mathlib_file="Mathlib/../Fake.lean",
+    )
+
+    assert _finding_map(blueprint)["roadmap/upstream.md"] == [
+        (
+            "invalid-mathlib-file",
+            "mathlib_file must be a canonical Mathlib/**/*.lean source path",
+        )
+    ]
 
 
 def test_audit_validates_local_source_links_without_network_access(tmp_path: Path, monkeypatch) -> None:
@@ -233,11 +257,14 @@ def test_audit_validates_lean_targets_only_when_root_is_supplied(tmp_path: Path)
         "wrong-kind.md",
         declaration="theorem",
         statement="formalized",
-        lean="Project.value",
+        lean="Project.value Project.good",
     )
     lean_root = tmp_path / "lean"
     lean_root.mkdir()
-    (lean_root / "Value.lean").write_text("def Project.value : Nat := 1\n", encoding="utf-8")
+    (lean_root / "Value.lean").write_text(
+        "def Project.value : Nat := 1\ntheorem Project.good : True := trivial\n",
+        encoding="utf-8",
+    )
 
     without_lean = _finding_map(blueprint)
     with_lean = _finding_map(blueprint, lean_root=lean_root)

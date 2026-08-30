@@ -19,7 +19,7 @@ import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _LINE_COMMENT = re.compile(r"--.*$")
 _NAMESPACE = re.compile(r"^\s*namespace\s+(\S+)")
@@ -35,6 +35,37 @@ _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
 _IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
 _PUBLICATION_MANIFEST = "publication.json"
 _PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
+
+# Lean erases the source-level distinction between theorem, lemma, corollary,
+# and proposition. Keep that normalization in one place so the lexical audit
+# and the kernel-backed CI probe enforce the same authored intent.
+DECLARATION_KIND_ALIASES = {
+    "abbrev": "abbrev",
+    "axiom": "axiom",
+    "class": "class",
+    "corollary": "theorem",
+    "def": "def",
+    "definition": "def",
+    "inductive": "inductive",
+    "instance": "instance",
+    "lemma": "theorem",
+    "opaque": "opaque",
+    "proposition": "theorem",
+    "structure": "structure",
+    "theorem": "theorem",
+}
+
+_DECLARATION_KEYWORDS = {
+    "abbrev": frozenset({"abbrev"}),
+    "axiom": frozenset({"axiom"}),
+    "class": frozenset({"class"}),
+    "def": frozenset({"def"}),
+    "inductive": frozenset({"inductive"}),
+    "instance": frozenset({"instance"}),
+    "opaque": frozenset({"opaque"}),
+    "structure": frozenset({"structure"}),
+    "theorem": frozenset({"lemma", "theorem"}),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +320,47 @@ def declaration_names(lean: str) -> list[str]:
     return [name.strip() for name in lean.replace(",", " ").split() if name.strip()]
 
 
+def declaration_kind(intent: str | None) -> str | None:
+    """Return the kernel-checkable kind represented by authored intent."""
+
+    if intent is None:
+        return None
+    return DECLARATION_KIND_ALIASES.get(intent.strip().casefold())
+
+
+def declaration_keywords(intent: str | None) -> frozenset[str] | None:
+    """Return source keywords accepted for authored declaration intent."""
+
+    kind = declaration_kind(intent)
+    return _DECLARATION_KEYWORDS.get(kind) if kind is not None else None
+
+
+def mathlib_module_name(source_file: str) -> str | None:
+    """Map a canonical ``Mathlib/**/*.lean`` source path to its module name."""
+
+    if not source_file or "\\" in source_file:
+        return None
+    path = PurePosixPath(source_file)
+    if path.is_absolute() or path.as_posix() != source_file:
+        return None
+    parts = path.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    if parts[0] != "Mathlib" and parts[0] != "Mathlib.lean":
+        return None
+    if not parts[-1].endswith(".lean") or parts[-1] == ".lean":
+        return None
+    module_parts = [*parts[:-1], parts[-1][: -len(".lean")]]
+    if not module_parts or module_parts[0] != "Mathlib":
+        return None
+    for part in module_parts:
+        if not part or not (part[0].isalpha() or part[0] == "_"):
+            return None
+        if any(not (character.isalnum() or character in "_'") for character in part):
+            return None
+    return ".".join(module_parts)
+
+
 @dataclass(frozen=True, slots=True)
 class SourceLinker:
     """Build permalinks into the project's Lean sources."""
@@ -375,15 +447,19 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 
 
 __all__ = [
+    "DECLARATION_KIND_ALIASES",
     "IndexedSourceSnapshot",
     "Declaration",
     "SourceIndex",
     "SourceLinker",
     "build_linker",
+    "declaration_kind",
+    "declaration_keywords",
     "declaration_names",
     "detect_ref",
     "detect_repository_url",
     "index_project",
+    "mathlib_module_name",
     "project_source_revision",
     "snapshot_project_sources",
 ]

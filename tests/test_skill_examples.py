@@ -285,18 +285,21 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert '<a href="{{ config.repo_url }}">Formalization source</a>.' in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
     assert "autoform check blueprint --lean-root ." in workflow
+    assert "needs: verify" in workflow
+    assert '"$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint "$probe"' in workflow
     assert "autoform render blueprint" in workflow
     assert "--require-declarations" in workflow
     assert "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128" in workflow
     assert "@main" not in workflow
 
     verify = (example / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
-    assert "autoform check blueprint" in verify
+    assert "autoform check blueprint --lean-root ." in verify
     assert 'lake clean "$root_package"' in verify
     assert "lake build" in verify
     assert "Reject kernel-check bypass options" in verify
-    assert "Audit every root-package declaration" in verify
-    assert "python3 .github/autoform_audit.py" in verify
+    assert "Bind blueprint claims to built artifacts" in verify
+    assert "python .github/autoform_audit.py" in verify
+    assert '"$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint "$probe"' in verify
     assert "lake pack" in verify
     assert "lake-modules" not in verify
     assert "contains no ILean artifacts" in (
@@ -563,6 +566,18 @@ def test_roadmap_commits_so_the_published_site_can_catch_up(repo_root: Path) -> 
 
     assert "Commit the vault" in roadmap
     assert "outward-facing" in roadmap
+
+
+def test_roadmap_records_kernel_verifiable_mathlib_provenance(repo_root: Path) -> None:
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+
+    for required in (
+        "mathlib_declaration",
+        "mathlib_file: Mathlib/.../*.lean",
+        "declaration kind",
+        "declaring module",
+    ):
+        assert required in roadmap
 
 
 def test_example_workflows_match_the_scaffold_templates(repo_root: Path) -> None:

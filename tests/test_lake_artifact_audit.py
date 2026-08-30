@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,21 @@ def _archive(path: Path, members: list[tuple[str, bytes | None]]) -> Path:
     return path
 
 
+def _blueprint(tmp_path: Path, name: str = "blueprint") -> Path:
+    blueprint = tmp_path / name
+    _write(blueprint / "roadmap/README.md", "# Fixture roadmap\n")
+    return blueprint
+
+
+def _blueprint_article(blueprint: Path, name: str, *metadata: str) -> Path:
+    path = blueprint / "roadmap" / f"{name}.md"
+    _write(
+        path,
+        "\n".join(["---", *metadata, "---", "", f"# {name.title()}", ""]) + "\n",
+    )
+    return path
+
+
 def test_root_package_comes_from_top_level_evaluated_config(
     helper: ModuleType, tmp_path: Path
 ) -> None:
@@ -132,6 +148,141 @@ def test_archive_modules_are_sorted_and_probe_fails_on_zero_declarations(
     assert 'throwError "kernel-trust audit found no root-package declarations"' in probe
     assert "info.isUnsafe || info.isPartial" in probe
     assert "Lean.collectAxioms" in probe
+
+
+def test_blueprint_targets_use_canonical_graph_and_preserve_multiple_claims(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    blueprint = _blueprint(tmp_path)
+    _blueprint_article(
+        blueprint,
+        "local",
+        "declaration: lemma",
+        "lean: Fixture.first, Fixture.second",
+    )
+    _blueprint_article(
+        blueprint,
+        "upstream",
+        "declaration: theorem",
+        "mathlib: true",
+        "mathlib_declaration: Nat.Prime, Nat.prime_def_lt",
+        "mathlib_file: Mathlib/Data/Nat/Prime/Basic.lean",
+    )
+
+    targets = helper.targets_from_blueprint(blueprint)
+
+    assert [
+        (
+            target.article_path,
+            target.name,
+            target.expected_kind,
+            target.owner,
+            target.expected_module,
+        )
+        for target in targets
+    ] == [
+        ("roadmap/local.md", "Fixture.first", "theorem", "root", None),
+        ("roadmap/local.md", "Fixture.second", "theorem", "root", None),
+        (
+            "roadmap/upstream.md",
+            "Nat.Prime",
+            "theorem",
+            "mathlib",
+            "Mathlib.Data.Nat.Prime.Basic",
+        ),
+        (
+            "roadmap/upstream.md",
+            "Nat.prime_def_lt",
+            "theorem",
+            "mathlib",
+            "Mathlib.Data.Nat.Prime.Basic",
+        ),
+    ]
+    probe = helper.render_probe(("Fixture",), targets)
+    assert "import Mathlib.Data.Nat.Prime.Basic" in probe
+    assert "local declaration {declName} belongs to non-root module" in probe
+    assert "Mathlib declaration {declName} is owned by root module" in probe
+    assert "does not have expected kind {expectedKind}" in probe
+
+
+def test_helper_remains_compatible_during_an_immutable_pin_upgrade(
+    repo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import autoform_cli.audit as audit_module
+    import autoform_cli.lean as lean_module
+
+    legacy = {
+        "definition": frozenset({"def"}),
+        "lemma": frozenset({"lemma", "theorem"}),
+    }
+    monkeypatch.delattr(lean_module, "declaration_kind")
+    monkeypatch.delattr(lean_module, "mathlib_module_name")
+    monkeypatch.setattr(audit_module, "_DECLARATION_KEYWORDS", legacy, raising=False)
+
+    compatibility_helper = _load_helper(repo_root)
+
+    assert compatibility_helper.declaration_kind("definition") == "def"
+    assert compatibility_helper.declaration_kind("lemma") == "theorem"
+    assert compatibility_helper.mathlib_module_name("Mathlib/Order/Basic.lean") == (
+        "Mathlib.Order.Basic"
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (("lean: Fixture.result",), "declaration intent is missing or unsupported"),
+        (
+            ("declaration: theorem", "statement: formalized"),
+            "formalized local work has no lean declaration target",
+        ),
+        (
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_file: Mathlib/Data/Nat/Prime/Basic.lean",
+            ),
+            "mathlib_declaration is missing",
+        ),
+        (
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_declaration: Nat.Prime",
+            ),
+            "mathlib_file is missing",
+        ),
+        (
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_declaration: Nat.Prime",
+                "mathlib_file: Mathlib/../Fake.lean",
+            ),
+            "canonical Mathlib",
+        ),
+        (
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_declaration: Totally.Fake",
+                "mathlib_file: Totally/Fake.lean",
+            ),
+            "canonical Mathlib",
+        ),
+    ],
+)
+def test_invalid_blueprint_claims_fail_before_probe_generation(
+    helper: ModuleType,
+    tmp_path: Path,
+    metadata: tuple[str, ...],
+    message: str,
+) -> None:
+    blueprint = _blueprint(tmp_path)
+    _blueprint_article(blueprint, "claim", *metadata)
+
+    with pytest.raises(helper.AuditInputError, match=message):
+        helper.targets_from_blueprint(blueprint)
 
 
 @pytest.mark.parametrize(
@@ -203,26 +354,37 @@ def test_helper_runs_on_python_310(repo_root: Path, tmp_path: Path) -> None:
     if python is None:
         pytest.skip("python3.10 is not installed")
     helper_path = repo_root / _TEMPLATE
+    environment = {**os.environ, "PYTHONPATH": str(repo_root)}
     config = tmp_path / "evaluated.toml"
     _write(config, 'name = "Fixture"\n')
     identified = subprocess.run(
         [python, str(helper_path), "--root-package", str(config)],
         capture_output=True,
         text=True,
+        env=environment,
     )
     assert identified.returncode == 0, identified.stderr
     assert identified.stdout == "Fixture\n"
 
     archive = _archive(tmp_path / "root.tgz", _module_members("Fixture"))
+    blueprint = _blueprint(tmp_path)
     probe = tmp_path / "probe.lean"
     result = subprocess.run(
-        [python, str(helper_path), "Fixture", str(archive), str(probe)],
+        [
+            python,
+            str(helper_path),
+            "Fixture",
+            str(archive),
+            str(blueprint),
+            str(probe),
+        ],
         capture_output=True,
         text=True,
+        env=environment,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "prepared kernel-trust audit for 1 root-package module" in result.stdout
+    assert "prepared artifact audit for 1 root-package module" in result.stdout
     assert probe.is_file()
 
 
@@ -295,6 +457,164 @@ srcDir = "app-src"
     probe.write_text(helper.render_probe(modules), encoding="utf-8")
     audited = _run(project, "lake", "env", "lean", str(probe))
     assert audited.returncode == 0, audited.stdout + audited.stderr
+
+
+@pytest.mark.real_lean
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
+def test_real_probe_binds_blueprint_claims_to_modules_and_kinds(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    mathlib = tmp_path / "mathlib"
+    mathlib.mkdir()
+    _write(mathlib / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
+    _write(
+        mathlib / "lakefile.toml",
+        '''name = "mathlib"
+version = "0.1.0"
+defaultTargets = ["Mathlib"]
+
+[[lean_lib]]
+name = "Mathlib"
+''',
+    )
+    _write(
+        mathlib / "Mathlib.lean",
+        "import Mathlib.Genuine\nimport Mathlib.Actual\nimport Mathlib.Expected\n",
+    )
+    _write(
+        mathlib / "Mathlib/Genuine.lean",
+        "theorem Mathlib.Genuine.first : True := by trivial\n"
+        "theorem Mathlib.Genuine.second : True := by trivial\n"
+        "axiom Mathlib.Genuine.assumed : True\n",
+    )
+    _write(
+        mathlib / "Mathlib/Actual.lean",
+        "theorem Mathlib.Actual.claim : True := by trivial\n",
+    )
+    _write(mathlib / "Mathlib/Expected.lean", "import Mathlib.Actual\n")
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(project / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
+    _write(
+        project / "lakefile.toml",
+        '''name = "ArtifactFixture"
+version = "0.1.0"
+defaultTargets = ["Fixture"]
+
+[[require]]
+name = "mathlib"
+path = "../mathlib"
+
+[[lean_lib]]
+name = "Fixture"
+''',
+    )
+    _write(
+        project / "Fixture.lean",
+        "import Mathlib.Genuine\n"
+        "import Mathlib.Expected\n"
+        "theorem Fixture.first : True := by trivial\n"
+        "theorem Fixture.second : True := by trivial\n"
+        "def Fixture.value : Nat := 1\n"
+        "abbrev Fixture.Count := Nat\n"
+        "opaque Fixture.hidden : Nat := 0\n"
+        "structure Fixture.Record where\n  value : Nat\n"
+        "class Fixture.Marker where\n  token : Nat\n"
+        "inductive Fixture.Flag where\n  | on\n"
+        "instance Fixture.flagInhabited : Inhabited Fixture.Flag := ⟨.on⟩\n",
+    )
+    _write(project / "Scratch.lean", "theorem Fixture.unbuilt : True := by trivial\n")
+
+    built = _run(project, "lake", "build")
+    assert built.returncode == 0, built.stdout + built.stderr
+    archive = project / "root.tgz"
+    packed = _run(project, "lake", "pack", str(archive))
+    assert packed.returncode == 0, packed.stdout + packed.stderr
+    modules = helper.modules_from_archive(archive, "ArtifactFixture")
+    assert modules == ("Fixture",)
+
+    def audit_claims(name: str, articles: tuple[tuple[str, ...], ...]):
+        blueprint = _blueprint(tmp_path, f"blueprint-{name}")
+        for index, metadata in enumerate(articles):
+            _blueprint_article(blueprint, f"claim-{index}", *metadata)
+        probe = project / f"probe-{name}.lean"
+        probe.write_text(
+            helper.render_probe(modules, helper.targets_from_blueprint(blueprint)),
+            encoding="utf-8",
+        )
+        return _run(project, "lake", "env", "lean", str(probe))
+
+    positive = audit_claims(
+        "positive",
+        (
+            (
+                "declaration: theorem",
+                "lean: Fixture.first, Fixture.second",
+            ),
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_declaration: Mathlib.Genuine.first, Mathlib.Genuine.second",
+                "mathlib_file: Mathlib/Genuine.lean",
+            ),
+            (
+                "declaration: axiom",
+                "mathlib: true",
+                "mathlib_declaration: Mathlib.Genuine.assumed",
+                "mathlib_file: Mathlib/Genuine.lean",
+            ),
+            ("declaration: definition", "lean: Fixture.value"),
+            ("declaration: abbrev", "lean: Fixture.Count"),
+            ("declaration: opaque", "lean: Fixture.hidden"),
+            ("declaration: structure", "lean: Fixture.Record"),
+            ("declaration: class", "lean: Fixture.Marker"),
+            ("declaration: inductive", "lean: Fixture.Flag"),
+            ("declaration: instance", "lean: Fixture.flagInhabited"),
+        ),
+    )
+    assert positive.returncode == 0, positive.stdout + positive.stderr
+
+    failures = {
+        "wrong-kind": (
+            ("declaration: theorem", "lean: Fixture.value"),
+            "does not have expected kind theorem",
+        ),
+        "unbuilt": (
+            ("declaration: theorem", "lean: Fixture.unbuilt"),
+            "local declaration does not exist",
+        ),
+        "wrong-owner": (
+            ("declaration: theorem", "lean: Mathlib.Genuine.first"),
+            "belongs to non-root module Mathlib.Genuine",
+        ),
+        "missing-mathlib": (
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_declaration: Mathlib.Genuine.missing",
+                "mathlib_file: Mathlib/Genuine.lean",
+            ),
+            "Mathlib declaration does not exist",
+        ),
+        "wrong-module": (
+            (
+                "declaration: theorem",
+                "mathlib: true",
+                "mathlib_declaration: Mathlib.Actual.claim",
+                "mathlib_file: Mathlib/Expected.lean",
+            ),
+            "belongs to Mathlib.Actual, not Mathlib.Expected",
+        ),
+    }
+    rejected = audit_claims(
+        "rejected",
+        tuple(metadata for metadata, _message in failures.values()),
+    )
+    output = rejected.stdout + rejected.stderr
+    assert rejected.returncode != 0, output
+    for name, (_metadata, message) in failures.items():
+        assert message in output, f"{name}: {output}"
 
 
 @pytest.mark.real_lean
@@ -421,6 +741,23 @@ def test_bundled_project_builds_against_pinned_mathlib(
     assert built.returncode == 0, built.stdout + built.stderr
     assert (project / ".lake/packages/mathlib/Mathlib.lean").is_file()
     assert (project / ".lake/build/lib/lean/CabannesThesis.olean").is_file()
+
+    archive = project / "root.tgz"
+    packed = _run(project, "lake", "pack", str(archive))
+    assert packed.returncode == 0, packed.stdout + packed.stderr
+    probe = project / "artifact-probe.lean"
+    generated = _run(
+        project,
+        sys.executable,
+        str(project / ".github/autoform_audit.py"),
+        "CabannesThesis",
+        str(archive),
+        str(project / "blueprint"),
+        str(probe),
+    )
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    audited = _run(project, "lake", "env", "lean", str(probe), timeout=900)
+    assert audited.returncode == 0, audited.stdout + audited.stderr
 
 
 def test_example_and_template_helpers_are_identical(repo_root: Path) -> None:

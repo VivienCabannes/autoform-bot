@@ -146,7 +146,8 @@ def test_substitutions_reach_the_site_config(tmp_path: Path) -> None:
     assert 'AUTOFORM_SOURCE: "https://example.test/autoform.git"' in verify
     assert f'AUTOFORM_REF: "{"0" * 40}"' in verify
     assert '"git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"' in verify
-    assert "python3 .github/autoform_audit.py" in verify
+    assert "python .github/autoform_audit.py" in verify
+    assert '"$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint "$probe"' in verify
 
 
 def test_no_placeholder_survives_anywhere(tmp_path: Path) -> None:

@@ -4,8 +4,11 @@ from pathlib import Path
 
 from autoform_cli.lean import (
     SourceLinker,
+    declaration_kind,
+    declaration_keywords,
     declaration_names,
     index_project,
+    mathlib_module_name,
 )
 
 _SOURCE = """import Mathlib
@@ -145,6 +148,33 @@ def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
 def test_declaration_names_splits_a_list() -> None:
     assert declaration_names("A.b, C.d  E.f") == ["A.b", "C.d", "E.f"]
     assert declaration_names("") == []
+
+
+def test_declaration_intent_aliases_have_one_shared_normalization() -> None:
+    assert declaration_kind("lemma") == "theorem"
+    assert declaration_kind("Corollary") == "theorem"
+    assert declaration_kind("definition") == "def"
+    assert declaration_kind("unknown") is None
+    assert declaration_keywords("proposition") == frozenset({"lemma", "theorem"})
+
+
+def test_mathlib_file_maps_only_canonical_source_paths() -> None:
+    assert mathlib_module_name("Mathlib.lean") == "Mathlib"
+    assert mathlib_module_name("Mathlib/Data/Nat/Prime/Basic.lean") == (
+        "Mathlib.Data.Nat.Prime.Basic"
+    )
+    for invalid in (
+        "",
+        "Mathlib/Data/Nat/Prime/Basic",
+        "Mathlib//Data/Nat.lean",
+        "./Mathlib/Data/Nat.lean",
+        "Mathlib/../Outside.lean",
+        r"Mathlib\Data\Nat.lean",
+        "/Mathlib/Data/Nat.lean",
+        "Batteries/Data/Nat.lean",
+        "Mathlib/not-valid!.lean",
+    ):
+        assert mathlib_module_name(invalid) is None
 
 
 def test_permalink_pins_the_commit(tmp_path: Path) -> None:
