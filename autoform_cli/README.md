@@ -262,6 +262,33 @@ canonical rows, counts, and the exact coverage source hash, while
 `publication.json` records aggregate counts without duplicating the authored
 rows.
 
+For exhaustive source work, opt in with exact frontmatter:
+
+```markdown
+---
+schema: autoform-coverage/v2
+artifact: sources/book.txt
+artifact_sha256: <64 lowercase hex characters>
+---
+
+| Unit | Area | Lines | Locator | Unit SHA-256 | Coverage | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| chapter-one | First chapter | 1-42 | Chapter 1 | <span hash> | DECOMPOSED | [Result](../roadmap/result.md) |
+```
+
+The artifact must be a nonempty, regular, non-symlink UTF-8 file with LF line
+endings and a final LF. Ordered one-based spans must partition it exactly, and
+each unit hash covers the raw LF-terminated bytes in that span. A decomposed
+unit may link only to formalizable roadmap leaves. Those leaves reciprocate in
+their frontmatter with `source_units: [chapter-one]`. The immutable
+`load_execution_input` API binds this contract to the unchanged
+`autoform-runtime/v1` projection; schema-less v1 remains valid for audit and
+render but is refused for execution with `coverage-v2-required`.
+
+The named v2 artifact is never copied into a publication. With repository
+coordinates its authored links become repository blob links; without them,
+inline links become plain text instead of dangling site links.
+
 The contract is read as published Markdown and fails closed. A table inside an
 HTML comment, a fenced block, or a four-space-indented block is documentation
 rather than contract, and is not discovered at all. A closing fence must carry

@@ -24,6 +24,7 @@ _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 _HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
 ARTICLE_ID_PATTERN = re.compile(r"af_[0-9a-f]{24}\Z")
+SOURCE_UNIT_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _FRONTMATTER_KEYS = frozenset(
     {
         "article_id",
@@ -37,6 +38,7 @@ _FRONTMATTER_KEYS = frozenset(
         "not_ready",
         "origin",
         "discussion",
+        "source_units",
     }
 )
 _FORMALIZED = "formalized"
@@ -91,11 +93,29 @@ class Node:
     depth: int = 0
     article_id: str | None = None
     source_sha256: str | None = None
+    source_units: tuple[str, ...] = ()
 
     @property
     def formalizable(self) -> bool:
         """Whether this article names a concrete Lean declaration."""
         return self.declaration is not None
+
+
+def _restore_node(node: Node, state: list[object]) -> None:
+    """Restore both pre-coverage and current slotted ``Node`` pickles."""
+
+    field_names = tuple(Node.__dataclass_fields__)
+    if len(state) == len(field_names) - 1:
+        state = [*state, ()]
+    if len(state) != len(field_names):
+        raise ValueError("unsupported Node pickle state")
+    for name, value in zip(field_names, state):
+        object.__setattr__(node, name, value)
+
+
+# Python generates its own slotted-frozen dataclass hook. Assign after the
+# decorator has run so every supported interpreter uses the compatibility hook.
+Node.__setstate__ = _restore_node  # type: ignore[attr-defined]
 
 
 class _TrackedNodeDict(dict[str, Node]):
@@ -316,6 +336,9 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             depth=_article_depth(parsed_node.id, parents),
             article_id=metadata.get("article_id"),
             source_sha256=source_hashes[parsed_node.id],
+            source_units=tuple(metadata.get("source_units", "").split(","))
+            if metadata.get("source_units")
+            else (),
         )
 
     if not issues:
@@ -572,6 +595,21 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
         if folded not in {"cited", "bridged", "background"}:
             return value, f"{location}: 'origin' accepts cited, bridged, or background"
         return folded, None
+    if key == "source_units":
+        if not (value.startswith("[") and value.endswith("]")):
+            return value, (
+                f"{location}: 'source_units' must be an inline list such as "
+                "[chapter-one, theorem-two]"
+            )
+        items = tuple(item.strip() for item in value[1:-1].split(","))
+        if not items or any(not item for item in items):
+            return value, f"{location}: 'source_units' must contain at least one unit id"
+        malformed = next((item for item in items if not SOURCE_UNIT_PATTERN.fullmatch(item)), None)
+        if malformed is not None:
+            return value, f"{location}: malformed source unit id {malformed!r}"
+        if len(set(items)) != len(items):
+            return value, f"{location}: duplicate source unit id in 'source_units'"
+        return ",".join(items), None
     return value, None
 
 
@@ -793,5 +831,6 @@ __all__ = [
     "Graph",
     "GraphValidationError",
     "Node",
+    "SOURCE_UNIT_PATTERN",
     "load_graph",
 ]

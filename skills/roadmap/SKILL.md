@@ -107,6 +107,18 @@ mathematics.
    linked articles are formalized or proved. Deciding the table is exhaustive is
    the author's judgement and cannot be checked locally, so state what the rows
    are meant to span rather than implying the tool verified it.
+
+   Before autonomous execution, replace the exploratory v1 table with an
+   exhaustive v2 contract selected by `schema: autoform-coverage/v2`. Its
+   frontmatter must name one canonical UTF-8 source
+   artifact below `blueprint/sources/` and its lowercase SHA-256. Use exactly
+   `Unit | Area | Lines | Locator | Unit SHA-256 | Coverage | Evidence`; each
+   stable lowercase unit id owns one ordered inclusive `START-END` span, and the
+   rows must partition every LF-terminated source line. Hash the exact raw bytes
+   in each span, including its final LF. Every `DECOMPOSED` row links only to
+   formalizable roadmap leaves, and each linked leaf must reciprocate with the
+   strict inline frontmatter form `source_units: [unit-id, other-unit]`.
+   `load_execution_input` refuses schema-less v1 with `coverage-v2-required`.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
 5. After approval, create one file per pull-request-sized unit beside its

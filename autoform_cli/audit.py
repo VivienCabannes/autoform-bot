@@ -307,11 +307,7 @@ def _coverage_findings(
     findings = [
         AuditFinding(
             "coverage/README.md",
-            (
-                "missing-coverage-contract"
-                if issue.reason == "coverage contract is missing"
-                else "invalid-coverage-contract"
-            ),
+            issue.code,
             f"{issue.reason}{f' (line {issue.line})' if issue.line else ''}",
         )
         for issue in issues

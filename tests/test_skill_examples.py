@@ -471,6 +471,18 @@ def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
         assert not re.search(r"^status:", text, flags=re.MULTILINE)
 
 
+def test_roadmap_skill_teaches_exhaustive_execution_coverage(repo_root: Path) -> None:
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+
+    for required in (
+        "schema: autoform-coverage/v2",
+        "Unit | Area | Lines | Locator | Unit SHA-256 | Coverage | Evidence",
+        "source_units: [unit-id, other-unit]",
+        "coverage-v2-required",
+    ):
+        assert required in roadmap
+
+
 def _documented_invocations(reference: str) -> set[tuple[str, ...]]:
     """Every `autoform ...` command line inside the reference's bash fences."""
     invocations: set[tuple[str, ...]] = set()
