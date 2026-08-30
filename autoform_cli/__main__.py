@@ -24,7 +24,9 @@ from .claims import (
     CLAIM_TTL_S,
     ClaimBoard,
     ClaimTransportError,
+    _claim_git_environment,
     author_claim_key,
+    claim_repository_is_remote,
     pin_claim_repository,
     pin_claim_scratch,
     resource_claim_key,
@@ -789,16 +791,26 @@ def _origin_url(project_or_blueprint: str | Path = ".") -> str:
     target = Path(project_or_blueprint).expanduser().resolve()
     try:
         result = subprocess.run(
-            ["git", "-C", str(target), "remote", "get-url", "origin"],
+            [
+                "git",
+                "-C",
+                str(target),
+                "config",
+                "--local",
+                "--no-includes",
+                "--get",
+                "remote.origin.url",
+            ],
             capture_output=True,
             text=True,
             check=True,
             timeout=10,
+            env=_claim_git_environment(),
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise ValueError("--repo is required outside a Git checkout with an origin remote") from exc
     origin = result.stdout.strip()
-    if "://" not in origin and not re.match(r"^[^/]+@[^:]+:", origin):
+    if not claim_repository_is_remote(origin):
         origin_path = Path(origin).expanduser()
         if not origin_path.is_absolute():
             try:
@@ -808,6 +820,7 @@ def _origin_url(project_or_blueprint: str | Path = ".") -> str:
                     text=True,
                     check=True,
                     timeout=10,
+                    env=_claim_git_environment(),
                 )
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 raise ValueError("could not resolve the relative origin repository") from exc
@@ -832,6 +845,7 @@ def _worktree_claim_session_id(project_or_blueprint: str | Path = ".") -> str:
             text=True,
             check=True,
             timeout=10,
+            env=_claim_git_environment(),
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise ValueError(

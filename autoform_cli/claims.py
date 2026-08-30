@@ -14,6 +14,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import socket
 import stat
 import subprocess
@@ -37,13 +38,63 @@ CLAIM_MAX_TTL_S = 3600
 CLAIM_CLOCK_SKEW_S = 300
 CLAIM_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 LEASE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+_SCP_REPOSITORY_RE = re.compile(
+    r"^(?:[^/@:]+@)?(?:\[[^\]]+\]|[^/:]+):.+$"
+)
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "autoform",
     "GIT_AUTHOR_EMAIL": "autoform@localhost",
     "GIT_COMMITTER_NAME": "autoform",
     "GIT_COMMITTER_EMAIL": "autoform@localhost",
+    "GIT_CONFIG_COUNT": "0",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
 }
+_GIT_ENV_ALLOWLIST = frozenset(
+    {
+        "ALL_PROXY",
+        "COMSPEC",
+        "CURL_CA_BUNDLE",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LANG",
+        "LANGUAGE",
+        "LOGNAME",
+        "NO_PROXY",
+        "PATH",
+        "PATHEXT",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SSH_AUTH_SOCK",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "USERPROFILE",
+        "WINDIR",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+_CANONICAL_SCRATCH_CONFIG = (
+    "[core]\n"
+    "\trepositoryformatversion = 0\n"
+    "\tbare = true\n"
+    f"\thooksPath = {os.devnull}\n"
+).encode()
 _CAS_REJECTIONS = (
     "stale info",
     "fetch first",
@@ -172,6 +223,14 @@ def _directory_operation_guard(
     return after
 
 
+def claim_repository_is_remote(repo_url: str | os.PathLike[str]) -> bool:
+    """Return whether Git will treat this repository name as a remote transport."""
+    value = os.fspath(repo_url)
+    if _WINDOWS_DRIVE_RE.match(value):
+        return False
+    return "://" in value or bool(_SCP_REPOSITORY_RE.match(value))
+
+
 def normalize_claim_repository(repo_url: str | os.PathLike[str]) -> str:
     """Return a stable transport identity, resolving local paths and file URLs."""
     raw_repo_url = os.fspath(repo_url)
@@ -183,7 +242,7 @@ def normalize_claim_repository(repo_url: str | os.PathLike[str]) -> str:
         if not local_path.is_absolute():
             raise ValueError("file repository URL must identify an absolute local path")
         return str(_resolve_local_path(local_path, label="claim repository"))
-    if "://" not in raw_repo_url and not re.match(r"^[^/]+@[^:]+:", raw_repo_url):
+    if not claim_repository_is_remote(raw_repo_url):
         return str(_resolve_local_path(raw_repo_url, label="claim repository"))
     return raw_repo_url
 
@@ -193,11 +252,7 @@ def pin_claim_repository(
 ) -> tuple[str, tuple[int, int] | None]:
     """Resolve a claim repository and capture its local filesystem identity."""
     normalized = normalize_claim_repository(repo_url)
-    local_path = (
-        Path(normalized)
-        if "://" not in normalized and not re.match(r"^[^/]+@[^:]+:", normalized)
-        else None
-    )
+    local_path = None if claim_repository_is_remote(normalized) else Path(normalized)
     identity = (
         _directory_identity(
             local_path,
@@ -242,6 +297,61 @@ def resource_claim_key(resource: str) -> str:
     return f"resource/{slug}-{digest}"
 
 
+def _open_pinned_directory(
+    path: Path,
+    identity: tuple[int, int] | None,
+    *,
+    label: str,
+) -> int | None:
+    if identity is None or os.name != "posix" or not hasattr(os, "fchdir"):
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ClaimTransportError(f"{label} cannot be pinned safely") from exc
+    if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+        os.close(descriptor)
+        raise ClaimTransportError(f"{label} was replaced")
+    return descriptor
+
+
+def _claim_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _GIT_ENV_ALLOWLIST or key.startswith("LC_")
+    }
+    environment.setdefault("PATH", os.defpath)
+    environment.update(_GIT_ENV)
+    return environment
+
+
+def _parse_ls_remote_output(output: str) -> list[tuple[str, str]]:
+    if not output:
+        return []
+    entries: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        oid, separator, ref = line.partition("\t")
+        if (
+            not separator
+            or not OBJECT_ID_RE.fullmatch(oid)
+            or not ref.startswith("refs/")
+            or any(character.isspace() for character in ref)
+        ):
+            raise ClaimTransportError("claim board returned malformed ls-remote output")
+        entries.append((oid, ref))
+    return entries
+
+
 class ClaimBoard:
     """Lease operations against a Git repository via a local bare object store."""
 
@@ -259,10 +369,7 @@ class ClaimBoard:
             raise ValueError("worker_id must not be empty")
         self.repo_url, current_repo_identity = pin_claim_repository(repo_url)
         self._repo_path = (
-            Path(self.repo_url)
-            if "://" not in self.repo_url
-            and not re.match(r"^[^/]+@[^:]+:", self.repo_url)
-            else None
+            None if claim_repository_is_remote(self.repo_url) else Path(self.repo_url)
         )
         if (
             expected_repo_identity is not _UNPINNED_REPOSITORY
@@ -291,46 +398,30 @@ class ClaimBoard:
                 label="claim scratch",
                 allow_missing=False,
             )
-        if self._repo_path is not None:
-            self._path_anchor = Path(
-                os.path.commonpath((self._repo_path, self.scratch))
+        self._path_anchor = (
+            Path(os.path.commonpath((self._repo_path, self.scratch)))
+            if self._repo_path is not None
+            else self.scratch
+        )
+        self._scratch_fd = _open_pinned_directory(
+            self.scratch,
+            self._scratch_identity,
+            label="claim scratch directory",
+        )
+        self._repo_fd = (
+            _open_pinned_directory(
+                self._repo_path,
+                self._repo_identity,
+                label="local claim repository",
             )
-        else:
-            self._path_anchor = self.scratch
-        self._scratch_relative = Path(os.path.relpath(self.scratch, self._path_anchor))
-        self._transport_repo_url = self.repo_url
-        self._anchor_fd: int | None = None
-        self._anchor_finalizer: weakref.finalize | None = None
-        if os.name == "posix" and hasattr(os, "fchdir"):
-            flags = os.O_RDONLY
-            if hasattr(os, "O_DIRECTORY"):
-                flags |= os.O_DIRECTORY
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            anchor_fd: int | None = None
-            try:
-                anchor_fd = os.open(self._path_anchor, flags)
-                fd_info = os.fstat(anchor_fd)
-                path_info = self._path_anchor.stat(follow_symlinks=False)
-            except OSError as exc:
-                if anchor_fd is not None:
-                    os.close(anchor_fd)
-                raise ClaimTransportError(
-                    "claim filesystem boundary cannot be pinned safely"
-                ) from exc
-            if not stat.S_ISDIR(fd_info.st_mode) or (
-                fd_info.st_dev,
-                fd_info.st_ino,
-            ) != (path_info.st_dev, path_info.st_ino):
-                os.close(anchor_fd)
-                raise ClaimTransportError("claim filesystem boundary was replaced")
-            self._anchor_fd = anchor_fd
-            self._anchor_finalizer = weakref.finalize(self, os.close, anchor_fd)
-            if self._repo_path is not None:
-                self._transport_repo_url = os.path.relpath(
-                    self._repo_path,
-                    self._path_anchor,
-                )
+            if self._repo_path is not None
+            else None
+        )
+        self._fd_finalizers: list[weakref.finalize] = []
+        for descriptor in (self._scratch_fd, self._repo_fd):
+            if descriptor is not None:
+                self._fd_finalizers.append(weakref.finalize(self, os.close, descriptor))
+        self._transport_helper = Path(__file__).with_name("_git_fd_transport.py").resolve()
         self._scratch_ready = False
         if session_id is None:
             session_id = f"scratch:{self.scratch}"
@@ -349,48 +440,49 @@ class ClaimBoard:
         input_text: str | None = None,
         remote: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        if remote and self._transport_repo_url != self.repo_url:
-            args = [
-                self._transport_repo_url if arg == self.repo_url else arg
-                for arg in args
-            ]
+        display_args = args
+        if remote and self._repo_fd is not None:
+            args = self._local_transport_args(args)
         self._verify_scratch_identity()
-        scratch_guard = _directory_operation_guard(
-            self.scratch,
-            anchor=self._path_anchor,
-            label="claim scratch",
-        )
+        scratch_guard = None
         repo_guard = None
+        if self._scratch_fd is None:
+            scratch_guard = _directory_operation_guard(
+                self.scratch,
+                anchor=self._path_anchor,
+                label="claim scratch",
+            )
         if remote:
             self._verify_repo_identity()
-            if self._repo_path is not None and self._repo_identity is not None:
+            if (
+                self._repo_fd is None
+                and self._repo_path is not None
+                and self._repo_identity is not None
+            ):
                 repo_guard = _directory_operation_guard(
                     self._repo_path,
                     anchor=self._path_anchor,
                     label="local claim repository",
-                )
+            )
         try:
-            environment = {
-                **os.environ,
-                **_GIT_ENV,
-                "GIT_DIR": (
-                    os.fspath(self._scratch_relative)
-                    if self._anchor_fd is not None
-                    else "."
-                ),
-            }
+            environment = {**_claim_git_environment(), "GIT_DIR": "."}
             command = ["git", *args]
             run_options: dict[str, Any] = {"cwd": self.scratch}
-            if self._anchor_fd is not None:
+            descriptors = tuple(
+                descriptor
+                for descriptor in (self._scratch_fd, self._repo_fd if remote else None)
+                if descriptor is not None
+            )
+            if self._scratch_fd is not None:
                 command = [
                     sys.executable,
                     "-c",
                     _FCHDIR_EXEC,
-                    str(self._anchor_fd),
+                    str(self._scratch_fd),
                     "git",
                     *args,
                 ]
-                run_options = {"pass_fds": (self._anchor_fd,)}
+                run_options = {"pass_fds": descriptors}
             proc = subprocess.run(
                 command,
                 capture_output=True,
@@ -416,7 +508,7 @@ class ClaimBoard:
                 raise ClaimTransportError(
                     "local claim repository changed during a Git operation"
                 )
-        if (
+        if scratch_guard is not None and (
             _directory_operation_guard(
                 self.scratch,
                 anchor=self._path_anchor,
@@ -427,8 +519,38 @@ class ClaimBoard:
             raise ClaimTransportError("claim scratch changed during a Git operation")
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()[:300]
-            raise ClaimTransportError(f"git {' '.join(args[:2])} failed against claim board: {detail}")
+            raise ClaimTransportError(
+                f"git {' '.join(display_args[:2])} failed against claim board: {detail}"
+            )
         return proc
+
+    def _local_transport_args(self, args: list[str]) -> list[str]:
+        if self._repo_fd is None or not args:
+            return args
+        operation = args[0]
+        if operation in {"ls-remote", "fetch"}:
+            mode = "upload"
+            option = "--upload-pack"
+        elif operation == "push":
+            mode = "receive"
+            option = "--receive-pack"
+        else:
+            raise ClaimTransportError(
+                f"unsupported local claim transport operation {operation!r}"
+            )
+        helper = shlex.join(
+            (
+                sys.executable,
+                os.fspath(self._transport_helper),
+                mode,
+                str(self._repo_fd),
+            )
+        )
+        rewritten = ["." if arg == self.repo_url else arg for arg in args]
+        if rewritten == args:
+            raise ClaimTransportError("local claim transport target was not explicit")
+        rewritten.insert(1, f"{option}={helper}")
+        return rewritten
 
     def _verify_repo_identity(self) -> None:
         if self._repo_path is None:
@@ -461,6 +583,76 @@ class ClaimBoard:
         if current != self._scratch_identity:
             raise ClaimTransportError("claim scratch directory was replaced")
 
+    def _install_canonical_scratch_config(self) -> None:
+        read_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            read_flags |= os.O_NOFOLLOW
+        existing: int | None = None
+        try:
+            if self._scratch_fd is not None:
+                existing = os.open("config", read_flags, dir_fd=self._scratch_fd)
+            else:
+                existing = os.open(self.scratch / "config", read_flags)
+            info = os.fstat(existing)
+            content = os.read(existing, len(_CANONICAL_SCRATCH_CONFIG) + 1)
+            if stat.S_ISREG(info.st_mode) and content == _CANONICAL_SCRATCH_CONFIG:
+                return
+        except OSError:
+            pass
+        finally:
+            if existing is not None:
+                try:
+                    os.close(existing)
+                except OSError:
+                    pass
+        temporary_name = f".autoform-config-{os.getpid()}-{secrets.token_hex(8)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor: int | None = None
+        try:
+            if self._scratch_fd is not None:
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=self._scratch_fd,
+                )
+            else:
+                descriptor = os.open(self.scratch / temporary_name, flags, 0o600)
+            remaining = memoryview(_CANONICAL_SCRATCH_CONFIG)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("short write while installing claim scratch config")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            if self._scratch_fd is not None:
+                os.replace(
+                    temporary_name,
+                    "config",
+                    src_dir_fd=self._scratch_fd,
+                    dst_dir_fd=self._scratch_fd,
+                )
+                os.fsync(self._scratch_fd)
+            else:
+                os.replace(self.scratch / temporary_name, self.scratch / "config")
+        except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                if self._scratch_fd is not None:
+                    os.unlink(temporary_name, dir_fd=self._scratch_fd)
+                else:
+                    (self.scratch / temporary_name).unlink()
+            except OSError:
+                pass
+            raise ClaimTransportError(
+                "claim scratch Git configuration cannot be installed safely"
+            ) from exc
+
     def _ensure_scratch(self) -> None:
         if self._scratch_identity is not None:
             self._verify_scratch_identity()
@@ -476,18 +668,21 @@ class ClaimBoard:
                 raise ClaimTransportError("claim scratch HEAD must not be a symbolic link")
             if not (self.scratch / "HEAD").is_file():
                 raise ClaimTransportError("claim scratch is no longer a bare Git repository")
+            self._install_canonical_scratch_config()
             return
         if (self.scratch / "HEAD").is_symlink():
             raise ClaimTransportError("claim scratch HEAD must not be a symbolic link")
         if (self.scratch / "HEAD").is_file():
+            self._install_canonical_scratch_config()
             proc = self._git(["rev-parse", "--is-bare-repository"], check=False)
             if proc.returncode != 0 or proc.stdout.strip() != "true":
                 raise ClaimTransportError("claim scratch must be a bare Git repository")
             self._scratch_ready = True
             return
-        self._git(["init", "--bare", "--quiet"])
+        self._git(["init", "--bare", "--quiet", "--template="])
         if (self.scratch / "HEAD").is_symlink() or not (self.scratch / "HEAD").is_file():
             raise ClaimTransportError("claim scratch initialization could not be verified")
+        self._install_canonical_scratch_config()
         self._scratch_ready = True
 
     @staticmethod
@@ -498,9 +693,16 @@ class ClaimBoard:
         return f"{CLAIM_RECEIPT_REF_PREFIX}{self._session_key}/{_validate_key(key)}"
 
     def _remote_oid(self, key: str) -> str | None:
-        proc = self._remote_git(["ls-remote", self.repo_url, self._ref(key)])
-        line = proc.stdout.strip()
-        return line.split("\t", 1)[0] if line else None
+        ref = self._ref(key)
+        proc = self._remote_git(["ls-remote", self.repo_url, ref])
+        entries = _parse_ls_remote_output(proc.stdout)
+        if not entries:
+            return None
+        if len(entries) != 1 or entries[0][1] != ref:
+            raise ClaimTransportError(
+                f"claim board did not resolve exact requested ref {ref!r}"
+            )
+        return entries[0][0]
 
     def _receipt_oid(self, key: str) -> str | None:
         proc = self._git(
@@ -748,7 +950,10 @@ class ClaimBoard:
             return False
         return bool(
             renewed_at > comparison_time + CLAIM_CLOCK_SKEW_S
-            or expires_at - renewed_at > CLAIM_MAX_TTL_S
+            or (
+                lease.get("schema") == CLAIM_SCHEMA
+                and expires_at - renewed_at > CLAIM_MAX_TTL_S
+            )
         )
 
     def install_legacy_compatibility(self, key: str, *, canonical_key: str) -> bool:
@@ -832,11 +1037,27 @@ class ClaimBoard:
                 return False
         return True
 
+    def _legacy_author_claim_blocks_v2(self, key: str) -> bool:
+        if not key.startswith("author/"):
+            return False
+        for lease in self.list():
+            if not str(lease["_key"]).startswith("author/"):
+                continue
+            if lease["_malformed"]:
+                raise MalformedLeaseError(str(lease["_error"]))
+            if lease.get("schema") == LEGACY_CLAIM_SCHEMA and (
+                lease["_recovery_required"] or not lease["_expired"]
+            ):
+                return True
+        return False
+
     def acquire(self, key: str, ttl: int | float = CLAIM_TTL_S, steal: bool = False, note: str = "") -> bool:
         """CAS-acquire a free or expired lease, or refresh this exact session's lease."""
         key = _validate_key(key)
         _validate_ttl(ttl)
         self._ensure_scratch()
+        if self._legacy_author_claim_blocks_v2(key):
+            return False
         old = self._remote_oid(key)
         lease_id: str | None = None
         acquired_at: int | float | None = None
@@ -869,6 +1090,13 @@ class ClaimBoard:
         )
         if not self._cas_push(key, old, new):
             return False
+        if self._legacy_author_claim_blocks_v2(key):
+            if not self._cas_push(key, new, old or ""):
+                raise ClaimTransportError(
+                    "a legacy v1 claim appeared while a v2 claim was acquired, and "
+                    "the v2 claim could not be rolled back"
+                )
+            return False
         self._record_receipt(key, new, expected=old if lease_id is not None else None)
         return True
 
@@ -883,6 +1111,8 @@ class ClaimBoard:
         key = _validate_key(key)
         _validate_ttl(ttl)
         self._ensure_scratch()
+        if self._legacy_author_claim_blocks_v2(key):
+            return False
         old = self._remote_oid(key)
         if old is None:
             return False
@@ -905,6 +1135,13 @@ class ClaimBoard:
             previous_expires_at=lease["expires_at"],
         )
         if not self._cas_push(key, old, new):
+            return False
+        if self._legacy_author_claim_blocks_v2(key):
+            if not self._cas_push(key, new, old):
+                raise ClaimTransportError(
+                    "a legacy v1 claim appeared while a v2 claim was renewed, and "
+                    "the prior lease could not be restored"
+                )
             return False
         self._record_receipt(key, new, expected=old)
         return True
@@ -939,6 +1176,8 @@ class ClaimBoard:
         """Return the fenced lease id held by this session, or ``None``."""
         key = _validate_key(key)
         self._ensure_scratch()
+        if self._legacy_author_claim_blocks_v2(key):
+            return None
         oid = self._remote_oid(key)
         if oid is None:
             return None
@@ -965,15 +1204,20 @@ class ClaimBoard:
         self._ensure_scratch()
         proc = self._remote_git(["ls-remote", self.repo_url, CLAIM_REF_PREFIX + "*"])
         leases: list[dict[str, Any]] = []
-        for line in proc.stdout.splitlines():
-            oid, separator, ref = line.partition("\t")
-            if not separator or not ref.startswith(CLAIM_REF_PREFIX):
-                continue
+        seen_refs: set[str] = set()
+        for oid, ref in _parse_ls_remote_output(proc.stdout):
+            if not ref.startswith(CLAIM_REF_PREFIX) or ref in seen_refs:
+                raise ClaimTransportError(
+                    "claim board returned an unexpected or duplicate claim ref"
+                )
+            seen_refs.add(ref)
             key = ref[len(CLAIM_REF_PREFIX) :]
             try:
                 _validate_key(key)
-            except ValueError:
-                continue
+            except ValueError as exc:
+                raise ClaimTransportError(
+                    f"claim board returned invalid claim ref {ref!r}"
+                ) from exc
             try:
                 lease = dict(self._read_lease(key, oid))
             except MalformedLeaseError as exc:
@@ -1136,6 +1380,7 @@ __all__ = [
     "LEASE_ID_RE",
     "MalformedLeaseError",
     "author_claim_key",
+    "claim_repository_is_remote",
     "normalize_claim_repository",
     "pin_claim_repository",
     "pin_claim_scratch",

@@ -658,6 +658,42 @@ def test_nested_blueprint_resolves_relative_origin_from_worktree_root(
     )
 
 
+def test_origin_url_preserves_scp_like_remote_without_user(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    origin = "git.example.test:team/claims.git"
+    subprocess.run(["git", "remote", "add", "origin", origin], cwd=project, check=True)
+
+    assert cli._origin_url(project) == origin
+
+
+def test_origin_url_ignores_inherited_and_local_url_rewrites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intended = _bare_repo(tmp_path / "intended")
+    redirected = _bare_repo(tmp_path / "redirected")
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(intended)],
+        cwd=project,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", f"url.{redirected}.insteadOf", str(intended)],
+        cwd=project,
+        check=True,
+    )
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{redirected}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(intended))
+
+    assert cli._origin_url(project) == str(intended)
+
+
 def test_claim_target_pins_origin_before_blueprint_path_replacement(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:

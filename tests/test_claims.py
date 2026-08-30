@@ -532,6 +532,100 @@ def test_live_v1_blocks_v2_but_expired_v1_can_be_replaced(
     assert claims.LEASE_ID_RE.fullmatch(lease["lease_id"])
 
 
+def test_historical_live_v1_blocks_direct_v2_renew_and_heartbeat(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    canonical_key = claims.author_claim_key("af_0123456789abcdef01234567")
+    historical_key = claims.author_claim_key("chapter/old-name")
+    board = _board(tmp_path, board_repo, "worker-a")
+    assert board.acquire(canonical_key, ttl=600)
+    original_oid = board._remote_oid(canonical_key)
+    now = claims.time.time()
+    _plant_lease(
+        board_repo,
+        historical_key,
+        schema=claims.LEGACY_CLAIM_SCHEMA,
+        lease_id=None,
+        acquired_at=now,
+        renewed_at=None,
+        expires_at=now + 600,
+        resource=historical_key,
+    )
+
+    assert not board.renew(canonical_key, ttl=600)
+    assert board.held_lease_id(canonical_key) is None
+    with pytest.raises(claims.ClaimTransportError, match="lost before heartbeat entry"):
+        with board.heartbeat(canonical_key, interval=1, ttl=600):
+            pytest.fail("mixed-version ownership must not authorize work")
+    peer = _board(tmp_path, board_repo, "worker-b", scratch=tmp_path / "peer-scratch")
+    assert not peer.acquire(claims.author_claim_key("af_abcdef0123456789abcdef01"), ttl=600)
+    assert board._remote_oid(canonical_key) == original_oid
+    assert board.release(canonical_key)
+
+
+def test_v2_acquire_rolls_back_if_a_live_v1_appears_during_push(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_key = claims.author_claim_key("af_0123456789abcdef01234567")
+    historical_key = claims.author_claim_key("chapter/old-name")
+    board = _board(tmp_path, board_repo, "worker-a")
+    checks = 0
+
+    def race(_key: str) -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            return False
+        now = claims.time.time()
+        _plant_lease(
+            board_repo,
+            historical_key,
+            schema=claims.LEGACY_CLAIM_SCHEMA,
+            lease_id=None,
+            acquired_at=now,
+            renewed_at=None,
+            expires_at=now + 600,
+            resource=historical_key,
+        )
+        return True
+
+    monkeypatch.setattr(board, "_legacy_author_claim_blocks_v2", race)
+
+    assert not board.acquire(canonical_key, ttl=600)
+    assert checks == 2
+    assert board._remote_oid(canonical_key) is None
+
+
+def test_legacy_v1_ttl_above_v2_limit_remains_live(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    key = "legacy-long-ttl"
+    _plant_lease(
+        board_repo,
+        key,
+        schema=claims.LEGACY_CLAIM_SCHEMA,
+        lease_id=None,
+        acquired_at=100.0,
+        renewed_at=None,
+        expires_at=now + claims.CLAIM_MAX_TTL_S + 1,
+    )
+    monkeypatch.setattr(claims.time, "time", lambda: now)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    lease = board.read(key)
+    assert lease is not None
+    assert not board.recovery_required(lease)
+    assert not board.expired(lease)
+    assert board.cleanup() == 0
+    assert not board.acquire(key, ttl=600)
+
+
 def test_legacy_compatibility_block_is_permanent_and_rejected_by_v1_clients(
     tmp_path: Path,
     board_repo: Path,
@@ -643,6 +737,173 @@ def test_relative_local_repo_path_is_resolved_before_entering_scratch(
     assert board.read("relative")["owner"] == "worker-a"
 
 
+def test_scp_like_repository_without_user_is_not_resolved_as_local_path() -> None:
+    repo = "git.example.test:team/claims.git"
+
+    assert claims.claim_repository_is_remote(repo)
+    assert claims.normalize_claim_repository(repo) == repo
+    assert claims.pin_claim_repository(repo) == (repo, None)
+
+
+def test_inherited_git_namespace_cannot_split_claim_refs(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GIT_NAMESPACE", "other-claim-universe")
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert board.acquire("resource/namespaced", ttl=600)
+
+    monkeypatch.delenv("GIT_NAMESPACE")
+    refs = _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/autoform-claims",
+        "refs/namespaces",
+        cwd=board_repo,
+    ).splitlines()
+    assert refs == [claims.CLAIM_REF_PREFIX + "resource/namespaced"]
+
+
+def test_git_subprocess_environment_drops_repository_control_variables(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GIT_NAMESPACE", "other-claim-universe")
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "objects"))
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.bad.invalid.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(board_repo))
+    real_run = claims.subprocess.run
+    environments: list[dict[str, str]] = []
+
+    def capture_environment(command, *args, **kwargs):
+        environments.append(dict(kwargs["env"]))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", capture_environment)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert board.acquire("resource/minimal-env", ttl=600)
+    assert environments
+    for environment in environments:
+        assert "GIT_NAMESPACE" not in environment
+        assert "GIT_OBJECT_DIRECTORY" not in environment
+        assert "GIT_CONFIG_KEY_0" not in environment
+        assert "GIT_CONFIG_VALUE_0" not in environment
+        assert environment["GIT_CONFIG_COUNT"] == "0"
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+def test_inherited_git_config_cannot_redirect_claim_repository(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirected = tmp_path / "redirected.git"
+    _git("init", "--bare", "--quiet", str(redirected))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{redirected}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(board_repo))
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert board.acquire("resource/config-redirect", ttl=600)
+
+    monkeypatch.delenv("GIT_CONFIG_COUNT")
+    monkeypatch.delenv("GIT_CONFIG_KEY_0")
+    monkeypatch.delenv("GIT_CONFIG_VALUE_0")
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=board_repo,
+    ) == claims.CLAIM_REF_PREFIX + "resource/config-redirect"
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=redirected,
+    ) == ""
+
+
+def test_existing_scratch_url_rewrite_is_removed_before_remote_use(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    redirected = tmp_path / "redirected.git"
+    scratch = tmp_path / "scratch"
+    _git("init", "--bare", "--quiet", str(redirected))
+    _git("init", "--bare", "--quiet", str(scratch))
+    _git("config", f"url.{redirected}.insteadOf", str(board_repo), cwd=scratch)
+    pre_push = scratch / "hooks/pre-push"
+    pre_push.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    pre_push.chmod(0o700)
+    board = _board(tmp_path, board_repo, "worker-a", scratch=scratch)
+
+    assert board.acquire("resource/local-config-redirect", ttl=600)
+
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=board_repo,
+    ) == claims.CLAIM_REF_PREFIX + "resource/local-config-redirect"
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=redirected,
+    ) == ""
+    config = (scratch / "config").read_text(encoding="utf-8")
+    assert "insteadOf" not in config
+    assert str(redirected) not in config
+
+
+def test_remote_oid_rejects_suffix_match_for_a_different_ref(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    key = "resource/exact"
+    oid = _plant_message(board_repo, "temporary", "payload")
+    _git("update-ref", f"refs/heads/{claims.CLAIM_REF_PREFIX}{key}", oid, cwd=board_repo)
+    _git("update-ref", "-d", claims.CLAIM_REF_PREFIX + "temporary", cwd=board_repo)
+    board = _board(tmp_path, board_repo, "worker-a")
+    board._ensure_scratch()
+
+    with pytest.raises(claims.ClaimTransportError, match="exact requested ref"):
+        board._remote_oid(key)
+
+
+def test_sibling_churn_does_not_strand_a_successful_claim(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+    real_run = claims.subprocess.run
+    intercepted = False
+
+    def run_during_sibling_churn(command, *args, **kwargs):
+        nonlocal intercepted
+        if not intercepted and "push" in command:
+            intercepted = True
+            sibling = tmp_path / "unrelated-sibling"
+            sibling.mkdir()
+            try:
+                return real_run(command, *args, **kwargs)
+            finally:
+                sibling.rmdir()
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_sibling_churn)
+
+    assert board.acquire("resource/sibling-churn", ttl=600)
+    assert intercepted
+    assert board.holds("resource/sibling-churn")
+
+
 def test_file_url_repo_is_pinned_before_its_symlink_is_redirected(tmp_path: Path) -> None:
     original = tmp_path / "original.git"
     redirected = tmp_path / "redirected.git"
@@ -682,7 +943,7 @@ def test_canonical_local_repo_replacement_fails_before_remote_mutation(tmp_path:
     ) == ""
 
 
-def test_repo_aba_during_git_subprocess_fails_closed(
+def test_repo_aba_during_git_subprocess_uses_pinned_repository(
     tmp_path: Path,
     board_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -699,7 +960,7 @@ def test_repo_aba_during_git_subprocess_fails_closed(
 
     def run_during_aba(command, *args, **kwargs):
         nonlocal intercepted
-        if not intercepted and "ls-remote" in command:
+        if not intercepted and "push" in command:
             intercepted = True
             board_repo.rename(parked)
             board_repo.symlink_to(redirected, target_is_directory=True)
@@ -712,20 +973,24 @@ def test_repo_aba_during_git_subprocess_fails_closed(
 
     monkeypatch.setattr(claims.subprocess, "run", run_during_aba)
 
-    with pytest.raises(claims.ClaimTransportError, match="repository changed during"):
-        board.acquire("repo-aba", ttl=600)
+    assert board.acquire("repo-aba", ttl=600)
 
     assert intercepted
-    for repo in (board_repo, redirected):
-        assert _git(
-            "for-each-ref",
-            "--format=%(refname)",
-            claims.CLAIM_REF_PREFIX,
-            cwd=repo,
-        ) == ""
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=board_repo,
+    ) == claims.CLAIM_REF_PREFIX + "repo-aba"
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=redirected,
+    ) == ""
 
 
-def test_repo_ancestor_aba_during_git_subprocess_fails_closed(
+def test_repo_ancestor_aba_during_git_subprocess_uses_pinned_repository(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -748,7 +1013,7 @@ def test_repo_ancestor_aba_during_git_subprocess_fails_closed(
 
     def run_during_ancestor_aba(command, *args, **kwargs):
         nonlocal intercepted
-        if not intercepted and "ls-remote" in command:
+        if not intercepted and "push" in command:
             intercepted = True
             intended_scope.rename(parked)
             intended_scope.symlink_to(redirected_scope, target_is_directory=True)
@@ -761,17 +1026,21 @@ def test_repo_ancestor_aba_during_git_subprocess_fails_closed(
 
     monkeypatch.setattr(claims.subprocess, "run", run_during_ancestor_aba)
 
-    with pytest.raises(claims.ClaimTransportError, match="repository changed during"):
-        board.acquire("repo-ancestor-aba", ttl=600)
+    assert board.acquire("repo-ancestor-aba", ttl=600)
 
     assert intercepted
-    for repo in (intended, redirected):
-        assert _git(
-            "for-each-ref",
-            "--format=%(refname)",
-            claims.CLAIM_REF_PREFIX,
-            cwd=repo,
-        ) == ""
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=intended,
+    ) == claims.CLAIM_REF_PREFIX + "repo-ancestor-aba"
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=redirected,
+    ) == ""
 
 
 def test_open_filesystem_boundary_prevents_redirect_above_guard(
@@ -927,7 +1196,7 @@ def test_replacing_pinned_scratch_fails_closed_without_reinitializing(
     assert inspector._remote_oid("scratch-replaced") == original_oid
 
 
-def test_scratch_aba_during_git_subprocess_fails_closed(
+def test_scratch_aba_during_git_subprocess_uses_pinned_scratch(
     tmp_path: Path,
     board_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -959,16 +1228,15 @@ def test_scratch_aba_during_git_subprocess_fails_closed(
 
     monkeypatch.setattr(claims.subprocess, "run", run_during_aba)
 
-    with pytest.raises(claims.ClaimTransportError, match="scratch changed during"):
-        board.renew("scratch-aba", ttl=600)
+    assert board.renew("scratch-aba", ttl=600)
 
     assert intercepted
     inspector = claims.ClaimBoard(board_repo, "inspector", tmp_path / "inspect")
     inspector._ensure_scratch()
-    assert inspector._remote_oid("scratch-aba") == original_oid
+    assert inspector._remote_oid("scratch-aba") != original_oid
 
 
-def test_scratch_ancestor_aba_during_git_subprocess_fails_closed(
+def test_scratch_ancestor_aba_during_git_subprocess_uses_pinned_scratch(
     tmp_path: Path,
     board_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1003,13 +1271,12 @@ def test_scratch_ancestor_aba_during_git_subprocess_fails_closed(
 
     monkeypatch.setattr(claims.subprocess, "run", run_during_ancestor_aba)
 
-    with pytest.raises(claims.ClaimTransportError, match="scratch changed during"):
-        board.renew("scratch-ancestor-aba", ttl=600)
+    assert board.renew("scratch-ancestor-aba", ttl=600)
 
     assert intercepted
     inspector = claims.ClaimBoard(board_repo, "inspector", tmp_path / "inspect-ancestor")
     inspector._ensure_scratch()
-    assert inspector._remote_oid("scratch-ancestor-aba") == original_oid
+    assert inspector._remote_oid("scratch-ancestor-aba") != original_oid
 
 
 def test_transport_failure_raises_without_local_fallback(tmp_path: Path) -> None:
