@@ -25,6 +25,119 @@ def test_pool_config_runs_base_post_init(monkeypatch):
     assert configured == [config]
 
 
+def test_repl_config_rejects_invalid_context_limits():
+    with pytest.raises(ValueError, match="positive integer"):
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            max_contexts_per_process=True,
+        )
+    with pytest.raises(ValueError, match="startup, import, and request"):
+        repl_pool.LeanReplPoolConfig(max_contexts_per_process=3)
+    with pytest.raises(ValueError, match="startup, import, and request"):
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            max_contexts_per_process=2,
+        )
+
+
+def test_close_clears_context_state_even_after_process_exit(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            max_contexts_per_process=4,
+        )
+    )
+
+    class ExitedProcess:
+        def poll(self):
+            return 1
+
+    repl.process = ExitedProcess()
+    repl._process_generation = 1
+    repl._base_environment = repl._make_environment_handle((), 11)
+    repl._import_environments[("Fixture",)] = repl._make_environment_handle(
+        ("Fixture",), 22
+    )
+    repl._contexts_created = 3
+
+    repl.close()
+
+    assert repl.process is None
+    assert repl._base_environment is None
+    assert repl._import_environments == {}
+    assert repl._contexts_created == 0
+    assert repl._process_generation == 1
+
+
+def test_successful_start_publishes_one_generation_after_warmup(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset({"Mathlib"}),
+            max_contexts_per_process=4,
+        )
+    )
+
+    class RunningProcess:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(repl_core.subprocess, "Popen", lambda *args, **kwargs: RunningProcess())
+    responses = iter(
+        [
+            {"env": 11, "messages": []},
+            {"env": 12, "messages": []},
+        ]
+    )
+    monkeypatch.setattr(repl, "_run", lambda code, env_id, timeout: next(responses))
+
+    repl.start()
+
+    assert repl._process_generation == 1
+    assert repl._contexts_created == 2
+    assert repl._base_environment is not None
+    assert repl._base_environment.process_generation == 1
+    assert repl._base_environment.import_context == ("Mathlib",)
+    assert repl._base_environment.env_id == 11
+
+
+def test_failed_start_does_not_publish_a_generation(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset({"Mathlib"}),
+            max_contexts_per_process=4,
+        )
+    )
+
+    class RunningProcess:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(repl_core.subprocess, "Popen", lambda *args, **kwargs: RunningProcess())
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda code, env_id, timeout: {
+            "env": 11,
+            "messages": [
+                {
+                    "severity": "error",
+                    "data": "bad import",
+                    "pos": {"line": 1, "column": 0},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", lambda process: None)
+
+    with pytest.raises(RuntimeError, match="Import preloading failed"):
+        repl.start()
+
+    assert repl._process_generation == 0
+    assert repl._base_environment is None
+    assert repl._contexts_created == 0
+    assert repl.process is None
+
+
 def test_partial_pool_startup_closes_all_constructed_workers(monkeypatch):
     workers = []
 
@@ -79,6 +192,73 @@ def test_shutdown_closes_every_worker_and_drains_idle_queue(monkeypatch):
     assert all(worker.closed for worker in workers)
     assert pool._workers == []
     assert pool._idle.empty()
+
+
+def test_pool_rejects_raw_environment_forwarding(monkeypatch):
+    pool = object.__new__(repl_pool.LeanReplPool)
+
+    with pytest.raises(TypeError, match="env_id"):
+        pool.run("#check Nat", env_id=22)
+
+
+def test_same_import_context_is_initialized_once_per_worker(tmp_path, monkeypatch):
+    workers = []
+
+    class RunningProcess:
+        def poll(self):
+            return None
+
+    class InstrumentedRepl(repl_core.LeanRepl):
+        def __init__(self, config):
+            super().__init__(config)
+            self.calls = []
+            self.next_env = 20 + 10 * len(workers)
+            workers.append(self)
+
+        def start(self):
+            self.process = RunningProcess()
+            self._process_generation += 1
+            self._base_environment = self._make_environment_handle((), self.next_env)
+            self._project_fingerprint = repl_core.lean_project_fingerprint(
+                self._project_identity
+            )
+            self._contexts_created = 1
+
+        def close(self):
+            self.process = None
+            self._base_environment = None
+            self._import_environments.clear()
+            self._contexts_created = 0
+
+        def _check_memory_and_maybe_restart(self, timeout=None):
+            pass
+
+        def _run(self, code, env_id, timeout):
+            self.calls.append((code, env_id))
+            self.next_env += 1
+            return {"env": self.next_env, "messages": []}
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", InstrumentedRepl)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(
+            cwd=str(tmp_path),
+            num_repls=2,
+            startup_stagger=0,
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    imports = resolve_project_imports(tmp_path, (), timeout=1)
+    try:
+        for _ in range(4):
+            pool.run("#check Nat", imports=imports, timeout=1)
+    finally:
+        pool.shutdown()
+
+    assert [worker.calls for worker in workers] == [
+        [("", None), ("#check Nat", 21), ("#check Nat", 21)],
+        [("", None), ("#check Nat", 31), ("#check Nat", 31)],
+    ]
 
 
 def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch):

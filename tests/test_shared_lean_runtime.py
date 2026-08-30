@@ -79,6 +79,7 @@ def runtime_config(**overrides):
         "total_repl_workers": 2,
         "repl_workers_per_project": 1,
         "repl_project_limit": 2,
+        "repl_max_contexts_per_process": 256,
         "repl_command": ("lake", "exe", "repl"),
         "lsp_command": ("lake", "serve"),
         "lsp_timeout": 60.0,
@@ -1743,6 +1744,7 @@ def test_connected_send_failure_is_never_retried(runtime_dir, monkeypatch):
         ("LEAN_NUM_REPLS", "-1", "nonnegative integer"),
         ("LEAN_REPL_CMD", "   ", "must not be empty"),
         ("AUTOFORM_LEAN_IDLE_SECONDS", "nan", "finite nonnegative"),
+        ("AUTOFORM_REPL_MAX_CONTEXTS_PER_PROCESS", "3", "at least 4"),
         ("LEAN_LSP_TIMEOUT", "601", "cannot exceed"),
         ("AUTOFORM_RUNTIME_RESPONSE_TIMEOUT", "100", "too small"),
     ],
@@ -1751,6 +1753,33 @@ def test_invalid_node_configuration_fails_fast(monkeypatch, name, value, match):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=match):
         LeanRuntimeConfig.from_environment()
+
+
+def test_repl_context_limit_is_serialized_and_propagated(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AUTOFORM_REPL_MAX_CONTEXTS_PER_PROCESS", "17")
+    config = LeanRuntimeConfig.from_environment()
+
+    assert config.repl_max_contexts_per_process == 17
+    assert config.as_dict()["repl_max_contexts_per_process"] == 17
+
+    observed = []
+
+    class ConfiguredPool(FakePool):
+        def __init__(self, pool_config):
+            observed.append(pool_config)
+            super().__init__(pool_config.cwd)
+
+    monkeypatch.setattr("servers.lean_runtime.LeanReplPool", ConfiguredPool)
+    services = LeanRuntimeServices(config, start_sweepers=False)
+    project = make_lake_project(tmp_path, "configured")
+    try:
+        with services.repl_projects.lease(str(project)) as pool:
+            assert pool is not None
+        assert observed[0].max_contexts_per_process == 17
+    finally:
+        services.close()
 
 
 def test_per_project_workers_cannot_exceed_node_budget(monkeypatch):
