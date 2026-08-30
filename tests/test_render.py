@@ -1129,7 +1129,7 @@ def test_stage_substitution_before_publish_is_rejected_and_retained(
     assert (workspaces[0] / "intended-stage/publication.json").is_file()
 
 
-def test_pre_exchange_destination_substitution_uses_verified_recovery(
+def test_pre_exchange_destination_substitution_retains_unverified_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path)
@@ -1157,9 +1157,14 @@ def test_pre_exchange_destination_substitution_uses_verified_recovery(
     with pytest.raises(PublicationError, match="recovery material was retained"):
         render_site(project / "blueprint", output, lean_root=project)
 
-    assert (output / PUBLICATION_MANIFEST).read_bytes() == substitute_manifest
+    assert (output / PUBLICATION_MANIFEST).read_bytes() not in {
+        old_manifest,
+        substitute_manifest,
+    }
     assert (substitute / PUBLICATION_MANIFEST).read_bytes() == old_manifest
-    assert len(list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))) == 1
+    workspaces = list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "site/publication.json").read_bytes() == substitute_manifest
 
 
 def test_failed_rollback_retains_the_previous_site_for_recovery(
@@ -1248,6 +1253,56 @@ def test_a_substituted_owned_generation_is_rejected_and_old_site_restored(
         render_site(project / "blueprint", output, lean_root=project)
 
     assert (output / PUBLICATION_MANIFEST).read_bytes() == before_manifest
+
+
+def test_substituted_rollback_stage_is_never_exchanged_into_live_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    old_manifest = (output / PUBLICATION_MANIFEST).read_bytes()
+    article = project / "blueprint/roadmap/top.md"
+    article.write_text(article.read_text(encoding="utf-8") + "\nIntended generation.\n")
+
+    other_project = _project(tmp_path / "other")
+    other_article = other_project / "blueprint/roadmap/top.md"
+    other_article.write_text(other_article.read_text(encoding="utf-8") + "\nAttacker.\n")
+    substitute = tmp_path / "substitute"
+    render_site(other_project / "blueprint", substitute, lean_root=other_project)
+    (substitute / "attacker.txt").write_text("must not publish\n", encoding="utf-8")
+    substitute_manifest = (substitute / PUBLICATION_MANIFEST).read_bytes()
+
+    original_exchange = render_module._rename_exchange
+    exchanges = 0
+
+    def exchange_then_substitute_stage(source_parent, source, target_parent, target):
+        nonlocal exchanges
+        exchanges += 1
+        original_exchange(source_parent, source, target_parent, target)
+        if exchanges == 1:
+            workspace = next(
+                tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*")
+            )
+            recovery_stage = workspace / "site"
+            displaced = workspace / "expected-old-generation"
+            recovery_stage.rename(displaced)
+            substitute.rename(recovery_stage)
+
+    monkeypatch.setattr(
+        render_module,
+        "_rename_exchange",
+        exchange_then_substitute_stage,
+    )
+    with pytest.raises(PublicationError, match="recovery material was retained"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert exchanges == 1
+    assert (output / PUBLICATION_MANIFEST).read_bytes() not in {
+        old_manifest,
+        substitute_manifest,
+    }
+    assert not (output / "attacker.txt").exists()
 
 
 def test_in_repo_staging_never_supplies_lean_source_links(tmp_path: Path) -> None:

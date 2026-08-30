@@ -1292,6 +1292,16 @@ def _publish_staged_site(
     except BaseException as publication_error:
         if exchanged:
             try:
+                if (
+                    _inspect_destination_at(
+                        stage_parent_descriptor, stage.name, stage
+                    )
+                    != expected
+                ):
+                    raise OSError(
+                        errno.ESTALE,
+                        "rollback generation changed before exchange",
+                    )
                 _rename_exchange(
                     stage_parent_descriptor,
                     stage.name,
