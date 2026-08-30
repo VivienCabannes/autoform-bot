@@ -563,8 +563,10 @@ directories must be disjoint.
 Every render writes `publication.json` with blueprint and Lean-source hashes,
 Git ref, article and dependency counts, complete file inventory, and available
 views. It contains no timestamp or absolute path, so identical inputs produce
-identical output files. If publication cannot verify a rollback or staging
-identity, it preserves the private workspace and reports its exact recovery path
-instead of deleting the only recoverable copy. If the site was already committed
-before cleanup becomes unsafe, the render succeeds and reports the retained
-workspace as a warning.
+identical output files. All validation and file syncing happens before one atomic
+filesystem commit. Once that operation begins, Autoform never tries to exchange
+a recovery path back into the live destination. If it cannot verify the final
+state or durability, it preserves the private workspace and reports its exact
+recovery path instead of deleting a potentially unique generation. If the site
+was fully verified before cleanup becomes unsafe, the render succeeds and
+reports the retained workspace as a warning.

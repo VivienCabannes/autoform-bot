@@ -1221,6 +1221,92 @@ def test_post_commit_verification_failure_retains_previous_site_for_recovery(
     assert recovered == before
 
 
+def test_interrupt_after_exchange_retains_previous_site_for_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    before_manifest = (output / PUBLICATION_MANIFEST).read_bytes()
+    article = project / "blueprint/roadmap/top.md"
+    article.write_text(article.read_text(encoding="utf-8") + "\nNew generation.\n")
+
+    original_exchange = render_module._rename_exchange
+
+    def exchange_then_interrupt(*args):
+        original_exchange(*args)
+        raise KeyboardInterrupt("injected after exchange")
+
+    monkeypatch.setattr(render_module, "_rename_exchange", exchange_then_interrupt)
+    with pytest.raises(PublicationError, match="commit began"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert (output / PUBLICATION_MANIFEST).read_bytes() != before_manifest
+    workspaces = list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "site/publication.json").read_bytes() == before_manifest
+
+
+def test_interrupt_after_first_install_retains_uncertain_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    original_noreplace = render_module._rename_noreplace
+
+    def install_then_interrupt(*args):
+        original_noreplace(*args)
+        raise KeyboardInterrupt("injected after install")
+
+    monkeypatch.setattr(render_module, "_rename_noreplace", install_then_interrupt)
+    with pytest.raises(PublicationError, match="commit began"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert (output / PUBLICATION_MANIFEST).is_file()
+    workspaces = list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "source").is_dir()
+
+
+def test_descriptor_close_failure_after_exchange_retains_previous_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    before_manifest = (output / PUBLICATION_MANIFEST).read_bytes()
+    article = project / "blueprint/roadmap/top.md"
+    article.write_text(article.read_text(encoding="utf-8") + "\nNew generation.\n")
+
+    original_exchange = render_module._rename_exchange
+    original_close = render_module.os.close
+    exchanged = False
+    failed_close = False
+
+    def track_exchange(*args):
+        nonlocal exchanged
+        original_exchange(*args)
+        exchanged = True
+
+    def fail_first_close_after_exchange(descriptor):
+        nonlocal failed_close
+        original_close(descriptor)
+        if exchanged and not failed_close:
+            failed_close = True
+            raise OSError("injected descriptor close failure")
+
+    monkeypatch.setattr(render_module, "_rename_exchange", track_exchange)
+    monkeypatch.setattr(render_module.os, "close", fail_first_close_after_exchange)
+    with pytest.raises(PublicationError, match="commit began"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert failed_close
+    assert (output / PUBLICATION_MANIFEST).read_bytes() != before_manifest
+    workspaces = list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "site/publication.json").read_bytes() == before_manifest
+
+
 def test_post_commit_destination_change_does_not_trigger_a_second_exchange(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1404,6 +1490,7 @@ def test_failed_stage_inspection_does_not_leak_file_descriptors(tmp_path: Path) 
                 destination,
                 expected,
                 render_module._DestinationState("owned"),
+                commit_state=render_module._PublicationCommitState(),
                 source_blueprint=tmp_path,
                 source_snapshot=tmp_path,
                 source_snapshot_identity=render_module._directory_path_identity(tmp_path),

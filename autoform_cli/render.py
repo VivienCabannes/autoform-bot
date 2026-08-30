@@ -247,7 +247,7 @@ class PublicationError(ValueError):
 
 
 class _PublicationRecoveryError(PublicationError):
-    """A failed rollback left recovery material that must not be deleted."""
+    """A publication result is uncertain and recovery material must be retained."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +261,14 @@ class _DestinationState:
     files: tuple[tuple[str, str], ...] = ()
     source_revision: str | None = None
     lean_source_revision: str | None = None
+
+
+@dataclass(slots=True)
+class _PublicationCommitState:
+    """Whether the filesystem commit may have run and was fully verified."""
+
+    attempted: bool = False
+    verified: bool = False
 
 
 def render_site(
@@ -300,7 +308,7 @@ def render_site(
 
     workspace, workspace_identity = _create_workspace(destination.parent, destination.name)
     remove_workspace = True
-    publication_committed = False
+    commit_state = _PublicationCommitState()
     report: RenderReport | None = None
     snapshot_identity: tuple[int, int] | None = None
     stage_identity: tuple[int, int] | None = None
@@ -375,6 +383,7 @@ def render_site(
             destination,
             expected_destination,
             staged,
+            commit_state=commit_state,
             source_blueprint=blueprint,
             source_snapshot=snapshot,
             source_snapshot_identity=snapshot_identity,
@@ -383,13 +392,14 @@ def render_site(
             lean_source_revision=lean_source_revision,
             lean_exclusions=lean_exclusions,
         )
-        publication_committed = True
         report.output_dir = destination
         return report
     except _PublicationRecoveryError:
         remove_workspace = False
         raise
     finally:
+        if commit_state.attempted and not commit_state.verified:
+            remove_workspace = False
         expected_children: dict[str, set[tuple[int, int]]] = {}
         if snapshot_identity is not None:
             expected_children["source"] = {snapshot_identity}
@@ -404,7 +414,7 @@ def render_site(
                 "publication staging workspace changed; cleanup was refused at "
                 f"{workspace}"
             )
-            if publication_committed and report is not None:
+            if commit_state.verified and report is not None:
                 report.warnings.append(issue)
             else:
                 raise PublicationError([issue])
@@ -1205,6 +1215,7 @@ def _publish_staged_site(
     expected: _DestinationState,
     staged: _DestinationState,
     *,
+    commit_state: _PublicationCommitState,
     source_blueprint: Path,
     source_snapshot: Path,
     source_snapshot_identity: tuple[int, int],
@@ -1216,7 +1227,6 @@ def _publish_staged_site(
     """Commit *stage* if the destination still matches the inspected generation."""
     parent_descriptor: int | None = None
     stage_parent_descriptor: int | None = None
-    published = False
     try:
         parent_descriptor = _open_directory_path(destination.parent)
         stage_parent_descriptor = _open_directory_path(stage.parent)
@@ -1255,6 +1265,7 @@ def _publish_staged_site(
             raise _PublicationRecoveryError(
                 [f"publication stage changed; recovery material was retained at {stage.parent}"]
             )
+        commit_state.attempted = True
         if expected.kind == "absent":
             _rename_noreplace(
                 stage_parent_descriptor,
@@ -1262,7 +1273,6 @@ def _publish_staged_site(
                 parent_descriptor,
                 destination.name,
             )
-            published = True
         else:
             _rename_exchange(
                 stage_parent_descriptor,
@@ -1270,12 +1280,11 @@ def _publish_staged_site(
                 parent_descriptor,
                 destination.name,
             )
-            published = True
             if _inspect_destination_at(
                 stage_parent_descriptor, stage.name, stage
             ) != expected:
                 raise PublicationError(
-                    ["output directory changed during publication; rollback is required"]
+                    ["the displaced publication changed during the commit operation"]
                 )
         published = _inspect_destination_at(
             parent_descriptor, destination.name, destination
@@ -1287,19 +1296,34 @@ def _publish_staged_site(
         os.fsync(stage_parent_descriptor)
         os.fsync(parent_descriptor)
     except BaseException as publication_error:
-        if published:
+        if commit_state.attempted:
             raise _PublicationRecoveryError(
                 [
-                    "publication committed but its final state could not be verified; "
+                    "publication commit began but its final state could not be verified; "
                     f"recovery material was retained at {stage.parent}"
                 ]
             ) from publication_error
         raise publication_error
     finally:
-        if stage_parent_descriptor is not None:
-            os.close(stage_parent_descriptor)
-        if parent_descriptor is not None:
-            os.close(parent_descriptor)
+        close_error: BaseException | None = None
+        for descriptor in (stage_parent_descriptor, parent_descriptor):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is not None:
+            if commit_state.attempted:
+                raise _PublicationRecoveryError(
+                    [
+                        "publication commit began but its final state could not be verified; "
+                        f"recovery material was retained at {stage.parent}"
+                    ]
+                ) from close_error
+            raise close_error
+    commit_state.verified = True
 
 
 def _rename_noreplace(
