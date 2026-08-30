@@ -414,6 +414,14 @@ CLI commands but cannot run `autoform render`. A legacy
 `autoform-publication/v1` output is never deleted automatically. Remove it
 explicitly or choose an empty output directory once, then subsequent v2 renders
 can replace only the exact checksummed generation they inspected.
+The renderer hashes both the blueprint snapshot and the exact Lean-file
+generation used for declaration links, then rechecks both under the publication
+lock immediately before the atomic rename. That check is the publication
+linearization point; later source edits belong to the next render. Generated
+v1/v2 publication trees and private staging directories are never indexed as
+Lean source.
+An existing v2 publication from before Lean-source hashing is still replaced
+only after its complete inventory is verified, then upgraded in place.
 
 ## Validation
 
@@ -552,9 +560,11 @@ credentials, logs, provider state, and agent/task state inside the blueprint
 cause the render to fail rather than silently leak them. Source and output
 directories must be disjoint.
 
-Every render writes `publication.json` with the source-content hash, Git ref,
-article and dependency counts, complete file inventory, and available views. It
-contains no timestamp or absolute path, so identical inputs produce identical
-output files. If publication cannot verify a rollback, it preserves the private
-staging workspace and reports its exact recovery path instead of deleting the
-only recoverable copy.
+Every render writes `publication.json` with blueprint and Lean-source hashes,
+Git ref, article and dependency counts, complete file inventory, and available
+views. It contains no timestamp or absolute path, so identical inputs produce
+identical output files. If publication cannot verify a rollback or staging
+identity, it preserves the private workspace and reports its exact recovery path
+instead of deleting the only recoverable copy. If the site was already committed
+before cleanup becomes unsafe, the render succeeds and reports the retained
+workspace as a warning.

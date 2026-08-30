@@ -12,6 +12,8 @@ and deliberately reports nothing it cannot see rather than guessing.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -31,6 +33,8 @@ _DECLARATION = re.compile(
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
 _IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
+_PUBLICATION_MANIFEST = "publication.json"
+_PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +58,14 @@ class SourceIndex:
         return self.declarations.get(name)
 
 
+@dataclass(frozen=True, slots=True)
+class IndexedSourceSnapshot:
+    """One source generation used for both declaration links and its digest."""
+
+    index: SourceIndex
+    revision: str
+
+
 def index_project(
     root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
 ) -> SourceIndex:
@@ -68,14 +80,7 @@ def index_project(
     if not root_path.is_dir():
         return SourceIndex(root=root_path, declarations=declarations)
 
-    for path in sorted(root_path.rglob("*.lean")):
-        relative = path.relative_to(root_path)
-        if (
-            _IGNORED_DIRECTORIES.intersection(relative.parts)
-            or any(part.startswith(_IGNORED_DIRECTORY_PREFIXES) for part in relative.parts)
-            or any(relative == prefix or relative.is_relative_to(prefix) for prefix in excluded)
-        ):
-            continue
+    for path, relative in _project_source_paths(root_path, excluded):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -85,6 +90,123 @@ def index_project(
             # one when a name is genuinely duplicated across namespaces.
             declarations.setdefault(declaration.name, declaration)
     return SourceIndex(root=root_path, declarations=declarations)
+
+
+def snapshot_project_sources(
+    root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
+) -> IndexedSourceSnapshot:
+    """Read each Lean source once and derive its index and revision together."""
+
+    root_path = Path(root).expanduser().resolve()
+    excluded: tuple[Path, ...] = tuple(
+        candidate
+        for value in exclude_roots
+        if (candidate := _relative_exclusion(root_path, value)) is not None
+    )
+    declarations: dict[str, Declaration] = {}
+    digest = hashlib.sha256(b"autoform-lean-source-index/v1\0")
+    if root_path.is_dir():
+        for path, relative in _project_source_paths(root_path, excluded):
+            data = _stable_source_bytes(path)
+            _update_source_digest(digest, relative, data)
+            try:
+                text = data.decode("utf-8")
+            except UnicodeError:
+                continue
+            for declaration in _scan(text, relative):
+                declarations.setdefault(declaration.name, declaration)
+    return IndexedSourceSnapshot(
+        SourceIndex(root=root_path, declarations=declarations), digest.hexdigest()
+    )
+
+
+def project_source_revision(
+    root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
+) -> str:
+    """Hash the exact Lean source set consumed by :func:`index_project`."""
+    root_path = Path(root).expanduser().resolve()
+    excluded: tuple[Path, ...] = tuple(
+        candidate
+        for value in exclude_roots
+        if (candidate := _relative_exclusion(root_path, value)) is not None
+    )
+    digest = hashlib.sha256(b"autoform-lean-source-index/v1\0")
+    if not root_path.is_dir():
+        return digest.hexdigest()
+    for path, relative in _project_source_paths(root_path, excluded):
+        data = _stable_source_bytes(path)
+        _update_source_digest(digest, relative, data)
+    return digest.hexdigest()
+
+
+def _update_source_digest(digest, relative: Path, data: bytes) -> None:
+    encoded = relative.as_posix().encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+
+
+def _project_source_paths(
+    root: Path, excluded: tuple[Path, ...]
+) -> Iterable[tuple[Path, Path]]:
+    publication_cache: dict[Path, bool] = {}
+    for path in sorted(root.rglob("*.lean")):
+        relative = path.relative_to(root)
+        if (
+            _IGNORED_DIRECTORIES.intersection(relative.parts)
+            or any(part.startswith(_IGNORED_DIRECTORY_PREFIXES) for part in relative.parts)
+            or any(relative == prefix or relative.is_relative_to(prefix) for prefix in excluded)
+            or _inside_publication(path.parent, root, publication_cache)
+        ):
+            continue
+        yield path, relative
+
+
+def _inside_publication(
+    directory: Path, root: Path, cache: dict[Path, bool]
+) -> bool:
+    if directory in cache:
+        return cache[directory]
+    marker = directory / _PUBLICATION_MANIFEST
+    generated = _is_publication_manifest(marker)
+    if not generated and directory != root:
+        generated = _inside_publication(directory.parent, root, cache)
+    cache[directory] = generated
+    return generated
+
+
+def _is_publication_manifest(path: Path) -> bool:
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            return False
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and value.get("schema") in _PUBLICATION_SCHEMAS
+
+
+def _stable_source_bytes(path: Path) -> bytes:
+    before = path.stat()
+    data = path.read_bytes()
+    after = path.stat()
+    before_signature = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_signature = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_signature != after_signature:
+        raise OSError("Lean source changed while it was read")
+    return data
 
 
 def _relative_exclusion(root: Path, value: str | Path) -> Path | None:
@@ -193,10 +315,15 @@ def build_linker(
     repository_url: str | None = None,
     ref: str | None = None,
     exclude_roots: Iterable[str | Path] = (),
+    source_index: SourceIndex | None = None,
 ) -> SourceLinker:
     """Index *lean_root* and resolve the repository coordinates to link against."""
     return SourceLinker(
-        index=index_project(lean_root, exclude_roots=exclude_roots),
+        index=(
+            source_index
+            if source_index is not None
+            else index_project(lean_root, exclude_roots=exclude_roots)
+        ),
         repository_url=repository_url or detect_repository_url(lean_root),
         ref=ref or detect_ref(lean_root),
     )
@@ -248,6 +375,7 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 
 
 __all__ = [
+    "IndexedSourceSnapshot",
     "Declaration",
     "SourceIndex",
     "SourceLinker",
@@ -256,4 +384,6 @@ __all__ = [
     "detect_ref",
     "detect_repository_url",
     "index_project",
+    "project_source_revision",
+    "snapshot_project_sources",
 ]

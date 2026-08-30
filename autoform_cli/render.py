@@ -16,9 +16,9 @@ import html
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
-import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,7 +28,14 @@ from urllib.parse import quote, unquote, urlsplit
 from . import graph_pages, graph_views, mermaid, status
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
-from .lean import SourceLinker, build_linker, declaration_names
+from .lean import (
+    IndexedSourceSnapshot,
+    SourceLinker,
+    build_linker,
+    declaration_names,
+    project_source_revision,
+    snapshot_project_sources,
+)
 from .status import is_definition
 
 try:
@@ -228,6 +235,7 @@ class RenderReport:
     nodes: int = 0
     linked: int = 0
     unresolved: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 class PublicationError(ValueError):
@@ -251,6 +259,8 @@ class _DestinationState:
     manifest_sha256: str | None = None
     directories: tuple[str, ...] = ()
     files: tuple[tuple[str, str], ...] = ()
+    source_revision: str | None = None
+    lean_source_revision: str | None = None
 
 
 def render_site(
@@ -288,25 +298,37 @@ def render_site(
         else blueprint.parent
     )
 
-    workspace = Path(
-        tempfile.mkdtemp(
-            prefix=f"{_PUBLICATION_STAGE_PREFIX}{destination.name}-",
-            dir=destination.parent,
-        )
-    )
+    workspace, workspace_identity = _create_workspace(destination.parent, destination.name)
     remove_workspace = True
+    publication_committed = False
+    report: RenderReport | None = None
+    snapshot_identity: tuple[int, int] | None = None
+    stage_identity: tuple[int, int] | None = None
     try:
         snapshot = workspace / "source"
         source_revision = _snapshot_publication_tree(blueprint, snapshot)
+        snapshot_identity = _directory_path_identity(snapshot)
+        lean_exclusions = (destination, workspace)
+        lean_snapshot = _capture_lean_source_snapshot(
+            repo_root, exclude_roots=lean_exclusions
+        )
+        lean_source_revision = lean_snapshot.revision
         linker = build_linker(
             repo_root,
             repository_url=repository_url,
             ref=ref,
-            exclude_roots=(destination, workspace),
+            exclude_roots=lean_exclusions,
+            source_index=lean_snapshot.index,
         )
         _require_source_revision(blueprint, source_revision)
+        _require_snapshot_revision(
+            snapshot, source_revision, snapshot_identity, workspace
+        )
+        _require_lean_source_revision(
+            repo_root, lean_source_revision, exclude_roots=lean_exclusions
+        )
         stage = workspace / "site"
-        stage.mkdir(mode=0o700)
+        stage_identity = _create_stage_directory(workspace, workspace_identity)
         if not clean and expected_destination.kind == "owned":
             _copy_owned_publication(destination, stage, expected_destination)
         report = _render_snapshot(
@@ -316,18 +338,76 @@ def render_site(
             linker=linker,
             source_blueprint=blueprint,
             source_revision=source_revision,
+            lean_source_revision=lean_source_revision,
         )
         _require_source_revision(blueprint, source_revision)
-        _sync_tree(stage)
-        _publish_staged_site(stage, destination, expected_destination)
+        _require_snapshot_revision(
+            snapshot, source_revision, snapshot_identity, workspace
+        )
+        _require_lean_source_revision(
+            repo_root, lean_source_revision, exclude_roots=lean_exclusions
+        )
+        try:
+            _sync_tree(stage)
+        except (OSError, PublicationError) as error:
+            raise _PublicationRecoveryError(
+                [f"publication stage integrity failed; recovery material was retained at {workspace}"]
+            ) from error
+        _require_source_revision(blueprint, source_revision)
+        _require_snapshot_revision(
+            snapshot, source_revision, snapshot_identity, workspace
+        )
+        _require_lean_source_revision(
+            repo_root, lean_source_revision, exclude_roots=lean_exclusions
+        )
+        staged = _inspect_destination(stage)
+        if (
+            staged.kind != "owned"
+            or staged.identity != stage_identity
+            or staged.source_revision != source_revision
+            or staged.lean_source_revision != lean_source_revision
+        ):
+            raise _PublicationRecoveryError(
+                [f"publication stage changed; recovery material was retained at {workspace}"]
+            )
+        _publish_staged_site(
+            stage,
+            destination,
+            expected_destination,
+            staged,
+            source_blueprint=blueprint,
+            source_snapshot=snapshot,
+            source_snapshot_identity=snapshot_identity,
+            source_revision=source_revision,
+            lean_root=repo_root,
+            lean_source_revision=lean_source_revision,
+            lean_exclusions=lean_exclusions,
+        )
+        publication_committed = True
         report.output_dir = destination
         return report
     except _PublicationRecoveryError:
         remove_workspace = False
         raise
     finally:
-        if remove_workspace:
-            shutil.rmtree(workspace, ignore_errors=True)
+        expected_children: dict[str, set[tuple[int, int]]] = {}
+        if snapshot_identity is not None:
+            expected_children["source"] = {snapshot_identity}
+        if stage_identity is not None:
+            expected_children["site"] = {stage_identity}
+            if expected_destination.identity is not None:
+                expected_children["site"].add(expected_destination.identity)
+        if remove_workspace and not _remove_owned_workspace(
+            workspace, workspace_identity, expected_children=expected_children
+        ):
+            issue = (
+                "publication staging workspace changed; cleanup was refused at "
+                f"{workspace}"
+            )
+            if publication_committed and report is not None:
+                report.warnings.append(issue)
+            else:
+                raise PublicationError([issue])
 
 
 def _render_snapshot(
@@ -338,6 +418,7 @@ def _render_snapshot(
     linker: SourceLinker,
     source_blueprint: Path,
     source_revision: str,
+    lean_source_revision: str,
 ) -> RenderReport:
     """Write one already-frozen blueprint into an isolated staging tree.
 
@@ -517,6 +598,7 @@ def _render_snapshot(
         coverage=coverage,
         complete=True,
         source_revision=source_revision,
+        lean_source_revision=lean_source_revision,
     )
     return report
 
@@ -589,9 +671,22 @@ def _inspect_destination_at(
             raise PublicationError(["publication manifest is not in canonical form"])
         if publication.get("complete") is not True:
             raise PublicationError(["refusing to overwrite an incomplete Autoform publication"])
-
         expected_files = _parse_inventory_files(publication.get("files"))
         expected_directories = _parse_inventory_directories(publication.get("directories"))
+        source_revision = publication.get("source_revision")
+        lean_source_revision = publication.get("lean_source_revision")
+        if (
+            not isinstance(source_revision, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_revision) is None
+            or (
+                lean_source_revision is not None
+                and (
+                    not isinstance(lean_source_revision, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", lean_source_revision) is None
+                )
+            )
+        ):
+            raise PublicationError(["publication manifest has invalid source revisions"])
         actual_directories, actual_files = _publication_inventory_descriptor(descriptor)
         if actual_directories != expected_directories:
             raise PublicationError(
@@ -630,6 +725,8 @@ def _inspect_destination_at(
             manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
             directories=expected_directories,
             files=expected_files,
+            source_revision=source_revision,
+            lean_source_revision=lean_source_revision,
         )
     finally:
         os.close(descriptor)
@@ -640,6 +737,14 @@ def _descriptor_identity(descriptor: int) -> tuple[int, int]:
     if not stat.S_ISDIR(metadata.st_mode):
         raise PublicationError(["output path changed while it was inspected"])
     return metadata.st_dev, metadata.st_ino
+
+
+def _directory_path_identity(path: Path) -> tuple[int, int]:
+    descriptor = _open_directory_path(path)
+    try:
+        return _descriptor_identity(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _require_publication_platform() -> None:
@@ -672,6 +777,149 @@ def _open_directory_path(path: Path) -> int:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def _create_workspace(parent: Path, destination_name: str) -> tuple[Path, tuple[int, int]]:
+    parent_descriptor = _open_directory_path(parent)
+    try:
+        for _ in range(128):
+            name = (
+                f"{_PUBLICATION_STAGE_PREFIX}{destination_name}-"
+                f"{secrets.token_hex(8)}"
+            )
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            identity = metadata.st_dev, metadata.st_ino
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_descriptor,
+                )
+                if _descriptor_identity(descriptor) != identity:
+                    raise OSError(errno.ESTALE, "workspace changed during creation")
+            except BaseException:
+                try:
+                    current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) == identity:
+                        os.rmdir(name, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+                raise
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+            return parent / name, identity
+    finally:
+        os.close(parent_descriptor)
+    raise PublicationError(["could not create a private publication workspace"])
+
+
+def _create_stage_directory(
+    workspace: Path, workspace_identity: tuple[int, int]
+) -> tuple[int, int]:
+    workspace_descriptor = _open_directory_path(workspace)
+    try:
+        if _descriptor_identity(workspace_descriptor) != workspace_identity:
+            raise PublicationError(["publication workspace changed before staging"])
+        os.mkdir("site", mode=0o700, dir_fd=workspace_descriptor)
+        metadata = os.stat("site", dir_fd=workspace_descriptor, follow_symlinks=False)
+        descriptor = os.open(
+            "site",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=workspace_descriptor,
+        )
+        try:
+            identity = _descriptor_identity(descriptor)
+            if identity != (metadata.st_dev, metadata.st_ino):
+                raise PublicationError(["publication stage changed during creation"])
+            return identity
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(workspace_descriptor)
+
+
+def _remove_owned_workspace(
+    workspace: Path,
+    identity: tuple[int, int],
+    *,
+    expected_children: dict[str, set[tuple[int, int]]],
+) -> bool:
+    parent_descriptor: int | None = None
+    workspace_descriptor: int | None = None
+    try:
+        parent_descriptor = _open_directory_path(workspace.parent)
+        metadata = os.stat(
+            workspace.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if not stat.S_ISDIR(metadata.st_mode) or (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) != identity:
+            return False
+        workspace_descriptor = os.open(
+            workspace.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        if _descriptor_identity(workspace_descriptor) != identity:
+            return False
+        names = set(os.listdir(workspace_descriptor))
+        if not names.issubset(expected_children):
+            return False
+        for name in names:
+            child = os.stat(name, dir_fd=workspace_descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(child.st_mode) or (
+                child.st_dev,
+                child.st_ino,
+            ) not in expected_children[name]:
+                return False
+        _remove_directory_contents(workspace_descriptor)
+        current = os.stat(
+            workspace.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if (current.st_dev, current.st_ino) != identity:
+            return False
+        os.rmdir(workspace.name, dir_fd=parent_descriptor)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    finally:
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def _remove_directory_contents(descriptor: int) -> None:
+    for name in os.listdir(descriptor):
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                identity = _descriptor_identity(child)
+                if identity != (metadata.st_dev, metadata.st_ino):
+                    raise OSError(errno.ESTALE, "workspace changed during cleanup")
+                _remove_directory_contents(child)
+                current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != identity:
+                    raise OSError(errno.ESTALE, "workspace changed during cleanup")
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
 
 
 def _parse_inventory_files(value: object) -> tuple[tuple[str, str], ...]:
@@ -868,6 +1116,54 @@ def _require_source_revision(blueprint: Path, expected: str) -> None:
         raise PublicationError(["blueprint changed during publication; previous site was preserved"])
 
 
+def _require_snapshot_revision(
+    snapshot: Path,
+    expected: str,
+    expected_identity: tuple[int, int],
+    workspace: Path,
+) -> None:
+    try:
+        before_identity = _directory_path_identity(snapshot)
+        actual = _source_revision(snapshot)
+        after_identity = _directory_path_identity(snapshot)
+    except (OSError, PublicationError) as error:
+        raise _PublicationRecoveryError(
+            [f"publication snapshot changed; recovery material was retained at {workspace}"]
+        ) from error
+    if (
+        before_identity != expected_identity
+        or after_identity != expected_identity
+        or actual != expected
+    ):
+        raise _PublicationRecoveryError(
+            [f"publication snapshot changed; recovery material was retained at {workspace}"]
+        )
+
+
+def _require_lean_source_revision(
+    root: Path, expected: str, *, exclude_roots: Iterable[Path]
+) -> None:
+    try:
+        actual = project_source_revision(root, exclude_roots=exclude_roots)
+    except OSError as error:
+        raise PublicationError(
+            ["Lean sources changed during publication; previous site was preserved"]
+        ) from error
+    if actual != expected:
+        raise PublicationError(
+            ["Lean sources changed during publication; previous site was preserved"]
+        )
+
+
+def _capture_lean_source_snapshot(
+    root: Path, *, exclude_roots: Iterable[Path]
+) -> IndexedSourceSnapshot:
+    try:
+        return snapshot_project_sources(root, exclude_roots=exclude_roots)
+    except OSError as error:
+        raise PublicationError(["could not capture a stable Lean source revision"]) from error
+
+
 def _sync_tree(root: Path) -> None:
     """Make every staged byte and directory entry durable before publication."""
     root.chmod(0o755)
@@ -904,7 +1200,18 @@ def _sync_tree(root: Path) -> None:
 
 
 def _publish_staged_site(
-    stage: Path, destination: Path, expected: _DestinationState
+    stage: Path,
+    destination: Path,
+    expected: _DestinationState,
+    staged: _DestinationState,
+    *,
+    source_blueprint: Path,
+    source_snapshot: Path,
+    source_snapshot_identity: tuple[int, int],
+    source_revision: str,
+    lean_root: Path,
+    lean_source_revision: str,
+    lean_exclusions: tuple[Path, ...],
 ) -> None:
     """Commit *stage* if the destination still matches the inspected generation."""
     parent_descriptor: int | None = None
@@ -914,15 +1221,40 @@ def _publish_staged_site(
     try:
         parent_descriptor = _open_directory_path(destination.parent)
         stage_parent_descriptor = _open_directory_path(stage.parent)
-        staged = _inspect_destination_at(stage_parent_descriptor, stage.name, stage)
-        if staged.kind != "owned" or staged.identity is None:
-            raise PublicationError(["the staged publication failed its ownership check"])
+        if staged.kind != "owned" or staged.identity is None or _inspect_destination_at(
+            stage_parent_descriptor, stage.name, stage
+        ) != staged:
+            raise _PublicationRecoveryError(
+                [f"publication stage changed; recovery material was retained at {stage.parent}"]
+            )
         fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
         if _inspect_destination_at(
             parent_descriptor, destination.name, destination
         ) != expected:
             raise PublicationError(
                 ["output directory changed during publication; previous site was preserved"]
+            )
+        if _inspect_destination_at(stage_parent_descriptor, stage.name, stage) != staged:
+            raise _PublicationRecoveryError(
+                [f"publication stage changed; recovery material was retained at {stage.parent}"]
+            )
+        _require_source_revision(source_blueprint, source_revision)
+        _require_snapshot_revision(
+            source_snapshot,
+            source_revision,
+            source_snapshot_identity,
+            stage.parent,
+        )
+        _require_lean_source_revision(
+            lean_root, lean_source_revision, exclude_roots=lean_exclusions
+        )
+        if _inspect_destination_at(
+            parent_descriptor, destination.name, destination
+        ) != expected:
+            raise PublicationError(["publication inputs changed at the commit boundary"])
+        if _inspect_destination_at(stage_parent_descriptor, stage.name, stage) != staged:
+            raise _PublicationRecoveryError(
+                [f"publication stage changed; recovery material was retained at {stage.parent}"]
             )
         if expected.kind == "absent":
             _rename_noreplace(
@@ -943,15 +1275,8 @@ def _publish_staged_site(
             if _inspect_destination_at(
                 stage_parent_descriptor, stage.name, stage
             ) != expected:
-                _rename_exchange(
-                    stage_parent_descriptor,
-                    stage.name,
-                    parent_descriptor,
-                    destination.name,
-                )
-                exchanged = False
                 raise PublicationError(
-                    ["output directory changed during publication; previous site was preserved"]
+                    ["output directory changed during publication; rollback is required"]
                 )
         published = _inspect_destination_at(
             parent_descriptor, destination.name, destination
@@ -1219,6 +1544,7 @@ def _write_publication_manifest(
     coverage: CoverageSummary,
     complete: bool,
     source_revision: str,
+    lean_source_revision: str,
 ) -> None:
     directories, files = _publication_inventory(destination)
     manifest = {
@@ -1236,6 +1562,7 @@ def _write_publication_manifest(
         "source": "blueprint/roadmap Markdown",
         "source_revision": source_revision,
         "git_ref": linker.ref,
+        "lean_source_revision": lean_source_revision,
         "nodes": len(graph.nodes),
         "dependencies": graph.edge_count,
         "views": ["book", "progress", "project", "chapter", "focus", "full"],

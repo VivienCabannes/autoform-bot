@@ -119,6 +119,23 @@ def test_explicit_and_publication_staging_roots_are_skipped(tmp_path: Path) -> N
     assert index.find("staged") is None
 
 
+def test_generated_publication_roots_are_never_indexed(tmp_path: Path) -> None:
+    _index(tmp_path, "def canonical : Nat := 0\n", "blueprint/Proofs.lean")
+    generated = tmp_path / "aaa-output"
+    generated.mkdir()
+    (generated / "publication.json").write_text(
+        '{"schema":"autoform-publication/v2"}\n', encoding="utf-8"
+    )
+    (generated / "Copied.lean").write_text(
+        "def generatedOnly : Nat := 0\n", encoding="utf-8"
+    )
+
+    index = index_project(tmp_path)
+
+    assert index.find("canonical") is not None
+    assert index.find("generatedOnly") is None
+
+
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
     index = _index(tmp_path, "instance : Inhabited Nat := ⟨0⟩\n")
 
