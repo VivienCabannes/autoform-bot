@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 
 
@@ -96,12 +98,97 @@ class Node:
         return self.declaration is not None
 
 
+class _TrackedNodeDict(dict[str, Node]):
+    """A normal mutable node dictionary with a cheap structural revision."""
+
+    __slots__ = ("_revision",)
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._revision = getattr(self, "_revision", -1) + 1
+        super().__init__(*args, **kwargs)
+
+    @property
+    def revision(self) -> int:
+        return getattr(self, "_revision", 0)
+
+    def _touch(self) -> None:
+        self._revision = getattr(self, "_revision", 0) + 1
+
+    def __setitem__(self, key: str, value: Node) -> None:
+        self._touch()
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        self._touch()
+        super().__delitem__(key)
+
+    def clear(self) -> None:
+        self._touch()
+        super().clear()
+
+    def pop(self, key, *args):
+        self._touch()
+        return super().pop(key, *args)
+
+    def popitem(self):
+        self._touch()
+        return super().popitem()
+
+    def setdefault(self, key, default=None):
+        self._touch()
+        return super().setdefault(key, default)
+
+    def update(self, *args, **kwargs) -> None:
+        self._touch()
+        super().update(*args, **kwargs)
+
+    def __ior__(self, other):
+        self._touch()
+        return super().__ior__(other)
+
+    def __getstate__(self) -> int:
+        return self._revision
+
+    def __setstate__(self, state: int) -> None:
+        self._revision = max(self.revision, state)
+
+
+class _GraphCache:
+    __slots__ = ("_children_by_parent", "_children_revision")
+
+    _children_by_parent: Mapping[str | None, tuple[str, ...]]
+    _children_revision: int
+
+
 @dataclass(frozen=True, slots=True)
-class Graph:
+class Graph(_GraphCache):
     """A validated blueprint graph, keyed by stable node id."""
 
     blueprint_dir: Path
     nodes: dict[str, Node]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.nodes, _TrackedNodeDict):
+            object.__setattr__(self, "nodes", _TrackedNodeDict(self.nodes))
+        self._refresh_children()
+
+    def __setstate__(self, state: list[object]) -> None:
+        """Restore legacy slot pickles through the current cache initializer."""
+        blueprint_dir, nodes = state
+        object.__setattr__(self, "blueprint_dir", blueprint_dir)
+        object.__setattr__(self, "nodes", nodes)
+        self.__post_init__()
+
+    def _refresh_children(self) -> None:
+        children: dict[str | None, list[str]] = {}
+        for node in self.nodes.values():
+            children.setdefault(node.parent, []).append(node.id)
+        object.__setattr__(
+            self,
+            "_children_by_parent",
+            MappingProxyType({parent: tuple(node_ids) for parent, node_ids in children.items()}),
+        )
+        object.__setattr__(self, "_children_revision", self.nodes.revision)
 
     @property
     def edge_count(self) -> int:
@@ -109,7 +196,9 @@ class Graph:
 
     def children(self, node_id: str) -> tuple[str, ...]:
         """Return the direct contained articles of *node_id*."""
-        return tuple(node.id for node in self.nodes.values() if node.parent == node_id)
+        if getattr(self, "_children_revision", -1) != self.nodes.revision:
+            self._refresh_children()
+        return self._children_by_parent.get(node_id, ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,79 +604,173 @@ def _resolve_target(
 def _find_cycles(nodes: dict[str, Node]) -> list[str]:
     state: dict[str, int] = {}
     stack: list[str] = []
+    stack_indexes: dict[str, int] = {}
     issues: list[str] = []
+    seen_issues: set[str] = set()
 
-    def visit(node_id: str) -> None:
-        state[node_id] = 1
-        stack.append(node_id)
-        for dependency in nodes[node_id].dependencies:
-            if state.get(dependency, 0) == 0:
-                visit(dependency)
-            elif state.get(dependency) == 1:
-                start = stack.index(dependency)
-                cycle = stack[start:] + [dependency]
+    for root_id in sorted(nodes):
+        if state.get(root_id, 0) != 0:
+            continue
+        state[root_id] = 1
+        stack_indexes[root_id] = len(stack)
+        stack.append(root_id)
+        frames = [(root_id, 0)]
+        while frames:
+            node_id, dependency_index = frames[-1]
+            dependencies = nodes[node_id].dependencies
+            if dependency_index == len(dependencies):
+                frames.pop()
+                stack.pop()
+                stack_indexes.pop(node_id)
+                state[node_id] = 2
+                continue
+
+            dependency = dependencies[dependency_index]
+            frames[-1] = (node_id, dependency_index + 1)
+            dependency_state = state.get(dependency, 0)
+            if dependency_state == 0:
+                state[dependency] = 1
+                stack_indexes[dependency] = len(stack)
+                stack.append(dependency)
+                frames.append((dependency, 0))
+            elif dependency_state == 1:
+                cycle = stack[stack_indexes[dependency] :] + [dependency]
                 message = f"dependency cycle: {' -> '.join(cycle)}"
-                if message not in issues:
+                if message not in seen_issues:
+                    seen_issues.add(message)
                     issues.append(message)
-        stack.pop()
-        state[node_id] = 2
-
-    for node_id in sorted(nodes):
-        if state.get(node_id, 0) == 0:
-            visit(node_id)
     return issues
 
 
 def _find_rollup_cycles(nodes: dict[str, Node]) -> list[str]:
     """Reject cycles introduced by contracting articles at any hierarchy level."""
     children: dict[str | None, list[str]] = {}
+    parents: dict[str, str | None] = {}
     for node in nodes.values():
         children.setdefault(node.parent, []).append(node.id)
+        parents[node.id] = node.parent
 
-    def direct_child(scope: str | None, node_id: str) -> str | None:
-        current = node_id
-        while nodes[current].parent != scope:
-            parent = nodes[current].parent
-            if parent is None:
-                return None
-            current = parent
-        return current
+    depths: dict[str, int] = {}
+    roots: dict[str, str] = {}
+    for node_id in nodes:
+        if node_id in depths:
+            continue
+        trail: list[str] = []
+        seen: set[str] = set()
+        current: str | None = node_id
+        while current is not None and current not in depths:
+            if current in seen or current not in parents:
+                raise ValueError("article containment is not a forest")
+            seen.add(current)
+            trail.append(current)
+            current = parents[current]
+        depth = depths[current] if current is not None else -1
+        root = roots[current] if current is not None else trail[-1]
+        for descendant in reversed(trail):
+            depth += 1
+            depths[descendant] = depth
+            roots[descendant] = root
+
+    ancestors: list[dict[str, str | None]] = [parents]
+    maximum_depth = max(depths.values(), default=0)
+    while 1 << len(ancestors) <= maximum_depth:
+        previous = ancestors[-1]
+        ancestors.append(
+            {node_id: previous[parent] if parent is not None else None for node_id, parent in previous.items()}
+        )
+
+    def lift(node_id: str, distance: int) -> str:
+        level = 0
+        while distance:
+            if distance & 1:
+                parent = ancestors[level][node_id]
+                if parent is None:
+                    raise ValueError("article containment depth is inconsistent")
+                node_id = parent
+            distance >>= 1
+            level += 1
+        return node_id
+
+    def lowest_common_ancestor(first: str, second: str) -> str | None:
+        if roots[first] != roots[second]:
+            return None
+        if depths[first] < depths[second]:
+            first, second = second, first
+        first = lift(first, depths[first] - depths[second])
+        if first == second:
+            return first
+        for level in range(len(ancestors) - 1, -1, -1):
+            first_parent = ancestors[level][first]
+            second_parent = ancestors[level][second]
+            if first_parent != second_parent:
+                if first_parent is None or second_parent is None:
+                    continue
+                first = first_parent
+                second = second_parent
+        return parents[first]
+
+    def direct_child(scope: str | None, node_id: str) -> str:
+        scope_depth = depths[scope] if scope is not None else -1
+        return lift(node_id, depths[node_id] - scope_depth - 1)
+
+    projections: dict[str | None, dict[str, set[str]]] = {}
+    for target in nodes.values():
+        for dependency in target.dependencies:
+            scope = lowest_common_ancestor(target.id, dependency)
+            if scope == target.id or scope == dependency:
+                continue
+            target_child = direct_child(scope, target.id)
+            source_child = direct_child(scope, dependency)
+            projections.setdefault(scope, {}).setdefault(target_child, set()).add(source_child)
 
     issues: list[str] = []
+    seen_issues: set[str] = set()
     for scope, siblings in children.items():
         if len(siblings) < 2:
             continue
-        dependencies = {sibling: set() for sibling in siblings}
-        for target in nodes.values():
-            target_child = direct_child(scope, target.id)
-            if target_child not in dependencies:
-                continue
-            for dependency in target.dependencies:
-                source_child = direct_child(scope, dependency)
-                if source_child in dependencies and source_child != target_child:
-                    dependencies[target_child].add(source_child)
+        projected = projections.get(scope)
+        if not projected:
+            continue
+        dependencies = {sibling: projected.get(sibling, set()) for sibling in siblings}
         state: dict[str, int] = {}
         stack: list[str] = []
+        stack_indexes: dict[str, int] = {}
+        ordered_dependencies = {
+            article_id: tuple(sorted(prerequisites)) for article_id, prerequisites in dependencies.items()
+        }
 
-        def visit(article_id: str) -> None:
-            state[article_id] = 1
-            stack.append(article_id)
-            for prerequisite in sorted(dependencies[article_id]):
-                if state.get(prerequisite, 0) == 0:
-                    visit(prerequisite)
-                elif state.get(prerequisite) == 1:
-                    start = stack.index(prerequisite)
-                    cycle = stack[start:] + [prerequisite]
+        for root_id in sorted(dependencies):
+            if state.get(root_id, 0) != 0:
+                continue
+            state[root_id] = 1
+            stack_indexes[root_id] = len(stack)
+            stack.append(root_id)
+            frames = [(root_id, 0)]
+            while frames:
+                article_id, dependency_index = frames[-1]
+                prerequisites = ordered_dependencies[article_id]
+                if dependency_index == len(prerequisites):
+                    frames.pop()
+                    stack.pop()
+                    stack_indexes.pop(article_id)
+                    state[article_id] = 2
+                    continue
+
+                prerequisite = prerequisites[dependency_index]
+                frames[-1] = (article_id, dependency_index + 1)
+                prerequisite_state = state.get(prerequisite, 0)
+                if prerequisite_state == 0:
+                    state[prerequisite] = 1
+                    stack_indexes[prerequisite] = len(stack)
+                    stack.append(prerequisite)
+                    frames.append((prerequisite, 0))
+                elif prerequisite_state == 1:
+                    cycle = stack[stack_indexes[prerequisite] :] + [prerequisite]
                     label = scope or "root"
                     message = f"rolled-up dependency cycle in {label}: {' -> '.join(cycle)}"
-                    if message not in issues:
+                    if message not in seen_issues:
+                        seen_issues.add(message)
                         issues.append(message)
-            stack.pop()
-            state[article_id] = 2
-
-        for article_id in sorted(dependencies):
-            if state.get(article_id, 0) == 0:
-                visit(article_id)
     return issues
 
 
