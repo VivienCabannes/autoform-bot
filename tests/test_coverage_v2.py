@@ -193,6 +193,66 @@ def test_unknown_and_duplicate_schemas_never_fall_back_to_v1(tmp_path: Path) -> 
     assert {issue.code for issue in load_coverage(blueprint)[1]} == {"coverage-schema-mixed"}
 
 
+@pytest.mark.parametrize(
+    ("frontmatter", "expected_code"),
+    [
+        (
+            "---\nschema: autoform-coverage/v2\nartifact: sources/nested/book.txt\n",
+            "coverage-frontmatter-invalid",
+        ),
+        ("---\nschema autoform-coverage/v2\n---\n", "coverage-frontmatter-invalid"),
+        ("----\nscema: autoform-coverage/v2\n---\n", "coverage-schema-ambiguous"),
+        (
+            "----\n# intended frontmatter\nschema: autoform-coverage/v2\n---\n",
+            "coverage-schema-ambiguous",
+        ),
+        ("----\nschema: autoform-coverage/v2\n---\n", "coverage-schema-ambiguous"),
+        ("\ufeff---\nschema: autoform-coverage/v2\n---\n", "coverage-schema-ambiguous"),
+    ],
+)
+def test_malformed_v2_frontmatter_cannot_downgrade_to_v1(
+    tmp_path: Path, frontmatter: str, expected_code: str
+) -> None:
+    blueprint, _ = _project(tmp_path)
+    contract = blueprint / "coverage/README.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        frontmatter
+        + "\n# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Whole source | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.code for issue in issues] == [expected_code]
+
+
+def test_v2_schema_example_inside_code_fence_does_not_select_v2(tmp_path: Path) -> None:
+    blueprint, _ = _project(tmp_path)
+    contract = blueprint / "coverage/README.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        "# Coverage\n\n"
+        "```yaml\n"
+        "schema: autoform-coverage/v2\n"
+        "```\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Whole source | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+    assert summary.schema == "autoform-coverage/v1"
+
+
 def test_v2_table_without_schema_and_mixed_rendered_tables_fail_closed(tmp_path: Path) -> None:
     blueprint, artifact = _project(tmp_path)
     contract = _contract(blueprint, artifact)

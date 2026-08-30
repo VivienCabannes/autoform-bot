@@ -145,3 +145,143 @@ def test_nonclean_upgrade_does_not_retain_artifact_from_v1_site(tmp_path: Path) 
         path.read_bytes() for path in output.rglob("*") if path.is_file()
     )
     assert artifact.rstrip(b"\n") not in generated
+
+
+def test_nonclean_v2_publication_purges_renamed_and_retired_source_artifacts(
+    tmp_path: Path,
+) -> None:
+    project, source, artifact = _project(tmp_path, ".md")
+    blueprint = project / "blueprint"
+    coverage = blueprint / "coverage/README.md"
+    v2_contract = coverage.read_text(encoding="utf-8")
+    retired = blueprint / "sources/nested/retired-source.txt"
+    retired_bytes = b"AUTOFORM-RETIRED-SOURCE-SENTINEL\n"
+    retired.write_bytes(retired_bytes)
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Book | OUT | Kept only to seed a legacy publication |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "site"
+    render_site(blueprint, output, lean_root=project)
+    old_relative = source.relative_to(blueprint)
+    assert (output / old_relative).is_file()
+    assert (output / retired.relative_to(blueprint)).is_file()
+
+    new_source = source.with_name("renamed-book.md")
+    source.rename(new_source)
+    retired.unlink()
+    new_relative = new_source.relative_to(blueprint)
+    coverage.write_text(
+        v2_contract.replace(old_relative.as_posix(), new_relative.as_posix()),
+        encoding="utf-8",
+    )
+    article = blueprint / "roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            old_relative.as_posix(), new_relative.as_posix()
+        ),
+        encoding="utf-8",
+    )
+
+    render_site(blueprint, output, lean_root=project, clean=False)
+
+    assert not (output / "sources").exists()
+    generated = b"\n".join(
+        path.read_bytes() for path in output.rglob("*") if path.is_file()
+    )
+    assert artifact.rstrip(b"\n") not in generated
+    assert retired_bytes.rstrip(b"\n") not in generated
+
+
+@pytest.mark.parametrize(
+    "raw_html",
+    [
+        '<a href="../sources/nested/book.txt">Textbook</a>',
+        "<img src='../sources/nested/book.txt' alt='scan'>",
+        '<a\n href="../sources/nested/book.txt">Textbook</a>',
+        '<a href="/sources/nested/book.txt">Textbook</a>',
+        '<svg><use xlink:href="..%2Fsources%2Fnested%2Fbook.txt"></use></svg>',
+    ],
+)
+def test_raw_html_links_to_excluded_v2_sources_fail_before_publication(
+    tmp_path: Path, raw_html: str
+) -> None:
+    project, _, _ = _project(tmp_path, ".txt")
+    output = tmp_path / "site"
+    render_site(project / "blueprint", output, lean_root=project)
+    before = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8") + f"\n{raw_html}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PublicationError, match="raw HTML link targets an excluded source"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    after = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_raw_html_source_link_examples_in_code_remain_publishable(tmp_path: Path) -> None:
+    project, _, _ = _project(tmp_path, ".txt")
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8")
+        + "\n`<a href=\"../sources/nested/book.txt\">example</a>`\n\n"
+        "```html\n<a href=\"../sources/nested/book.txt\">example</a>\n```\n",
+        encoding="utf-8",
+    )
+
+    render_site(project / "blueprint", tmp_path / "site", lean_root=project)
+
+
+def test_nonclean_v2_rejects_raw_source_link_carried_from_prior_site(
+    tmp_path: Path,
+) -> None:
+    project, _, _ = _project(tmp_path, ".txt")
+    blueprint = project / "blueprint"
+    coverage = blueprint / "coverage/README.md"
+    v2_contract = coverage.read_bytes()
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Book | OUT | Kept only to seed a legacy publication |\n",
+        encoding="utf-8",
+    )
+    stale = blueprint / "retired.md"
+    stale.write_text(
+        '# Retired\n\n<a href="sources/nested/book.txt">Old source</a>\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "site"
+    render_site(blueprint, output, lean_root=project)
+    before = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+
+    stale.unlink()
+    coverage.write_bytes(v2_contract)
+    with pytest.raises(PublicationError, match="raw HTML link targets an excluded source"):
+        render_site(blueprint, output, lean_root=project, clean=False)
+
+    after = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before

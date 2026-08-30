@@ -47,6 +47,12 @@ _V2_EXPECTED_HEADER = (
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LINE_SPAN = re.compile(r"([1-9][0-9]*)-([1-9][0-9]*)\Z")
+_V2_SCHEMA_SIGNAL = re.compile(
+    r"^[ \t]*(?:schema[ \t]*(?::[ \t]*|[ \t]+)|"
+    r"[A-Za-z_][A-Za-z0-9_-]*[ \t]*:[ \t]*)"
+    r"[\"']?autoform-coverage/v2[\"']?[ \t]*$",
+    re.IGNORECASE,
+)
 
 #: Stem of the marker that stands in for a row's cells when tracing which
 #: published table those source lines became. Grown by `_unique_marker` until
@@ -205,9 +211,10 @@ def load_coverage(blueprint_dir: str | Path) -> tuple[CoverageSummary | None, tu
         return None, (CoverageIssue(0, "coverage contract cannot be read"),)
 
     schema_values, frontmatter, frontmatter_end, frontmatter_issues = _coverage_frontmatter(text)
+    ambiguous_schema_line = _ambiguous_v2_schema_line(text)
+    if frontmatter_issues and (schema_values or ambiguous_schema_line is not None):
+        return None, tuple(frontmatter_issues)
     if schema_values:
-        if frontmatter_issues:
-            return None, tuple(frontmatter_issues)
         if len(schema_values) != 1:
             return None, (
                 CoverageIssue(
@@ -232,6 +239,15 @@ def load_coverage(blueprint_dir: str | Path) -> tuple[CoverageSummary | None, tu
             text,
             frontmatter,
             frontmatter_end,
+        )
+
+    if ambiguous_schema_line is not None:
+        return None, (
+            CoverageIssue(
+                ambiguous_schema_line,
+                "autoform-coverage/v2 appears outside valid coverage frontmatter",
+                "coverage-schema-ambiguous",
+            ),
         )
 
     published_headers = {table.headers for table in published_tables(text)}
@@ -317,6 +333,21 @@ def _coverage_frontmatter(
             continue
         values[key] = (line_number, value)
     return schemas, values, end + 1, issues
+
+
+def _ambiguous_v2_schema_line(text: str) -> int | None:
+    """Find a visible, frontmatter-shaped v2 selector we could not parse.
+
+    A malformed opening fence or key must not turn an intended exhaustive v2
+    contract into permissive legacy v1. Fenced examples remain documentation,
+    not schema selection.
+    """
+
+    view = content(text)
+    for line_number, line in enumerate(view.lines, start=1):
+        if _V2_SCHEMA_SIGNAL.fullmatch(line):
+            return line_number
+    return None
 
 
 def _unquote_frontmatter_scalar(value: str) -> str:

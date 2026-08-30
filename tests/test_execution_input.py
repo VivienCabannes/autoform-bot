@@ -143,7 +143,97 @@ def test_concurrent_authority_change_is_not_snapshotted(
 
     monkeypatch.setattr(execution_module, "load_coverage", mutate_after_first)
 
+    snapshot = load_execution_input(project)
+
+    assert calls >= 2
+    assert snapshot.runtime.source_revision == load_runtime_graph(project).source_revision
+
+
+def _mutate_roadmap(project: Path) -> None:
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8") + "\nA concurrently revised explanation.\n",
+        encoding="utf-8",
+    )
+
+
+def _mutate_coverage_source(project: Path) -> bytes:
+    source = project / "blueprint/sources/book.md"
+    previous = source.read_bytes()
+    replacement = b"The concurrently revised source result.\n"
+    source.write_bytes(replacement)
+    contract = project / "blueprint/coverage/README.md"
+    contract.write_text(
+        contract.read_text(encoding="utf-8").replace(
+            _digest(previous), _digest(replacement)
+        ),
+        encoding="utf-8",
+    )
+    return replacement
+
+
+@pytest.mark.parametrize("authority", ["runtime", "coverage"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_execution_input_retries_mutations_at_every_authority_read_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+    timing: str,
+) -> None:
+    project = _project(tmp_path)
+    attribute = "load_runtime_graph" if authority == "runtime" else "load_coverage"
+    original = getattr(execution_module, attribute)
+    mutated = False
+    calls = 0
+    replacement: bytes | None = None
+
+    def mutate_once(*args, **kwargs):
+        nonlocal calls, mutated, replacement
+        calls += 1
+        if not mutated and timing == "before":
+            replacement = (
+                _mutate_coverage_source(project)
+                if authority == "coverage"
+                else (_mutate_roadmap(project) or None)
+            )
+            mutated = True
+        result = original(*args, **kwargs)
+        if not mutated and timing == "after":
+            replacement = (
+                _mutate_coverage_source(project)
+                if authority == "coverage"
+                else (_mutate_roadmap(project) or None)
+            )
+            mutated = True
+        return result
+
+    monkeypatch.setattr(execution_module, attribute, mutate_once)
+
+    snapshot = load_execution_input(project)
+
+    assert calls >= 2
+    assert snapshot.runtime.source_revision == load_runtime_graph(project).source_revision
+    if replacement is not None:
+        assert snapshot.artifact_sha256 == _digest(replacement)
+
+
+def test_execution_input_fails_closed_after_bounded_continuous_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    original = execution_module.load_runtime_graph
+    calls = 0
+
+    def mutate_before_every_read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        _mutate_roadmap(project)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module, "load_runtime_graph", mutate_before_every_read)
+
     with pytest.raises(ExecutionInputError) as raised:
         load_execution_input(project)
 
+    assert calls == execution_module._EXECUTION_INPUT_READ_ATTEMPTS
     assert [issue.code for issue in raised.value.issues] == ["execution-input-changed"]

@@ -479,6 +479,7 @@ def test_roadmap_skill_teaches_exhaustive_execution_coverage(repo_root: Path) ->
         "Unit | Area | Lines | Locator | Unit SHA-256 | Coverage | Evidence",
         "source_units: [unit-id, other-unit]",
         "coverage-v2-required",
+        "excludes the complete `blueprint/sources/` authority tree",
     ):
         assert required in roadmap
 

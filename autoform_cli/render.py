@@ -21,6 +21,7 @@ import shutil
 import stat
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from pathlib import PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
@@ -36,6 +37,7 @@ from .lean import (
     project_source_revision,
     snapshot_project_sources,
 )
+from .markdown import INLINE_CODE, content
 from .status import is_definition
 
 try:
@@ -56,6 +58,9 @@ _AUTOLINK = re.compile(r"<(?P<target>(?:\.{1,2}/|/)[^<>\s]+)>")
 _LINK_DEFINITION = re.compile(
     r'^(?P<indent>[ ]{0,3})\[(?P<label>[^\]]+)\]:[ \t]*'
     r'(?P<target><[^>\r\n]+>|[^\s]+)(?P<rest>[ \t]+.*)?$'
+)
+_RAW_HTML_LINK_ATTRIBUTES = frozenset(
+    {"action", "data", "formaction", "href", "poster", "src", "srcset"}
 )
 _ARTICLE_SLOT = re.compile(
     r"^(?P<indent>[ \t]*)[-*+]\s+\[[^\]]+\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)\s*$"
@@ -302,11 +307,10 @@ def render_site(
         )
     _validate_publication_tree(blueprint)
     _, coverage = _load_publication_contract(blueprint)
-    excluded_artifact = (
-        Path(coverage.artifact_path)
-        if coverage.schema == COVERAGE_V2_SCHEMA and coverage.artifact_path is not None
-        else None
-    )
+    # Every v2 raw artifact is constrained below ``sources/``. Excluding that
+    # authority root, rather than only today's named file, also purges renamed
+    # artifacts carried by an older incremental publication.
+    excluded_source_root = Path(SOURCES_DIR) if coverage.schema == COVERAGE_V2_SCHEMA else None
     destination.parent.mkdir(parents=True, exist_ok=True)
     expected_destination = _inspect_destination(destination)
     repo_root = (
@@ -326,7 +330,7 @@ def render_site(
         source_revision = _snapshot_publication_tree(
             blueprint,
             snapshot,
-            excluded_relative=excluded_artifact,
+            excluded_root=excluded_source_root,
         )
         snapshot_identity = _directory_path_identity(snapshot)
         lean_exclusions = (destination, workspace)
@@ -344,7 +348,7 @@ def render_site(
         _require_source_revision(
             blueprint,
             source_revision,
-            excluded_relative=excluded_artifact,
+            excluded_root=excluded_source_root,
             expected_coverage=coverage,
         )
         _require_snapshot_revision(
@@ -360,7 +364,7 @@ def render_site(
                 destination,
                 stage,
                 expected_destination,
-                excluded_relative=excluded_artifact,
+                excluded_root=excluded_source_root,
             )
         report = _render_snapshot(
             snapshot,
@@ -375,7 +379,7 @@ def render_site(
         _require_source_revision(
             blueprint,
             source_revision,
-            excluded_relative=excluded_artifact,
+            excluded_root=excluded_source_root,
             expected_coverage=coverage,
         )
         _require_snapshot_revision(
@@ -393,7 +397,7 @@ def render_site(
         _require_source_revision(
             blueprint,
             source_revision,
-            excluded_relative=excluded_artifact,
+            excluded_root=excluded_source_root,
             expected_coverage=coverage,
         )
         _require_snapshot_revision(
@@ -425,7 +429,7 @@ def render_site(
             lean_root=repo_root,
             lean_source_revision=lean_source_revision,
             lean_exclusions=lean_exclusions,
-            excluded_source=excluded_artifact,
+            excluded_source_root=excluded_source_root,
             expected_coverage=coverage,
         )
         report.output_dir = destination
@@ -489,10 +493,8 @@ def _render_snapshot(
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
     sources_base = _sources_base(source_blueprint, repo_root, linker)
-    unpublished_source = (
-        blueprint / coverage.artifact_path
-        if coverage.schema == COVERAGE_V2_SCHEMA and coverage.artifact_path is not None
-        else None
+    unpublished_source_root = (
+        blueprint / SOURCES_DIR if coverage.schema == COVERAGE_V2_SCHEMA else None
     )
 
     report = RenderReport(output_dir=destination)
@@ -554,7 +556,7 @@ def _render_snapshot(
                 node_sources=node_sources,
                 targets=targets,
                 sources_base=sources_base,
-                unpublished_source=unpublished_source,
+                unpublished_source_root=unpublished_source_root,
             )
             target.write_text(rewritten, encoding="utf-8")
         else:
@@ -596,7 +598,7 @@ def _render_snapshot(
             destination=destination,
             node_sources=node_sources,
             sources_base=sources_base,
-            unpublished_source=unpublished_source,
+            unpublished_source_root=unpublished_source_root,
             source_blueprint=source_blueprint,
         )
         page.write_text(chapter, encoding="utf-8")
@@ -648,6 +650,8 @@ def _render_snapshot(
         asset = destination / relative
         asset.parent.mkdir(parents=True, exist_ok=True)
         asset.write_text(contents, encoding="utf-8")
+    if unpublished_source_root is not None:
+        _reject_staged_excluded_raw_html_links(destination, Path(SOURCES_DIR))
     _write_publication_manifest(
         destination,
         graph,
@@ -1092,13 +1096,15 @@ def _copy_owned_publication(
     destination: Path,
     state: _DestinationState,
     *,
-    excluded_relative: Path | None = None,
+    excluded_root: Path | None = None,
 ) -> None:
     """Seed a non-clean render from the exact previously verified generation."""
     for relative in state.directories:
+        if _is_excluded_relative(Path(relative), excluded_root):
+            continue
         (destination / relative).mkdir(parents=True, exist_ok=True)
     for relative, expected_digest in state.files:
-        if excluded_relative is not None and Path(relative) == excluded_relative:
+        if _is_excluded_relative(Path(relative), excluded_root):
             continue
         data = _read_regular_file(source / relative)
         if hashlib.sha256(data).hexdigest() != expected_digest:
@@ -1112,13 +1118,13 @@ def _snapshot_publication_tree(
     source: Path,
     destination: Path,
     *,
-    excluded_relative: Path | None = None,
+    excluded_root: Path | None = None,
 ) -> str:
     """Copy and hash the exact source generation used by one render."""
     destination.mkdir(mode=0o700)
     digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
     for path, relative in _published_source_files(source):
-        if excluded_relative is not None and relative == excluded_relative:
+        if _is_excluded_relative(relative, excluded_root):
             continue
         data = _read_regular_file(path)
         _update_source_digest(digest, relative, data)
@@ -1185,10 +1191,10 @@ def _require_source_revision(
     blueprint: Path,
     expected: str,
     *,
-    excluded_relative: Path | None = None,
+    excluded_root: Path | None = None,
     expected_coverage: CoverageSummary | None = None,
 ) -> None:
-    if _source_revision(blueprint, excluded_relative=excluded_relative) != expected:
+    if _source_revision(blueprint, excluded_root=excluded_root) != expected:
         raise PublicationError(["blueprint changed during publication; previous site was preserved"])
     if expected_coverage is not None:
         current, issues = load_coverage(blueprint)
@@ -1295,7 +1301,7 @@ def _publish_staged_site(
     lean_root: Path,
     lean_source_revision: str,
     lean_exclusions: tuple[Path, ...],
-    excluded_source: Path | None = None,
+    excluded_source_root: Path | None = None,
     expected_coverage: CoverageSummary | None = None,
 ) -> None:
     """Commit *stage* if the destination still matches the inspected generation."""
@@ -1324,7 +1330,7 @@ def _publish_staged_site(
         _require_source_revision(
             source_blueprint,
             source_revision,
-            excluded_relative=excluded_source,
+            excluded_root=excluded_source_root,
             expected_coverage=expected_coverage,
         )
         _require_snapshot_revision(
@@ -1573,13 +1579,19 @@ def _published_source_files(blueprint: Path):
         yield source, relative
 
 
-def _source_revision(blueprint: Path, *, excluded_relative: Path | None = None) -> str:
+def _source_revision(blueprint: Path, *, excluded_root: Path | None = None) -> str:
     digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
     for source, relative in _published_source_files(blueprint):
-        if excluded_relative is not None and relative == excluded_relative:
+        if _is_excluded_relative(relative, excluded_root):
             continue
         _update_source_digest(digest, relative, _read_regular_file(source))
     return digest.hexdigest()
+
+
+def _is_excluded_relative(relative: Path, excluded_root: Path | None) -> bool:
+    return excluded_root is not None and (
+        relative == excluded_root or relative.is_relative_to(excluded_root)
+    )
 
 
 def _write_publication_manifest(
@@ -2372,7 +2384,7 @@ def _rewrite_links(
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
     sources_base: "_SourceBase | None" = None,
-    unpublished_source: Path | None = None,
+    unpublished_source_root: Path | None = None,
 ) -> str:
     """Resolve a page's relative links against where it is being published.
 
@@ -2387,13 +2399,9 @@ def _rewrite_links(
     strip_link = object()
 
     def is_unpublished_target(raw: str) -> bool:
-        if unpublished_source is None:
-            return False
-        bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
-        path = bare.partition("#")[0]
-        if not path or urlsplit(path).scheme or path.startswith("/"):
-            return False
-        return (source_dir / unquote(path)).resolve() == unpublished_source.resolve()
+        return unpublished_source_root is not None and _link_targets_excluded_root(
+            raw, source_dir=source_dir, excluded_root=unpublished_source_root
+        )
 
     def moved_target(raw: str) -> str | object | None:
         """Where *raw* should point once published, or None to leave it alone."""
@@ -2411,7 +2419,7 @@ def _rewrite_links(
         if not _is_within(candidate, blueprint):
             return None
         relative = candidate.relative_to(blueprint)
-        if unpublished_source is not None and candidate == unpublished_source.resolve():
+        if is_unpublished_target(raw):
             if sources_base is not None:
                 return f"{_source_href(sources_base, relative.parts[1:])}{separator}{fragment}"
             return strip_link
@@ -2446,6 +2454,8 @@ def _rewrite_links(
             return match.group(0)
         return f"<{href}>"
 
+    _reject_excluded_raw_html_links(text, is_unpublished_target)
+
     def rewrite(line: str) -> str:
         # A reference definition carries the destination for every `[x][label]`
         # on the page. Rewriting only inline links leaves it pointing at the
@@ -2464,6 +2474,96 @@ def _rewrite_links(
         return _MARKDOWN_LINK.sub(replace, line)
 
     return _outside_fences(text, rewrite)
+
+
+class _RawHtmlTargetParser(HTMLParser):
+    """Collect URL-bearing attributes from authored raw HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.targets: list[tuple[str, str, str]] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self._collect(tag, attrs)
+
+    def handle_startendtag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self._collect(tag, attrs)
+
+    def _collect(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for name, value in attrs:
+            folded_name = name.casefold()
+            if value is None or (
+                folded_name not in _RAW_HTML_LINK_ATTRIBUTES
+                and not folded_name.endswith(":href")
+            ):
+                continue
+            values = (
+                tuple(part.strip().split()[0] for part in value.split(",") if part.strip())
+                if folded_name == "srcset"
+                else (value,)
+            )
+            self.targets.extend((tag, name, target) for target in values)
+
+
+def _reject_excluded_raw_html_links(
+    text: str, is_excluded, *, markdown: bool = True
+) -> None:
+    visible_text = text
+    if markdown:
+        visible_text = INLINE_CODE.sub("", "\n".join(content(text).lines))
+    parser = _RawHtmlTargetParser()
+    parser.feed(visible_text)
+    parser.close()
+    for tag, attribute, target in parser.targets:
+        if is_excluded(target):
+            raise PublicationError(
+                [
+                    "raw HTML link targets an excluded source; use a Markdown link "
+                    f"that Autoform can rewrite ({tag} {attribute})"
+                ]
+            )
+
+
+def _link_targets_excluded_root(raw: str, *, source_dir: Path, excluded_root: Path) -> bool:
+    bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
+    split = urlsplit(bare)
+    if not split.path or split.scheme or split.netloc:
+        return False
+    decoded_path = unquote(split.path).replace("\\", "/")
+    if decoded_path.startswith("/"):
+        relative = Path(PurePosixPath(decoded_path.lstrip("/")))
+        return _is_excluded_relative(relative, Path(SOURCES_DIR))
+    candidate = (source_dir / decoded_path).resolve()
+    root = excluded_root.resolve()
+    return candidate == root or _is_within(candidate, root)
+
+
+def _reject_staged_excluded_raw_html_links(
+    destination: Path, excluded_source_root: Path
+) -> None:
+    """Reject raw links carried forward from an older incremental site."""
+
+    root = destination / excluded_source_root
+    for page in sorted(destination.rglob("*")):
+        if not page.is_file() or page.suffix.casefold() not in {".htm", ".html", ".md", ".svg"}:
+            continue
+        try:
+            text = _read_regular_file(page).decode("utf-8")
+        except UnicodeError as error:
+            raise PublicationError(
+                [f"could not inspect publication links in {page.relative_to(destination)}"]
+            ) from error
+        _reject_excluded_raw_html_links(
+            text,
+            lambda raw, parent=page.parent: _link_targets_excluded_root(
+                raw, source_dir=parent, excluded_root=root
+            ),
+            markdown=page.suffix.casefold() == ".md",
+        )
 
 
 def _is_within(path: Path, directory: Path) -> bool:
@@ -2532,7 +2632,7 @@ def _render_chapter(
     destination: Path,
     node_sources: dict[Path, str],
     sources_base: "_SourceBase | None" = None,
-    unpublished_source: Path | None = None,
+    unpublished_source_root: Path | None = None,
     source_blueprint: Path,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
@@ -2557,7 +2657,7 @@ def _render_chapter(
             node_sources=node_sources,
             targets=targets,
             sources_base=sources_base,
-            unpublished_source=unpublished_source,
+            unpublished_source_root=unpublished_source_root,
             source_blueprint=source_blueprint,
         )
         environments[node_id] = environment
@@ -2648,7 +2748,7 @@ def _render_environment(
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
     sources_base: "_SourceBase | None" = None,
-    unpublished_source: Path | None = None,
+    unpublished_source_root: Path | None = None,
     source_blueprint: Path,
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
@@ -2666,7 +2766,7 @@ def _render_environment(
             node_sources=node_sources,
             targets=targets,
             sources_base=sources_base,
-            unpublished_source=unpublished_source,
+            unpublished_source_root=unpublished_source_root,
         )
         for part in (statement, remainder)
     )

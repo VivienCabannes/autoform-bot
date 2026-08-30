@@ -119,6 +119,8 @@ mathematics.
    formalizable roadmap leaves, and each linked leaf must reciprocate with the
    strict inline frontmatter form `source_units: [unit-id, other-unit]`.
    `load_execution_input` refuses schema-less v1 with `coverage-v2-required`.
+   A v2 publication excludes the complete `blueprint/sources/` authority tree;
+   use Markdown links to those files so publication can rewrite or remove them.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
 5. After approval, create one file per pull-request-sized unit beside its

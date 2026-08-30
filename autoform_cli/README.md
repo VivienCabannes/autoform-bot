@@ -285,9 +285,11 @@ their frontmatter with `source_units: [chapter-one]`. The immutable
 `autoform-runtime/v1` projection; schema-less v1 remains valid for audit and
 render but is refused for execution with `coverage-v2-required`.
 
-The named v2 artifact is never copied into a publication. With repository
-coordinates its authored links become repository blob links; without them,
-inline links become plain text instead of dangling site links.
+A v2 publication excludes the entire `blueprint/sources/` authority tree, so
+renamed artifacts cannot survive an incremental render. With repository
+coordinates its authored Markdown links become repository blob links; without
+them, those links become plain text instead of dangling site links. Raw HTML
+links into the excluded tree are rejected.
 
 The contract is read as published Markdown and fails closed. A table inside an
 HTML comment, a fenced block, or a four-space-indented block is documentation
