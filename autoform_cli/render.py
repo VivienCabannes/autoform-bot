@@ -26,7 +26,7 @@ from pathlib import PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
-from .coverage import CoverageSummary, load_coverage
+from .coverage import COVERAGE_V2_SCHEMA, CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import (
     IndexedSourceSnapshot,
@@ -46,6 +46,10 @@ except ImportError:  # pragma: no cover - Windows import compatibility
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
+_ANY_INLINE_LINK = re.compile(
+    r"(?P<image>!?)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)"
+)
+_AUTOLINK = re.compile(r"<(?P<target>(?:\.{1,2}/|/)[^<>\s]+)>")
 #: A reference-style link definition, `[label]: target "title"`. Markdown
 #: resolves `[Paper][paper]` through one of these, so a rewrite that only sees
 #: inline links leaves the destination behind and publishes a dead link.
@@ -297,7 +301,12 @@ def render_site(
             ["blueprint and output directories must be disjoint; refusing destructive render"]
         )
     _validate_publication_tree(blueprint)
-    _load_publication_contract(blueprint)
+    _, coverage = _load_publication_contract(blueprint)
+    excluded_artifact = (
+        Path(coverage.artifact_path)
+        if coverage.schema == COVERAGE_V2_SCHEMA and coverage.artifact_path is not None
+        else None
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     expected_destination = _inspect_destination(destination)
     repo_root = (
@@ -314,7 +323,11 @@ def render_site(
     stage_identity: tuple[int, int] | None = None
     try:
         snapshot = workspace / "source"
-        source_revision = _snapshot_publication_tree(blueprint, snapshot)
+        source_revision = _snapshot_publication_tree(
+            blueprint,
+            snapshot,
+            excluded_relative=excluded_artifact,
+        )
         snapshot_identity = _directory_path_identity(snapshot)
         lean_exclusions = (destination, workspace)
         lean_snapshot = _capture_lean_source_snapshot(
@@ -328,7 +341,12 @@ def render_site(
             exclude_roots=lean_exclusions,
             source_index=lean_snapshot.index,
         )
-        _require_source_revision(blueprint, source_revision)
+        _require_source_revision(
+            blueprint,
+            source_revision,
+            excluded_relative=excluded_artifact,
+            expected_coverage=coverage,
+        )
         _require_snapshot_revision(
             snapshot, source_revision, snapshot_identity, workspace
         )
@@ -338,7 +356,12 @@ def render_site(
         stage = workspace / "site"
         stage_identity = _create_stage_directory(workspace, workspace_identity)
         if not clean and expected_destination.kind == "owned":
-            _copy_owned_publication(destination, stage, expected_destination)
+            _copy_owned_publication(
+                destination,
+                stage,
+                expected_destination,
+                excluded_relative=excluded_artifact,
+            )
         report = _render_snapshot(
             snapshot,
             stage,
@@ -347,8 +370,14 @@ def render_site(
             source_blueprint=blueprint,
             source_revision=source_revision,
             lean_source_revision=lean_source_revision,
+            coverage=coverage,
         )
-        _require_source_revision(blueprint, source_revision)
+        _require_source_revision(
+            blueprint,
+            source_revision,
+            excluded_relative=excluded_artifact,
+            expected_coverage=coverage,
+        )
         _require_snapshot_revision(
             snapshot, source_revision, snapshot_identity, workspace
         )
@@ -361,7 +390,12 @@ def render_site(
             raise _PublicationRecoveryError(
                 [f"publication stage integrity failed; recovery material was retained at {workspace}"]
             ) from error
-        _require_source_revision(blueprint, source_revision)
+        _require_source_revision(
+            blueprint,
+            source_revision,
+            excluded_relative=excluded_artifact,
+            expected_coverage=coverage,
+        )
         _require_snapshot_revision(
             snapshot, source_revision, snapshot_identity, workspace
         )
@@ -391,6 +425,8 @@ def render_site(
             lean_root=repo_root,
             lean_source_revision=lean_source_revision,
             lean_exclusions=lean_exclusions,
+            excluded_source=excluded_artifact,
+            expected_coverage=coverage,
         )
         report.output_dir = destination
         return report
@@ -429,6 +465,7 @@ def _render_snapshot(
     source_blueprint: Path,
     source_revision: str,
     lean_source_revision: str,
+    coverage: CoverageSummary,
 ) -> RenderReport:
     """Write one already-frozen blueprint into an isolated staging tree.
 
@@ -441,7 +478,10 @@ def _render_snapshot(
     destination = Path(output_dir).resolve()
     _validate_publication_tree(blueprint)
 
-    graph, coverage = _load_publication_contract(blueprint)
+    graph = load_graph(blueprint)
+    contract_path = blueprint / coverage.source_path
+    if hashlib.sha256(_read_regular_file(contract_path)).hexdigest() != coverage.source_sha256:
+        raise PublicationError(["coverage contract changed in the publication snapshot"])
     statuses = status.derive(graph)
     # The repository root, not the vault's parent. A blueprint nested at
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
@@ -449,6 +489,11 @@ def _render_snapshot(
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
     sources_base = _sources_base(source_blueprint, repo_root, linker)
+    unpublished_source = (
+        blueprint / coverage.artifact_path
+        if coverage.schema == COVERAGE_V2_SCHEMA and coverage.artifact_path is not None
+        else None
+    )
 
     report = RenderReport(output_dir=destination)
     node_paths = {node.path.resolve(): node for node in graph.nodes.values()}
@@ -509,6 +554,7 @@ def _render_snapshot(
                 node_sources=node_sources,
                 targets=targets,
                 sources_base=sources_base,
+                unpublished_source=unpublished_source,
             )
             target.write_text(rewritten, encoding="utf-8")
         else:
@@ -550,6 +596,7 @@ def _render_snapshot(
             destination=destination,
             node_sources=node_sources,
             sources_base=sources_base,
+            unpublished_source=unpublished_source,
             source_blueprint=source_blueprint,
         )
         page.write_text(chapter, encoding="utf-8")
@@ -1041,12 +1088,18 @@ def _publication_inventory_descriptor(
 
 
 def _copy_owned_publication(
-    source: Path, destination: Path, state: _DestinationState
+    source: Path,
+    destination: Path,
+    state: _DestinationState,
+    *,
+    excluded_relative: Path | None = None,
 ) -> None:
     """Seed a non-clean render from the exact previously verified generation."""
     for relative in state.directories:
         (destination / relative).mkdir(parents=True, exist_ok=True)
     for relative, expected_digest in state.files:
+        if excluded_relative is not None and Path(relative) == excluded_relative:
+            continue
         data = _read_regular_file(source / relative)
         if hashlib.sha256(data).hexdigest() != expected_digest:
             raise PublicationError(["publication output changed while it was copied"])
@@ -1055,11 +1108,18 @@ def _copy_owned_publication(
         target.write_bytes(data)
 
 
-def _snapshot_publication_tree(source: Path, destination: Path) -> str:
+def _snapshot_publication_tree(
+    source: Path,
+    destination: Path,
+    *,
+    excluded_relative: Path | None = None,
+) -> str:
     """Copy and hash the exact source generation used by one render."""
     destination.mkdir(mode=0o700)
     digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
     for path, relative in _published_source_files(source):
+        if excluded_relative is not None and relative == excluded_relative:
+            continue
         data = _read_regular_file(path)
         _update_source_digest(digest, relative, data)
         target = destination / relative
@@ -1121,9 +1181,21 @@ def _read_regular_file_at(parent_descriptor: int, name: str, display_path: Path)
         os.close(descriptor)
 
 
-def _require_source_revision(blueprint: Path, expected: str) -> None:
-    if _source_revision(blueprint) != expected:
+def _require_source_revision(
+    blueprint: Path,
+    expected: str,
+    *,
+    excluded_relative: Path | None = None,
+    expected_coverage: CoverageSummary | None = None,
+) -> None:
+    if _source_revision(blueprint, excluded_relative=excluded_relative) != expected:
         raise PublicationError(["blueprint changed during publication; previous site was preserved"])
+    if expected_coverage is not None:
+        current, issues = load_coverage(blueprint)
+        if issues or current != expected_coverage:
+            raise PublicationError(
+                ["coverage or source artifact changed during publication; previous site was preserved"]
+            )
 
 
 def _require_snapshot_revision(
@@ -1223,6 +1295,8 @@ def _publish_staged_site(
     lean_root: Path,
     lean_source_revision: str,
     lean_exclusions: tuple[Path, ...],
+    excluded_source: Path | None = None,
+    expected_coverage: CoverageSummary | None = None,
 ) -> None:
     """Commit *stage* if the destination still matches the inspected generation."""
     parent_descriptor: int | None = None
@@ -1247,7 +1321,12 @@ def _publish_staged_site(
             raise _PublicationRecoveryError(
                 [f"publication stage changed; recovery material was retained at {stage.parent}"]
             )
-        _require_source_revision(source_blueprint, source_revision)
+        _require_source_revision(
+            source_blueprint,
+            source_revision,
+            excluded_relative=excluded_source,
+            expected_coverage=expected_coverage,
+        )
         _require_snapshot_revision(
             source_snapshot,
             source_revision,
@@ -1494,9 +1573,11 @@ def _published_source_files(blueprint: Path):
         yield source, relative
 
 
-def _source_revision(blueprint: Path) -> str:
+def _source_revision(blueprint: Path, *, excluded_relative: Path | None = None) -> str:
     digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
     for source, relative in _published_source_files(blueprint):
+        if excluded_relative is not None and relative == excluded_relative:
+            continue
         _update_source_digest(digest, relative, _read_regular_file(source))
     return digest.hexdigest()
 
@@ -1512,15 +1593,24 @@ def _write_publication_manifest(
     lean_source_revision: str,
 ) -> None:
     directories, files = _publication_inventory(destination)
+    coverage_manifest: dict[str, object] = {
+        "complete": coverage.complete,
+        "counts": coverage.counts,
+        "schema": coverage.schema,
+        "source_path": coverage.source_path,
+        "source_sha256": coverage.source_sha256,
+    }
+    if coverage.schema == COVERAGE_V2_SCHEMA:
+        coverage_manifest.update(
+            {
+                "artifact_path": coverage.artifact_path,
+                "artifact_sha256": coverage.artifact_sha256,
+                "contract_sha256": coverage.source_sha256,
+            }
+        )
     manifest = {
         "complete": complete,
-        "coverage": {
-            "complete": coverage.complete,
-            "counts": coverage.counts,
-            "schema": coverage.schema,
-            "source_path": coverage.source_path,
-            "source_sha256": coverage.source_sha256,
-        },
+        "coverage": coverage_manifest,
         "directories": list(directories),
         "files": dict(files),
         "schema": PUBLICATION_SCHEMA,
@@ -2282,6 +2372,7 @@ def _rewrite_links(
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
     sources_base: "_SourceBase | None" = None,
+    unpublished_source: Path | None = None,
 ) -> str:
     """Resolve a page's relative links against where it is being published.
 
@@ -2293,7 +2384,18 @@ def _rewrite_links(
     """
     anchored = _anchored_links(targets, page, extension=".md")
 
-    def moved_target(raw: str) -> str | None:
+    strip_link = object()
+
+    def is_unpublished_target(raw: str) -> bool:
+        if unpublished_source is None:
+            return False
+        bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
+        path = bare.partition("#")[0]
+        if not path or urlsplit(path).scheme or path.startswith("/"):
+            return False
+        return (source_dir / unquote(path)).resolve() == unpublished_source.resolve()
+
+    def moved_target(raw: str) -> str | object | None:
         """Where *raw* should point once published, or None to leave it alone."""
         bare = raw[1:-1] if raw.startswith("<") and raw.endswith(">") else raw
         path, separator, fragment = bare.partition("#")
@@ -2309,6 +2411,10 @@ def _rewrite_links(
         if not _is_within(candidate, blueprint):
             return None
         relative = candidate.relative_to(blueprint)
+        if unpublished_source is not None and candidate == unpublished_source.resolve():
+            if sources_base is not None:
+                return f"{_source_href(sources_base, relative.parts[1:])}{separator}{fragment}"
+            return strip_link
         if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
             return f"{_source_href(sources_base, relative.parts[1:])}{separator}{fragment}"
         published = destination / relative
@@ -2316,7 +2422,29 @@ def _rewrite_links(
 
     def replace(match: re.Match[str]) -> str:
         href = moved_target(match.group("target"))
+        if href is strip_link:
+            return match.group("label")
         return match.group(0) if href is None else f"[{match.group('label')}]({href})"
+
+    def replace_artifact_link(match: re.Match[str]) -> str:
+        if match.group("image") != "!" or not is_unpublished_target(match.group("target")):
+            return match.group(0)
+        href = moved_target(match.group("target"))
+        if href is strip_link:
+            return match.group("label")
+        if href is None:
+            return match.group(0)
+        return f"{match.group('image')}[{match.group('label')}]({href})"
+
+    def replace_autolink(match: re.Match[str]) -> str:
+        if not is_unpublished_target(match.group("target")):
+            return match.group(0)
+        href = moved_target(match.group("target"))
+        if href is strip_link:
+            return "source artifact"
+        if href is None:
+            return match.group(0)
+        return f"<{href}>"
 
     def rewrite(line: str) -> str:
         # A reference definition carries the destination for every `[x][label]`
@@ -2325,10 +2453,14 @@ def _rewrite_links(
         definition = _LINK_DEFINITION.match(line)
         if definition is not None:
             href = moved_target(definition.group("target"))
+            if href is strip_link:
+                return ""
             if href is not None:
                 indent, label = definition.group("indent"), definition.group("label")
                 return f"{indent}[{label}]: {href}{definition.group('rest') or ''}"
             return line
+        line = _ANY_INLINE_LINK.sub(replace_artifact_link, line)
+        line = _AUTOLINK.sub(replace_autolink, line)
         return _MARKDOWN_LINK.sub(replace, line)
 
     return _outside_fences(text, rewrite)
@@ -2400,6 +2532,7 @@ def _render_chapter(
     destination: Path,
     node_sources: dict[Path, str],
     sources_base: "_SourceBase | None" = None,
+    unpublished_source: Path | None = None,
     source_blueprint: Path,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
@@ -2424,6 +2557,7 @@ def _render_chapter(
             node_sources=node_sources,
             targets=targets,
             sources_base=sources_base,
+            unpublished_source=unpublished_source,
             source_blueprint=source_blueprint,
         )
         environments[node_id] = environment
@@ -2514,6 +2648,7 @@ def _render_environment(
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
     sources_base: "_SourceBase | None" = None,
+    unpublished_source: Path | None = None,
     source_blueprint: Path,
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
@@ -2531,6 +2666,7 @@ def _render_environment(
             node_sources=node_sources,
             targets=targets,
             sources_base=sources_base,
+            unpublished_source=unpublished_source,
         )
         for part in (statement, remainder)
     )

@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pytest
+
+import autoform_cli.render as render_module
+from autoform_cli.render import PUBLICATION_MANIFEST, PublicationError, render_site
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _project(tmp_path: Path, suffix: str) -> tuple[Path, Path, bytes]:
+    project = tmp_path / "project"
+    blueprint = project / "blueprint"
+    roadmap = blueprint / "roadmap"
+    roadmap.mkdir(parents=True)
+    (roadmap / "README.md").write_text("# Book\n", encoding="utf-8")
+    artifact = f"AUTOFORM-SECRET-SENTINEL-{suffix}\n".encode()
+    relative = Path("sources") / "nested" / f"book{suffix}"
+    source = blueprint / relative
+    source.parent.mkdir(parents=True)
+    source.write_bytes(artifact)
+    (roadmap / "result.md").write_text(
+        "---\n"
+        "declaration: theorem\n"
+        "source_units: [result]\n"
+        "---\n\n"
+        "# Result\n\nThe result.\n\n"
+        "## Sources\n\n"
+        f"- [Textbook](../{relative.as_posix()})\n"
+        f"- ![Scan](../{relative.as_posix()})\n"
+        f"- <../{relative.as_posix()}>\n"
+        "- [Reference][book-source]\n\n"
+        f"[book-source]: ../{relative.as_posix()}\n",
+        encoding="utf-8",
+    )
+    coverage = blueprint / "coverage" / "README.md"
+    coverage.parent.mkdir(parents=True)
+    coverage.write_text(
+        "---\n"
+        "schema: autoform-coverage/v2\n"
+        f"artifact: {relative.as_posix()}\n"
+        f"artifact_sha256: {_digest(artifact)}\n"
+        "---\n\n"
+        "# Coverage\n\n"
+        "| Unit | Area | Lines | Locator | Unit SHA-256 | Coverage | Evidence |\n"
+        "| --- | --- | --- | --- | --- | --- | --- |\n"
+        f"| result | Main result | 1-1 | theorem | {_digest(artifact)} | "
+        "DECOMPOSED | [Result](../roadmap/result.md) |\n",
+        encoding="utf-8",
+    )
+    return project, source, artifact
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md"])
+@pytest.mark.parametrize("with_coordinates", [False, True])
+def test_named_artifact_never_enters_snapshot_or_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    with_coordinates: bool,
+) -> None:
+    project, source, artifact = _project(tmp_path, suffix)
+    output = tmp_path / "site"
+    original = render_module._render_snapshot
+
+    def inspect_snapshot(snapshot, *args, **kwargs):
+        relative = source.relative_to(project / "blueprint")
+        assert not (Path(snapshot) / relative).exists()
+        return original(snapshot, *args, **kwargs)
+
+    monkeypatch.setattr(render_module, "_render_snapshot", inspect_snapshot)
+    kwargs = (
+        {"repository_url": "https://github.com/owner/repo", "ref": "abc123"}
+        if with_coordinates
+        else {"repository_url": "", "ref": ""}
+    )
+
+    render_site(project / "blueprint", output, lean_root=project, **kwargs)
+
+    generated = b"\n".join(
+        path.read_bytes() for path in output.rglob("*") if path.is_file()
+    )
+    assert artifact.rstrip(b"\n") not in generated
+    assert not (output / source.relative_to(project / "blueprint")).exists()
+    chapter = (output / "roadmap/README.md").read_text(encoding="utf-8")
+    if with_coordinates:
+        assert (
+            f"https://github.com/owner/repo/blob/abc123/blueprint/"
+            f"{source.relative_to(project / 'blueprint').as_posix()}"
+        ) in chapter
+    else:
+        assert source.name not in chapter
+        assert "[Textbook](" not in chapter
+
+
+def test_stale_artifact_fails_without_replacing_previous_publication(tmp_path: Path) -> None:
+    project, source, _ = _project(tmp_path, ".txt")
+    output = tmp_path / "site"
+    render_site(project / "blueprint", output, lean_root=project)
+    before = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    source.write_text("changed source\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match="artifact_sha256 does not match"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    after = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert (output / PUBLICATION_MANIFEST).is_file()
+
+
+def test_nonclean_upgrade_does_not_retain_artifact_from_v1_site(tmp_path: Path) -> None:
+    project, source, artifact = _project(tmp_path, ".md")
+    coverage = project / "blueprint/coverage/README.md"
+    v2_contract = coverage.read_bytes()
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Book | OUT | Kept only to seed a legacy publication |\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "site"
+    render_site(project / "blueprint", output, lean_root=project)
+    published_artifact = output / source.relative_to(project / "blueprint")
+    assert published_artifact.is_file()
+
+    coverage.write_bytes(v2_contract)
+    render_site(project / "blueprint", output, lean_root=project, clean=False)
+
+    assert not published_artifact.exists()
+    generated = b"\n".join(
+        path.read_bytes() for path in output.rglob("*") if path.is_file()
+    )
+    assert artifact.rstrip(b"\n") not in generated
