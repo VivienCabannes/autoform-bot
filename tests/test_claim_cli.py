@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from autoform_cli import __main__ as cli
 from autoform_cli.__main__ import main
 from autoform_cli.claims import (
     CLAIM_REF_PREFIX,
@@ -76,7 +78,12 @@ def _args(repo: Path, scratch: Path, blueprint: Path, *command: str) -> list[str
     return args
 
 
-def test_claim_cli_acquire_renew_list_release_round_trip(tmp_path: Path, capsys) -> None:
+def test_claim_cli_acquire_renew_list_release_round_trip(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 1_000.0)
     repo = _bare_repo(tmp_path)
     scratch = tmp_path / "scratch"
     blueprint = _blueprint(tmp_path)
@@ -384,7 +391,7 @@ def test_renamed_live_legacy_path_blocks_durable_article_claim(
     assert main(_args(repo, tmp_path / "scratch", blueprint, "acquire", new_id)) == 1
     assert "live legacy v1 claim" in capsys.readouterr().out
 
-    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 201.0)
+    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 500.0)
     assert main(_args(repo, tmp_path / "scratch", blueprint, "acquire", new_id)) == 0
     capsys.readouterr()
     board = ClaimBoard(repo, "inspector", tmp_path / "inspect")
@@ -429,7 +436,7 @@ def test_expired_legacy_path_claim_does_not_block_new_article_key(
         "resource": author_claim_key(node_id),
     }
     _plant_message(repo, author_claim_key(node_id), json.dumps(lease))
-    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 201.0)
+    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 500.0)
 
     assert main(_args(repo, tmp_path / "scratch", blueprint, "acquire", node_id)) == 0
     capsys.readouterr()
@@ -461,7 +468,7 @@ def test_expired_v1_at_durable_key_is_upgraded_instead_of_permanently_blocked(
         "resource": canonical_key,
     }
     _plant_message(repo, canonical_key, json.dumps(lease))
-    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 201.0)
+    monkeypatch.setattr("autoform_cli.claims.time.time", lambda: 500.0)
 
     assert main(
         _args(repo, tmp_path / "scratch", blueprint, "acquire", "chapter/main-result")
@@ -549,6 +556,34 @@ def test_cli_derives_a_stable_session_from_the_target_worktree(
     assert "renewed" in capsys.readouterr().out
 
 
+def test_existing_worktree_claim_token_is_read_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    token_path = git_dir / "autoform-claim-session"
+    token_path.write_text("a" * 64 + "\n")
+    real_open = cli.os.open
+
+    def reject_token_writes(path, flags, *args):
+        if Path(path) == token_path and flags & (os.O_WRONLY | os.O_RDWR):
+            raise AssertionError("an existing worktree token must not be rewritten")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(cli.os, "open", reject_token_writes)
+
+    assert cli._worktree_claim_token(git_dir) == "a" * 64
+
+
+def test_worktree_claim_token_rejects_non_regular_file(tmp_path: Path) -> None:
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    os.mkfifo(git_dir / "autoform-claim-session")
+
+    with pytest.raises(ValueError, match="must be a regular file"):
+        cli._worktree_claim_token(git_dir)
+
+
 def test_blueprint_project_selects_that_projects_origin(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:
@@ -577,6 +612,308 @@ def test_blueprint_project_selects_that_projects_origin(
     ]
     assert main(args) == 0
     assert "acquired" in capsys.readouterr().out
+
+
+def test_nested_blueprint_resolves_relative_origin_from_worktree_root(
+    tmp_path: Path, capsys
+) -> None:
+    repo = _bare_repo(tmp_path / "remote")
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "../remote/claims.git"],
+        cwd=project,
+        check=True,
+    )
+    blueprint = _blueprint(project)
+
+    assert main(
+        [
+            "claim",
+            "acquire",
+            "--resource",
+            "lake-build",
+            "--worker-id",
+            "worker-a",
+            "--scratch",
+            str(tmp_path / "scratch"),
+            "--blueprint",
+            str(blueprint),
+        ]
+    ) == 0
+    assert "acquired" in capsys.readouterr().out
+    refs = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname)", CLAIM_REF_PREFIX],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert refs == sorted(
+        [
+            CLAIM_REF_PREFIX + author_claim_key("lake-build"),
+            CLAIM_REF_PREFIX + resource_claim_key("lake-build"),
+        ]
+    )
+
+
+def test_claim_target_pins_origin_before_blueprint_path_replacement(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    intended_repo = _bare_repo(tmp_path / "intended")
+    redirected_repo = _bare_repo(tmp_path / "redirected")
+    intended_project = tmp_path / "project"
+    redirected_project = tmp_path / "redirected-project"
+    for project, repo in (
+        (intended_project, intended_repo),
+        (redirected_project, redirected_repo),
+    ):
+        project.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(repo)], cwd=project, check=True)
+        _blueprint(project)
+
+    original_resolve = cli._resolve_claim_target
+    pinned_project = tmp_path / "pinned-project"
+
+    def resolve_then_replace(args):
+        target = original_resolve(args)
+        intended_project.rename(pinned_project)
+        intended_project.symlink_to(redirected_project, target_is_directory=True)
+        return target
+
+    monkeypatch.setattr(cli, "_resolve_claim_target", resolve_then_replace)
+    args = [
+        "claim",
+        "acquire",
+        "chapter/main-result",
+        "--worker-id",
+        "worker-a",
+        "--scratch",
+        str(tmp_path / "scratch"),
+        "--blueprint",
+        str(intended_project),
+    ]
+
+    assert main(args) == 0
+    assert "acquired" in capsys.readouterr().out
+    intended_refs = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname)", CLAIM_REF_PREFIX],
+        cwd=intended_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    redirected_refs = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname)", CLAIM_REF_PREFIX],
+        cwd=redirected_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert len(intended_refs) == 2
+    assert redirected_refs == []
+
+
+def test_claim_target_rejects_aba_replacement_during_origin_resolution(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    intended_repo = _bare_repo(tmp_path / "intended")
+    redirected_repo = _bare_repo(tmp_path / "redirected")
+    intended_project = tmp_path / "project"
+    redirected_project = tmp_path / "redirected-project"
+    for project, repo in (
+        (intended_project, intended_repo),
+        (redirected_project, redirected_repo),
+    ):
+        project.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(repo)], cwd=project, check=True)
+        _blueprint(project)
+
+    original_origin = cli._origin_url
+    parked_project = tmp_path / "parked-project"
+
+    def origin_during_aba(context):
+        intended_project.rename(parked_project)
+        intended_project.symlink_to(redirected_project, target_is_directory=True)
+        try:
+            return original_origin(context)
+        finally:
+            intended_project.unlink()
+            parked_project.rename(intended_project)
+
+    monkeypatch.setattr(cli, "_origin_url", origin_during_aba)
+
+    assert main(
+        [
+            "claim",
+            "acquire",
+            "chapter/main-result",
+            "--worker-id",
+            "worker-a",
+            "--scratch",
+            str(tmp_path / "scratch"),
+            "--blueprint",
+            str(intended_project),
+        ]
+    ) == 1
+    assert "was replaced while resolving the claim" in capsys.readouterr().out
+    for repo in (intended_repo, redirected_repo):
+        refs = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname)", CLAIM_REF_PREFIX],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        assert refs == []
+
+
+def test_claim_target_rejects_ancestor_aba_during_origin_resolution(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    intended_repo = _bare_repo(tmp_path / "intended")
+    redirected_repo = _bare_repo(tmp_path / "redirected")
+    project_root = tmp_path / "projects"
+    intended_scope = project_root / "scope"
+    redirected_scope = project_root / "other"
+    intended_project = intended_scope / "inner" / "project"
+    redirected_project = redirected_scope / "inner" / "project"
+    for project, repo in (
+        (intended_project, intended_repo),
+        (redirected_project, redirected_repo),
+    ):
+        project.mkdir(parents=True)
+        subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(repo)], cwd=project, check=True)
+        _blueprint(project)
+
+    original_origin = cli._origin_url
+    parked = project_root / "parked"
+
+    def origin_during_ancestor_aba(context):
+        intended_scope.rename(parked)
+        intended_scope.symlink_to(redirected_scope, target_is_directory=True)
+        try:
+            return original_origin(context)
+        finally:
+            intended_scope.unlink()
+            parked.rename(intended_scope)
+
+    monkeypatch.setattr(cli, "_origin_url", origin_during_ancestor_aba)
+
+    assert main(
+        [
+            "claim",
+            "acquire",
+            "chapter/main-result",
+            "--worker-id",
+            "worker-a",
+            "--scratch",
+            str(tmp_path / "scratch"),
+            "--blueprint",
+            str(intended_project),
+        ]
+    ) == 1
+    assert "was replaced while resolving the claim" in capsys.readouterr().out
+    for repo in (intended_repo, redirected_repo):
+        refs = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname)", CLAIM_REF_PREFIX],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        assert refs == []
+
+
+def test_replacement_worktree_cannot_inherit_default_claim_session(
+    tmp_path: Path, capsys
+) -> None:
+    repo = _bare_repo(tmp_path)
+    project = tmp_path / "project"
+
+    def initialize_worktree(path: Path) -> None:
+        path.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(repo)], cwd=path, check=True)
+        _blueprint(path)
+
+    initialize_worktree(project)
+    args = [
+        "claim",
+        "acquire",
+        "chapter/main-result",
+        "--worker-id",
+        "worker-a",
+        "--scratch",
+        str(tmp_path / "scratch"),
+        "--blueprint",
+        str(project),
+    ]
+    assert main(args) == 0
+    capsys.readouterr()
+    board = ClaimBoard(repo, "inspector", tmp_path / "inspect")
+    key = author_claim_key("af_0123456789abcdef01234567")
+    board._ensure_scratch()
+    original_oid = board._remote_oid(key)
+
+    project.rename(tmp_path / "original-project")
+    initialize_worktree(project)
+    args[1] = "renew"
+
+    assert main(args) == 1
+    assert "ownership is held or unverifiable" in capsys.readouterr().out
+    assert board._remote_oid(key) == original_oid
+
+
+def test_cleanup_rejects_blueprint_replacement_before_selecting_origin(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    intended_repo = _bare_repo(tmp_path / "intended")
+    redirected_repo = _bare_repo(tmp_path / "redirected")
+    intended_project = tmp_path / "project"
+    redirected_project = tmp_path / "redirected-project"
+    for project, repo in (
+        (intended_project, intended_repo),
+        (redirected_project, redirected_repo),
+    ):
+        project.mkdir()
+        subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(repo)], cwd=project, check=True)
+        _blueprint(project)
+
+    key = "expired"
+    lease = {
+        "schema": CLAIM_SCHEMA,
+        "lease_id": "1" * 64,
+        "owner": "old-worker",
+        "host": "old-host",
+        "pid": 1,
+        "acquired_at": 100.0,
+        "renewed_at": 100.0,
+        "expires_at": 200.0,
+        "resource": key,
+    }
+    _plant_message(intended_repo, key, json.dumps(lease))
+    original_load = cli.load_graph
+    pinned_project = tmp_path / "pinned-project"
+
+    def load_then_replace(blueprint):
+        graph = original_load(blueprint)
+        intended_project.rename(pinned_project)
+        intended_project.symlink_to(redirected_project, target_is_directory=True)
+        return graph
+
+    monkeypatch.setattr(cli, "load_graph", load_then_replace)
+
+    assert main(["claim", "cleanup", "--blueprint", str(intended_project)]) == 1
+    assert "was replaced while resolving the claim" in capsys.readouterr().out
+    board = ClaimBoard(intended_repo, "inspector", tmp_path / "inspect-cleanup")
+    assert board.read(key) is not None
+    assert ClaimBoard(redirected_repo, "inspector", tmp_path / "inspect-redirected").list() == []
 
 
 def test_cleanup_needs_no_worker_or_worktree_session(tmp_path: Path, capsys, monkeypatch) -> None:

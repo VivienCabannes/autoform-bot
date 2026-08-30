@@ -6,10 +6,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import secrets
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from . import status
@@ -20,6 +25,8 @@ from .claims import (
     ClaimBoard,
     ClaimTransportError,
     author_claim_key,
+    pin_claim_repository,
+    pin_claim_scratch,
     resource_claim_key,
 )
 from .doctor import diagnose_project
@@ -38,6 +45,65 @@ from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
 from .runtime import RuntimeProjectionError, resolve_runtime_paths
 from .scaffold import ScaffoldError, scaffold_project
+
+_CLAIM_TEMP_DIRECTORY = Path(tempfile.gettempdir()).resolve()
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimBoardIdentity:
+    repo: str
+    repo_identity: tuple[int, int] | None
+    session_id: str
+    scratch: Path
+    scratch_identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PinnedDirectory:
+    path: Path
+    identity: tuple[tuple[int, int, int | None], ...]
+
+    @staticmethod
+    def _snapshot(path: Path, *, label: str) -> tuple[tuple[int, int, int | None], ...]:
+        snapshot: list[tuple[int, int, int | None]] = []
+        temp_ancestors = frozenset(
+            (_CLAIM_TEMP_DIRECTORY, *_CLAIM_TEMP_DIRECTORY.parents)
+        )
+        for component in reversed((path, *path.parents)):
+            try:
+                info = component.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(f"{label} cannot be inspected safely") from exc
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"{label} must have only real directory components")
+            changed_at_ns = None if component in temp_ancestors else info.st_ctime_ns
+            snapshot.append((info.st_dev, info.st_ino, changed_at_ns))
+        return tuple(snapshot)
+
+    @classmethod
+    def capture(cls, path: Path, *, label: str) -> _PinnedDirectory:
+        before = cls._snapshot(path, label=label)
+        after = cls._snapshot(path, label=label)
+        if before != after:
+            raise ValueError(f"{label} changed while its path was being inspected")
+        return cls(path=path, identity=after)
+
+    def verify(self, *, label: str) -> None:
+        try:
+            current = self._snapshot(self.path, label=label)
+        except ValueError as exc:
+            raise ValueError(f"{label} was replaced while resolving the claim") from exc
+        if current != self.identity:
+            raise ValueError(f"{label} was replaced while resolving the claim")
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedClaimTarget:
+    key: str
+    label: str
+    legacy_key: str | None
+    canonical_keys: tuple[str, ...]
+    board_identity: _ClaimBoardIdentity
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -499,12 +565,28 @@ def _claim(args: argparse.Namespace) -> int:
             print(json.dumps(board.list(), sort_keys=True, separators=(",", ":")))
             return 0
         if operation == "cleanup":
-            board = _claim_board(args, require_identity=False)
             canonical_keys = None
+            board_identity = None
             if args.blueprint is not None:
                 try:
-                    blueprint = resolve_runtime_paths(args.blueprint).blueprint_dir
+                    paths = resolve_runtime_paths(args.blueprint)
+                    blueprint = paths.blueprint_dir
+                    project_pin = _PinnedDirectory.capture(
+                        paths.project_root,
+                        label="claim project",
+                    )
+                    blueprint_pin = _PinnedDirectory.capture(
+                        blueprint,
+                        label="claim blueprint",
+                    )
                     graph = load_graph(blueprint)
+                    board_identity = _resolve_claim_board_identity(
+                        args,
+                        context=paths.project_root,
+                        require_identity=False,
+                    )
+                    project_pin.verify(label="claim project")
+                    blueprint_pin.verify(label="claim blueprint")
                 except RuntimeProjectionError as exc:
                     raise ValueError(str(exc)) from exc
                 except GraphValidationError as exc:
@@ -514,36 +596,41 @@ def _claim(args: argparse.Namespace) -> int:
                     for node in graph.nodes.values()
                     if node.article_id is not None
                 )
+            board = _claim_board(
+                args,
+                identity=board_identity,
+                require_identity=False,
+            )
             print(
                 f"recovered {board.cleanup(canonical_keys=canonical_keys)} "
                 "expired or unsafe-timestamp claim(s)"
             )
             return 0
 
-        key, label, legacy_key, canonical_keys = _resolve_claim_target(args)
-        board = _claim_board(args)
-        if operation in {"acquire", "renew"} and legacy_key is not None:
+        target = _resolve_claim_target(args)
+        board = _claim_board(args, identity=target.board_identity)
+        if operation in {"acquire", "renew"} and target.legacy_key is not None:
             if not board.prepare_v2_claim(
-                key,
-                [legacy_key],
-                canonical_keys=canonical_keys,
+                target.key,
+                [target.legacy_key],
+                canonical_keys=target.canonical_keys,
             ):
                 print(
-                    f"error: could not {operation} {label}; "
+                    f"error: could not {operation} {target.label}; "
                     "a live legacy v1 claim or incompatible path claim blocks v2 rollout"
                 )
                 return 1
         if operation == "acquire":
-            succeeded = board.acquire(key, ttl=args.ttl, note=args.note)
+            succeeded = board.acquire(target.key, ttl=args.ttl, note=args.note)
         elif operation == "renew":
-            succeeded = board.renew(key, ttl=args.ttl)
+            succeeded = board.renew(target.key, ttl=args.ttl)
         else:
-            succeeded = board.release(key)
+            succeeded = board.release(target.key)
         if succeeded:
             past_tense = {"acquire": "acquired", "renew": "renewed", "release": "released"}
-            print(f"{past_tense[operation]} {label} ({key})")
+            print(f"{past_tense[operation]} {target.label} ({target.key})")
             return 0
-        print(f"error: could not {operation} {label}; ownership is held or unverifiable")
+        print(f"error: could not {operation} {target.label}; ownership is held or unverifiable")
         return 1
     except (ClaimTransportError, ValueError) as exc:
         print(f"error: {exc}")
@@ -572,24 +659,66 @@ def _migrate(args: argparse.Namespace) -> int:
     return 1 if args.check and not plan.complete else 0
 
 
-def _claim_board(args: argparse.Namespace, *, require_identity: bool = True) -> ClaimBoard:
-    worker_id = args.worker_id or ("claim-maintenance" if not require_identity else None)
-    if worker_id is None:
-        raise ValueError("--worker-id or AUTOFORM_WORKER_ID is required")
-    context = getattr(args, "blueprint", None) or "."
-    repo = args.repo or _origin_url(context)
+def _resolve_claim_board_identity(
+    args: argparse.Namespace,
+    *,
+    context: str | Path | None = None,
+    require_identity: bool = True,
+) -> _ClaimBoardIdentity:
+    repo = args.repo
     session_id = args.session_id
+    context_pin = None
+    if repo is None or (require_identity and session_id is None):
+        if context is None:
+            context = getattr(args, "blueprint", None) or "."
+        context = Path(context).expanduser().resolve()
+        context_pin = _PinnedDirectory.capture(context, label="claim context")
+    if repo is None:
+        assert context is not None
+        repo = _origin_url(context)
     if session_id is None and require_identity:
+        assert context is not None
         session_id = _worktree_claim_session_id(context)
     if session_id is None:
         session_id = "claim-maintenance"
-    scratch = args.scratch or _default_claim_scratch(repo, session_id)
-    return ClaimBoard(repo, worker_id, scratch, session_id=session_id)
+    if context_pin is not None:
+        context_pin.verify(label="claim context")
+    normalized_repo, repo_identity = pin_claim_repository(repo)
+    scratch, scratch_identity = pin_claim_scratch(
+        args.scratch or _default_claim_scratch(normalized_repo, session_id)
+    )
+    return _ClaimBoardIdentity(
+        repo=normalized_repo,
+        repo_identity=repo_identity,
+        session_id=session_id,
+        scratch=scratch,
+        scratch_identity=scratch_identity,
+    )
+
+
+def _claim_board(
+    args: argparse.Namespace,
+    *,
+    identity: _ClaimBoardIdentity | None = None,
+    require_identity: bool = True,
+) -> ClaimBoard:
+    worker_id = args.worker_id or ("claim-maintenance" if not require_identity else None)
+    if worker_id is None:
+        raise ValueError("--worker-id or AUTOFORM_WORKER_ID is required")
+    identity = identity or _resolve_claim_board_identity(args, require_identity=require_identity)
+    return ClaimBoard(
+        identity.repo,
+        worker_id,
+        identity.scratch,
+        session_id=identity.session_id,
+        expected_repo_identity=identity.repo_identity,
+        expected_scratch_identity=identity.scratch_identity,
+    )
 
 
 def _resolve_claim_target(
     args: argparse.Namespace,
-) -> tuple[str, str, str | None, tuple[str, ...]]:
+) -> _ResolvedClaimTarget:
     article_target = args.node_id
     resource = args.resource
     if article_target and resource:
@@ -597,12 +726,22 @@ def _resolve_claim_target(
     if resource:
         if ARTICLE_ID_PATTERN.fullmatch(resource):
             raise ValueError("resource names must not use the reserved article_id format")
-        return resource_claim_key(resource), resource, author_claim_key(resource), ()
+        identity = _resolve_claim_board_identity(args)
+        return _ResolvedClaimTarget(
+            resource_claim_key(resource),
+            resource,
+            author_claim_key(resource),
+            (),
+            identity,
+        )
     if not article_target:
         raise ValueError("an article target or --resource is required")
 
     try:
-        blueprint = resolve_runtime_paths(args.blueprint).blueprint_dir
+        paths = resolve_runtime_paths(args.blueprint)
+        blueprint = paths.blueprint_dir
+        project_pin = _PinnedDirectory.capture(paths.project_root, label="claim project")
+        blueprint_pin = _PinnedDirectory.capture(blueprint, label="claim blueprint")
         graph = load_graph(blueprint)
     except RuntimeProjectionError as exc:
         raise ValueError(str(exc)) from exc
@@ -634,7 +773,16 @@ def _resolve_claim_target(
         for candidate in graph.nodes.values()
         if candidate.article_id is not None
     )
-    return author_claim_key(node.article_id), node.id, author_claim_key(node.id), canonical_keys
+    identity = _resolve_claim_board_identity(args, context=paths.project_root)
+    project_pin.verify(label="claim project")
+    blueprint_pin.verify(label="claim blueprint")
+    return _ResolvedClaimTarget(
+        author_claim_key(node.article_id),
+        node.id,
+        author_claim_key(node.id),
+        canonical_keys,
+        identity,
+    )
 
 
 def _origin_url(project_or_blueprint: str | Path = ".") -> str:
@@ -649,14 +797,37 @@ def _origin_url(project_or_blueprint: str | Path = ".") -> str:
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise ValueError("--repo is required outside a Git checkout with an origin remote") from exc
-    return result.stdout.strip()
+    origin = result.stdout.strip()
+    if "://" not in origin and not re.match(r"^[^/]+@[^:]+:", origin):
+        origin_path = Path(origin).expanduser()
+        if not origin_path.is_absolute():
+            try:
+                root_result = subprocess.run(
+                    ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10,
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                raise ValueError("could not resolve the relative origin repository") from exc
+            origin_path = Path(root_result.stdout.strip()) / origin_path
+        return str(origin_path.resolve())
+    return origin
 
 
 def _worktree_claim_session_id(project_or_blueprint: str | Path = ".") -> str:
     target = Path(project_or_blueprint).expanduser().resolve()
     try:
         result = subprocess.run(
-            ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+            [
+                "git",
+                "-C",
+                str(target),
+                "rev-parse",
+                "--show-toplevel",
+                "--absolute-git-dir",
+            ],
             capture_output=True,
             text=True,
             check=True,
@@ -666,9 +837,99 @@ def _worktree_claim_session_id(project_or_blueprint: str | Path = ".") -> str:
         raise ValueError(
             "--session-id or AUTOFORM_CLAIM_SESSION_ID is required outside a Git worktree"
         ) from exc
-    root = str(Path(result.stdout.strip()).resolve())
-    digest = hashlib.sha256(f"{socket.gethostname()}\0{root}".encode()).hexdigest()
+    lines = result.stdout.splitlines()
+    if len(lines) != 2:
+        raise ValueError("could not determine a stable Git worktree identity")
+    root = Path(lines[0]).resolve()
+    git_dir = Path(lines[1]).resolve()
+    try:
+        root_stat = root.stat(follow_symlinks=False)
+        git_dir_stat = git_dir.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("could not inspect the Git worktree identity") from exc
+    token = _worktree_claim_token(git_dir)
+    identity = (
+        f"{socket.gethostname()}\0{token}\0{root_stat.st_dev}:{root_stat.st_ino}"
+        f"\0{git_dir_stat.st_dev}:{git_dir_stat.st_ino}"
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()
     return f"worktree-{digest}"
+
+
+def _worktree_claim_token(git_dir: Path) -> str:
+    token_path = git_dir / "autoform-claim-session"
+    stored_token = _read_worktree_claim_token(token_path)
+    if stored_token is not None:
+        return stored_token
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    token = secrets.token_hex(32)
+    temporary_path = git_dir / f".autoform-claim-session-{secrets.token_hex(16)}"
+    try:
+        descriptor = os.open(temporary_path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError("could not create the Git worktree claim identity") from exc
+    try:
+        try:
+            os.write(descriptor, f"{token}\n".encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(temporary_path, token_path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ValueError("could not install the Git worktree claim identity") from exc
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    stored_token = _read_worktree_claim_token(token_path)
+    if stored_token is None:
+        raise ValueError("could not install the Git worktree claim identity")
+    return stored_token
+
+
+def _read_worktree_claim_token(token_path: Path) -> str | None:
+    read_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        read_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        read_flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(token_path, read_flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("could not read the Git worktree claim identity") from exc
+    try:
+        try:
+            token_info = os.fstat(descriptor)
+            path_info = token_path.stat(follow_symlinks=False)
+            raw_token = os.read(descriptor, 256)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ValueError("could not read the Git worktree claim identity") from exc
+    if not stat.S_ISREG(token_info.st_mode):
+        raise ValueError("Git worktree claim identity must be a regular file")
+    if (token_info.st_dev, token_info.st_ino) != (path_info.st_dev, path_info.st_ino):
+        raise ValueError("Git worktree claim identity changed while it was read")
+    try:
+        stored_token = raw_token.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Git worktree claim identity is malformed") from exc
+    if len(raw_token) != token_info.st_size or not re.fullmatch(
+        r"[0-9a-f]{64}\n?",
+        stored_token,
+    ):
+        raise ValueError("Git worktree claim identity is malformed")
+    return stored_token.rstrip("\n")
 
 
 def _default_claim_scratch(repo: str, session_id: str) -> Path:

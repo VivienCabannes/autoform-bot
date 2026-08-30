@@ -504,6 +504,14 @@ recovered only by an explicit CAS-safe `claim cleanup`. A heartbeat captures one
 lease ID, records any refusal or transport uncertainty as lost ownership, and
 waits for an in-flight renewal before exiting.
 
+Owners must stop at `expires_at`. Other observers cannot take over or clean up
+the ref until `expires_at + 300` seconds, so the intervening skew window fails
+closed instead of admitting two owners. A valid unrenewed lease is bounded by
+its 3600-second TTL plus this 300-second reclaim grace; a timestamp already 300
+seconds ahead of an observer can add at most one further 300-second offset.
+Renewals clamp their timestamp and expiry to the prior values when a clock steps
+backward.
+
 Moving from v1 path keys to v2 durable IDs is a one-way rollout. Stop v1 clients
 before the first v2 claim. Autoform refuses live or unreadable v1 author refs,
 replaces expired v1 refs with permanent compatibility fences, and installs a

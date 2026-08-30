@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -144,6 +145,11 @@ def test_expired_lease_can_be_taken_over(tmp_path: Path, board_repo: Path, monke
     first_lease_id = first.read("expired")["lease_id"]
     monkeypatch.setattr(claims.time, "time", lambda: now + 11)
     assert not first.holds("expired")
+    assert not first.renew("expired", ttl=60)
+    assert not second.acquire("expired", ttl=60)
+    assert second.cleanup() == 0
+
+    monkeypatch.setattr(claims.time, "time", lambda: now + 10 + claims.CLAIM_CLOCK_SKEW_S)
     assert second.acquire("expired", ttl=60)
     assert second.read("expired")["owner"] == "worker-b"
     assert second.read("expired")["lease_id"] != first_lease_id
@@ -242,6 +248,79 @@ def test_expired_rejects_nonfinite_default_comparison_clock(
         claims.ClaimBoard.expired({"expires_at": 200.0})
 
 
+def test_expiry_honors_positive_clock_skew_at_the_exact_boundary() -> None:
+    lease = {"expires_at": 1_060.0}
+
+    assert not claims.ClaimBoard.expired(
+        lease,
+        now=1_060.0 + claims.CLAIM_CLOCK_SKEW_S - 0.001,
+    )
+    assert claims.ClaimBoard.expired(
+        lease,
+        now=1_060.0 + claims.CLAIM_CLOCK_SKEW_S,
+    )
+
+
+def test_fast_observer_cannot_steal_or_cleanup_a_live_lease(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claims.time, "time", lambda: 1_000.0)
+    owner = _board(tmp_path, board_repo, "owner")
+    observer = _board(tmp_path, board_repo, "fast-observer")
+    assert owner.acquire("clock-skew", ttl=60)
+
+    monkeypatch.setattr(claims.time, "time", lambda: 1_061.0)
+
+    assert not owner.holds("clock-skew")
+    assert not owner.renew("clock-skew", ttl=60)
+    assert not observer.acquire("clock-skew", ttl=60)
+    assert observer.list()[0]["_expired"] is False
+    assert observer.cleanup() == 0
+    assert owner.read("clock-skew")["owner"] == "owner"
+
+
+def test_renewal_after_benign_backward_clock_step_stays_monotonic(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claims.time, "time", lambda: 1_000.0)
+    board = _board(tmp_path, board_repo, "owner")
+    assert board.acquire("backward-renew", ttl=60)
+
+    monkeypatch.setattr(claims.time, "time", lambda: 950.0)
+
+    assert board.renew("backward-renew", ttl=60)
+    lease = board.read("backward-renew")
+    assert lease is not None
+    assert lease["renewed_at"] >= lease["acquired_at"]
+    assert lease["expires_at"] - lease["renewed_at"] == 60
+    assert board.list()[0]["_malformed"] is False
+    assert board.holds("backward-renew")
+
+
+def test_refresh_never_regresses_renewal_or_expiry_timestamps(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claims.time, "time", lambda: 1_000.0)
+    board = _board(tmp_path, board_repo, "owner")
+    assert board.acquire("monotonic", ttl=600)
+    original = board.read("monotonic")
+    assert original is not None
+
+    monkeypatch.setattr(claims.time, "time", lambda: 950.0)
+
+    assert board.acquire("monotonic", ttl=30)
+    refreshed = board.read("monotonic")
+    assert refreshed is not None
+    assert refreshed["renewed_at"] >= original["renewed_at"]
+    assert refreshed["expires_at"] >= original["expires_at"]
+
+
 def test_cleanup_removes_only_expired_snapshot_entries(
     tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -249,7 +328,7 @@ def test_cleanup_removes_only_expired_snapshot_entries(
     board = _board(tmp_path, board_repo, "worker-a")
     assert board.acquire("dead", ttl=5)
     assert board.acquire("live", ttl=500)
-    monkeypatch.setattr(claims.time, "time", lambda: 1_010.0)
+    monkeypatch.setattr(claims.time, "time", lambda: 1_310.0)
 
     assert board.cleanup() == 1
     assert [lease["_key"] for lease in board.list()] == ["live"]
@@ -261,7 +340,7 @@ def test_cleanup_cas_does_not_delete_renewed_lease(
     monkeypatch.setattr(claims.time, "time", lambda: 1_000.0)
     cleaner = _board(tmp_path, board_repo, "worker-a")
     assert cleaner.acquire("lease", ttl=5)
-    monkeypatch.setattr(claims.time, "time", lambda: 1_010.0)
+    monkeypatch.setattr(claims.time, "time", lambda: 1_310.0)
 
     original_list = cleaner.list
     owner = _board(tmp_path, board_repo, "worker-a")
@@ -273,7 +352,7 @@ def test_cleanup_cas_does_not_delete_renewed_lease(
 
     monkeypatch.setattr(cleaner, "list", list_then_renew)
     assert cleaner.cleanup() == 0
-    assert cleaner.read("lease")["expires_at"] == 1_510.0
+    assert cleaner.read("lease")["expires_at"] == 1_810.0
 
 
 def test_cleanup_replaces_expired_v1_author_ref_with_a_compatibility_block(
@@ -288,7 +367,7 @@ def test_cleanup_replaces_expired_v1_author_ref_with_a_compatibility_block(
         schema=claims.LEGACY_CLAIM_SCHEMA,
         lease_id=None,
     )
-    monkeypatch.setattr(claims.time, "time", lambda: 201.0)
+    monkeypatch.setattr(claims.time, "time", lambda: 500.0)
     board = _board(tmp_path, board_repo, "worker-a")
 
     with pytest.raises(ValueError, match="blueprint is required"):
@@ -446,7 +525,7 @@ def test_live_v1_blocks_v2_but_expired_v1_can_be_replaced(
     assert not board.renew(key, ttl=600)
     assert not board.release(key)
 
-    monkeypatch.setattr(claims.time, "time", lambda: 201.0)
+    monkeypatch.setattr(claims.time, "time", lambda: 500.0)
     assert board.acquire(key, ttl=600)
     lease = board.read(key)
     assert lease["schema"] == claims.CLAIM_SCHEMA
@@ -562,6 +641,375 @@ def test_relative_local_repo_path_is_resolved_before_entering_scratch(
 
     assert board.acquire("relative", ttl=600)
     assert board.read("relative")["owner"] == "worker-a"
+
+
+def test_file_url_repo_is_pinned_before_its_symlink_is_redirected(tmp_path: Path) -> None:
+    original = tmp_path / "original.git"
+    redirected = tmp_path / "redirected.git"
+    _git("init", "--bare", "--quiet", str(original))
+    _git("init", "--bare", "--quiet", str(redirected))
+    alias = tmp_path / "claims.git"
+    alias.symlink_to(original, target_is_directory=True)
+    board = claims.ClaimBoard(alias.absolute().as_uri(), "worker-a", tmp_path / "scratch")
+    assert board.acquire("file-url", ttl=600)
+
+    alias.unlink()
+    alias.symlink_to(redirected, target_is_directory=True)
+
+    assert board.release("file-url")
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX, cwd=original) == ""
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX, cwd=redirected) == ""
+
+
+def test_canonical_local_repo_replacement_fails_before_remote_mutation(tmp_path: Path) -> None:
+    original = tmp_path / "claims.git"
+    redirected = tmp_path / "redirected.git"
+    _git("init", "--bare", "--quiet", str(original))
+    _git("init", "--bare", "--quiet", str(redirected))
+    board = claims.ClaimBoard(original, "worker-a", tmp_path / "scratch")
+    original.rename(tmp_path / "original.git")
+    original.symlink_to(redirected, target_is_directory=True)
+
+    with pytest.raises(claims.ClaimTransportError, match="local claim repository"):
+        board.acquire("repo-replaced", ttl=600)
+
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX, cwd=redirected) == ""
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=tmp_path / "original.git",
+    ) == ""
+
+
+def test_repo_aba_during_git_subprocess_fails_closed(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirected = tmp_path / "redirected.git"
+    _git("init", "--bare", "--quiet", str(redirected))
+    scratch_parent = tmp_path / "scratch-parent"
+    scratch_parent.mkdir()
+    board = claims.ClaimBoard(board_repo, "worker-a", scratch_parent / "scratch")
+    board._ensure_scratch()
+    parked = tmp_path / "parked.git"
+    real_run = claims.subprocess.run
+    intercepted = False
+
+    def run_during_aba(command, *args, **kwargs):
+        nonlocal intercepted
+        if not intercepted and "ls-remote" in command:
+            intercepted = True
+            board_repo.rename(parked)
+            board_repo.symlink_to(redirected, target_is_directory=True)
+            try:
+                return real_run(command, *args, **kwargs)
+            finally:
+                board_repo.unlink()
+                parked.rename(board_repo)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_aba)
+
+    with pytest.raises(claims.ClaimTransportError, match="repository changed during"):
+        board.acquire("repo-aba", ttl=600)
+
+    assert intercepted
+    for repo in (board_repo, redirected):
+        assert _git(
+            "for-each-ref",
+            "--format=%(refname)",
+            claims.CLAIM_REF_PREFIX,
+            cwd=repo,
+        ) == ""
+
+
+def test_repo_ancestor_aba_during_git_subprocess_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo-root"
+    intended_scope = repo_root / "scope"
+    redirected_scope = repo_root / "other"
+    intended = intended_scope / "inner" / "claims.git"
+    redirected = redirected_scope / "inner" / "claims.git"
+    intended.parent.mkdir(parents=True)
+    redirected.parent.mkdir(parents=True)
+    _git("init", "--bare", "--quiet", str(intended))
+    _git("init", "--bare", "--quiet", str(redirected))
+    scratch_root = tmp_path / "scratch-root"
+    scratch_root.mkdir()
+    board = claims.ClaimBoard(intended, "worker-a", scratch_root / "scratch")
+    board._ensure_scratch()
+    parked = repo_root / "parked"
+    real_run = claims.subprocess.run
+    intercepted = False
+
+    def run_during_ancestor_aba(command, *args, **kwargs):
+        nonlocal intercepted
+        if not intercepted and "ls-remote" in command:
+            intercepted = True
+            intended_scope.rename(parked)
+            intended_scope.symlink_to(redirected_scope, target_is_directory=True)
+            try:
+                return real_run(command, *args, **kwargs)
+            finally:
+                intended_scope.unlink()
+                parked.rename(intended_scope)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_ancestor_aba)
+
+    with pytest.raises(claims.ClaimTransportError, match="repository changed during"):
+        board.acquire("repo-ancestor-aba", ttl=600)
+
+    assert intercepted
+    for repo in (intended, redirected):
+        assert _git(
+            "for-each-ref",
+            "--format=%(refname)",
+            claims.CLAIM_REF_PREFIX,
+            cwd=repo,
+        ) == ""
+
+
+def test_open_filesystem_boundary_prevents_redirect_above_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    intended_scope = workspace / "scope"
+    intended_repo = intended_scope / "claims.git"
+    intended_scratch = intended_scope / "scratch"
+    intended_scope.mkdir(parents=True)
+    _git("init", "--bare", "--quiet", str(intended_repo))
+    redirected_workspace = tmp_path / "redirected-workspace"
+    redirected_scope = redirected_workspace / "scope"
+    redirected_scope.mkdir(parents=True)
+    redirected_repo = redirected_scope / "claims.git"
+    redirected_scratch = redirected_scope / "scratch"
+    _git("init", "--bare", "--quiet", str(redirected_repo))
+    _git("init", "--bare", "--quiet", str(redirected_scratch))
+    board = claims.ClaimBoard(
+        intended_repo,
+        "worker-a",
+        intended_scratch,
+    )
+    parked = tmp_path / "parked-workspace"
+    real_run = claims.subprocess.run
+    interceptions = 0
+    redirecting = True
+
+    def run_during_outer_ancestor_aba(command, *args, **kwargs):
+        nonlocal interceptions, redirecting
+        if not redirecting:
+            return real_run(command, *args, **kwargs)
+        interceptions += 1
+        workspace.rename(parked)
+        workspace.symlink_to(redirected_workspace, target_is_directory=True)
+        try:
+            return real_run(command, *args, **kwargs)
+        finally:
+            workspace.unlink()
+            parked.rename(workspace)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_outer_ancestor_aba)
+
+    assert board.acquire("anchored", ttl=600)
+    redirecting = False
+    assert interceptions > 0
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=intended_repo,
+    ) == claims.CLAIM_REF_PREFIX + "anchored"
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claims.CLAIM_REF_PREFIX,
+        cwd=redirected_repo,
+    ) == ""
+
+
+def test_remote_board_anchors_scratch_leaf_with_directory_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = tmp_path / "scratch"
+    board = claims.ClaimBoard(
+        "https://example.invalid/claims.git",
+        "worker-a",
+        scratch,
+    )
+    board._ensure_scratch()
+    oid = board._git(["hash-object", "-w", "--stdin"], input_text="payload").stdout.strip()
+    redirected = tmp_path / "redirected-scratch"
+    shutil.copytree(scratch, redirected)
+    parked = tmp_path / "parked-scratch"
+    real_run = claims.subprocess.run
+    intercepted = False
+
+    def run_during_leaf_aba(command, *args, **kwargs):
+        nonlocal intercepted
+        if not intercepted and "update-ref" in command:
+            intercepted = True
+            scratch.rename(parked)
+            scratch.symlink_to(redirected, target_is_directory=True)
+            try:
+                return real_run(command, *args, **kwargs)
+            finally:
+                scratch.unlink()
+                parked.rename(scratch)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_leaf_aba)
+
+    board._git(["update-ref", "refs/test/anchored", oid])
+
+    assert intercepted
+    assert _git("rev-parse", "refs/test/anchored", cwd=scratch) == oid
+    assert _git("for-each-ref", "--format=%(refname)", "refs/test", cwd=redirected) == ""
+
+
+def test_scratch_symlink_is_pinned_before_bare_repo_initialization(
+    tmp_path: Path, board_repo: Path
+) -> None:
+    original = tmp_path / "original-scratch"
+    redirected = tmp_path / "redirected-scratch"
+    original.mkdir()
+    redirected.mkdir()
+    alias = tmp_path / "scratch"
+    alias.symlink_to(original, target_is_directory=True)
+    board = claims.ClaimBoard(board_repo, "worker-a", alias)
+
+    alias.unlink()
+    alias.symlink_to(redirected, target_is_directory=True)
+
+    assert board.acquire("scratch-link", ttl=600)
+    assert (original / "HEAD").is_file()
+    assert not (redirected / "HEAD").exists()
+
+
+def test_existing_scratch_replacement_before_first_use_fails_closed(
+    tmp_path: Path, board_repo: Path
+) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    board = claims.ClaimBoard(board_repo, "worker-a", scratch)
+    scratch.rename(tmp_path / "original-scratch")
+    scratch.mkdir()
+
+    with pytest.raises(claims.ClaimTransportError, match="scratch directory was replaced"):
+        board.acquire("scratch-replaced-before-use", ttl=600)
+
+    assert not (scratch / "HEAD").exists()
+    assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX, cwd=board_repo) == ""
+
+
+def test_replacing_pinned_scratch_fails_closed_without_reinitializing(
+    tmp_path: Path, board_repo: Path
+) -> None:
+    scratch = tmp_path / "scratch"
+    board = claims.ClaimBoard(board_repo, "worker-a", scratch)
+    assert board.acquire("scratch-replaced", ttl=600)
+    original_oid = board._remote_oid("scratch-replaced")
+    scratch.rename(tmp_path / "original-scratch")
+    scratch.mkdir()
+
+    with pytest.raises(claims.ClaimTransportError, match="scratch directory was replaced"):
+        board.renew("scratch-replaced", ttl=600)
+
+    assert not (scratch / "HEAD").exists()
+    inspector = claims.ClaimBoard(board_repo, "inspector", tmp_path / "inspect")
+    inspector._ensure_scratch()
+    assert inspector._remote_oid("scratch-replaced") == original_oid
+
+
+def test_scratch_aba_during_git_subprocess_fails_closed(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch_parent = tmp_path / "scratch-parent"
+    scratch_parent.mkdir()
+    scratch = scratch_parent / "scratch"
+    board = claims.ClaimBoard(board_repo, "worker-a", scratch)
+    assert board.acquire("scratch-aba", ttl=600)
+    original_oid = board._remote_oid("scratch-aba")
+    redirected = scratch_parent / "redirected"
+    shutil.copytree(scratch, redirected)
+    parked = scratch_parent / "parked"
+    real_run = claims.subprocess.run
+    intercepted = False
+
+    def run_during_aba(command, *args, **kwargs):
+        nonlocal intercepted
+        if not intercepted and "cat-file" in command and "-e" in command:
+            intercepted = True
+            scratch.rename(parked)
+            scratch.symlink_to(redirected, target_is_directory=True)
+            try:
+                return real_run(command, *args, **kwargs)
+            finally:
+                scratch.unlink()
+                parked.rename(scratch)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_aba)
+
+    with pytest.raises(claims.ClaimTransportError, match="scratch changed during"):
+        board.renew("scratch-aba", ttl=600)
+
+    assert intercepted
+    inspector = claims.ClaimBoard(board_repo, "inspector", tmp_path / "inspect")
+    inspector._ensure_scratch()
+    assert inspector._remote_oid("scratch-aba") == original_oid
+
+
+def test_scratch_ancestor_aba_during_git_subprocess_fails_closed(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch_root = tmp_path / "scratch-root"
+    intended_scope = scratch_root / "scope"
+    redirected_scope = scratch_root / "other"
+    scratch = intended_scope / "inner" / "scratch"
+    scratch.parent.mkdir(parents=True)
+    board = claims.ClaimBoard(board_repo, "worker-a", scratch)
+    assert board.acquire("scratch-ancestor-aba", ttl=600)
+    original_oid = board._remote_oid("scratch-ancestor-aba")
+    redirected = redirected_scope / "inner" / "scratch"
+    redirected.parent.mkdir(parents=True)
+    shutil.copytree(scratch, redirected)
+    parked = scratch_root / "parked"
+    real_run = claims.subprocess.run
+    intercepted = False
+
+    def run_during_ancestor_aba(command, *args, **kwargs):
+        nonlocal intercepted
+        if not intercepted and "cat-file" in command and "-e" in command:
+            intercepted = True
+            intended_scope.rename(parked)
+            intended_scope.symlink_to(redirected_scope, target_is_directory=True)
+            try:
+                return real_run(command, *args, **kwargs)
+            finally:
+                intended_scope.unlink()
+                parked.rename(intended_scope)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(claims.subprocess, "run", run_during_ancestor_aba)
+
+    with pytest.raises(claims.ClaimTransportError, match="scratch changed during"):
+        board.renew("scratch-ancestor-aba", ttl=600)
+
+    assert intercepted
+    inspector = claims.ClaimBoard(board_repo, "inspector", tmp_path / "inspect-ancestor")
+    inspector._ensure_scratch()
+    assert inspector._remote_oid("scratch-ancestor-aba") == original_oid
 
 
 def test_transport_failure_raises_without_local_fallback(tmp_path: Path) -> None:
