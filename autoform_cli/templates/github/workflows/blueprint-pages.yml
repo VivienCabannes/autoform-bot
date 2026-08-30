@@ -106,10 +106,12 @@ jobs:
           archive="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-root-build.XXXXXX.tgz")"
           probe="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-artifact-probe.XXXXXX.lean")"
           trap 'rm -f "$archive" "$probe"' EXIT
+          # Keep root ownership in its archive. The helper resolves Mathlib
+          # claims through Lake's exact `mathlib` package id and build traces.
           lake pack "$archive"
           uv run --no-project --with "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
             python .github/autoform_audit.py \
-            "$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint "$probe"
+            "$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint . "$probe"
           lake env lean "$probe"
 
   build:

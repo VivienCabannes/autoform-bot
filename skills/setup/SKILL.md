@@ -106,11 +106,12 @@ Never invent either value. `init` refuses a branch, tag, abbreviated SHA,
 credential-bearing URL, or mismatched pair.
 
 The two workflows it writes are `autoform-verify.yml`, which validates the
-Markdown DAG, builds Lean, binds every local and Mathlib declaration claim to
-the built environment, rejects unfinished or unsafe proofs, and audits theorem
-axioms on pull requests, and `blueprint-pages.yml`, which runs the same artifact
-gate before it renders the blueprint, builds MkDocs, and deploys GitHub Pages.
-Pass the verified source and commit pair to pin them.
+Markdown DAG, builds Lean, binds local declaration claims to root-package
+artifacts and Mathlib claims to trace metadata from the exact Lake package id
+`mathlib`, rejects unfinished or unsafe proofs, and audits theorem axioms on
+pull requests, and `blueprint-pages.yml`, which runs the same artifact gate
+before it renders the blueprint, builds MkDocs, and deploys GitHub Pages. Pass
+the verified source and commit pair to pin them.
 
 After it runs, fill in what only a human or a source can supply: the project
 description in `blueprint/README.md`, the coverage contract, and a verified

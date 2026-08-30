@@ -96,8 +96,10 @@ jobs:
           # Lake resolves both manifest languages and package/custom buildDir.
           # `lake pack` archives only the root package's actual build directory,
           # leaving dependency package artifacts outside the audit boundary.
+          # The helper separately resolves claimed Mathlib modules through
+          # Lake's exact `mathlib` package id and validates their build traces.
           lake pack "$archive"
           uv run --no-project --with "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
             python .github/autoform_audit.py \
-            "$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint "$probe"
+            "$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint . "$probe"
           lake env lean "$probe"

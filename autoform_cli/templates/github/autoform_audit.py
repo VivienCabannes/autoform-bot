@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import tarfile
 from dataclasses import dataclass
@@ -181,6 +182,99 @@ def _validate_trace(trace: object, module: str, root_package: str, display_path:
         )
 
 
+def mathlib_modules_from_lake(
+    lean_root: Path, targets: tuple[BlueprintTarget, ...]
+) -> tuple[str, ...]:
+    """Resolve claimed modules through Lake's package whose id is ``mathlib``."""
+
+    modules = tuple(
+        sorted(
+            {
+                target.expected_module
+                for target in targets
+                if target.owner == "mathlib" and target.expected_module is not None
+            }
+        )
+    )
+    if not modules:
+        return ()
+    try:
+        project = lean_root.resolve(strict=True)
+    except OSError as exc:
+        raise AuditInputError(f"cannot resolve Lean project root: {exc}") from exc
+    if not project.is_dir():
+        raise AuditInputError(f"Lean project root is not a directory: {project}")
+
+    for module in modules:
+        target = f"@mathlib/+{module}:ilean"
+        try:
+            queried = subprocess.run(
+                ["lake", "query", "--json", target],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise AuditInputError(f"cannot query Lake package id 'mathlib': {exc}") from exc
+        if queried.returncode != 0:
+            detail = queried.stderr.strip().splitlines()
+            suffix = f": {detail[-1]}" if detail else ""
+            raise AuditInputError(
+                f"Lake package id 'mathlib' does not provide module {module!r}{suffix}"
+            )
+        try:
+            ilean_value = json.loads(queried.stdout)
+        except json.JSONDecodeError as exc:
+            raise AuditInputError(
+                f"Lake returned invalid artifact metadata for package id 'mathlib' module "
+                f"{module!r}"
+            ) from exc
+        if not isinstance(ilean_value, str) or not ilean_value.endswith(".ilean"):
+            raise AuditInputError(
+                f"Lake returned no ILean artifact for package id 'mathlib' module {module!r}"
+            )
+        ilean = Path(ilean_value)
+        if not ilean.is_absolute():
+            ilean = project / ilean
+        _validate_mathlib_artifacts(ilean, module)
+    return modules
+
+
+def _validate_mathlib_artifacts(ilean: Path, module: str) -> None:
+    display_path = str(ilean)
+    if not ilean.is_file():
+        raise AuditInputError(f"Mathlib ILean artifact is not a regular file: {display_path}")
+    try:
+        size = ilean.stat().st_size
+    except OSError as exc:
+        raise AuditInputError(f"cannot inspect Mathlib ILean artifact: {display_path}") from exc
+    if size > _MAX_ILEAN_BYTES:
+        raise AuditInputError(f"Mathlib ILean artifact is unexpectedly large: {display_path}")
+    metadata = _read_path_json(ilean, "Mathlib ILean")
+    actual_module = _module_from_metadata(metadata, ilean.parts, display_path)
+    if actual_module != module:
+        raise AuditInputError(
+            f"Mathlib ILean artifact identifies module {actual_module!r}, not {module!r}: "
+            f"{display_path}"
+        )
+
+    olean = ilean.with_suffix(".olean")
+    if not olean.is_file():
+        raise AuditInputError(f"Mathlib ILean artifact has no matching OLean: {display_path}")
+    trace = ilean.with_suffix(".trace")
+    if not trace.is_file():
+        raise AuditInputError(f"Mathlib ILean artifact has no matching Lake trace: {display_path}")
+    _validate_trace(_read_path_json(trace, "Mathlib Lake trace"), module, "mathlib", str(trace))
+
+
+def _read_path_json(path: Path, kind: str) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AuditInputError(f"malformed {kind} metadata in {path}: {exc}") from exc
+
+
 def _json_strings(value: object):
     if isinstance(value, str):
         yield value
@@ -349,19 +443,31 @@ def _validate_blueprint_name(name: str, article_path: str) -> None:
 
 
 def render_probe(
-    modules: tuple[str, ...], targets: tuple[BlueprintTarget, ...] = ()
+    modules: tuple[str, ...],
+    targets: tuple[BlueprintTarget, ...] = (),
+    mathlib_modules: tuple[str, ...] = (),
 ) -> str:
     """Render the Lean program that audits *modules* and blueprint claims."""
 
     if not modules:
         raise AuditInputError("refusing to render an empty kernel-trust audit")
-    mathlib_modules = {
+    required_mathlib_modules = {
         target.expected_module
         for target in targets
         if target.owner == "mathlib" and target.expected_module is not None
     }
-    imports = "\n".join(f"import {module}" for module in sorted(set(modules) | mathlib_modules))
+    missing_mathlib_modules = required_mathlib_modules - set(mathlib_modules)
+    if missing_mathlib_modules:
+        missing = ", ".join(sorted(missing_mathlib_modules))
+        raise AuditInputError(
+            "Mathlib blueprint modules lack build trace metadata from Lake package id "
+            f"'mathlib': {missing}"
+        )
+    imports = "\n".join(
+        f"import {module}" for module in sorted(set(modules) | required_mathlib_modules)
+    )
     target_modules = ", ".join(_lean_name(module) for module in modules)
+    validated_mathlib_modules = ", ".join(_lean_name(module) for module in mathlib_modules)
     local_targets = ", ".join(
         f"({json.dumps(target.article_path, ensure_ascii=False)}, {_lean_name(target.name)}, "
         f"{json.dumps(target.expected_kind, ensure_ascii=False)})"
@@ -412,6 +518,7 @@ private def matchesDeclarationKind
 
 run_cmd do
   let rootModules : List Name := [{target_modules}]
+  let mathlibModules : List Name := [{validated_mathlib_modules}]
   let localTargets : List (String × Name × String) := [{local_targets}]
   let mathlibTargets : List (String × Name × String × Name) := [{mathlib_targets}]
   let allowed : List Name := [``propext, ``Classical.choice, ``Quot.sound]
@@ -446,6 +553,9 @@ run_cmd do
           if rootModules.contains moduleName then
             badTargets := true
             logError m!"{{article}}: Mathlib declaration {{declName}} is owned by root module {{moduleName}}"
+          unless mathlibModules.contains moduleName do
+            badTargets := true
+            logError m!"{{article}}: Mathlib declaration {{declName}} is not backed by Lake package id mathlib build metadata"
           if moduleName != expectedModule then
             badTargets := true
             logError m!"{{article}}: Mathlib declaration {{declName}} belongs to {{moduleName}}, not {{expectedModule}}"
@@ -493,26 +603,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         return 0
-    if len(arguments) != 4:
+    if len(arguments) != 5:
         print(
             "usage: autoform_audit.py --root-package EVALUATED_CONFIG\n"
-            "   or: autoform_audit.py ROOT_PACKAGE ROOT_BUILD_ARCHIVE BLUEPRINT OUTPUT_PROBE",
+            "   or: autoform_audit.py ROOT_PACKAGE ROOT_BUILD_ARCHIVE BLUEPRINT "
+            "LEAN_ROOT OUTPUT_PROBE",
             file=sys.stderr,
         )
         return 2
     root_package = arguments[0]
-    archive, blueprint, output = map(Path, arguments[1:])
+    archive, blueprint, lean_root, output = map(Path, arguments[1:])
     try:
         modules = modules_from_archive(archive, root_package)
         targets = targets_from_blueprint(blueprint)
-        probe = render_probe(modules, targets)
+        mathlib_modules = mathlib_modules_from_lake(lean_root, targets)
+        probe = render_probe(modules, targets, mathlib_modules)
         output.write_text(probe, encoding="utf-8")
     except (AuditInputError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(
         f"prepared artifact audit for {len(modules)} root-package module(s) "
-        f"and {len(targets)} blueprint declaration claim(s)"
+        f"and {len(targets)} blueprint declaration claim(s) from "
+        f"{len(mathlib_modules)} Mathlib module(s)"
     )
     return 0
 
