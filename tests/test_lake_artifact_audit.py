@@ -424,6 +424,71 @@ def test_mathlib_checkout_revision_remote_and_cleanliness_fail_closed(
         helper.mathlib_modules_from_lake(project, (target,))
 
 
+def test_mathlib_checkout_rejects_git_replacement_refs(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project, _, _ = _canonical_mathlib_fixture(tmp_path)
+    checkout = project / ".lake/packages/mathlib"
+    canonical = _run(checkout, "git", "rev-parse", "HEAD").stdout.strip()
+    _write(
+        checkout / "Mathlib/Provenance.lean",
+        "theorem Mathlib.Provenance.counterfeit : False := by sorry\n",
+    )
+    assert _run(checkout, "git", "add", "Mathlib/Provenance.lean").returncode == 0
+    assert _run(checkout, "git", "commit", "-q", "-m", "counterfeit").returncode == 0
+    counterfeit = _run(checkout, "git", "rev-parse", "HEAD").stdout.strip()
+    assert _run(checkout, "git", "replace", canonical, counterfeit).returncode == 0
+    assert _run(checkout, "git", "reset", "--hard", canonical).returncode == 0
+    assert "counterfeit" in (checkout / "Mathlib/Provenance.lean").read_text(encoding="utf-8")
+
+    with pytest.raises(helper.AuditInputError, match="replacement references"):
+        helper._mathlib_checkout_from_manifest(project)
+
+
+@pytest.mark.parametrize(
+    ("relative", "message"),
+    [
+        ("commondir", "alternate common directory"),
+        ("info/grafts", "graft file"),
+        ("objects/info/alternates", "alternate object database"),
+        ("objects/info/http-alternates", "HTTP alternate object database"),
+    ],
+)
+def test_mathlib_checkout_rejects_git_object_indirection(
+    helper: ModuleType, tmp_path: Path, relative: str, message: str
+) -> None:
+    project, _, _ = _canonical_mathlib_fixture(tmp_path)
+    path = project / ".lake/packages/mathlib/.git" / relative
+    _write(path, "/counterfeit/object/store\n")
+
+    with pytest.raises(helper.AuditInputError, match=message):
+        helper._mathlib_checkout_from_manifest(project)
+
+
+def test_mathlib_git_inspection_scrubs_inherited_control_environment(
+    helper: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _, _ = _canonical_mathlib_fixture(tmp_path)
+    expected = _manifest(project)["packages"][0]["rev"]
+    hostile = tmp_path / "hostile"
+    for key, value in {
+        "GIT_DIR": str(hostile / "git-dir"),
+        "GIT_INDEX_FILE": str(hostile / "index"),
+        "GIT_OBJECT_DIRECTORY": str(hostile / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(hostile / "alternates"),
+        "GIT_NAMESPACE": "counterfeit",
+        "GIT_REPLACE_REF_BASE": "refs/counterfeit/",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "/counterfeit/fsmonitor",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    checkout = helper._mathlib_checkout_from_manifest(project)
+
+    assert checkout.revision == expected
+
+
 def test_mathlib_checkout_and_artifacts_must_not_escape_or_use_symlinks(
     helper: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

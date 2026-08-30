@@ -237,6 +237,7 @@ def mathlib_modules_from_lake(
                 capture_output=True,
                 text=True,
                 check=False,
+                env=_audit_subprocess_environment(),
             )
         except OSError as exc:
             raise AuditInputError(f"cannot query Lake package id 'mathlib': {exc}") from exc
@@ -324,6 +325,7 @@ def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
         raise AuditInputError(f"Mathlib checkout has no readable .git directory: {checkout}") from exc
     if stat.S_ISLNK(marker_status.st_mode) or not stat.S_ISDIR(marker_status.st_mode):
         raise AuditInputError(f"Mathlib checkout .git must be a real directory: {git_marker}")
+    _validate_git_object_database(checkout, git_marker)
 
     top = Path(_git_output(checkout, "rev-parse", "--show-toplevel", label="top level"))
     try:
@@ -424,10 +426,21 @@ def _git_output(
 ) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(checkout), *arguments],
+            [
+                "git",
+                "--no-replace-objects",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                f"core.hooksPath={os.devnull}",
+                "-C",
+                str(checkout),
+                *arguments,
+            ],
             capture_output=True,
             text=True,
             check=False,
+            env=_audit_subprocess_environment(),
         )
     except OSError as exc:
         raise AuditInputError(f"cannot inspect Mathlib Git {label}: {exc}") from exc
@@ -439,6 +452,57 @@ def _git_output(
     if not allow_empty and not output:
         raise AuditInputError(f"Mathlib Git {label} is empty")
     return output
+
+
+def _audit_subprocess_environment() -> dict[str, str]:
+    """Return the host environment without caller-controlled Git behavior."""
+
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+    )
+    return environment
+
+
+def _validate_git_object_database(checkout: Path, git_directory: Path) -> None:
+    """Reject Git indirection that can change what a pinned commit means."""
+
+    _resolved_child_directory(git_directory, Path("objects"), "Mathlib Git object database")
+    forbidden = (
+        (Path("commondir"), "alternate common directory"),
+        (Path("info/grafts"), "graft file"),
+        (Path("objects/info/alternates"), "alternate object database"),
+        (Path("objects/info/http-alternates"), "HTTP alternate object database"),
+    )
+    for relative, description in forbidden:
+        path = git_directory / relative
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AuditInputError(
+                f"cannot inspect Mathlib Git {description}: {path}: {exc}"
+            ) from exc
+        raise AuditInputError(f"Mathlib checkout uses a Git {description}: {path}")
+
+    replacements = _git_output(
+        checkout,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/replace/",
+        label="replacement references",
+        allow_empty=True,
+    )
+    if replacements:
+        raise AuditInputError("Mathlib checkout uses Git replacement references")
 
 
 def _validate_mathlib_artifacts(
