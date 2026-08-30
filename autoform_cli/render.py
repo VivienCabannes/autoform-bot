@@ -1216,8 +1216,7 @@ def _publish_staged_site(
     """Commit *stage* if the destination still matches the inspected generation."""
     parent_descriptor: int | None = None
     stage_parent_descriptor: int | None = None
-    exchanged = False
-    installed = False
+    published = False
     try:
         parent_descriptor = _open_directory_path(destination.parent)
         stage_parent_descriptor = _open_directory_path(stage.parent)
@@ -1263,7 +1262,7 @@ def _publish_staged_site(
                 parent_descriptor,
                 destination.name,
             )
-            installed = True
+            published = True
         else:
             _rename_exchange(
                 stage_parent_descriptor,
@@ -1271,7 +1270,7 @@ def _publish_staged_site(
                 parent_descriptor,
                 destination.name,
             )
-            exchanged = True
+            published = True
             if _inspect_destination_at(
                 stage_parent_descriptor, stage.name, stage
             ) != expected:
@@ -1287,82 +1286,14 @@ def _publish_staged_site(
             )
         os.fsync(stage_parent_descriptor)
         os.fsync(parent_descriptor)
-        exchanged = False
-        installed = False
     except BaseException as publication_error:
-        if exchanged:
-            try:
-                if (
-                    _inspect_destination_at(
-                        stage_parent_descriptor, stage.name, stage
-                    )
-                    != expected
-                ):
-                    raise OSError(
-                        errno.ESTALE,
-                        "rollback generation changed before exchange",
-                    )
-                _rename_exchange(
-                    stage_parent_descriptor,
-                    stage.name,
-                    parent_descriptor,
-                    destination.name,
-                )
-                os.fsync(stage_parent_descriptor)
-                os.fsync(parent_descriptor)
-                if (
-                    _inspect_destination_at(
-                        parent_descriptor, destination.name, destination
-                    )
-                    != expected
-                    or _inspect_destination_at(
-                        stage_parent_descriptor, stage.name, stage
-                    )
-                    != staged
-                ):
-                    raise OSError(errno.ESTALE, "rollback generations changed")
-            except BaseException as rollback_error:
-                raise _PublicationRecoveryError(
-                    [
-                        "publication failed and rollback could not be verified; "
-                        f"recovery material was retained at {stage.parent}"
-                    ]
-                ) from rollback_error
-        elif installed:
-            try:
-                installed_metadata = os.stat(
-                    destination.name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (installed_metadata.st_dev, installed_metadata.st_ino) != staged.identity:
-                    raise OSError(errno.ESTALE, "published directory identity changed")
-                os.rename(
-                    destination.name,
-                    stage.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=stage_parent_descriptor,
-                )
-                os.fsync(stage_parent_descriptor)
-                os.fsync(parent_descriptor)
-                if (
-                    _inspect_destination_at(
-                        parent_descriptor, destination.name, destination
-                    )
-                    != expected
-                    or _inspect_destination_at(
-                        stage_parent_descriptor, stage.name, stage
-                    )
-                    != staged
-                ):
-                    raise OSError(errno.ESTALE, "rollback generations changed")
-            except BaseException as rollback_error:
-                raise _PublicationRecoveryError(
-                    [
-                        "publication failed and the new site could not be withdrawn safely; "
-                        f"recovery material was retained at {stage.parent}"
-                    ]
-                ) from rollback_error
+        if published:
+            raise _PublicationRecoveryError(
+                [
+                    "publication committed but its final state could not be verified; "
+                    f"recovery material was retained at {stage.parent}"
+                ]
+            ) from publication_error
         raise publication_error
     finally:
         if stage_parent_descriptor is not None:

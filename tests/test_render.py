@@ -1167,7 +1167,7 @@ def test_pre_exchange_destination_substitution_retains_unverified_recovery(
     assert (workspaces[0] / "site/publication.json").read_bytes() == substitute_manifest
 
 
-def test_failed_rollback_retains_the_previous_site_for_recovery(
+def test_post_commit_verification_failure_retains_previous_site_for_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path)
@@ -1200,18 +1200,17 @@ def test_failed_rollback_retains_the_previous_site_for_recovery(
                 )
         return state
 
-    def fail_rollback(*args):
+    def track_exchange(*args):
         nonlocal exchanges
         exchanges += 1
-        if exchanges == 2:
-            raise OSError("injected rollback failure")
         return original_exchange(*args)
 
     monkeypatch.setattr(render_module, "_inspect_destination_at", substitute_final_state)
-    monkeypatch.setattr(render_module, "_rename_exchange", fail_rollback)
+    monkeypatch.setattr(render_module, "_rename_exchange", track_exchange)
     with pytest.raises(PublicationError, match="recovery material was retained"):
         render_site(project / "blueprint", output, lean_root=project)
 
+    assert exchanges == 1
     workspaces = list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
     assert len(workspaces) == 1
     recovered = {
@@ -1222,7 +1221,7 @@ def test_failed_rollback_retains_the_previous_site_for_recovery(
     assert recovered == before
 
 
-def test_a_substituted_owned_generation_is_rejected_and_old_site_restored(
+def test_post_commit_destination_change_does_not_trigger_a_second_exchange(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path)
@@ -1237,6 +1236,7 @@ def test_a_substituted_owned_generation_is_rejected_and_old_site_restored(
     other_article.write_text(other_article.read_text(encoding="utf-8") + "\nSubstitute.\n")
     substitute = tmp_path / "substitute"
     render_site(other_project / "blueprint", substitute, lean_root=other_project)
+    substitute_manifest = (substitute / PUBLICATION_MANIFEST).read_bytes()
 
     original_exchange = render_module._rename_exchange
     exchanges = 0
@@ -1252,10 +1252,18 @@ def test_a_substituted_owned_generation_is_rejected_and_old_site_restored(
     with pytest.raises(PublicationError, match="recovery material was retained"):
         render_site(project / "blueprint", output, lean_root=project)
 
-    assert (output / PUBLICATION_MANIFEST).read_bytes() == before_manifest
+    assert exchanges == 1
+    assert (output / PUBLICATION_MANIFEST).read_bytes() == substitute_manifest
+    workspaces = list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+    assert len(workspaces) == 1
+    assert (workspaces[0] / "site/publication.json").read_bytes() == before_manifest
+    assert (substitute / PUBLICATION_MANIFEST).read_bytes() not in {
+        before_manifest,
+        substitute_manifest,
+    }
 
 
-def test_substituted_rollback_stage_is_never_exchanged_into_live_output(
+def test_post_commit_stage_change_never_reenters_live_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path)
