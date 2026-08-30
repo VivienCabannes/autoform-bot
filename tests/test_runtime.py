@@ -273,6 +273,7 @@ def test_adapter_rejects_inconsistent_hand_built_graph_without_host_paths(tmp_pa
         build_runtime_graph(graph, project_root=project)
 
     assert error.value.issues == (
+        "chapter/section/base: article source digest is unavailable",
         "chapter/section/base: dependency does not name a runtime node: missing",
         "chapter/section/base: dependency union does not match typed dependencies",
     )
