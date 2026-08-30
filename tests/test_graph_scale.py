@@ -140,6 +140,7 @@ def test_graph_children_cache_tracks_public_dict_reinitialization(tmp_path: Path
 
 def test_parent_format_graph_pickle_restores_cache_and_builds_runtime(tmp_path: Path) -> None:
     graph = pickle.loads(_PARENT_GRAPH_PICKLE)
+    assert isinstance(graph.nodes, _TrackedNodeDict)
     assert graph.children("roadmap") == ("child",)
 
     project = tmp_path / "project"

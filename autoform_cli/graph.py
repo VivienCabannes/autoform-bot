@@ -172,13 +172,6 @@ class Graph(_GraphCache):
             object.__setattr__(self, "nodes", _TrackedNodeDict(self.nodes))
         self._refresh_children()
 
-    def __setstate__(self, state: list[object]) -> None:
-        """Restore legacy slot pickles through the current cache initializer."""
-        blueprint_dir, nodes = state
-        object.__setattr__(self, "blueprint_dir", blueprint_dir)
-        object.__setattr__(self, "nodes", nodes)
-        self.__post_init__()
-
     def _refresh_children(self) -> None:
         children: dict[str | None, list[str]] = {}
         for node in self.nodes.values():
@@ -199,6 +192,20 @@ class Graph(_GraphCache):
         if getattr(self, "_children_revision", -1) != self.nodes.revision:
             self._refresh_children()
         return self._children_by_parent.get(node_id, ())
+
+
+def _restore_graph_state(graph: Graph, state: list[object]) -> None:
+    """Restore legacy slot pickles through the current cache initializer."""
+    blueprint_dir, nodes = state
+    object.__setattr__(graph, "blueprint_dir", blueprint_dir)
+    object.__setattr__(graph, "nodes", nodes)
+    graph.__post_init__()
+
+
+# Python 3.10's ``dataclass(slots=True, frozen=True)`` replaces a class-defined
+# pickle hook. Installing it after decoration keeps old Graph pickles compatible
+# on every supported interpreter.
+setattr(Graph, "__setstate__", _restore_graph_state)
 
 
 @dataclass(frozen=True, slots=True)
