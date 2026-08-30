@@ -397,12 +397,17 @@ def test_worker_id_is_metadata_not_lease_authority(tmp_path: Path, board_repo: P
     )
 
     assert owner.acquire("article", ttl=600)
+    claim_oid = owner.held_claim_oid("article")
+    assert claim_oid is not None
+    assert claim_oid == owner._remote_oid("article")
     assert owner.holds("article")
+    assert peer.held_claim_oid("article") is None
     assert not peer.holds("article")
     assert not peer.acquire("article", ttl=600)
     assert not peer.renew("article", ttl=600)
     assert not peer.release("article")
     assert owner.holds("article")
+    assert owner.held_claim_oid("article") == claim_oid
 
 
 def test_exact_receipt_is_fenced_after_another_copy_renews(
@@ -431,6 +436,8 @@ def test_exact_receipt_is_fenced_after_another_copy_renews(
     assert stale.holds("article")
 
     assert owner.renew("article", ttl=600)
+    assert owner.held_claim_oid("article") != original
+    assert stale.held_claim_oid("article") is None
     assert not stale.holds("article")
     assert not stale.renew("article", ttl=600)
     assert not stale.release("article")

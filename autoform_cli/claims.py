@@ -1170,10 +1170,23 @@ class ClaimBoard:
 
     def holds(self, key: str) -> bool:
         """Return whether this session has the exact receipt for the live lease."""
-        return self.held_lease_id(key) is not None
+        return self.held_claim_oid(key) is not None
+
+    def held_claim_oid(self, key: str) -> str | None:
+        """Return the exact live claim commit owned by this session, or ``None``.
+
+        Callers must still use this object ID as a remote compare-and-swap lease.
+        Ownership can change immediately after this point-in-time validation.
+        """
+        held = self._held_claim(key)
+        return held[0] if held is not None else None
 
     def held_lease_id(self, key: str) -> str | None:
         """Return the fenced lease id held by this session, or ``None``."""
+        held = self._held_claim(key)
+        return str(held[1]["lease_id"]) if held is not None else None
+
+    def _held_claim(self, key: str) -> tuple[str, dict[str, Any]] | None:
         key = _validate_key(key)
         self._ensure_scratch()
         if self._legacy_author_claim_blocks_v2(key):
@@ -1189,7 +1202,7 @@ class ClaimBoard:
             or not self._receipt_matches(key, oid, lease)
         ):
             return None
-        return str(lease["lease_id"])
+        return oid, lease
 
     def _receipt_matches(self, key: str, oid: str, lease: Mapping[str, Any]) -> bool:
         """Return whether this session recorded this exact v2 lease commit."""
