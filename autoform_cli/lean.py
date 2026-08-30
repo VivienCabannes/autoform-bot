@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,7 @@ _DECLARATION = re.compile(
     r"([^\s:(){}\[\]⦃⦄,]+)"
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
+_IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,26 +54,47 @@ class SourceIndex:
         return self.declarations.get(name)
 
 
-def index_project(root: str | Path) -> SourceIndex:
+def index_project(
+    root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
+) -> SourceIndex:
     """Scan ``*.lean`` beneath *root* and index declarations by full name."""
     root_path = Path(root).expanduser().resolve()
+    excluded: tuple[Path, ...] = tuple(
+        candidate
+        for value in exclude_roots
+        if (candidate := _relative_exclusion(root_path, value)) is not None
+    )
     declarations: dict[str, Declaration] = {}
     if not root_path.is_dir():
         return SourceIndex(root=root_path, declarations=declarations)
 
     for path in sorted(root_path.rglob("*.lean")):
-        if _IGNORED_DIRECTORIES.intersection(path.relative_to(root_path).parts):
+        relative = path.relative_to(root_path)
+        if (
+            _IGNORED_DIRECTORIES.intersection(relative.parts)
+            or any(part.startswith(_IGNORED_DIRECTORY_PREFIXES) for part in relative.parts)
+            or any(relative == prefix or relative.is_relative_to(prefix) for prefix in excluded)
+        ):
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        relative = path.relative_to(root_path)
         for declaration in _scan(text, relative):
             # First definition wins, so an earlier file is not masked by a later
             # one when a name is genuinely duplicated across namespaces.
             declarations.setdefault(declaration.name, declaration)
     return SourceIndex(root=root_path, declarations=declarations)
+
+
+def _relative_exclusion(root: Path, value: str | Path) -> Path | None:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        return candidate.resolve().relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _scan(text: str, relative: Path) -> list[Declaration]:
@@ -169,10 +192,11 @@ def build_linker(
     *,
     repository_url: str | None = None,
     ref: str | None = None,
+    exclude_roots: Iterable[str | Path] = (),
 ) -> SourceLinker:
     """Index *lean_root* and resolve the repository coordinates to link against."""
     return SourceLinker(
-        index=index_project(lean_root),
+        index=index_project(lean_root, exclude_roots=exclude_roots),
         repository_url=repository_url or detect_repository_url(lean_root),
         ref=ref or detect_ref(lean_root),
     )

@@ -103,6 +103,22 @@ def test_build_output_is_skipped(tmp_path: Path) -> None:
     assert index.find("vendored") is None
 
 
+def test_explicit_and_publication_staging_roots_are_skipped(tmp_path: Path) -> None:
+    _index(tmp_path, "def canonical : Nat := 0\n", "Project/Basic.lean")
+    excluded = tmp_path / "site"
+    excluded.mkdir()
+    (excluded / "Copied.lean").write_text("def copied : Nat := 0\n", encoding="utf-8")
+    staging = tmp_path / ".autoform-publication-site-random/source"
+    staging.mkdir(parents=True)
+    (staging / "Staged.lean").write_text("def staged : Nat := 0\n", encoding="utf-8")
+
+    index = index_project(tmp_path, exclude_roots=(excluded,))
+
+    assert index.find("canonical") is not None
+    assert index.find("copied") is None
+    assert index.find("staged") is None
+
+
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
     index = _index(tmp_path, "instance : Inhabited Nat := ⟨0⟩\n")
 

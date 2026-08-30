@@ -238,6 +238,10 @@ class PublicationError(ValueError):
         super().__init__("; ".join(self.issues))
 
 
+class _PublicationRecoveryError(PublicationError):
+    """A failed rollback left recovery material that must not be deleted."""
+
+
 @dataclass(frozen=True, slots=True)
 class _DestinationState:
     """The exact destination generation a render is allowed to replace."""
@@ -267,6 +271,7 @@ def render_site(
     blueprint = Path(blueprint_dir).expanduser().resolve()
     requested_destination = Path(output_dir).expanduser().absolute()
     destination = requested_destination.parent.resolve() / requested_destination.name
+    _require_publication_platform()
     if destination.is_symlink():
         raise PublicationError(["refusing symlink output directory"])
     if _is_within(destination, blueprint) or _is_within(blueprint, destination):
@@ -277,6 +282,11 @@ def render_site(
     _load_publication_contract(blueprint)
     destination.parent.mkdir(parents=True, exist_ok=True)
     expected_destination = _inspect_destination(destination)
+    repo_root = (
+        Path(lean_root).expanduser().resolve()
+        if lean_root is not None
+        else blueprint.parent
+    )
 
     workspace = Path(
         tempfile.mkdtemp(
@@ -284,9 +294,16 @@ def render_site(
             dir=destination.parent,
         )
     )
+    remove_workspace = True
     try:
         snapshot = workspace / "source"
         source_revision = _snapshot_publication_tree(blueprint, snapshot)
+        linker = build_linker(
+            repo_root,
+            repository_url=repository_url,
+            ref=ref,
+            exclude_roots=(destination, workspace),
+        )
         _require_source_revision(blueprint, source_revision)
         stage = workspace / "site"
         stage.mkdir(mode=0o700)
@@ -295,9 +312,8 @@ def render_site(
         report = _render_snapshot(
             snapshot,
             stage,
-            lean_root=lean_root,
-            repository_url=repository_url,
-            ref=ref,
+            repo_root=repo_root,
+            linker=linker,
             source_blueprint=blueprint,
             source_revision=source_revision,
         )
@@ -306,17 +322,20 @@ def render_site(
         _publish_staged_site(stage, destination, expected_destination)
         report.output_dir = destination
         return report
+    except _PublicationRecoveryError:
+        remove_workspace = False
+        raise
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if remove_workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def _render_snapshot(
     blueprint_dir: str | Path,
     output_dir: str | Path,
     *,
-    lean_root: str | Path | None = None,
-    repository_url: str | None = None,
-    ref: str | None = None,
+    repo_root: Path,
+    linker: SourceLinker,
     source_blueprint: Path,
     source_revision: str,
 ) -> RenderReport:
@@ -336,12 +355,6 @@ def _render_snapshot(
     # The repository root, not the vault's parent. A blueprint nested at
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
     # and every generated permalink would 404.
-    repo_root = (
-        Path(lean_root).expanduser().resolve()
-        if lean_root is not None
-        else source_blueprint.parent
-    )
-    linker = build_linker(repo_root, repository_url=repository_url, ref=ref)
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
     sources_base = _sources_base(source_blueprint, repo_root, linker)
@@ -510,10 +523,23 @@ def _render_snapshot(
 
 def _inspect_destination(destination: Path) -> _DestinationState:
     """Return the exact safe generation at *destination*, or fail closed."""
-    if not destination.exists() and not destination.is_symlink():
-        return _DestinationState("absent")
     try:
-        metadata = destination.lstat()
+        parent_descriptor = _open_directory_path(destination.parent)
+    except OSError as error:
+        raise PublicationError(["could not inspect the output directory safely"]) from error
+    try:
+        return _inspect_destination_at(parent_descriptor, destination.name, destination)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _inspect_destination_at(
+    parent_descriptor: int, name: str, display_path: Path
+) -> _DestinationState:
+    try:
+        metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return _DestinationState("absent")
     except OSError as error:
         raise PublicationError(["could not inspect the output directory safely"]) from error
     if stat.S_ISLNK(metadata.st_mode):
@@ -522,57 +548,130 @@ def _inspect_destination(destination: Path) -> _DestinationState:
         raise PublicationError(["output path exists and is not a directory"])
     identity = metadata.st_dev, metadata.st_ino
     try:
-        if not any(destination.iterdir()):
-            return _DestinationState("empty", identity=identity)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
     except OSError as error:
         raise PublicationError(["could not inspect the output directory safely"]) from error
-
-    manifest = destination / PUBLICATION_MANIFEST
     try:
-        manifest_bytes = _read_regular_file(manifest)
-        publication = json.loads(manifest_bytes.decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, PublicationError):
-        publication = None
-        manifest_bytes = b""
-    if not isinstance(publication, dict) or publication.get("schema") != PUBLICATION_SCHEMA:
-        raise PublicationError(
-            [
-                "refusing to overwrite a non-Autoform output directory or legacy publication; "
-                "choose an empty directory or remove it explicitly"
-            ]
-        )
-    canonical_manifest = (json.dumps(publication, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    if manifest_bytes != canonical_manifest:
-        raise PublicationError(["publication manifest is not in canonical form"])
-    if publication.get("complete") is not True:
-        raise PublicationError(["refusing to overwrite an incomplete Autoform publication"])
+        if _descriptor_identity(descriptor) != identity:
+            raise PublicationError(["output directory changed while it was inspected"])
+        if not os.listdir(descriptor):
+            current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if _descriptor_identity(descriptor) != identity or (
+                current.st_dev,
+                current.st_ino,
+            ) != identity or os.listdir(descriptor):
+                raise PublicationError(["output directory changed while it was inspected"])
+            return _DestinationState("empty", identity=identity)
 
-    expected_files = _parse_inventory_files(publication.get("files"))
-    expected_directories = _parse_inventory_directories(publication.get("directories"))
-    actual_directories, actual_files = _publication_inventory(destination)
-    if actual_directories != expected_directories:
-        raise PublicationError(
-            ["refusing to overwrite an output directory with untracked or missing directories"]
+        try:
+            manifest_bytes = _read_regular_file_at(
+                descriptor, PUBLICATION_MANIFEST, display_path / PUBLICATION_MANIFEST
+            )
+            publication = json.loads(manifest_bytes.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, PublicationError):
+            publication = None
+            manifest_bytes = b""
+        if not isinstance(publication, dict) or publication.get("schema") != PUBLICATION_SCHEMA:
+            raise PublicationError(
+                [
+                    "refusing to overwrite a non-Autoform output directory or legacy "
+                    "publication; choose an empty directory or remove it explicitly"
+                ]
+            )
+        canonical_manifest = (json.dumps(publication, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
         )
-    if tuple(path for path, _ in actual_files) != tuple(path for path, _ in expected_files):
-        expected_paths = {path for path, _ in expected_files}
-        actual_paths = {path for path, _ in actual_files}
-        difference = sorted(expected_paths ^ actual_paths)
-        raise PublicationError(
-            [
-                "refusing to overwrite an output directory with untracked or missing files: "
-                + ", ".join(difference)
-            ]
+        if manifest_bytes != canonical_manifest:
+            raise PublicationError(["publication manifest is not in canonical form"])
+        if publication.get("complete") is not True:
+            raise PublicationError(["refusing to overwrite an incomplete Autoform publication"])
+
+        expected_files = _parse_inventory_files(publication.get("files"))
+        expected_directories = _parse_inventory_directories(publication.get("directories"))
+        actual_directories, actual_files = _publication_inventory_descriptor(descriptor)
+        if actual_directories != expected_directories:
+            raise PublicationError(
+                ["refusing to overwrite an output directory with untracked or missing directories"]
+            )
+        if tuple(path for path, _ in actual_files) != tuple(path for path, _ in expected_files):
+            expected_paths = {path for path, _ in expected_files}
+            actual_paths = {path for path, _ in actual_files}
+            difference = sorted(expected_paths ^ actual_paths)
+            raise PublicationError(
+                [
+                    "refusing to overwrite an output directory with untracked or missing files: "
+                    + ", ".join(difference)
+                ]
+            )
+        if actual_files != expected_files:
+            raise PublicationError(["refusing to overwrite a modified Autoform publication"])
+        if (
+            _read_regular_file_at(
+                descriptor, PUBLICATION_MANIFEST, display_path / PUBLICATION_MANIFEST
+            )
+            != manifest_bytes
+            or _publication_inventory_descriptor(descriptor)
+            != (actual_directories, actual_files)
+        ):
+            raise PublicationError(["publication output changed while it was inspected"])
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if _descriptor_identity(descriptor) != identity or (
+            current.st_dev,
+            current.st_ino,
+        ) != identity:
+            raise PublicationError(["output directory changed while it was inspected"])
+        return _DestinationState(
+            "owned",
+            identity=identity,
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            directories=expected_directories,
+            files=expected_files,
         )
-    if actual_files != expected_files:
-        raise PublicationError(["refusing to overwrite a modified Autoform publication"])
-    return _DestinationState(
-        "owned",
-        identity=identity,
-        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
-        directories=expected_directories,
-        files=expected_files,
-    )
+    finally:
+        os.close(descriptor)
+
+
+def _descriptor_identity(descriptor: int) -> tuple[int, int]:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PublicationError(["output path changed while it was inspected"])
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_publication_platform() -> None:
+    required_options = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    if (
+        fcntl is None
+        or any(not hasattr(os, option) for option in required_options)
+        or os.open not in os.supports_dir_fd
+        or os.rename not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+    ):
+        raise PublicationError(
+            ["transactional publication is unavailable on this platform"]
+        )
+    _rename_implementation(exchange=False)
+    _rename_implementation(exchange=True)
+
+
+def _open_directory_path(path: Path) -> int:
+    """Open every component without following a symbolic link."""
+    absolute = path.absolute()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for part in absolute.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def _parse_inventory_files(value: object) -> tuple[tuple[str, str], ...]:
@@ -618,24 +717,68 @@ def _valid_inventory_path(value: str) -> bool:
 
 
 def _publication_inventory(root: Path) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    descriptor = _open_directory_path(root)
+    try:
+        return _publication_inventory_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publication_inventory_descriptor(
+    root_descriptor: int,
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
     directories: list[str] = []
     files: list[tuple[str, str]] = []
-    for entry in sorted(root.rglob("*")):
-        relative = entry.relative_to(root).as_posix()
+
+    def visit(descriptor: int, prefix: str) -> None:
         try:
-            metadata = entry.lstat()
+            names = sorted(os.listdir(descriptor))
+            for name in names:
+                relative = f"{prefix}/{name}" if prefix else name
+                metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise PublicationError(
+                        [f"refusing symlink in publication output: {relative}"]
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    directories.append(relative)
+                    child = os.open(
+                        name,
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        if _descriptor_identity(child) != (metadata.st_dev, metadata.st_ino):
+                            raise PublicationError(
+                                ["publication output changed while it was inspected"]
+                            )
+                        visit(child, relative)
+                    finally:
+                        os.close(child)
+                    current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise PublicationError(
+                            ["publication output changed while it was inspected"]
+                        )
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise PublicationError(
+                        [f"refusing non-regular publication output: {relative}"]
+                    )
+                if relative == PUBLICATION_MANIFEST:
+                    continue
+                data = _read_regular_file_at(descriptor, name, Path(relative))
+                files.append((relative, hashlib.sha256(data).hexdigest()))
+            if sorted(os.listdir(descriptor)) != names:
+                raise PublicationError(
+                    ["publication output changed while it was inspected"]
+                )
         except OSError as error:
-            raise PublicationError(["publication output changed while it was inspected"]) from error
-        if stat.S_ISLNK(metadata.st_mode):
-            raise PublicationError([f"refusing symlink in publication output: {relative}"])
-        if stat.S_ISDIR(metadata.st_mode):
-            directories.append(relative)
-            continue
-        if not stat.S_ISREG(metadata.st_mode):
-            raise PublicationError([f"refusing non-regular publication output: {relative}"])
-        if relative == PUBLICATION_MANIFEST:
-            continue
-        files.append((relative, hashlib.sha256(_read_regular_file(entry)).hexdigest()))
+            raise PublicationError(
+                ["publication output changed while it was inspected"]
+            ) from error
+
+    visit(root_descriptor, "")
     return tuple(sorted(directories)), tuple(sorted(files))
 
 
@@ -657,27 +800,49 @@ def _copy_owned_publication(
 def _snapshot_publication_tree(source: Path, destination: Path) -> str:
     """Copy and hash the exact source generation used by one render."""
     destination.mkdir(mode=0o700)
-    digest = hashlib.sha256(b"autoform-markdown-publication/v1\0")
+    digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
     for path, relative in _published_source_files(source):
         data = _read_regular_file(path)
-        digest.update(relative.as_posix().encode("utf-8") + b"\0")
-        digest.update(data + b"\0")
+        _update_source_digest(digest, relative, data)
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     return digest.hexdigest()
 
 
+def _update_source_digest(digest, relative: Path, data: bytes) -> None:
+    path = relative.as_posix().encode("utf-8")
+    digest.update(len(path).to_bytes(8, "big"))
+    digest.update(path)
+    digest.update(len(data).to_bytes(8, "big"))
+    digest.update(data)
+
+
 def _read_regular_file(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        parent_descriptor = _open_directory_path(path.parent)
     except OSError as error:
-        raise PublicationError([f"could not safely read regular file: {path.name}"]) from error
+        raise PublicationError(
+            [f"could not safely read regular file: {path.name}"]
+        ) from error
+    try:
+        return _read_regular_file_at(parent_descriptor, path.name, path)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _read_regular_file_at(parent_descriptor: int, name: str, display_path: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise PublicationError(
+            [f"could not safely read regular file: {display_path.name}"]
+        ) from error
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
-            raise PublicationError([f"refusing non-regular file: {path.name}"])
+            raise PublicationError([f"refusing non-regular file: {display_path.name}"])
         chunks: list[bytes] = []
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -689,10 +854,10 @@ def _read_regular_file(path: Path) -> bytes:
             (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
         ):
-            raise PublicationError([f"file changed while it was read: {path.name}"])
-        entry = path.lstat()
+            raise PublicationError([f"file changed while it was read: {display_path.name}"])
+        entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         if (entry.st_dev, entry.st_ino) != (after.st_dev, after.st_ino):
-            raise PublicationError([f"file changed while it was read: {path.name}"])
+            raise PublicationError([f"file changed while it was read: {display_path.name}"])
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -704,32 +869,58 @@ def _require_source_revision(blueprint: Path, expected: str) -> None:
 
 
 def _sync_tree(root: Path) -> None:
-    """Make the staged root publishable before its atomic directory swap."""
+    """Make every staged byte and directory entry durable before publication."""
     root.chmod(0o755)
+    directories = [root]
+    for entry in sorted(root.rglob("*")):
+        metadata = entry.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PublicationError(["refusing symlink in staged publication"])
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.append(entry)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PublicationError(["refusing non-regular staged publication entry"])
+        descriptor = os.open(
+            entry,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise PublicationError(["staged publication changed while syncing"])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _publish_staged_site(
     stage: Path, destination: Path, expected: _DestinationState
 ) -> None:
     """Commit *stage* if the destination still matches the inspected generation."""
-    if fcntl is None:
-        raise PublicationError(["atomic publication is unavailable on this platform"])
-    parent_descriptor = os.open(
-        destination.parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    stage_parent_descriptor = os.open(
-        stage.parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    staged = _inspect_destination(stage)
-    if staged.kind != "owned" or staged.identity is None:
-        raise PublicationError(["the staged publication failed its ownership check"])
+    parent_descriptor: int | None = None
+    stage_parent_descriptor: int | None = None
     exchanged = False
     installed = False
     try:
+        parent_descriptor = _open_directory_path(destination.parent)
+        stage_parent_descriptor = _open_directory_path(stage.parent)
+        staged = _inspect_destination_at(stage_parent_descriptor, stage.name, stage)
+        if staged.kind != "owned" or staged.identity is None:
+            raise PublicationError(["the staged publication failed its ownership check"])
         fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
-        if _inspect_destination(destination) != expected:
+        if _inspect_destination_at(
+            parent_descriptor, destination.name, destination
+        ) != expected:
             raise PublicationError(
                 ["output directory changed during publication; previous site was preserved"]
             )
@@ -749,7 +940,9 @@ def _publish_staged_site(
                 destination.name,
             )
             exchanged = True
-            if _inspect_destination(stage) != expected:
+            if _inspect_destination_at(
+                stage_parent_descriptor, stage.name, stage
+            ) != expected:
                 _rename_exchange(
                     stage_parent_descriptor,
                     stage.name,
@@ -760,13 +953,18 @@ def _publish_staged_site(
                 raise PublicationError(
                     ["output directory changed during publication; previous site was preserved"]
                 )
-        published = _inspect_destination(destination)
-        if published.kind != "owned":
-            raise PublicationError(["the staged publication failed its final ownership check"])
+        published = _inspect_destination_at(
+            parent_descriptor, destination.name, destination
+        )
+        if published != staged:
+            raise PublicationError(
+                ["the published generation changed before its final ownership check"]
+            )
+        os.fsync(stage_parent_descriptor)
         os.fsync(parent_descriptor)
         exchanged = False
         installed = False
-    except Exception:
+    except BaseException as publication_error:
         if exchanged:
             try:
                 _rename_exchange(
@@ -775,9 +973,25 @@ def _publish_staged_site(
                     parent_descriptor,
                     destination.name,
                 )
-            except Exception as rollback_error:
-                raise PublicationError(
-                    ["publication failed and the previous site could not be restored"]
+                os.fsync(stage_parent_descriptor)
+                os.fsync(parent_descriptor)
+                if (
+                    _inspect_destination_at(
+                        parent_descriptor, destination.name, destination
+                    )
+                    != expected
+                    or _inspect_destination_at(
+                        stage_parent_descriptor, stage.name, stage
+                    )
+                    != staged
+                ):
+                    raise OSError(errno.ESTALE, "rollback generations changed")
+            except BaseException as rollback_error:
+                raise _PublicationRecoveryError(
+                    [
+                        "publication failed and rollback could not be verified; "
+                        f"recovery material was retained at {stage.parent}"
+                    ]
                 ) from rollback_error
         elif installed:
             try:
@@ -794,14 +1008,32 @@ def _publish_staged_site(
                     src_dir_fd=parent_descriptor,
                     dst_dir_fd=stage_parent_descriptor,
                 )
-            except Exception as rollback_error:
-                raise PublicationError(
-                    ["publication failed and the newly installed site could not be withdrawn"]
+                os.fsync(stage_parent_descriptor)
+                os.fsync(parent_descriptor)
+                if (
+                    _inspect_destination_at(
+                        parent_descriptor, destination.name, destination
+                    )
+                    != expected
+                    or _inspect_destination_at(
+                        stage_parent_descriptor, stage.name, stage
+                    )
+                    != staged
+                ):
+                    raise OSError(errno.ESTALE, "rollback generations changed")
+            except BaseException as rollback_error:
+                raise _PublicationRecoveryError(
+                    [
+                        "publication failed and the new site could not be withdrawn safely; "
+                        f"recovery material was retained at {stage.parent}"
+                    ]
                 ) from rollback_error
-        raise
+        raise publication_error
     finally:
-        os.close(stage_parent_descriptor)
-        os.close(parent_descriptor)
+        if stage_parent_descriptor is not None:
+            os.close(stage_parent_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def _rename_noreplace(
@@ -973,10 +1205,9 @@ def _published_source_files(blueprint: Path):
 
 
 def _source_revision(blueprint: Path) -> str:
-    digest = hashlib.sha256(b"autoform-markdown-publication/v1\0")
+    digest = hashlib.sha256(b"autoform-markdown-publication/v2\0")
     for source, relative in _published_source_files(blueprint):
-        digest.update(relative.as_posix().encode("utf-8") + b"\0")
-        digest.update(_read_regular_file(source) + b"\0")
+        _update_source_digest(digest, relative, _read_regular_file(source))
     return digest.hexdigest()
 
 

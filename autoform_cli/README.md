@@ -407,6 +407,14 @@ its local context. Point `mkdocs.yml` at `docs_dir: site-src` and enable
 `md_in_html` plus a `pymdownx.superfences` mermaid fence; see the [repository
 example](../skills/setup/assets/cabannes-thesis-project/mkdocs.yml).
 
+Publication is staged, synced, validated, and atomically exchanged with the
+previous generated site. This fail-closed transaction requires macOS
+`renameatx_np` or Linux `renameat2`; other platforms can still use the remaining
+CLI commands but cannot run `autoform render`. A legacy
+`autoform-publication/v1` output is never deleted automatically. Remove it
+explicitly or choose an empty output directory once, then subsequent v2 renders
+can replace only the exact checksummed generation they inspected.
+
 ## Validation
 
 `autoform check` rejects cycles, missing targets, escaping paths,
@@ -545,5 +553,8 @@ cause the render to fail rather than silently leak them. Source and output
 directories must be disjoint.
 
 Every render writes `publication.json` with the source-content hash, Git ref,
-article and dependency counts, and available views. It contains no timestamp or
-absolute path, so identical inputs produce identical output files.
+article and dependency counts, complete file inventory, and available views. It
+contains no timestamp or absolute path, so identical inputs produce identical
+output files. If publication cannot verify a rollback, it preserves the private
+staging workspace and reports its exact recovery path instead of deleting the
+only recoverable copy.
