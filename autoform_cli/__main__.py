@@ -17,14 +17,13 @@ from .article_identity import plan_article_ids
 from .audit import audit_blueprint
 from .claims import (
     CLAIM_TTL_S,
-    LEGACY_CLAIM_SCHEMA,
     ClaimBoard,
     ClaimTransportError,
     author_claim_key,
     resource_claim_key,
 )
 from .doctor import diagnose_project
-from .graph import GraphValidationError, load_graph
+from .graph import ARTICLE_ID_PATTERN, GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .project import (
     ProjectCatalogError,
@@ -165,6 +164,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     _add_claim_board_arguments(claim_list)
     claim_cleanup = claim_subparsers.add_parser("cleanup")
     _add_claim_board_arguments(claim_cleanup)
+    claim_cleanup.add_argument(
+        "--blueprint",
+        help="project or blueprint directory required to retire legacy author refs safely",
+    )
 
     migrate = subparsers.add_parser("migrate", help="inspect authored migration contracts")
     migrate_subparsers = migrate.add_subparsers(dest="migrate_command", required=True)
@@ -492,26 +495,45 @@ def _claim(args: argparse.Namespace) -> int:
     try:
         operation = args.claim_command
         if operation == "list":
-            board = _claim_board(args)
+            board = _claim_board(args, require_identity=False)
             print(json.dumps(board.list(), sort_keys=True, separators=(",", ":")))
             return 0
         if operation == "cleanup":
-            board = _claim_board(args)
-            print(f"removed {board.cleanup()} expired claim(s)")
+            board = _claim_board(args, require_identity=False)
+            canonical_keys = None
+            if args.blueprint is not None:
+                try:
+                    blueprint = resolve_runtime_paths(args.blueprint).blueprint_dir
+                    graph = load_graph(blueprint)
+                except RuntimeProjectionError as exc:
+                    raise ValueError(str(exc)) from exc
+                except GraphValidationError as exc:
+                    raise ValueError("; ".join(exc.issues)) from exc
+                canonical_keys = tuple(
+                    author_claim_key(node.article_id)
+                    for node in graph.nodes.values()
+                    if node.article_id is not None
+                )
+            print(
+                f"recovered {board.cleanup(canonical_keys=canonical_keys)} "
+                "expired or unsafe-timestamp claim(s)"
+            )
             return 0
 
-        key, label, legacy_key = _resolve_claim_target(args)
+        key, label, legacy_key, canonical_keys = _resolve_claim_target(args)
         board = _claim_board(args)
+        if operation in {"acquire", "renew"} and legacy_key is not None:
+            if not board.prepare_v2_claim(
+                key,
+                [legacy_key],
+                canonical_keys=canonical_keys,
+            ):
+                print(
+                    f"error: could not {operation} {label}; "
+                    "a live legacy v1 claim or incompatible path claim blocks v2 rollout"
+                )
+                return 1
         if operation == "acquire":
-            if legacy_key is not None and legacy_key != key:
-                legacy = board.read(legacy_key)
-                if legacy is not None and not board.expired(legacy):
-                    schema = legacy.get("schema")
-                    kind = "legacy v1" if schema == LEGACY_CLAIM_SCHEMA else "path-keyed"
-                    print(
-                        f"error: could not acquire {label}; a live {kind} claim still guards its path"
-                    )
-                    return 1
             succeeded = board.acquire(key, ttl=args.ttl, note=args.note)
         elif operation == "renew":
             succeeded = board.renew(key, ttl=args.ttl)
@@ -550,43 +572,53 @@ def _migrate(args: argparse.Namespace) -> int:
     return 1 if args.check and not plan.complete else 0
 
 
-def _claim_board(args: argparse.Namespace) -> ClaimBoard:
-    worker_id = args.worker_id
-    if not worker_id:
+def _claim_board(args: argparse.Namespace, *, require_identity: bool = True) -> ClaimBoard:
+    worker_id = args.worker_id or ("claim-maintenance" if not require_identity else None)
+    if worker_id is None:
         raise ValueError("--worker-id or AUTOFORM_WORKER_ID is required")
-    repo = args.repo or _origin_url()
-    session_id = args.session_id or _worktree_claim_session_id(getattr(args, "blueprint", "."))
+    context = getattr(args, "blueprint", None) or "."
+    repo = args.repo or _origin_url(context)
+    session_id = args.session_id
+    if session_id is None and require_identity:
+        session_id = _worktree_claim_session_id(context)
+    if session_id is None:
+        session_id = "claim-maintenance"
     scratch = args.scratch or _default_claim_scratch(repo, session_id)
     return ClaimBoard(repo, worker_id, scratch, session_id=session_id)
 
 
-def _resolve_claim_target(args: argparse.Namespace) -> tuple[str, str, str | None]:
+def _resolve_claim_target(
+    args: argparse.Namespace,
+) -> tuple[str, str, str | None, tuple[str, ...]]:
     article_target = args.node_id
     resource = args.resource
     if article_target and resource:
         raise ValueError("article target and --resource are mutually exclusive")
     if resource:
-        return resource_claim_key(resource), resource, None
+        if ARTICLE_ID_PATTERN.fullmatch(resource):
+            raise ValueError("resource names must not use the reserved article_id format")
+        return resource_claim_key(resource), resource, author_claim_key(resource), ()
     if not article_target:
         raise ValueError("an article target or --resource is required")
-    if article_target == "lake-build":
-        print(
-            "warning: positional lake-build is deprecated; use --resource lake-build",
-            file=sys.stderr,
-        )
-        return resource_claim_key(article_target), article_target, None
 
     try:
         blueprint = resolve_runtime_paths(args.blueprint).blueprint_dir
+        graph = load_graph(blueprint)
     except RuntimeProjectionError as exc:
         raise ValueError(str(exc)) from exc
-    graph = load_graph(blueprint)
+    except GraphValidationError as exc:
+        raise ValueError("; ".join(exc.issues)) from exc
     matches = [
         node
         for node in graph.nodes.values()
         if article_target == node.id or article_target == node.article_id
     ]
     if not matches:
+        if article_target == "lake-build":
+            raise ValueError(
+                f"article target {article_target!r} does not exist in {blueprint}; "
+                "use --resource lake-build for the shared build lock"
+            )
         raise ValueError(f"article target {article_target!r} does not exist in {blueprint}")
     if len(matches) != 1:
         paths = ", ".join(sorted(node.id for node in matches))
@@ -597,13 +629,19 @@ def _resolve_claim_target(args: argparse.Namespace) -> tuple[str, str, str | Non
             f"article {node.id!r} has no durable article_id; "
             f"run 'autoform migrate article-ids {blueprint}' and add the proposed ID"
         )
-    return author_claim_key(node.article_id), node.id, author_claim_key(node.id)
+    canonical_keys = tuple(
+        author_claim_key(candidate.article_id)
+        for candidate in graph.nodes.values()
+        if candidate.article_id is not None
+    )
+    return author_claim_key(node.article_id), node.id, author_claim_key(node.id), canonical_keys
 
 
-def _origin_url() -> str:
+def _origin_url(project_or_blueprint: str | Path = ".") -> str:
+    target = Path(project_or_blueprint).expanduser().resolve()
     try:
         result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
+            ["git", "-C", str(target), "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             check=True,

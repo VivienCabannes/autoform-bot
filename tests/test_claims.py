@@ -70,6 +70,7 @@ def _plant_lease(repo: Path, key: str, **changes: object) -> str:
         "host": "test-host",
         "pid": 1,
         "acquired_at": 100.0,
+        "renewed_at": 100.0,
         "expires_at": 200.0,
         "resource": key,
     }
@@ -211,6 +212,18 @@ def test_owner_only_renew_and_release(tmp_path: Path, board_repo: Path, monkeypa
     assert owner.release("owned")
 
 
+def test_steal_cannot_replace_a_live_peer_lease(tmp_path: Path, board_repo: Path) -> None:
+    owner = _board(tmp_path, board_repo, "owner", session_id="owner-session")
+    peer = _board(tmp_path, board_repo, "peer", session_id="peer-session")
+    assert owner.acquire("owned", ttl=30)
+    oid = owner._remote_oid("owned")
+
+    assert not peer.acquire("owned", ttl=30, steal=True)
+
+    assert owner._remote_oid("owned") == oid
+    assert owner.holds("owned")
+
+
 @pytest.mark.parametrize("now", [float("nan"), float("inf"), float("-inf")])
 def test_expired_rejects_nonfinite_explicit_comparison_clock(now: float) -> None:
     lease = {"expires_at": 200.0}
@@ -261,6 +274,31 @@ def test_cleanup_cas_does_not_delete_renewed_lease(
     monkeypatch.setattr(cleaner, "list", list_then_renew)
     assert cleaner.cleanup() == 0
     assert cleaner.read("lease")["expires_at"] == 1_510.0
+
+
+def test_cleanup_replaces_expired_v1_author_ref_with_a_compatibility_block(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = claims.author_claim_key("chapter/old-path")
+    _plant_lease(
+        board_repo,
+        key,
+        schema=claims.LEGACY_CLAIM_SCHEMA,
+        lease_id=None,
+    )
+    monkeypatch.setattr(claims.time, "time", lambda: 201.0)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(ValueError, match="blueprint is required"):
+        board.cleanup()
+    assert board.read(key)["schema"] == claims.LEGACY_CLAIM_SCHEMA
+    assert board.cleanup(canonical_keys=[]) == 1
+    block = board.read(key)
+    assert block is not None
+    assert block["schema"] == claims.LEGACY_BLOCK_SCHEMA
+    assert block["canonical_resource"] == "legacy-rollout"
 
 
 def test_worker_id_is_metadata_not_lease_authority(tmp_path: Path, board_repo: Path) -> None:
@@ -354,6 +392,42 @@ def test_receipt_failure_after_remote_renewal_leaves_the_old_receipt_fenced(
     assert not board.holds("article")
 
 
+def test_release_of_absent_remote_cannot_clear_a_concurrent_acquire_receipt(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = tmp_path / "shared"
+    releaser = _board(
+        tmp_path,
+        board_repo,
+        "worker-a",
+        session_id="shared-session",
+        scratch=scratch,
+    )
+    acquirer = _board(
+        tmp_path,
+        board_repo,
+        "worker-a",
+        session_id="shared-session",
+        scratch=scratch,
+    )
+    releaser._ensure_scratch()
+    original_remote_oid = releaser._remote_oid
+
+    def absent_then_acquire(key: str) -> None:
+        assert original_remote_oid(key) is None
+        assert acquirer.acquire(key, ttl=600)
+        return None
+
+    monkeypatch.setattr(releaser, "_remote_oid", absent_then_acquire)
+
+    with pytest.raises(claims.ClaimTransportError, match="receipt could not be cleared"):
+        releaser.release("article")
+
+    assert acquirer.holds("article")
+
+
 def test_live_v1_blocks_v2_but_expired_v1_can_be_replaced(
     tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -377,6 +451,64 @@ def test_live_v1_blocks_v2_but_expired_v1_can_be_replaced(
     lease = board.read(key)
     assert lease["schema"] == claims.CLAIM_SCHEMA
     assert claims.LEASE_ID_RE.fullmatch(lease["lease_id"])
+
+
+def test_legacy_compatibility_block_is_permanent_and_rejected_by_v1_clients(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    key = claims.author_claim_key("chapter/result")
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert board.install_legacy_compatibility(key, canonical_key="author/durable")
+    block = board.read(key)
+    assert block is not None
+    assert block["schema"] == claims.LEGACY_BLOCK_SCHEMA
+    assert not board.expired(block)
+    assert board.cleanup() == 0
+
+    class D9Client(claims.ClaimBoard):
+        @staticmethod
+        def _lease_is_valid(lease: dict[str, object], key: str | None = None) -> bool:
+            return bool(
+                lease.get("schema") == claims.LEGACY_CLAIM_SCHEMA
+                and claims.ClaimBoard._lease_is_valid(lease, key)
+            )
+
+    old_client = D9Client(board_repo, "old-worker", tmp_path / "old-client")
+    with pytest.raises(claims.MalformedLeaseError, match="invalid lease schema"):
+        old_client.acquire(key, ttl=600)
+
+
+def test_legacy_compatibility_install_cannot_overwrite_a_racing_v1_acquire(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = claims.author_claim_key("chapter/result")
+    board = _board(tmp_path, board_repo, "worker-a")
+    board._ensure_scratch()
+    original_remote_oid = board._remote_oid
+
+    def absent_then_legacy_acquire(candidate: str) -> None:
+        assert original_remote_oid(candidate) is None
+        now = claims.time.time()
+        _plant_lease(
+            board_repo,
+            candidate,
+            schema=claims.LEGACY_CLAIM_SCHEMA,
+            lease_id=None,
+            acquired_at=now,
+            renewed_at=None,
+            expires_at=now + 600,
+        )
+        return None
+
+    monkeypatch.setattr(board, "_remote_oid", absent_then_legacy_acquire)
+
+    assert not board.install_legacy_compatibility(key, canonical_key="author/durable")
+    inspector = _board(tmp_path, board_repo, "inspector")
+    assert inspector.read(key)["schema"] == claims.LEGACY_CLAIM_SCHEMA
 
 
 def test_v2_lease_is_rejected_by_the_v1_schema_contract(tmp_path: Path, board_repo: Path) -> None:
@@ -594,12 +726,18 @@ def test_heartbeat_exit_waits_for_inflight_renew_and_no_renewal_runs_after_exit(
         {"resource": "different"},
         {"owner": ""},
         {"expires_at": "later"},
+        {"renewed_at": "later"},
+        {"renewed_at": 50.0},
+        {"renewed_at": 201.0},
         {"acquired_at": float("nan")},
         {"acquired_at": float("inf")},
         {"acquired_at": float("-inf")},
         {"expires_at": float("nan")},
         {"expires_at": float("inf")},
         {"expires_at": float("-inf")},
+        {"renewed_at": float("nan")},
+        {"renewed_at": float("inf")},
+        {"renewed_at": float("-inf")},
     ],
 )
 def test_schema_resource_or_required_field_mismatch_is_malformed(
@@ -622,7 +760,10 @@ def test_schema_resource_or_required_field_mismatch_is_malformed(
     assert board.cleanup() == 0
 
 
-@pytest.mark.parametrize("field", ["schema", "lease_id", "owner", "resource", "acquired_at", "expires_at"])
+@pytest.mark.parametrize(
+    "field",
+    ["schema", "lease_id", "owner", "resource", "acquired_at", "renewed_at", "expires_at"],
+)
 def test_planted_lease_with_duplicate_decision_field_is_rejected_by_strict_json_parser(
     tmp_path: Path, board_repo: Path, field: str
 ) -> None:
@@ -632,6 +773,7 @@ def test_planted_lease_with_duplicate_decision_field_is_rejected_by_strict_json_
         "owner": '"worker-a"',
         "resource": '"duplicate"',
         "acquired_at": "100.0",
+        "renewed_at": "100.0",
         "expires_at": "200.0",
     }
     pairs = [f'"{name}":{value}' for name, value in values.items()]
@@ -653,7 +795,7 @@ def test_planted_nonfinite_lease_is_rejected_by_strict_json_parser(
         + "1" * 64
         + '",'
         '"owner":"worker-a","resource":"strict-json",'
-        '"acquired_at":0,"expires_at":NaN}'
+        '"acquired_at":0,"renewed_at":0,"expires_at":NaN}'
     )
     _plant_message(board_repo, "strict-json", message)
     board = _board(tmp_path, board_repo, "worker-a")
@@ -680,7 +822,74 @@ def test_acquire_rejects_nonfinite_expiry_before_commit_or_push(
     board = _board(tmp_path, board_repo, "worker-a")
     monkeypatch.setattr(claims.time, "time", lambda: 1e308)
 
-    with pytest.raises(ValueError, match="claim expiry must be finite"):
+    with pytest.raises(ValueError, match="must not exceed"):
         board.acquire("bad-expiry", ttl=1e308)
 
     assert _git("for-each-ref", "--format=%(refname)", claims.CLAIM_REF_PREFIX + "bad-expiry", cwd=board_repo) == ""
+
+
+def test_ttl_is_bounded_before_commit_or_push(tmp_path: Path, board_repo: Path) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(ValueError, match=f"must not exceed {claims.CLAIM_MAX_TTL_S}"):
+        board.acquire("too-long", ttl=claims.CLAIM_MAX_TTL_S + 1)
+
+    assert (
+        _git(
+            "for-each-ref",
+            "--format=%(refname)",
+            claims.CLAIM_REF_PREFIX + "too-long",
+            cwd=board_repo,
+        )
+        == ""
+    )
+
+
+def test_far_future_lease_fails_closed_until_explicit_cleanup_recovery(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    key = "future"
+    _plant_lease(
+        board_repo,
+        key,
+        acquired_at=now + claims.CLAIM_CLOCK_SKEW_S + 1,
+        renewed_at=now + claims.CLAIM_CLOCK_SKEW_S + 1,
+        expires_at=now + claims.CLAIM_CLOCK_SKEW_S + 601,
+    )
+    monkeypatch.setattr(claims.time, "time", lambda: now)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert not board.acquire(key, ttl=600)
+    assert not board.holds(key)
+    listed = board.list()
+    assert listed[0]["_recovery_required"] is True
+    assert listed[0]["_expired"] is False
+
+    assert board.cleanup() == 1
+    assert board.acquire(key, ttl=600)
+
+
+def test_oversized_remote_ttl_fails_closed_until_explicit_cleanup_recovery(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000.0
+    key = "oversized"
+    _plant_lease(
+        board_repo,
+        key,
+        acquired_at=now,
+        renewed_at=now,
+        expires_at=now + claims.CLAIM_MAX_TTL_S + 1,
+    )
+    monkeypatch.setattr(claims.time, "time", lambda: now)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert not board.acquire(key, ttl=600)
+    assert board.list()[0]["_recovery_required"] is True
+    assert board.cleanup() == 1
+    assert board.acquire(key, ttl=600)

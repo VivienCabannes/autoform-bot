@@ -375,6 +375,8 @@ autoform claim acquire "chapter/main-result"
 autoform claim renew "chapter/main-result"
 autoform claim release "chapter/main-result"
 autoform claim acquire --resource lake-build
+autoform claim list
+autoform claim cleanup
 ```
 
 Claims are fail-closed compare-and-swap leases under
@@ -386,7 +388,8 @@ session from the worktree, with `--session-id` or
 `AUTOFORM_CLAIM_SESSION_ID` as an explicit override. A failed acquire or renew
 means the caller cannot prove ownership and must stop before committing or
 pushing protected work. Claims do not prove mathematical correctness and do
-not replace branch-level Git CAS.
+not replace branch-level Git CAS. `list` and `cleanup` need neither a worker nor
+a worktree when `--repo` and, if needed, `--scratch` are supplied.
 
 Write the Mermaid dependency graph into the vault, where Obsidian renders it:
 
@@ -494,21 +497,32 @@ work, stamps articles, or creates another graph artifact.
 Claims use canonical `autoform-claim/v2` JSON in orphan commit messages. A
 cryptographically random lease ID and a session-local receipt for the exact
 pushed object fence every ownership operation; `worker_id` is display metadata,
-not authority. Absent and verifiably expired leases may be acquired; live peer
-leases are refused. Valid v1 leases remain readable during migration, but a live
-v1 lease cannot be adopted, renewed, or released by a v2 session. Malformed or
-unreadable refs remain unverifiable. A heartbeat captures one lease ID, records
-any refusal or transport uncertainty as lost ownership, and waits for an
-in-flight renewal before exiting.
+not authority. Live peer leases cannot be stolen. Leases are limited to 3600
+seconds and assume clocks differ by at most 300 seconds. Entries outside those
+bounds fail closed, appear as `_recovery_required` in `claim list`, and are
+recovered only by an explicit CAS-safe `claim cleanup`. A heartbeat captures one
+lease ID, records any refusal or transport uncertainty as lost ownership, and
+waits for an in-flight renewal before exiting.
+
+Moving from v1 path keys to v2 durable IDs is a one-way rollout. Stop v1 clients
+before the first v2 claim. Autoform refuses live or unreadable v1 author refs,
+replaces expired v1 refs with permanent compatibility fences, and installs a
+fence for the current article path or raw resource name before acquiring its v2
+key. Old clients reject those fences, so they cannot acquire a path already
+owned by v2. Historical renamed paths with no claim ref cannot be discovered;
+retiring v1 clients is therefore part of the protocol, not an optional cleanup.
+Use `claim cleanup --blueprint PROJECT` during rollout so expired v1 path refs
+become fences while expired durable-ID refs remain reusable.
 
 Article claims require a real graph node with materialized `article_id`
 frontmatter. Separate raw-resource keys cover coordination outside the roadmap.
 Parallel agents get one Git worktree each and serialize shared build state with
 `autoform claim acquire --resource lake-build`.
 
-Claims are temporary operational state, never article frontmatter. Future
-Deicyde workers may share this protocol, but their current continue-uncoordinated
-failure behavior must be removed before they use the canonical claim API.
+Leases are temporary operational state; compatibility fences are persistent
+migration state. Neither belongs in article frontmatter. Future Deicyde workers
+may share this protocol, but their current continue-uncoordinated failure
+behavior must be removed before they use the canonical claim API.
 
 ## Local runtime doctor
 

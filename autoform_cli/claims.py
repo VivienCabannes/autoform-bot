@@ -19,14 +19,17 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 CLAIM_REF_PREFIX = "refs/autoform-claims/"
 CLAIM_RECEIPT_REF_PREFIX = "refs/autoform-claim-receipts/"
 CLAIM_SCHEMA = "autoform-claim/v2"
 LEGACY_CLAIM_SCHEMA = "autoform-claim/v1"
+LEGACY_BLOCK_SCHEMA = "autoform-claim/legacy-block/v1"
 CLAIM_TTL_S = 1500
 CLAIM_HEARTBEAT_S = 300
+CLAIM_MAX_TTL_S = 3600
+CLAIM_CLOCK_SKEW_S = 300
 CLAIM_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 LEASE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -72,6 +75,8 @@ def _is_finite_number(value: object) -> bool:
 def _validate_ttl(ttl: int | float) -> int | float:
     if not _is_finite_number(ttl) or ttl <= 0:
         raise ValueError("claim TTL must be a finite positive number")
+    if ttl > CLAIM_MAX_TTL_S:
+        raise ValueError(f"claim TTL must not exceed {CLAIM_MAX_TTL_S} seconds")
     return ttl
 
 
@@ -202,10 +207,12 @@ class ClaimBoard:
                 + (f": {detail}" if detail else "")
             )
 
-    def _clear_receipt(self, key: str, *, expected: str | None = None) -> None:
-        args = ["update-ref", "-d", self._receipt_ref(key)]
-        if expected is not None:
-            args.append(expected)
+    def _clear_receipt(self, key: str, *, expected: str | None) -> None:
+        object_id_width = len(
+            self._git(["hash-object", "--stdin"], input_text="").stdout.strip()
+        )
+        zero_oid = "0" * object_id_width
+        args = ["update-ref", self._receipt_ref(key), zero_oid, expected or zero_oid]
         proc = self._git(args, check=False)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()[:300]
@@ -238,7 +245,15 @@ class ClaimBoard:
 
     @staticmethod
     def _lease_is_valid(lease: Mapping[str, Any], key: str | None = None) -> bool:
+        if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+            return bool(
+                isinstance(lease.get("resource"), str)
+                and _is_finite_number(lease.get("blocked_at"))
+                and isinstance(lease.get("canonical_resource"), str)
+                and (key is None or lease.get("resource") == key)
+            )
         acquired_at = lease.get("acquired_at")
+        renewed_at = lease.get("renewed_at", acquired_at)
         expires_at = lease.get("expires_at")
         valid = (
             lease.get("schema") in {CLAIM_SCHEMA, LEGACY_CLAIM_SCHEMA}
@@ -250,10 +265,30 @@ class ClaimBoard:
             and acquired_at <= expires_at
         )
         if lease.get("schema") == CLAIM_SCHEMA:
-            valid = valid and isinstance(lease.get("lease_id"), str) and bool(
-                LEASE_ID_RE.fullmatch(str(lease.get("lease_id")))
+            valid = (
+                valid
+                and _is_finite_number(renewed_at)
+                and acquired_at <= renewed_at <= expires_at
+                and isinstance(lease.get("lease_id"), str)
+                and bool(LEASE_ID_RE.fullmatch(str(lease.get("lease_id"))))
             )
         return bool(valid and (key is None or lease.get("resource") == key))
+
+    def _make_legacy_block_commit(self, key: str, canonical_key: str) -> str:
+        key = _validate_key(key)
+        canonical_key = _validate_key(canonical_key)
+        now = time.time()
+        if not math.isfinite(now):
+            raise ValueError("claim timestamp must be finite")
+        block = {
+            "blocked_at": now,
+            "canonical_resource": canonical_key,
+            "resource": key,
+            "schema": LEGACY_BLOCK_SCHEMA,
+        }
+        tree = self._git(["mktree"], input_text="").stdout.strip()
+        message = json.dumps(block, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return self._git(["commit-tree", tree, "-m", message]).stdout.strip()
 
     def _make_lease_commit(
         self,
@@ -277,8 +312,10 @@ class ClaimBoard:
             raise ValueError("claim expiry must be finite")
         if acquired_at is None:
             acquired_at = now
-        if not _is_finite_number(acquired_at) or acquired_at > now:
-            raise ValueError("claim acquisition timestamp must be finite and not in the future")
+        if not _is_finite_number(acquired_at) or acquired_at > now + CLAIM_CLOCK_SKEW_S:
+            raise ValueError(
+                "claim acquisition timestamp must be finite and within the allowed clock skew"
+            )
         if lease_id is None:
             lease_id = secrets.token_hex(32)
         if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
@@ -290,6 +327,7 @@ class ClaimBoard:
             "host": socket.gethostname(),
             "pid": os.getpid(),
             "acquired_at": acquired_at,
+            "renewed_at": now,
             "expires_at": expires_at,
             "resource": key,
         }
@@ -329,13 +367,118 @@ class ClaimBoard:
     @classmethod
     def expired(cls, lease: Mapping[str, Any], now: float | None = None) -> bool:
         """Return whether a lease is malformed or no longer live."""
-        expires_at = lease.get("expires_at")
-        if not _is_finite_number(expires_at):
-            return True
         comparison_time = time.time() if now is None else now
         if not _is_finite_number(comparison_time):
             raise ValueError("claim expiry comparison clock must be finite")
+        if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+            return False
+        expires_at = lease.get("expires_at")
+        if not _is_finite_number(expires_at):
+            return True
         return expires_at <= comparison_time
+
+    @classmethod
+    def recovery_required(cls, lease: Mapping[str, Any], now: float | None = None) -> bool:
+        """Return whether bounded lease timing was violated and explicit cleanup is required."""
+        comparison_time = time.time() if now is None else now
+        if not _is_finite_number(comparison_time):
+            raise ValueError("claim recovery comparison clock must be finite")
+        if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+            return False
+        acquired_at = lease.get("acquired_at")
+        renewed_at = lease.get("renewed_at", acquired_at)
+        expires_at = lease.get("expires_at")
+        if (
+            not _is_finite_number(acquired_at)
+            or not _is_finite_number(renewed_at)
+            or not _is_finite_number(expires_at)
+        ):
+            return False
+        return bool(
+            renewed_at > comparison_time + CLAIM_CLOCK_SKEW_S
+            or expires_at - renewed_at > CLAIM_MAX_TTL_S
+        )
+
+    def install_legacy_compatibility(self, key: str, *, canonical_key: str) -> bool:
+        """Permanently fence a v1 path key before a v2 canonical claim is used."""
+        key = _validate_key(key)
+        canonical_key = _validate_key(canonical_key)
+        self._ensure_scratch()
+        old = self._remote_oid(key)
+        if old is not None:
+            lease = self._read_lease(key, old)
+            if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+                return True
+            if (
+                lease.get("schema") != LEGACY_CLAIM_SCHEMA
+                or self.recovery_required(lease)
+                or not self.expired(lease)
+            ):
+                return False
+        new = self._make_legacy_block_commit(key, canonical_key)
+        return self._cas_push(key, old, new)
+
+    def prepare_v2_claim(
+        self,
+        canonical_key: str,
+        compatibility_keys: Iterable[str],
+        *,
+        canonical_keys: Iterable[str] = (),
+    ) -> bool:
+        """Retire observable v1 keys, then install permanent compatibility fences."""
+        canonical_key = _validate_key(canonical_key)
+        keys = tuple(
+            key
+            for key in dict.fromkeys(_validate_key(key) for key in compatibility_keys)
+            if key != canonical_key
+        )
+        protected = {_validate_key(key) for key in canonical_keys}
+        protected.add(canonical_key)
+        collisions = sorted(set(keys) & (protected - {canonical_key}))
+        if collisions:
+            raise ValueError(
+                "legacy compatibility key collides with a durable canonical claim key: "
+                + ", ".join(collisions)
+            )
+
+        for lease in self.list():
+            key = str(lease["_key"])
+            if not key.startswith("author/"):
+                continue
+            if lease["_malformed"]:
+                raise MalformedLeaseError(
+                    f"legacy rollout is blocked by unreadable author claim {key!r}: "
+                    f"{lease['_error']}"
+                )
+            if lease.get("schema") != LEGACY_CLAIM_SCHEMA:
+                continue
+            if lease["_recovery_required"]:
+                raise ClaimTransportError(
+                    f"legacy rollout is blocked by unsafe-timestamp claim {key!r}; "
+                    "inspect it and run claim cleanup --blueprint PROJECT to recover"
+                )
+            if not lease["_expired"]:
+                return False
+            if key in protected:
+                continue
+            if not self.install_legacy_compatibility(key, canonical_key=canonical_key):
+                return False
+
+        for key in keys:
+            if not self.install_legacy_compatibility(key, canonical_key=canonical_key):
+                return False
+
+        for lease in self.list():
+            key = str(lease["_key"])
+            if not key.startswith("author/"):
+                continue
+            if lease["_malformed"]:
+                return False
+            if lease.get("schema") == LEGACY_CLAIM_SCHEMA and not (
+                key in protected and lease["_expired"]
+            ):
+                return False
+        return True
 
     def acquire(self, key: str, ttl: int | float = CLAIM_TTL_S, steal: bool = False, note: str = "") -> bool:
         """CAS-acquire a free or expired lease, or refresh this exact session's lease."""
@@ -347,12 +490,13 @@ class ClaimBoard:
         acquired_at: int | float | None = None
         if old is not None:
             lease = self._read_lease(key, old)
+            if lease.get("schema") == LEGACY_BLOCK_SCHEMA or self.recovery_required(lease):
+                return False
             if not self.expired(lease):
                 if lease.get("schema") == LEGACY_CLAIM_SCHEMA:
                     return False
                 if not self._receipt_matches(key, old, lease):
-                    if not steal:
-                        return False
+                    return False
                 else:
                     lease_id = str(lease["lease_id"])
                     acquired_at = lease["acquired_at"]
@@ -385,6 +529,7 @@ class ClaimBoard:
         lease = self._read_lease(key, old)
         if (
             lease.get("schema") != CLAIM_SCHEMA
+            or self.recovery_required(lease)
             or self.expired(lease)
             or not self._receipt_matches(key, old, lease)
             or (lease_id is not None and lease.get("lease_id") != lease_id)
@@ -406,13 +551,15 @@ class ClaimBoard:
         """CAS-delete this session's lease; refuse stale or unverifiable ownership."""
         key = _validate_key(key)
         self._ensure_scratch()
+        receipt = self._receipt_oid(key)
         old = self._remote_oid(key)
         if old is None:
-            self._clear_receipt(key)
+            self._clear_receipt(key, expected=receipt)
             return True
         lease = self._read_lease(key, old)
         if (
             lease.get("schema") != CLAIM_SCHEMA
+            or self.recovery_required(lease)
             or self.expired(lease)
             or not self._receipt_matches(key, old, lease)
         ):
@@ -436,6 +583,7 @@ class ClaimBoard:
         lease = self._read_lease(key, oid)
         if (
             lease.get("schema") != CLAIM_SCHEMA
+            or self.recovery_required(lease)
             or self.expired(lease)
             or not self._receipt_matches(key, oid, lease)
         ):
@@ -476,21 +624,54 @@ class ClaimBoard:
             else:
                 lease["_malformed"] = False
                 lease["_legacy"] = lease.get("schema") == LEGACY_CLAIM_SCHEMA
+                lease["_legacy_block"] = lease.get("schema") == LEGACY_BLOCK_SCHEMA
             lease["_key"] = key
             lease["_oid"] = oid
             lease["_expired"] = not lease["_malformed"] and self.expired(lease)
+            lease["_recovery_required"] = not lease["_malformed"] and self.recovery_required(
+                lease
+            )
             leases.append(lease)
         return sorted(leases, key=lambda lease: str(lease["_key"]))
 
-    def cleanup(self) -> int:
-        """CAS-delete leases expired at snapshot time and return the deletion count."""
-        removed = 0
-        for lease in self.list():
-            if not lease["_malformed"] and lease["_expired"] and self._cas_push(
-                str(lease["_key"]), str(lease["_oid"]), ""
+    def cleanup(self, *, canonical_keys: Iterable[str] | None = None) -> int:
+        """CAS-recover expired or unsafe leases and return the changed-ref count."""
+        protected = (
+            None
+            if canonical_keys is None
+            else {_validate_key(key) for key in canonical_keys}
+        )
+        leases = self.list()
+        if protected is None and any(
+            lease.get("schema") == LEGACY_CLAIM_SCHEMA
+            and str(lease["_key"]).startswith("author/")
+            and (lease["_expired"] or lease["_recovery_required"])
+            for lease in leases
+        ):
+            raise ValueError(
+                "a blueprint is required to recover legacy author claims without "
+                "blocking durable article IDs"
+            )
+        recovered = 0
+        for lease in leases:
+            if lease["_malformed"] or not (
+                lease["_expired"] or lease["_recovery_required"]
             ):
-                removed += 1
-        return removed
+                continue
+            key = str(lease["_key"])
+            old = str(lease["_oid"])
+            if lease.get("schema") == LEGACY_CLAIM_SCHEMA and key.startswith("author/"):
+                assert protected is not None
+                new = (
+                    ""
+                    if key in protected
+                    else self._make_legacy_block_commit(key, "legacy-rollout")
+                )
+            else:
+                new = ""
+            if self._cas_push(key, old, new):
+                recovered += 1
+        return recovered
 
     def gc(self) -> int:
         """Compatibility alias for :meth:`cleanup`."""
@@ -579,6 +760,8 @@ class Heartbeat:
 __all__ = [
     "CLAIM_HEARTBEAT_S",
     "CLAIM_KEY_RE",
+    "CLAIM_CLOCK_SKEW_S",
+    "CLAIM_MAX_TTL_S",
     "CLAIM_RECEIPT_REF_PREFIX",
     "CLAIM_REF_PREFIX",
     "CLAIM_SCHEMA",
@@ -587,6 +770,7 @@ __all__ = [
     "ClaimTransportError",
     "Heartbeat",
     "LEGACY_CLAIM_SCHEMA",
+    "LEGACY_BLOCK_SCHEMA",
     "LEASE_ID_RE",
     "MalformedLeaseError",
     "author_claim_key",
