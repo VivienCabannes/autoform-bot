@@ -1,7 +1,7 @@
 """Lean REPL backend: one session managing a ``lake exe repl`` subprocess.
 
-Provides LeanRepl with non-blocking I/O, a preloaded import environment,
-memory monitoring, automatic restart, and multi-snippet chaining.
+Provides LeanRepl with non-blocking I/O, private import-context caching,
+memory monitoring, and automatic restart.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ logger = getLogger(__name__)
 DEFAULT_MAX_DIAGNOSTICS = 10
 DEFAULT_SMOKE_TEST_TIMEOUT = 10
 DEFAULT_REPL_STARTUP_TIMEOUT = 180.0
+DEFAULT_MAX_CONTEXTS_PER_PROCESS = 256
 
 ALLOWED_IMPORTS = frozenset({"Mathlib", "Aesop", "Batteries", "LeanSearchClient"})
 WARMUP_IMPORTS = frozenset({"Mathlib"})
@@ -184,6 +185,16 @@ def _validate_command_response(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _EnvironmentHandle:
+    project_identity: Path
+    worker_token: object
+    process_generation: int
+    import_context: tuple[str, ...]
+    resolved_imports: ResolvedImports | None
+    env_id: int
+
+
 @dataclass
 class LeanReplConfig:
     """Configuration for a Lean REPL instance."""
@@ -209,9 +220,18 @@ class LeanReplConfig:
     max_buffer_bytes: int = 10 * 1024 * 1024
     mem_restart_ratio: float = 0.9
     validate_imports: bool = True
+    max_contexts_per_process: int = DEFAULT_MAX_CONTEXTS_PER_PROCESS
 
     def __post_init__(self) -> None:
-        """Allow derived pool configs to extend validation consistently."""
+        """Reject limits that cannot bound the configured startup contexts."""
+        limit = self.max_contexts_per_process
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("max_contexts_per_process must be a positive integer")
+        minimum = 4 if self.warmup_imports else 3
+        if limit < minimum:
+            raise ValueError(
+                "max_contexts_per_process must allow startup, import, and request contexts"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +257,24 @@ def _adjust_line_numbers(resp: dict, offset: int) -> None:
         end_pos = sorry.get("endPos")
         if end_pos and isinstance(end_pos, dict) and "line" in end_pos:
             end_pos["line"] = end_pos["line"] + offset
+
+
+def _without_process_handles(response: dict[str, Any]) -> dict[str, Any]:
+    """Copy a response without IDs owned by a retired REPL process."""
+    cleaned = dict(response)
+    cleaned.pop("env", None)
+    cleaned.pop("proofState", None)
+    for response_field in ("sorries", "tactics"):
+        values = cleaned.get(response_field)
+        if not isinstance(values, list):
+            continue
+        cleaned[response_field] = [
+            {key: value for key, value in item.items() if key != "proofState"}
+            if isinstance(item, dict)
+            else item
+            for item in values
+        ]
+    return cleaned
 
 
 def format_message(msg: dict) -> str:
@@ -381,7 +419,11 @@ class LeanRepl:
         self.request_timeout = config.request_timeout
         self.max_retries = config.max_retries
 
-        self._base_env_id: int | None = None
+        self._worker_token = object()
+        self._process_generation = 0
+        self._base_environment: _EnvironmentHandle | None = None
+        self._import_environments: dict[tuple[str, ...], _EnvironmentHandle] = {}
+        self._contexts_created = 0
         self._project_fingerprint: ProjectFingerprint | None = None
         self.chunk_size: int = config.chunk_size
 
@@ -400,7 +442,9 @@ class LeanRepl:
 
     def start(self, startup_timeout: float | None = None) -> None:
         """Start and warm the Lean REPL within one startup deadline."""
-        self._base_env_id = None
+        self._base_environment = None
+        self._import_environments.clear()
+        self._contexts_created = 0
         self._project_fingerprint = None
         timeout = self.config.startup_timeout if startup_timeout is None else min(
             self.config.startup_timeout,
@@ -433,10 +477,15 @@ class LeanRepl:
 
         try:
             base_env_id: int | None = None
-            if self.config.warmup_imports:
-                header = "\n".join(f"import {root}" for root in self.config.warmup_imports)
-                logger.info("Loading imports at startup: %s", self.config.warmup_imports)
-                resp = self._run(code=header, env_id=None, timeout=remaining())
+            base_imports = tuple(sorted(self.config.warmup_imports))
+            if base_imports:
+                header = "\n".join(f"import {root}" for root in base_imports)
+                logger.info("Loading imports at startup: %s", base_imports)
+                resp = self._run_counted(
+                    code=header,
+                    env_id=None,
+                    timeout=remaining(),
+                )
                 base_env_id, messages = _validate_command_response(
                     resp,
                     context="startup imports",
@@ -445,11 +494,13 @@ class LeanRepl:
                 if errors:
                     error_details = "\n".join(m["data"] for m in errors)
                     raise RuntimeError(f"Import preloading failed:\n{error_details}")
+                if self._contexts_created + 1 > self.config.max_contexts_per_process:
+                    raise RuntimeError("REPL startup exceeded its context limit")
 
             # A retained Init-derived environment keeps every later source request
             # in command mode. Otherwise a header-scanner miss sent without an
             # environment could execute imports in the REPL's fresh-file mode.
-            smoke = self._run(
+            smoke = self._run_counted(
                 code="#check Nat",
                 env_id=base_env_id,
                 timeout=min(DEFAULT_SMOKE_TEST_TIMEOUT, remaining()),
@@ -465,23 +516,30 @@ class LeanRepl:
                     "REPL smoke test failed, LEAN_PATH may be misconfigured. "
                     f"Errors: {error_details}"
                 )
+            if self._contexts_created > self.config.max_contexts_per_process:
+                raise RuntimeError("REPL startup exceeded its context limit")
             if lean_project_fingerprint(self._project_identity) != startup_fingerprint:
                 raise RuntimeError("Lean project changed during REPL startup")
-            self._base_env_id = smoke_env_id if base_env_id is None else base_env_id
+            self._process_generation += 1
+            self._base_environment = self._make_environment_handle(
+                base_imports,
+                smoke_env_id if base_env_id is None else base_env_id,
+            )
             self._project_fingerprint = startup_fingerprint
         except Exception:
             self.close()
             raise
 
     def close(self) -> None:
-        """Close the Lean REPL process."""
+        """Close the Lean REPL process and invalidate its environments."""
         try:
-            if not self.process or self.process.poll() is not None:
-                return
-            _kill_subprocesses(self.process)
+            if self.process is not None and self.process.poll() is None:
+                _kill_subprocesses(self.process)
         finally:
             self.process = None
-            self._base_env_id = None
+            self._base_environment = None
+            self._import_environments.clear()
+            self._contexts_created = 0
             self._project_fingerprint = None
             self._stderr_bytes = 0
             self._stderr_tail.clear()
@@ -511,6 +569,23 @@ class LeanRepl:
     def get_memory_usage(self) -> float:
         """Return memory usage in GB."""
         return _get_process_memory_gb(self.process)
+
+    @property
+    def _base_env_id(self) -> int | None:
+        """Compatibility view of the private base environment handle."""
+        if self._base_environment is None:
+            return None
+        return self._base_environment.env_id
+
+    @_base_env_id.setter
+    def _base_env_id(self, env_id: int | None) -> None:
+        if env_id is None:
+            self._base_environment = None
+            return
+        self._base_environment = self._make_environment_handle(
+            tuple(sorted(self.config.warmup_imports)),
+            env_id,
+        )
 
     def run(
         self,
@@ -561,14 +636,14 @@ class LeanRepl:
         header_line_count = 0
         if not run_from_env:
             inline_imports, code, header_line_count = _split_imports_and_body(code)
-            if structured_imports is not None and inline_imports:
+            if descriptor is not None and inline_imports:
                 return {
                     "repl_error": (
                         "Structured imports cannot be combined with import statements "
                         "at the start of code."
                     )
                 }
-            if structured_imports is None:
+            if descriptor is None:
                 if self.config.validate_imports and self._allowed_import_roots is not None:
                     submitted_roots = {stmt.split(".")[0] for stmt in inline_imports}
                     disallowed = submitted_roots - self._allowed_import_roots
@@ -597,11 +672,13 @@ class LeanRepl:
                     "REPL process restarted before the request; environment state was lost"
                 )
 
+            initial_generation = self._process_generation
             process_before_memory_check = self.process
             try:
                 if not self.is_alive():
                     self.restart(timeout=remaining())
-                self._check_memory_and_maybe_restart(timeout=remaining())
+                if self._process_generation == initial_generation:
+                    self._check_memory_and_maybe_restart(timeout=remaining())
                 self._assert_project_current(deadline)
             except (TimeoutError, RuntimeError) as error:
                 self.close()
@@ -612,21 +689,101 @@ class LeanRepl:
             if descriptor is not None:
                 self._assert_resolved_imports_current(descriptor, deadline)
 
-            if run_from_env and self.process is not process_before_memory_check:
+            if run_from_env and (
+                self._process_generation != initial_generation
+                or self.process is not process_before_memory_check
+            ):
                 raise ReplProcessRestarted(
                     "REPL process restarted before the request; environment state was lost"
                 )
 
+            request_restarted = (
+                self._process_generation != initial_generation
+                or self.process is not process_before_memory_check
+            )
+
             for i in range(max_retries + 1):
                 body_dispatched = False
                 try:
-                    request_env_id = env_id if run_from_env else self._base_env_id
-                    if descriptor is not None and structured_imports:
+                    if run_from_env:
+                        cached = None
+                    elif descriptor is not None:
+                        cached = self._import_environments.get(structured_imports)
+                    else:
+                        cached = self._base_environment
+
+                    # The same module tuple can name different compiled artifacts
+                    # after another collaborator rebuilds the project. Lean may
+                    # retain loaded modules for the life of the process, so a fresh
+                    # descriptor cannot safely reuse, or merely replace, the old
+                    # process-local environment. Recycle the whole worker first.
+                    if (
+                        descriptor is not None
+                        and cached is not None
+                        and cached.resolved_imports != descriptor
+                    ):
+                        if request_restarted:
+                            return {
+                                "repl_error": (
+                                    "Lean import artifacts changed after a fresh "
+                                    "worker start"
+                                )
+                            }
+                        self.restart(timeout=remaining())
+                        request_restarted = True
+                        self._assert_project_current(deadline)
+                        self._assert_resolved_imports_current(descriptor, deadline)
+                        cached = None
+
+                    reservation = 1 + int(descriptor is not None and cached is None)
+                    if (
+                        self._contexts_created + reservation
+                        > self.config.max_contexts_per_process
+                    ):
+                        if run_from_env:
+                            self.close()
+                            raise ReplProcessRestarted(
+                                "REPL process reached its context limit; "
+                                "environment state was lost"
+                            )
+                        if request_restarted:
+                            return {
+                                "repl_error": (
+                                    "REPL context limit is too small for this request "
+                                    "after a fresh worker start"
+                                )
+                            }
+                        self.restart(timeout=remaining())
+                        request_restarted = True
+                        self._assert_project_current(deadline)
+                        if descriptor is not None:
+                            self._assert_resolved_imports_current(descriptor, deadline)
+                        cached = (
+                            self._import_environments.get(structured_imports)
+                            if descriptor is not None
+                            else self._base_environment
+                        )
+                        reservation = 1 + int(
+                            descriptor is not None and cached is None
+                        )
+                        if (
+                            self._contexts_created + reservation
+                            > self.config.max_contexts_per_process
+                        ):
+                            return {
+                                "repl_error": (
+                                    "REPL context limit is too small for this request "
+                                    "after a fresh worker start"
+                                )
+                            }
+
+                    if descriptor is not None and cached is None:
+                        assert structured_imports is not None
+                        self._assert_resolved_imports_current(descriptor, deadline)
                         header = "\n".join(
                             f"import {module}" for module in structured_imports
                         )
-                        self._assert_resolved_imports_current(descriptor, deadline)
-                        imported = self._run(
+                        imported = self._run_counted(
                             code=header,
                             env_id=None,
                             timeout=remaining(),
@@ -637,10 +794,56 @@ class LeanRepl:
                         )
                         self._assert_resolved_imports_current(descriptor, deadline)
                         if any(message["severity"] == "error" for message in messages):
+                            if (
+                                self._contexts_created
+                                > self.config.max_contexts_per_process
+                            ):
+                                self.close()
+                                return _without_process_handles(imported)
                             return imported
-                    self._assert_project_current(deadline)
+                        if (
+                            self._contexts_created + 1
+                            > self.config.max_contexts_per_process
+                        ):
+                            self.close()
+                            return {
+                                "repl_error": (
+                                    "REPL import setup exceeded its context limit "
+                                    "before the requested code ran"
+                                )
+                            }
+                        assert request_env_id is not None
+                        cached = self._make_environment_handle(
+                            structured_imports,
+                            request_env_id,
+                            resolved_imports=descriptor,
+                        )
+                        self._import_environments[structured_imports] = cached
+
+                    if run_from_env:
+                        request_env_id = env_id
+                    elif cached is not None:
+                        expected_context = (
+                            structured_imports
+                            if descriptor is not None
+                            else tuple(sorted(self.config.warmup_imports))
+                        )
+                        assert expected_context is not None
+                        request_env_id = self._environment_id(
+                            cached,
+                            expected_context,
+                            expected_resolved_imports=(
+                                descriptor if descriptor is not None else None
+                            ),
+                        )
+                    else:
+                        request_env_id = None
+                    if descriptor is not None:
+                        self._assert_resolved_imports_current(descriptor, deadline)
+                    else:
+                        self._assert_project_current(deadline)
                     body_dispatched = True
-                    resp = self._run(
+                    resp = self._run_counted(
                         code=code,
                         env_id=request_env_id,
                         timeout=remaining(),
@@ -659,7 +862,19 @@ class LeanRepl:
                             "Lean project freshness changed while the requested "
                             "command was executing; its outcome is unknown"
                         ) from error
+                    over_context_limit = (
+                        self._contexts_created
+                        > self.config.max_contexts_per_process
+                    )
                     _adjust_line_numbers(resp, header_line_count)
+                    if over_context_limit:
+                        self.close()
+                        if run_from_env:
+                            raise ReplProcessRestarted(
+                                "REPL process exceeded its context limit after the "
+                                "command; environment state was lost"
+                            )
+                        resp = _without_process_handles(resp)
                     return resp
                 except ReplStderrBacklog as e:
                     # _run() already retired the process, so nothing can inherit the
@@ -671,10 +886,15 @@ class LeanRepl:
                     self.close()
                     if run_from_env:
                         raise ReplProcessRestarted(str(e)) from e
-                    if structured_imports and not body_dispatched:
+                    if not body_dispatched:
+                        setup = (
+                            "REPL import setup"
+                            if descriptor is not None
+                            else "REPL setup"
+                        )
                         return {
                             "repl_error": (
-                                "REPL import setup failed before the requested code ran: "
+                                f"{setup} failed before the requested code ran: "
                                 f"{e}"
                             )
                         }
@@ -692,8 +912,7 @@ class LeanRepl:
                             "repl_error": str(error),
                             "outcome_unknown": True,
                         }
-                    response = dict(e.response)
-                    response.pop("env", None)
+                    response = _without_process_handles(e.response)
                     _adjust_line_numbers(response, header_line_count)
                     return response
                 except ReplOutcomeUnknown as e:
@@ -704,6 +923,18 @@ class LeanRepl:
                     self.close()
                     if run_from_env:
                         raise
+                    if not body_dispatched:
+                        setup = (
+                            "REPL import setup"
+                            if descriptor is not None
+                            else "REPL setup"
+                        )
+                        return {
+                            "repl_error": (
+                                f"{setup} failed before the requested code ran: "
+                                f"{e}"
+                            )
+                        }
                     return {"repl_error": str(e), "outcome_unknown": True}
                 except ReplCommandError as e:
                     logger.error("Lean REPL rejected the command: %s", e)
@@ -728,7 +959,7 @@ class LeanRepl:
                         self.close()
                         raise ReplProcessRestarted(str(e)) from e
 
-                if i >= max_retries:
+                if i >= max_retries or request_restarted:
                     self.close()
                     break
 
@@ -738,6 +969,7 @@ class LeanRepl:
                         raise deadline_error()
                     time.sleep(backoff)
                     self.restart(timeout=remaining())
+                    request_restarted = True
                 except (TimeoutError, RuntimeError) as error:
                     last_exception = error
                     self.close()
@@ -786,6 +1018,76 @@ class LeanRepl:
             yield
         finally:
             self._request_deadline = previous
+
+    def _make_environment_handle(
+        self,
+        import_context: tuple[str, ...],
+        env_id: int,
+        *,
+        resolved_imports: ResolvedImports | None = None,
+    ) -> _EnvironmentHandle:
+        """Bind a raw Lean environment ID to this worker process generation."""
+        if not _is_natural_number(env_id):
+            raise RuntimeError("Lean REPL returned an invalid environment ID")
+        return _EnvironmentHandle(
+            project_identity=self._project_identity,
+            worker_token=self._worker_token,
+            process_generation=self._process_generation,
+            import_context=import_context,
+            resolved_imports=resolved_imports,
+            env_id=env_id,
+        )
+
+    def _environment_id(
+        self,
+        handle: _EnvironmentHandle,
+        expected_import_context: tuple[str, ...],
+        *,
+        expected_resolved_imports: ResolvedImports | None = None,
+    ) -> int:
+        """Validate a private environment handle before using its raw ID."""
+        if (
+            handle.project_identity != self._project_identity
+            or handle.worker_token is not self._worker_token
+            or handle.process_generation != self._process_generation
+            or handle.import_context != expected_import_context
+            or handle.resolved_imports != expected_resolved_imports
+            or not self.is_alive()
+            or not _is_natural_number(handle.env_id)
+        ):
+            raise ReplProcessRestarted(
+                "Lean environment belongs to another worker or process generation"
+            )
+        return handle.env_id
+
+    def _run_counted(
+        self,
+        code: str,
+        env_id: int | None,
+        timeout: float,
+    ) -> Any:
+        """Run one command and account for every returned retained-state ID."""
+        response = self._run(code=code, env_id=env_id, timeout=timeout)
+        response_env_id = response.get("env") if isinstance(response, dict) else None
+        if _is_natural_number(response_env_id):
+            self._contexts_created += 1
+        proof_states: set[int] = set()
+        if isinstance(response, dict):
+            top_level_proof_state = response.get("proofState")
+            if _is_natural_number(top_level_proof_state):
+                proof_states.add(top_level_proof_state)
+            for response_field in ("sorries", "tactics"):
+                values = response.get(response_field, [])
+                if not isinstance(values, list):
+                    continue
+                for value in values:
+                    proof_state = (
+                        value.get("proofState") if isinstance(value, dict) else None
+                    )
+                    if _is_natural_number(proof_state):
+                        proof_states.add(proof_state)
+        self._contexts_created += len(proof_states)
+        return response
 
     def _check_memory_and_maybe_restart(self, timeout: float | None = None) -> None:
         """Proactively restart if memory usage is near the limit."""
