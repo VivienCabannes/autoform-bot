@@ -39,8 +39,20 @@ def board_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _board(tmp_path: Path, repo: Path, owner: str) -> claims.ClaimBoard:
-    return claims.ClaimBoard(repo, owner, tmp_path / f"scratch-{owner}")
+def _board(
+    tmp_path: Path,
+    repo: Path,
+    owner: str,
+    *,
+    session_id: str | None = None,
+    scratch: Path | None = None,
+) -> claims.ClaimBoard:
+    return claims.ClaimBoard(
+        repo,
+        owner,
+        scratch or tmp_path / f"scratch-{owner}",
+        session_id=session_id,
+    )
 
 
 def _plant_message(repo: Path, key: str, message: str) -> str:
@@ -53,6 +65,7 @@ def _plant_message(repo: Path, key: str, message: str) -> str:
 def _plant_lease(repo: Path, key: str, **changes: object) -> str:
     lease: dict[str, object] = {
         "schema": claims.CLAIM_SCHEMA,
+        "lease_id": "1" * 64,
         "owner": "original-owner",
         "host": "test-host",
         "pid": 1,
@@ -71,6 +84,7 @@ def test_acquire_read_list_and_release_round_trip(tmp_path: Path, board_repo: Pa
     lease = board.read("author/node")
     assert lease is not None
     assert lease["schema"] == claims.CLAIM_SCHEMA
+    assert claims.LEASE_ID_RE.fullmatch(lease["lease_id"])
     assert lease["owner"] == "worker-a"
     assert lease["resource"] == "author/node"
     assert lease["note"] == "proof"
@@ -126,10 +140,12 @@ def test_expired_lease_can_be_taken_over(tmp_path: Path, board_repo: Path, monke
     second = _board(tmp_path, board_repo, "worker-b")
 
     assert first.acquire("expired", ttl=10)
+    first_lease_id = first.read("expired")["lease_id"]
     monkeypatch.setattr(claims.time, "time", lambda: now + 11)
     assert not first.holds("expired")
     assert second.acquire("expired", ttl=60)
     assert second.read("expired")["owner"] == "worker-b"
+    assert second.read("expired")["lease_id"] != first_lease_id
 
 
 def test_malformed_lease_is_unverifiable_and_not_takeover_eligible(tmp_path: Path, board_repo: Path) -> None:
@@ -239,12 +255,149 @@ def test_cleanup_cas_does_not_delete_renewed_lease(
 
     def list_then_renew() -> list[dict[str, object]]:
         snapshot = original_list()
-        assert owner.renew("lease", ttl=500)
+        assert owner.acquire("lease", ttl=500)
         return snapshot
 
     monkeypatch.setattr(cleaner, "list", list_then_renew)
     assert cleaner.cleanup() == 0
     assert cleaner.read("lease")["expires_at"] == 1_510.0
+
+
+def test_worker_id_is_metadata_not_lease_authority(tmp_path: Path, board_repo: Path) -> None:
+    owner = _board(
+        tmp_path,
+        board_repo,
+        "same-worker",
+        session_id="session-a",
+        scratch=tmp_path / "session-a",
+    )
+    peer = _board(
+        tmp_path,
+        board_repo,
+        "same-worker",
+        session_id="session-b",
+        scratch=tmp_path / "session-b",
+    )
+
+    assert owner.acquire("article", ttl=600)
+    assert owner.holds("article")
+    assert not peer.holds("article")
+    assert not peer.acquire("article", ttl=600)
+    assert not peer.renew("article", ttl=600)
+    assert not peer.release("article")
+    assert owner.holds("article")
+
+
+def test_exact_receipt_is_fenced_after_another_copy_renews(
+    tmp_path: Path, board_repo: Path
+) -> None:
+    owner = _board(
+        tmp_path,
+        board_repo,
+        "worker-a",
+        session_id="shared-session",
+        scratch=tmp_path / "owner",
+    )
+    stale = _board(
+        tmp_path,
+        board_repo,
+        "worker-a",
+        session_id="shared-session",
+        scratch=tmp_path / "stale",
+    )
+    assert owner.acquire("article", ttl=600)
+    original = owner._remote_oid("article")
+    assert original is not None
+    stale._ensure_scratch()
+    stale._git(["fetch", "--quiet", str(board_repo), f"+{claims.CLAIM_REF_PREFIX}article:{claims.CLAIM_REF_PREFIX}article"])
+    stale._record_receipt("article", original)
+    assert stale.holds("article")
+
+    assert owner.renew("article", ttl=600)
+    assert not stale.holds("article")
+    assert not stale.renew("article", ttl=600)
+    assert not stale.release("article")
+
+
+def test_receipt_failure_after_remote_acquire_is_uncertain_and_fails_closed(
+    tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a", session_id="session-a")
+
+    def fail_receipt(*args: object, **kwargs: object) -> None:
+        raise claims.ClaimTransportError("receipt unavailable")
+
+    monkeypatch.setattr(board, "_record_receipt", fail_receipt)
+    with pytest.raises(claims.ClaimTransportError, match="receipt unavailable"):
+        board.acquire("article", ttl=600)
+
+    assert board.read("article")["schema"] == claims.CLAIM_SCHEMA
+    assert not board.holds("article")
+
+
+def test_receipt_failure_after_remote_renewal_leaves_the_old_receipt_fenced(
+    tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a", session_id="session-a")
+    assert board.acquire("article", ttl=600)
+    old = board._remote_oid("article")
+
+    def fail_receipt(*args: object, **kwargs: object) -> None:
+        raise claims.ClaimTransportError("receipt unavailable")
+
+    monkeypatch.setattr(board, "_record_receipt", fail_receipt)
+    with pytest.raises(claims.ClaimTransportError, match="receipt unavailable"):
+        board.renew("article", ttl=600)
+
+    assert board._remote_oid("article") != old
+    assert board._receipt_oid("article") == old
+    assert not board.holds("article")
+
+
+def test_live_v1_blocks_v2_but_expired_v1_can_be_replaced(
+    tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "legacy"
+    _plant_lease(
+        board_repo,
+        key,
+        schema=claims.LEGACY_CLAIM_SCHEMA,
+        lease_id=None,
+    )
+    board = _board(tmp_path, board_repo, "original-owner")
+    monkeypatch.setattr(claims.time, "time", lambda: 150.0)
+
+    assert not board.holds(key)
+    assert not board.acquire(key, ttl=600)
+    assert not board.renew(key, ttl=600)
+    assert not board.release(key)
+
+    monkeypatch.setattr(claims.time, "time", lambda: 201.0)
+    assert board.acquire(key, ttl=600)
+    lease = board.read(key)
+    assert lease["schema"] == claims.CLAIM_SCHEMA
+    assert claims.LEASE_ID_RE.fullmatch(lease["lease_id"])
+
+
+def test_v2_lease_is_rejected_by_the_v1_schema_contract(tmp_path: Path, board_repo: Path) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+    assert board.acquire("article", ttl=600)
+
+    class V1Client(claims.ClaimBoard):
+        @staticmethod
+        def _lease_is_valid(lease: dict[str, object], key: str | None = None) -> bool:
+            return bool(
+                lease.get("schema") == claims.LEGACY_CLAIM_SCHEMA
+                and claims.ClaimBoard._lease_is_valid(lease, key)
+            )
+
+    old_client = V1Client(board_repo, "worker-a", tmp_path / "old-client")
+    with pytest.raises(claims.MalformedLeaseError, match="invalid lease schema"):
+        old_client.read("article")
+
+
+def test_resource_claim_keys_are_distinct_from_article_claim_keys() -> None:
+    assert claims.resource_claim_key("lake-build") != claims.author_claim_key("lake-build")
 
 
 def test_author_claim_keys_are_ref_safe_and_resist_slug_collisions() -> None:
@@ -289,8 +442,11 @@ def test_transport_failure_raises_without_local_fallback(tmp_path: Path) -> None
 
 def test_heartbeat_verifies_ownership_immediately_on_entry() -> None:
     class LostBoard:
-        def renew(self, key: str, ttl: int | float) -> bool:
-            return False
+        def held_lease_id(self, key: str) -> str | None:
+            return None
+
+        def renew(self, key: str, ttl: int | float, *, lease_id: str | None = None) -> bool:
+            raise AssertionError("an unheld lease must not be renewed")
 
     heartbeat = claims.Heartbeat(LostBoard(), "key", interval=1, ttl=30)  # type: ignore[arg-type]
     with pytest.raises(claims.ClaimTransportError, match="lost before"):
@@ -327,7 +483,11 @@ def test_heartbeat_marks_ownership_lost_on_transport_failure() -> None:
     class FailingBoard:
         calls = 0
 
-        def renew(self, key: str, ttl: int | float) -> bool:
+        def held_lease_id(self, key: str) -> str | None:
+            return "a" * 64
+
+        def renew(self, key: str, ttl: int | float, *, lease_id: str | None = None) -> bool:
+            assert lease_id == "a" * 64
             self.calls += 1
             if self.calls == 1:
                 return True
@@ -348,7 +508,11 @@ def test_heartbeat_marks_ownership_lost_when_renew_is_refused() -> None:
     class LostBoard:
         calls = 0
 
-        def renew(self, key: str, ttl: int | float) -> bool:
+        def held_lease_id(self, key: str) -> str | None:
+            return "b" * 64
+
+        def renew(self, key: str, ttl: int | float, *, lease_id: str | None = None) -> bool:
+            assert lease_id == "b" * 64
             self.calls += 1
             if self.calls == 1:
                 return True
@@ -361,6 +525,66 @@ def test_heartbeat_marks_ownership_lost_when_renew_is_refused() -> None:
         assert heartbeat.lost.wait(timeout=2)
 
     assert heartbeat.error is None
+
+
+def test_heartbeat_captures_one_lease_id_for_every_renewal() -> None:
+    renewed: list[str | None] = []
+    attempted = threading.Event()
+
+    class Board:
+        def held_lease_id(self, key: str) -> str | None:
+            return "c" * 64
+
+        def renew(self, key: str, ttl: int | float, *, lease_id: str | None = None) -> bool:
+            renewed.append(lease_id)
+            if len(renewed) > 1:
+                attempted.set()
+                return False
+            return True
+
+    heartbeat = claims.Heartbeat(Board(), "key", interval=0.01, ttl=30)  # type: ignore[arg-type]
+    with heartbeat:
+        assert attempted.wait(timeout=2)
+        assert heartbeat.lost.wait(timeout=2)
+
+    assert renewed == ["c" * 64, "c" * 64]
+
+
+def test_heartbeat_exit_waits_for_inflight_renew_and_no_renewal_runs_after_exit() -> None:
+    entered = threading.Event()
+    allow_return = threading.Event()
+    exited = threading.Event()
+
+    class Board:
+        calls = 0
+
+        def held_lease_id(self, key: str) -> str | None:
+            return "d" * 64
+
+        def renew(self, key: str, ttl: int | float, *, lease_id: str | None = None) -> bool:
+            self.calls += 1
+            if self.calls >= 2:
+                entered.set()
+                if self.calls == 2:
+                    assert allow_return.wait(timeout=2)
+            return True
+
+    board = Board()
+    heartbeat = claims.Heartbeat(board, "key", interval=0.01, ttl=30)  # type: ignore[arg-type]
+    heartbeat.__enter__()
+    assert entered.wait(timeout=2)
+
+    closer = threading.Thread(target=lambda: (heartbeat.__exit__(), exited.set()))
+    closer.start()
+    assert not exited.wait(timeout=0.05)
+    allow_return.set()
+    assert exited.wait(timeout=2)
+    closer.join(timeout=2)
+    assert not closer.is_alive()
+    calls_at_exit = board.calls
+    entered.clear()
+    assert not entered.wait(timeout=0.05)
+    assert board.calls == calls_at_exit
 
 
 @pytest.mark.parametrize(
@@ -398,12 +622,13 @@ def test_schema_resource_or_required_field_mismatch_is_malformed(
     assert board.cleanup() == 0
 
 
-@pytest.mark.parametrize("field", ["schema", "owner", "resource", "acquired_at", "expires_at"])
+@pytest.mark.parametrize("field", ["schema", "lease_id", "owner", "resource", "acquired_at", "expires_at"])
 def test_planted_lease_with_duplicate_decision_field_is_rejected_by_strict_json_parser(
     tmp_path: Path, board_repo: Path, field: str
 ) -> None:
     values = {
-        "schema": '"autoform-claim/v1"',
+        "schema": '"autoform-claim/v2"',
+        "lease_id": '"' + "1" * 64 + '"',
         "owner": '"worker-a"',
         "resource": '"duplicate"',
         "acquired_at": "100.0",
@@ -424,7 +649,10 @@ def test_planted_nonfinite_lease_is_rejected_by_strict_json_parser(
     tmp_path: Path, board_repo: Path
 ) -> None:
     message = (
-        '{"schema":"autoform-claim/v1","owner":"worker-a","resource":"strict-json",'
+        '{"schema":"autoform-claim/v2","lease_id":"'
+        + "1" * 64
+        + '",'
+        '"owner":"worker-a","resource":"strict-json",'
         '"acquired_at":0,"expires_at":NaN}'
     )
     _plant_message(board_repo, "strict-json", message)

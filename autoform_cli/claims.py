@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import secrets
 import socket
 import subprocess
 import threading
@@ -21,10 +22,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 CLAIM_REF_PREFIX = "refs/autoform-claims/"
-CLAIM_SCHEMA = "autoform-claim/v1"
+CLAIM_RECEIPT_REF_PREFIX = "refs/autoform-claim-receipts/"
+CLAIM_SCHEMA = "autoform-claim/v2"
+LEGACY_CLAIM_SCHEMA = "autoform-claim/v1"
 CLAIM_TTL_S = 1500
 CLAIM_HEARTBEAT_S = 300
 CLAIM_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+LEASE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "autoform",
@@ -93,10 +97,28 @@ def author_claim_key(node_id: str) -> str:
     return f"author/{slug}-{digest}"
 
 
+def resource_claim_key(resource: str) -> str:
+    """Return a ref-safe key in the namespace for non-article resources."""
+    if not isinstance(resource, str):
+        raise TypeError("resource must be a string")
+    if not resource:
+        raise ValueError("resource must not be empty")
+    slug = re.sub(r"[^a-z0-9-]+", "-", resource.lower()).strip("-")[:48] or "resource"
+    digest = hashlib.sha256(resource.encode("utf-8")).hexdigest()[:16]
+    return f"resource/{slug}-{digest}"
+
+
 class ClaimBoard:
     """Lease operations against a Git repository via a local bare object store."""
 
-    def __init__(self, repo_url: str | os.PathLike[str], worker_id: str, scratch: str | os.PathLike[str]):
+    def __init__(
+        self,
+        repo_url: str | os.PathLike[str],
+        worker_id: str,
+        scratch: str | os.PathLike[str],
+        *,
+        session_id: str | None = None,
+    ):
         if not worker_id:
             raise ValueError("worker_id must not be empty")
         raw_repo_url = os.fspath(repo_url)
@@ -105,6 +127,14 @@ class ClaimBoard:
         self.repo_url = raw_repo_url
         self.worker_id = worker_id
         self.scratch = Path(scratch)
+        if session_id is None:
+            session_id = f"scratch:{self.scratch.expanduser().resolve()}"
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must not be empty")
+        self.session_id = session_id
+        self._session_key = hashlib.sha256(
+            f"{self.repo_url}\0{session_id}".encode("utf-8")
+        ).hexdigest()
 
     def _git(
         self,
@@ -140,10 +170,49 @@ class ClaimBoard:
     def _ref(key: str) -> str:
         return CLAIM_REF_PREFIX + _validate_key(key)
 
+    def _receipt_ref(self, key: str) -> str:
+        return f"{CLAIM_RECEIPT_REF_PREFIX}{self._session_key}/{_validate_key(key)}"
+
     def _remote_oid(self, key: str) -> str | None:
         proc = self._git(["ls-remote", self.repo_url, self._ref(key)])
         line = proc.stdout.strip()
         return line.split("\t", 1)[0] if line else None
+
+    def _receipt_oid(self, key: str) -> str | None:
+        proc = self._git(
+            ["rev-parse", "--verify", "--quiet", self._receipt_ref(key)],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip() or None
+        if proc.returncode == 1:
+            return None
+        detail = (proc.stderr or proc.stdout).strip()[:300]
+        raise ClaimTransportError(f"could not read local claim receipt: {detail}")
+
+    def _record_receipt(self, key: str, oid: str, *, expected: str | None = None) -> None:
+        args = ["update-ref", self._receipt_ref(key), oid]
+        if expected is not None:
+            args.append(expected)
+        proc = self._git(args, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[:300]
+            raise ClaimTransportError(
+                "remote claim changed but its exact local ownership receipt could not be recorded"
+                + (f": {detail}" if detail else "")
+            )
+
+    def _clear_receipt(self, key: str, *, expected: str | None = None) -> None:
+        args = ["update-ref", "-d", self._receipt_ref(key)]
+        if expected is not None:
+            args.append(expected)
+        proc = self._git(args, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[:300]
+            raise ClaimTransportError(
+                "remote claim changed but its local ownership receipt could not be cleared"
+                + (f": {detail}" if detail else "")
+            )
 
     def _read_lease(self, key: str, oid: str) -> dict[str, Any]:
         ref = self._ref(key)
@@ -172,7 +241,7 @@ class ClaimBoard:
         acquired_at = lease.get("acquired_at")
         expires_at = lease.get("expires_at")
         valid = (
-            lease.get("schema") == CLAIM_SCHEMA
+            lease.get("schema") in {CLAIM_SCHEMA, LEGACY_CLAIM_SCHEMA}
             and isinstance(lease.get("owner"), str)
             and bool(lease.get("owner"))
             and isinstance(lease.get("resource"), str)
@@ -180,9 +249,21 @@ class ClaimBoard:
             and _is_finite_number(expires_at)
             and acquired_at <= expires_at
         )
+        if lease.get("schema") == CLAIM_SCHEMA:
+            valid = valid and isinstance(lease.get("lease_id"), str) and bool(
+                LEASE_ID_RE.fullmatch(str(lease.get("lease_id")))
+            )
         return bool(valid and (key is None or lease.get("resource") == key))
 
-    def _make_lease_commit(self, key: str, ttl: int | float, note: str = "") -> str:
+    def _make_lease_commit(
+        self,
+        key: str,
+        ttl: int | float,
+        note: str = "",
+        *,
+        lease_id: str | None = None,
+        acquired_at: int | float | None = None,
+    ) -> str:
         key = _validate_key(key)
         ttl = _validate_ttl(ttl)
         now = time.time()
@@ -194,12 +275,21 @@ class ClaimBoard:
             raise ValueError("claim expiry must be finite") from exc
         if not math.isfinite(expires_at):
             raise ValueError("claim expiry must be finite")
+        if acquired_at is None:
+            acquired_at = now
+        if not _is_finite_number(acquired_at) or acquired_at > now:
+            raise ValueError("claim acquisition timestamp must be finite and not in the future")
+        if lease_id is None:
+            lease_id = secrets.token_hex(32)
+        if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
+            raise ValueError("claim lease_id must be 64 lowercase hexadecimal characters")
         lease: dict[str, Any] = {
             "schema": CLAIM_SCHEMA,
+            "lease_id": lease_id,
             "owner": self.worker_id,
             "host": socket.gethostname(),
             "pid": os.getpid(),
-            "acquired_at": now,
+            "acquired_at": acquired_at,
             "expires_at": expires_at,
             "resource": key,
         }
@@ -248,26 +338,44 @@ class ClaimBoard:
         return expires_at <= comparison_time
 
     def acquire(self, key: str, ttl: int | float = CLAIM_TTL_S, steal: bool = False, note: str = "") -> bool:
-        """CAS-acquire a free, expired, malformed, owned, or explicitly stolen lease."""
+        """CAS-acquire a free or expired lease, or refresh this exact session's lease."""
         key = _validate_key(key)
         _validate_ttl(ttl)
         self._ensure_scratch()
         old = self._remote_oid(key)
+        lease_id: str | None = None
+        acquired_at: int | float | None = None
         if old is not None:
             lease = self._read_lease(key, old)
-            if (
-                lease is not None
-                and self._lease_is_valid(lease, key)
-                and lease.get("owner") != self.worker_id
-                and not self.expired(lease)
-                and not steal
-            ):
-                return False
-        new = self._make_lease_commit(key, ttl, note)
-        return self._cas_push(key, old, new)
+            if not self.expired(lease):
+                if lease.get("schema") == LEGACY_CLAIM_SCHEMA:
+                    return False
+                if not self._receipt_matches(key, old, lease):
+                    if not steal:
+                        return False
+                else:
+                    lease_id = str(lease["lease_id"])
+                    acquired_at = lease["acquired_at"]
+        new = self._make_lease_commit(
+            key,
+            ttl,
+            note,
+            lease_id=lease_id,
+            acquired_at=acquired_at,
+        )
+        if not self._cas_push(key, old, new):
+            return False
+        self._record_receipt(key, new, expected=old if lease_id is not None else None)
+        return True
 
-    def renew(self, key: str, ttl: int | float = CLAIM_TTL_S) -> bool:
-        """CAS-renew this worker's lease, returning ``False`` if ownership was lost."""
+    def renew(
+        self,
+        key: str,
+        ttl: int | float = CLAIM_TTL_S,
+        *,
+        lease_id: str | None = None,
+    ) -> bool:
+        """CAS-renew this session's exact lease, returning ``False`` if it was lost."""
         key = _validate_key(key)
         _validate_ttl(ttl)
         self._ensure_scratch()
@@ -275,32 +383,72 @@ class ClaimBoard:
         if old is None:
             return False
         lease = self._read_lease(key, old)
-        if lease is None or not self._lease_is_valid(lease, key) or lease.get("owner") != self.worker_id:
+        if (
+            lease.get("schema") != CLAIM_SCHEMA
+            or self.expired(lease)
+            or not self._receipt_matches(key, old, lease)
+            or (lease_id is not None and lease.get("lease_id") != lease_id)
+        ):
             return False
-        new = self._make_lease_commit(key, ttl, str(lease.get("note", "")))
-        return self._cas_push(key, old, new)
+        new = self._make_lease_commit(
+            key,
+            ttl,
+            str(lease.get("note", "")),
+            lease_id=str(lease["lease_id"]),
+            acquired_at=lease["acquired_at"],
+        )
+        if not self._cas_push(key, old, new):
+            return False
+        self._record_receipt(key, new, expected=old)
+        return True
 
     def release(self, key: str) -> bool:
-        """CAS-delete this worker's lease; refuse foreign or unverifiable ownership."""
+        """CAS-delete this session's lease; refuse stale or unverifiable ownership."""
         key = _validate_key(key)
         self._ensure_scratch()
         old = self._remote_oid(key)
         if old is None:
+            self._clear_receipt(key)
             return True
         lease = self._read_lease(key, old)
-        if lease is None or not self._lease_is_valid(lease, key) or lease.get("owner") != self.worker_id:
+        if (
+            lease.get("schema") != CLAIM_SCHEMA
+            or self.expired(lease)
+            or not self._receipt_matches(key, old, lease)
+        ):
             return False
-        return self._cas_push(key, old, "")
+        if not self._cas_push(key, old, ""):
+            return False
+        self._clear_receipt(key, expected=old)
+        return True
 
     def holds(self, key: str) -> bool:
-        """Return whether this worker verifiably owns the current live lease."""
-        lease = self.read(key)
-        return bool(
-            lease is not None
-            and self._lease_is_valid(lease, key)
-            and lease.get("owner") == self.worker_id
-            and not self.expired(lease)
-        )
+        """Return whether this session has the exact receipt for the live lease."""
+        return self.held_lease_id(key) is not None
+
+    def held_lease_id(self, key: str) -> str | None:
+        """Return the fenced lease id held by this session, or ``None``."""
+        key = _validate_key(key)
+        self._ensure_scratch()
+        oid = self._remote_oid(key)
+        if oid is None:
+            return None
+        lease = self._read_lease(key, oid)
+        if (
+            lease.get("schema") != CLAIM_SCHEMA
+            or self.expired(lease)
+            or not self._receipt_matches(key, oid, lease)
+        ):
+            return None
+        return str(lease["lease_id"])
+
+    def _receipt_matches(self, key: str, oid: str, lease: Mapping[str, Any]) -> bool:
+        """Return whether this session recorded this exact v2 lease commit."""
+        receipt_oid = self._receipt_oid(key)
+        if receipt_oid != oid or lease.get("schema") != CLAIM_SCHEMA:
+            return False
+        receipt = self._read_lease(key, receipt_oid)
+        return bool(receipt.get("lease_id") == lease.get("lease_id"))
 
     def list(self) -> list[dict[str, Any]]:
         """Return all claim refs, including malformed and expired entries."""
@@ -327,6 +475,7 @@ class ClaimBoard:
                 }
             else:
                 lease["_malformed"] = False
+                lease["_legacy"] = lease.get("schema") == LEGACY_CLAIM_SCHEMA
             lease["_key"] = key
             lease["_oid"] = oid
             lease["_expired"] = not lease["_malformed"] and self.expired(lease)
@@ -380,6 +529,7 @@ class Heartbeat:
         self.ttl = ttl
         self.lost = threading.Event()
         self.error: Exception | None = None
+        self.lease_id: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -387,7 +537,12 @@ class Heartbeat:
         if self._thread is not None:
             raise RuntimeError("heartbeat cannot be started more than once")
         try:
-            renewed = self.board.renew(self.key, ttl=self.ttl)
+            self.lease_id = self.board.held_lease_id(self.key)
+            renewed = self.lease_id is not None and self.board.renew(
+                self.key,
+                ttl=self.ttl,
+                lease_id=self.lease_id,
+            )
         except Exception as exc:
             self.error = exc
             self.lost.set()
@@ -402,12 +557,16 @@ class Heartbeat:
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join()
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             try:
-                renewed = self.board.renew(self.key, ttl=self.ttl)
+                renewed = self.board.renew(
+                    self.key,
+                    ttl=self.ttl,
+                    lease_id=self.lease_id,
+                )
             except Exception as exc:
                 self.error = exc
                 self.lost.set()
@@ -420,12 +579,16 @@ class Heartbeat:
 __all__ = [
     "CLAIM_HEARTBEAT_S",
     "CLAIM_KEY_RE",
+    "CLAIM_RECEIPT_REF_PREFIX",
     "CLAIM_REF_PREFIX",
     "CLAIM_SCHEMA",
     "CLAIM_TTL_S",
     "ClaimBoard",
     "ClaimTransportError",
     "Heartbeat",
+    "LEGACY_CLAIM_SCHEMA",
+    "LEASE_ID_RE",
     "MalformedLeaseError",
     "author_claim_key",
+    "resource_claim_key",
 ]

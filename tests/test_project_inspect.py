@@ -1012,7 +1012,7 @@ def test_claim_help_describes_git_refs(capsys, monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(SystemExit):
         main(["--help"])
     captured = capsys.readouterr()
-    assert "coordinate temporary node ownership through Git refs" in captured.out
+    assert "coordinate temporary article and resource ownership through Git refs" in captured.out
 
 
 def test_inspection_does_not_write_project(tmp_path: Path) -> None:

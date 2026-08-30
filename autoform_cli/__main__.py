@@ -15,7 +15,14 @@ from pathlib import Path, PurePosixPath
 from . import status
 from .article_identity import plan_article_ids
 from .audit import audit_blueprint
-from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
+from .claims import (
+    CLAIM_TTL_S,
+    LEGACY_CLAIM_SCHEMA,
+    ClaimBoard,
+    ClaimTransportError,
+    author_claim_key,
+    resource_claim_key,
+)
 from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
@@ -30,6 +37,7 @@ from .project import (
 )
 from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
+from .runtime import RuntimeProjectionError, resolve_runtime_paths
 from .scaffold import ScaffoldError, scaffold_project
 
 
@@ -135,11 +143,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--json", action="store_true", help="write stable machine-readable output"
     )
 
-    claim = subparsers.add_parser("claim", help="coordinate temporary node ownership through Git refs")
+    claim = subparsers.add_parser(
+        "claim", help="coordinate temporary article and resource ownership through Git refs"
+    )
     claim_subparsers = claim.add_subparsers(dest="claim_command", required=True)
     for operation in ("acquire", "renew", "release"):
         command = claim_subparsers.add_parser(operation)
-        command.add_argument("node_id")
+        command.add_argument("node_id", nargs="?", help="roadmap path id or exact article_id")
+        command.add_argument("--resource", help="claim a raw shared resource instead of an article")
+        command.add_argument(
+            "--blueprint",
+            default=".",
+            help="project or blueprint directory used to resolve the article (default: current directory)",
+        )
         _add_claim_board_arguments(command)
         if operation in {"acquire", "renew"}:
             command.add_argument("--ttl", type=int, default=CLAIM_TTL_S)
@@ -204,7 +220,12 @@ def _add_claim_board_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--worker-id",
         default=os.environ.get("AUTOFORM_WORKER_ID"),
-        help="stable identity for this agent (or set AUTOFORM_WORKER_ID)",
+        help="display identity for this agent (or set AUTOFORM_WORKER_ID)",
+    )
+    parser.add_argument(
+        "--session-id",
+        default=os.environ.get("AUTOFORM_CLAIM_SESSION_ID"),
+        help="stable work session identity (or set AUTOFORM_CLAIM_SESSION_ID)",
     )
     parser.add_argument("--scratch", type=Path, help="local bare Git object cache")
 
@@ -469,17 +490,28 @@ def _print_project_inspection(result) -> None:
 
 def _claim(args: argparse.Namespace) -> int:
     try:
-        board = _claim_board(args)
         operation = args.claim_command
         if operation == "list":
+            board = _claim_board(args)
             print(json.dumps(board.list(), sort_keys=True, separators=(",", ":")))
             return 0
         if operation == "cleanup":
+            board = _claim_board(args)
             print(f"removed {board.cleanup()} expired claim(s)")
             return 0
 
-        key = author_claim_key(args.node_id)
+        key, label, legacy_key = _resolve_claim_target(args)
+        board = _claim_board(args)
         if operation == "acquire":
+            if legacy_key is not None and legacy_key != key:
+                legacy = board.read(legacy_key)
+                if legacy is not None and not board.expired(legacy):
+                    schema = legacy.get("schema")
+                    kind = "legacy v1" if schema == LEGACY_CLAIM_SCHEMA else "path-keyed"
+                    print(
+                        f"error: could not acquire {label}; a live {kind} claim still guards its path"
+                    )
+                    return 1
             succeeded = board.acquire(key, ttl=args.ttl, note=args.note)
         elif operation == "renew":
             succeeded = board.renew(key, ttl=args.ttl)
@@ -487,9 +519,9 @@ def _claim(args: argparse.Namespace) -> int:
             succeeded = board.release(key)
         if succeeded:
             past_tense = {"acquire": "acquired", "renew": "renewed", "release": "released"}
-            print(f"{past_tense[operation]} {args.node_id} ({key})")
+            print(f"{past_tense[operation]} {label} ({key})")
             return 0
-        print(f"error: could not {operation} {args.node_id}; ownership is held or unverifiable")
+        print(f"error: could not {operation} {label}; ownership is held or unverifiable")
         return 1
     except (ClaimTransportError, ValueError) as exc:
         print(f"error: {exc}")
@@ -523,8 +555,49 @@ def _claim_board(args: argparse.Namespace) -> ClaimBoard:
     if not worker_id:
         raise ValueError("--worker-id or AUTOFORM_WORKER_ID is required")
     repo = args.repo or _origin_url()
-    scratch = args.scratch or _default_claim_scratch(repo, worker_id)
-    return ClaimBoard(repo, worker_id, scratch)
+    session_id = args.session_id or _worktree_claim_session_id(getattr(args, "blueprint", "."))
+    scratch = args.scratch or _default_claim_scratch(repo, session_id)
+    return ClaimBoard(repo, worker_id, scratch, session_id=session_id)
+
+
+def _resolve_claim_target(args: argparse.Namespace) -> tuple[str, str, str | None]:
+    article_target = args.node_id
+    resource = args.resource
+    if article_target and resource:
+        raise ValueError("article target and --resource are mutually exclusive")
+    if resource:
+        return resource_claim_key(resource), resource, None
+    if not article_target:
+        raise ValueError("an article target or --resource is required")
+    if article_target == "lake-build":
+        print(
+            "warning: positional lake-build is deprecated; use --resource lake-build",
+            file=sys.stderr,
+        )
+        return resource_claim_key(article_target), article_target, None
+
+    try:
+        blueprint = resolve_runtime_paths(args.blueprint).blueprint_dir
+    except RuntimeProjectionError as exc:
+        raise ValueError(str(exc)) from exc
+    graph = load_graph(blueprint)
+    matches = [
+        node
+        for node in graph.nodes.values()
+        if article_target == node.id or article_target == node.article_id
+    ]
+    if not matches:
+        raise ValueError(f"article target {article_target!r} does not exist in {blueprint}")
+    if len(matches) != 1:
+        paths = ", ".join(sorted(node.id for node in matches))
+        raise ValueError(f"article target {article_target!r} is ambiguous: {paths}")
+    node = matches[0]
+    if node.article_id is None:
+        raise ValueError(
+            f"article {node.id!r} has no durable article_id; "
+            f"run 'autoform migrate article-ids {blueprint}' and add the proposed ID"
+        )
+    return author_claim_key(node.article_id), node.id, author_claim_key(node.id)
 
 
 def _origin_url() -> str:
@@ -541,9 +614,28 @@ def _origin_url() -> str:
     return result.stdout.strip()
 
 
-def _default_claim_scratch(repo: str, worker_id: str) -> Path:
+def _worktree_claim_session_id(project_or_blueprint: str | Path = ".") -> str:
+    target = Path(project_or_blueprint).expanduser().resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(
+            "--session-id or AUTOFORM_CLAIM_SESSION_ID is required outside a Git worktree"
+        ) from exc
+    root = str(Path(result.stdout.strip()).resolve())
+    digest = hashlib.sha256(f"{socket.gethostname()}\0{root}".encode()).hexdigest()
+    return f"worktree-{digest}"
+
+
+def _default_claim_scratch(repo: str, session_id: str) -> Path:
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    identity = hashlib.sha256(f"{repo}\0{worker_id}\0{socket.gethostname()}".encode()).hexdigest()[:24]
+    identity = hashlib.sha256(f"{repo}\0{session_id}\0{socket.gethostname()}".encode()).hexdigest()[:24]
     return cache / "autoform" / "claims" / identity
 
 

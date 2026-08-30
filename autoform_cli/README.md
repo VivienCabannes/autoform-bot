@@ -363,8 +363,9 @@ autoform migrate article-ids blueprint --check
 `article_id` accepts opaque values in the form `af_` plus 24 lowercase hex
 digits. The planner validates uniqueness, proposes deterministic IDs for
 missing articles, includes exact source hashes, and is strictly read-only.
-Applying plans, moving runtime consumers and claims to durable IDs, and
-preserving publication routes are intentionally deferred to follow-up changes.
+Apply the proposed IDs to article frontmatter before dispatching collaborative
+work. Claims resolve current roadmap paths to these durable IDs, so renaming an
+article does not change its lock.
 
 Coordinate temporary cross-machine ownership without modifying the book:
 
@@ -373,13 +374,19 @@ export AUTOFORM_WORKER_ID="agent-name"
 autoform claim acquire "chapter/main-result"
 autoform claim renew "chapter/main-result"
 autoform claim release "chapter/main-result"
+autoform claim acquire --resource lake-build
 ```
 
 Claims are fail-closed compare-and-swap leases under
 `refs/autoform-claims/` on the Git `origin`; pass `--repo` for another claim
-board. A failed acquire or renew means the caller cannot prove ownership and
-must stop before committing or pushing protected work. Claims do not prove
-mathematical correctness and do not replace branch-level Git CAS.
+board. Article targets are resolved against the current project's `blueprint/`
+and keyed by their durable `article_id`; use `--blueprint` when invoking the
+command elsewhere. Raw locks require `--resource`. The CLI derives a stable
+session from the worktree, with `--session-id` or
+`AUTOFORM_CLAIM_SESSION_ID` as an explicit override. A failed acquire or renew
+means the caller cannot prove ownership and must stop before committing or
+pushing protected work. Claims do not prove mathematical correctness and do
+not replace branch-level Git CAS.
 
 Write the Mermaid dependency graph into the vault, where Obsidian renders it:
 
@@ -484,18 +491,20 @@ work, stamps articles, or creates another graph artifact.
 
 ## Claim contract
 
-Claims use canonical `autoform-claim/v1` JSON in orphan commit messages and
-exact observed object IDs as update preconditions. Absent and verifiably expired
-leases may be acquired; live peer leases are refused. Malformed or unreadable
-refs are unverifiable and may not be acquired, renewed, released, or removed by
-cleanup. A heartbeat verifies ownership on entry and permanently records any
-later refusal or transport uncertainty as lost ownership.
+Claims use canonical `autoform-claim/v2` JSON in orphan commit messages. A
+cryptographically random lease ID and a session-local receipt for the exact
+pushed object fence every ownership operation; `worker_id` is display metadata,
+not authority. Absent and verifiably expired leases may be acquired; live peer
+leases are refused. Valid v1 leases remain readable during migration, but a live
+v1 lease cannot be adopted, renewed, or released by a v2 session. Malformed or
+unreadable refs remain unverifiable. A heartbeat captures one lease ID, records
+any refusal or transport uncertainty as lost ownership, and waits for an
+in-flight renewal before exiting.
 
-A claim key is a slug and digest of any string, not a validated node id, so a
-shared resource is locked the same way a node is. Parallel agents get one Git
-worktree each and serialize `lake build` behind a `lake-build` claim, because
-builds share the elan toolchain and the Mathlib cache even when the checkouts
-are separate.
+Article claims require a real graph node with materialized `article_id`
+frontmatter. Separate raw-resource keys cover coordination outside the roadmap.
+Parallel agents get one Git worktree each and serialize shared build state with
+`autoform claim acquire --resource lake-build`.
 
 Claims are temporary operational state, never article frontmatter. Future
 Deicyde workers may share this protocol, but their current continue-uncoordinated
