@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+import autoform_cli.render as render_module
 from autoform_cli.lean import _normalize_remote
 from autoform_cli.render import PUBLICATION_MANIFEST, PublicationError, render_site
 from autoform_cli.status import STATES
@@ -575,14 +579,31 @@ def test_render_is_deterministic_and_records_a_path_free_manifest(tmp_path: Path
             "source_sha256": manifest["coverage"]["source_sha256"],
         },
         "dependencies": 1,
+        "directories": manifest["directories"],
+        "files": manifest["files"],
         "git_ref": "a" * 40,
         "nodes": 3,
-        "schema": "autoform-publication/v1",
+        "schema": "autoform-publication/v2",
         "source": "blueprint/roadmap Markdown",
         "source_revision": manifest["source_revision"],
         "views": ["book", "progress", "project", "chapter", "focus", "full"],
     }
     assert re.fullmatch(r"[0-9a-f]{64}", manifest["source_revision"])
+    expected_files = {path for path in first if path != PUBLICATION_MANIFEST}
+    assert set(manifest["files"]) == expected_files
+    assert all(
+        digest == hashlib.sha256(first[path]).hexdigest()
+        for path, digest in manifest["files"].items()
+    )
+    expected_directories = sorted(
+        {
+            parent.as_posix()
+            for path in expected_files
+            for parent in Path(path).parents
+            if parent != Path(".")
+        }
+    )
+    assert manifest["directories"] == expected_directories
     assert str(tmp_path).encode() not in b"".join(first.values())
 
 
@@ -746,17 +767,154 @@ def test_render_refuses_decomposition_evidence_with_a_missing_anchor(tmp_path: P
     assert manifest["coverage"]["complete"]
 
 
-def test_render_cleans_only_an_owned_publication(tmp_path: Path) -> None:
+def test_render_replaces_only_an_exact_owned_publication(tmp_path: Path) -> None:
     project = _project(tmp_path)
     output = tmp_path / "out"
     render_site(project / "blueprint", output, lean_root=project)
+    render_site(project / "blueprint", output, lean_root=project)
+    assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+
     stale = output / "stale.txt"
     stale.write_text("old generated output\n", encoding="utf-8")
 
-    render_site(project / "blueprint", output, lean_root=project)
+    with pytest.raises(PublicationError, match="untracked or missing files.*stale.txt"):
+        render_site(project / "blueprint", output, lean_root=project)
 
-    assert not stale.exists()
+    assert stale.read_text(encoding="utf-8") == "old generated output\n"
+
+
+def test_schema_only_manifest_cannot_authorize_deletion(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("user data\n", encoding="utf-8")
+    (output / PUBLICATION_MANIFEST).write_text(
+        json.dumps(
+            {"schema": "autoform-publication/v2", "complete": True},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PublicationError, match="valid file inventory"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert sentinel.read_text(encoding="utf-8") == "user data\n"
+
+
+def test_render_refuses_a_modified_owned_file(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    overview = output / "README.md"
+    overview.write_text("changed after publication\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match="modified Autoform publication"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert overview.read_text(encoding="utf-8") == "changed after publication\n"
+
+
+def test_failed_staged_render_preserves_the_previous_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    before = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected render failure")
+
+    monkeypatch.setattr(render_module, "_render_summary_nav", fail)
+    with pytest.raises(RuntimeError, match="injected render failure"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    after = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+
+
+def test_source_change_during_render_aborts_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    old_manifest = (output / PUBLICATION_MANIFEST).read_bytes()
+    article = project / "blueprint/roadmap/top.md"
+    original = render_module._render_snapshot
+
+    def mutate_after_render(*args, **kwargs):
+        report = original(*args, **kwargs)
+        article.write_text(article.read_text(encoding="utf-8") + "\nChanged concurrently.\n")
+        return report
+
+    monkeypatch.setattr(render_module, "_render_snapshot", mutate_after_render)
+    with pytest.raises(PublicationError, match="blueprint changed during publication"):
+        render_site(project / "blueprint", output, lean_root=project)
+
+    assert (output / PUBLICATION_MANIFEST).read_bytes() == old_manifest
+    assert not list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+
+
+def test_concurrent_renders_publish_one_generation_without_leaking_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    output = tmp_path / "out"
+    barrier = threading.Barrier(2)
+    original = render_module._publish_staged_site
+
+    def publish_together(*args, **kwargs):
+        barrier.wait(timeout=10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(render_module, "_publish_staged_site", publish_together)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(render_site, project / "blueprint", output, lean_root=project)
+            for _ in range(2)
+        ]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except Exception as error:
+                outcomes.append(error)
+
+    assert sum(isinstance(outcome, render_module.RenderReport) for outcome in outcomes) == 1
+    failures = [outcome for outcome in outcomes if isinstance(outcome, PublicationError)]
+    assert len(failures) == 1
+    assert "output directory changed during publication" in str(failures[0])
     assert json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))["complete"]
+    assert not list(tmp_path.glob(f"{render_module._PUBLICATION_STAGE_PREFIX}out-*"))
+
+
+def test_non_clean_render_preserves_only_verified_prior_files(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    source = project / "blueprint/appendix.txt"
+    source.write_text("generated companion asset\n", encoding="utf-8")
+    output = tmp_path / "out"
+    render_site(project / "blueprint", output, lean_root=project)
+    source.unlink()
+
+    render_site(project / "blueprint", output, lean_root=project, clean=False)
+
+    assert (output / "appendix.txt").read_text(encoding="utf-8") == "generated companion asset\n"
+    manifest = json.loads((output / PUBLICATION_MANIFEST).read_text(encoding="utf-8"))
+    assert "appendix.txt" in manifest["files"]
 
 
 def test_render_refuses_to_overwrite_an_unowned_directory(tmp_path: Path) -> None:
