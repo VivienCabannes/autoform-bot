@@ -228,10 +228,14 @@ uv run --with mkdocs --with mkdocs-material --with mkdocs-literate-nav \
 Generated CI additionally rebuilds the root Lake package, then checks every
 local `lean:` target belongs to one of those built modules. Each
 `mathlib_declaration` must exist in the module named by `mathlib_file`. Lake
-must resolve that module from the dependency whose package id is exactly
-`mathlib`, and the module's build trace must record that same package id. A
-different dependency exporting a `Mathlib.*` module is rejected, as is a
-root-package declaration impersonating a Mathlib result. Existence and
+must resolve that module from the sole `mathlib` entry in `lake-manifest.json`.
+That entry must pin a full commit from the canonical upstream Mathlib URL, and
+the checked-out dependency must have the matching clean Git `HEAD` and origin.
+The queried artifacts must remain inside that checkout's build directory, and
+must carry a valid Lake build or cache trace; a full build trace must record the
+`mathlib` package id. Local path packages, forks, mirrors, dirty or mismatched
+checkouts, and other dependencies exporting a `Mathlib.*` module are rejected,
+as is a root-package declaration impersonating a Mathlib result. Existence and
 declaration kind are read from Lean's environment, not inferred from source
 text.
 

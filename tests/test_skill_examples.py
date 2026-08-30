@@ -576,7 +576,8 @@ def test_roadmap_records_kernel_verifiable_mathlib_provenance(repo_root: Path) -
         "mathlib_file: Mathlib/.../*.lean",
         "declaration kind",
         "declaring module",
-        "package id is exactly `mathlib`",
+        "manifest-pinned commit",
+        "canonical upstream Mathlib Git checkout",
     ):
         assert required in roadmap
 

@@ -128,8 +128,10 @@ Python package so its console scripts are on `PATH`.
 `check --lean-root` lexically resolves names in local Lean files; it does not
 compile them or prove that they belong to a Lake target. Use `lake build` and
 the verification workflow for compilation and audit. That gate binds local
-claims to the root package's artifacts and Mathlib claims to build traces from
-the Lake package whose id is exactly `mathlib`.
+claims to the root package's artifacts. It accepts Mathlib claims only from a
+clean checkout at the manifest-pinned commit of the canonical upstream
+`https://github.com/leanprover-community/mathlib4.git`, then checks the module's
+Lake package trace.
 
 `render` writes MkDocs source, not a deployed site. The generated Pages workflow
 deploys from `main` only after GitHub Pages is enabled in repository settings.

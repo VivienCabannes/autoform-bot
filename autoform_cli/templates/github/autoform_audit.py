@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path, PurePosixPath
 
 from autoform_cli.graph import GraphValidationError, load_graph
@@ -53,6 +57,11 @@ except ImportError:
         return ".".join(module_parts)
 
 _MAX_ILEAN_BYTES = 16 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_CANONICAL_MATHLIB_URL = "https://github.com/leanprover-community/mathlib4.git"
+_FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
+_LAKE_HASH = re.compile(r"[0-9a-f]{16}")
+_CACHE_SCHEMA_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _TOP_LEVEL_NAME = re.compile(r'^name\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$')
 
 
@@ -69,6 +78,24 @@ class BlueprintTarget:
     expected_kind: str
     owner: str
     expected_module: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MathlibCheckout:
+    project: Path
+    checkout: Path
+    build_root: Path
+    revision: str
+    manifest_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FileSignature:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
 
 
 def root_package_from_config(config: Path) -> str:
@@ -185,7 +212,7 @@ def _validate_trace(trace: object, module: str, root_package: str, display_path:
 def mathlib_modules_from_lake(
     lean_root: Path, targets: tuple[BlueprintTarget, ...]
 ) -> tuple[str, ...]:
-    """Resolve claimed modules through Lake's package whose id is ``mathlib``."""
+    """Resolve claims through the manifest-pinned canonical Mathlib checkout."""
 
     modules = tuple(
         sorted(
@@ -198,19 +225,15 @@ def mathlib_modules_from_lake(
     )
     if not modules:
         return ()
-    try:
-        project = lean_root.resolve(strict=True)
-    except OSError as exc:
-        raise AuditInputError(f"cannot resolve Lean project root: {exc}") from exc
-    if not project.is_dir():
-        raise AuditInputError(f"Lean project root is not a directory: {project}")
+    checkout = _mathlib_checkout_from_manifest(lean_root)
+    signatures: dict[Path, _FileSignature] = {}
 
     for module in modules:
         target = f"@mathlib/+{module}:ilean"
         try:
             queried = subprocess.run(
                 ["lake", "query", "--json", target],
-                cwd=project,
+                cwd=checkout.project,
                 capture_output=True,
                 text=True,
                 check=False,
@@ -236,22 +259,232 @@ def mathlib_modules_from_lake(
             )
         ilean = Path(ilean_value)
         if not ilean.is_absolute():
-            ilean = project / ilean
-        _validate_mathlib_artifacts(ilean, module)
+            ilean = checkout.project / ilean
+        signatures.update(_validate_mathlib_artifacts(ilean, module, checkout))
+
+    if _mathlib_checkout_from_manifest(checkout.project) != checkout:
+        raise AuditInputError("Mathlib manifest or checkout changed during artifact validation")
+    for path, expected in signatures.items():
+        if _regular_file_signature(path, "Mathlib build artifact") != expected:
+            raise AuditInputError(f"Mathlib build artifact changed during validation: {path}")
     return modules
 
 
-def _validate_mathlib_artifacts(ilean: Path, module: str) -> None:
-    display_path = str(ilean)
-    if not ilean.is_file():
-        raise AuditInputError(f"Mathlib ILean artifact is not a regular file: {display_path}")
+def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
+    if lean_root.is_symlink():
+        raise AuditInputError("Lean project root must not be a symbolic link")
     try:
-        size = ilean.stat().st_size
+        project = lean_root.resolve(strict=True)
     except OSError as exc:
-        raise AuditInputError(f"cannot inspect Mathlib ILean artifact: {display_path}") from exc
-    if size > _MAX_ILEAN_BYTES:
-        raise AuditInputError(f"Mathlib ILean artifact is unexpectedly large: {display_path}")
-    metadata = _read_path_json(ilean, "Mathlib ILean")
+        raise AuditInputError(f"cannot resolve Lean project root: {exc}") from exc
+    if not project.is_dir():
+        raise AuditInputError(f"Lean project root is not a directory: {project}")
+
+    manifest_path = project / "lake-manifest.json"
+    manifest_bytes, _ = _read_stable_regular_file(
+        manifest_path, "Lake manifest", _MAX_MANIFEST_BYTES
+    )
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise AuditInputError(f"malformed Lake manifest: {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("packages"), list):
+        raise AuditInputError("Lake manifest must contain a package list")
+    entries = [
+        entry
+        for entry in manifest["packages"]
+        if isinstance(entry, dict) and entry.get("name") == "mathlib"
+    ]
+    if len(entries) != 1:
+        raise AuditInputError("Lake manifest must contain exactly one mathlib package entry")
+    entry = entries[0]
+    if entry.get("scope") != "":
+        raise AuditInputError("Lake manifest Mathlib entry must have the exact package id 'mathlib'")
+    if entry.get("type") != "git":
+        raise AuditInputError("Lake manifest Mathlib entry must be a Git dependency")
+    if entry.get("url") != _CANONICAL_MATHLIB_URL:
+        raise AuditInputError(
+            f"Lake manifest Mathlib URL must be exactly {_CANONICAL_MATHLIB_URL}"
+        )
+    revision = entry.get("rev")
+    if not isinstance(revision, str) or _FULL_GIT_REVISION.fullmatch(revision) is None:
+        raise AuditInputError("Lake manifest Mathlib revision must be a full 40-hex commit")
+    if entry.get("subDir") is not None:
+        raise AuditInputError("Lake manifest Mathlib dependency must not select a subdirectory")
+
+    packages_dir_value = manifest.get("packagesDir")
+    packages_dir = _safe_relative_path(packages_dir_value, "Lake packagesDir")
+    packages_root = _resolved_child_directory(project, packages_dir, "Lake packages directory")
+    checkout_path = packages_root / "mathlib"
+    checkout = _resolved_child_directory(project, checkout_path.relative_to(project), "Mathlib checkout")
+    git_marker = checkout / ".git"
+    try:
+        marker_status = git_marker.lstat()
+    except OSError as exc:
+        raise AuditInputError(f"Mathlib checkout has no readable .git directory: {checkout}") from exc
+    if stat.S_ISLNK(marker_status.st_mode) or not stat.S_ISDIR(marker_status.st_mode):
+        raise AuditInputError(f"Mathlib checkout .git must be a real directory: {git_marker}")
+
+    top = Path(_git_output(checkout, "rev-parse", "--show-toplevel", label="top level"))
+    try:
+        top = top.resolve(strict=True)
+    except OSError as exc:
+        raise AuditInputError(f"cannot resolve Mathlib Git top level: {exc}") from exc
+    if top != checkout:
+        raise AuditInputError("Mathlib package directory is not the Git checkout root")
+    head = _git_output(checkout, "rev-parse", "--verify", "HEAD^{commit}", label="HEAD")
+    if head != revision:
+        raise AuditInputError(
+            f"Mathlib checkout HEAD {head!r} does not match manifest revision {revision!r}"
+        )
+    remotes = _git_output(checkout, "remote", label="remote list").splitlines()
+    if remotes != ["origin"]:
+        raise AuditInputError("Mathlib checkout must have exactly one Git remote named origin")
+    remote_urls = _git_output(
+        checkout,
+        "config",
+        "--local",
+        "--get-all",
+        "remote.origin.url",
+        label="origin URL",
+    ).splitlines()
+    if remote_urls != [_CANONICAL_MATHLIB_URL]:
+        raise AuditInputError(
+            f"Mathlib checkout origin must be exactly {_CANONICAL_MATHLIB_URL}"
+        )
+    status = _git_output(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        label="status",
+        allow_empty=True,
+    )
+    if status:
+        raise AuditInputError("Mathlib checkout is dirty")
+    untracked_outside_build = _git_output(
+        checkout,
+        "ls-files",
+        "--others",
+        "--",
+        ":!.lake/**",
+        label="untracked files",
+        allow_empty=True,
+    )
+    if untracked_outside_build:
+        raise AuditInputError("Mathlib checkout has untracked files outside .lake")
+    tracked_flags = _git_output(
+        checkout, "ls-files", "-v", label="index flags", allow_empty=True
+    ).splitlines()
+    if any(not line.startswith("H ") for line in tracked_flags):
+        raise AuditInputError("Mathlib checkout uses nonstandard Git index flags")
+
+    return _MathlibCheckout(
+        project=project,
+        checkout=checkout,
+        build_root=checkout / ".lake/build",
+        revision=revision,
+        manifest_digest=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+
+
+def _safe_relative_path(value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise AuditInputError(f"{label} must be a nonempty relative path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise AuditInputError(f"{label} must be a confined relative path")
+    return Path(*path.parts)
+
+
+def _resolved_child_directory(root: Path, relative: Path, label: str) -> Path:
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise AuditInputError(f"{label} escapes its owning directory")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            status = current.lstat()
+        except OSError as exc:
+            raise AuditInputError(f"{label} does not exist: {current}") from exc
+        if stat.S_ISLNK(status.st_mode):
+            raise AuditInputError(f"{label} contains a symbolic link: {current}")
+    try:
+        resolved = current.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise AuditInputError(f"{label} escapes its owning directory: {current}") from exc
+    if not resolved.is_dir():
+        raise AuditInputError(f"{label} is not a directory: {resolved}")
+    return resolved
+
+
+def _git_output(
+    checkout: Path, *arguments: str, label: str, allow_empty: bool = False
+) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise AuditInputError(f"cannot inspect Mathlib Git {label}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise AuditInputError(f"cannot inspect Mathlib Git {label}{suffix}")
+    output = result.stdout.rstrip("\n")
+    if not allow_empty and not output:
+        raise AuditInputError(f"Mathlib Git {label} is empty")
+    return output
+
+
+def _validate_mathlib_artifacts(
+    ilean: Path, module: str, checkout: _MathlibCheckout
+) -> dict[Path, _FileSignature]:
+    if any(part == ".." for part in ilean.parts):
+        raise AuditInputError(f"Mathlib ILean artifact path contains traversal: {ilean}")
+    build_root = _resolved_child_directory(
+        checkout.checkout, Path(".lake/build"), "Mathlib build directory"
+    )
+    try:
+        relative = ilean.relative_to(build_root)
+    except ValueError as exc:
+        raise AuditInputError(
+            f"Mathlib ILean artifact is outside the validated checkout build root: {ilean}"
+        ) from exc
+    expected_parts = _module_parts(module, str(ilean))
+    source_relative = Path(*expected_parts[:-1], f"{expected_parts[-1]}.lean")
+    _reject_path_symlinks(checkout.checkout, source_relative, "Mathlib source module")
+    tracked_source = _git_output(
+        checkout.checkout,
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        source_relative.as_posix(),
+        label=f"tracked source for {module}",
+    )
+    if tracked_source != source_relative.as_posix():
+        raise AuditInputError(f"Mathlib module is not tracked at the pinned revision: {module}")
+    source = checkout.checkout / source_relative
+    source_signature = _regular_file_signature(source, "Mathlib source module")
+    expected = Path("lib", "lean", *expected_parts[:-1], f"{expected_parts[-1]}.ilean")
+    if relative != expected:
+        raise AuditInputError(
+            f"Mathlib ILean artifact path does not match module {module!r}: {ilean}"
+        )
+    _reject_path_symlinks(build_root, relative, "Mathlib ILean artifact")
+
+    display_path = str(ilean)
+    metadata_bytes, ilean_signature = _read_stable_regular_file(
+        ilean, "Mathlib ILean", _MAX_ILEAN_BYTES
+    )
+    try:
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise AuditInputError(f"malformed Mathlib ILean metadata in {ilean}: {exc}") from exc
     actual_module = _module_from_metadata(metadata, ilean.parts, display_path)
     if actual_module != module:
         raise AuditInputError(
@@ -260,19 +493,148 @@ def _validate_mathlib_artifacts(ilean: Path, module: str) -> None:
         )
 
     olean = ilean.with_suffix(".olean")
-    if not olean.is_file():
-        raise AuditInputError(f"Mathlib ILean artifact has no matching OLean: {display_path}")
+    _reject_path_symlinks(build_root, olean.relative_to(build_root), "Mathlib OLean artifact")
+    olean_signature = _regular_file_signature(olean, "Mathlib OLean artifact")
     trace = ilean.with_suffix(".trace")
-    if not trace.is_file():
-        raise AuditInputError(f"Mathlib ILean artifact has no matching Lake trace: {display_path}")
-    _validate_trace(_read_path_json(trace, "Mathlib Lake trace"), module, "mathlib", str(trace))
-
-
-def _read_path_json(path: Path, kind: str) -> object:
+    _reject_path_symlinks(build_root, trace.relative_to(build_root), "Mathlib Lake trace")
+    trace_bytes, trace_signature = _read_stable_regular_file(trace, "Mathlib Lake trace")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise AuditInputError(f"malformed {kind} metadata in {path}: {exc}") from exc
+        trace_metadata = json.loads(trace_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise AuditInputError(f"malformed Mathlib Lake trace metadata in {trace}: {exc}") from exc
+    _validate_mathlib_trace(trace_metadata, module, str(trace))
+    return {
+        source: source_signature,
+        ilean: ilean_signature,
+        olean: olean_signature,
+        trace: trace_signature,
+    }
+
+
+def _validate_mathlib_trace(trace: object, module: str, display_path: str) -> None:
+    if isinstance(trace, dict) and trace.get("synthetic") is False:
+        _validate_trace(trace, module, "mathlib", display_path)
+        return
+    if not isinstance(trace, dict) or "synthetic" in trace:
+        raise AuditInputError(f"invalid Mathlib Lake trace metadata: {display_path}")
+    outputs = trace.get("outputs")
+    dep_hash = trace.get("depHash")
+    schema = trace.get("schemaVersion")
+    if (
+        not isinstance(schema, str)
+        or not _is_iso_date(schema)
+        or not isinstance(dep_hash, str)
+        or _LAKE_HASH.fullmatch(dep_hash) is None
+        or not isinstance(outputs, dict)
+    ):
+        raise AuditInputError(f"invalid cached Mathlib Lake trace metadata: {display_path}")
+    ilean_output = outputs.get("i")
+    olean_outputs = outputs.get("o")
+    if (
+        not isinstance(ilean_output, str)
+        or re.fullmatch(r"[0-9a-f]{16}\.ilean", ilean_output) is None
+        or not isinstance(olean_outputs, list)
+        or not any(
+            isinstance(output, str)
+            and re.fullmatch(r"[0-9a-f]{16}\.olean", output) is not None
+            for output in olean_outputs
+        )
+    ):
+        raise AuditInputError(f"invalid cached Mathlib Lake trace outputs: {display_path}")
+
+
+def _is_iso_date(value: str) -> bool:
+    if _CACHE_SCHEMA_DATE.fullmatch(value) is None:
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _reject_path_symlinks(root: Path, relative: Path, label: str) -> None:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            status = current.lstat()
+        except OSError as exc:
+            raise AuditInputError(f"{label} does not exist: {current}") from exc
+        if stat.S_ISLNK(status.st_mode):
+            raise AuditInputError(f"{label} must not contain a symbolic link: {current}")
+
+
+def _read_stable_regular_file(
+    path: Path, kind: str, maximum_bytes: int | None = None
+) -> tuple[bytes, _FileSignature]:
+    try:
+        path_status = path.lstat()
+    except OSError as exc:
+        raise AuditInputError(f"cannot inspect {kind}: {path}: {exc}") from exc
+    if stat.S_ISLNK(path_status.st_mode):
+        raise AuditInputError(f"{kind} must not be a symbolic link: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AuditInputError(f"cannot open {kind} as a regular file: {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise AuditInputError(f"{kind} is not a regular file: {path}")
+        if (before.st_dev, before.st_ino) != (path_status.st_dev, path_status.st_ino):
+            raise AuditInputError(f"{kind} changed before it was opened: {path}")
+        if maximum_bytes is not None and before.st_size > maximum_bytes:
+            raise AuditInputError(f"{kind} is unexpectedly large: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if maximum_bytes is not None and sum(map(len, chunks)) > maximum_bytes:
+                raise AuditInputError(f"{kind} is unexpectedly large: {path}")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    before_signature = _signature(before)
+    if _signature(after) != before_signature:
+        raise AuditInputError(f"{kind} changed while it was read: {path}")
+    return b"".join(chunks), before_signature
+
+
+def _regular_file_signature(path: Path, kind: str) -> _FileSignature:
+    try:
+        path_status = path.lstat()
+    except OSError as exc:
+        raise AuditInputError(f"cannot inspect {kind}: {path}: {exc}") from exc
+    if stat.S_ISLNK(path_status.st_mode):
+        raise AuditInputError(f"{kind} must not be a symbolic link: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AuditInputError(f"cannot open {kind} as a regular file: {path}: {exc}") from exc
+    try:
+        status = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(status.st_mode):
+        raise AuditInputError(f"{kind} is not a regular file: {path}")
+    if (status.st_dev, status.st_ino) != (path_status.st_dev, path_status.st_ino):
+        raise AuditInputError(f"{kind} changed before it was opened: {path}")
+    return _signature(status)
+
+
+def _signature(status: os.stat_result) -> _FileSignature:
+    return _FileSignature(
+        device=status.st_dev,
+        inode=status.st_ino,
+        size=status.st_size,
+        modified_ns=status.st_mtime_ns,
+        changed_ns=status.st_ctime_ns,
+    )
 
 
 def _json_strings(value: object):

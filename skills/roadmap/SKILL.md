@@ -131,9 +131,10 @@ mathematics.
    `mathlib: true` only for an exact verified upstream result, and record both
    its compiled name in `mathlib_declaration` and its exact declaring source
    file as `mathlib_file: Mathlib/.../*.lean`. Generated CI checks the name,
-   declaration kind, and declaring module, then requires build trace metadata
-   from the Lake dependency whose package id is exactly `mathlib`. A different
-   package exporting the same `Mathlib.*` module does not establish Mathlib
+   declaration kind, and declaring module. It accepts provenance only from the
+   manifest-pinned commit of the clean canonical upstream Mathlib Git checkout,
+   then verifies the module's `mathlib` package trace. A local package, fork, or
+   mirror exporting the same `Mathlib.*` module does not establish Mathlib
    provenance. Record partial or uncertain candidates as notes, never as
    formalization status.
 8. Reconcile every page whose claims this work has just invalidated. That means
