@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -387,23 +389,247 @@ def test_workspace_init_path_collision_restores_exact_tree(tmp_path: Path) -> No
     assert collision.read_text(encoding="utf-8") == "repository-owned\n"
 
 
-def test_workspace_init_removes_manifest_after_post_link_failure(
+def test_workspace_init_treats_complete_manifest_publication_as_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "repository"
     root.mkdir()
+    manifest = root / ".autoform.toml"
+    raced = False
+    original_unlink = Path.unlink
+
+    def replace_before_unlink(path: Path, *args, **kwargs) -> None:
+        nonlocal raced
+        if path == manifest:
+            raced = True
+            path.rename(root / ".autoform-owned")
+            path.write_text("concurrent replacement\n", encoding="utf-8")
+        original_unlink(path, *args, **kwargs)
 
     def fail_fsync(_path: Path) -> None:
         raise OSError("injected directory sync failure")
 
+    monkeypatch.setattr(Path, "unlink", replace_before_unlink)
     monkeypatch.setattr(workspace_module, "_fsync_directory", fail_fsync)
-    with pytest.raises(WorkspaceError, match="could not create"):
+    initialize_workspace(root, blueprint_root="Plans")
+
+    assert not raced
+    assert load_workspace(root).manifest.locations[0].path == "Plans"
+    assert (root / "Plans").is_dir()
+
+
+def test_workspace_init_retains_paths_instead_of_racing_directory_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    nested = root / "Plans/Nested"
+    raced = False
+    workspace_module._require_workspace_mutation_support()
+    original_open = workspace_module.os.open
+    original_rmdir = Path.rmdir
+
+    def fail_after_creating_nested(path, *args, **kwargs):
+        if path == "Nested":
+            raise OSError("injected open failure")
+        return original_open(path, *args, **kwargs)
+
+    def replace_before_rmdir(path: Path) -> None:
+        nonlocal raced
+        if path == nested:
+            raced = True
+            path.rename(root / "retained-owned-directory")
+            path.mkdir()
+        original_rmdir(path)
+
+    monkeypatch.setattr(workspace_module, "_require_workspace_mutation_support", lambda: None)
+    monkeypatch.setattr(workspace_module.os, "open", fail_after_creating_nested)
+    monkeypatch.setattr(Path, "rmdir", replace_before_rmdir)
+
+    with pytest.raises(WorkspaceError, match="retained complete staged manifest"):
+        initialize_workspace(root, blueprint_root="Plans/Nested")
+
+    assert not raced
+    assert not (root / ".autoform.toml").exists()
+    assert nested.is_dir()
+    staged, = root.glob("..autoform.toml.*.tmp")
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
+
+
+def test_workspace_init_checks_atomic_publication_support_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    monkeypatch.setattr(workspace_module, "_atomic_noreplace_available", lambda: False)
+
+    with pytest.raises(WorkspaceError, match="platform"):
         initialize_workspace(root, blueprint_root="Plans")
 
     assert list(root.iterdir()) == []
 
 
-def test_concurrent_workspace_init_loser_leaves_no_collection(tmp_path: Path) -> None:
+def test_workspace_init_does_not_claim_incomplete_stage_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def fail_stage_fsync(_descriptor: int) -> None:
+        raise OSError("injected stage sync failure")
+
+    monkeypatch.setattr(workspace_module.os, "fsync", fail_stage_fsync)
+
+    with pytest.raises(WorkspaceError) as raised:
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert "complete" not in str(raised.value)
+    staged, = root.glob("..autoform.toml.*.tmp")
+    assert staged.name in str(raised.value)
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert not (root / ".autoform.toml").exists()
+    assert not (root / "Plans").exists()
+
+
+@pytest.mark.parametrize("replacement", [False, True], ids=["absent", "replaced"])
+def test_workspace_init_rejects_changed_final_manifest_after_atomic_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: bool,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    original = workspace_module._rename_noreplace
+    displaced = root / "published-manifest"
+
+    def change_after_publish(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        original(source_parent, source, target_parent, target)
+        manifest = root / target
+        manifest.rename(displaced)
+        if replacement:
+            manifest.write_text("concurrent replacement\n", encoding="utf-8")
+
+    monkeypatch.setattr(workspace_module, "_rename_noreplace", change_after_publish)
+
+    with pytest.raises(WorkspaceError, match="changed before initialization could continue"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert parse_workspace(displaced.read_text(encoding="utf-8")).locations[0].path == "Plans"
+    assert (root / "Plans").is_dir()
+    manifest = root / ".autoform.toml"
+    if replacement:
+        assert manifest.read_text(encoding="utf-8") == "concurrent replacement\n"
+    else:
+        assert not manifest.exists()
+
+
+def test_workspace_init_rejects_replaced_directory_before_descending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    workspace_module._require_workspace_mutation_support()
+    original_open = workspace_module.os.open
+    replaced = False
+
+    def replace_after_mkdir(path, *args, **kwargs):
+        nonlocal replaced
+        if path == "Plans" and not replaced:
+            replaced = True
+            (root / "Plans").rename(root / "created-plans")
+            (root / "Plans").mkdir()
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(workspace_module, "_require_workspace_mutation_support", lambda: None)
+    monkeypatch.setattr(workspace_module.os, "open", replace_after_mkdir)
+
+    with pytest.raises(WorkspaceError, match="changed while it was being opened"):
+        initialize_workspace(root, blueprint_root="Plans/Nested")
+
+    assert replaced
+    assert not (root / ".autoform.toml").exists()
+    assert list((root / "Plans").iterdir()) == []
+    assert list((root / "created-plans").iterdir()) == []
+    staged, = root.glob("..autoform.toml.*.tmp")
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
+
+
+def test_concurrent_workspace_init_never_exposes_partial_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    original = workspace_module._rename_noreplace
+    original_fchmod = workspace_module.os.fchmod
+    ready = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+    first_stage: list[str] = []
+    restrictive_modes: list[int] = []
+    errors: list[WorkspaceError] = []
+
+    def observe_final_mode(descriptor: int, mode: int) -> None:
+        if mode == 0o644:
+            restrictive_modes.append(stat.S_IMODE(workspace_module.os.fstat(descriptor).st_mode))
+        original_fchmod(descriptor, mode)
+
+    def pause_first_publish(source_parent: int, source: str, target_parent: int, target: str):
+        nonlocal calls
+        with lock:
+            calls += 1
+            first = calls == 1
+        if first:
+            stage = root / source
+            first_stage.append(source)
+            assert stat.S_IMODE(stage.stat().st_mode) == 0o644
+            parse_workspace(stage.read_text(encoding="utf-8"))
+            ready.set()
+            assert release.wait(timeout=30)
+        return original(source_parent, source, target_parent, target)
+
+    def initialize_first() -> None:
+        try:
+            initialize_workspace(root, blueprint_root="PlansA")
+        except WorkspaceError as error:
+            errors.append(error)
+
+    monkeypatch.setattr(workspace_module.os, "fchmod", observe_final_mode)
+    monkeypatch.setattr(workspace_module, "_rename_noreplace", pause_first_publish)
+    thread = threading.Thread(target=initialize_first)
+    thread.start()
+    assert ready.wait(timeout=30)
+    assert not (root / ".autoform.toml").exists()
+
+    try:
+        initialize_workspace(root, blueprint_root="PlansB")
+    finally:
+        release.set()
+        thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert restrictive_modes and set(restrictive_modes) == {0o600}
+    assert first_stage[0] in str(errors[0])
+    assert "PlansA" in str(errors[0])
+    assert (root / first_stage[0]).is_file()
+    assert stat.S_IMODE((root / first_stage[0]).stat().st_mode) == 0o600
+    assert load_workspace(root).manifest.locations[0].path == "PlansB"
+    assert (root / "PlansB").is_dir()
+    assert (root / "PlansA").is_dir()
+    assert list((root / "PlansA").iterdir()) == []
+
+
+def test_concurrent_workspace_init_preserves_winner_and_safe_loser_residue(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "repository"
     root.mkdir()
     processes = [
@@ -431,7 +657,11 @@ def test_concurrent_workspace_init_loser_leaves_no_collection(tmp_path: Path) ->
     winner = manifest.locations[0].path
     loser = "PlansB" if winner == "PlansA" else "PlansA"
     assert (root / winner).is_dir()
-    assert not (root / loser).exists()
+    if (root / loser).exists():
+        assert list((root / loser).iterdir()) == []
+    for staged in root.glob("..autoform.toml.*.tmp"):
+        assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+        parse_workspace(staged.read_text(encoding="utf-8"))
 
 
 def test_workspace_resolution_requires_a_project_at_multi_project_root(tmp_path: Path) -> None:

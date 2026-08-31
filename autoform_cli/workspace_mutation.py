@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import stat
 import tempfile
@@ -12,6 +13,7 @@ import tomlkit
 from tomlkit.items import InlineTable, KeyType, SingleKey, Table
 
 from .scaffold import ScaffoldError, scaffold_blueprint
+from .project.create import ProjectCreateError, _rename_noreplace
 from .workspace import (
     Workspace,
     _path_contains_symlink,
@@ -51,6 +53,13 @@ class _BlueprintBinding:
     location: WorkspaceLocation
     combined: str
     destination: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedFile:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,21 +132,37 @@ def initialize_workspace(
     collection = root / PurePosixPath(blueprint_root)
     _reject_case_collisions(root, PurePosixPath(blueprint_root))
     _reject_existing_symlink_chain(collection, root)
-    if collection.exists() and not collection.is_dir():
-        raise WorkspaceError(["blueprint root exists and is not a directory"])
+    _preflight_directory_chain(root, PurePosixPath(blueprint_root))
 
     text = _initial_manifest(location_id=location_id, blueprint_root=blueprint_root)
-    manifest_identity = _publish_new_file(manifest_path, text.encode("utf-8"), mode=0o644)
+    staged = _stage_new_file(manifest_path, text.encode("utf-8"))
     created_directories: tuple[Path, ...] = ()
     try:
-        created_directories = _create_directory_chain(
-            root,
-            PurePosixPath(blueprint_root),
-        )
-    except WorkspaceError:
-        _remove_created_directories(created_directories)
-        _remove_owned_file(manifest_path, manifest_identity)
-        raise
+        try:
+            created_directories = _create_directory_chain(
+                root,
+                PurePosixPath(blueprint_root),
+            )
+        except WorkspaceError as error:
+            detail = "; ".join(error.issues)
+            raise WorkspaceError(
+                [f"{detail}; retained complete staged manifest at {staged.path.name}"]
+            ) from None
+        try:
+            _publish_staged_file(manifest_path, staged, mode=0o644)
+        except WorkspaceError as error:
+            retained = ", ".join(
+                path.relative_to(root).as_posix() for path in created_directories
+            )
+            detail = "; ".join(error.issues)
+            if retained:
+                detail += f"; retained unregistered directories: {retained}"
+            raise WorkspaceError([detail]) from None
+    finally:
+        try:
+            os.close(staged.descriptor)
+        except OSError:
+            pass
     return WorkspaceInitResult(root, WORKSPACE_FILE, location_id, blueprint_root)
 
 
@@ -340,6 +365,20 @@ def _initial_manifest(*, location_id: str, blueprint_root: str) -> str:
     return tomlkit.dumps(document)
 
 
+def _preflight_directory_chain(root: Path, relative: PurePosixPath) -> None:
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise WorkspaceError(["blueprint root could not be inspected safely"]) from None
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise WorkspaceError(["blueprint root exists and is not a directory"])
+
+
 def _manifest_with_project(
     text: str,
     *,
@@ -494,9 +533,10 @@ def _require_workspace_mutation_support() -> None:
         fcntl is not None,
         hasattr(os, "O_NOFOLLOW"),
         hasattr(os, "O_DIRECTORY"),
-        hasattr(os, "link"),
+        _atomic_noreplace_available(),
         os.mkdir in os.supports_dir_fd,
         os.open in os.supports_dir_fd,
+        os.stat in os.supports_dir_fd,
     )
     if not all(required):
         raise WorkspaceError(
@@ -504,10 +544,18 @@ def _require_workspace_mutation_support() -> None:
         )
 
 
-def _publish_new_file(path: Path, content: bytes, *, mode: int) -> tuple[int, int]:
+def _atomic_noreplace_available() -> bool:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return False
+    return hasattr(libc, "renameatx_np") or hasattr(libc, "renameat2")
+
+
+def _stage_new_file(path: Path, content: bytes) -> _StagedFile:
     temporary: Path | None = None
-    identity: tuple[int, int] | None = None
-    published = False
+    descriptor: int | None = None
+    complete = False
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=path.parent,
@@ -515,33 +563,119 @@ def _publish_new_file(path: Path, content: bytes, *, mode: int) -> tuple[int, in
             suffix=".tmp",
         )
         temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "wb") as output:
+        with os.fdopen(os.dup(descriptor), "wb") as output:
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
-        temporary.chmod(mode)
-        metadata = temporary.stat(follow_symlinks=False)
+        metadata = os.fstat(descriptor)
         identity = (metadata.st_dev, metadata.st_ino)
-        os.link(temporary, path)
-        published = True
-        _fsync_directory(path.parent)
-    except FileExistsError:
-        if published and identity is not None:
-            _remove_owned_file(path, identity)
-            raise WorkspaceError([f"could not create {path.name}"]) from None
-        raise WorkspaceError([f"{path.name} already exists"]) from None
+        named = temporary.stat(follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != identity or not stat.S_ISREG(named.st_mode):
+            raise WorkspaceError(
+                [f"staged manifest changed before publication; inspect {temporary.name}"]
+            )
+        complete = True
+        return _StagedFile(temporary, descriptor, identity)
+    except WorkspaceError:
+        raise
     except Exception:
-        if published and identity is not None:
-            _remove_owned_file(path, identity)
-        raise WorkspaceError([f"could not create {path.name}"]) from None
-    finally:
         if temporary is not None:
+            raise WorkspaceError(
+                [f"could not stage {path.name}; retained staged file at {temporary.name}"]
+            ) from None
+        raise WorkspaceError([f"could not stage {path.name}"]) from None
+    finally:
+        if descriptor is not None and not complete:
             try:
-                temporary.unlink(missing_ok=True)
+                os.close(descriptor)
             except OSError:
                 pass
-    assert identity is not None
-    return identity
+
+
+def _publish_staged_file(path: Path, staged: _StagedFile, *, mode: int) -> None:
+    published = False
+    try:
+        os.fchmod(staged.descriptor, mode)
+        os.fsync(staged.descriptor)
+        named = staged.path.stat(follow_symlinks=False)
+        if (
+            (named.st_dev, named.st_ino) != staged.identity
+            or not stat.S_ISREG(named.st_mode)
+        ):
+            raise WorkspaceError(
+                [f"staged manifest changed before publication; inspect {staged.path.name}"]
+            )
+        parent_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            _rename_noreplace(
+                parent_descriptor,
+                staged.path.name,
+                parent_descriptor,
+                path.name,
+            )
+            published = True
+        finally:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+        try:
+            named = path.stat(follow_symlinks=False)
+        except OSError:
+            raise WorkspaceError(
+                [f"published {path.name} changed before initialization could continue"]
+            ) from None
+        if (named.st_dev, named.st_ino) != staged.identity or not stat.S_ISREG(named.st_mode):
+            raise WorkspaceError(
+                [f"published {path.name} changed before initialization could continue"]
+            )
+        try:
+            _fsync_directory(path.parent)
+        except OSError:
+            pass
+    except FileExistsError:
+        _restrict_staged_file(staged.descriptor)
+        raise WorkspaceError(
+            [
+                f"{path.name} already exists; retained complete staged manifest at "
+                f"{staged.path.name}"
+            ]
+        ) from None
+    except ProjectCreateError:
+        _restrict_staged_file(staged.descriptor)
+        raise WorkspaceError(
+            [
+                "atomic manifest publication failed; retained complete staged manifest at "
+                f"{staged.path.name}"
+            ]
+        ) from None
+    except WorkspaceError:
+        if not published:
+            _restrict_staged_file(staged.descriptor)
+        raise
+    except Exception:
+        if published:
+            raise WorkspaceError(
+                [f"published {path.name} but could not confirm final state; inspect it before retrying"]
+            ) from None
+        _restrict_staged_file(staged.descriptor)
+        raise WorkspaceError(
+            [
+                f"could not publish {path.name}; retained complete staged manifest at "
+                f"{staged.path.name}"
+            ]
+        ) from None
+
+
+def _restrict_staged_file(descriptor: int) -> None:
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except OSError:
+        pass
 
 
 def _create_directory_chain(root: Path, relative: PurePosixPath) -> tuple[Path, ...]:
@@ -564,37 +698,29 @@ def _create_directory_chain(root: Path, relative: PurePosixPath) -> tuple[Path, 
             else:
                 created.append(next_path)
             try:
+                expected = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                if not stat.S_ISDIR(expected.st_mode):
+                    raise OSError("blueprint path component is not a directory")
                 next_descriptor = os.open(part, flags, dir_fd=descriptor)
             except OSError:
                 raise WorkspaceError(["blueprint root could not be opened safely"]) from None
+            opened = os.fstat(next_descriptor)
+            if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+                os.close(next_descriptor)
+                raise WorkspaceError(["blueprint root changed while it was being opened"])
             os.close(descriptor)
             descriptor = next_descriptor
             current = next_path
-    except WorkspaceError:
-        _remove_created_directories(tuple(created))
-        raise
+    except WorkspaceError as error:
+        retained = ", ".join(path.relative_to(root).as_posix() for path in created)
+        detail = "; ".join(error.issues)
+        if retained:
+            detail += f"; retained created directories: {retained}"
+        raise WorkspaceError([detail]) from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
     return tuple(created)
-
-
-def _remove_created_directories(paths: tuple[Path, ...]) -> None:
-    for path in reversed(paths):
-        try:
-            path.rmdir()
-        except OSError:
-            pass
-
-
-def _remove_owned_file(path: Path, identity: tuple[int, int]) -> None:
-    try:
-        metadata = path.stat(follow_symlinks=False)
-        if (metadata.st_dev, metadata.st_ino) == identity and stat.S_ISREG(metadata.st_mode):
-            path.unlink()
-            _fsync_directory(path.parent)
-    except OSError:
-        pass
 
 
 def _fsync_directory(path: Path) -> None:
