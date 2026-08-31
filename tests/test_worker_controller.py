@@ -6,19 +6,23 @@ import pytest
 
 from autoform_cli.runtime import RuntimeAssertions, RuntimeGraph, RuntimeNode, RuntimeStatus
 from autoform_worker.controller import (
+    CANDIDATE_GATE_NAME,
     ControllerError,
     RecoveryAction,
+    REVIEW_GATE_NAME,
     RunStopSignal,
     build_task_specs,
     classify_no_work,
     create_run,
     initialize_created_run,
+    plan_candidate_admission,
     plan_recovery,
     select_ready_task,
     status_payload,
 )
 from autoform_worker.ledger import (
     AttemptRecord,
+    GateRecord,
     MergeItemRecord,
     MergeReplayRecord,
     RecoverySnapshot,
@@ -338,6 +342,7 @@ def _recovery_snapshot(
     run: RunRecord,
     tasks: tuple[TaskRecord, ...] = (),
     attempts: tuple[AttemptRecord, ...] = (),
+    gates: tuple[GateRecord, ...] = (),
     merge_items: tuple[MergeItemRecord, ...] = (),
     merge_replays: tuple[MergeReplayRecord, ...] = (),
 ) -> RecoverySnapshot:
@@ -345,7 +350,7 @@ def _recovery_snapshot(
         run=run,
         tasks=tasks,
         attempts=attempts,
-        gates=(),
+        gates=gates,
         merge_items=merge_items,
         merge_replays=merge_replays,
         target_adoptions=(),
@@ -434,6 +439,17 @@ def _merge_replay(*, status: str = "prepared") -> MergeReplayRecord:
     )
 
 
+def _gate(attempt_id: str, name: str, passed: bool) -> GateRecord:
+    return GateRecord(
+        attempt_id=attempt_id,
+        name=name,
+        passed=passed,
+        evidence_sha256="9" * 64,
+        detail="",
+        created_ns=1,
+    )
+
+
 def test_recovery_plan_prioritizes_replay_over_stale_merge_item() -> None:
     snapshot = _recovery_snapshot(
         run=_run_record(),
@@ -489,6 +505,91 @@ def test_recovery_plan_does_not_admit_candidate_after_stop_request() -> None:
             attempts=(attempt,),
         )
     ) == RecoveryAction("stop-candidate", "attempt")
+
+
+@pytest.mark.parametrize(
+    ("gates", "kind"),
+    [
+        ((), "run-fixed-gates"),
+        ((_gate("attempt", CANDIDATE_GATE_NAME, False),), "reject-candidate"),
+        ((_gate("attempt", CANDIDATE_GATE_NAME, True),), "run-independent-review"),
+        (
+            (
+                _gate("attempt", CANDIDATE_GATE_NAME, True),
+                _gate("attempt", REVIEW_GATE_NAME, False),
+            ),
+            "reject-candidate",
+        ),
+        (
+            (
+                _gate("attempt", CANDIDATE_GATE_NAME, True),
+                _gate("attempt", REVIEW_GATE_NAME, True),
+            ),
+            "enqueue-candidate",
+        ),
+    ],
+)
+def test_candidate_admission_resumes_from_exact_gate_evidence(
+    gates: tuple[GateRecord, ...],
+    kind: str,
+) -> None:
+    candidate_oid = "2" * 40
+    task = replace(
+        _task("af_000000000000000000000001", "proof", "candidate"),
+        attempts=1,
+        candidate_oid=candidate_oid,
+    )
+    attempt = _attempt(task, status="candidate", candidate_oid=candidate_oid)
+    snapshot = _recovery_snapshot(
+        run=_run_record(),
+        tasks=(task,),
+        attempts=(attempt,),
+        gates=gates,
+    )
+
+    assert plan_candidate_admission(snapshot, "attempt") == RecoveryAction(kind, "attempt")
+
+
+def test_candidate_admission_rejects_review_without_passing_fixed_gates() -> None:
+    candidate_oid = "2" * 40
+    task = replace(
+        _task("af_000000000000000000000001", "proof", "candidate"),
+        attempts=1,
+        candidate_oid=candidate_oid,
+    )
+    attempt = _attempt(task, status="candidate", candidate_oid=candidate_oid)
+    snapshot = _recovery_snapshot(
+        run=_run_record(),
+        tasks=(task,),
+        attempts=(attempt,),
+        gates=(_gate("attempt", REVIEW_GATE_NAME, True),),
+    )
+
+    with pytest.raises(ControllerError, match="without passing fixed gates"):
+        plan_candidate_admission(snapshot, "attempt")
+
+
+def test_candidate_admission_obeys_stop_before_enqueue() -> None:
+    candidate_oid = "2" * 40
+    task = replace(
+        _task("af_000000000000000000000001", "proof", "candidate"),
+        attempts=1,
+        candidate_oid=candidate_oid,
+    )
+    attempt = _attempt(task, status="candidate", candidate_oid=candidate_oid)
+    snapshot = _recovery_snapshot(
+        run=_run_record(stop_requested=True),
+        tasks=(task,),
+        attempts=(attempt,),
+        gates=(
+            _gate("attempt", CANDIDATE_GATE_NAME, True),
+            _gate("attempt", REVIEW_GATE_NAME, True),
+        ),
+    )
+
+    assert plan_candidate_admission(snapshot, "attempt") == RecoveryAction(
+        "stop-candidate", "attempt"
+    )
 
 
 def test_recovery_plan_keeps_external_recovery_ahead_of_stop() -> None:

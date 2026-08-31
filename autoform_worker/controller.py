@@ -52,6 +52,8 @@ class RecoveryAction:
 
 
 EXECUTE_OUTPUT_SCHEMA = "autoform-execute/v1"
+CANDIDATE_GATE_NAME = "fixed-gates/v1"
+REVIEW_GATE_NAME = "independent-review/v1"
 
 
 class RunStopSignal:
@@ -266,6 +268,74 @@ def plan_recovery(snapshot: RecoverySnapshot) -> RecoveryAction:
     return RecoveryAction("terminal", run.run_id)
 
 
+def plan_candidate_admission(
+    snapshot: RecoverySnapshot,
+    attempt_id: str,
+) -> RecoveryAction:
+    """Resume candidate admission from immutable gate evidence without skipping work."""
+
+    if not isinstance(snapshot, RecoverySnapshot):
+        raise TypeError("candidate admission planning requires a RecoverySnapshot")
+    attempts = tuple(attempt for attempt in snapshot.attempts if attempt.attempt_id == attempt_id)
+    if len(attempts) != 1:
+        raise ControllerError(
+            "candidate-attempt-missing",
+            f"candidate admission requires one exact attempt: {attempt_id}",
+        )
+    attempt = attempts[0]
+    if attempt.status != "candidate" or attempt.candidate_oid is None:
+        raise ControllerError(
+            "candidate-attempt-invalid",
+            f"attempt is not an admissible candidate: {attempt_id}",
+        )
+    tasks = tuple(
+        task
+        for task in snapshot.tasks
+        if task.article_id == attempt.article_id and task.phase == attempt.phase
+    )
+    if len(tasks) != 1:
+        raise ControllerError(
+            "candidate-task-missing",
+            f"candidate admission requires one exact task: {attempt_id}",
+        )
+    task = tasks[0]
+    if (
+        task.status != "candidate"
+        or task.attempts != attempt.number
+        or task.candidate_oid != attempt.candidate_oid
+    ):
+        raise ControllerError(
+            "candidate-task-mismatch",
+            f"candidate task does not match its attempt: {attempt_id}",
+        )
+    if snapshot.run.status != "running" or snapshot.run.stop_requested:
+        return RecoveryAction("stop-candidate", attempt_id)
+
+    gates = tuple(gate for gate in snapshot.gates if gate.attempt_id == attempt_id)
+    by_name = {gate.name: gate for gate in gates}
+    if len(by_name) != len(gates):
+        raise ControllerError(
+            "duplicate-candidate-gate",
+            f"candidate has duplicate gate evidence: {attempt_id}",
+        )
+    fixed = by_name.get(CANDIDATE_GATE_NAME)
+    review = by_name.get(REVIEW_GATE_NAME)
+    if review is not None and (fixed is None or not fixed.passed):
+        raise ControllerError(
+            "review-without-fixed-gates",
+            f"candidate review exists without passing fixed gates: {attempt_id}",
+        )
+    if fixed is None:
+        return RecoveryAction("run-fixed-gates", attempt_id)
+    if not fixed.passed:
+        return RecoveryAction("reject-candidate", attempt_id)
+    if review is None:
+        return RecoveryAction("run-independent-review", attempt_id)
+    if not review.passed:
+        return RecoveryAction("reject-candidate", attempt_id)
+    return RecoveryAction("enqueue-candidate", attempt_id)
+
+
 def create_run(
     ledger: RunLedger,
     identity: RunIdentity,
@@ -420,15 +490,18 @@ def _article_id(node: RuntimeNode) -> str:
 
 
 __all__ = [
+    "CANDIDATE_GATE_NAME",
     "ControllerError",
     "EXECUTE_OUTPUT_SCHEMA",
     "RecoveryAction",
+    "REVIEW_GATE_NAME",
     "RunStopSignal",
     "TaskSpec",
     "build_task_specs",
     "classify_no_work",
     "create_run",
     "initialize_created_run",
+    "plan_candidate_admission",
     "plan_recovery",
     "select_ready_task",
     "status_payload",
