@@ -9,7 +9,6 @@ import os
 import re
 import sqlite3
 import stat
-import tempfile
 import time
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
@@ -397,16 +396,39 @@ class RunLedger:
             metadata = self.path.lstat()
         except FileNotFoundError:
             metadata = None
-        if metadata is not None and (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
-            raise LedgerError(f"ledger path is not a regular file: {self.path}")
+        if metadata is not None:
+            _validate_private_regular_file(self.path, metadata, label="ledger")
         created = metadata is None
         self._connection = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
         self._connection.row_factory = sqlite3.Row
         try:
-            self._configure()
+            connected_metadata = self.path.lstat()
+            _validate_private_regular_file(self.path, connected_metadata, label="ledger")
+            if metadata is not None and (connected_metadata.st_dev, connected_metadata.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise LedgerError(f"ledger path changed while it was being opened: {self.path}")
             with _initialization_lock(self.path.with_suffix(self.path.suffix + ".initialize.lock")):
+                locked_metadata = self.path.lstat()
+                _validate_private_regular_file(self.path, locked_metadata, label="ledger")
+                if (locked_metadata.st_dev, locked_metadata.st_ino) != (
+                    connected_metadata.st_dev,
+                    connected_metadata.st_ino,
+                ):
+                    raise LedgerError(f"ledger path changed before initialization: {self.path}")
+                _validate_sqlite_sidecars(self.path)
+                self._configure()
                 self._initialize_schema()
                 self._enable_wal()
+                wal_metadata = self.path.lstat()
+                _validate_private_regular_file(self.path, wal_metadata, label="ledger")
+                if (wal_metadata.st_dev, wal_metadata.st_ino) != (
+                    connected_metadata.st_dev,
+                    connected_metadata.st_ino,
+                ):
+                    raise LedgerError(f"ledger path changed while enabling WAL: {self.path}")
+                _validate_sqlite_sidecars(self.path)
             if created:
                 _fsync_directory(self.path.parent)
         except BaseException:
@@ -594,6 +616,7 @@ class RunLedger:
                 return self.get_run(run_id)
             if current["status"] not in {"stopped", "blocked"}:
                 raise InvalidTransition(f"cannot resume a {current['status']} run")
+            max_attempts = _run_record(current).config.max_attempts
             now = self._clock_ns()
             cursor = self._connection.execute(
                 """
@@ -607,10 +630,12 @@ class RunLedger:
                 raise GenerationConflict(f"run changed while resuming: {run_id}")
             self._connection.execute(
                 """
-                UPDATE tasks SET status = 'retrying', generation = generation + 1
+                UPDATE tasks SET
+                    status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'retrying' END,
+                    generation = generation + 1
                 WHERE run_id = ? AND status = 'stopped'
                 """,
-                (run_id,),
+                (max_attempts, run_id),
             )
             self._append_event(run_id, "run.resumed", {"from": current["status"]}, now)
         return self.get_run(run_id)
@@ -661,6 +686,10 @@ class RunLedger:
                     f"task {article_id}:{phase} is at generation {task['generation']}, "
                     f"expected {expected_generation}"
                 )
+            max_attempts = _run_record(run).config.max_attempts
+            requested_status = status
+            if status == "retrying" and task["attempts"] >= max_attempts:
+                status = "failed"
             if (
                 task["status"] == status
                 and task["detail"] == detail
@@ -669,22 +698,13 @@ class RunLedger:
                 return _task_record(task)
             if task["status"] not in _TASK_RECOVERY_SOURCES:
                 raise InvalidTransition(f"cannot recover task from {task['status']} to {status}")
-            max_attempts = _run_record(run).config.max_attempts
             if status == "failed":
-                if task["status"] != "candidate":
+                if requested_status == "failed" and task["status"] != "candidate":
                     raise InvalidTransition("only a rejected candidate may use terminal task failure")
                 if task["attempts"] < max_attempts:
                     raise InvalidTransition(
                         f"candidate has used {task['attempts']} of {max_attempts} attempts; retry is required"
                     )
-            elif (
-                status == "retrying"
-                and task["status"] == "candidate"
-                and task["attempts"] >= max_attempts
-            ):
-                raise InvalidTransition(
-                    f"candidate exhausted {max_attempts} attempts and must transition to failed"
-                )
             if task["status"] == "running":
                 attempts = self._connection.execute(
                     """
@@ -726,17 +746,20 @@ class RunLedger:
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(f"task changed while recovering: {article_id}:{phase}")
+            payload: dict[str, object] = {
+                "from": task["status"],
+                "to": status,
+                "article_id": article_id,
+                "phase": phase,
+                "detail": detail,
+                "blocked_by": blockers,
+            }
+            if requested_status != status:
+                payload["requested_status"] = requested_status
             self._append_event(
                 run_id,
                 "task.recovered",
-                {
-                    "from": task["status"],
-                    "to": status,
-                    "article_id": article_id,
-                    "phase": phase,
-                    "detail": detail,
-                    "blocked_by": blockers,
-                },
+                payload,
                 now,
             )
         return self.get_task(run_id, article_id, phase)
@@ -950,6 +973,9 @@ class RunLedger:
                     f"task {attempt['article_id']}:{attempt['phase']} is at generation "
                     f"{task['generation']}, expected {expected_task_generation}"
                 )
+            effective_outcome = outcome
+            if outcome == "retrying" and attempt["number"] >= _run_record(run).config.max_attempts:
+                effective_outcome = "failed"
             if recovery_evidence is None:
                 if run["status"] != "running" or run["stop_requested"]:
                     raise InvalidTransition(f"run is not accepting attempt results: {run['status']}")
@@ -964,7 +990,7 @@ class RunLedger:
                     raise InvalidTransition(f"cannot recover an attempt for a {run['status']} run")
             if attempt["status"] != "running":
                 if (
-                    attempt["status"] == outcome
+                    attempt["status"] == effective_outcome
                     and attempt["detail"] == detail
                     and attempt["candidate_oid"] == candidate_oid
                 ):
@@ -980,7 +1006,7 @@ class RunLedger:
                 UPDATE attempts SET status = ?, candidate_oid = ?, detail = ?, finished_ns = ?
                 WHERE attempt_id = ? AND status = 'running'
                 """,
-                (outcome, candidate_oid, detail, now, attempt_id),
+                (effective_outcome, candidate_oid, detail, now, attempt_id),
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(f"attempt changed while finishing: {attempt_id}")
@@ -991,7 +1017,7 @@ class RunLedger:
                     AND attempts = ? AND generation = ?
                 """,
                 (
-                    outcome,
+                    effective_outcome,
                     candidate_oid,
                     detail,
                     attempt["run_id"],
@@ -1007,10 +1033,12 @@ class RunLedger:
                 )
             payload: dict[str, object] = {
                 "attempt_id": attempt_id,
-                "outcome": outcome,
+                "outcome": effective_outcome,
                 "candidate_oid": candidate_oid,
                 "detail": detail,
             }
+            if effective_outcome != outcome:
+                payload["requested_outcome"] = outcome
             if recovery_evidence is not None:
                 payload["repository_inspection"] = dict(recovery_evidence)
             self._append_event(
@@ -1250,12 +1278,7 @@ class RunLedger:
         now = self._clock_ns()
         with self._transaction():
             item = self._merge_item_row(queue_item_id)
-            run = self._run_row(item["run_id"])
-            if run["generation"] != expected_run_generation:
-                raise GenerationConflict(
-                    f"run {item['run_id']} is at generation {run['generation']}, "
-                    f"expected {expected_run_generation}"
-                )
+            self._active_run_row(item["run_id"], expected_run_generation)
             if item["generation"] != expected_generation:
                 raise GenerationConflict(
                     f"merge item {queue_item_id} is at generation {item['generation']}, "
@@ -1317,11 +1340,7 @@ class RunLedger:
                     f"merge item {queue_item_id} is at generation {item['generation']}, "
                     f"expected {expected_item_generation}"
                 )
-            run = self._run_row(item["run_id"])
-            if run["generation"] != expected_generation:
-                raise GenerationConflict(
-                    f"run {item['run_id']} is at generation {run['generation']}, expected {expected_generation}"
-                )
+            run = self._active_run_row(item["run_id"], expected_generation)
             if integrated_oid != item["candidate_oid"]:
                 raise InvalidTransition("integrated OID must equal the queued candidate OID")
             if item["status"] == "integrated" and item["integrated_oid"] == integrated_oid:
@@ -1468,27 +1487,41 @@ class RunLedger:
         _validate_identifier("artifact kind", kind)
         digest = hashlib.sha256(content).hexdigest()
         directory = self.artifact_root / digest[:2]
-        _ensure_private_directory(directory)
         target = directory / digest
-        if target.exists():
-            _verify_artifact(target, digest, len(content))
-        else:
-            descriptor, temporary_name = tempfile.mkstemp(prefix=".autoform-artifact-", dir=directory)
-            temporary = Path(temporary_name)
+        with _open_private_subdirectory(
+            self.path.parent,
+            ("artifacts", "sha256", digest[:2]),
+            create=True,
+        ) as directory_descriptor:
             try:
-                os.fchmod(descriptor, 0o600)
-                with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, target)
-                _fsync_directory(directory)
-            finally:
+                os.stat(digest, dir_fd=directory_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                temporary_name = f".autoform-artifact-{uuid.uuid4().hex}"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
                 try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
-            _verify_artifact(target, digest, len(content))
+                    descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_descriptor)
+                except OSError as error:
+                    raise LedgerError(f"artifact temporary file cannot be created: {target}") from error
+                try:
+                    with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                        stream.write(content)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(
+                        temporary_name,
+                        digest,
+                        src_dir_fd=directory_descriptor,
+                        dst_dir_fd=directory_descriptor,
+                    )
+                    os.fsync(directory_descriptor)
+                finally:
+                    try:
+                        os.unlink(temporary_name, dir_fd=directory_descriptor)
+                    except FileNotFoundError:
+                        pass
+            _read_artifact_at(directory_descriptor, target, digest, len(content))
         now = self._clock_ns()
         with self._transaction():
             self._connection.execute(
@@ -1513,7 +1546,12 @@ class RunLedger:
         path = self.artifact_root / digest[:2] / digest
         if row["relative_path"] != str(path.relative_to(self.path.parent)):
             raise LedgerError(f"artifact path is inconsistent: {digest}")
-        return _read_artifact(path, digest, row["size"])
+        with _open_private_subdirectory(
+            self.path.parent,
+            ("artifacts", "sha256", digest[:2]),
+            create=False,
+        ) as directory_descriptor:
+            return _read_artifact_at(directory_descriptor, path, digest, row["size"])
 
     def _configure(self) -> None:
         self._connection.execute("PRAGMA busy_timeout = 5000")
@@ -1716,6 +1754,11 @@ class RunLedger:
                 raise LedgerError(f"v1 run used more than one prover backend: {run_id}")
             backend = next(iter(backends), "claude")
             reviewer_backend = "claude" if backend != "claude" else "codex"
+            observed_attempt_limit = self._connection.execute(
+                "SELECT COALESCE(MAX(attempts), 0) FROM tasks WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            _validate_nonnegative_integer("v1 task attempt count", observed_attempt_limit)
             # V1 did not persist these controller inputs. Historical defaults make the
             # archived record readable, while the terminal status below prevents resume.
             config = RunConfig(
@@ -1731,7 +1774,7 @@ class RunLedger:
                 execution_input_sha256=values["execution_input_sha256"],  # type: ignore[arg-type]
                 source_artifacts_sha256=values["source_artifact_sha256"],  # type: ignore[arg-type]
                 gate_policy_version="legacy-v1",
-                max_attempts=3,
+                max_attempts=max(3, observed_attempt_limit),
                 max_steers=3,
                 timeout_seconds=1800.0,
                 claim_ttl_seconds=1500.0,
@@ -1746,17 +1789,10 @@ class RunLedger:
                 SELECT expected_target_oid, candidate_oid, integrated_oid
                 FROM merge_items
                 WHERE run_id = ? AND status = 'integrated'
-                ORDER BY created_ns, queue_item_id
                 """,
                 (run_id,),
             ).fetchall()
-            for item in integrated:
-                if (
-                    item["expected_target_oid"] != current_oid
-                    or item["candidate_oid"] != item["integrated_oid"]
-                ):
-                    raise LedgerError(f"v1 integration history is ambiguous: {run_id}")
-                current_oid = item["candidate_oid"]
+            current_oid = _reconstruct_integrated_oid(current_oid, integrated, run_id=run_id)
             status = row["status"]
             detail = row["detail"]
             stop_requested = row["stop_requested"]
@@ -1846,6 +1882,7 @@ class RunLedger:
                 FROM attempts_v2
                 """
             )
+            self._normalize_v2_exhausted_retries()
             self._connection.execute(
                 """
                 INSERT INTO gates(attempt_id, name, passed, evidence_sha256, detail, created_ns)
@@ -1897,6 +1934,33 @@ class RunLedger:
             )
             _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
             self._validate_content_rows()
+
+    def _normalize_v2_exhausted_retries(self) -> None:
+        """Close retry states that the persisted v2 attempt policy cannot resume."""
+        for row in self._connection.execute("SELECT * FROM runs ORDER BY run_id").fetchall():
+            run = _run_record(row)
+            self._connection.execute(
+                """
+                UPDATE attempts SET status = 'failed'
+                WHERE run_id = ? AND status = 'retrying' AND EXISTS (
+                    SELECT 1 FROM tasks
+                    WHERE tasks.run_id = attempts.run_id
+                        AND tasks.article_id = attempts.article_id
+                        AND tasks.phase = attempts.phase
+                        AND tasks.status = 'retrying'
+                        AND tasks.attempts = attempts.number
+                        AND tasks.attempts >= ?
+                )
+                """,
+                (run.run_id, run.config.max_attempts),
+            )
+            self._connection.execute(
+                """
+                UPDATE tasks SET status = 'failed'
+                WHERE run_id = ? AND status = 'retrying' AND attempts >= ?
+                """,
+                (run.run_id, run.config.max_attempts),
+            )
 
     def _prepare_v2_run_migrations(self) -> tuple[tuple[object, ...], ...]:
         prepared: list[tuple[object, ...]] = []
@@ -1968,27 +2032,42 @@ class RunLedger:
             run = _run_record(row)
             run_backends[run.run_id] = run.config.backend
             run_plans[run.run_id] = run
-        task_attempts: dict[tuple[str, str, str], int] = {}
+        tasks_by_key: dict[tuple[str, str, str], TaskRecord] = {}
         tasks_by_run: dict[str, list[tuple[str, str]]] = {run_id: [] for run_id in run_plans}
         for row in self._connection.execute("SELECT * FROM tasks").fetchall():
             task = _task_record(row)
-            task_attempts[(task.run_id, task.article_id, task.phase)] = task.attempts
+            tasks_by_key[(task.run_id, task.article_id, task.phase)] = task
             tasks_by_run[task.run_id].append((task.article_id, task.phase))
         for run_id, run in run_plans.items():
             task_plan = tuple(sorted(tasks_by_run[run_id]))
             if run.task_count != len(task_plan) or run.task_plan_sha256 != _task_plan_sha256(task_plan):
                 raise LedgerError(f"task plan binding is invalid: {run_id}")
+        attempts_by_id: dict[str, AttemptRecord] = {}
+        attempts_by_task: dict[tuple[str, str, str], list[AttemptRecord]] = {
+            task_key: [] for task_key in tasks_by_key
+        }
         for row in self._connection.execute("SELECT * FROM attempts").fetchall():
             attempt = _attempt_record(row)
             task_key = (attempt.run_id, attempt.article_id, attempt.phase)
-            if attempt.number > task_attempts[task_key] or attempt.backend != run_backends[attempt.run_id]:
+            if task_key not in tasks_by_key or attempt.backend != run_backends[attempt.run_id]:
                 raise LedgerError(f"attempt binding is invalid: {attempt.attempt_id}")
+            attempts_by_id[attempt.attempt_id] = attempt
+            attempts_by_task[task_key].append(attempt)
         for row in self._connection.execute("SELECT * FROM gates").fetchall():
-            _gate_record(row)
+            gate = _gate_record(row)
+            attempt = attempts_by_id[gate.attempt_id]
+            if attempt.status not in {"candidate", "integrated"}:
+                raise LedgerError(f"gate is bound to a non-candidate attempt: {gate.attempt_id}:{gate.name}")
+        merge_items_by_id: dict[str, MergeItemRecord] = {}
+        merge_items_by_attempt: dict[str, MergeItemRecord] = {}
         for row in self._connection.execute("SELECT * FROM merge_items").fetchall():
-            _merge_item_record(row)
-        for row in self._connection.execute("SELECT * FROM events").fetchall():
-            _event_record(row)
+            item = _merge_item_record(row)
+            merge_items_by_id[item.queue_item_id] = item
+            merge_items_by_attempt[item.attempt_id] = item
+        events_by_run: dict[str, list[EventRecord]] = {run_id: [] for run_id in run_plans}
+        for row in self._connection.execute("SELECT * FROM events ORDER BY sequence").fetchall():
+            event = _event_record(row)
+            events_by_run[event.run_id].append(event)
         for row in self._connection.execute("SELECT * FROM artifacts").fetchall():
             _validate_artifact_row(row)
         bad_gate = self._connection.execute(
@@ -2011,6 +2090,15 @@ class RunLedger:
         ).fetchone()
         if bad_merge is not None:
             raise LedgerError(f"merge item binding is invalid: {bad_merge['queue_item_id']}")
+        _validate_lifecycle_rows(
+            run_plans,
+            tasks_by_key,
+            attempts_by_task,
+            attempts_by_id,
+            merge_items_by_id,
+            merge_items_by_attempt,
+            events_by_run,
+        )
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -2083,6 +2171,152 @@ class RunLedger:
             "INSERT INTO events(run_id, kind, payload_json, created_ns) VALUES (?, ?, ?, ?)",
             (run_id, kind, _json_text(dict(payload)), created_ns),
         )
+
+
+def _reconstruct_integrated_oid(
+    start_oid: str,
+    items: Iterable[Mapping[str, object]],
+    *,
+    run_id: str,
+) -> str:
+    successors: dict[str, str] = {}
+    for item in items:
+        expected_target_oid = item["expected_target_oid"]
+        candidate_oid = item["candidate_oid"]
+        integrated_oid = item["integrated_oid"]
+        if not isinstance(expected_target_oid, str) or not isinstance(candidate_oid, str):
+            raise LedgerError(f"integration history is malformed: {run_id}")
+        _validate_oid(expected_target_oid)
+        _validate_oid(candidate_oid)
+        if candidate_oid != integrated_oid:
+            raise LedgerError(f"integration history is inconsistent: {run_id}")
+        if expected_target_oid in successors:
+            raise LedgerError(f"integration history is ambiguous: {run_id}")
+        successors[expected_target_oid] = candidate_oid
+    current_oid = start_oid
+    while current_oid in successors:
+        current_oid = successors.pop(current_oid)
+    if successors:
+        raise LedgerError(f"integration history is ambiguous: {run_id}")
+    return current_oid
+
+
+def _validate_lifecycle_rows(
+    runs: Mapping[str, RunRecord],
+    tasks: Mapping[tuple[str, str, str], TaskRecord],
+    attempts_by_task: Mapping[tuple[str, str, str], list[AttemptRecord]],
+    attempts_by_id: Mapping[str, AttemptRecord],
+    merge_items_by_id: Mapping[str, MergeItemRecord],
+    merge_items_by_attempt: Mapping[str, MergeItemRecord],
+    events_by_run: Mapping[str, list[EventRecord]],
+) -> None:
+    tasks_for_run: dict[str, list[TaskRecord]] = {run_id: [] for run_id in runs}
+    integrated_items_for_run: dict[str, set[str]] = {run_id: set() for run_id in runs}
+    for task_key, task in tasks.items():
+        run = runs[task.run_id]
+        tasks_for_run[task.run_id].append(task)
+        attempts = sorted(attempts_by_task[task_key], key=lambda attempt: attempt.number)
+        numbers = tuple(attempt.number for attempt in attempts)
+        if numbers != tuple(range(1, task.attempts + 1)):
+            raise LedgerError(f"task attempt history is incomplete: {task.article_id}:{task.phase}")
+        if task.attempts > run.config.max_attempts:
+            raise LedgerError(f"task exceeds its configured attempt limit: {task.article_id}:{task.phase}")
+        if task.status == "pending":
+            if attempts:
+                raise LedgerError(f"pending task has attempt history: {task.article_id}:{task.phase}")
+            continue
+        if not attempts:
+            raise LedgerError(f"active task has no attempt history: {task.article_id}:{task.phase}")
+        latest = attempts[-1]
+        expected_latest_statuses = {
+            "running": frozenset({"running"}),
+            "candidate": frozenset({"candidate"}),
+            "queued": frozenset({"candidate"}),
+            "integrated": frozenset({"integrated"}),
+            "retrying": frozenset({"retrying", "candidate", "stopped", "interrupted"}),
+            "blocked": frozenset({"candidate", "interrupted"}),
+            "failed": frozenset({"candidate", "failed", "interrupted", "stopped"}),
+            "stopped": frozenset({"candidate", "interrupted", "stopped"}),
+        }[task.status]
+        if latest.status not in expected_latest_statuses:
+            raise LedgerError(f"task and latest attempt lifecycle disagree: {task.article_id}:{task.phase}")
+        running_attempts = [attempt for attempt in attempts if attempt.status == "running"]
+        if task.status == "running":
+            if running_attempts != [latest]:
+                raise LedgerError(f"running task does not have one current attempt: {task.article_id}:{task.phase}")
+        elif running_attempts:
+            raise LedgerError(f"inactive task retains a running attempt: {task.article_id}:{task.phase}")
+        if task.status == "retrying" and task.attempts >= run.config.max_attempts:
+            raise LedgerError(f"retrying task exhausted its configured attempts: {task.article_id}:{task.phase}")
+        if (
+            task.status == "failed"
+            and latest.status != "failed"
+            and task.attempts < run.config.max_attempts
+        ):
+            raise LedgerError(f"task failed before exhausting recoverable attempts: {task.article_id}:{task.phase}")
+        if task.status in {"candidate", "queued", "integrated"} and (
+            latest.candidate_oid is None or latest.candidate_oid != task.candidate_oid
+        ):
+            raise LedgerError(f"task candidate does not match its latest attempt: {task.article_id}:{task.phase}")
+        if task.status in {"queued", "integrated"}:
+            item = merge_items_by_attempt.get(latest.attempt_id)
+            if item is None:
+                raise LedgerError(f"task is missing its merge item: {task.article_id}:{task.phase}")
+            if task.status == "queued" and item.status == "integrated":
+                raise LedgerError(f"queued task has an integrated merge item: {task.article_id}:{task.phase}")
+            if task.status == "integrated" and item.status != "integrated":
+                raise LedgerError(f"integrated task has no integrated merge item: {task.article_id}:{task.phase}")
+
+    for item in merge_items_by_id.values():
+        attempt = attempts_by_id[item.attempt_id]
+        task = tasks[(attempt.run_id, attempt.article_id, attempt.phase)]
+        expected_attempt_status = "integrated" if item.status == "integrated" else "candidate"
+        if attempt.status != expected_attempt_status:
+            raise LedgerError(f"merge item and attempt lifecycle disagree: {item.queue_item_id}")
+        if item.status == "integrated" and task.status != "integrated":
+            raise LedgerError(f"integrated merge item is not bound to an integrated task: {item.queue_item_id}")
+        if item.status == "integrated":
+            integrated_items_for_run[item.run_id].add(item.queue_item_id)
+        if item.status not in _MERGE_ITEM_TERMINAL_STATUSES and (
+            attempt.number != task.attempts
+            or task.status not in {"queued", "retrying", "blocked", "stopped"}
+        ):
+            raise LedgerError(f"unresolved merge item is not bound to the current task: {item.queue_item_id}")
+
+    for run_id, run in runs.items():
+        run_tasks = tasks_for_run[run_id]
+        if run.status == "created" and any(task.status != "pending" for task in run_tasks):
+            raise LedgerError(f"created run contains active tasks: {run_id}")
+        if run.status == "complete" and any(task.status != "integrated" for task in run_tasks):
+            raise LedgerError(f"complete run contains unintegrated tasks: {run_id}")
+        if run.status in {"complete", "failed"} and run.stop_requested:
+            raise LedgerError(f"terminal run retains a stop request: {run_id}")
+
+        current_oid = run.config.start_oid
+        seen_items: set[str] = set()
+        for event in events_by_run[run_id]:
+            if event.kind != "candidate.integrated":
+                continue
+            queue_item_id = event.payload.get("queue_item_id")
+            expected_target_oid = event.payload.get("expected_target_oid")
+            integrated_oid = event.payload.get("integrated_oid")
+            if not isinstance(queue_item_id, str) or queue_item_id in seen_items:
+                raise LedgerError(f"run integration event is invalid: {run_id}")
+            item = merge_items_by_id.get(queue_item_id)
+            if (
+                item is None
+                or item.run_id != run_id
+                or item.status != "integrated"
+                or expected_target_oid != item.expected_target_oid
+                or integrated_oid != item.integrated_oid
+            ):
+                raise LedgerError(f"run integration event does not match its merge item: {run_id}")
+            if item.expected_target_oid != current_oid:
+                raise LedgerError(f"run integration history is not linear: {run_id}")
+            current_oid = item.candidate_oid
+            seen_items.add(queue_item_id)
+        if seen_items != integrated_items_for_run[run_id] or run.current_oid != current_oid:
+            raise LedgerError(f"run current OID does not match its integration history: {run_id}")
 
 
 def _run_record(row: sqlite3.Row) -> RunRecord:
@@ -2467,6 +2701,81 @@ def _ensure_private_directory(path: Path) -> None:
         raise LedgerError(f"state path is not a real directory: {path}")
 
 
+def _validate_private_regular_file(path: Path, metadata: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise LedgerError(f"{label} path is not a regular file: {path}")
+    if metadata.st_nlink != 1:
+        raise LedgerError(f"{label} path is hard-linked: {path}")
+
+
+def _validate_sqlite_sidecars(path: Path) -> None:
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            metadata = sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        _validate_private_regular_file(sidecar, metadata, label="SQLite state file")
+
+
+@contextmanager
+def _open_private_subdirectory(root: Path, components: tuple[str, ...], *, create: bool) -> Iterator[int]:
+    """Pin a real directory path below ``root`` without following component symlinks."""
+    try:
+        root_metadata = root.lstat()
+    except OSError as error:
+        raise LedgerError(f"state directory cannot be inspected: {root}") from error
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise LedgerError(f"state path is not a real directory: {root}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptors: list[int] = []
+    current_path = root
+    try:
+        try:
+            descriptor = os.open(root, flags)
+        except OSError as error:
+            raise LedgerError(f"state directory cannot be opened safely: {root}") from error
+        descriptors.append(descriptor)
+        opened_root = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino) != (root_metadata.st_dev, root_metadata.st_ino)
+        ):
+            raise LedgerError(f"state directory changed while it was being opened: {root}")
+        for component in components:
+            if not component or component in {".", ".."} or "/" in component or "\x00" in component:
+                raise LedgerError(f"invalid private state directory component: {component!r}")
+            created = False
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    raise LedgerError(f"state directory cannot be created: {current_path / component}") from error
+            try:
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise LedgerError(
+                    f"state directory is missing or unsafe: {current_path / component}"
+                ) from error
+            descriptors.append(child_descriptor)
+            child_metadata = os.fstat(child_descriptor)
+            if not stat.S_ISDIR(child_metadata.st_mode):
+                raise LedgerError(f"state path is not a real directory: {current_path / component}")
+            if created:
+                os.fsync(descriptor)
+            descriptor = child_descriptor
+            current_path /= component
+        yield descriptor
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 @contextmanager
 def _initialization_lock(path: Path) -> Iterator[None]:
     """Serialize schema discovery, migration, validation, and journal configuration."""
@@ -2506,12 +2815,12 @@ def _write_all(descriptor: int, content: bytes) -> None:
         view = view[written:]
 
 
-def _read_artifact(path: Path, digest: str, size: int) -> bytes:
+def _read_artifact_at(directory_descriptor: int, path: Path, digest: str, size: int) -> bytes:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
     except OSError as error:
         raise LedgerError(f"artifact cannot be inspected: {path}") from error
     try:
@@ -2538,10 +2847,6 @@ def _read_artifact(path: Path, digest: str, size: int) -> bytes:
     if hashlib.sha256(content).hexdigest() != digest:
         raise LedgerError(f"artifact content changed: {digest}")
     return content
-
-
-def _verify_artifact(path: Path, digest: str, size: int) -> None:
-    _read_artifact(path, digest, size)
 
 
 def _fsync_directory(path: Path) -> None:
