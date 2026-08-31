@@ -1106,7 +1106,13 @@ def test_parameter_map_covers_every_scaffold_placeholder() -> None:
     for template in scaffold_module._TEMPLATES.rglob("*"):
         if not template.is_file():
             continue
-        relative = template.relative_to(scaffold_module._TEMPLATES).as_posix()
+        relative_path = template.relative_to(scaffold_module._TEMPLATES)
+        if (
+            "__pycache__" in relative_path.parts
+            or template.suffix == ".pyc"
+        ):
+            continue
+        relative = relative_path.as_posix()
         destination = scaffold_module._destination(relative)
         for match in scaffold_module._TEMPLATE_PLACEHOLDER.finditer(
             template.read_text(encoding="utf-8")
