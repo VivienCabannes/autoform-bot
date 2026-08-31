@@ -473,6 +473,24 @@ def test_recovery_plan_resumes_exact_candidate_attempt() -> None:
     ) == RecoveryAction("admit-candidate", "attempt")
 
 
+def test_recovery_plan_does_not_admit_candidate_after_stop_request() -> None:
+    candidate_oid = "2" * 40
+    task = replace(
+        _task("af_000000000000000000000001", "proof", "candidate"),
+        attempts=1,
+        candidate_oid=candidate_oid,
+    )
+    attempt = _attempt(task, status="candidate", candidate_oid=candidate_oid)
+
+    assert plan_recovery(
+        _recovery_snapshot(
+            run=_run_record(stop_requested=True),
+            tasks=(task,),
+            attempts=(attempt,),
+        )
+    ) == RecoveryAction("stop-candidate", "attempt")
+
+
 def test_recovery_plan_keeps_external_recovery_ahead_of_stop() -> None:
     snapshot = _recovery_snapshot(
         run=_run_record(stop_requested=True),

@@ -246,6 +246,8 @@ def plan_recovery(snapshot: RecoverySnapshot) -> RecoveryAction:
                     "candidate-evidence-missing",
                     f"candidate task has no unique attempt evidence: {task.article_id}:{task.phase}",
                 )
+            if snapshot.run.stop_requested:
+                return RecoveryAction("stop-candidate", candidates[0].attempt_id)
             return RecoveryAction("admit-candidate", candidates[0].attempt_id)
         raise ControllerError(
             "active-task-evidence-missing",
