@@ -237,6 +237,20 @@ def test_ls_remote_parser_accepts_non_utf8_ref_bytes_via_surrogateescape() -> No
     assert claims._parse_ls_remote_output(f"{oid}\t{ref}\n") == [(oid, ref)]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="raw Git ref bytes require POSIX argv semantics")
+def test_list_rejects_non_utf8_claim_ref_without_decode_error(
+    tmp_path: Path, board_repo: Path
+) -> None:
+    oid = _plant_message(board_repo, "valid", "not used")
+    raw_key = os.fsdecode(b"invalid-\xff")
+    raw_ref = claims.CLAIM_REF_PREFIX + raw_key
+    _git("update-ref", raw_ref, oid, cwd=board_repo)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(claims.ClaimTransportError, match="invalid claim ref"):
+        board.list()
+
+
 def test_existing_claim_scratch_must_match_repository_object_format(tmp_path: Path) -> None:
     repo = tmp_path / "claims-sha256.git"
     scratch = tmp_path / "scratch"

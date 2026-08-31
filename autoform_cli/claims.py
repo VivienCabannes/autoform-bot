@@ -520,6 +520,7 @@ class ClaimBoard:
                 command,
                 capture_output=True,
                 text=True,
+                errors="surrogateescape",
                 input=input_text,
                 timeout=120,
                 env=environment,
