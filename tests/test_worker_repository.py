@@ -17,6 +17,7 @@ import pytest
 
 import autoform_worker
 import autoform_worker.repository as repository_module
+from autoform_cli.claims import ClaimFence
 from autoform_worker.ledger import RunLedger
 from autoform_worker.repository import (
     AttemptWorktrees,
@@ -41,8 +42,8 @@ class _FencedTestClaimBoard:
         self.worker = worker
         self.scratch = scratch
         self.repo_url = str(remote.resolve())
-        self._owned_oid: str | None = None
-        self._lease_id: str | None = None
+        self._owned_oids: dict[str, str] = {}
+        self._lease_ids: dict[str, str] = {}
 
     def _ref(self, key: str) -> str:
         return f"refs/autoform-claims/{key}"
@@ -52,7 +53,7 @@ class _FencedTestClaimBoard:
 
     def acquire(self, key: str, ttl: int | float = 60, steal: bool = False, note: str = "") -> bool:
         old = self._remote_oid(key)
-        if old is not None and old != self._owned_oid and not steal:
+        if old is not None and old != self._owned_oids.get(key) and not steal:
             return False
         self.scratch.mkdir(parents=True, exist_ok=True)
         token = self.scratch / "claim-token"
@@ -62,30 +63,57 @@ class _FencedTestClaimBoard:
             _git("update-ref", self._ref(key), new, old or ("0" * len(new)), cwd=self.remote)
         except subprocess.CalledProcessError:
             return False
-        self._owned_oid = new
-        self._lease_id = os.urandom(32).hex()
+        self._owned_oids[key] = new
+        self._lease_ids[key] = os.urandom(32).hex()
         return True
 
     def holds(self, key: str) -> bool:
-        return self._owned_oid is not None and self._remote_oid(key) == self._owned_oid
+        return key in self._owned_oids and self._remote_oid(key) == self._owned_oids[key]
 
     def held_claim_oid(self, key: str) -> str | None:
-        return self._owned_oid if self.holds(key) else None
+        return self._owned_oids.get(key) if self.holds(key) else None
 
     def held_lease_id(self, key: str) -> str | None:
-        return self._lease_id if self.holds(key) else None
+        return self._lease_ids.get(key) if self.holds(key) else None
 
-    def release(self, key: str) -> bool:
-        if self._owned_oid is None:
-            return True
-        if self._remote_oid(key) != self._owned_oid:
+    def held_claim_fence(self, key: str) -> ClaimFence | None:
+        if not self.holds(key):
+            return None
+        return ClaimFence(
+            key=key,
+            ref=self._ref(key),
+            oid=self._owned_oids[key],
+            lease_id=self._lease_ids[key],
+        )
+
+    def renew(self, key: str, ttl: int | float = 60, *, lease_id: str | None = None) -> bool:
+        old = self._owned_oids.get(key)
+        if old is None or self._remote_oid(key) != old:
             return False
+        if lease_id is not None and lease_id != self._lease_ids[key]:
+            return False
+        token = self.scratch / "claim-token"
+        token.write_bytes(os.urandom(32))
+        new = _git("hash-object", "-w", str(token), cwd=self.remote)
         try:
-            _git("update-ref", "-d", self._ref(key), self._owned_oid, cwd=self.remote)
+            _git("update-ref", self._ref(key), new, old, cwd=self.remote)
         except subprocess.CalledProcessError:
             return False
-        self._owned_oid = None
-        self._lease_id = None
+        self._owned_oids[key] = new
+        return True
+
+    def release(self, key: str) -> bool:
+        owned_oid = self._owned_oids.get(key)
+        if owned_oid is None:
+            return True
+        if self._remote_oid(key) != owned_oid:
+            return False
+        try:
+            _git("update-ref", "-d", self._ref(key), owned_oid, cwd=self.remote)
+        except subprocess.CalledProcessError:
+            return False
+        self._owned_oids.pop(key, None)
+        self._lease_ids.pop(key, None)
         return True
 
     def heartbeat(self, key: str, *, interval: float = 300, ttl: int | float = 600) -> _StaticHeartbeat:
@@ -200,6 +228,18 @@ def _queue(
         claim_ttl=600,
         heartbeat_interval=300,
     )
+
+
+def _article_claim(queue: RemoteMergeQueue) -> ClaimFence:
+    key = f"author/{queue.worker_id}"
+    cached = getattr(queue, "_test_article_claim", None)
+    if isinstance(cached, ClaimFence):
+        return cached
+    assert queue.claim_board.acquire(key, ttl=600)
+    fence = queue.claim_board.held_claim_fence(key)
+    assert fence is not None
+    queue._test_article_claim = fence
+    return fence
 
 
 def test_scp_style_remote_without_user_is_not_treated_as_local() -> None:
@@ -3475,6 +3515,7 @@ def test_remote_merge_queue_publishes_exact_cas_and_is_idempotent(
         "queue_ref": "refs/autoform/queue/run-1-attempt-1",
         "expected_target_oid": base,
         "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
     }
 
     receipt = queue.publish("queue-1", **arguments)
@@ -3487,16 +3528,52 @@ def test_remote_merge_queue_publishes_exact_cas_and_is_idempotent(
     assert receipt.claim_oid is not None
     assert receipt.observed_claim_oid is None
     assert receipt.observed_target_oid == candidate
-    assert receipt.observed_queue_oid == candidate
+    assert receipt.observed_queue_oid is None
+    assert receipt.observed_article_claim_oid is None
+    assert receipt.article_claim_oid == arguments["article_claim"].oid
     assert hashlib.sha256(receipt.evidence_bytes()).hexdigest() == receipt.evidence_sha256
     with RunLedger(tmp_path / "ledger/run.sqlite3") as ledger:
         evidence = ledger.put_artifact("merge-receipt", receipt.evidence_bytes())
         assert evidence == receipt.evidence_sha256
         assert ledger.read_artifact(evidence) == receipt.evidence_bytes()
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
-    assert _git("rev-parse", "refs/autoform/queue/run-1-attempt-1", cwd=remote) == candidate
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/run-1-attempt-1", cwd=remote) == ""
     assert _git("for-each-ref", "--format=%(refname)", receipt.claim_ref, cwd=remote) == ""
     _git("fsck", "--full", cwd=remote)
+
+
+def test_remote_merge_queue_rejects_article_claim_for_wrong_object_format(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = ClaimFence(
+        key="author/article-0123456789abcdef",
+        ref="refs/autoform-claims/author/article-0123456789abcdef",
+        oid="1" * 64,
+        lease_id="2" * 64,
+    )
+
+    with pytest.raises(MergeQueueError, match="object format"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+            article_claim=article_claim,
+        )
+
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
 
 
 @pytest.mark.parametrize("boundary", ("publication-staging-created", "publication-staging-recorded"))
@@ -3517,6 +3594,7 @@ def test_publication_staging_resumes_before_final_directory_rename(
     )
     state = tmp_path / "queue-state"
     queue = _queue(manager, remote, state, "worker-a")
+    article_claim = _article_claim(queue)
 
     def interrupt(name: str) -> None:
         if name == boundary:
@@ -3530,6 +3608,7 @@ def test_publication_staging_resumes_before_final_directory_rename(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=article_claim,
         )
     staging_journal = state / "publications/.queue-1.preparing/publication.json"
     assert staging_journal.is_file() == (boundary == "publication-staging-recorded")
@@ -3542,6 +3621,7 @@ def test_publication_staging_resumes_before_final_directory_rename(
         queue_ref="refs/autoform/queue/queue-1",
         expected_target_oid=base,
         candidate_oid=candidate,
+        article_claim=article_claim,
     )
     assert recovered.status == "prepared"
     receipt = queue.publish(
@@ -3550,9 +3630,66 @@ def test_publication_staging_resumes_before_final_directory_rename(
         queue_ref="refs/autoform/queue/queue-1",
         expected_target_oid=base,
         candidate_oid=candidate,
+        article_claim=article_claim,
     )
     assert receipt.status == "integrated"
     assert not (state / "publications/.queue-1.preparing").exists()
+
+
+def test_recovery_binds_stable_article_lease_across_prepublication_renewal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    original_claim = _article_claim(queue)
+    assert queue.claim_board.renew(
+        original_claim.key,
+        ttl=600,
+        lease_id=original_claim.lease_id,
+    )
+    renewed_claim = queue.claim_board.held_claim_fence(original_claim.key)
+    assert renewed_claim is not None
+    assert renewed_claim.oid != original_claim.oid
+    assert renewed_claim.lease_id == original_claim.lease_id
+
+    def interrupt(name: str) -> None:
+        if name == "publication-intent-recorded":
+            raise KeyboardInterrupt
+
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+    }
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", article_claim=renewed_claim, **arguments)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    wrong_lease = ClaimFence(
+        key=original_claim.key,
+        ref=original_claim.ref,
+        oid=original_claim.oid,
+        lease_id="f" * 64,
+    )
+    with pytest.raises(PublicationUncertain, match="different article_claim_lease_id"):
+        queue.recover("queue-1", article_claim=wrong_lease, **arguments)
+    recovered = queue.recover("queue-1", article_claim=original_claim, **arguments)
+    assert recovered.status == "prepared"
+    assert recovered.article_claim == renewed_claim
+    receipt = queue.publish("queue-1", article_claim=recovered.article_claim, **arguments)
+    assert receipt.status == "integrated"
 
 
 def test_pre_journal_atomic_write_orphan_does_not_block_publication_recovery(
@@ -3576,6 +3713,7 @@ def test_pre_journal_atomic_write_orphan_does_not_block_publication_recovery(
         "queue_ref": "refs/autoform/queue/queue-1",
         "expected_target_oid": base,
         "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
     }
 
     def interrupt(name: str) -> None:
@@ -3623,6 +3761,7 @@ def test_remote_merge_queue_rejects_stale_remote_without_publishing_queue_ref(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
 
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
@@ -3656,6 +3795,7 @@ def test_candidate_ancestry_ignores_git_graph_substitution(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=unrelated,
+            article_claim=_article_claim(queue),
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
     assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
@@ -3690,6 +3830,7 @@ def test_concurrent_publishers_cannot_overwrite_each_other(
                 queue_ref=f"refs/autoform/queue/queue-{index}",
                 expected_target_oid=base,
                 candidate_oid=candidates[index],
+                article_claim=_article_claim(queues[index]),
             )
         except (MergeQueueBusy, RemoteDrift) as error:
             result = error
@@ -3713,6 +3854,7 @@ def test_concurrent_publishers_cannot_overwrite_each_other(
             queue_ref=f"refs/autoform/queue/queue-{loser}",
             expected_target_oid=base,
             candidate_oid=candidates[loser],
+            article_claim=_article_claim(queues[loser]),
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidates[winner]
 
@@ -3721,10 +3863,12 @@ def test_concurrent_publishers_cannot_overwrite_each_other(
     ("boundary", "recovered_status"),
     (
         ("publication-intent-recorded", "prepared"),
+        ("queue-push-attempted", "prepared"),
         ("queue-pushed", "queued"),
         ("claim-fence-recorded", "queued"),
         ("target-push-attempted", "queued"),
         ("target-pushed", "integrated"),
+        ("target-verified", "integrated"),
     ),
 )
 def test_publication_interruption_is_classified_from_remote_evidence(
@@ -3749,6 +3893,7 @@ def test_publication_interruption_is_classified_from_remote_evidence(
         "queue_ref": "refs/autoform/queue/queue-1",
         "expected_target_oid": base,
         "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
     }
 
     def interrupt(name: str) -> None:
@@ -3787,6 +3932,7 @@ def test_atomic_push_disconnect_is_uncertain_then_recovers_from_remote_evidence(
         "queue_ref": "refs/autoform/queue/queue-1",
         "expected_target_oid": base,
         "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
     }
     original_remote_git = queue._remote_git
 
@@ -3794,7 +3940,11 @@ def test_atomic_push_disconnect_is_uncertain_then_recovers_from_remote_evidence(
         git_arguments: list[str], *, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         result = original_remote_git(git_arguments, check=check)
-        if git_arguments[0] == "push" and "--atomic" in git_arguments:
+        if (
+            git_arguments[0] == "push"
+            and "--atomic" in git_arguments
+            and f"{candidate}:refs/heads/main" in git_arguments
+        ):
             return subprocess.CompletedProcess(
                 result.args,
                 1,
@@ -3811,7 +3961,183 @@ def test_atomic_push_disconnect_is_uncertain_then_recovers_from_remote_evidence(
     recovered = queue.recover("queue-1", **arguments)
     assert recovered.status == "integrated"
     assert recovered.observed_target_oid == candidate
+    assert recovered.observed_queue_oid is None
+
+
+def test_queue_handoff_disconnect_recovers_from_two_ref_remote_evidence(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+    original_remote_git = queue._remote_git
+
+    def apply_handoff_then_report_disconnect(
+        git_arguments: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        result = original_remote_git(git_arguments, check=check)
+        if (
+            git_arguments[0] == "push"
+            and "--atomic" in git_arguments
+            and f"{candidate}:refs/autoform/queue/queue-1" in git_arguments
+        ):
+            return subprocess.CompletedProcess(
+                result.args,
+                1,
+                stdout=result.stdout,
+                stderr="connection reset after remote update",
+            )
+        return result
+
+    monkeypatch.setattr(queue, "_remote_git", apply_handoff_then_report_disconnect)
+    with pytest.raises(PublicationUncertain, match="handoff outcome is uncertain"):
+        queue.publish("queue-1", **arguments)
+
+    monkeypatch.setattr(queue, "_remote_git", original_remote_git)
+    recovered = queue.recover("queue-1", **arguments)
+    assert recovered.status == "queued"
     assert recovered.observed_queue_oid == candidate
+    assert recovered.observed_article_claim_oid is None
+    receipt = queue.publish("queue-1", **arguments)
+    assert receipt.status == "integrated"
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
+    assert _git("for-each-ref", "--format=%(refname)", arguments["queue_ref"], cwd=remote) == ""
+
+
+def test_article_claim_steal_before_atomic_handoff_cannot_create_queue_ref(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    thief = _FencedTestClaimBoard(remote, "worker-b", tmp_path / "thief-claims")
+    original_handoff = queue._atomic_queue_handoff
+
+    def steal_then_handoff(**arguments: object) -> bool:
+        assert thief.acquire(article_claim.key, ttl=600, steal=True)
+        return original_handoff(**arguments)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(queue, "_atomic_queue_handoff", steal_then_handoff)
+    with pytest.raises(PublicationUncertain, match="article claim .* changed during queue handoff"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+            article_claim=article_claim,
+        )
+
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
+    assert thief.holds(article_claim.key)
+    assert thief.release(article_claim.key)
+
+
+def test_incoherent_article_claim_fence_cannot_create_queue_ref(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    original_fence = queue.claim_board.held_claim_fence
+
+    def incoherent_fence(key: str) -> ClaimFence | None:
+        fence = original_fence(key)
+        if key != article_claim.key or fence is None:
+            return fence
+        return ClaimFence(key=fence.key, ref=fence.ref, oid=fence.oid, lease_id="f" * 64)
+
+    monkeypatch.setattr(queue.claim_board, "held_claim_fence", incoherent_fence)
+    with pytest.raises(PublicationUncertain, match="not owned by this exact controller session"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+            article_claim=article_claim,
+        )
+
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
+
+
+def test_successor_article_claim_after_atomic_handoff_does_not_obscure_success(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    successor = _FencedTestClaimBoard(remote, "worker-b", tmp_path / "successor-claims")
+
+    def acquire_successor(name: str) -> None:
+        if name == "queue-pushed":
+            assert successor.acquire(article_claim.key, ttl=600)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", acquire_successor)
+    receipt = queue.publish(
+        "queue-1",
+        target_ref="refs/heads/main",
+        queue_ref="refs/autoform/queue/queue-1",
+        expected_target_oid=base,
+        candidate_oid=candidate,
+        article_claim=article_claim,
+    )
+
+    successor_fence = successor.held_claim_fence(article_claim.key)
+    assert successor_fence is not None
+    assert receipt.status == "integrated"
+    assert receipt.observed_article_claim_oid == successor_fence.oid
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
+    assert successor.release(article_claim.key)
 
 
 def test_queue_ref_collision_is_preserved_as_uncertain_state(
@@ -3837,6 +4163,7 @@ def test_queue_ref_collision_is_preserved_as_uncertain_state(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
     assert _git("rev-parse", "refs/autoform/queue/queue-1", cwd=remote) == base
@@ -3866,6 +4193,7 @@ def test_target_candidate_does_not_hide_a_colliding_queue_ref(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
     assert _git("rev-parse", "refs/autoform/queue/queue-1", cwd=remote) == base
@@ -3899,9 +4227,52 @@ def test_queue_ref_change_during_target_cas_never_records_integration(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
     assert _git("rev-parse", "refs/autoform/queue/queue-1", cwd=remote) == base
+
+
+def test_target_and_queue_changes_without_merge_claim_consumption_are_uncertain(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "claim-fence-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    record = queue._read_journal(journal)
+    _git("update-ref", str(record["claim_ref"]), str(record["claim_oid"]), cwd=remote)
+    _git("update-ref", "refs/heads/main", candidate, base, cwd=remote)
+    _git("update-ref", "-d", arguments["queue_ref"], candidate, cwd=remote)
+    recovered = queue.recover("queue-1", **arguments)
+    assert recovered.status == "uncertain"
+    assert "without consuming the exact merge claim" in recovered.detail
 
 
 def test_claim_steal_before_atomic_publication_cannot_advance_target(
@@ -3935,6 +4306,7 @@ def test_claim_steal_before_atomic_publication_cannot_advance_target(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
     assert thief.holds(claim_key)
@@ -3972,6 +4344,7 @@ def test_successor_claim_after_atomic_publication_does_not_obscure_success(
         queue_ref="refs/autoform/queue/queue-1",
         expected_target_oid=base,
         candidate_oid=candidate,
+        article_claim=_article_claim(queue),
     )
     assert receipt.status == "integrated"
     assert receipt.observed_claim_oid not in {None, receipt.claim_oid}
@@ -4000,6 +4373,7 @@ def test_remote_target_oid_cannot_substitute_for_local_candidate_validation(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=remote_only,
+            article_claim=_article_claim(queue),
         )
     assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
 
@@ -4029,6 +4403,7 @@ def test_local_remote_replacement_is_rejected_before_any_ref_mutation(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
     assert _git("for-each-ref", "--format=%(refname)", cwd=remote) == ""
 
@@ -4075,6 +4450,7 @@ def test_publication_directory_substitution_is_read_only_and_fails_closed(
         "queue_ref": "refs/autoform/queue/queue-1",
         "expected_target_oid": base,
         "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
     }
 
     def interrupt(name: str) -> None:
@@ -4126,6 +4502,7 @@ def test_publication_does_not_adopt_a_foreign_empty_directory(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=_article_claim(queue),
         )
     assert list(foreign.iterdir()) == []
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
@@ -4158,6 +4535,9 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
         def held_claim_oid(self, _key: str) -> str:
             return base
 
+        def held_claim_fence(self, _key: str) -> ClaimFence:
+            raise RuntimeError("receipt unavailable")
+
         def release(self, _key: str) -> bool:
             self.released = True
             return True
@@ -4170,6 +4550,13 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
         worker_id="worker-a",
         claim_board=board,
     )
+    article_claim = ClaimFence(
+        key="author/af_0123456789abcdef01234567",
+        ref="refs/autoform-claims/author/af_0123456789abcdef01234567",
+        oid=base,
+        lease_id="1" * 64,
+    )
+    _git("update-ref", article_claim.ref, article_claim.oid, cwd=remote)
     with pytest.raises(RuntimeError, match="receipt unavailable"):
         queue.publish(
             "queue-1",
@@ -4177,6 +4564,7 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
+            article_claim=article_claim,
         )
     assert board.released
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base

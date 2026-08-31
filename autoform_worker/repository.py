@@ -23,7 +23,13 @@ from typing import Any, BinaryIO, Callable, Protocol
 from urllib.parse import unquote, urlsplit
 
 import autoform_cli.claims as claims_module
-from autoform_cli.claims import CLAIM_HEARTBEAT_S, CLAIM_REF_PREFIX, CLAIM_TTL_S, ClaimBoard
+from autoform_cli.claims import (
+    CLAIM_HEARTBEAT_S,
+    CLAIM_REF_PREFIX,
+    CLAIM_TTL_S,
+    ClaimBoard,
+    ClaimFence,
+)
 
 from ._paths import GENERATED_DIRECTORY_NAMES
 from .ledger import CoordinatorLock
@@ -47,7 +53,7 @@ _MAX_CANDIDATE_ABANDONED_INDEX_STAGES = 8
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
 _CANDIDATE_SCHEMA = "autoform-candidate/v5"
 _READY_CANDIDATE_INDEX_TOPOLOGY = frozenset({"stage", "index", "displaced-backup"})
-_PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
+_PUBLICATION_SCHEMA = "autoform-merge-publication/v3"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
 _PUBLICATION_STATES = frozenset({"prepared", "queueing", "queued", "publishing", "integrated", "stale", "uncertain"})
@@ -148,7 +154,7 @@ class _ClaimBoardLike(Protocol):
 
     def holds(self, key: str) -> bool: ...
 
-    def held_claim_oid(self, key: str) -> str | None: ...
+    def held_claim_fence(self, key: str) -> ClaimFence | None: ...
 
     def release(self, key: str) -> bool: ...
 
@@ -235,6 +241,11 @@ class PublicationReceipt:
     status: str
     observed_target_oid: str | None
     observed_queue_oid: str | None
+    article_claim_key: str
+    article_claim_ref: str
+    article_claim_oid: str
+    article_claim_lease_id: str
+    observed_article_claim_oid: str | None
     claim_key: str
     claim_ref: str
     claim_oid: str | None
@@ -251,6 +262,17 @@ class PublicationReceipt:
     def evidence_bytes(self) -> bytes:
         """Return canonical bytes suitable for :meth:`RunLedger.put_artifact`."""
         return _json_bytes({"schema": _PUBLICATION_SCHEMA, **self.as_dict()})
+
+    @property
+    def article_claim(self) -> ClaimFence:
+        """Return the exact article-claim fence recorded for publication."""
+
+        return ClaimFence(
+            key=self.article_claim_key,
+            ref=self.article_claim_ref,
+            oid=self.article_claim_oid,
+            lease_id=self.article_claim_lease_id,
+        )
 
     @property
     def evidence_sha256(self) -> str:
@@ -3493,8 +3515,8 @@ class RemoteMergeQueue:
                 if _paths_overlap(remote_path, protected):
                     raise RepositoryError(f"local publication remote must be disjoint from the {label}")
         claim_provider: object = ClaimBoard if claim_board is None else claim_board
-        if not callable(getattr(claim_provider, "held_claim_oid", None)):
-            raise RepositoryError("merge claim board must expose an exact held_claim_oid ownership fence")
+        if not callable(getattr(claim_provider, "held_claim_fence", None)):
+            raise RepositoryError("merge claim board must expose coherent ownership fences")
         if claim_board is not None and _normalize_remote(claim_board.repo_url) != self.remote_url:
             raise RepositoryError("merge claim board must use the publication remote")
         self.state_root = _prepare_private_root(state_path)
@@ -3577,9 +3599,11 @@ class RemoteMergeQueue:
         queue_ref: str,
         expected_target_oid: str,
         candidate_oid: str,
+        article_claim: ClaimFence,
     ) -> PublicationReceipt:
-        """Publish one descendant candidate, or fail without overwriting drift."""
+        """Consume one article claim and publish its descendant candidate."""
         self._validate_publication_identity(queue_item_id, target_ref, queue_ref, expected_target_oid, candidate_oid)
+        self._validate_article_claim(article_claim)
         self._verify_state()
         claim_key = _merge_claim_key(target_ref)
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
@@ -3591,6 +3615,10 @@ class RemoteMergeQueue:
                 queue_ref=queue_ref,
                 expected_target_oid=expected_target_oid,
                 candidate_oid=candidate_oid,
+                article_claim_key=article_claim.key,
+                article_claim_ref=article_claim.ref,
+                article_claim_oid=article_claim.oid,
+                article_claim_lease_id=article_claim.lease_id,
                 claim_key=claim_key,
                 claim_ref=CLAIM_REF_PREFIX + claim_key,
             )
@@ -3610,13 +3638,11 @@ class RemoteMergeQueue:
             )
             if not acquired:
                 raise MergeQueueBusy(f"another publisher owns {target_ref}")
-            lease_id: str | None = None
+            merge_fence: ClaimFence | None = None
             release_warning = ""
             result: PublicationReceipt | None = None
             pending_error: BaseException | None = None
-            fenced_claim_oid: str | None = None
             try:
-                lease_id = self._held_lease_id(claim_key)
                 ready_to_publish = False
                 with self.claim_board.heartbeat(
                     claim_key,
@@ -3624,7 +3650,10 @@ class RemoteMergeQueue:
                     ttl=self.claim_ttl,
                 ) as heartbeat:
                     record = self._read_journal(journal)
-                    record["claim_lease_id"] = lease_id
+                    merge_fence = self._held_claim_fence(claim_key)
+                    if merge_fence is None:
+                        raise PublicationUncertain("publication claim has no coherent ownership fence")
+                    record["claim_lease_id"] = merge_fence.lease_id
                     self._assert_lease(claim_key, heartbeat)
                     record = self._recover_record(record, journal)
                     if record["status"] == "integrated":
@@ -3637,17 +3666,20 @@ class RemoteMergeQueue:
                         record = self._ensure_queue_ref(record, journal, heartbeat)
                         if record["status"] == "uncertain":
                             raise PublicationUncertain(str(record["detail"]))
+                        if record["status"] != "queued":
+                            raise MergeQueueBusy(str(record["detail"]))
                         self._assert_lease(claim_key, heartbeat)
                         ready_to_publish = True
                 if ready_to_publish or result is not None:
-                    fenced_claim_oid = self._held_claim_oid(claim_key)
-                    if fenced_claim_oid is None:
-                        raise PublicationUncertain("publication claim has no exact owned ref fence")
+                    merge_fence = self._held_claim_fence(claim_key)
+                    if merge_fence is None:
+                        raise PublicationUncertain("publication claim has no coherent ownership fence")
                 if ready_to_publish:
-                    record["claim_oid"] = fenced_claim_oid
+                    record["claim_oid"] = merge_fence.oid
+                    record["claim_lease_id"] = merge_fence.lease_id
                     record = _transition_journal(journal, record, "queued", "exact claim-ref fence recorded")
                     _checkpoint("claim-fence-recorded")
-                    record = self._publish_target(record, journal, str(fenced_claim_oid))
+                    record = self._publish_target(record, journal, merge_fence.oid)
                     if record["status"] == "integrated":
                         result = _publication_receipt(record)
                     elif record["status"] == "stale":
@@ -3660,8 +3692,8 @@ class RemoteMergeQueue:
                 pending_error = error
             finally:
                 try:
-                    if fenced_claim_oid is not None:
-                        self._release_claim_fence(CLAIM_REF_PREFIX + claim_key, fenced_claim_oid)
+                    if merge_fence is not None:
+                        self._release_claim_fence(merge_fence.ref, merge_fence.oid)
                     else:
                         released = self.claim_board.release(claim_key)
                         if not released:
@@ -3688,32 +3720,44 @@ class RemoteMergeQueue:
         queue_ref: str,
         expected_target_oid: str,
         candidate_oid: str,
+        article_claim: ClaimFence,
     ) -> PublicationReceipt:
-        """Classify an interrupted publication from its journal and exact remote refs."""
+        """Classify an interrupted publication from its journal and exact remote refs.
+
+        Recovery binds the stable article-claim key and lease id. Its supplied OID may
+        predate the final heartbeat renewal recorded by the publication journal.
+        """
         self._validate_publication_identity(queue_item_id, target_ref, queue_ref, expected_target_oid, candidate_oid)
+        self._validate_article_claim(article_claim)
         self._verify_state()
         _, journal = self._publication_paths(queue_item_id)
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
         with CoordinatorLock(self.lock_root / f"publish-{lock_digest}.lock"):
             self._verify_state()
-            identity = {
+            stable_identity = {
                 "queue_item_id": queue_item_id,
                 "target_ref": target_ref,
                 "queue_ref": queue_ref,
                 "expected_target_oid": expected_target_oid,
                 "candidate_oid": candidate_oid,
+                "article_claim_key": article_claim.key,
+                "article_claim_ref": article_claim.ref,
+                "article_claim_lease_id": article_claim.lease_id,
                 "claim_key": _merge_claim_key(target_ref),
                 "claim_ref": CLAIM_REF_PREFIX + _merge_claim_key(target_ref),
             }
             staging = self.publication_root / f".{queue_item_id}.preparing"
             if not journal.exists() and not journal.is_symlink() and (staging.exists() or staging.is_symlink()):
-                record, journal = self._load_or_create(**identity)
+                record, journal = self._load_or_create(
+                    **stable_identity,
+                    article_claim_oid=article_claim.oid,
+                )
             else:
                 record = self._read_journal(journal)
             self._validate_journal(
                 record,
                 journal=journal,
-                **identity,
+                **stable_identity,
             )
             if record["status"] != "integrated":
                 self._verify_candidate(expected_target_oid, candidate_oid)
@@ -3727,32 +3771,104 @@ class RemoteMergeQueue:
     ) -> dict[str, object]:
         queue_ref = str(record["queue_ref"])
         candidate = str(record["candidate_oid"])
-        observed = self._remote_oid(queue_ref)
-        record["observed_queue_oid"] = observed
-        if observed == candidate:
-            return _transition_journal(journal, record, "queued", "candidate queue ref verified")
-        if observed is not None:
+        article_claim_ref = str(record["article_claim_ref"])
+        article_claim_oid = str(record["article_claim_oid"])
+        observed_queue = self._remote_oid(queue_ref)
+        observed_article_claim = self._remote_oid(article_claim_ref)
+        record["observed_queue_oid"] = observed_queue
+        record["observed_article_claim_oid"] = observed_article_claim
+        if observed_queue == candidate:
+            if observed_article_claim == article_claim_oid:
+                return _transition_journal(
+                    journal,
+                    record,
+                    "uncertain",
+                    "queue ref exists but the exact article claim was not consumed",
+                )
+            return _transition_journal(
+                journal,
+                record,
+                "queued",
+                "candidate queue ref and consumed article claim verified",
+            )
+        if observed_queue is not None:
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
-                f"queue ref {queue_ref} points to unexpected object {observed}",
+                f"queue ref {queue_ref} points to unexpected object {observed_queue}",
             )
-        record = _transition_journal(journal, record, "queueing", "queue-ref CAS about to run")
+        if observed_article_claim != article_claim_oid:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"article claim {article_claim_ref} changed before queue handoff",
+            )
+        expected_fence = ClaimFence(
+            key=str(record["article_claim_key"]),
+            ref=article_claim_ref,
+            oid=article_claim_oid,
+            lease_id=str(record["article_claim_lease_id"]),
+        )
+        if self._held_claim_fence(expected_fence.key) != expected_fence:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "article claim is not owned by this exact controller session",
+            )
+        record = _transition_journal(
+            journal,
+            record,
+            "queueing",
+            "atomic article-claim to queue-ref handoff about to run",
+        )
         _checkpoint("queue-push-attempted")
         self._assert_lease(str(record["claim_key"]), heartbeat)
-        pushed = self._cas_push(queue_ref, None, candidate)
+        pushed = self._atomic_queue_handoff(
+            queue_ref=queue_ref,
+            candidate=candidate,
+            article_claim_ref=article_claim_ref,
+            article_claim_oid=article_claim_oid,
+        )
         _checkpoint("queue-pushed")
-        observed = self._remote_oid(queue_ref)
-        record["observed_queue_oid"] = observed
-        if observed != candidate:
-            detail = (
-                f"queue ref {queue_ref} is {observed or 'absent'} after "
-                + ("a rejected" if not pushed else "a successful")
-                + " CAS push"
+        observed_queue = self._remote_oid(queue_ref)
+        observed_article_claim = self._remote_oid(article_claim_ref)
+        record["observed_queue_oid"] = observed_queue
+        record["observed_article_claim_oid"] = observed_article_claim
+        if observed_queue == candidate and observed_article_claim != article_claim_oid:
+            return _transition_journal(
+                journal,
+                record,
+                "queued",
+                "atomic article-claim to queue-ref handoff verified",
             )
-            return _transition_journal(journal, record, "uncertain", detail)
-        return _transition_journal(journal, record, "queued", "candidate queue ref verified")
+        if observed_queue not in {None, candidate}:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"queue ref {queue_ref} changed during article-claim handoff",
+            )
+        if observed_article_claim != article_claim_oid:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"article claim {article_claim_ref} changed during queue handoff",
+            )
+        detail = (
+            "article-claim handoff CAS was rejected without remote drift"
+            if not pushed
+            else "article-claim handoff reported success without the exact two-ref result"
+        )
+        return _transition_journal(
+            journal,
+            record,
+            "prepared" if not pushed else "uncertain",
+            detail,
+        )
 
     def _publish_target(
         self,
@@ -3785,9 +3901,7 @@ class RemoteMergeQueue:
             )
         observed = self._remote_oid(target_ref)
         record["observed_target_oid"] = observed
-        if observed == candidate:
-            return _transition_journal(journal, record, "integrated", "target already equals candidate")
-        if observed != _expected_oid(expected):
+        if observed not in {_expected_oid(expected), candidate}:
             return _transition_journal(
                 journal,
                 record,
@@ -3801,7 +3915,7 @@ class RemoteMergeQueue:
             queue_ref=queue_ref,
             claim_ref=claim_ref,
             claim_oid=claim_oid,
-            expected_target=_expected_oid(expected),
+            expected_target=observed,
             candidate=candidate,
         )
         _checkpoint("target-pushed")
@@ -3812,9 +3926,14 @@ class RemoteMergeQueue:
         record["observed_queue_oid"] = observed_queue
         record["observed_claim_oid"] = observed_claim
         if pushed:
-            if observed == candidate and observed_queue == candidate and observed_claim != claim_oid:
+            if observed == candidate and observed_queue is None and observed_claim != claim_oid:
                 _checkpoint("target-verified")
-                return _transition_journal(journal, record, "integrated", "atomic claim/queue/target CAS verified")
+                return _transition_journal(
+                    journal,
+                    record,
+                    "integrated",
+                    "atomic target advance and queue/claim consumption verified",
+                )
             return _transition_journal(
                 journal,
                 record,
@@ -3828,16 +3947,21 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"claim ref {claim_ref} changed during target publication",
             )
-        if observed_queue != candidate:
+        if observed_queue not in {None, candidate}:
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
                 f"queue ref {queue_ref} changed during target publication",
             )
-        if observed == candidate:
-            return _transition_journal(journal, record, "integrated", "target already equals candidate")
-        if observed == _expected_oid(expected):
+        if observed == candidate and observed_queue is None:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "target advanced and queue disappeared without consuming the exact merge claim",
+            )
+        if observed in {_expected_oid(expected), candidate} and observed_queue == candidate:
             return _transition_journal(journal, record, "queued", "target CAS was rejected without drift")
         if observed != _expected_oid(expected):
             return _transition_journal(
@@ -3855,14 +3979,19 @@ class RemoteMergeQueue:
         queue_ref = str(record["queue_ref"])
         target_ref = str(record["target_ref"])
         claim_ref = str(record["claim_ref"])
+        article_claim_ref = str(record["article_claim_ref"])
+        article_claim_oid = str(record["article_claim_oid"])
+        recorded_claim_oid = record.get("claim_oid")
         expected = _expected_oid(str(record["expected_target_oid"]))
         candidate = str(record["candidate_oid"])
         queue_oid = self._remote_oid(queue_ref)
         target_oid = self._remote_oid(target_ref)
         claim_oid = self._remote_oid(claim_ref)
+        article_claim_oid_observed = self._remote_oid(article_claim_ref)
         record["observed_queue_oid"] = queue_oid
         record["observed_target_oid"] = target_oid
         record["observed_claim_oid"] = claim_oid
+        record["observed_article_claim_oid"] = article_claim_oid_observed
         if queue_oid not in {None, candidate}:
             return _transition_journal(
                 journal,
@@ -3871,27 +4000,60 @@ class RemoteMergeQueue:
                 f"recovery found queue-ref collision: {queue_oid}",
             )
         if target_oid == candidate:
-            if queue_oid == candidate:
+            if queue_oid is None:
+                if article_claim_oid_observed == article_claim_oid:
+                    return _transition_journal(
+                        journal,
+                        record,
+                        "uncertain",
+                        "target advanced without consuming the exact article claim",
+                    )
+                if recorded_claim_oid is not None and claim_oid == recorded_claim_oid:
+                    return _transition_journal(
+                        journal,
+                        record,
+                        "uncertain",
+                        "target advanced and queue disappeared without consuming the exact merge claim",
+                    )
                 return _transition_journal(
                     journal,
                     record,
                     "integrated",
-                    "recovery verified target and queue candidate",
+                    "recovery verified target and consumed queue ref",
                 )
-            return _transition_journal(
-                journal,
-                record,
-                "prepared",
-                "target equals candidate but queue evidence is absent; publication must reconcile",
-            )
-        if target_oid != expected:
+            if article_claim_oid_observed == article_claim_oid:
+                return _transition_journal(
+                    journal,
+                    record,
+                    "uncertain",
+                    "target and queue point to the candidate while the article claim remains",
+                )
+            recovered_status = "queued"
+        elif target_oid != expected:
             return _transition_journal(
                 journal,
                 record,
                 "stale",
                 f"recovery found target drift: {target_oid or 'absent'}",
             )
-        recovered_status = "queued" if queue_oid == candidate else "prepared"
+        elif queue_oid == candidate:
+            if article_claim_oid_observed == article_claim_oid:
+                return _transition_journal(
+                    journal,
+                    record,
+                    "uncertain",
+                    "recovery found a queue ref without consuming the article claim",
+                )
+            recovered_status = "queued"
+        elif article_claim_oid_observed == article_claim_oid:
+            recovered_status = "prepared"
+        else:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "recovery found neither the queued candidate nor the exact article claim",
+            )
         if status == recovered_status:
             record["detail"] = f"recovery verified {recovered_status} remote state"
             _write_json_file(journal, record)
@@ -3957,6 +4119,7 @@ class RemoteMergeQueue:
             "status": "prepared",
             "observed_target_oid": None,
             "observed_queue_oid": None,
+            "observed_article_claim_oid": None,
             "claim_oid": None,
             "observed_claim_oid": None,
             "claim_lease_id": None,
@@ -4006,9 +4169,18 @@ class RemoteMergeQueue:
         if not isinstance(record.get("detail"), str):
             raise PublicationUncertain("publication journal detail is malformed")
         lease_id = record.get("claim_lease_id")
-        if lease_id is not None and (not isinstance(lease_id, str) or not lease_id):
+        if lease_id is not None and (
+            not isinstance(lease_id, str) or re.fullmatch(r"[0-9a-f]{64}", lease_id) is None
+        ):
             raise PublicationUncertain("publication journal claim lease id is malformed")
-        for key in ("claim_oid", "observed_claim_oid", "observed_target_oid", "observed_queue_oid"):
+        for key in (
+            "article_claim_oid",
+            "claim_oid",
+            "observed_article_claim_oid",
+            "observed_claim_oid",
+            "observed_target_oid",
+            "observed_queue_oid",
+        ):
             observed = record.get(key)
             if observed is not None and (not isinstance(observed, str) or not _OID.fullmatch(observed)):
                 raise PublicationUncertain(f"publication journal has an invalid {key}")
@@ -4039,6 +4211,15 @@ class RemoteMergeQueue:
         if target_ref == queue_ref:
             raise MergeQueueError("target ref and queue ref must differ")
 
+    def _validate_article_claim(self, article_claim: ClaimFence) -> None:
+        if not isinstance(article_claim, ClaimFence):
+            raise MergeQueueError("article claim must be a coherent ClaimFence")
+        if not article_claim.key.startswith("author/"):
+            raise MergeQueueError("article claim must use the author claim namespace")
+        expected_oid_length = 64 if self.repository.object_format == "sha256" else 40
+        if len(article_claim.oid) != expected_oid_length:
+            raise MergeQueueError("article claim object id does not match the repository object format")
+
     def _verify_candidate(self, expected: str, candidate: str) -> None:
         self.repository._verify_commit(candidate)
         if expected not in _ZERO_OIDS:
@@ -4046,26 +4227,18 @@ class RemoteMergeQueue:
             if not self.repository._is_ancestor(expected, candidate):
                 raise MergeQueueError("candidate is not descended from the expected target object")
 
-    def _held_lease_id(self, key: str) -> str | None:
-        method = getattr(self.claim_board, "held_lease_id", None)
+    def _held_claim_fence(self, key: str) -> ClaimFence | None:
+        method = getattr(self.claim_board, "held_claim_fence", None)
         if method is None:
-            return None
+            raise PublicationUncertain("claim board does not expose coherent ownership fences")
         value = method(key)
         if value is None:
             return None
-        if not isinstance(value, str) or not value:
-            raise PublicationUncertain("publication claim returned an invalid lease id")
-        return value
-
-    def _held_claim_oid(self, key: str) -> str | None:
-        method = getattr(self.claim_board, "held_claim_oid", None)
-        if method is None:
-            raise PublicationUncertain("claim board does not expose an exact claim-ref ownership fence")
-        value = method(key)
-        if value is None:
-            return None
-        if not isinstance(value, str) or not _OID.fullmatch(value) or value in _ZERO_OIDS:
-            raise PublicationUncertain("publication claim returned an invalid claim-ref object id")
+        if not isinstance(value, ClaimFence) or value.key != key:
+            raise PublicationUncertain("claim board returned an invalid ownership fence")
+        expected_oid_length = 64 if self.repository.object_format == "sha256" else 40
+        if len(value.oid) != expected_oid_length:
+            raise PublicationUncertain("claim board returned an ownership fence for a different object format")
         return value
 
     def _assert_lease(self, key: str, heartbeat: Any) -> None:
@@ -4084,25 +4257,40 @@ class RemoteMergeQueue:
             raise PublicationUncertain(f"remote returned an invalid result for exact ref {ref}")
         return oid
 
-    def _cas_push(self, ref: str, expected: str | None, candidate: str) -> bool:
-        lease = expected or ""
+    def _atomic_queue_handoff(
+        self,
+        *,
+        queue_ref: str,
+        candidate: str,
+        article_claim_ref: str,
+        article_claim_oid: str,
+    ) -> bool:
         proc = self._remote_git(
             [
                 "push",
                 "--quiet",
                 "--porcelain",
-                f"--force-with-lease={ref}:{lease}",
+                "--atomic",
+                f"--force-with-lease={queue_ref}:",
+                f"--force-with-lease={article_claim_ref}:{article_claim_oid}",
                 self.remote_url,
-                f"{candidate}:{ref}",
+                f"{candidate}:{queue_ref}",
+                f":{article_claim_ref}",
             ],
             check=False,
         )
         if proc.returncode == 0:
             return True
         detail = f"{proc.stdout}\n{proc.stderr}".strip()
-        if any(marker in detail.casefold() for marker in _CAS_REJECTIONS):
+        folded = detail.casefold()
+        if "does not support --atomic" in folded:
+            raise MergeQueueError("publication remote does not support atomic pushes")
+        if any(marker in folded for marker in _CAS_REJECTIONS):
             return False
-        raise MergeQueueError(f"remote CAS push failed: {_redact_remote(detail[:500], self.remote_url)}")
+        raise PublicationUncertain(
+            "remote article-claim handoff outcome is uncertain: "
+            + _redact_remote(detail[:500], self.remote_url)
+        )
 
     def _release_claim_fence(self, claim_ref: str, claim_oid: str) -> None:
         observed = self._remote_oid(claim_ref)
@@ -4146,7 +4334,7 @@ class RemoteMergeQueue:
                 f"--force-with-lease={target_ref}:{expected_target or ''}",
                 f"--force-with-lease={claim_ref}:{claim_oid}",
                 self.remote_url,
-                f"{candidate}:{queue_ref}",
+                f":{queue_ref}",
                 f"{candidate}:{target_ref}",
                 f":{claim_ref}",
             ],
@@ -4511,6 +4699,15 @@ def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
         ),
         observed_queue_oid=(
             str(record["observed_queue_oid"]) if record.get("observed_queue_oid") is not None else None
+        ),
+        article_claim_key=str(record["article_claim_key"]),
+        article_claim_ref=str(record["article_claim_ref"]),
+        article_claim_oid=str(record["article_claim_oid"]),
+        article_claim_lease_id=str(record["article_claim_lease_id"]),
+        observed_article_claim_oid=(
+            str(record["observed_article_claim_oid"])
+            if record.get("observed_article_claim_oid") is not None
+            else None
         ),
         claim_key=str(record["claim_key"]),
         claim_ref=str(record["claim_ref"]),
