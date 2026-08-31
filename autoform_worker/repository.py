@@ -559,6 +559,7 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record)
+        self._assert_candidate_tree_closure(snapshot.entries, admin, config_sha256)
         candidate_entries = dict(snapshot.entries)
         candidate_index = self._candidate_index_image(tree, str(record["candidate_oid"]), candidate_entries)
         self._assert_recorded_candidate_index(record, candidate_index)
@@ -645,6 +646,7 @@ class AttemptWorktrees:
             objects = rebuilt_objects
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record, expected_content=commit_content)
+        self._assert_candidate_tree_closure(snapshot.entries, admin, config_sha256)
         candidate_entries = dict(snapshot.entries)
         if candidate_index is None:
             candidate_index = self._candidate_index_image(tree, candidate_oid, candidate_entries)
@@ -784,6 +786,7 @@ class AttemptWorktrees:
         )
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
+        self._assert_candidate_tree_closure(snapshot.entries, admin, config_sha256)
 
         ready = dict(record)
         ready.update(
@@ -1416,6 +1419,34 @@ class AttemptWorktrees:
         if observed != expected_sha256:
             raise CandidateUncertain("repository configuration changed during candidate creation")
 
+    def _assert_candidate_tree_closure(
+        self,
+        entries: tuple[tuple[str, tuple[str, str]], ...],
+        admin: _CandidateAdminBinding,
+        expected_config_sha256: str,
+    ) -> None:
+        """Require every blob referenced by the exact candidate tree to be available."""
+        oids = tuple(sorted({oid for _, (_, oid) in entries}))
+        for oid in oids:
+            _validate_oid(oid)
+            if len(oid) != hashlib.new(self.object_format).digest_size * 2:
+                raise CandidateUncertain("candidate blob id does not match the repository object format")
+        self._assert_candidate_config_snapshot(admin, expected_config_sha256)
+        proc = self._run_git(
+            [
+                "--no-replace-objects",
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+            check=False,
+            input_text="".join(f"{oid}\n" for oid in oids),
+        )
+        self._assert_candidate_config_snapshot(admin, expected_config_sha256)
+        expected = "".join(f"{oid} blob\n" for oid in oids)
+        if proc.returncode != 0 or proc.stdout != expected:
+            detail = (proc.stderr or proc.stdout).strip()[:500]
+            raise CandidateUncertain(f"candidate tree closure is incomplete: {detail}")
+
     def _write_candidate_object(self, object_type: str, expected_oid: str, content: bytes) -> None:
         proc = self._run_git_bytes(
             ["hash-object", "-t", object_type, "-w", "--stdin", "--no-filters"],
@@ -1478,6 +1509,7 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record)
+        self._assert_candidate_tree_closure(snapshot.entries, admin, config_sha256)
         if (
             self._tree_head(tree) != record["candidate_oid"]
             or _candidate_head_oid(admin.head_snapshot) != record["candidate_oid"]
@@ -4594,6 +4626,7 @@ def _git_environment() -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_GRAFT_FILE": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",

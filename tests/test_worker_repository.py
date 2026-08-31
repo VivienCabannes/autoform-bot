@@ -1770,6 +1770,144 @@ def test_candidate_commit_supports_repository_object_formats(tmp_path: Path, obj
     _git("fsck", "--full", cwd=repository)
 
 
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_candidate_commit_and_inspection_reject_missing_reachable_base_blob(
+    tmp_path: Path,
+    object_format: str,
+) -> None:
+    repository = tmp_path / f"repository-{object_format}"
+    initialized = subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main", f"--object-format={object_format}", str(repository)],
+        capture_output=True,
+        text=True,
+    )
+    if initialized.returncode != 0 and object_format == "sha256":
+        pytest.skip("installed Git does not support SHA-256 repositories")
+    initialized.check_returncode()
+    (repository / "changed.txt").write_text("original changed content\n", encoding="utf-8")
+    (repository / "unchanged.txt").write_text("required unchanged content\n", encoding="utf-8")
+    _git("add", "changed.txt", "unchanged.txt", cwd=repository)
+    _git("commit", "--quiet", "-m", "base", cwd=repository)
+    base = _git("rev-parse", "HEAD", cwd=repository)
+    manager = AttemptWorktrees(repository, tmp_path / "state")
+    ready_tree = Path(manager.prepare("run-1", "ready", base_oid=base).path)
+    pending_tree = Path(manager.prepare("run-1", "pending", base_oid=base).path)
+    ready_tree.joinpath("changed.txt").write_text("ready candidate\n", encoding="utf-8")
+    pending_tree.joinpath("changed.txt").write_text("pending candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"changed.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+    ready = manager.commit_candidate("run-1", "ready", **arguments)
+
+    blob_oid = _git("rev-parse", f"{base}:unchanged.txt", cwd=repository)
+    object_path = manager.common_git_dir / "objects" / blob_oid[:2] / blob_oid[2:]
+    assert object_path.is_file()
+    object_path.unlink()
+
+    with pytest.raises(CandidateUncertain, match="tree closure is incomplete"):
+        manager.inspect_candidate("run-1", "ready")
+    with pytest.raises(CandidateUncertain, match="tree closure is incomplete"):
+        manager.commit_candidate("run-1", "pending", **arguments)
+    assert _git("rev-parse", "HEAD", cwd=pending_tree) == base
+    assert _git("rev-parse", "HEAD", cwd=ready_tree) == ready.candidate_oid
+
+
+def test_candidate_tree_closure_ignores_replacement_refs(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    blob_oid = _git("rev-parse", f"{base}:.gitignore", cwd=coordinator)
+    replacement = tmp_path / "replacement-blob"
+    replacement.write_text("replacement\n", encoding="utf-8")
+    replacement_oid = _git("hash-object", "-w", str(replacement), cwd=coordinator)
+    _git("replace", blob_oid, replacement_oid, cwd=coordinator)
+    object_path = manager.common_git_dir / "objects" / blob_oid[:2] / blob_oid[2:]
+    assert object_path.is_file()
+    object_path.unlink()
+
+    with pytest.raises(CandidateUncertain, match="tree closure is incomplete"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+def test_candidate_tree_closure_accepts_available_alternate_objects(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    blob_oid = _git("rev-parse", f"{base}:.gitignore", cwd=coordinator)
+    object_path = manager.common_git_dir / "objects" / blob_oid[:2] / blob_oid[2:]
+    alternate_objects = tmp_path / "alternate-objects"
+    alternate_path = alternate_objects / blob_oid[:2] / blob_oid[2:]
+    alternate_path.parent.mkdir(parents=True)
+    object_path.replace(alternate_path)
+    alternates = manager.common_git_dir / "objects" / "info" / "alternates"
+    alternates.write_text(f"{alternate_objects}\n", encoding="utf-8")
+
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert manager.inspect_candidate("run-1", "attempt-1") == candidate
+
+
+def test_candidate_tree_closure_rechecks_repository_config(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    original_run_git = manager._run_git
+
+    def mutate_after_closure_check(
+        args: list[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        proc = original_run_git(args, check=check, input_text=input_text)
+        if "cat-file" in args and any(argument.startswith("--batch-check=") for argument in args):
+            _git("config", "autoform.closureProbe", "changed", cwd=coordinator)
+        return proc
+
+    monkeypatch.setattr(manager, "_run_git", mutate_after_closure_check)
+    with pytest.raises(CandidateUncertain, match="configuration changed"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
 def test_merge_queue_paths_are_disjoint_before_state_creation(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
