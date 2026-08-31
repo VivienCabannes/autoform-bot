@@ -99,6 +99,45 @@ def test_acquire_read_list_and_release_round_trip(tmp_path: Path, board_repo: Pa
     assert board.release("author/node")
 
 
+def test_held_claim_fence_returns_one_coherent_remote_receipt(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+    assert board.acquire("author/node", ttl=600)
+
+    first = board.held_claim_fence("author/node")
+    assert first is not None
+    assert first.key == "author/node"
+    assert first.ref == claims.CLAIM_REF_PREFIX + first.key
+    assert first.oid == board.held_claim_oid(first.key)
+    assert first.lease_id == board.held_lease_id(first.key)
+    assert first.as_dict() == {
+        "key": first.key,
+        "lease_id": first.lease_id,
+        "oid": first.oid,
+        "ref": first.ref,
+    }
+
+    assert board.renew(first.key, ttl=600, lease_id=first.lease_id)
+    renewed = board.held_claim_fence(first.key)
+    assert renewed is not None
+    assert renewed.lease_id == first.lease_id
+    assert renewed.oid != first.oid
+
+    assert board.release(first.key)
+    assert board.held_claim_fence(first.key) is None
+
+
+def test_claim_fence_rejects_mismatched_or_malformed_fields() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        claims.ClaimFence("author/node", "refs/heads/main", "1" * 40, "2" * 64)
+    with pytest.raises(ValueError, match="OID"):
+        claims.ClaimFence("author/node", claims.CLAIM_REF_PREFIX + "author/node", "bad", "2" * 64)
+    with pytest.raises(ValueError, match="lease_id"):
+        claims.ClaimFence("author/node", claims.CLAIM_REF_PREFIX + "author/node", "1" * 40, "bad")
+
+
 def test_sha256_repository_uses_matching_claim_scratch(tmp_path: Path) -> None:
     repo = tmp_path / "claims-sha256.git"
     _git("init", "--bare", "--quiet", "--object-format=sha256", str(repo))

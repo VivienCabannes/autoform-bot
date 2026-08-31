@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import weakref
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
@@ -110,6 +111,28 @@ class ClaimTransportError(RuntimeError):
 
 class MalformedLeaseError(ClaimTransportError):
     """A claim ref exists, but its lease cannot be verified safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimFence:
+    """One coherent, exact remote ownership receipt for an acquired claim."""
+
+    key: str
+    ref: str
+    oid: str
+    lease_id: str
+
+    def __post_init__(self) -> None:
+        key = _validate_key(self.key)
+        if self.ref != CLAIM_REF_PREFIX + key:
+            raise ValueError("claim fence ref does not match its key")
+        if not isinstance(self.oid, str) or OBJECT_ID_RE.fullmatch(self.oid) is None:
+            raise ValueError("claim fence OID must be a full Git object ID")
+        if not isinstance(self.lease_id, str) or LEASE_ID_RE.fullmatch(self.lease_id) is None:
+            raise ValueError("claim fence lease_id must be 64 lowercase hexadecimal characters")
+
+    def as_dict(self) -> dict[str, str]:
+        return asdict(self)
 
 
 def _validate_key(key: str) -> str:
@@ -1349,13 +1372,27 @@ class ClaimBoard:
         Callers must still use this object ID as a remote compare-and-swap lease.
         Ownership can change immediately after this point-in-time validation.
         """
-        held = self._held_claim(key)
-        return held[0] if held is not None else None
+        fence = self.held_claim_fence(key)
+        return fence.oid if fence is not None else None
 
     def held_lease_id(self, key: str) -> str | None:
         """Return the fenced lease id held by this session, or ``None``."""
+        fence = self.held_claim_fence(key)
+        return fence.lease_id if fence is not None else None
+
+    def held_claim_fence(self, key: str) -> ClaimFence | None:
+        """Return one coherent ref/OID/lease receipt for this session's live claim."""
+
         held = self._held_claim(key)
-        return str(held[1]["lease_id"]) if held is not None else None
+        if held is None:
+            return None
+        oid, lease = held
+        return ClaimFence(
+            key=key,
+            ref=self._ref(key),
+            oid=oid,
+            lease_id=str(lease["lease_id"]),
+        )
 
     def _held_claim(self, key: str) -> tuple[str, dict[str, Any]] | None:
         key = _validate_key(key)
@@ -1558,6 +1595,7 @@ __all__ = [
     "CLAIM_SCHEMA",
     "CLAIM_TTL_S",
     "ClaimBoard",
+    "ClaimFence",
     "ClaimTransportError",
     "Heartbeat",
     "LEGACY_CLAIM_SCHEMA",
