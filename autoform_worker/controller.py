@@ -14,6 +14,7 @@ from autoform_cli.status import DEFINITION_DECLARATIONS
 from .ledger import (
     AttemptRecord,
     MergeItemRecord,
+    RecoverySnapshot,
     RunConfig,
     RunIdentity,
     RunLedger,
@@ -40,6 +41,14 @@ class TaskSpec:
     article_id: str
     phase: str
     node_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryAction:
+    """One deterministic next step derived from a read-only ledger snapshot."""
+
+    kind: str
+    identifier: str | None = None
 
 
 EXECUTE_OUTPUT_SCHEMA = "autoform-execute/v1"
@@ -164,6 +173,95 @@ def status_payload(
             "total": len(tasks),
         },
     }
+
+
+def plan_recovery(snapshot: RecoverySnapshot) -> RecoveryAction:
+    """Choose one safe controller action without changing durable state."""
+
+    if not isinstance(snapshot, RecoverySnapshot):
+        raise TypeError("recovery planning requires a RecoverySnapshot")
+
+    replays = snapshot.unresolved_merge_replays
+    if len(replays) > 1:
+        raise ControllerError(
+            "multiple-unresolved-replays",
+            "more than one merge replay requires recovery",
+        )
+    if replays:
+        replay = replays[0]
+        if replay.status == "uncertain":
+            raise ControllerError(
+                "replay-outcome-uncertain",
+                f"merge replay outcome is uncertain: {replay.replay_id}",
+            )
+        return RecoveryAction("recover-replay", replay.replay_id)
+
+    merge_items = snapshot.unresolved_merge_items
+    if len(merge_items) > 1:
+        raise ControllerError(
+            "multiple-unresolved-merge-items",
+            "more than one merge item requires recovery",
+        )
+    if merge_items:
+        item = merge_items[0]
+        if item.status == "uncertain":
+            raise ControllerError(
+                "publication-outcome-uncertain",
+                f"merge publication outcome is uncertain: {item.queue_item_id}",
+            )
+        kind = "prepare-replay" if item.status == "stale" else "recover-publication"
+        return RecoveryAction(kind, item.queue_item_id)
+
+    running_attempts = snapshot.running_attempts
+    if len(running_attempts) > 1:
+        raise ControllerError(
+            "multiple-running-attempts",
+            "more than one attempt requires repository recovery",
+        )
+    if running_attempts:
+        return RecoveryAction("recover-attempt", running_attempts[0].attempt_id)
+
+    active_tasks = tuple(
+        task for task in snapshot.tasks if task.status in {"running", "candidate", "queued"}
+    )
+    if len(active_tasks) > 1:
+        raise ControllerError(
+            "multiple-active-tasks",
+            "more than one task is active without matching recovery state",
+        )
+    if active_tasks:
+        task = active_tasks[0]
+        if task.status == "candidate":
+            candidates = tuple(
+                attempt
+                for attempt in snapshot.attempts
+                if attempt.article_id == task.article_id
+                and attempt.phase == task.phase
+                and attempt.number == task.attempts
+                and attempt.status == "candidate"
+                and attempt.candidate_oid == task.candidate_oid
+            )
+            if len(candidates) != 1:
+                raise ControllerError(
+                    "candidate-evidence-missing",
+                    f"candidate task has no unique attempt evidence: {task.article_id}:{task.phase}",
+                )
+            return RecoveryAction("admit-candidate", candidates[0].attempt_id)
+        raise ControllerError(
+            "active-task-evidence-missing",
+            f"{task.status} task has no matching recovery evidence: {task.article_id}:{task.phase}",
+        )
+
+    run = snapshot.run
+    if run.stop_requested:
+        return RecoveryAction("stop-run", run.run_id)
+    if run.status == "created":
+        return RecoveryAction("initialize-run", run.run_id)
+    if run.status == "running":
+        return RecoveryAction("schedule", run.run_id)
+    if run.status in {"blocked", "stopped"}:
+        return RecoveryAction("await-resume", run.run_id)
+    return RecoveryAction("terminal", run.run_id)
 
 
 def create_run(
@@ -322,12 +420,14 @@ def _article_id(node: RuntimeNode) -> str:
 __all__ = [
     "ControllerError",
     "EXECUTE_OUTPUT_SCHEMA",
+    "RecoveryAction",
     "RunStopSignal",
     "TaskSpec",
     "build_task_specs",
     "classify_no_work",
     "create_run",
     "initialize_created_run",
+    "plan_recovery",
     "select_ready_task",
     "status_payload",
 ]

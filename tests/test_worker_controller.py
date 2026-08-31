@@ -7,17 +7,21 @@ import pytest
 from autoform_cli.runtime import RuntimeAssertions, RuntimeGraph, RuntimeNode, RuntimeStatus
 from autoform_worker.controller import (
     ControllerError,
+    RecoveryAction,
     RunStopSignal,
     build_task_specs,
     classify_no_work,
     create_run,
     initialize_created_run,
+    plan_recovery,
     select_ready_task,
     status_payload,
 )
 from autoform_worker.ledger import (
     AttemptRecord,
     MergeItemRecord,
+    MergeReplayRecord,
+    RecoverySnapshot,
     RunConfig,
     RunIdentity,
     RunLedger,
@@ -327,6 +331,175 @@ def test_stop_signal_fails_closed_when_run_cannot_be_read(tmp_path) -> None:
     with RunStopSignal(ledger_path, "unknown", poll_interval=0.01) as signal:
         assert signal.wait(2.0)
         assert signal.failure == "durable stop monitor could not read the run ledger"
+
+
+def _recovery_snapshot(
+    *,
+    run: RunRecord,
+    tasks: tuple[TaskRecord, ...] = (),
+    attempts: tuple[AttemptRecord, ...] = (),
+    merge_items: tuple[MergeItemRecord, ...] = (),
+    merge_replays: tuple[MergeReplayRecord, ...] = (),
+) -> RecoverySnapshot:
+    return RecoverySnapshot(
+        run=run,
+        tasks=tasks,
+        attempts=attempts,
+        gates=(),
+        merge_items=merge_items,
+        merge_replays=merge_replays,
+        target_adoptions=(),
+        external_integrations=(),
+    )
+
+
+def _run_record(*, status: str = "running", stop_requested: bool = False) -> RunRecord:
+    config, identity = _run_inputs()
+    return RunRecord(
+        run_id="run",
+        identity=identity,
+        identity_sha256=identity.sha256,
+        config=config,
+        config_sha256=config.sha256,
+        status=status,
+        generation=1,
+        task_plan_sha256="8" * 64,
+        task_count=1,
+        current_oid="1" * 40,
+        stop_requested=stop_requested,
+        detail="",
+        created_ns=1,
+        updated_ns=2,
+    )
+
+
+def _attempt(
+    task: TaskRecord,
+    *,
+    status: str,
+    candidate_oid: str | None = None,
+) -> AttemptRecord:
+    return AttemptRecord(
+        attempt_id="attempt",
+        run_id="run",
+        article_id=task.article_id,
+        phase=task.phase,
+        number=task.attempts,
+        status=status,
+        worktree_path="/private/worktree",
+        branch="detached/attempt",
+        base_oid="1" * 40,
+        backend="claude",
+        claim_key="author/af_000000000000000000000001",
+        claim_token={"opaque": "test"},
+        candidate_oid=candidate_oid,
+        detail="",
+        started_ns=1,
+        finished_ns=2,
+    )
+
+
+def _merge_item(*, status: str = "stale") -> MergeItemRecord:
+    return MergeItemRecord(
+        queue_item_id="queue",
+        run_id="run",
+        attempt_id="attempt",
+        queue_ref="refs/autoform/queue/queue",
+        expected_target_oid="1" * 40,
+        candidate_oid="2" * 40,
+        status=status,
+        generation=1,
+        integrated_oid=None,
+        detail="",
+        created_ns=1,
+        updated_ns=2,
+    )
+
+
+def _merge_replay(*, status: str = "prepared") -> MergeReplayRecord:
+    return MergeReplayRecord(
+        replay_id="replay",
+        queue_item_id="queue",
+        ordinal=1,
+        target_oid="3" * 40,
+        candidate_oid="4" * 40,
+        gate_evidence_sha256="5" * 64,
+        review_evidence_sha256="6" * 64,
+        status=status,
+        generation=0,
+        publication_evidence_sha256=None,
+        detail="",
+        created_ns=1,
+        updated_ns=2,
+    )
+
+
+def test_recovery_plan_prioritizes_replay_over_stale_merge_item() -> None:
+    snapshot = _recovery_snapshot(
+        run=_run_record(),
+        merge_items=(_merge_item(),),
+        merge_replays=(_merge_replay(),),
+    )
+
+    assert plan_recovery(snapshot) == RecoveryAction("recover-replay", "replay")
+
+
+def test_recovery_plan_rejects_uncertain_external_outcomes() -> None:
+    with pytest.raises(ControllerError, match="replay outcome is uncertain"):
+        plan_recovery(
+            _recovery_snapshot(
+                run=_run_record(),
+                merge_items=(_merge_item(),),
+                merge_replays=(_merge_replay(status="uncertain"),),
+            )
+        )
+    with pytest.raises(ControllerError, match="publication outcome is uncertain"):
+        plan_recovery(
+            _recovery_snapshot(
+                run=_run_record(),
+                merge_items=(_merge_item(status="uncertain"),),
+            )
+        )
+
+
+def test_recovery_plan_resumes_exact_candidate_attempt() -> None:
+    candidate_oid = "2" * 40
+    task = _task("af_000000000000000000000001", "proof", "candidate")
+    task = replace(task, attempts=1, candidate_oid=candidate_oid)
+    attempt = _attempt(task, status="candidate", candidate_oid=candidate_oid)
+
+    assert plan_recovery(
+        _recovery_snapshot(run=_run_record(), tasks=(task,), attempts=(attempt,))
+    ) == RecoveryAction("admit-candidate", "attempt")
+
+
+def test_recovery_plan_keeps_external_recovery_ahead_of_stop() -> None:
+    snapshot = _recovery_snapshot(
+        run=_run_record(stop_requested=True),
+        merge_items=(_merge_item(status="publishing"),),
+    )
+
+    assert plan_recovery(snapshot) == RecoveryAction("recover-publication", "queue")
+
+
+@pytest.mark.parametrize(
+    ("status", "stop_requested", "kind"),
+    [
+        ("created", False, "initialize-run"),
+        ("running", False, "schedule"),
+        ("running", True, "stop-run"),
+        ("blocked", False, "await-resume"),
+        ("complete", False, "terminal"),
+    ],
+)
+def test_recovery_plan_classifies_idle_run_state(
+    status: str,
+    stop_requested: bool,
+    kind: str,
+) -> None:
+    assert plan_recovery(
+        _recovery_snapshot(run=_run_record(status=status, stop_requested=stop_requested))
+    ) == RecoveryAction(kind, "run")
 
 
 def test_status_payload_is_stable_and_redacts_private_controller_data() -> None:
