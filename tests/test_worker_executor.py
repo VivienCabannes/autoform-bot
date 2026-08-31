@@ -13,7 +13,13 @@ from autoform_cli.runtime import (
     RuntimeNode,
     RuntimeStatus,
 )
-from autoform_worker.executor import ProverExecutor, _attempt_result, _verify_statement, backend_factory
+from autoform_worker.executor import (
+    ProverExecutor,
+    _attempt_result,
+    _verify_statement,
+    _work_prompt,
+    backend_factory,
+)
 from autoform_worker.scheduler import AttemptOutcome, WorkItem, WorkPhase
 from servers.prover import Event, EventKind, ProofResult, ProverAdapter, Run
 
@@ -107,6 +113,13 @@ def test_backend_factory_supports_only_safe_cli_backends(name: str) -> None:
 def test_backend_factory_rejects_unknown_backend() -> None:
     with pytest.raises(ValueError, match="unknown backend"):
         backend_factory("other")
+
+
+def test_proof_prompt_requires_verified_roadmap_transition() -> None:
+    prompt = _work_prompt(WorkItem(_node(stated=True), WorkPhase.PROOF, 1, "revision"))
+
+    assert "Complete the Lean proof without changing the declaration statement." in prompt
+    assert "Update the roadmap article's proof metadata only after Lean accepts it." in prompt
 
 
 def test_proof_result_mapping_distinguishes_retry_cancel_and_failure() -> None:

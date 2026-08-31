@@ -430,7 +430,10 @@ def _work_prompt(item: WorkItem) -> str:
         "Formalize and compile the declaration statement. Update the roadmap article's "
         "statement metadata only after Lean accepts it."
         if item.phase is WorkPhase.STATEMENT
-        else "Complete the Lean proof without changing the declaration statement."
+        else (
+            "Complete the Lean proof without changing the declaration statement. Update the "
+            "roadmap article's proof metadata only after Lean accepts it."
+        )
     )
     return "\n".join(
         (
