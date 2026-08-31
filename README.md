@@ -39,8 +39,26 @@ manifest is included, but Muse installation is not covered here.
 
 ## Quick start
 
-Work from an existing Lean repository. First verify the loaded plugin's source
-and exact commit, then pass that pair into the scaffold command:
+For a repository that may contain more than one formalization effort, create a
+workspace manifest and then register each blueprint explicitly:
+
+```bash
+autoform workspace init /path/to/lean-project --blueprint-root docs/blueprints
+autoform blueprint new finite-flat --workspace /path/to/lean-project \
+  --path FiniteFlat --title "Finite Flat Group Schemes"
+autoform workspace inspect /path/to/lean-project
+autoform workspace check /path/to/lean-project --lean-root /path/to/lean-project
+```
+
+The root `.autoform.toml` is the sole registry. Autoform does not scan sibling
+directories or require a marker inside each vault. Location names and paths are
+repository-defined; `docs/blueprints` above is only an example. Registered
+vaults must have non-overlapping portable paths, and commands never infer a
+project from an unrelated directory.
+
+For a dedicated repository that intentionally uses the original single-vault
+layout, first verify the loaded plugin's source and exact commit, then use the
+legacy scaffold command:
 
 ```bash
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform project provenance --json
@@ -52,7 +70,8 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform init /path/to/lean-project \
 This creates `blueprint/`, `mkdocs.yml`, and `requirements-docs.txt`. GitHub
 workflows are created only when both values are present. A plain wheel cannot
 infer them. The Setup skill guides repository inspection, Lean/Mathlib shell
-preparation, and this non-destructive `autoform init` flow.
+preparation, workspace setup, and this backwards-compatible `autoform init`
+flow.
 
 Next use the host skills from the Lean project:
 
@@ -69,6 +88,23 @@ alternatives; review the roadmap before treating it as an execution plan.
 
 ## Blueprint model
 
+A workspace can hold several independent vaults:
+
+```text
+.autoform.toml
+docs/blueprints/
+├── FiniteFlat/
+│   ├── README.md
+│   ├── coverage/README.md
+│   ├── roadmap/README.md
+│   └── sources/README.md
+└── AnotherProject/
+    └── ...
+```
+
+Each registered project has the same internal vault model. In a legacy
+single-vault repository that model lives directly at:
+
 ```text
 blueprint/
 ├── README.md
@@ -82,7 +118,7 @@ blueprint/
 └── sources/paper.md
 ```
 
-Every Markdown file below `blueprint/roadmap/` is an article. A nested
+Every Markdown file below the selected vault's `roadmap/` is an article. A nested
 `README.md` represents its directory and contains the articles below it.
 Optional `declaration: theorem`, `declaration: def`, and similar frontmatter
 marks a formalizable article. Inline relative links under `## Depends on` and
@@ -96,7 +132,13 @@ complete frontmatter, hierarchy, status, and validation rules.
 
 | Command | Purpose |
 | --- | --- |
-| `autoform init` | Scaffold the blueprint and site; add CI when immutably pinned. |
+| `autoform workspace init` | Create a root manifest and blueprint collection. |
+| `autoform workspace inspect` | Inspect registered locations and projects without scanning siblings. |
+| `autoform workspace check` | Validate every registered blueprint. |
+| `autoform blueprint new` | Create and centrally register one blueprint vault. |
+| `autoform blueprint register` | Register an existing vault without modifying it. |
+| `autoform blueprint list` | List centrally registered blueprints. |
+| `autoform init` | Scaffold the legacy single-vault layout and publication files. |
 | `autoform check` | Validate Markdown structure and dependencies. |
 | `autoform audit` | Audit completeness and checked facts. |
 | `autoform doctor` | Diagnose the local blueprint contract. |

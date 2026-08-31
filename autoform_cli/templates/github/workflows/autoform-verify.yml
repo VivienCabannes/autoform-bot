@@ -1,5 +1,6 @@
-# Builds the Lean project and validates its Autoform blueprint on neutral
-# hardware. Actions and the Autoform source are pinned immutably.
+# Builds the Lean project and validates its registered Autoform blueprints, or
+# its legacy single vault, on neutral hardware. Actions and the Autoform source
+# are pinned immutably.
 
 name: autoform verify
 
@@ -34,9 +35,14 @@ jobs:
           version: "0.12.1"
 
       - name: Validate the theorem DAG
-        run: >-
-          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"
-          autoform check blueprint
+        run: |
+          if [[ -f .autoform.toml ]]; then
+            uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
+              autoform workspace check .
+          else
+            uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
+              autoform check blueprint
+          fi
 
       - name: Install elan
         run: |

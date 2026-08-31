@@ -1,11 +1,12 @@
-"""Write a blueprint vault deterministically instead of describing one.
+"""Write Autoform vault files deterministically instead of describing them.
 
-Setup used to instruct an agent, in prose, to create ``blueprint/`` with a
-landing page, ``roadmap/``, ``coverage/``, and ``sources/``, and to imitate the
-bundled example. Agents improvise: a real project came back with chapter pages
-as siblings of their directories rather than as ``<chapter>/README.md``, which
-parses cleanly and publishes a book with no chapters at all. The structure is
-fixed, so the tool writes it.
+The legacy project scaffold creates ``blueprint/`` with a landing page,
+``roadmap/``, ``coverage/``, and ``sources/`` rather than asking an agent to
+imitate the bundled example. Agents improvise: a real project came back with
+chapter pages as siblings of their directories rather than as
+``<chapter>/README.md``, which parses cleanly and publishes a book with no
+chapters at all. The internal vault structure is fixed, so both legacy and
+workspace scaffolds write it.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ _DOTTED = {
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}")
+_WORKSPACE_MANIFEST = ".autoform.toml"
 
 
 def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -> str | None:
@@ -148,6 +150,80 @@ def _within(path: Path, root: Path) -> bool:
     return True
 
 
+def _require_exclusive_scaffold_support() -> None:
+    required = (
+        hasattr(os, "O_DIRECTORY"),
+        hasattr(os, "O_NOFOLLOW"),
+        os.open in os.supports_dir_fd,
+        os.mkdir in os.supports_dir_fd,
+        os.listdir in os.supports_fd,
+    )
+    if not all(required):
+        raise ScaffoldError(
+            ["this platform cannot scaffold a blueprint with the required path safety"]
+        )
+
+
+def _open_directory_chain(path: Path) -> int:
+    """Open an absolute directory path without following any component link."""
+
+    _require_exclusive_scaffold_support()
+    absolute = path.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(absolute.anchor, flags)
+        for part in absolute.parts[1:]:
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except OSError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise ScaffoldError([f"cannot open blueprint directory safely: {path}"]) from None
+
+
+def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        os.mkdir(name, mode=0o755, dir_fd=parent_descriptor)
+    except FileExistsError:
+        pass
+    except OSError:
+        raise ScaffoldError([f"cannot create blueprint directory: {name}"]) from None
+    try:
+        return os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
+
+
+def _exclusive_write_at(parent_descriptor: int, name: str, content: bytes, *, mode: int) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, mode, dir_fd=parent_descriptor)
+    except FileExistsError:
+        raise ScaffoldError([f"blueprint destination already exists: {name}"]) from None
+    except OSError:
+        raise ScaffoldError([f"cannot create blueprint file safely: {name}"]) from None
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError:
+        raise ScaffoldError([f"cannot write blueprint file safely: {name}"]) from None
+
+
 def scaffold_project(
     target: str | Path,
     *,
@@ -174,6 +250,11 @@ def scaffold_project(
     root = requested.resolve()
     if root.exists() and not root.is_dir():
         issues.append(f"target exists and is not a directory: {root}")
+    if (root / _WORKSPACE_MANIFEST).exists() or (root / _WORKSPACE_MANIFEST).is_symlink():
+        issues.append(
+            "refusing the legacy single-vault scaffold in a manifest-managed workspace; "
+            "use 'autoform blueprint new'"
+        )
     # A branch name or an abbreviated sha is the same silent failure this
     # gate exists to prevent, just supplied by hand: CI would reinstall a
     # different Autoform later and break a project that was passing.
@@ -269,9 +350,80 @@ def scaffold_project(
     return ScaffoldResult(title.strip(), tuple(written), tuple(skipped), unpinned)
 
 
+def scaffold_blueprint(target: str | Path, *, title: str) -> tuple[str, ...]:
+    """Write only the vault files beneath ``templates/blueprint`` into *target*.
+
+    This is the workspace counterpart to :func:`scaffold_project`: shared
+    repository files stay at the workspace root, while each registered project
+    receives an independent roadmap, coverage contract, and source notes.
+    """
+
+    _require_exclusive_scaffold_support()
+    requested = Path(target).expanduser().absolute()
+    issues: list[str] = []
+    if not title.strip():
+        issues.append("project title must not be empty")
+    if requested.is_symlink():
+        issues.append(f"refusing to scaffold into a symlink: {requested}")
+    if not requested.exists():
+        issues.append(f"target directory does not exist: {requested}")
+    elif not requested.is_dir():
+        issues.append(f"target exists and is not a directory: {requested}")
+    if issues:
+        raise ScaffoldError(issues)
+
+    root_descriptor = _open_directory_chain(requested)
+    try:
+        try:
+            if os.listdir(root_descriptor):
+                raise ScaffoldError([f"target directory is not empty: {requested}"])
+        except OSError:
+            raise ScaffoldError([f"cannot inspect blueprint directory: {requested}"]) from None
+
+        substitutions = {"PROJECT_TITLE": title.strip()}
+        source_root = _TEMPLATES / "blueprint"
+        written: list[str] = []
+        for template in sorted(source_root.rglob("*")):
+            relative_path = template.relative_to(source_root)
+            if (
+                not template.is_file()
+                or "__pycache__" in relative_path.parts
+                or template.suffix == ".pyc"
+            ):
+                continue
+            relative = relative_path.as_posix()
+            destination_relative = ".gitignore" if relative == "gitignore" else relative
+            if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
+                content = template.read_bytes()
+            else:
+                content = _render(template.read_text(encoding="utf-8"), substitutions).encode(
+                    "utf-8"
+                )
+
+            parent_descriptor = os.dup(root_descriptor)
+            try:
+                for part in Path(destination_relative).parts[:-1]:
+                    next_descriptor = _open_or_create_directory(parent_descriptor, part)
+                    os.close(parent_descriptor)
+                    parent_descriptor = next_descriptor
+                _exclusive_write_at(
+                    parent_descriptor,
+                    Path(destination_relative).name,
+                    content,
+                    mode=stat.S_IMODE(template.stat().st_mode),
+                )
+            finally:
+                os.close(parent_descriptor)
+            written.append(destination_relative)
+        return tuple(written)
+    finally:
+        os.close(root_descriptor)
+
+
 __all__ = [
     "ScaffoldError",
     "ScaffoldResult",
     "plugin_pin",
+    "scaffold_blueprint",
     "scaffold_project",
 ]

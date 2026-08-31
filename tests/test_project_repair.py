@@ -19,6 +19,7 @@ from autoform_cli.project import (
     repair_project,
 )
 from autoform_cli.project import repair as repair_module
+from autoform_cli.workspace_mutation import initialize_workspace
 
 _RELEASE = "lean-v4.32.2-mathlib-v4.32.2"
 _LEAN_4330_RELEASE = "lean-v4.33.0-mathlib-v4.33.0"
@@ -104,6 +105,19 @@ def test_second_repair_is_a_noop(tmp_path: Path) -> None:
     assert second.written == ()
     assert second.converged == ()
     assert _files(root) == after_first
+
+
+def test_legacy_repair_refuses_a_manifest_managed_workspace(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    initialize_workspace(root, blueprint_root="Plans")
+
+    with pytest.raises(ProjectRepairError) as raised:
+        _repair(root, dry_run=True)
+
+    assert any(
+        conflict.code == "project-repair-workspace-unsupported"
+        for conflict in raised.value.conflicts
+    )
 
 
 def test_aggregate_conflicts_produce_zero_writes(tmp_path: Path) -> None:

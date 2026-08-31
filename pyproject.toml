@@ -21,6 +21,9 @@ dependencies = [
     # construction, not tokenising: browsers repair malformed markup rather than
     # reject it, and the repair decides what stays hidden.
     "html5lib>=1.1,<2",
+    # Workspace manifests are user-authored TOML. Mutations must preserve
+    # comments and support equivalent table and inline-table representations.
+    "tomlkit>=0.13,<1",
     "tomli>=2.0; python_version < '3.11'",
 ]
 

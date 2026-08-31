@@ -70,6 +70,7 @@ def diagnose_project(
     project_or_blueprint: str | Path,
     *,
     lean_root: str | Path | None = None,
+    project_id: str | None = None,
 ) -> DoctorResult:
     """Diagnose one project using only its local authored source files."""
 
@@ -79,7 +80,7 @@ def diagnose_project(
     checks: list[DoctorCheck] = []
 
     try:
-        paths = resolve_runtime_paths(project_or_blueprint)
+        paths = resolve_runtime_paths(project_or_blueprint, project_id=project_id)
     except RuntimeProjectionError as error:
         checks.append(DoctorCheck("blueprint", False, _issues(error.issues)))
     except (OSError, RuntimeError, ValueError):
