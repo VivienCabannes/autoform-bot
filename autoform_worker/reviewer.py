@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import math
@@ -459,6 +460,264 @@ class CandidateReviewResult:
         raise ReviewError(f"review evidence has no {name!r} blob")
 
 
+def load_candidate_review_result(content: bytes) -> CandidateReviewResult:
+    """Revalidate durable review evidence before a resumed enqueue."""
+
+    if not isinstance(content, bytes) or not content:
+        raise ReviewError("durable review evidence must be nonempty bytes")
+    if len(content) > 4 * _MAX_BUNDLE_BYTES:
+        raise ReviewError("durable review evidence exceeds the size limit")
+    value = _canonical_json_object(content, "durable review evidence")
+    if _json_bytes(value) != content:
+        raise ReviewError("durable review evidence must use canonical JSON")
+    expected_result_keys = {
+        "approved",
+        "evidence",
+        "reason",
+        "request",
+        "reviewer_backend",
+        "reviewer_model",
+        "schema",
+        "status",
+    }
+    if set(value) != expected_result_keys or value.get("schema") != REVIEW_EVIDENCE_SCHEMA:
+        raise ReviewError("durable review evidence fields do not match the required schema")
+
+    blobs = tuple(
+        sorted(
+            (_load_review_evidence_blob(item) for item in _list(value["evidence"], "review evidence blobs")),
+            key=lambda blob: blob.name,
+        )
+    )
+    if len(blobs) != len({blob.name for blob in blobs}):
+        raise ReviewError("durable review evidence contains duplicate blob names")
+    by_name = {blob.name: blob for blob in blobs}
+    required_request_blobs = {
+        "base-execution-input.json",
+        "candidate-execution-input.json",
+        "gate-evidence.json",
+        "gate-record.json",
+    }
+    if not required_request_blobs.issubset(by_name):
+        raise ReviewError("durable review evidence is missing request preimages")
+
+    request_value = _mapping(value["request"], "durable review request")
+    expected_request_keys = {
+        "article_id",
+        "article_path",
+        "base_execution_input_sha256",
+        "base_oid",
+        "candidate_execution_input_sha256",
+        "candidate_oid",
+        "changed_paths",
+        "gate_evidence_sha256",
+        "gate_record_sha256",
+        "node_id",
+        "phase",
+        "protected_roadmap_sha256",
+        "prover_backend",
+        "reviewer_backend",
+        "source_contract_sha256",
+        "work_item_sha256",
+    }
+    if set(request_value) != expected_request_keys:
+        raise ReviewError("durable review request fields do not match the required schema")
+    changed_paths = _list(request_value["changed_paths"], "durable review changed paths")
+    if any(not isinstance(path, str) for path in changed_paths):
+        raise ReviewError("durable review changed paths must contain strings")
+    request = CandidateReviewRequest(
+        base_oid=request_value["base_oid"],  # type: ignore[arg-type]
+        candidate_oid=request_value["candidate_oid"],  # type: ignore[arg-type]
+        article_id=request_value["article_id"],  # type: ignore[arg-type]
+        node_id=request_value["node_id"],  # type: ignore[arg-type]
+        phase=request_value["phase"],  # type: ignore[arg-type]
+        article_path=request_value["article_path"],  # type: ignore[arg-type]
+        changed_paths=tuple(changed_paths),
+        prover_backend=request_value["prover_backend"],  # type: ignore[arg-type]
+        reviewer_backend=request_value["reviewer_backend"],  # type: ignore[arg-type]
+        source_contract_sha256=request_value["source_contract_sha256"],  # type: ignore[arg-type]
+        protected_roadmap_sha256=request_value["protected_roadmap_sha256"],  # type: ignore[arg-type]
+        work_item_sha256=request_value["work_item_sha256"],  # type: ignore[arg-type]
+        base_execution_input=by_name["base-execution-input.json"].content,
+        candidate_execution_input=by_name["candidate-execution-input.json"].content,
+        gate_evidence=by_name["gate-evidence.json"].content,
+        gate_record=by_name["gate-record.json"].content,
+    )
+    if request.as_dict() != dict(request_value):
+        raise ReviewError("durable review request does not match its evidence preimages")
+
+    if type(value["approved"]) is not bool:
+        raise ReviewError("durable review approval must be a bool")
+    if not isinstance(value["status"], str) or not isinstance(value["reason"], str):
+        raise ReviewError("durable review status and reason must be strings")
+    if not isinstance(value["reviewer_backend"], str) or not isinstance(value["reviewer_model"], str):
+        raise ReviewError("durable reviewer identity must contain strings")
+    result = CandidateReviewResult(
+        status=value["status"],  # type: ignore[arg-type]
+        approved=value["approved"],
+        reason=value["reason"],  # type: ignore[arg-type]
+        reviewer_backend=value["reviewer_backend"],  # type: ignore[arg-type]
+        reviewer_model=value["reviewer_model"],  # type: ignore[arg-type]
+        request=request,
+        evidence=blobs,
+    )
+    if result.as_dict() != dict(value):
+        raise ReviewError("durable review result does not round-trip exactly")
+    _validate_durable_approval(result)
+    return result
+
+
+def _load_review_evidence_blob(value: object) -> ReviewEvidenceBlob:
+    record = _mapping(value, "durable review evidence blob")
+    if set(record) != {"content_base64", "name", "sha256", "size"}:
+        raise ReviewError("durable review evidence blob fields do not match the required schema")
+    encoded = record["content_base64"]
+    if not isinstance(encoded, str) or len(encoded) > 2 * _MAX_BUNDLE_BYTES:
+        raise ReviewError("durable review evidence blob encoding is invalid")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ReviewError("durable review evidence blob is not strict base64") from error
+    blob = ReviewEvidenceBlob(record["name"], content)  # type: ignore[arg-type]
+    if type(record["size"]) is not int or record["size"] != len(content):
+        raise ReviewError(f"durable review evidence blob has the wrong size: {blob.name}")
+    if record["sha256"] != blob.sha256:
+        raise ReviewError(f"durable review evidence blob has the wrong digest: {blob.name}")
+    return blob
+
+
+def _validate_durable_approval(result: CandidateReviewResult) -> None:
+    if not result.approved:
+        return
+    config_blob = result._blob("reviewer-config.json")
+    config = _canonical_json_object(config_blob.content, "durable reviewer configuration")
+    policy = _list(config.get("launch_policy"), "durable reviewer launch policy")
+    if any(not isinstance(item, str) for item in policy):
+        raise ReviewError("durable reviewer launch policy must contain strings")
+    timeout = config.get("timeout_seconds")
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+        raise ReviewError("durable reviewer timeout must be numeric")
+
+    def unavailable_builder(_environment: Mapping[str, str]) -> ProverAdapter:
+        raise ReviewError("deserialized review configuration cannot launch a reviewer")
+
+    factory = ReviewAdapterFactory(
+        result.reviewer_backend,
+        result.reviewer_model,
+        timeout,
+        tuple(policy),
+        unavailable_builder,
+    )
+    if factory.evidence_bytes() != config_blob.content:
+        raise ReviewError("durable reviewer configuration does not match the recorded reviewer")
+    request_blob = result._blob("request.json")
+    if request_blob.content != _json_bytes(result.request.as_dict()):
+        raise ReviewError("durable review request blob does not match the result")
+    manifest = result._blob("manifest.json")
+    bundle_blobs = _validate_durable_manifest(result, manifest)
+    bundle = _ReviewBundle(manifest.sha256, bundle_blobs)
+    prompt = _review_prompt(result.request, factory, bundle).encode("utf-8")
+    if result._blob("review-prompt.txt").content != prompt:
+        raise ReviewError("durable review prompt does not match its evidence bundle")
+    launch_blob = result._blob("reviewer-launch.json")
+    launch = _canonical_json_object(launch_blob.content, "durable reviewer launch")
+    expected_launch = _expected_launch_identity(prompt.decode("utf-8"), factory, _neutral_review_cwd())
+    if dict(launch) != expected_launch or _json_bytes(launch) != launch_blob.content:
+        raise ReviewError("durable reviewer launch does not match the locked configuration")
+    try:
+        response = result._blob("response.txt").content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReviewError("durable reviewer response is not UTF-8") from error
+    status, reason = _parse_response(response, result.request, factory, manifest.sha256)
+    if status != result.status or reason != result.reason:
+        raise ReviewError("durable reviewer verdict does not match the result")
+    transcript_blob = result._blob("transcript.json")
+    try:
+        transcript = json.loads(
+            transcript_blob.content,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ReviewError("durable review transcript is not strict JSON") from error
+    if not isinstance(transcript, list):
+        raise ReviewError("durable review transcript must be a JSON array")
+    if _json_bytes(transcript) != transcript_blob.content:
+        raise ReviewError("durable review transcript must use canonical JSON")
+    for event in transcript:
+        record = _mapping(event, "durable review transcript event")
+        if set(record) != {"content", "kind", "path", "payload", "raw"}:
+            raise ReviewError("durable review transcript event fields are invalid")
+        if record.get("kind") not in {kind.value for kind in EventKind}:
+            raise ReviewError("durable review transcript event kind is invalid")
+        if record.get("kind") in {EventKind.EDIT.value, EventKind.ERROR.value, EventKind.TOOL.value}:
+            raise ReviewError("approved durable review contains a forbidden transcript event")
+
+
+def _validate_durable_manifest(
+    result: CandidateReviewResult,
+    manifest_blob: ReviewEvidenceBlob,
+) -> tuple[ReviewEvidenceBlob, ...]:
+    manifest = _canonical_json_object(manifest_blob.content, "durable review manifest")
+    if _json_bytes(manifest) != manifest_blob.content:
+        raise ReviewError("durable review manifest must use canonical JSON")
+    if set(manifest) != {"git", "inputs", "request", "schema"} or manifest.get("schema") != REVIEW_BUNDLE_SCHEMA:
+        raise ReviewError("durable review manifest fields do not match the required schema")
+    if manifest.get("request") != result.request.as_dict():
+        raise ReviewError("durable review manifest request does not match the result")
+    git = _mapping(manifest.get("git"), "durable review manifest Git identity")
+    if set(git) != {
+        "base_oid",
+        "base_tree_oid",
+        "candidate_oid",
+        "candidate_tree_oid",
+        "diff_sha256",
+        "object_format",
+    }:
+        raise ReviewError("durable review manifest Git fields are invalid")
+    if git.get("base_oid") != result.request.base_oid or git.get("candidate_oid") != result.request.candidate_oid:
+        raise ReviewError("durable review manifest commits do not match the request")
+    for key in ("base_tree_oid", "candidate_tree_oid"):
+        _validate_oid(git.get(key), f"durable review manifest {key}")
+    object_format = git.get("object_format")
+    expected_format = "sha1" if len(result.request.base_oid) == 40 else "sha256"
+    if object_format != expected_format:
+        raise ReviewError("durable review manifest Git object format is invalid")
+    if any(len(str(git[key])) != len(result.request.base_oid) for key in ("base_tree_oid", "candidate_tree_oid")):
+        raise ReviewError("durable review manifest tree OIDs use the wrong object format")
+
+    by_name = {blob.name: blob for blob in result.evidence}
+    inputs = _list(manifest.get("inputs"), "durable review manifest inputs")
+    names: list[str] = []
+    bundle_blobs: list[ReviewEvidenceBlob] = []
+    for value in inputs:
+        entry = _mapping(value, "durable review manifest input")
+        name = entry.get("bundle_path")
+        if not isinstance(name, str):
+            raise ReviewError("durable review manifest input has no bundle path")
+        _validate_relative_path(name, "durable review manifest bundle path")
+        if not isinstance(entry.get("role"), str):
+            raise ReviewError("durable review manifest input has no role")
+        blob = by_name.get(name)
+        if blob is None:
+            raise ReviewError(f"durable review manifest input is missing: {name}")
+        if type(entry.get("size")) is not int or entry.get("size") != len(blob.content):
+            raise ReviewError(f"durable review manifest input has the wrong size: {name}")
+        if entry.get("sha256") != blob.sha256:
+            raise ReviewError(f"durable review manifest input has the wrong digest: {name}")
+        names.append(name)
+        bundle_blobs.append(blob)
+    if names != sorted(set(names)):
+        raise ReviewError("durable review manifest inputs must be unique and sorted")
+    later = {"manifest.json", "review-prompt.txt", "reviewer-launch.json", "response.txt", "transcript.json"}
+    if set(names) != set(by_name) - later:
+        raise ReviewError("durable review manifest does not inventory every bundle input")
+    candidate_diff = by_name.get("candidate.diff")
+    if candidate_diff is None or git.get("diff_sha256") != candidate_diff.sha256:
+        raise ReviewError("durable review manifest candidate diff is invalid")
+    return tuple(sorted((*bundle_blobs, manifest_blob), key=lambda blob: blob.name))
+
+
 @dataclass(frozen=True, slots=True)
 class _GitBlob:
     path: str
@@ -752,6 +1011,17 @@ def _validated_launch_identity(
     }
     if set(launch) != expected_keys or launch.get("schema") != CLI_LAUNCH_SCHEMA:
         raise ReviewError("review launch identity does not match the required schema")
+    expected = _expected_launch_identity(prompt, adapter_factory, neutral_cwd)
+    if launch != expected:
+        raise ReviewError("observed reviewer launch does not match the locked configuration")
+    return launch
+
+
+def _expected_launch_identity(
+    prompt: str,
+    adapter_factory: ReviewAdapterFactory,
+    neutral_cwd: Path,
+) -> dict[str, object]:
     if adapter_factory.backend == "codex":
         launched_prompt = f"{_REVIEW_SYSTEM_PROMPT}\n\n{prompt}"
         expected_argv = [
@@ -783,7 +1053,7 @@ def _validated_launch_identity(
             "--mcp-config",
             _EMPTY_CLAUDE_MCP_CONFIG,
         ]
-    expected = {
+    return {
         "argv": expected_argv,
         "backend": adapter_factory.backend,
         "cwd": str(neutral_cwd),
@@ -792,9 +1062,6 @@ def _validated_launch_identity(
         "prompt_transport": PROMPT_TRANSPORT_STDIN,
         "schema": CLI_LAUNCH_SCHEMA,
     }
-    if launch != expected:
-        raise ReviewError("observed reviewer launch does not match the locked configuration")
-    return launch
 
 
 def _neutral_review_cwd() -> Path:
@@ -1936,6 +2203,7 @@ __all__ = [
     "ReviewError",
     "ReviewEvidenceBlob",
     "bind_candidate_review_request",
+    "load_candidate_review_result",
     "review_candidate",
     "reviewer_factory",
     "validate_independent_backends",

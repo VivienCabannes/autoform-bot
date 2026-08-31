@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ from autoform_worker.reviewer import (
     ReviewAdapterFactory,
     ReviewError,
     bind_candidate_review_request,
+    load_candidate_review_result,
     review_candidate,
     reviewer_factory,
     validate_independent_backends,
@@ -423,6 +425,17 @@ def _blobs(result) -> dict[str, bytes]:
     return {blob.name: blob.content for blob in result.evidence}
 
 
+def _replace_durable_blob(value: dict[str, object], name: str, content: bytes) -> None:
+    evidence = value["evidence"]
+    assert isinstance(evidence, list)
+    blob = next(item for item in evidence if item["name"] == name)
+    blob.update(
+        content_base64=base64.b64encode(content).decode("ascii"),
+        sha256=_sha(content),
+        size=len(content),
+    )
+
+
 def _rebind_request(
     request: CandidateReviewRequest,
     *,
@@ -575,6 +588,42 @@ def test_review_uses_inline_commit_bound_evidence_and_retains_replay_data(review
     launch = json.loads(blobs["reviewer-launch.json"])
     assert launch["cwd"] == os.path.abspath(os.sep)
     assert launch["backend"] == "codex"
+    assert load_candidate_review_result(result.evidence_bytes()) == result
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda value: value.update(reason="forged approval"), "verdict does not match"),
+        (
+            lambda value: value["request"].update(candidate_oid="4" * 40),
+            "candidate_oid does not match",
+        ),
+        (
+            lambda value: value["evidence"][0].update(content_base64="!"),
+            "not strict base64",
+        ),
+        (
+            lambda value: _replace_durable_blob(value, "review-prompt.txt", b"forged prompt"),
+            "prompt does not match",
+        ),
+        (
+            lambda value: _replace_durable_blob(
+                value,
+                "transcript.json",
+                _json_bytes([{"content": "", "kind": "tool", "path": None, "payload": None, "raw": {}}]),
+            ),
+            "forbidden transcript event",
+        ),
+    ],
+)
+def test_durable_review_loader_rejects_tampered_evidence(review_case, mutation, reason) -> None:
+    result = review_candidate(review_case.repo, review_case.request, _factory(_Adapter()), threading.Event())
+    durable = json.loads(result.evidence_bytes())
+    mutation(durable)
+
+    with pytest.raises(ReviewError, match=reason):
+        load_candidate_review_result(_json_bytes(durable))
 
 
 @pytest.mark.parametrize(
