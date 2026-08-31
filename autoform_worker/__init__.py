@@ -14,6 +14,19 @@ from .ledger import (
     RunRecord,
     TaskRecord,
 )
+from .repository import (
+    AttemptWorktrees,
+    MergeQueueBusy,
+    MergeQueueError,
+    PublicationReceipt,
+    PublicationUncertain,
+    RemoteDrift,
+    RemoteMergeQueue,
+    RepositoryError,
+    WorktreeConflict,
+    WorktreeReceipt,
+    WorktreeUncertain,
+)
 from .scheduler import (
     AttemptOutcome,
     AttemptResult,
@@ -29,6 +42,7 @@ from .scheduler import (
 
 __all__ = [
     "AdapterFactory",
+    "AttemptWorktrees",
     "AttemptOutcome",
     "AttemptResult",
     "AttemptRecord",
@@ -43,6 +57,13 @@ __all__ = [
     "LifecycleRecord",
     "ProverExecutor",
     "LifecycleStatus",
+    "MergeQueueBusy",
+    "MergeQueueError",
+    "PublicationReceipt",
+    "PublicationUncertain",
+    "RemoteDrift",
+    "RemoteMergeQueue",
+    "RepositoryError",
     "RoundResult",
     "RunIdentity",
     "RunLedger",
@@ -51,5 +72,8 @@ __all__ = [
     "TaskRecord",
     "WorkItem",
     "WorkPhase",
+    "WorktreeConflict",
+    "WorktreeReceipt",
+    "WorktreeUncertain",
     "backend_factory",
 ]

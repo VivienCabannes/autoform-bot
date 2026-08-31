@@ -1,0 +1,1715 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+import autoform_worker.repository as repository_module
+from autoform_worker.ledger import RunLedger
+from autoform_worker.repository import (
+    AttemptWorktrees,
+    MergeQueueError,
+    MergeQueueBusy,
+    PublicationUncertain,
+    RemoteDrift,
+    RemoteMergeQueue,
+    RepositoryError,
+    WorktreeConflict,
+    WorktreeUncertain,
+)
+
+
+class _FencedTestClaimBoard:
+    """Minimal exact-ref claim board for isolated merge-queue tests."""
+
+    def __init__(self, remote: Path, worker: str, scratch: Path) -> None:
+        self.remote = remote
+        self.worker = worker
+        self.scratch = scratch
+        self.repo_url = str(remote.resolve())
+        self._owned_oid: str | None = None
+        self._lease_id: str | None = None
+
+    def _ref(self, key: str) -> str:
+        return f"refs/autoform-claims/{key}"
+
+    def _remote_oid(self, key: str) -> str | None:
+        return _git("for-each-ref", "--format=%(objectname)", self._ref(key), cwd=self.remote) or None
+
+    def acquire(self, key: str, ttl: int | float = 60, steal: bool = False, note: str = "") -> bool:
+        old = self._remote_oid(key)
+        if old is not None and old != self._owned_oid and not steal:
+            return False
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        token = self.scratch / "claim-token"
+        token.write_bytes(os.urandom(32))
+        new = _git("hash-object", "-w", str(token), cwd=self.remote)
+        try:
+            _git("update-ref", self._ref(key), new, old or ("0" * len(new)), cwd=self.remote)
+        except subprocess.CalledProcessError:
+            return False
+        self._owned_oid = new
+        self._lease_id = os.urandom(32).hex()
+        return True
+
+    def holds(self, key: str) -> bool:
+        return self._owned_oid is not None and self._remote_oid(key) == self._owned_oid
+
+    def held_claim_oid(self, key: str) -> str | None:
+        return self._owned_oid if self.holds(key) else None
+
+    def held_lease_id(self, key: str) -> str | None:
+        return self._lease_id if self.holds(key) else None
+
+    def release(self, key: str) -> bool:
+        if self._owned_oid is None:
+            return True
+        if self._remote_oid(key) != self._owned_oid:
+            return False
+        try:
+            _git("update-ref", "-d", self._ref(key), self._owned_oid, cwd=self.remote)
+        except subprocess.CalledProcessError:
+            return False
+        self._owned_oid = None
+        self._lease_id = None
+        return True
+
+    def heartbeat(self, key: str, *, interval: float = 300, ttl: int | float = 600) -> _StaticHeartbeat:
+        return _StaticHeartbeat(self, key)
+
+
+class _StaticHeartbeat:
+    def __init__(self, board: _FencedTestClaimBoard, key: str) -> None:
+        self.board = board
+        self.key = key
+        self.lost = threading.Event()
+
+    def __enter__(self) -> _StaticHeartbeat:
+        if not self.board.holds(self.key):
+            self.lost.set()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _git(*args: str, cwd: Path | None = None) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Autoform test",
+            "GIT_AUTHOR_EMAIL": "autoform@example.test",
+            "GIT_COMMITTER_NAME": "Autoform test",
+            "GIT_COMMITTER_EMAIL": "autoform@example.test",
+        },
+    )
+    return proc.stdout.strip()
+
+
+@pytest.fixture
+def git_repository(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    coordinator = tmp_path / "coordinator"
+    _git("init", "--bare", "--quiet", str(remote))
+    _git("init", "--quiet", "--initial-branch=main", str(seed))
+    (seed / "book.txt").write_text("base\n", encoding="utf-8")
+    (seed / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    _git("add", "book.txt", ".gitignore", cwd=seed)
+    _git("commit", "--quiet", "-m", "base", cwd=seed)
+    base = _git("rev-parse", "HEAD", cwd=seed)
+    _git("remote", "add", "origin", str(remote), cwd=seed)
+    _git("push", "--quiet", "origin", "main", cwd=seed)
+    _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=remote)
+    _git("clone", "--quiet", str(remote), str(coordinator))
+    return remote, seed, coordinator, base
+
+
+def _candidate(
+    manager: AttemptWorktrees,
+    *,
+    run_id: str,
+    attempt_id: str,
+    base: str,
+    content: str,
+) -> str:
+    receipt = manager.prepare(run_id, attempt_id, base_oid=base)
+    tree = Path(receipt.path)
+    (tree / "book.txt").write_text(content, encoding="utf-8")
+    _git("add", "book.txt", cwd=tree)
+    _git("commit", "--quiet", "-m", attempt_id, cwd=tree)
+    return manager.candidate_oid(run_id, attempt_id)
+
+
+def _queue(
+    manager: AttemptWorktrees,
+    remote: Path,
+    state: Path,
+    worker: str,
+) -> RemoteMergeQueue:
+    board = _FencedTestClaimBoard(remote, worker, state / "test-claims")
+    return RemoteMergeQueue(
+        manager,
+        remote_url=remote,
+        state_root=state,
+        worker_id=worker,
+        claim_board=board,
+        claim_ttl=600,
+        heartbeat_interval=300,
+    )
+
+
+def test_scp_style_remote_without_user_is_not_treated_as_local() -> None:
+    remote = "github.com:organization/repository.git"
+
+    assert repository_module._normalize_remote(remote) == remote
+    assert not repository_module._remote_is_local(remote)
+
+
+@pytest.mark.parametrize("remote", ("ext::sh -c touch-owned", "evil://host/repository.git"))
+def test_external_remote_helpers_are_rejected_before_state_creation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    remote: str,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    state = tmp_path / "queue-state"
+
+    with pytest.raises(RepositoryError, match="remote helpers|URL scheme"):
+        RemoteMergeQueue(manager, remote_url=remote, state_root=state, worker_id="worker-a")
+    assert not state.exists()
+
+
+def test_attempt_worktree_is_isolated_resumable_and_cleanup_is_owned(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    before = (coordinator / "book.txt").read_bytes()
+    manager = AttemptWorktrees(coordinator, state)
+
+    first = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert first.state == "ready"
+    assert first.head_oid == base
+    assert Path(first.path).parent.parent.parent == state / "worktrees"
+    assert Path(first.path) != coordinator
+    assert (coordinator / "book.txt").read_bytes() == before
+    assert _git("status", "--porcelain", cwd=coordinator) == ""
+
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    reopened = AttemptWorktrees(coordinator, state)
+    resumed = reopened.prepare("run-1", "attempt-1", base_oid=base)
+    assert resumed.identity_sha256 == first.identity_sha256
+    assert resumed.head_oid == candidate
+    with pytest.raises(WorktreeConflict, match="different base_oid"):
+        reopened.prepare("run-1", "attempt-1", base_oid=candidate)
+    assert (coordinator / "book.txt").read_bytes() == before
+
+    dot_git = Path(first.path) / ".git"
+    original_dot_git = dot_git.with_name(".git-original")
+    dot_git.rename(original_dot_git)
+    dot_git.write_bytes(original_dot_git.read_bytes())
+    with pytest.raises(WorktreeConflict, match="Git identity was replaced"):
+        reopened.inspect("run-1", "attempt-1")
+    dot_git.unlink()
+    original_dot_git.rename(dot_git)
+
+    reopened.cleanup("run-1", "attempt-1")
+    assert not Path(first.path).exists()
+    assert (coordinator / "book.txt").read_bytes() == before
+
+
+def test_attempt_worktree_must_remain_detached(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    tree = Path(receipt.path)
+
+    _git("checkout", "--quiet", "--ignore-other-worktrees", "main", cwd=tree)
+    with pytest.raises(WorktreeConflict, match="attached to a shared branch"):
+        manager.inspect("run-1", "attempt-1")
+    with pytest.raises(WorktreeConflict, match="attached to a shared branch"):
+        manager.candidate_oid("run-1", "attempt-1")
+    with pytest.raises(WorktreeConflict, match="attached to a shared branch"):
+        manager.cleanup("run-1", "attempt-1")
+
+    _git("checkout", "--quiet", "--detach", base, cwd=tree)
+    manager.cleanup("run-1", "attempt-1")
+
+
+def test_attempt_names_and_state_paths_cannot_escape_or_follow_symlinks(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    for run_id, attempt_id in (("../escape", "attempt"), ("run", "../../escape"), (".run", "attempt")):
+        with pytest.raises(RepositoryError, match="safe portable"):
+            manager.prepare(run_id, attempt_id, base_oid=base)
+
+    real = tmp_path / "real-state"
+    real.mkdir()
+    linked = tmp_path / "linked-state"
+    linked.symlink_to(real, target_is_directory=True)
+    with pytest.raises(RepositoryError, match="symbolic link"):
+        AttemptWorktrees(coordinator, linked)
+
+    forbidden = coordinator / "autoform-state"
+    with pytest.raises(RepositoryError, match="outside the coordinator checkout"):
+        AttemptWorktrees(coordinator, forbidden)
+    assert not forbidden.exists()
+
+    queue_forbidden = coordinator / "queue-state"
+    with pytest.raises(RepositoryError, match="outside the coordinator checkout"):
+        RemoteMergeQueue(
+            manager,
+            remote_url=remote,
+            state_root=queue_forbidden,
+            worker_id="worker-a",
+        )
+    assert not queue_forbidden.exists()
+
+
+def test_linked_coordinator_git_entry_substitution_fails_before_git_mutation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    linked = tmp_path / "linked"
+    _git("worktree", "add", "--detach", "--quiet", str(linked), base, cwd=coordinator)
+    manager = AttemptWorktrees(linked, tmp_path / "attempt-state")
+
+    foreign = tmp_path / "foreign"
+    foreign_linked = tmp_path / "foreign-linked"
+    _git("clone", "--quiet", str(remote), str(foreign))
+    _git("worktree", "add", "--detach", "--quiet", str(foreign_linked), base, cwd=foreign)
+    foreign_before = _git("worktree", "list", "--porcelain", cwd=foreign)
+
+    (linked / ".git").rename(linked / ".git.original")
+    (linked / ".git").write_bytes((foreign_linked / ".git").read_bytes())
+
+    with pytest.raises(RepositoryError, match=r"\.git entry was replaced"):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert _git("worktree", "list", "--porcelain", cwd=foreign) == foreign_before
+    assert not (manager.worktree_root / "run-1").exists()
+
+
+@pytest.mark.parametrize("boundary", ("worktree-scaffold-created", "worktree-tree-created"))
+def test_pre_marker_worktree_creation_is_resumable(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert receipt.state == "ready"
+
+
+@pytest.mark.parametrize("boundary", ("worktree-intent-recorded", "worktree-added"))
+def test_interrupted_preparation_recovers_only_the_exact_registered_worktree(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    marker = state / "worktrees/run-1/attempt-1/attempt.json"
+    assert '"state":"preparing"' in marker.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    recovered = AttemptWorktrees(coordinator, state).prepare("run-1", "attempt-1", base_oid=base)
+    assert recovered.state == "ready"
+    assert recovered.head_oid == base
+
+
+def test_interrupted_registered_checkout_repairs_only_absent_tracked_paths(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-added":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    tracked = state / "worktrees/run-1/attempt-1/tree/book.txt"
+    tracked.unlink()
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    recovered = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert recovered.state == "ready"
+    assert tracked.read_text(encoding="utf-8") == "base\n"
+
+
+def test_interrupted_registered_checkout_preserves_untracked_content(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-added":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    untracked = state / "worktrees/run-1/attempt-1/tree/preserve.txt"
+    untracked.write_text("preserve\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    with pytest.raises(WorktreeUncertain, match="changes beyond absent tracked paths"):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert untracked.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_interrupted_checkout_does_not_overwrite_a_concurrent_path(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-added":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    tracked = state / "worktrees/run-1/attempt-1/tree/book.txt"
+    tracked.unlink()
+
+    def create_concurrent_path(name: str) -> None:
+        if name == "worktree-missing-path-verified":
+            tracked.write_text("foreign concurrent data\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", create_concurrent_path)
+    with pytest.raises(WorktreeUncertain, match="could not be restored"):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert tracked.read_text(encoding="utf-8") == "foreign concurrent data\n"
+
+
+def test_interrupted_checkout_repairs_a_pathspec_magic_filename(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    magic_name = ":(literal)proof.txt"
+    (coordinator / magic_name).write_text("literal\n", encoding="utf-8")
+    _git("add", "--", f"./{magic_name}", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "add literal pathspec name", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-added":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    tracked = state / f"worktrees/run-1/attempt-1/tree/{magic_name}"
+    tracked.unlink()
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    recovered = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert recovered.state == "ready"
+    assert tracked.read_text(encoding="utf-8") == "literal\n"
+
+
+def test_pre_marker_atomic_write_orphan_does_not_block_worktree_recovery(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-tree-created":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    marker = state / "worktrees/run-1/attempt-1/attempt.json"
+    orphan = marker.parent / f"{repository_module._atomic_write_prefix(marker)}deadbeef.tmp"
+    orphan.write_bytes(b'{"partial":')
+    orphan.chmod(0o600)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    recovered = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert recovered.state == "ready"
+    assert not orphan.exists()
+
+
+def test_pre_marker_atomic_write_recovery_preserves_unsafe_reserved_path(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-tree-created":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    marker = state / "worktrees/run-1/attempt-1/attempt.json"
+    sentinel = tmp_path / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    reserved = marker.parent / f"{repository_module._atomic_write_prefix(marker)}foreign.tmp"
+    reserved.symlink_to(sentinel)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    with pytest.raises(RepositoryError, match="not a safe orphan"):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert reserved.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_atomic_write_orphan_swap_is_quarantined_and_preserved(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-tree-created":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    marker = state / "worktrees/run-1/attempt-1/attempt.json"
+    prefix = repository_module._atomic_write_prefix(marker)
+    orphan = marker.parent / f"{prefix}deadbeef.tmp"
+    orphan.write_bytes(b'{"partial":')
+    orphan.chmod(0o600)
+    original = tmp_path / "original-orphan"
+    replacement = tmp_path / "replacement"
+    replacement.write_text("foreign replacement\n", encoding="utf-8")
+    replacement.chmod(0o600)
+    original_rename = os.rename
+
+    def swap_before_quarantine(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        if Path(source) == orphan:
+            original_rename(orphan, original)
+            original_rename(replacement, orphan)
+        original_rename(source, destination)
+
+    monkeypatch.setattr(repository_module.os, "rename", swap_before_quarantine)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    with pytest.raises(RepositoryError, match="changed while being quarantined"):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+
+    quarantined = list(marker.parent.glob(f"{prefix}quarantine-*.tmp"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "foreign replacement\n"
+    assert original.read_bytes() == b'{"partial":'
+
+
+def test_atomic_write_orphan_quarantine_is_resumable(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt_creation(name: str) -> None:
+        if name == "worktree-tree-created":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt_creation)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    marker = state / "worktrees/run-1/attempt-1/attempt.json"
+    prefix = repository_module._atomic_write_prefix(marker)
+    orphan = marker.parent / f"{prefix}deadbeef.tmp"
+    orphan.write_bytes(b'{"partial":')
+    orphan.chmod(0o600)
+    original_rename = os.rename
+
+    def interrupt_after_quarantine(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        original_rename(source, destination)
+        if Path(source) == orphan:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module.os, "rename", interrupt_after_quarantine)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+    quarantined = list(marker.parent.glob(f"{prefix}quarantine-*.tmp"))
+    assert len(quarantined) == 1
+
+    monkeypatch.setattr(repository_module.os, "rename", original_rename)
+    recovered = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert recovered.state == "ready"
+    assert not quarantined[0].exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "worktree-scaffold-created",
+        "worktree-tree-created",
+        "worktree-intent-recorded",
+        "worktree-added",
+    ),
+)
+def test_cleanup_resumes_interrupted_preparation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    _, _, coordinator, base = git_repository
+    state = tmp_path / "state"
+    manager = AttemptWorktrees(coordinator, state)
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.prepare("run-1", "attempt-1", base_oid=base)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    manager.cleanup("run-1", "attempt-1")
+    assert not (state / "worktrees/run-1").exists()
+    assert str(state / "worktrees/run-1/attempt-1/tree") not in _git("worktree", "list", "--porcelain", cwd=coordinator)
+
+
+def test_cleanup_refuses_replaced_or_foreign_attempt_directories(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    tree = Path(receipt.path)
+    original = tree.with_name("original-tree")
+    tree.rename(original)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    sentinel = foreign / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    tree.symlink_to(foreign, target_is_directory=True)
+
+    with pytest.raises((RepositoryError, WorktreeConflict)):
+        manager.cleanup("run-1", "attempt-1")
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+    tree.unlink()
+    original.rename(tree)
+    manager.cleanup("run-1", "attempt-1")
+
+
+def test_cleanup_refuses_untracked_and_ignored_content_inside_owned_worktree(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    tree = Path(receipt.path)
+    untracked = tree / "foreign/keep.txt"
+    ignored = tree / "ignored/keep.txt"
+    untracked.parent.mkdir()
+    ignored.parent.mkdir()
+    untracked.write_text("keep", encoding="utf-8")
+    ignored.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(WorktreeConflict, match="untracked, or ignored"):
+        manager.cleanup("run-1", "attempt-1")
+    assert untracked.read_text(encoding="utf-8") == "keep"
+    assert ignored.read_text(encoding="utf-8") == "keep"
+
+    untracked.unlink()
+    ignored.unlink()
+    ignored.parent.rmdir()
+    with pytest.raises(WorktreeConflict, match="unowned path"):
+        manager.cleanup("run-1", "attempt-1")
+    assert untracked.parent.is_dir()
+    untracked.parent.rmdir()
+    manager.cleanup("run-1", "attempt-1")
+
+
+def test_cleanup_quarantines_late_foreign_content_instead_of_deleting_it(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    quarantine = Path(receipt.path).with_name("tree-cleaning")
+    late = quarantine / "ignored/late.txt"
+
+    def inject(name: str) -> None:
+        if name == "worktree-quarantined":
+            late.parent.mkdir()
+            late.write_text("preserve\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", inject)
+    with pytest.raises(WorktreeConflict, match="preserves foreign state"):
+        manager.cleanup("run-1", "attempt-1")
+    assert late.read_text(encoding="utf-8") == "preserve\n"
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    late.unlink()
+    late.parent.rmdir()
+    manager.cleanup("run-1", "attempt-1")
+    assert not quarantine.exists()
+
+
+def test_cleanup_preserves_late_tracked_mode_change(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    quarantine = Path(receipt.path).with_name("tree-cleaning")
+    tracked = quarantine / "book.txt"
+
+    def change_mode(name: str) -> None:
+        if name == "worktree-quarantined":
+            tracked.chmod(0o755)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", change_mode)
+    with pytest.raises(WorktreeConflict, match="type or mode changed"):
+        manager.cleanup("run-1", "attempt-1")
+    assert tracked.is_file()
+    assert tracked.stat().st_mode & stat.S_IXUSR
+
+    tracked.chmod(0o644)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    manager.cleanup("run-1", "attempt-1")
+    assert not quarantine.exists()
+
+
+def test_cleanup_accepts_canonical_executable_and_symlink_modes(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, _ = git_repository
+    executable = coordinator / "build.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (coordinator / "book-link").symlink_to("book.txt")
+    _git("add", "build.sh", "book-link", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "add mode fixtures", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    manager.cleanup("run-1", "attempt-1")
+    assert not Path(receipt.path).exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "worktree-cleanup-intent-recorded",
+        "worktree-quarantined",
+        "worktree-quarantine-removed",
+        "worktree-removed",
+        "worktree-marker-removed",
+    ),
+)
+def test_cleanup_resumes_at_every_durable_boundary(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.cleanup("run-1", "attempt-1")
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    manager.cleanup("run-1", "attempt-1")
+    assert not Path(receipt.path).exists()
+    assert Path(receipt.path) not in manager._listed_worktree_paths()
+
+
+@pytest.mark.parametrize("already_unregistered", (False, True))
+def test_cleanup_restores_parent_mode_after_process_kill(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    already_unregistered: bool,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    attempt_root = Path(receipt.path).parent
+
+    def interrupt(name: str) -> None:
+        if name == "worktree-quarantine-removed":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.cleanup("run-1", "attempt-1")
+    if already_unregistered:
+        _git("worktree", "remove", receipt.path, cwd=coordinator)
+    attempt_root.chmod(0o500)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    manager.cleanup("run-1", "attempt-1")
+    assert not attempt_root.exists()
+
+
+def test_empty_pre_marker_attempt_scaffolds_are_resumable(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    scaffold = manager.worktree_root / "run-1/attempt-1"
+    (scaffold / "tree").mkdir(parents=True)
+
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    assert receipt.state == "ready"
+    manager.cleanup("run-1", "attempt-1")
+
+    empty = manager.worktree_root / "run-2/attempt-1"
+    empty.mkdir(parents=True)
+    manager.cleanup("run-2", "attempt-1")
+    assert not empty.exists()
+
+
+def test_index_flags_cannot_hide_modified_content_or_cleanup_data_loss(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    tree = Path(receipt.path)
+    tracked = tree / "book.txt"
+
+    _git("update-index", "--assume-unchanged", "book.txt", cwd=tree)
+    tracked.write_text("hidden modification\n", encoding="utf-8")
+    assert _git("status", "--porcelain=v1", cwd=tree) == ""
+    with pytest.raises(WorktreeConflict, match="noncanonical flags"):
+        manager.candidate_oid("run-1", "attempt-1")
+    with pytest.raises(WorktreeConflict, match="noncanonical flags"):
+        manager.cleanup("run-1", "attempt-1")
+    assert tracked.read_text(encoding="utf-8") == "hidden modification\n"
+
+    _git("update-index", "--no-assume-unchanged", "book.txt", cwd=tree)
+    tracked.write_text("base\n", encoding="utf-8")
+    _git("update-index", "--skip-worktree", "book.txt", cwd=tree)
+    with pytest.raises(WorktreeConflict, match="noncanonical flags"):
+        manager.candidate_oid("run-1", "attempt-1")
+    with pytest.raises(WorktreeConflict, match="noncanonical flags"):
+        manager.cleanup("run-1", "attempt-1")
+    assert tracked.exists()
+
+    _git("update-index", "--no-skip-worktree", "book.txt", cwd=tree)
+    manager.cleanup("run-1", "attempt-1")
+
+
+def test_repository_fsmonitor_hook_is_disabled_for_integrity_checks(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    manager.prepare("run-1", "attempt-1", base_oid=base)
+    sentinel = tmp_path / "fsmonitor-ran"
+    hook = tmp_path / "fsmonitor-hook"
+    hook.write_text('#!/bin/sh\ntouch "$(dirname "$0")/fsmonitor-ran"\n', encoding="utf-8")
+    hook.chmod(0o700)
+    _git("config", "core.fsmonitor", str(hook), cwd=coordinator)
+
+    assert manager.candidate_oid("run-1", "attempt-1") == base
+    assert not sentinel.exists()
+    manager.cleanup("run-1", "attempt-1")
+    assert not sentinel.exists()
+
+
+def test_merge_queue_paths_are_disjoint_before_state_creation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    remote_entries = {entry.name for entry in remote.iterdir()}
+
+    for state in (remote, remote / "queue-state"):
+        with pytest.raises(RepositoryError, match="disjoint"):
+            _queue(manager, remote, state, "worker-a")
+        assert {entry.name for entry in remote.iterdir()} == remote_entries
+
+    with pytest.raises(RepositoryError, match="outside the attempt state"):
+        _queue(manager, remote, manager.state_root, "worker-a")
+
+    for index, overlapping_remote in enumerate(
+        (manager.repository_root, manager.common_git_dir, manager.state_root),
+    ):
+        state = tmp_path / f"rejected-state-{index}"
+        with pytest.raises(RepositoryError, match="must be disjoint"):
+            _queue(manager, overlapping_remote, state, "worker-a")
+        assert not state.exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "transport-intent-recorded",
+        "transport-staging-created",
+        "transport-staging-recorded",
+        "transport-marker-recorded",
+    ),
+)
+def test_transport_initialization_resumes_at_durable_boundaries(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    remote, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    state = tmp_path / "queue-state"
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _queue(manager, remote, state, "worker-a")
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    queue = _queue(manager, remote, state, "worker-a")
+    assert queue.transport_root.is_dir()
+    assert queue.transport_marker.is_file()
+    assert not queue.transport_staging.exists()
+    assert not queue.transport_intent.exists()
+    queue.close()
+
+
+def test_local_transport_uses_and_verifies_canonical_python_executable(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    assert queue._transport_python == Path(sys.executable).resolve(strict=True)
+
+    replacement = tmp_path / "python-replacement"
+    replacement.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    replacement.chmod(0o755)
+    monkeypatch.setattr(queue, "_transport_python", replacement)
+    with pytest.raises(PublicationUncertain, match="Python executable was replaced"):
+        queue._remote_oid("refs/heads/main")
+
+
+def test_remote_merge_queue_publishes_exact_cas_and_is_idempotent(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="published\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/run-1-attempt-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+    }
+
+    receipt = queue.publish("queue-1", **arguments)
+    repeated = queue.publish("queue-1", **arguments)
+
+    assert receipt.status == "integrated"
+    assert repeated == receipt
+    assert receipt.remote_kind == "local"
+    assert (receipt.remote_device, receipt.remote_inode) == (remote.stat().st_dev, remote.stat().st_ino)
+    assert receipt.claim_oid is not None
+    assert receipt.observed_claim_oid is None
+    assert receipt.observed_target_oid == candidate
+    assert receipt.observed_queue_oid == candidate
+    assert hashlib.sha256(receipt.evidence_bytes()).hexdigest() == receipt.evidence_sha256
+    with RunLedger(tmp_path / "ledger/run.sqlite3") as ledger:
+        evidence = ledger.put_artifact("merge-receipt", receipt.evidence_bytes())
+        assert evidence == receipt.evidence_sha256
+        assert ledger.read_artifact(evidence) == receipt.evidence_bytes()
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
+    assert _git("rev-parse", "refs/autoform/queue/run-1-attempt-1", cwd=remote) == candidate
+    assert _git("for-each-ref", "--format=%(refname)", receipt.claim_ref, cwd=remote) == ""
+    _git("fsck", "--full", cwd=remote)
+
+
+@pytest.mark.parametrize("boundary", ("publication-staging-created", "publication-staging-recorded"))
+def test_publication_staging_resumes_before_final_directory_rename(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    state = tmp_path / "queue-state"
+    queue = _queue(manager, remote, state, "worker-a")
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    staging_journal = state / "publications/.queue-1.preparing/publication.json"
+    assert staging_journal.is_file() == (boundary == "publication-staging-recorded")
+    assert not (state / "publications/queue-1").exists()
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    recovered = queue.recover(
+        "queue-1",
+        target_ref="refs/heads/main",
+        queue_ref="refs/autoform/queue/queue-1",
+        expected_target_oid=base,
+        candidate_oid=candidate,
+    )
+    assert recovered.status == "prepared"
+    receipt = queue.publish(
+        "queue-1",
+        target_ref="refs/heads/main",
+        queue_ref="refs/autoform/queue/queue-1",
+        expected_target_oid=base,
+        candidate_oid=candidate,
+    )
+    assert receipt.status == "integrated"
+    assert not (state / "publications/.queue-1.preparing").exists()
+
+
+def test_pre_journal_atomic_write_orphan_does_not_block_publication_recovery(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    state = tmp_path / "queue-state"
+    queue = _queue(manager, remote, state, "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "publication-staging-created":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)
+    journal = state / "publications/.queue-1.preparing/publication.json"
+    orphan = journal.parent / f"{repository_module._atomic_write_prefix(journal)}deadbeef.tmp"
+    orphan.write_bytes(b'{"partial":')
+    orphan.chmod(0o600)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    receipt = queue.publish("queue-1", **arguments)
+    assert receipt.status == "integrated"
+    assert not orphan.exists()
+
+
+def test_remote_merge_queue_rejects_stale_remote_without_publishing_queue_ref(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, seed, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="stale candidate\n",
+    )
+    (seed / "book.txt").write_text("remote moved\n", encoding="utf-8")
+    _git("add", "book.txt", cwd=seed)
+    _git("commit", "--quiet", "-m", "remote moved", cwd=seed)
+    moved = _git("rev-parse", "HEAD", cwd=seed)
+    _git("push", "--quiet", "origin", "main", cwd=seed)
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    with pytest.raises(RemoteDrift, match="drift"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
+
+
+@pytest.mark.parametrize("substitution", ("replace", "graft"))
+def test_candidate_ancestry_ignores_git_graph_substitution(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    substitution: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    tree = _git("rev-parse", f"{base}^{{tree}}", cwd=coordinator)
+    descendant = _git("commit-tree", tree, "-p", base, "-m", "descendant", cwd=coordinator)
+    unrelated = _git("commit-tree", tree, "-m", "unrelated", cwd=coordinator)
+    if substitution == "replace":
+        _git("replace", unrelated, descendant, cwd=coordinator)
+    else:
+        git_dir = Path(_git("rev-parse", "--absolute-git-dir", cwd=coordinator))
+        graft = git_dir / "info/grafts"
+        graft.parent.mkdir(parents=True, exist_ok=True)
+        graft.write_text(f"{unrelated} {base}\n", encoding="utf-8")
+
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    with pytest.raises(MergeQueueError, match="not descended"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=unrelated,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
+
+
+def test_concurrent_publishers_cannot_overwrite_each_other(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidates = [
+        _candidate(
+            manager,
+            run_id="run-1",
+            attempt_id=f"attempt-{index}",
+            base=base,
+            content=f"candidate {index}\n",
+        )
+        for index in (1, 2)
+    ]
+    queues = [_queue(manager, remote, tmp_path / f"queue-state-{index}", f"worker-{index}") for index in (1, 2)]
+    barrier = threading.Barrier(2)
+    outcomes: list[tuple[int, object]] = []
+
+    def publish(index: int) -> None:
+        barrier.wait(timeout=5)
+        try:
+            result: object = queues[index].publish(
+                f"queue-{index}",
+                target_ref="refs/heads/main",
+                queue_ref=f"refs/autoform/queue/queue-{index}",
+                expected_target_oid=base,
+                candidate_oid=candidates[index],
+            )
+        except (MergeQueueBusy, RemoteDrift) as error:
+            result = error
+        outcomes.append((index, result))
+
+    threads = [threading.Thread(target=publish, args=(index,)) for index in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+    assert not any(thread.is_alive() for thread in threads)
+    assert len([value for _, value in outcomes if not isinstance(value, Exception)]) == 1
+
+    winner = next(index for index, value in outcomes if not isinstance(value, Exception))
+    loser = 1 - winner
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidates[winner]
+    with pytest.raises(RemoteDrift):
+        queues[loser].publish(
+            f"queue-{loser}",
+            target_ref="refs/heads/main",
+            queue_ref=f"refs/autoform/queue/queue-{loser}",
+            expected_target_oid=base,
+            candidate_oid=candidates[loser],
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidates[winner]
+
+
+@pytest.mark.parametrize(
+    ("boundary", "recovered_status"),
+    (
+        ("publication-intent-recorded", "prepared"),
+        ("queue-pushed", "queued"),
+        ("claim-fence-recorded", "queued"),
+        ("target-push-attempted", "queued"),
+        ("target-pushed", "integrated"),
+    ),
+)
+def test_publication_interruption_is_classified_from_remote_evidence(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    recovered_status: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+    }
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    recovered = queue.recover("queue-1", **arguments)
+    assert recovered.status == recovered_status
+    final = queue.publish("queue-1", **arguments)
+    assert final.status == "integrated"
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
+
+
+def test_atomic_push_disconnect_is_uncertain_then_recovers_from_remote_evidence(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+    }
+    original_remote_git = queue._remote_git
+
+    def apply_then_report_disconnect(
+        git_arguments: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        result = original_remote_git(git_arguments, check=check)
+        if git_arguments[0] == "push" and "--atomic" in git_arguments:
+            return subprocess.CompletedProcess(
+                result.args,
+                1,
+                stdout=result.stdout,
+                stderr="connection reset after remote update",
+            )
+        return result
+
+    monkeypatch.setattr(queue, "_remote_git", apply_then_report_disconnect)
+    with pytest.raises(PublicationUncertain, match="outcome is uncertain"):
+        queue.publish("queue-1", **arguments)
+
+    monkeypatch.setattr(queue, "_remote_git", original_remote_git)
+    recovered = queue.recover("queue-1", **arguments)
+    assert recovered.status == "integrated"
+    assert recovered.observed_target_oid == candidate
+    assert recovered.observed_queue_oid == candidate
+
+
+def test_queue_ref_collision_is_preserved_as_uncertain_state(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    _git("update-ref", "refs/autoform/queue/queue-1", base, cwd=remote)
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    with pytest.raises(PublicationUncertain, match="collision"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+    assert _git("rev-parse", "refs/autoform/queue/queue-1", cwd=remote) == base
+
+
+def test_target_candidate_does_not_hide_a_colliding_queue_ref(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    _git("push", "--quiet", str(remote), f"{candidate}:refs/heads/main", cwd=coordinator)
+    _git("update-ref", "refs/autoform/queue/queue-1", base, cwd=remote)
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    with pytest.raises(PublicationUncertain, match="collision"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
+    assert _git("rev-parse", "refs/autoform/queue/queue-1", cwd=remote) == base
+
+
+def test_queue_ref_change_during_target_cas_never_records_integration(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    def replace_queue(name: str) -> None:
+        if name == "target-push-attempted":
+            _git("update-ref", "refs/autoform/queue/queue-1", base, cwd=remote)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_queue)
+    with pytest.raises(PublicationUncertain, match="changed during target publication"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+    assert _git("rev-parse", "refs/autoform/queue/queue-1", cwd=remote) == base
+
+
+def test_claim_steal_before_atomic_publication_cannot_advance_target(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    thief = _FencedTestClaimBoard(remote, "worker-b", tmp_path / "thief-claims")
+    claim_key = repository_module._merge_claim_key("refs/heads/main")
+    original_push = queue._atomic_target_push
+
+    def steal_then_push(**arguments: object) -> bool:
+        assert thief.acquire(claim_key, ttl=600, steal=True)
+        return original_push(**arguments)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(queue, "_atomic_target_push", steal_then_push)
+    with pytest.raises(PublicationUncertain, match="claim ref .* changed during target publication"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+    assert thief.holds(claim_key)
+    assert thief.release(claim_key)
+
+
+@pytest.mark.parametrize("successor_worker", ("worker-b", "worker-a"))
+def test_successor_claim_after_atomic_publication_does_not_obscure_success(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    successor_worker: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    successor = _FencedTestClaimBoard(remote, successor_worker, tmp_path / "successor-claims")
+    claim_key = repository_module._merge_claim_key("refs/heads/main")
+
+    def acquire_successor(name: str) -> None:
+        if name == "target-pushed":
+            assert successor.acquire(claim_key, ttl=600)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", acquire_successor)
+    receipt = queue.publish(
+        "queue-1",
+        target_ref="refs/heads/main",
+        queue_ref="refs/autoform/queue/queue-1",
+        expected_target_oid=base,
+        candidate_oid=candidate,
+    )
+    assert receipt.status == "integrated"
+    assert receipt.observed_claim_oid not in {None, receipt.claim_oid}
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == candidate
+    assert successor.holds(claim_key)
+    assert successor.release(claim_key)
+
+
+def test_remote_target_oid_cannot_substitute_for_local_candidate_validation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, seed, coordinator, base = git_repository
+    (seed / "book.txt").write_text("remote-only\n", encoding="utf-8")
+    _git("add", "book.txt", cwd=seed)
+    _git("commit", "--quiet", "-m", "remote-only", cwd=seed)
+    remote_only = _git("rev-parse", "HEAD", cwd=seed)
+    _git("push", "--quiet", "origin", "main", cwd=seed)
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    with pytest.raises(RepositoryError, match="does not resolve exactly"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=remote_only,
+        )
+    assert _git("for-each-ref", "--format=%(refname)", "refs/autoform/queue/queue-1", cwd=remote) == ""
+
+
+def test_local_remote_replacement_is_rejected_before_any_ref_mutation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    original = remote.with_name("original.git")
+    remote.rename(original)
+    _git("init", "--bare", "--quiet", str(remote))
+
+    with pytest.raises(PublicationUncertain, match="remote was replaced"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert _git("for-each-ref", "--format=%(refname)", cwd=remote) == ""
+
+
+def test_local_remote_replacement_across_restart_is_rejected(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    state = tmp_path / "queue-state"
+    queue = _queue(manager, remote, state, "worker-a")
+    original_identity = (remote.stat().st_dev, remote.stat().st_ino)
+    queue.close()
+
+    original = remote.with_name("original.git")
+    remote.rename(original)
+    _git("clone", "--bare", "--quiet", str(original), str(remote))
+    assert (remote.stat().st_dev, remote.stat().st_ino) != original_identity
+
+    with pytest.raises(PublicationUncertain, match="replaced across restart"):
+        _queue(manager, remote, state, "worker-b")
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+
+
+def test_publication_directory_substitution_is_read_only_and_fails_closed(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    state = tmp_path / "queue-state"
+    queue = _queue(manager, remote, state, "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "publication-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    publication = state / "publications/queue-1"
+    original = publication.with_name("queue-1-original")
+    publication.rename(original)
+    foreign = tmp_path / "foreign-publication"
+    foreign.mkdir()
+    (foreign / "publication.json").write_bytes((original / "publication.json").read_bytes())
+    sentinel = foreign / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    publication.symlink_to(foreign, target_is_directory=True)
+
+    with pytest.raises(PublicationUncertain, match="directory was replaced"):
+        queue.recover("queue-1", **arguments)
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+
+
+def test_publication_does_not_adopt_a_foreign_empty_directory(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    foreign = tmp_path / "queue-state/publications/queue-1"
+    foreign.mkdir()
+
+    with pytest.raises(PublicationUncertain, match="without a durable ownership journal"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert list(foreign.iterdir()) == []
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+
+
+def test_claim_is_released_when_fencing_receipt_lookup_fails(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+
+    class FailingReceiptBoard:
+        repo_url = str(remote)
+        released = False
+
+        def acquire(self, *_args: object, **_kwargs: object) -> bool:
+            return True
+
+        def held_lease_id(self, _key: str) -> str:
+            raise RuntimeError("receipt unavailable")
+
+        def held_claim_oid(self, _key: str) -> str:
+            return base
+
+        def release(self, _key: str) -> bool:
+            self.released = True
+            return True
+
+    board = FailingReceiptBoard()
+    queue = RemoteMergeQueue(
+        manager,
+        remote_url=remote,
+        state_root=tmp_path / "queue-state",
+        worker_id="worker-a",
+        claim_board=board,
+    )
+    with pytest.raises(RuntimeError, match="receipt unavailable"):
+        queue.publish(
+            "queue-1",
+            target_ref="refs/heads/main",
+            queue_ref="refs/autoform/queue/queue-1",
+            expected_target_oid=base,
+            candidate_oid=candidate,
+        )
+    assert board.released
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
