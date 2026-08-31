@@ -25,9 +25,13 @@ def _project(tmp_path: Path, *, v2: bool = True) -> Path:
     blueprint = project / "blueprint"
     roadmap = blueprint / "roadmap"
     roadmap.mkdir(parents=True)
-    (roadmap / "README.md").write_text("# Roadmap\n", encoding="utf-8")
+    (roadmap / "README.md").write_text(
+        "---\narticle_id: af_000000000000000000000000\n---\n\n# Roadmap\n",
+        encoding="utf-8",
+    )
     (roadmap / "result.md").write_text(
         "---\n"
+        "article_id: af_111111111111111111111111\n"
         "declaration: theorem\n"
         "source_units: [result]\n"
         "---\n\n"
@@ -75,6 +79,9 @@ def test_builds_deterministic_deeply_immutable_execution_input(tmp_path: Path) -
     assert first.schema == EXECUTION_INPUT_SCHEMA
     assert first.runtime.schema == RUNTIME_SCHEMA
     assert first.coverage_schema == "autoform-coverage/v2"
+    assert len(first.authority_sha256) == 64
+    assert first.lean_source_revision is None
+    assert len(first.source_contract_sha256) == 64
     assert first.artifact_path == "sources/book.md"
     assert first.units[0].roadmap_nodes == ("result",)
     assert json.loads(first.to_json()) == first.as_dict()
@@ -112,6 +119,24 @@ def test_v1_coverage_is_explicitly_refused_for_execution(tmp_path: Path) -> None
         load_execution_input(project)
 
     assert [issue.code for issue in raised.value.issues] == ["coverage-v2-required"]
+
+
+def test_missing_durable_article_id_is_refused_for_execution(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "article_id: af_111111111111111111111111\n",
+            "",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project)
+
+    assert [issue.code for issue in raised.value.issues] == ["article-id-required"]
+    assert "result" in raised.value.issues[0].reason
 
 
 def test_invalid_roadmap_is_reported_through_execution_input_error(tmp_path: Path) -> None:
@@ -245,6 +270,29 @@ def test_lean_aba_hidden_inside_runtime_loader_is_retried(
     result = snapshot.runtime.get("result")
     assert result is not None
     assert result.lean_targets[0].source_file == "Project/Stable.lean"
+
+
+def test_lean_source_bytes_are_bound_into_execution_input(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "declaration: theorem\n",
+            "declaration: theorem\nlean: Project.result\n",
+        ),
+        encoding="utf-8",
+    )
+    source = project / "Project.lean"
+    source.write_text("theorem Project.result : True := by trivial\n", encoding="utf-8")
+
+    before = load_execution_input(project, lean_root=project)
+    source.write_text("theorem Project.result : True := by\n  trivial\n", encoding="utf-8")
+    after = load_execution_input(project, lean_root=project)
+
+    assert before.lean_source_revision != after.lean_source_revision
+    assert before.authority_sha256 != after.authority_sha256
+    assert before.sha256 != after.sha256
+    assert before.source_contract_sha256 == after.source_contract_sha256
 
 
 def _mutate_roadmap(project: Path) -> None:

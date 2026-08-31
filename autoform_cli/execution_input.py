@@ -96,6 +96,8 @@ class ExecutionInput:
     artifact_sha256: str
     units: tuple[ExecutionSourceUnit, ...]
     node_bindings: tuple[ExecutionNodeBinding, ...]
+    authority_sha256: str | None = None
+    lean_source_revision: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -103,6 +105,7 @@ class ExecutionInput:
                 "path": self.artifact_path,
                 "sha256": self.artifact_sha256,
             },
+            "authority_sha256": self.authority_sha256,
             "coverage": {
                 "path": self.coverage_path,
                 "schema": self.coverage_schema,
@@ -111,6 +114,7 @@ class ExecutionInput:
             "node_bindings": [binding.as_dict() for binding in self.node_bindings],
             "runtime": self.runtime.as_dict(),
             "runtime_sha256": self.runtime_sha256,
+            "lean_source_revision": self.lean_source_revision,
             "schema": self.schema,
             "units": [unit.as_dict() for unit in self.units],
         }
@@ -121,6 +125,24 @@ class ExecutionInput:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+    @property
+    def source_contract_sha256(self) -> str:
+        """Hash the immutable source-coverage contract without progress state."""
+
+        payload = {
+            "artifact": {"path": self.artifact_path, "sha256": self.artifact_sha256},
+            "coverage": {
+                "path": self.coverage_path,
+                "schema": self.coverage_schema,
+                "sha256": self.coverage_sha256,
+            },
+            "node_bindings": [binding.as_dict() for binding in self.node_bindings],
+            "units": [unit.as_dict() for unit in self.units],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
 
 def load_execution_input(
@@ -140,6 +162,7 @@ def load_execution_input(
     resolved_lean_root = Path(lean_root).expanduser().resolve() if lean_root is not None else None
     runtime: RuntimeGraph | None = None
     coverage: CoverageSummary | None = None
+    authority: _ExecutionAuthorityRevision | None = None
     for _ in range(_EXECUTION_INPUT_READ_ATTEMPTS):
         before: _ExecutionAuthorityRevision | None = None
         lean_index: SourceIndex | None = None
@@ -182,16 +205,30 @@ def load_execution_input(
         except OSError:
             continue
         if before == between == after and _coverage_matches_authority(coverage, before):
+            authority = after
             break
     else:
         raise _changed_execution_input()
 
-    assert runtime is not None and coverage is not None
+    assert runtime is not None and coverage is not None and authority is not None
+    missing_article_ids = tuple(node.id for node in runtime.nodes if node.article_id is None)
+    if missing_article_ids:
+        raise ExecutionInputError(
+            [
+                ExecutionInputIssue(
+                    "article-id-required",
+                    "autonomous execution requires durable article_id frontmatter on every "
+                    f"roadmap article; missing: {', '.join(missing_article_ids)}",
+                )
+            ]
+        )
     runtime_json = runtime.to_json()
     return ExecutionInput(
         schema=EXECUTION_INPUT_SCHEMA,
         runtime=runtime,
+        authority_sha256=authority.sha256,
         runtime_sha256=hashlib.sha256(runtime_json.encode("utf-8")).hexdigest(),
+        lean_source_revision=authority.lean_source_revision,
         coverage_schema=coverage.schema,
         coverage_path=coverage.source_path,
         coverage_sha256=coverage.source_sha256,

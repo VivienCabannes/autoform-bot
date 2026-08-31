@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 
-from .graph import Graph, load_graph
+from .graph import ARTICLE_ID_PATTERN, Graph, load_graph
 from .lean import declaration_names, index_project
 from .status import derive, is_definition
 
@@ -116,9 +117,12 @@ class RuntimeNode:
     mathlib: bool
     mathlib_declarations: tuple[str, ...]
     mathlib_file: str | None
+    article_id: str | None = None
+    source_sha256: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "article_id": self.article_id,
             "article_path": self.article_path,
             "assertions": self.assertions.as_dict(),
             "declaration": self.declaration,
@@ -134,6 +138,7 @@ class RuntimeNode:
             "origin": self.origin,
             "parent": self.parent,
             "proof_dependencies": list(self.proof_dependencies),
+            "source_sha256": self.source_sha256,
             "source_targets": list(self.source_targets),
             "statement_dependencies": list(self.statement_dependencies),
             "status": self.status.as_dict(),
@@ -353,6 +358,7 @@ def build_runtime_graph(
         runtime_nodes.append(
             RuntimeNode(
                 id=node.id,
+                article_id=node.article_id,
                 title=node.title,
                 article_path=article_paths[node.id],
                 parent=node.parent,
@@ -383,6 +389,7 @@ def build_runtime_graph(
                 mathlib=node.mathlib,
                 mathlib_declarations=tuple(declaration_names(node.mathlib_declaration or "")),
                 mathlib_file=node.mathlib_file.replace("\\", "/") if node.mathlib_file else None,
+                source_sha256=node.source_sha256,
             )
         )
 
@@ -524,12 +531,22 @@ def _source_revision(article_paths: dict[str, str], article_bytes: dict[str, byt
 def _validate_runtime(runtime: RuntimeGraph) -> None:
     issues: list[str] = []
     nodes = {node.id: node for node in runtime.nodes}
+    article_ids: dict[str, str] = {}
     parents_with_children = {
         node.parent for node in runtime.nodes if node.parent is not None
     }
     if len(nodes) != len(runtime.nodes):
         issues.append("runtime node ids are not unique")
     for node in runtime.nodes:
+        if node.article_id is not None:
+            if ARTICLE_ID_PATTERN.fullmatch(node.article_id) is None:
+                issues.append(f"{node.id}: runtime article_id is malformed")
+            previous = article_ids.get(node.article_id)
+            if previous is not None:
+                issues.append(f"{node.id}: runtime article_id also names {previous}")
+            article_ids[node.article_id] = node.id
+        if node.source_sha256 is not None and re.fullmatch(r"[0-9a-f]{64}", node.source_sha256) is None:
+            issues.append(f"{node.id}: runtime source_sha256 is malformed")
         if node.parent is not None and node.parent not in nodes:
             issues.append(f"{node.id}: runtime parent does not resolve")
         if node.dependencies != _ordered_union(node.statement_dependencies, node.proof_dependencies):

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import threading
+from dataclasses import replace
 
+from autoform_cli.execution_input import ExecutionInput
 from autoform_cli.runtime import RuntimeAssertions, RuntimeGraph, RuntimeNode, RuntimeStatus
 from autoform_worker.scheduler import AttemptResult, Scheduler, WorkPhase
 
@@ -15,6 +18,7 @@ def _node(
 ) -> RuntimeNode:
     return RuntimeNode(
         id=node_id,
+        article_id=f"af_{hashlib.sha256(node_id.encode()).hexdigest()[:24]}",
         title=node_id.title(),
         article_path=f"blueprint/roadmap/{node_id}.md",
         parent=None,
@@ -63,6 +67,23 @@ def _runtime(revision: str, *nodes: RuntimeNode) -> RuntimeGraph:
     )
 
 
+def _input(revision: str, coverage_sha256: str, *nodes: RuntimeNode) -> ExecutionInput:
+    return ExecutionInput(
+        schema="autoform-execution-input/v1",
+        runtime=_runtime(revision, *nodes),
+        authority_sha256="a" * 64,
+        runtime_sha256="b" * 64,
+        lean_source_revision=None,
+        coverage_schema="autoform-coverage/v2",
+        coverage_path="coverage/README.md",
+        coverage_sha256=coverage_sha256,
+        artifact_path="sources/book.md",
+        artifact_sha256="d" * 64,
+        units=(),
+        node_bindings=(),
+    )
+
+
 class _Heartbeat:
     def __init__(self) -> None:
         self.lost = threading.Event()
@@ -79,6 +100,9 @@ class _Board:
         self._on_acquire = on_acquire
         self.released: list[str] = []
         self.heartbeat_keys: list[str] = []
+
+    def prepare_v2_claim(self, canonical_key, compatibility_keys, *, canonical_keys=()):
+        return True
 
     def acquire(self, key: str, ttl: int | float = 1500, steal: bool = False, note: str = "") -> bool:
         self._on_acquire()
@@ -163,3 +187,77 @@ def test_run_once_does_not_execute_when_claimed_phase_changes() -> None:
     assert executed == []
     assert scheduler.record("target").attempts == 0
     assert scheduler.ready_items(current[0])[0].phase is WorkPhase.PROOF
+
+
+def test_run_once_does_not_execute_when_claimed_article_id_changes() -> None:
+    original = _node("target")
+    changed = replace(original, article_id="af_aaaaaaaaaaaaaaaaaaaaaaaa")
+    current = [_runtime("revision-1", original)]
+    board = _Board(lambda: current.__setitem__(0, _runtime("revision-2", changed)))
+    executed = []
+    scheduler = Scheduler(
+        lambda: current[0],
+        board,
+        lambda item, cancelled: executed.append(item) or AttemptResult.succeeded(),
+        claim_ttl=60,
+        heartbeat_interval=5,
+    )
+
+    result = scheduler.run_once()
+
+    assert not result.progressed
+    assert "changed durable article_id" in result.detail
+    assert executed == []
+    assert board.heartbeat_keys == []
+    assert len(board.released) == 1
+
+
+def test_run_once_does_not_execute_when_source_contract_changes_after_claim() -> None:
+    original = _node("target")
+    current = [_input("revision-1", "c" * 64, original)]
+    board = _Board(
+        lambda: current.__setitem__(0, _input("revision-2", "e" * 64, original))
+    )
+    executed = []
+    scheduler = Scheduler(
+        lambda: current[0],
+        board,
+        lambda item, cancelled: executed.append(item) or AttemptResult.succeeded(),
+        claim_ttl=60,
+        heartbeat_interval=5,
+    )
+
+    result = scheduler.run_once()
+
+    assert not result.progressed
+    assert result.detail == "claimed work source-coverage contract changed"
+    assert executed == []
+    assert board.heartbeat_keys == []
+    assert len(board.released) == 1
+
+
+def test_run_once_does_not_execute_when_another_article_changes_after_claim() -> None:
+    target = replace(_node("target"), source_sha256="1" * 64)
+    sibling = replace(_node("sibling"), source_sha256="2" * 64)
+    changed_sibling = replace(sibling, source_sha256="3" * 64)
+    current = [_input("revision-1", "c" * 64, target, sibling)]
+    board = _Board(
+        lambda: current.__setitem__(
+            0,
+            _input("revision-2", "c" * 64, target, changed_sibling),
+        )
+    )
+    executed = []
+    scheduler = Scheduler(
+        lambda: current[0],
+        board,
+        lambda item, cancelled: executed.append(item) or AttemptResult.succeeded(),
+        claim_ttl=60,
+        heartbeat_interval=5,
+    )
+
+    result = scheduler.run_once(node_id="target")
+
+    assert not result.progressed
+    assert result.detail == "roadmap outside the claimed article changed"
+    assert executed == []

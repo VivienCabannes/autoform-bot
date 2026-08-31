@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,7 @@ def _node(
 ) -> RuntimeNode:
     return RuntimeNode(
         id="result",
+        article_id="af_0123456789abcdef01234567",
         title="Result",
         article_path="blueprint/roadmap/result.md",
         parent=None,
@@ -357,6 +359,7 @@ def test_statement_success_rejects_unrelated_side_effects(tmp_path, monkeypatch,
 @pytest.mark.parametrize(
     ("changed_field", "changed_value"),
     [
+        ("article_id", "af_aaaaaaaaaaaaaaaaaaaaaaaa"),
         ("article_path", "blueprint/roadmap/other.md"),
         ("declaration", "lemma"),
         ("lean_targets", (RuntimeLeanTarget("other", "Main.lean"),)),
@@ -386,6 +389,73 @@ def test_proof_success_rejects_changed_target_metadata(
     assert result.outcome is AttemptOutcome.FAILED
     assert "changed target metadata" in result.detail
     assert changed_field in result.detail
+
+
+def test_proof_success_rejects_changed_source_contract(tmp_path, monkeypatch) -> None:
+    original = _node(stated=True, source_file="Main.lean")
+    refreshed = _node(stated=True, proved=True, source_file="Main.lean")
+    monkeypatch.setattr("autoform_worker.executor.prove", lambda *args, **kwargs: ProofResult("proved"))
+    monkeypatch.setattr(
+        "autoform_worker.executor.load_execution_input",
+        lambda *args, **kwargs: SimpleNamespace(
+            runtime=_runtime(refreshed),
+            source_contract_sha256="b" * 64,
+        ),
+    )
+
+    result = ProverExecutor(tmp_path, lambda: FakeAdapter(ProofResult("proved")))(
+        WorkItem(
+            original,
+            WorkPhase.PROOF,
+            1,
+            "revision",
+            source_contract_sha256="a" * 64,
+        ),
+        threading.Event(),
+    )
+
+    assert result.outcome is AttemptOutcome.RETRY
+    assert result.detail == "source-coverage contract changed during attempt"
+
+
+def test_proof_success_rejects_changed_unrelated_roadmap_article(tmp_path, monkeypatch) -> None:
+    original = replace(_node(stated=True, source_file="Main.lean"), source_sha256="1" * 64)
+    refreshed = replace(_node(stated=True, proved=True, source_file="Main.lean"), source_sha256="2" * 64)
+    sibling = replace(_node(stated=True), id="sibling", article_id="af_aaaaaaaaaaaaaaaaaaaaaaaa", source_sha256="3" * 64)
+    changed_sibling = replace(sibling, source_sha256="4" * 64)
+    before_runtime = _runtime(original)
+    before_runtime = replace(
+        before_runtime,
+        nodes=(original, sibling),
+        article_count=2,
+        formalizable_count=2,
+        dispatchable_count=2,
+    )
+    after_runtime = replace(before_runtime, nodes=(refreshed, changed_sibling))
+    monkeypatch.setattr("autoform_worker.executor.prove", lambda *args, **kwargs: ProofResult("proved"))
+    monkeypatch.setattr(
+        "autoform_worker.executor.load_execution_input",
+        lambda *args, **kwargs: SimpleNamespace(
+            runtime=after_runtime,
+            source_contract_sha256="c" * 64,
+        ),
+    )
+    from autoform_worker.scheduler import _protected_roadmap_sha256
+
+    result = ProverExecutor(tmp_path, lambda: FakeAdapter(ProofResult("proved")))(
+        WorkItem(
+            original,
+            WorkPhase.PROOF,
+            1,
+            "revision",
+            source_contract_sha256="c" * 64,
+            protected_roadmap_sha256=_protected_roadmap_sha256(before_runtime, original),
+        ),
+        threading.Event(),
+    )
+
+    assert result.outcome is AttemptOutcome.RETRY
+    assert result.detail == "roadmap outside the selected article changed during attempt"
 
 
 def test_proof_success_rejects_stale_already_proved_work_item(tmp_path, monkeypatch) -> None:

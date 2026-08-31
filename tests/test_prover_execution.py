@@ -37,6 +37,7 @@ def runtime_node(
 ) -> RuntimeNode:
     return RuntimeNode(
         id="chapter/result",
+        article_id="af_0123456789abcdef01234567",
         title="Result",
         article_path="blueprint/roadmap/chapter/result.md",
         parent="chapter",

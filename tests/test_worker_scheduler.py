@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
 from autoform_cli.claims import author_claim_key
+from autoform_cli.execution_input import ExecutionInputError
 from autoform_cli.runtime import (
     RuntimeAssertions,
     RuntimeGraph,
@@ -34,6 +36,7 @@ def _node(
 ) -> RuntimeNode:
     return RuntimeNode(
         id=node_id,
+        article_id=f"af_{hashlib.sha256(node_id.encode()).hexdigest()[:24]}",
         title=node_id.title(),
         article_path=f"blueprint/roadmap/{node_id}.md",
         parent=None,
@@ -103,12 +106,18 @@ class FakeHeartbeat:
 class FakeBoard:
     unavailable: set[str] | None = None
     lose_heartbeat: bool = False
+    legacy_blocked: bool = False
 
     def __post_init__(self) -> None:
         self.unavailable = set(self.unavailable or ())
         self.acquired: list[tuple[str, int | float, str]] = []
         self.released: list[str] = []
         self.heartbeats: list[FakeHeartbeat] = []
+        self.prepared: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+
+    def prepare_v2_claim(self, canonical_key, compatibility_keys, *, canonical_keys=()):
+        self.prepared.append((canonical_key, tuple(compatibility_keys), tuple(canonical_keys)))
+        return not self.legacy_blocked
 
     def acquire(self, key: str, ttl: int | float = 1500, steal: bool = False, note: str = "") -> bool:
         self.acquired.append((key, ttl, note))
@@ -183,7 +192,7 @@ def test_fresh_projection_advances_successful_statement_to_proof() -> None:
 
 def test_run_once_skips_contended_claim_and_executes_one_ready_leaf() -> None:
     runtime = _runtime(_node("b"), _node("a"))
-    first_key = author_claim_key("a")
+    first_key = author_claim_key(_node("a").article_id)
     board = FakeBoard(unavailable={first_key})
     executed = []
 
@@ -201,7 +210,7 @@ def test_run_once_skips_contended_claim_and_executes_one_ready_leaf() -> None:
 
     result = scheduler.run_once()
 
-    second_key = author_claim_key("b")
+    second_key = author_claim_key(_node("b").article_id)
     assert result.progressed
     assert result.item is not None and result.item.node.id == "b"
     assert result.record == scheduler.record("b")
@@ -211,6 +220,80 @@ def test_run_once_skips_contended_claim_and_executes_one_ready_leaf() -> None:
     assert board.released == [second_key]
     assert board.heartbeats[0].entered and board.heartbeats[0].exited
     assert "revision-1" in board.acquired[-1][2]
+    assert board.prepared[0][0] == first_key
+    assert board.prepared[0][1] == (author_claim_key("a"),)
+
+
+def test_ready_work_without_durable_article_id_fails_before_claiming() -> None:
+    runtime = _runtime(replace(_node("missing-id"), article_id=None))
+    board = FakeBoard()
+    scheduler = Scheduler(lambda: runtime, board, lambda item, cancelled: AttemptResult.succeeded())
+
+    with pytest.raises(ValueError, match="no durable article_id"):
+        scheduler.run_once()
+
+    assert board.acquired == []
+
+
+def test_live_legacy_claim_blocks_durable_worker_claim() -> None:
+    runtime = _runtime(_node("target"))
+    board = FakeBoard(legacy_blocked=True)
+    executed = []
+    scheduler = Scheduler(
+        lambda: runtime,
+        board,
+        lambda item, cancelled: executed.append(item) or AttemptResult.succeeded(),
+    )
+
+    result = scheduler.run_once()
+
+    assert not result.progressed
+    assert executed == []
+    assert board.acquired == []
+    assert board.prepared == [
+        (
+            author_claim_key(_node("target").article_id),
+            (author_claim_key("target"),),
+            (author_claim_key(_node("target").article_id),),
+        )
+    ]
+
+
+def test_project_scheduler_refuses_legacy_coverage_before_claiming(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    roadmap = project / "blueprint" / "roadmap"
+    roadmap.mkdir(parents=True)
+    (roadmap / "README.md").write_text(
+        "---\narticle_id: af_000000000000000000000000\n---\n\n# Roadmap\n",
+        encoding="utf-8",
+    )
+    (roadmap / "result.md").write_text(
+        "---\narticle_id: af_111111111111111111111111\ndeclaration: theorem\n---\n\n# Result\n",
+        encoding="utf-8",
+    )
+    coverage = project / "blueprint" / "coverage" / "README.md"
+    coverage.parent.mkdir()
+    coverage.write_text(
+        "# Coverage\n\n| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
+        "| Result | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+    board = FakeBoard()
+    monkeypatch.setattr("autoform_worker.scheduler.ClaimBoard", lambda *args, **kwargs: board)
+    scheduler = Scheduler.for_project(
+        project,
+        claim_repo=tmp_path / "claims.git",
+        worker_id="worker",
+        claim_scratch=tmp_path / "scratch",
+        executor=lambda item, cancelled: AttemptResult.succeeded(),
+    )
+
+    with pytest.raises(ExecutionInputError, match="coverage-v2-required"):
+        scheduler.run_once()
+
+    assert board.acquired == []
 
 
 def test_retry_is_requeued_then_exhaustion_becomes_terminal_failure() -> None:
@@ -265,7 +348,7 @@ def test_exception_is_retryable_and_claim_is_always_released() -> None:
     assert result.record is not None
     assert result.record.status is LifecycleStatus.RETRYING
     assert "OSError: tool disappeared" in result.record.detail
-    assert board.released == [author_claim_key("raises")]
+    assert board.released == [author_claim_key(_node("raises").article_id)]
 
 
 def test_cancellation_and_failure_propagate_through_dependencies() -> None:

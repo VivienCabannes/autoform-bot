@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -51,6 +52,7 @@ def _project(tmp_path: Path) -> Path:
         project,
         "chapter/section/base.md",
         title="Base",
+        article_id="af_0123456789abcdef01234567",
         declaration="definition",
         statement="formalized",
         lean="Project.base",
@@ -100,13 +102,18 @@ def test_loads_identical_runtime_from_project_or_blueprint(tmp_path: Path) -> No
 
 
 def test_preserves_hierarchy_typed_dependencies_and_dispatchability(tmp_path: Path) -> None:
-    runtime = load_runtime_graph(_project(tmp_path))
+    project = _project(tmp_path)
+    runtime = load_runtime_graph(project)
     chapter = runtime.get("chapter")
     base = runtime.get("chapter/section/base")
     result = runtime.get("chapter/section/result")
 
     assert chapter is not None and not chapter.formalizable and not chapter.dispatchable
     assert base is not None and base.dispatchable
+    assert base.article_id == "af_0123456789abcdef01234567"
+    assert base.source_sha256 == hashlib.sha256(
+        (project / base.article_path).read_bytes()
+    ).hexdigest()
     assert base.status.state == "fully_proved"
     assert base.status.defined
     assert result is not None

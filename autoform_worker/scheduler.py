@@ -7,6 +7,8 @@ ownership is delegated to :class:`autoform_cli.claims.ClaimBoard`.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -21,7 +23,8 @@ from autoform_cli.claims import (
     ClaimTransportError,
     author_claim_key,
 )
-from autoform_cli.runtime import RuntimeGraph, RuntimeNode, load_runtime_graph
+from autoform_cli.execution_input import ExecutionInput, load_execution_input
+from autoform_cli.runtime import RuntimeGraph, RuntimeNode
 
 
 class WorkPhase(str, Enum):
@@ -60,6 +63,8 @@ class WorkItem:
     phase: WorkPhase
     attempt: int
     source_revision: str
+    source_contract_sha256: str | None = None
+    protected_roadmap_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +138,14 @@ class ClaimHeartbeat(Protocol):
 
 
 class ClaimBoardLike(Protocol):
+    def prepare_v2_claim(
+        self,
+        canonical_key: str,
+        compatibility_keys: tuple[str, ...],
+        *,
+        canonical_keys: tuple[str, ...] = (),
+    ) -> bool: ...
+
     def acquire(self, key: str, ttl: int | float = CLAIM_TTL_S, steal: bool = False, note: str = "") -> bool: ...
 
     def release(self, key: str) -> bool: ...
@@ -169,7 +182,7 @@ class _CombinedCancellation:
         return True
 
 
-RuntimeLoader = Callable[[], RuntimeGraph]
+RuntimeLoader = Callable[[], RuntimeGraph | ExecutionInput]
 
 
 class Scheduler:
@@ -214,8 +227,8 @@ class Scheduler:
     ) -> Scheduler:
         """Build a scheduler using the shared runtime loader and claim board."""
 
-        def runtime_loader() -> RuntimeGraph:
-            return load_runtime_graph(project_or_blueprint, lean_root=lean_root)
+        def runtime_loader() -> ExecutionInput:
+            return load_execution_input(project_or_blueprint, lean_root=lean_root)
 
         board = ClaimBoard(claim_repo, worker_id, claim_scratch)
         return cls(
@@ -257,14 +270,17 @@ class Scheduler:
             self._records[node_id] = cancelled
             return cancelled
 
-    def ready_items(self, runtime: RuntimeGraph | None = None) -> tuple[WorkItem, ...]:
+    def ready_items(
+        self,
+        runtime: RuntimeGraph | ExecutionInput | None = None,
+    ) -> tuple[WorkItem, ...]:
         """Return deterministically ordered, unclaimed-candidate work items.
 
         Claims are intentionally not read here. Acquisition is the authoritative
         race-safe readiness check and happens in :meth:`run_once`.
         """
 
-        runtime = runtime or self._runtime_loader()
+        runtime, source_contract_sha256 = _runtime_projection(runtime or self._runtime_loader())
         with self._lock:
             self._propagate_blocked(runtime)
             items: list[WorkItem] = []
@@ -272,6 +288,7 @@ class Scheduler:
                 phase = _ready_phase(node)
                 if phase is None:
                     continue
+                _required_article_id(node)
                 record = self._records.get(node.id, LifecycleRecord())
                 if record.status is LifecycleStatus.SUCCEEDED and record.phase is not phase:
                     record = LifecycleRecord()
@@ -284,6 +301,12 @@ class Scheduler:
                         phase=phase,
                         attempt=record.attempts + 1,
                         source_revision=runtime.source_revision,
+                        source_contract_sha256=source_contract_sha256,
+                        protected_roadmap_sha256=(
+                            _protected_roadmap_sha256(runtime, node)
+                            if source_contract_sha256 is not None
+                            else None
+                        ),
                     )
                 )
             return tuple(sorted(items, key=lambda item: item.node.id))
@@ -304,17 +327,34 @@ class Scheduler:
         if cancelled.is_set():
             return RoundResult(None, None, "scheduler cancelled before selection")
 
-        runtime = self._runtime_loader()
-        candidates = self.ready_items(runtime)
+        projection = self._runtime_loader()
+        runtime, _source_contract_sha256 = _runtime_projection(projection)
+        candidates = self.ready_items(projection)
         if node_id is not None:
             candidates = tuple(item for item in candidates if item.node.id == node_id)
         if not candidates:
             return RoundResult(None, None, "no ready work")
 
+        canonical_keys = tuple(
+            author_claim_key(_required_article_id(node))
+            for node in runtime.nodes
+            if node.article_id is not None
+        )
         for item in candidates:
             if cancelled.is_set():
                 return RoundResult(None, None, "scheduler cancelled before claim")
-            key = author_claim_key(item.node.id)
+            key = author_claim_key(_required_article_id(item.node))
+            legacy_key = author_claim_key(item.node.id)
+            try:
+                prepared = self._board.prepare_v2_claim(
+                    key,
+                    (legacy_key,),
+                    canonical_keys=canonical_keys,
+                )
+            except ClaimTransportError as error:
+                return RoundResult(None, None, str(error))
+            if not prepared:
+                continue
             note = f"{item.phase.value} {item.source_revision} attempt {item.attempt}"
             if not self._board.acquire(key, ttl=self.claim_ttl, note=note):
                 continue
@@ -328,7 +368,9 @@ class Scheduler:
         return RoundResult(None, None, "ready work is claimed by other workers")
 
     def _refresh_claimed(self, item: WorkItem) -> WorkItem | RoundResult:
-        runtime = self._runtime_loader()
+        runtime, source_contract_sha256 = _runtime_projection(self._runtime_loader())
+        if item.source_contract_sha256 != source_contract_sha256:
+            return RoundResult(None, None, "claimed work source-coverage contract changed")
         node = next((candidate for candidate in runtime.nodes if candidate.id == item.node.id), None)
         if node is None:
             return RoundResult(None, None, f"claimed node {item.node.id!r} no longer exists")
@@ -342,6 +384,17 @@ class Scheduler:
                 None,
                 f"claimed node {item.node.id!r} phase changed from {item.phase.value} to {phase.value}",
             )
+        if node.article_id != item.node.article_id:
+            return RoundResult(
+                None,
+                None,
+                f"claimed node {item.node.id!r} changed durable article_id",
+            )
+        if (
+            item.protected_roadmap_sha256 is not None
+            and _protected_roadmap_sha256(runtime, node) != item.protected_roadmap_sha256
+        ):
+            return RoundResult(None, None, "roadmap outside the claimed article changed")
 
         with self._lock:
             record = self._records.get(node.id, LifecycleRecord())
@@ -353,6 +406,8 @@ class Scheduler:
             phase=phase,
             attempt=attempt,
             source_revision=runtime.source_revision,
+            source_contract_sha256=source_contract_sha256,
+            protected_roadmap_sha256=item.protected_roadmap_sha256,
         )
 
     def _run_claimed(self, item: WorkItem, key: str, cancelled: CancellationSignal) -> RoundResult:
@@ -457,6 +512,32 @@ def _ready_phase(node: RuntimeNode) -> WorkPhase | None:
     if not node.status.proved:
         return WorkPhase.PROOF if node.status.can_prove else None
     return None
+
+
+def _required_article_id(node: RuntimeNode) -> str:
+    article_id = node.article_id
+    if article_id is None:
+        raise ValueError(
+            f"ready node {node.id!r} has no durable article_id; "
+            "run 'autoform migrate article-ids blueprint' and add the proposed ID"
+        )
+    return article_id
+
+
+def _runtime_projection(value: RuntimeGraph | ExecutionInput) -> tuple[RuntimeGraph, str | None]:
+    if isinstance(value, ExecutionInput):
+        return value.runtime, value.source_contract_sha256
+    return value, None
+
+
+def _protected_roadmap_sha256(runtime: RuntimeGraph, selected: RuntimeNode) -> str:
+    entries = [
+        {"article_id": node.article_id, "id": node.id, "source_sha256": node.source_sha256}
+        for node in runtime.nodes
+        if node.article_id != selected.article_id
+    ]
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 __all__ = [

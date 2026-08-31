@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-import re
 
+from autoform_cli.execution_input import ExecutionInputError, load_execution_input
 from autoform_cli.lean import SourceIndex, index_project
-from autoform_cli.runtime import RuntimeNode, load_runtime_graph
+from autoform_cli.runtime import RuntimeGraph, RuntimeNode, load_runtime_graph
 from servers.prover import ProofResult, ProverAdapter
 from servers.prover.claude_adapter import ClaudeAdapter
 from servers.prover.codex_adapter import CodexAdapter
@@ -109,7 +112,10 @@ class ProverExecutor:
             if not backend_result.proved:
                 return _attempt_result(backend_result)
 
-            refreshed = load_runtime_graph(self.project_dir, lean_root=self.project_dir)
+            refreshed, contract_error = self._refreshed_runtime(item)
+            if contract_error:
+                return AttemptResult.retry(contract_error)
+            assert refreshed is not None
             node = refreshed.get(item.node.id)
             if node is None:
                 return AttemptResult.failed("statement run removed its roadmap node")
@@ -153,7 +159,10 @@ class ProverExecutor:
 
         if item.node.status.proved:
             return AttemptResult.failed("proof work item was already proved before execution")
-        refreshed = load_runtime_graph(self.project_dir, lean_root=self.project_dir)
+        refreshed, contract_error = self._refreshed_runtime(item)
+        if contract_error:
+            return AttemptResult.retry(contract_error)
+        assert refreshed is not None
         node = refreshed.get(item.node.id)
         if node is None:
             return AttemptResult.failed("proof run removed its roadmap node")
@@ -168,18 +177,54 @@ class ProverExecutor:
             )
         return AttemptResult.succeeded("proof verified by an authoritative runtime transition to proved")
 
+    def _refreshed_runtime(self, item: WorkItem) -> tuple[RuntimeGraph | None, str]:
+        if item.source_contract_sha256 is None:
+            return load_runtime_graph(self.project_dir, lean_root=self.project_dir), ""
+        try:
+            execution_input = load_execution_input(self.project_dir, lean_root=self.project_dir)
+        except ExecutionInputError as error:
+            return None, f"execution input became invalid during attempt: {error}"
+        if execution_input.source_contract_sha256 != item.source_contract_sha256:
+            return None, "source-coverage contract changed during attempt"
+        if (
+            item.protected_roadmap_sha256 is not None
+            and _protected_roadmap_sha256(execution_input.runtime, item.node)
+            != item.protected_roadmap_sha256
+        ):
+            return None, "roadmap outside the selected article changed during attempt"
+        return execution_input.runtime, ""
+
 
 def _preserved_metadata_error(before: RuntimeNode, after: RuntimeNode) -> str:
     preserved = (
+        "article_id",
         "article_path",
+        "title",
         "declaration",
+        "formalizable",
+        "dispatchable",
         "lean_targets",
         "statement_dependencies",
         "proof_dependencies",
         "dependencies",
+        "origin",
+        "source_targets",
+        "mathlib",
+        "mathlib_declarations",
+        "mathlib_file",
     )
     changed = [field for field in preserved if getattr(before, field) != getattr(after, field)]
     return f"changed target metadata: {changed}" if changed else ""
+
+
+def _protected_roadmap_sha256(runtime: RuntimeGraph, selected: RuntimeNode) -> str:
+    entries = [
+        {"article_id": node.article_id, "id": node.id, "source_sha256": node.source_sha256}
+        for node in runtime.nodes
+        if node.article_id != selected.article_id
+    ]
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _proof_transition_error(before: RuntimeNode, after: RuntimeNode) -> str:
