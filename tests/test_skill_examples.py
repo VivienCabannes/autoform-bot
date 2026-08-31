@@ -432,6 +432,19 @@ def test_setup_resolves_provenance_before_creating_a_consumer(repo_root: Path) -
         assert required in setup
 
 
+def test_setup_does_not_force_unlisted_stable_patch_upgrades(repo_root: Path) -> None:
+    setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+    normalized = " ".join(setup.split())
+
+    for required in (
+        "structurally valid stable patch pair",
+        "do not silently upgrade the consumer or patch its installed Autoform cache",
+        "reviewed plugin change",
+        "without replacing the catalog's recommended release",
+    ):
+        assert required in normalized
+
+
 def test_skills_teach_the_shipped_frontmatter_model(repo_root: Path) -> None:
     """Agent instructions must match what `autoform_cli.graph` actually parses.
 

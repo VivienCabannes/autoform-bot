@@ -21,11 +21,12 @@ from autoform_cli.project import (
 from autoform_cli.project import repair as repair_module
 
 _RELEASE = "lean-v4.32.2-mathlib-v4.32.2"
+_LEAN_4330_RELEASE = "lean-v4.33.0-mathlib-v4.33.0"
 
 
-def _project(tmp_path: Path) -> Path:
+def _project(tmp_path: Path, *, release_id: str = _RELEASE) -> Path:
     root = tmp_path / "project"
-    create_project(root, package="Project", release_id=_RELEASE)
+    create_project(root, package="Project", release_id=release_id)
     return root
 
 
@@ -77,6 +78,17 @@ def test_dry_run_reports_exact_plan_without_writing(tmp_path: Path) -> None:
     assert result.converged == ()
     assert _files(root) == before
     assert not (root / "mkdocs.yml").exists()
+
+
+def test_repairs_supported_lean_4_33_0_project(tmp_path: Path) -> None:
+    root = _project(tmp_path, release_id=_LEAN_4330_RELEASE)
+    (root / "mkdocs.yml").unlink()
+
+    result = _repair(root)
+
+    assert result.release == _LEAN_4330_RELEASE
+    assert result.written == ("mkdocs.yml",)
+    assert (root / "mkdocs.yml").is_file()
 
 
 def test_second_repair_is_a_noop(tmp_path: Path) -> None:

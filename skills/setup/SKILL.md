@@ -67,6 +67,12 @@ preserves the current directory inode and mode and fails closed when an
 interrupted transaction cannot prove ownership. Do not invent version pairs or
 copy the populated example as a project generator.
 
+If inspection reports a structurally valid stable patch pair as `unlisted`, do
+not silently upgrade the consumer or patch its installed Autoform cache. Report
+that repair is blocked. When the user elects to extend Autoform, validate the
+exact pair and add it through a reviewed plugin change; an older stable patch
+may be supported without replacing the catalog's recommended release.
+
 For an incomplete existing repository, inspect first, preview the conservative
 repair, then apply it only when the plan contains solely the intended missing
 Autoform files:
