@@ -220,9 +220,14 @@ def test_remote_detached_head_detects_object_format_without_refs(
 def test_ls_remote_parser_accepts_git_valid_non_ascii_whitespace() -> None:
     oid = "a" * 40
 
-    assert claims._parse_ls_remote_output(f"{oid}\trefs/heads/valid\N{NO-BREAK SPACE}name\n") == [
-        (oid, "refs/heads/valid\N{NO-BREAK SPACE}name")
-    ]
+    for separator in (
+        "\N{NO-BREAK SPACE}",
+        "\N{NEXT LINE}",
+        "\N{LINE SEPARATOR}",
+        "\N{PARAGRAPH SEPARATOR}",
+    ):
+        ref = f"refs/heads/valid{separator}name"
+        assert claims._parse_ls_remote_output(f"{oid}\t{ref}\n") == [(oid, ref)]
 
 
 def test_ls_remote_parser_accepts_non_utf8_ref_bytes_via_surrogateescape() -> None:

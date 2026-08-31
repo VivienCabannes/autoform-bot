@@ -358,7 +358,10 @@ def _parse_ls_remote_output(
     if not output:
         return []
     entries: list[tuple[str, str]] = []
-    for line in output.splitlines():
+    lines = output.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    for line in lines:
         oid, separator, ref = line.partition("\t")
         if (
             not separator
