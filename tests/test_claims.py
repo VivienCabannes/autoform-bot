@@ -119,6 +119,31 @@ def test_cas_acquire_race_has_exactly_one_winner(tmp_path: Path, board_repo: Pat
     assert boards[0].read("race")["owner"] in {"worker-a", "worker-b"}
 
 
+@pytest.mark.parametrize(
+    ("new", "remote_output"),
+    [
+        ("b" * 40, f"{'b' * 40}\t{claims.CLAIM_REF_PREFIX}race\n"),
+        ("", ""),
+    ],
+)
+def test_ambiguous_cas_failure_accepts_the_desired_remote_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    new: str,
+    remote_output: str,
+) -> None:
+    board = claims.ClaimBoard(tmp_path / "claims.git", "worker", tmp_path / "scratch")
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="remote failure"),
+            subprocess.CompletedProcess([], 0, stdout=remote_output, stderr=""),
+        ]
+    )
+    monkeypatch.setattr(board, "_git", lambda *args, **kwargs: next(responses))
+
+    assert board._cas_push("race", "a" * 40, new)
+
+
 def test_expired_lease_can_be_taken_over(tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_000.0
     monkeypatch.setattr(claims.time, "time", lambda: now)

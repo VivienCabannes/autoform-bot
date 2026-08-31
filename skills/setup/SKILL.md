@@ -12,14 +12,17 @@ description: >-
 
 # Set up an Autoform repository
 
-Setup prepares the Lean toolchain, an empty blueprint vault, ignore rules,
-MkDocs, CI, and optionally publication. It does not scope sources, choose
+Setup prepares the Lean toolchain, one or more empty blueprint vaults, ignore
+rules, MkDocs, CI, and optionally publication. It does not scope sources, choose
 theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
 Inspect existing Lean, Lake, Markdown, workflow, and ignore files before
 writing, and preserve them. Start with the offline, read-only
-`autoform project inspect <TARGET>` command; when a blueprint exists, also use
-`autoform doctor` for its runtime contract. Infer safe
+`autoform project inspect <TARGET>` command. If `.autoform.toml` exists, also
+run `autoform workspace inspect <TARGET>` and treat its project registry as
+authoritative; never infer managed vaults by scanning sibling directories.
+When a blueprint exists, also use `autoform doctor` for its runtime contract,
+passing `--project` when a workspace root contains several projects. Infer safe
 local defaults from the request and repository. If a
 material choice is missing, ask once for the run type (new, repair, or inspect),
 UpperCamelCase package name, target directory, and whether publication is
@@ -67,15 +70,40 @@ preserves the current directory inode and mode and fails closed when an
 interrupted transaction cannot prove ownership. Do not invent version pairs or
 copy the populated example as a project generator.
 
+For an existing repository, prefer a manifest-managed workspace when the
+repository contains several formalization efforts, already uses `blueprint` or
+`Blueprint` for unrelated material, or needs repository-defined placement.
+Create `.autoform.toml` with `autoform workspace init`, supplying an explicit
+repository-relative blueprint collection. Then use `autoform blueprint new`
+for each approved project. The command creates one child vault and appends one
+entry to the root registry; it does not write `autoform.toml` inside the vault.
+Use `autoform blueprint register` to adopt an existing vault without changing
+any file inside it.
+Location names and paths belong to the consumer repository. Autoform understands
+the generic `blueprints` capability and must not special-case package or
+directory names from its examples.
+Workspace mutation requires the CLI's file-locking and no-follow safety support.
+If the command reports that the platform is unsupported, stop and report the
+blocker rather than hand-writing around the safety gate.
+
+Inspect a workspace before and after creation. `autoform workspace check`
+validates exactly the registered projects and ignores unregistered siblings.
+Single-vault commands accept the workspace root plus `--project`, infer the
+sole project at the workspace root, or infer the containing project when
+invoked from inside its registered vault. They never infer a project from an
+unrelated directory. Keep `autoform init` only
+for backwards-compatible repositories that intentionally want one lowercase
+`blueprint/` at the repository root.
+
 If inspection reports a structurally valid stable patch pair as `unlisted`, do
 not silently upgrade the consumer or patch its installed Autoform cache. Report
 that repair is blocked. When the user elects to extend Autoform, validate the
 exact pair and add it through a reviewed plugin change; an older stable patch
 may be supported without replacing the catalog's recommended release.
 
-For an incomplete existing repository, inspect first, preview the conservative
-repair, then apply it only when the plan contains solely the intended missing
-Autoform files:
+For an incomplete legacy single-vault repository, inspect first, preview the
+conservative repair, then apply it only when the plan contains solely the
+intended missing Autoform files:
 
 ```bash
 autoform project inspect <TARGET>
@@ -94,7 +122,13 @@ inputs after an interrupted multi-file repair, and inspect any reported stale
 temporary or retained published file before removing it. Never substitute
 `init --force` for repair.
 
-`autoform init` is the whole vault: `blueprint/` with its landing page,
+`project repair` deliberately refuses a manifest-managed workspace: its legacy
+overlay would otherwise create an unrelated lowercase `blueprint/`. Repair
+workspace registration with the workspace commands and inspect shared CI or
+publication files separately until a workspace-aware publication repair
+contract exists.
+
+Legacy `autoform init` is the whole vault: `blueprint/` with its landing page,
 `roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
 override, ignore rules, and both workflows when an immutable Autoform pin is
 available. Do not hand-build any of it and do not copy the bundled example: the
@@ -117,8 +151,8 @@ theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the
 DAG and its `lean:` declarations, renders the blueprint, builds MkDocs, and
 deploys GitHub Pages. Pass the verified source and commit pair to pin them.
 
-After it runs, fill in what only a human or a source can supply: the project
-description in `blueprint/README.md`, the coverage contract, and a verified
+After creating a vault, fill in what only a human or a source can supply: the
+project description in its `README.md`, its coverage contract, and a verified
 `repo_url`. That URL is the *formalization project's own* repository, never
 AutoformBot's: Material renders it as the repository link in the site header,
 and pointing it at the plugin sends every reader to the wrong project. Pass
@@ -139,16 +173,16 @@ lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
 ```
 
-Then validate, visualize, render, and strict-build the site, keeping
+Then validate, visualize, render, and strict-build the selected vault, keeping
 `--require-declarations` so a named Lean declaration that does not exist fails
 here rather than in CI. The exact invocations, including how to resolve
 `<AUTOFORM_PLUGIN_ROOT>`, are in the [CLI reference](../../autoform_cli/README.md#commands);
 do not restate them here.
 
 `render` writes a derived tree; the vault stays the source of truth. Ignore
-`site-src/`, `site/`, and `blueprint/dependencies.md`.
+`site-src/`, `site/`, and the selected vault's generated `dependencies.md`.
 
-Publication is opt-in because files under `blueprint/` become public site
+Publication is opt-in because files under the selected vault become public site
 content, together with derived progress, graph pages, and a path-free
 publication manifest. Show that boundary, confirm the exact repository and
 visibility, default to private, and warn that private Pages may require a paid
@@ -164,7 +198,8 @@ the user asks to discover community context or announce and coordinate the
 project, read and follow [the shared Zulip workflow](references/zulip.md). Do not infer consent
 to post from repository setup, roadmap work, or permission to search.
 
-Report the Lean toolchain, vault path, CI and Pages files, validation results,
+Report the Lean toolchain, workspace manifest when present, exact vault path,
+CI and Pages files, validation results,
 the publication decision, and any one-time GitHub setting the user must still
 apply. State explicitly that no sources were scoped, roadmap nodes created, or
 proofs started, then hand the repository to Roadmap.

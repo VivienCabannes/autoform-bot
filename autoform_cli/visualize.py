@@ -10,6 +10,7 @@ from typing import Sequence
 
 from . import mermaid, status
 from .graph import GraphValidationError, load_graph
+from .runtime import RuntimeProjectionError, resolve_runtime_paths
 
 
 GENERATED_STRUCTURE_MARKER = "---\nkind: structure\nautoform_generated: true\n---"
@@ -158,7 +159,12 @@ def export_structure(blueprint_dir: Path, output: Path | None = None) -> Path:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("blueprint_dir", type=Path, help="directory containing roadmap Markdown nodes")
+    parser.add_argument(
+        "blueprint_dir",
+        type=Path,
+        help="workspace, legacy project, or directory containing roadmap Markdown nodes",
+    )
+    parser.add_argument("--project", help="registered workspace project id")
     parser.add_argument(
         "-o",
         "--output",
@@ -179,26 +185,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        blueprint_dir = resolve_runtime_paths(
+            args.blueprint_dir, project_id=args.project
+        ).blueprint_dir
         structure = None
         graph_output = _destination(
-            args.output or Path(args.blueprint_dir).resolve() / "dependencies.md"
+            args.output or blueprint_dir / "dependencies.md"
         )
         if args.structure:
-            structure = _destination(Path(args.blueprint_dir).resolve() / "structure.md")
+            structure = _destination(blueprint_dir / "structure.md")
             if graph_output == structure:
                 raise VisualizationError(
                     f"graph and structure outputs must be different paths: {structure}"
                 )
             _preflight_structure(structure)
         output = export_graph(
-            args.blueprint_dir,
+            blueprint_dir,
             args.output,
             link_extension=args.link_extension,
             title=args.title,
         )
         if structure is not None:
-            structure = export_structure(args.blueprint_dir, structure)
-    except (GraphValidationError, VisualizationError) as error:
+            structure = export_structure(blueprint_dir, structure)
+    except (GraphValidationError, RuntimeProjectionError, VisualizationError) as error:
         parser.exit(2, f"error: {error}\n")
     print(output)
     return 0

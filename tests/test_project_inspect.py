@@ -170,6 +170,79 @@ def test_inspects_bundled_example_without_host_paths(repo_root: Path) -> None:
     assert str(repo_root) not in result.to_json()
 
 
+def test_inspects_manifest_managed_blueprints_without_scanning_siblings(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "Blueprint/SyntheticHomotopy/roadmap").mkdir(parents=True)
+    (root / "Blueprint/HartshorneCh2Sec5").mkdir()
+    (root / ".autoform.toml").write_text(
+        'schema = "autoform-workspace/v1"\n'
+        "[locations.plans]\n"
+        'path = "Blueprint"\n'
+        'provides = ["blueprints"]\n'
+        "[projects.synthetic-homotopy]\n"
+        'blueprint = { location = "plans", path = "SyntheticHomotopy" }\n',
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root / "Blueprint/SyntheticHomotopy")
+
+    assert result.ok
+    assert result.autoform.detected
+    assert result.autoform.manifest_path == ".autoform.toml"
+    assert result.autoform.manifest_sha256 is not None
+    assert result.autoform.blueprint_path is None
+    assert result.autoform.blueprint_paths == ("Blueprint/SyntheticHomotopy",)
+    assert "Blueprint/HartshorneCh2Sec5" not in result.to_json()
+    assert not any(
+        diagnostic.code == "autoform-mkdocs-missing" for diagnostic in result.diagnostics
+    )
+
+
+def test_inspects_unregistered_workspace_locations_for_path_safety(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "Blueprint").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    (root / ".autoform.toml").write_text(
+        'schema = "autoform-workspace/v1"\n'
+        "[locations.plans]\n"
+        'path = "Blueprint"\n'
+        'provides = ["blueprints"]\n'
+        "[projects]\n",
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert any(
+        diagnostic.code == "autoform-location-is-symlink"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_inspects_workspace_location_at_repository_root(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "Example/roadmap").mkdir(parents=True)
+    (root / ".autoform.toml").write_text(
+        'schema = "autoform-workspace/v1"\n'
+        "[locations.root]\n"
+        'path = "."\n'
+        'provides = ["blueprints"]\n'
+        "[projects.example]\n"
+        'blueprint = { location = "root", path = "Example" }\n',
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.autoform.blueprint_paths == ("Example",)
+
+
 def test_discovers_nearest_project_from_nested_file(tmp_path: Path) -> None:
     outer = _project(tmp_path)
     inner = outer / "nested"

@@ -432,6 +432,14 @@ def _inspection_conflicts(inspection) -> list[ProjectRepairConflict]:
         for diagnostic in inspection.diagnostics
         if diagnostic.severity == "error"
     ]
+    if inspection.autoform.manifest_path is not None:
+        conflicts.append(
+            ProjectRepairConflict(
+                "project-repair-workspace-unsupported",
+                "Use workspace and blueprint commands for a manifest-managed repository; legacy project repair would create an unrelated blueprint/ vault.",
+                inspection.autoform.manifest_path,
+            )
+        )
     if inspection.lake is None or inspection.lake.name is None:
         conflicts.append(
             ProjectRepairConflict(

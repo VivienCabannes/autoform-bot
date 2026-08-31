@@ -250,7 +250,7 @@ def create_in_current_directory(
                     target_identity,
                     target_mode,
                 )
-                names = set(os.listdir(target_descriptor))
+                names = set(_list_directory(target_descriptor))
                 if not names:
                     transaction = _start_transaction(
                         target_descriptor,
@@ -297,7 +297,7 @@ def create_in_current_directory(
                             target_identity,
                             target_mode,
                         )
-                        if os.listdir(target_descriptor):
+                        if _list_directory(target_descriptor):
                             raise _recovery_required()
                         transaction = _start_transaction(
                             target_descriptor,
@@ -413,6 +413,16 @@ def _open_directory(parent_descriptor: int, name: str) -> int:
     return os.open(name, _directory_flags(), dir_fd=parent_descriptor)
 
 
+def _list_directory(directory_descriptor: int) -> list[str]:
+    """List through a fresh descriptor so a prior scan cannot leave it at EOF."""
+
+    fresh = _open_directory(directory_descriptor, ".")
+    try:
+        return os.listdir(fresh)
+    finally:
+        os.close(fresh)
+
+
 def _open_current_target() -> tuple[int, str, int, tuple[int, int], int]:
     try:
         target_descriptor = os.open(".", _directory_flags())
@@ -500,7 +510,7 @@ def _preflight(target_descriptor: int) -> None:
         flags = os.fstatvfs(target_descriptor).f_flag
         if flags & getattr(os, "ST_RDONLY", 1):
             raise OSError(errno.EROFS, "read-only filesystem")
-        os.listdir(target_descriptor)
+        _list_directory(target_descriptor)
         os.fsync(target_descriptor)
     except OSError:
         raise InPlaceCreateError("project-create-safety-unavailable", _SAFETY_MESSAGE) from None
@@ -606,7 +616,7 @@ def _snapshot_tree(directory_descriptor: int) -> tuple[_Node, ...]:
 def _snapshot_children(
     directory_descriptor: int, prefix: str, nodes: list[_Node]
 ) -> None:
-    before_names = sorted(os.listdir(directory_descriptor))
+    before_names = sorted(_list_directory(directory_descriptor))
     for name in before_names:
         if not name or name in {".", ".."} or "/" in name or "\0" in name:
             raise OSError(errno.EINVAL, "unsafe directory entry")
@@ -636,7 +646,7 @@ def _snapshot_children(
                 "project-create-validation-failed",
                 "The staged project contains an unsupported filesystem entry.",
             )
-    if sorted(os.listdir(directory_descriptor)) != before_names:
+    if sorted(_list_directory(directory_descriptor)) != before_names:
         raise OSError(errno.ESTALE, "directory changed during snapshot")
 
 
@@ -748,7 +758,7 @@ def _copy_children(
     prefix: str,
     expected: Mapping[str, _Node],
 ) -> None:
-    names = sorted(os.listdir(source_descriptor))
+    names = sorted(_list_directory(source_descriptor))
     for name in names:
         path = f"{prefix}/{name}" if prefix else name
         node = expected.get(path)
@@ -782,7 +792,7 @@ def _copy_children(
             )
         else:  # pragma: no cover - manifest validation rejects this
             raise OSError(errno.EINVAL, "unsupported staged entry")
-    if sorted(os.listdir(source_descriptor)) != names:
+    if sorted(_list_directory(source_descriptor)) != names:
         raise OSError(errno.ESTALE, "source tree changed during copy")
     os.fsync(destination_descriptor)
 
@@ -948,7 +958,7 @@ def _node_is_owned_remainder(
             or stat.S_IMODE(opened.st_mode) != node.mode
         ):
             return False
-        actual_names = set(os.listdir(child))
+        actual_names = set(_list_directory(child))
         expected_names = {
             candidate.path.rsplit("/", 1)[-1]
             for candidate in expected.values()
@@ -1152,7 +1162,7 @@ def _start_transaction(
     stage_descriptor: int | None = None
     controls: list[_Control] = []
     try:
-        if os.listdir(target_descriptor):
+        if _list_directory(target_descriptor):
             raise InPlaceCreateError(
                 "project-target-not-empty",
                 "The current directory must be completely empty before project creation.",
@@ -1190,7 +1200,7 @@ def _start_transaction(
             _DIRECTORY_MODE,
         )
         os.fsync(marker_descriptor)
-        if set(os.listdir(target_descriptor)) != {MARKER}:
+        if set(_list_directory(target_descriptor)) != {MARKER}:
             raise _recovery_required()
         _copy_tree(source_descriptor, stage_descriptor, source_manifest)
         if _snapshot_tree(source_descriptor) != tuple(source_manifest):
@@ -1310,7 +1320,7 @@ def _load_transaction(
             marker_identity,
             _DIRECTORY_MODE,
         )
-        marker_names = set(os.listdir(marker_descriptor))
+        marker_names = set(_list_directory(marker_descriptor))
         if not marker_names:
             raise _recovery_required()
         if MANIFEST not in marker_names:
@@ -1418,7 +1428,7 @@ def _load_transaction(
                 raise _recovery_required()
             if complete:
                 return transaction, False
-            if set(os.listdir(target_descriptor)) == {MARKER}:
+            if set(_list_directory(target_descriptor)) == {MARKER}:
                 return transaction, True
             raise _recovery_required()
 
@@ -1919,7 +1929,7 @@ def _require_transaction_controls(
         expected_marker_names.add(METADATA)
     if transaction.journal_control is not None:
         expected_marker_names.add(JOURNAL)
-    if set(os.listdir(transaction.marker_descriptor)) != expected_marker_names:
+    if set(_list_directory(transaction.marker_descriptor)) != expected_marker_names:
         raise _recovery_required()
     if transaction.stage_descriptor is not None:
         _require_directory_entry(
@@ -1997,11 +2007,11 @@ def _require_transaction_namespace(
             if index < len(state.published) or not source_matches or target_exists:
                 raise _recovery_required()
             source_roots.add(root)
-    if set(os.listdir(target_descriptor)) != {MARKER, *target_roots}:
+    if set(_list_directory(target_descriptor)) != {MARKER, *target_roots}:
         raise _recovery_required()
-    if set(os.listdir(transaction.stage_descriptor)) != source_roots:
+    if set(_list_directory(transaction.stage_descriptor)) != source_roots:
         raise _recovery_required()
-    if set(os.listdir(transaction.marker_descriptor)) != {
+    if set(_list_directory(transaction.marker_descriptor)) != {
         STAGE,
         METADATA,
         MANIFEST,
@@ -2096,7 +2106,7 @@ def _publish(
 
 def _all_published(target_descriptor: int, transaction: _Transaction) -> bool:
     roots = _root_names(transaction.manifest)
-    if set(os.listdir(target_descriptor)) != {MARKER, *roots}:
+    if set(_list_directory(target_descriptor)) != {MARKER, *roots}:
         return False
     return all(
         _entry_matches(target_descriptor, root, transaction.manifest)
@@ -2163,7 +2173,7 @@ def _cleanup_marker(
         target_identity,
         target_mode,
     )
-    if set(os.listdir(target_descriptor)) != {MARKER, *expected_roots}:
+    if set(_list_directory(target_descriptor)) != {MARKER, *expected_roots}:
         raise _recovery_required()
     _require_directory_entry(
         target_descriptor,
@@ -2179,7 +2189,7 @@ def _cleanup_marker(
         expected_marker_names.add(METADATA)
     if transaction.journal_control is not None:
         expected_marker_names.add(JOURNAL)
-    if set(os.listdir(transaction.marker_descriptor)) != expected_marker_names:
+    if set(_list_directory(transaction.marker_descriptor)) != expected_marker_names:
         raise _recovery_required()
     if transaction.stage_descriptor is not None:
         _require_directory_entry(
@@ -2189,7 +2199,7 @@ def _cleanup_marker(
             transaction.stage_identity,
             _DIRECTORY_MODE,
         )
-        if os.listdir(transaction.stage_descriptor):
+        if _list_directory(transaction.stage_descriptor):
             raise _recovery_required()
         os.rmdir(STAGE, dir_fd=transaction.marker_descriptor)
         os.fsync(transaction.marker_descriptor)
@@ -2234,7 +2244,7 @@ def _cleanup_marker(
     os.close(transaction.manifest_control.descriptor)
     transaction.manifest_control = _Control(MANIFEST, -1, -1, -1)
     _checkpoint("manifest-removed")
-    if os.listdir(transaction.marker_descriptor):
+    if _list_directory(transaction.marker_descriptor):
         raise _recovery_required()
     _require_directory_entry(
         target_descriptor,
@@ -2253,7 +2263,7 @@ def _cleanup_marker(
         target_identity,
         target_mode,
     )
-    if set(os.listdir(target_descriptor)) != expected_roots:
+    if set(_list_directory(target_descriptor)) != expected_roots:
         raise _recovery_required()
     if expected_roots and not all(
         _entry_matches(target_descriptor, root, transaction.manifest)
@@ -2343,11 +2353,11 @@ def _rollback(
                 locations[root] = "missing"
             else:
                 return False
-        if set(os.listdir(target_descriptor)) != {MARKER, *target_roots}:
+        if set(_list_directory(target_descriptor)) != {MARKER, *target_roots}:
             return False
-        if set(os.listdir(transaction.stage_descriptor)) != source_roots:
+        if set(_list_directory(transaction.stage_descriptor)) != source_roots:
             return False
-        if set(os.listdir(transaction.marker_descriptor)) != {
+        if set(_list_directory(transaction.marker_descriptor)) != {
             STAGE,
             METADATA,
             MANIFEST,
@@ -2399,9 +2409,9 @@ def _rollback(
                 return False
             source_roots.add(root)
             target_roots.discard(root)
-        if set(os.listdir(target_descriptor)) != {MARKER}:
+        if set(_list_directory(target_descriptor)) != {MARKER}:
             return False
-        if set(os.listdir(transaction.stage_descriptor)) != source_roots:
+        if set(_list_directory(transaction.stage_descriptor)) != source_roots:
             return False
         for root in _root_names(transaction.manifest):
             if not _exists(transaction.stage_descriptor, root):
@@ -2415,7 +2425,7 @@ def _rollback(
             )
             os.fsync(transaction.stage_descriptor)
             _checkpoint(f"rollback-removed:{root}")
-        if os.listdir(transaction.stage_descriptor):
+        if _list_directory(transaction.stage_descriptor):
             return False
         _cleanup_marker(
             parent_descriptor,
@@ -2472,7 +2482,7 @@ def _remove_manifest_node(
             if candidate.path.startswith(f"{path}/")
             and "/" not in candidate.path[len(path) + 1 :]
         }
-        actual_children = sorted(os.listdir(child))
+        actual_children = sorted(_list_directory(child))
         if not set(actual_children).issubset(expected_children):
             raise OSError(errno.ESTALE, "owned directory changed during rollback")
         for child_name in actual_children:
