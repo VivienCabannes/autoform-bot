@@ -350,7 +350,11 @@ def _claim_git_environment() -> dict[str, str]:
     return environment
 
 
-def _parse_ls_remote_output(output: str) -> list[tuple[str, str]]:
+def _parse_ls_remote_output(
+    output: str,
+    *,
+    allow_head: bool = False,
+) -> list[tuple[str, str]]:
     if not output:
         return []
     entries: list[tuple[str, str]] = []
@@ -359,8 +363,11 @@ def _parse_ls_remote_output(output: str) -> list[tuple[str, str]]:
         if (
             not separator
             or not OBJECT_ID_RE.fullmatch(oid)
-            or not ref.startswith("refs/")
-            or any(character.isspace() for character in ref)
+            or (not ref.startswith("refs/") and not (allow_head and ref == "HEAD"))
+            or any(
+                character == " " or ord(character) < 32 or ord(character) == 127
+                for character in ref
+            )
         ):
             raise ClaimTransportError("claim board returned malformed ls-remote output")
         entries.append((oid, ref))
@@ -643,24 +650,34 @@ class ClaimBoard:
                 )
             detected = proc.stdout.strip()
         else:
-            try:
-                proc = subprocess.run(
-                    ["git", "ls-remote", "--refs", self.repo_url],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    env=_claim_git_environment(),
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise ClaimTransportError(
-                    f"cannot inspect claim repository object format: {exc}"
-                ) from exc
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout).strip()[:300]
-                raise ClaimTransportError(
-                    f"cannot inspect claim repository object format: {detail}"
-                )
-            widths = {len(oid) for oid, _ref in _parse_ls_remote_output(proc.stdout)}
+            entries: list[tuple[str, str]] = []
+            commands = (
+                (["git", "ls-remote", "--refs", self.repo_url], False),
+                (["git", "ls-remote", self.repo_url, "HEAD"], True),
+            )
+            for command, allow_head in commands:
+                try:
+                    proc = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        errors="surrogateescape",
+                        timeout=120,
+                        env=_claim_git_environment(),
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise ClaimTransportError(
+                        f"cannot inspect claim repository object format: {exc}"
+                    ) from exc
+                if proc.returncode != 0:
+                    detail = (proc.stderr or proc.stdout).strip()[:300]
+                    raise ClaimTransportError(
+                        f"cannot inspect claim repository object format: {detail}"
+                    )
+                entries = _parse_ls_remote_output(proc.stdout, allow_head=allow_head)
+                if entries:
+                    break
+            widths = {len(oid) for oid, _ref in entries}
             if not widths:
                 return self._expected_object_format
             if len(widths) != 1:

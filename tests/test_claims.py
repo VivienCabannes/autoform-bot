@@ -193,6 +193,45 @@ def test_remote_claim_only_ref_detects_object_format_without_head(
     assert board._repository_object_format() == "sha256"
 
 
+def test_remote_detached_head_detects_object_format_without_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        stdout = "" if "--refs" in command else f"{'a' * 64}\tHEAD\n"
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    board = claims.ClaimBoard(
+        "https://example.invalid/claims.git",
+        "worker-a",
+        tmp_path / "scratch",
+    )
+
+    assert board._repository_object_format() == "sha256"
+    assert commands == [
+        ["git", "ls-remote", "--refs", "https://example.invalid/claims.git"],
+        ["git", "ls-remote", "https://example.invalid/claims.git", "HEAD"],
+    ]
+
+
+def test_ls_remote_parser_accepts_git_valid_non_ascii_whitespace() -> None:
+    oid = "a" * 40
+
+    assert claims._parse_ls_remote_output(f"{oid}\trefs/heads/valid\N{NO-BREAK SPACE}name\n") == [
+        (oid, "refs/heads/valid\N{NO-BREAK SPACE}name")
+    ]
+
+
+def test_ls_remote_parser_accepts_non_utf8_ref_bytes_via_surrogateescape() -> None:
+    oid = "a" * 40
+    ref = b"refs/heads/non-utf8-\xff".decode("utf-8", errors="surrogateescape")
+
+    assert claims._parse_ls_remote_output(f"{oid}\t{ref}\n") == [(oid, ref)]
+
+
 def test_existing_claim_scratch_must_match_repository_object_format(tmp_path: Path) -> None:
     repo = tmp_path / "claims-sha256.git"
     scratch = tmp_path / "scratch"

@@ -299,6 +299,12 @@ def _add_claim_board_arguments(parser: argparse.ArgumentParser) -> None:
         help="stable work session identity (or set AUTOFORM_CLAIM_SESSION_ID)",
     )
     parser.add_argument("--scratch", type=Path, help="local bare Git object cache")
+    parser.add_argument(
+        "--object-format",
+        choices=("sha1", "sha256"),
+        default=os.environ.get("AUTOFORM_GIT_OBJECT_FORMAT"),
+        help="Git object format for an empty network claim repository",
+    )
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -713,6 +719,7 @@ def _claim_board(
         worker_id,
         identity.scratch,
         session_id=identity.session_id,
+        expected_object_format=args.object_format,
         expected_repo_identity=identity.repo_identity,
         expected_scratch_identity=identity.scratch_identity,
     )

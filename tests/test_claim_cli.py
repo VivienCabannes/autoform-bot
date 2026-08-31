@@ -144,6 +144,20 @@ def test_claim_cli_transport_failure_is_nonzero(tmp_path: Path, capsys) -> None:
     assert "error:" in capsys.readouterr().out
 
 
+def test_claim_cli_passes_explicit_object_format(tmp_path: Path, capsys) -> None:
+    repo = tmp_path / "claims-sha256.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--quiet", "--object-format=sha256", str(repo)],
+        check=True,
+    )
+    blueprint = _blueprint(tmp_path)
+    args = _args(repo, tmp_path / "scratch", blueprint, "list")
+    args.extend(["--object-format", "sha1"])
+
+    assert main(args) == 1
+    assert "does not match expected" in capsys.readouterr().out
+
+
 def test_claim_cli_refuses_malformed_remote_lease(tmp_path: Path, capsys) -> None:
     repo = _bare_repo(tmp_path)
     blueprint = _blueprint(tmp_path)
