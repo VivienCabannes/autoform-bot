@@ -29,7 +29,7 @@ from .ledger import CoordinatorLock
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
-_CANDIDATE_SCHEMA = "autoform-candidate/v1"
+_CANDIDATE_SCHEMA = "autoform-candidate/v2"
 _PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
@@ -184,6 +184,20 @@ class _CandidateSnapshot:
     git_identity: tuple[int, int, str]
     file_identities: tuple[tuple[str, tuple[int, ...]], ...]
     directory_identities: tuple[tuple[str, tuple[int, ...]], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateFileSnapshot:
+    identity: tuple[int, ...]
+    sha256: str
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateAdminBinding:
+    path: Path
+    identity: tuple[int, int]
+    index_path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,8 +436,18 @@ class AttemptWorktrees:
                 raise CandidateUncertain("attempt HEAD advanced without a durable candidate intent")
 
             base_entries = self._candidate_base_entries(worktree.base_oid)
-            self._assert_candidate_index(tree, base_entries, label="recorded base")
-            config_snapshot = self._candidate_config_snapshot(tree)
+            admin = self._candidate_admin_binding(tree)
+            config_snapshot = self._candidate_config_snapshot(admin)
+            config_sha256 = hashlib.sha256(_json_bytes(config_snapshot)).hexdigest()
+            base_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+            self._assert_candidate_index_lock_absent(admin)
+            self._assert_candidate_index(
+                tree,
+                base_entries,
+                label="recorded base",
+                index_path=admin.index_path,
+                index_snapshot=base_index,
+            )
             snapshot = self._candidate_snapshot(tree, base_entries, paths)
             tree_oid, objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
             commit_content = _candidate_commit_content(
@@ -434,6 +458,18 @@ class AttemptWorktrees:
                 message_bytes,
             )
             candidate_oid = _git_object_oid("commit", commit_content, self.object_format)
+            for object_type, expected_oid, content in (*objects, ("commit", candidate_oid, commit_content)):
+                self._write_candidate_object(object_type, expected_oid, content)
+            candidate_index = self._candidate_index_image(
+                tree,
+                candidate_oid,
+                dict(snapshot.entries),
+            )
+            self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+            self._assert_candidate_config_snapshot(admin, config_sha256)
+            if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != base_index:
+                raise CandidateUncertain("attempt Git index changed before candidate intent was recorded")
+            self._assert_candidate_index_lock_absent(admin)
             root_device, root_inode = _directory_identity(attempt_root)
             record: dict[str, object] = {
                 "schema": _CANDIDATE_SCHEMA,
@@ -441,6 +477,15 @@ class AttemptWorktrees:
                 "state": "prepared",
                 "tree_oid": tree_oid,
                 "candidate_oid": candidate_oid,
+                "git_dir": str(admin.path),
+                "git_dir_device": admin.identity[0],
+                "git_dir_inode": admin.identity[1],
+                "base_index_identity": list(base_index.identity),
+                "base_index_sha256": base_index.sha256,
+                "candidate_index_size": len(candidate_index.content),
+                "candidate_index_sha256": candidate_index.sha256,
+                "candidate_index_identity": None,
+                "config_snapshot_sha256": config_sha256,
                 "root_device": root_device,
                 "root_inode": root_inode,
                 "created_ns": time.time_ns(),
@@ -449,7 +494,7 @@ class AttemptWorktrees:
             self._write_candidate_journal(journal, record)
             _checkpoint("candidate-intent-recorded")
             self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-            self._assert_candidate_config_snapshot(tree, config_snapshot)
+            self._assert_candidate_config_snapshot(admin, config_sha256)
             return self._finish_candidate(
                 record,
                 journal,
@@ -458,7 +503,7 @@ class AttemptWorktrees:
                 snapshot=snapshot,
                 objects=objects,
                 commit_content=commit_content,
-                config_snapshot=config_snapshot,
+                candidate_index=candidate_index,
             )
 
     def inspect_candidate(self, run_id: str, attempt_id: str) -> CandidateReceipt:
@@ -493,6 +538,13 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record)
+        admin = self._assert_candidate_admin_binding(tree, record)
+        self._assert_candidate_config_snapshot(admin, str(record["config_snapshot_sha256"]))
+        candidate_entries = dict(snapshot.entries)
+        candidate_index = self._candidate_index_image(tree, str(record["candidate_oid"]), candidate_entries)
+        self._assert_recorded_candidate_index(record, candidate_index)
+        staged_index = self._candidate_staged_index(admin, candidate_index)
+        observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
 
         candidate_oid = str(record["candidate_oid"])
         head_oid = self._tree_head(tree)
@@ -500,13 +552,26 @@ class AttemptWorktrees:
             if record["state"] == "prepared" and head_oid == worktree.base_oid:
                 raise CandidateUncertain("candidate intent exists but its commit is not current")
             raise CandidateUncertain("attempt HEAD conflicts with the candidate journal")
-        candidate_entries = dict(snapshot.entries)
         if record["state"] == "ready":
-            self._assert_candidate_index(tree, candidate_entries, label="candidate")
+            if staged_index is not None:
+                raise CandidateUncertain("ready candidate has an unresolved Git index lock")
+            self._assert_candidate_index(
+                tree,
+                candidate_entries,
+                label="candidate",
+                index_path=admin.index_path,
+                index_snapshot=observed_index,
+            )
             return self._candidate_receipt(record, state="ready")
-        index_entries = self._candidate_index_entries(tree)
-        if index_entries not in (base_entries, candidate_entries):
-            raise CandidateUncertain("candidate index conflicts with its recorded base and tree")
+        index_state = self._candidate_index_state(record, observed_index)
+        expected_entries = base_entries if index_state == "base" else candidate_entries
+        self._assert_candidate_index(
+            tree,
+            expected_entries,
+            label=f"{index_state} tree",
+            index_path=admin.index_path,
+            index_snapshot=observed_index,
+        )
         return self._candidate_receipt(record, state="recoverable")
 
     def _finish_candidate(
@@ -519,7 +584,7 @@ class AttemptWorktrees:
         snapshot: _CandidateSnapshot | None = None,
         objects: tuple[tuple[str, str, bytes], ...] | None = None,
         commit_content: bytes | None = None,
-        config_snapshot: tuple[tuple[str, object], ...] | None = None,
+        candidate_index: _CandidateFileSnapshot | None = None,
     ) -> CandidateReceipt:
         base_oid = str(record["base_oid"])
         paths = tuple(str(path) for path in record["allowed_paths"])
@@ -542,38 +607,62 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate inputs do not reproduce the journaled commit")
         if objects is None:
             objects = rebuilt_objects
-        if config_snapshot is None:
-            config_snapshot = self._candidate_config_snapshot(tree)
+        self._verify_candidate_objects(objects)
+        self._verify_candidate_object(record, expected_content=commit_content)
+        admin = self._assert_candidate_admin_binding(tree, record)
+        config_sha256 = str(record["config_snapshot_sha256"])
+        self._assert_candidate_config_snapshot(admin, config_sha256)
+        candidate_entries = dict(snapshot.entries)
+        if candidate_index is None:
+            candidate_index = self._candidate_index_image(tree, candidate_oid, candidate_entries)
+        self._assert_recorded_candidate_index(record, candidate_index)
+        staged_index = self._candidate_staged_index(admin, candidate_index)
+        observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
 
         head_oid = self._tree_head(tree)
-        candidate_entries = dict(snapshot.entries)
         if record["state"] == "ready":
             if head_oid != candidate_oid:
                 raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
-            self._verify_candidate_objects(objects)
-            self._verify_candidate_object(record, expected_content=commit_content)
-            self._assert_candidate_index(tree, candidate_entries, label="candidate")
+            if staged_index is not None:
+                raise CandidateUncertain("ready candidate has an unresolved Git index lock")
+            self._assert_candidate_index(
+                tree,
+                candidate_entries,
+                label="candidate",
+                index_path=admin.index_path,
+                index_snapshot=observed_index,
+            )
             self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-            self._assert_candidate_config_snapshot(tree, config_snapshot)
+            self._assert_candidate_config_snapshot(admin, config_sha256)
             return self._candidate_receipt(record, state="ready")
         if record["state"] != "prepared":  # pragma: no cover - validated before dispatch
             raise CandidateUncertain("candidate journal has an unknown state")
         if head_oid not in {base_oid, candidate_oid}:
             raise CandidateUncertain("attempt HEAD conflicts with the prepared candidate")
-        index_entries = self._candidate_index_entries(tree)
-        if head_oid == base_oid and index_entries != base_entries:
-            raise CandidateUncertain("candidate index does not match the recorded base")
-        if head_oid == candidate_oid and index_entries not in (base_entries, candidate_entries):
-            raise CandidateUncertain("candidate index conflicts with its recorded base and tree")
+        index_state = self._candidate_index_state(record, observed_index)
+        expected_entries = base_entries if index_state == "base" else candidate_entries
+        self._assert_candidate_index(
+            tree,
+            expected_entries,
+            label=f"{index_state} tree",
+            index_path=admin.index_path,
+            index_snapshot=observed_index,
+        )
+        if head_oid == base_oid and index_state != "base":
+            raise CandidateUncertain("candidate Git index advanced before its HEAD")
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
 
         for object_type, expected_oid, content in (*objects, ("commit", candidate_oid, commit_content)):
             self._write_candidate_object(object_type, expected_oid, content)
         _checkpoint("candidate-objects-written")
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
         self._verify_candidate_object(record, expected_content=commit_content)
+        if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != observed_index:
+            raise CandidateUncertain("attempt Git index changed before candidate HEAD update")
+        if self._candidate_staged_index(admin, candidate_index) != staged_index:
+            raise CandidateUncertain("attempt Git index lock changed before candidate HEAD update")
 
         if head_oid == base_oid:
             updated = self._run_tree_git(
@@ -589,29 +678,50 @@ class AttemptWorktrees:
         if self._tree_head(tree) != candidate_oid:
             raise CandidateUncertain("candidate HEAD update could not be verified")
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
 
-        index_entries = self._candidate_index_entries(tree)
-        if index_entries == base_entries:
-            self._run_tree_git(tree, ["read-tree", candidate_oid])
-        elif index_entries != candidate_entries:
-            raise CandidateUncertain("candidate index changed during commit recovery")
+        observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        index_state = self._candidate_index_state(record, observed_index)
+        if index_state == "base":
+            observed_index = self._replace_candidate_index(admin, observed_index, candidate_index)
         _checkpoint("candidate-index-updated")
-        self._assert_candidate_index(tree, candidate_entries, label="candidate")
+        if self._candidate_index_state(record, observed_index) != "candidate":  # pragma: no cover - invariant
+            raise CandidateUncertain("candidate Git index update could not be verified")
+        self._assert_candidate_index(
+            tree,
+            candidate_entries,
+            label="candidate",
+            index_path=admin.index_path,
+            index_snapshot=observed_index,
+        )
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
 
         ready = dict(record)
-        ready.update({"state": "ready", "ready_ns": time.time_ns()})
+        ready.update(
+            {
+                "state": "ready",
+                "candidate_index_identity": list(observed_index.identity),
+                "ready_ns": time.time_ns(),
+            }
+        )
         self._write_candidate_journal(journal, ready)
         _checkpoint("candidate-result-recorded")
         if self._tree_head(tree) != candidate_oid:
             raise CandidateUncertain("candidate HEAD changed after its result was recorded")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(ready, expected_content=commit_content)
-        self._assert_candidate_index(tree, candidate_entries, label="candidate")
+        final_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        self._assert_candidate_index_lock_absent(admin)
+        self._assert_candidate_index(
+            tree,
+            candidate_entries,
+            label="candidate",
+            index_path=admin.index_path,
+            index_snapshot=final_index,
+        )
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
-        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
         return self._candidate_receipt(ready, state="ready")
 
     def _candidate_base_entries(self, base_oid: str) -> dict[str, tuple[str, str]]:
@@ -658,6 +768,21 @@ class AttemptWorktrees:
         extra = sorted(current_paths - frozenset(base_entries) - allowed)
         if extra:  # pragma: no cover - included in changed_outside, retained for a precise invariant
             raise CandidateUncertain(f"candidate contains foreign output: {extra[0]}")
+        added_allowed = sorted((current_paths - frozenset(base_entries)) & allowed)
+        if added_allowed:
+            payload = b"".join(b"./" + path.encode("utf-8") + b"\0" for path in added_allowed)
+            ignored = self._run_tree_git_bytes(
+                tree,
+                ["check-ignore", "--no-index", "--stdin", "-z"],
+                check=False,
+                input_bytes=payload,
+            )
+            if ignored.returncode not in {0, 1}:
+                detail = ignored.stderr.decode("utf-8", errors="replace").strip()[:500]
+                raise CandidateUncertain(f"candidate ignore classification failed: {detail}")
+            if ignored.stdout:
+                first = ignored.stdout.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                raise CandidateUncertain(f"candidate allowed path is ignored: {first}")
         entries = dict(base_entries)
         for path in allowed:
             value = files.get(path)
@@ -694,9 +819,80 @@ class AttemptWorktrees:
         if observed != expected:
             raise CandidateUncertain("candidate path was replaced or changed during commit creation")
 
-    def _candidate_index_entries(self, tree: Path) -> dict[str, tuple[str, str]]:
-        self._assert_canonical_index_flags(tree)
-        proc = self._run_tree_git(tree, ["ls-files", "--stage", "-z", "--cached"])
+    def _candidate_admin_binding(self, tree: Path) -> _CandidateAdminBinding:
+        self._verify_tree_binding(tree, require_head=True)
+        dot_git = tree / ".git"
+        try:
+            info = dot_git.stat(follow_symlinks=False)
+        except OSError as error:
+            raise CandidateUncertain("attempt worktree .git entry cannot be inspected safely") from error
+        content, _ = _read_candidate_regular_file(dot_git, info, ".git")
+        try:
+            line = content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise CandidateUncertain("attempt worktree .git entry is not UTF-8") from error
+        if "\0" in line or len(line.splitlines()) != 1 or not line.startswith("gitdir: "):
+            raise CandidateUncertain("attempt worktree .git entry is malformed")
+        value = line.removeprefix("gitdir: ").strip()
+        if not value:
+            raise CandidateUncertain("attempt worktree .git entry has no Git directory")
+        raw = Path(value)
+        if not raw.is_absolute():
+            raw = tree / raw
+        try:
+            git_dir = _existing_real_directory(raw, label="attempt Git directory")
+            worktrees = _existing_real_directory(
+                self.common_git_dir / "worktrees",
+                label="linked-worktree Git directory",
+            )
+        except RepositoryError as error:
+            raise CandidateUncertain(str(error)) from error
+        if git_dir.parent != worktrees:
+            raise CandidateUncertain("attempt Git directory is outside the repository worktree administration area")
+        return _CandidateAdminBinding(
+            path=git_dir,
+            identity=_directory_identity(git_dir),
+            index_path=git_dir / "index",
+        )
+
+    def _assert_candidate_admin_binding(
+        self,
+        tree: Path,
+        record: Mapping[str, object],
+    ) -> _CandidateAdminBinding:
+        observed = self._candidate_admin_binding(tree)
+        expected = (
+            record.get("git_dir"),
+            record.get("git_dir_device"),
+            record.get("git_dir_inode"),
+        )
+        if (str(observed.path), *observed.identity) != expected:
+            raise CandidateUncertain("attempt Git directory changed after candidate preparation")
+        return observed
+
+    def _candidate_index_entries(
+        self,
+        tree: Path,
+        *,
+        index_path: Path,
+        index_snapshot: _CandidateFileSnapshot,
+    ) -> dict[str, tuple[str, str]]:
+        if _candidate_private_file_snapshot(index_path, label="attempt Git index") != index_snapshot:
+            raise CandidateUncertain("attempt Git index changed before inspection")
+        flags = self._run_tree_git_with_index(tree, index_path, ["ls-files", "-v", "-z", "--cached"])
+        flagged_paths: set[str] = set()
+        for entry in flags.stdout.split("\0"):
+            if not entry:
+                continue
+            tag, separator, path = entry.partition(" ")
+            if not separator or not _safe_candidate_path(path) or tag != "H" or path in flagged_paths:
+                raise CandidateUncertain("candidate index has noncanonical flags or entries")
+            flagged_paths.add(path)
+        proc = self._run_tree_git_with_index(
+            tree,
+            index_path,
+            ["ls-files", "--stage", "-z", "--cached"],
+        )
         entries: dict[str, tuple[str, str]] = {}
         for entry in proc.stdout.split("\0"):
             if not entry:
@@ -712,6 +908,10 @@ class AttemptWorktrees:
             if path in entries:
                 raise CandidateUncertain("candidate index contains duplicate paths")
             entries[path] = (mode, oid)
+        if flagged_paths != set(entries):
+            raise CandidateUncertain("candidate index flag and stage inventories differ")
+        if _candidate_private_file_snapshot(index_path, label="attempt Git index") != index_snapshot:
+            raise CandidateUncertain("attempt Git index changed during inspection")
         return entries
 
     def _assert_candidate_index(
@@ -720,22 +920,189 @@ class AttemptWorktrees:
         expected: Mapping[str, tuple[str, str]],
         *,
         label: str,
+        index_path: Path,
+        index_snapshot: _CandidateFileSnapshot,
     ) -> None:
-        if self._candidate_index_entries(tree) != dict(expected):
+        if self._candidate_index_entries(
+            tree,
+            index_path=index_path,
+            index_snapshot=index_snapshot,
+        ) != dict(expected):
             raise CandidateUncertain(f"candidate index does not match the {label}")
 
-    def _candidate_config_snapshot(self, tree: Path) -> tuple[tuple[str, object], ...]:
-        git_dir = self._run_tree_git(tree, ["rev-parse", "--path-format=absolute", "--absolute-git-dir"])
-        worktree_git_dir = _existing_real_directory(git_dir.stdout.strip(), label="attempt Git directory")
-        paths = (self.common_git_dir / "config", worktree_git_dir / "config.worktree")
-        return tuple((str(path), _optional_regular_file_snapshot(path)) for path in paths)
+    def _candidate_index_image(
+        self,
+        tree: Path,
+        candidate_oid: str,
+        expected_entries: Mapping[str, tuple[str, str]],
+    ) -> _CandidateFileSnapshot:
+        with tempfile.TemporaryDirectory(prefix="autoform-candidate-index-") as scratch:
+            scratch_path = _existing_real_directory(
+                Path(scratch).resolve(strict=True),
+                label="candidate index scratch directory",
+            )
+            index_path = scratch_path / "index"
+            self._run_tree_git_with_index(
+                tree,
+                index_path,
+                [
+                    "-c",
+                    "index.version=2",
+                    "-c",
+                    "core.splitIndex=false",
+                    "-c",
+                    "index.sparse=false",
+                    "read-tree",
+                    "--no-sparse-checkout",
+                    candidate_oid,
+                ],
+            )
+            snapshot = _candidate_private_file_snapshot(index_path, label="generated candidate Git index")
+            self._assert_candidate_index(
+                tree,
+                expected_entries,
+                label="candidate tree",
+                index_path=index_path,
+                index_snapshot=snapshot,
+            )
+            return snapshot
+
+    def _replace_candidate_index(
+        self,
+        admin: _CandidateAdminBinding,
+        expected_base: _CandidateFileSnapshot,
+        candidate: _CandidateFileSnapshot,
+    ) -> _CandidateFileSnapshot:
+        if _directory_identity(admin.path) != admin.identity:
+            raise CandidateUncertain("attempt Git directory changed before index update")
+        observed = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        if observed != expected_base:
+            raise CandidateUncertain("attempt Git index does not match its recorded base before update")
+        lock = admin.index_path.with_name("index.lock")
+        staged = self._candidate_staged_index(admin, candidate)
+        if staged is None:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(lock, flags, 0o600)
+            except OSError as error:
+                raise CandidateUncertain("candidate Git index lock could not be acquired") from error
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                    stream.write(candidate.content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+            staged = _candidate_private_file_snapshot(lock, label="staged candidate Git index")
+            if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
+                raise CandidateUncertain("staged candidate Git index differs from its durable intent")
+            _fsync_directory(admin.path)
+            _checkpoint("candidate-index-staged")
+        if _directory_identity(admin.path) != admin.identity:
+            raise CandidateUncertain("attempt Git directory changed during index staging")
+        if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != expected_base:
+            raise CandidateUncertain("attempt Git index changed during index staging")
+        if _candidate_private_file_snapshot(lock, label="staged candidate Git index") != staged:
+            raise CandidateUncertain("staged candidate Git index changed before installation")
+        try:
+            os.replace(lock, admin.index_path)
+            _fsync_directory(admin.path)
+        except OSError as error:
+            raise CandidateUncertain("candidate Git index could not be replaced atomically") from error
+        installed = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        if installed.sha256 != candidate.sha256 or installed.content != candidate.content:
+            raise CandidateUncertain("candidate Git index replacement could not be verified")
+        return installed
+
+    def _candidate_staged_index(
+        self,
+        admin: _CandidateAdminBinding,
+        candidate: _CandidateFileSnapshot,
+    ) -> _CandidateFileSnapshot | None:
+        lock = admin.index_path.with_name("index.lock")
+        if not lock.exists() and not lock.is_symlink():
+            return None
+        staged = _candidate_private_file_snapshot(lock, label="candidate Git index lock")
+        if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
+            raise CandidateUncertain("candidate Git index lock contains foreign state")
+        return staged
+
+    def _assert_candidate_index_lock_absent(self, admin: _CandidateAdminBinding) -> None:
+        lock = admin.index_path.with_name("index.lock")
+        if lock.exists() or lock.is_symlink():
+            raise CandidateUncertain("attempt Git index lock already exists")
+
+    def _assert_recorded_candidate_index(
+        self,
+        record: Mapping[str, object],
+        candidate: _CandidateFileSnapshot,
+    ) -> None:
+        if len(candidate.content) != record.get("candidate_index_size") or candidate.sha256 != record.get(
+            "candidate_index_sha256"
+        ):
+            raise CandidateUncertain("generated candidate Git index differs from its durable intent")
+
+    def _candidate_index_state(
+        self,
+        record: Mapping[str, object],
+        observed: _CandidateFileSnapshot,
+    ) -> str:
+        base_identity = record.get("base_index_identity")
+        if (
+            isinstance(base_identity, list)
+            and list(observed.identity) == base_identity
+            and observed.sha256 == record.get("base_index_sha256")
+        ):
+            return "base"
+        if len(observed.content) == record.get("candidate_index_size") and observed.sha256 == record.get(
+            "candidate_index_sha256"
+        ):
+            return "candidate"
+        raise CandidateUncertain("attempt Git index conflicts with the durable candidate transition")
+
+    def _candidate_config_snapshot(self, admin: _CandidateAdminBinding) -> tuple[tuple[str, object], ...]:
+        if _directory_identity(admin.path) != admin.identity:
+            raise CandidateUncertain("attempt Git directory changed during configuration inspection")
+        config_paths = (self.common_git_dir / "config", admin.path / "config.worktree")
+        values: list[tuple[str, object]] = []
+        for path in config_paths:
+            snapshot = _optional_candidate_private_file_snapshot(path, label="repository configuration")
+            if snapshot is not None:
+                _assert_candidate_config_is_self_contained(self, snapshot.content)
+                value: object = [*snapshot.identity, snapshot.sha256]
+            else:
+                value = None
+            values.append((str(path), value))
+        try:
+            info_dir = _existing_real_directory(self.common_git_dir / "info", label="repository info directory")
+        except RepositoryError as error:
+            raise CandidateUncertain(str(error)) from error
+        values.append((str(info_dir), list(_directory_identity(info_dir))))
+        exclude_path = info_dir / "exclude"
+        exclude = _optional_candidate_private_file_snapshot(exclude_path, label="repository exclude file")
+        values.append(
+            (
+                str(exclude_path),
+                None if exclude is None else [*exclude.identity, exclude.sha256],
+            )
+        )
+        if _directory_identity(admin.path) != admin.identity:
+            raise CandidateUncertain("attempt Git directory changed during configuration inspection")
+        return tuple(values)
 
     def _assert_candidate_config_snapshot(
         self,
-        tree: Path,
-        expected: tuple[tuple[str, object], ...],
+        admin: _CandidateAdminBinding,
+        expected_sha256: str,
     ) -> None:
-        if self._candidate_config_snapshot(tree) != expected:
+        observed = hashlib.sha256(_json_bytes(self._candidate_config_snapshot(admin))).hexdigest()
+        if observed != expected_sha256:
             raise CandidateUncertain("repository configuration changed during candidate creation")
 
     def _write_candidate_object(self, object_type: str, expected_oid: str, content: bytes) -> None:
@@ -800,7 +1167,17 @@ class AttemptWorktrees:
         self._verify_candidate_object(record)
         if self._tree_head(tree) != record["candidate_oid"]:
             raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
-        self._assert_candidate_index(tree, dict(snapshot.entries), label="candidate")
+        admin = self._assert_candidate_admin_binding(tree, record)
+        self._assert_candidate_config_snapshot(admin, str(record["config_snapshot_sha256"]))
+        self._assert_candidate_index_lock_absent(admin)
+        index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        self._assert_candidate_index(
+            tree,
+            dict(snapshot.entries),
+            label="candidate",
+            index_path=admin.index_path,
+            index_snapshot=index,
+        )
 
     def _candidate_receipt(self, record: Mapping[str, object], *, state: str) -> CandidateReceipt:
         identity = {
@@ -819,6 +1196,15 @@ class AttemptWorktrees:
                 "message_sha256",
                 "tree_oid",
                 "candidate_oid",
+                "git_dir",
+                "git_dir_device",
+                "git_dir_inode",
+                "base_index_identity",
+                "base_index_sha256",
+                "candidate_index_size",
+                "candidate_index_sha256",
+                "candidate_index_identity",
+                "config_snapshot_sha256",
             )
         }
         return CandidateReceipt(
@@ -888,9 +1274,31 @@ class AttemptWorktrees:
             _validate_candidate_identity(str(record["author_name"]), str(record["author_email"]))
         except RepositoryError as error:
             raise CandidateUncertain("candidate journal has an invalid author identity") from error
-        for key in ("message_sha256",):
+        for key in ("message_sha256", "base_index_sha256", "candidate_index_sha256", "config_snapshot_sha256"):
             if not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", str(record.get(key))):
                 raise CandidateUncertain(f"candidate journal has an invalid {key}")
+        if not isinstance(record.get("git_dir"), str) or not Path(str(record["git_dir"])).is_absolute():
+            raise CandidateUncertain("candidate journal has an invalid Git directory")
+        for key in ("git_dir_device", "git_dir_inode", "candidate_index_size"):
+            if not _is_integer(record.get(key)) or int(record[key]) < 0:
+                raise CandidateUncertain(f"candidate journal has an invalid {key}")
+        base_index_identity = record.get("base_index_identity")
+        if (
+            not isinstance(base_index_identity, list)
+            or len(base_index_identity) != 7
+            or any(not _is_integer(value) or int(value) < 0 for value in base_index_identity)
+        ):
+            raise CandidateUncertain("candidate journal has an invalid base index identity")
+        candidate_index_identity = record.get("candidate_index_identity")
+        if record.get("state") == "ready":
+            if (
+                not isinstance(candidate_index_identity, list)
+                or len(candidate_index_identity) != 7
+                or any(not _is_integer(value) or int(value) < 0 for value in candidate_index_identity)
+            ):
+                raise CandidateUncertain("ready candidate journal has an invalid candidate index identity")
+        elif candidate_index_identity is not None:
+            raise CandidateUncertain("prepared candidate journal has a premature candidate index identity")
         try:
             for key in ("base_oid", "tree_oid", "candidate_oid"):
                 _validate_oid(str(record.get(key, "")))
@@ -1628,6 +2036,43 @@ class AttemptWorktrees:
         input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return self._run_git(["-C", str(tree), *args], check=check, input_text=input_text)
+
+    def _run_tree_git_bytes(
+        self,
+        tree: Path,
+        args: list[str],
+        *,
+        check: bool = True,
+        input_bytes: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return self._run_git_bytes(["-C", str(tree), *args], check=check, input_bytes=input_bytes)
+
+    def _run_tree_git_with_index(
+        self,
+        tree: Path,
+        index_path: Path,
+        args: list[str],
+        *,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        self._verify_repository()
+        environment = _git_environment()
+        environment["GIT_INDEX_FILE"] = str(index_path)
+        try:
+            proc = subprocess.run(
+                _git_command(["-C", str(tree), *args]),
+                cwd=self.repository_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise CandidateUncertain(f"Git index operation failed: {error}") from error
+        self._verify_repository()
+        if check and proc.returncode != 0:
+            raise CandidateUncertain(_git_failure(f"git {args[0] if args else ''}", proc))
+        return proc
 
     def _run_git(
         self,
@@ -3194,6 +3639,8 @@ def _snapshot_regular_tree(
 
 
 def _read_candidate_regular_file(path: Path, expected: os.stat_result, relative: str) -> tuple[bytes, tuple[int, ...]]:
+    if not stat.S_ISREG(expected.st_mode) or stat.S_ISLNK(expected.st_mode) or expected.st_nlink != 1:
+        raise CandidateUncertain(f"candidate path is not a private regular file: {relative}")
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -3204,7 +3651,11 @@ def _read_candidate_regular_file(path: Path, expected: os.stat_result, relative:
     try:
         opened = os.fstat(descriptor)
         expected_identity = _candidate_stat_identity(expected)
-        if not stat.S_ISREG(opened.st_mode) or _candidate_stat_identity(opened) != expected_identity:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _candidate_stat_identity(opened) != expected_identity
+        ):
             raise CandidateUncertain(f"candidate regular file changed while being opened: {relative}")
         content = bytearray()
         while True:
@@ -3282,19 +3733,68 @@ def _candidate_tree_objects(
     return root_oid, objects
 
 
-def _optional_regular_file_snapshot(path: Path) -> object:
+def _candidate_private_file_snapshot(path: Path, *, label: str) -> _CandidateFileSnapshot:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be inspected safely: {path}") from error
+    content, identity = _read_candidate_regular_file(path, info, label)
+    return _CandidateFileSnapshot(
+        identity=identity,
+        sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+    )
+
+
+def _optional_candidate_private_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+) -> _CandidateFileSnapshot | None:
     try:
         info = path.stat(follow_symlinks=False)
     except FileNotFoundError:
         if path.is_symlink():
-            raise CandidateUncertain(f"repository config path is a dangling symbolic link: {path}")
+            raise CandidateUncertain(f"{label} is a dangling symbolic link: {path}")
         return None
     except OSError as error:
-        raise CandidateUncertain(f"repository config cannot be inspected: {path}") from error
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise CandidateUncertain(f"repository config is not a regular file: {path}")
-    content, identity = _read_candidate_regular_file(path, info, str(path))
-    return (*identity, hashlib.sha256(content).hexdigest())
+        raise CandidateUncertain(f"{label} cannot be inspected: {path}") from error
+    content, identity = _read_candidate_regular_file(path, info, label)
+    return _CandidateFileSnapshot(
+        identity=identity,
+        sha256=hashlib.sha256(content).hexdigest(),
+        content=content,
+    )
+
+
+def _assert_candidate_config_is_self_contained(repository: AttemptWorktrees, content: bytes) -> None:
+    with tempfile.TemporaryDirectory(prefix="autoform-candidate-config-") as scratch:
+        config = Path(scratch) / "config"
+        descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        proc = repository._run_git_bytes(  # noqa: SLF001 - isolated parser for repository-owned config
+            ["config", "--file", str(config), "--no-includes", "--null", "--name-only", "--list"],
+            check=False,
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()[:500]
+        raise CandidateUncertain(f"repository configuration cannot be parsed safely: {detail}")
+    for raw_name in proc.stdout.split(b"\0"):
+        name = raw_name.decode("utf-8", errors="surrogateescape").casefold()
+        if name == "include.path" or (name.startswith("includeif.") and name.endswith(".path")):
+            raise CandidateUncertain("repository configuration includes external configuration")
+        if name == "core.excludesfile":
+            raise CandidateUncertain("repository configuration uses an external excludes file")
 
 
 def _assert_missing_worktree_path(tree: Path, path: Path) -> None:
