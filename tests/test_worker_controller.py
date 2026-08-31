@@ -9,10 +9,20 @@ from autoform_worker.controller import (
     ControllerError,
     build_task_specs,
     classify_no_work,
+    create_run,
+    initialize_created_run,
     select_ready_task,
     status_payload,
 )
-from autoform_worker.ledger import AttemptRecord, MergeItemRecord, RunConfig, RunIdentity, RunRecord, TaskRecord
+from autoform_worker.ledger import (
+    AttemptRecord,
+    MergeItemRecord,
+    RunConfig,
+    RunIdentity,
+    RunLedger,
+    RunRecord,
+    TaskRecord,
+)
 from autoform_worker.scheduler import WorkPhase
 
 
@@ -64,7 +74,7 @@ def _runtime(*nodes: RuntimeNode) -> RuntimeGraph:
     return RuntimeGraph(
         "autoform-runtime/v1",
         "markdown-articles",
-        "revision",
+        "6" * 64,
         "blueprint",
         nodes,
         len(nodes),
@@ -88,6 +98,42 @@ def _task(article_id: str, phase: str, status: str = "pending", generation: int 
         candidate_oid=None,
         integrated_oid=None,
     )
+
+
+def _run_inputs(*, runtime_revision: str = "6" * 64) -> tuple[RunConfig, RunIdentity]:
+    config = RunConfig(
+        repository_id="repository",
+        target_ref="refs/heads/main",
+        remote="https://example.test/private.git",
+        backend="claude",
+        reviewer_backend="codex",
+        max_attempts=3,
+        max_steers=3,
+        timeout_seconds=1800.0,
+        claim_ttl_seconds=1500.0,
+        heartbeat_interval_seconds=300.0,
+        start_oid="1" * 40,
+        plugin_version="revision",
+        toolchain_fingerprint="2" * 64,
+        coverage_contract_sha256="3" * 64,
+        execution_input_sha256="4" * 64,
+        source_artifacts_sha256="5" * 64,
+        gate_policy_version="gates-v1",
+    )
+    identity = RunIdentity(
+        repository_id=config.repository_id,
+        project_root="/private/project",
+        target_ref=config.target_ref,
+        base_oid=config.start_oid,
+        runtime_revision=runtime_revision,
+        coverage_revision=config.coverage_contract_sha256,
+        source_artifact_sha256=config.source_artifacts_sha256,
+        plugin_revision=config.plugin_version,
+        toolchain_fingerprint=config.toolchain_fingerprint,
+        execution_input_sha256=config.execution_input_sha256,
+        config_sha256=config.sha256,
+    )
+    return config, identity
 
 
 def test_task_plan_covers_missing_theorem_phases_and_definition_statement() -> None:
@@ -187,6 +233,74 @@ def test_planning_requires_durable_article_ids() -> None:
         build_task_specs(_runtime(node))
 
 
+def test_create_run_persists_exact_tasks_before_running(tmp_path) -> None:
+    runtime = _runtime(_node("result", "af_000000000000000000000001"))
+    config, identity = _run_inputs()
+
+    with RunLedger(tmp_path / "run.sqlite3") as ledger:
+        run = create_run(ledger, identity, config, runtime, run_id="run")
+
+        assert run.status == "running"
+        assert [(task.article_id, task.phase, task.status) for task in ledger.tasks("run")] == [
+            ("af_000000000000000000000001", "proof", "pending"),
+            ("af_000000000000000000000001", "statement", "pending"),
+        ]
+
+
+def test_created_run_recovers_after_atomic_task_insert(tmp_path) -> None:
+    runtime = _runtime(_node("result", "af_000000000000000000000001"))
+    config, identity = _run_inputs()
+    expected = tuple((spec.article_id, spec.phase) for spec in build_task_specs(runtime))
+
+    with RunLedger(tmp_path / "run.sqlite3") as ledger:
+        ledger.create_run(identity, config, tasks=expected, run_id="interrupted")
+
+        assert initialize_created_run(ledger, "interrupted", runtime).status == "running"
+
+
+def test_created_run_rejects_task_or_runtime_drift(tmp_path) -> None:
+    runtime = _runtime(_node("result", "af_000000000000000000000001"))
+    config, identity = _run_inputs()
+
+    with RunLedger(tmp_path / "run.sqlite3") as ledger:
+        ledger.create_run(
+            identity,
+            config,
+            tasks=(("af_000000000000000000000001", "statement"),),
+            run_id="task-drift",
+        )
+        with pytest.raises(ControllerError, match="task set"):
+            initialize_created_run(ledger, "task-drift", runtime)
+
+        ledger.create_run(
+            identity,
+            config,
+            tasks=tuple((spec.article_id, spec.phase) for spec in build_task_specs(runtime)),
+            run_id="runtime-drift",
+        )
+        changed = replace(runtime, source_revision="7" * 64)
+        with pytest.raises(ControllerError, match="runtime revision"):
+            initialize_created_run(ledger, "runtime-drift", changed)
+
+
+def test_create_run_allows_an_already_complete_task_plan(tmp_path) -> None:
+    runtime = _runtime(
+        _node(
+            "proved",
+            "af_000000000000000000000001",
+            state="fully_proved",
+        )
+    )
+    config, identity = _run_inputs()
+
+    with RunLedger(tmp_path / "run.sqlite3") as ledger:
+        run = create_run(ledger, identity, config, runtime, run_id="run")
+
+        assert run.status == "running"
+        assert ledger.tasks("run") == ()
+        assert classify_no_work(ledger.tasks("run")) == "complete"
+
+
 def test_status_payload_is_stable_and_redacts_private_controller_data() -> None:
     config = RunConfig(
         repository_id="repository",
@@ -228,6 +342,8 @@ def test_status_payload_is_stable_and_redacts_private_controller_data() -> None:
         config_sha256=config.sha256,
         status="running",
         generation=7,
+        task_plan_sha256="8" * 64,
+        task_count=1,
         current_oid="7" * 40,
         stop_requested=False,
         detail="secret backend output",

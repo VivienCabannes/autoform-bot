@@ -8,7 +8,15 @@ from typing import Any
 from autoform_cli.runtime import RuntimeGraph, RuntimeNode
 from autoform_cli.status import DEFINITION_DECLARATIONS
 
-from .ledger import AttemptRecord, MergeItemRecord, RunRecord, TaskRecord
+from .ledger import (
+    AttemptRecord,
+    MergeItemRecord,
+    RunConfig,
+    RunIdentity,
+    RunLedger,
+    RunRecord,
+    TaskRecord,
+)
 from .scheduler import WorkPhase, _ready_phase
 
 
@@ -78,6 +86,61 @@ def status_payload(
             "total": len(tasks),
         },
     }
+
+
+def create_run(
+    ledger: RunLedger,
+    identity: RunIdentity,
+    config: RunConfig,
+    runtime: RuntimeGraph,
+    *,
+    run_id: str,
+) -> RunRecord:
+    """Persist the complete task plan atomically, then start the run."""
+
+    tasks = tuple((spec.article_id, spec.phase) for spec in build_task_specs(runtime))
+    ledger.create_run(identity, config, tasks=tasks, run_id=run_id)
+    return initialize_created_run(ledger, run_id, runtime)
+
+
+def initialize_created_run(
+    ledger: RunLedger,
+    run_id: str,
+    runtime: RuntimeGraph,
+) -> RunRecord:
+    """Resume the sole safe interruption point between creation and execution."""
+
+    run = ledger.get_run(run_id)
+    if run.status != "created":
+        raise ControllerError(
+            "run-already-initialized",
+            f"run is {run.status}, not created: {run_id}",
+        )
+    if run.identity.runtime_revision != runtime.source_revision:
+        raise ControllerError(
+            "runtime-revision-changed",
+            "the runtime revision does not match the run identity",
+        )
+
+    expected = tuple((spec.article_id, spec.phase) for spec in build_task_specs(runtime))
+    tasks = ledger.tasks(run_id)
+    actual = tuple((task.article_id, task.phase) for task in tasks)
+    if actual != expected:
+        raise ControllerError(
+            "task-set-mismatch",
+            "the durable task set does not match the bound runtime",
+        )
+    if any(task.status != "pending" or task.attempts != 0 for task in tasks):
+        raise ControllerError(
+            "created-run-mutated",
+            "a created run contains task progress",
+        )
+    return ledger.transition_run(
+        run_id,
+        "running",
+        expected_generation=run.generation,
+        detail="",
+    )
 
 
 def build_task_specs(runtime: RuntimeGraph) -> tuple[TaskSpec, ...]:
@@ -184,6 +247,8 @@ __all__ = [
     "TaskSpec",
     "build_task_specs",
     "classify_no_work",
+    "create_run",
+    "initialize_created_run",
     "select_ready_task",
     "status_payload",
 ]
