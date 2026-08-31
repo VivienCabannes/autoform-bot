@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -24,6 +25,7 @@ class Workspace:
 
     root: Path
     manifest: WorkspaceManifest
+    manifest_sha256: str
 
     @property
     def path(self) -> Path:
@@ -94,6 +96,7 @@ def discover_workspace(start: str | Path = ".") -> Workspace:
     if candidate.is_file():
         candidate = candidate.parent
     for root in (candidate, *candidate.parents):
+        _reject_case_collisions(root, PurePosixPath(WORKSPACE_FILE))
         manifest_path = root / WORKSPACE_FILE
         if manifest_path.is_symlink():
             raise WorkspaceError([f"{WORKSPACE_FILE} must not be a symbolic link"])
@@ -117,6 +120,7 @@ def load_workspace(root: str | Path) -> Workspace:
         resolved = requested.resolve()
     except (OSError, RuntimeError, ValueError):
         raise WorkspaceError(["workspace root path cannot be resolved"]) from None
+    _reject_case_collisions(resolved, PurePosixPath(WORKSPACE_FILE))
     manifest_path = resolved / WORKSPACE_FILE
     if manifest_path.is_symlink():
         raise WorkspaceError([f"{WORKSPACE_FILE} must not be a symbolic link"])
@@ -134,7 +138,7 @@ def load_workspace(root: str | Path) -> Workspace:
     except UnicodeDecodeError:
         raise WorkspaceError([f"{WORKSPACE_FILE} is not valid UTF-8 TOML"]) from None
     manifest = parse_workspace(text)
-    workspace = Workspace(resolved, manifest)
+    workspace = Workspace(resolved, manifest, hashlib.sha256(content).hexdigest())
     _validate_workspace_paths(workspace)
     return workspace
 
@@ -235,6 +239,10 @@ def resolve_blueprint(
 
 def _validate_workspace_paths(workspace: Workspace) -> None:
     issues: list[str] = []
+    try:
+        _reject_case_collisions(workspace.root, PurePosixPath(WORKSPACE_FILE))
+    except WorkspaceError as error:
+        issues.extend(error.issues)
     for location in workspace.manifest.locations:
         path = workspace.root / PurePosixPath(location.path)
         try:

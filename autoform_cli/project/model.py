@@ -142,12 +142,12 @@ class MathlibProject:
 class AutoformProject:
     detected: bool
     blueprint_path: str | None
-    blueprint_paths: tuple[str, ...]
-    manifest_path: str | None
-    manifest_sha256: str | None
     mkdocs_path: str | None
     verification_workflow_path: str | None
     pages_workflow_path: str | None
+    blueprint_paths: tuple[str, ...] = ()
+    manifest_path: str | None = None
+    manifest_sha256: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {

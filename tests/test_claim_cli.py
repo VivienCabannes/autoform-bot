@@ -18,7 +18,9 @@ from autoform_cli.claims import (
     MalformedLeaseError,
     author_claim_key,
     resource_claim_key,
+    workspace_author_claim_key,
 )
+from autoform_cli.workspace_mutation import create_blueprint_project, initialize_workspace
 
 
 def _bare_repo(tmp_path: Path) -> Path:
@@ -135,6 +137,60 @@ def test_claim_cli_refuses_live_peer_and_list_needs_no_session_identity(
 
     assert main(["claim", "list", "--repo", str(repo), "--scratch", str(second)]) == 0
     assert json.loads(capsys.readouterr().out)
+
+
+def test_workspace_projects_with_the_same_article_id_claim_independently(
+    tmp_path: Path, capsys
+) -> None:
+    repo = _bare_repo(tmp_path)
+    root = tmp_path / "repository"
+    root.mkdir()
+    initialize_workspace(root, blueprint_root="Plans")
+    create_blueprint_project(root, project_id="one", title="One", path="One")
+    create_blueprint_project(root, project_id="two", title="Two", path="Two")
+    article_id = "af_0123456789abcdef01234567"
+    for project in ("One", "Two"):
+        _article(root / f"Plans/{project}/roadmap/result.md", "Result", article_id)
+
+    def command(operation: str, project: str, worker: str, scratch: str) -> list[str]:
+        args = [
+            "claim",
+            operation,
+            "result",
+            "--blueprint",
+            str(root),
+            "--project",
+            project,
+            "--repo",
+            str(repo),
+            "--worker-id",
+            worker,
+            "--session-id",
+            worker,
+            "--scratch",
+            str(tmp_path / scratch),
+        ]
+        if operation in {"acquire", "renew"}:
+            args.extend(["--ttl", "600"])
+        return args
+
+    assert main(command("acquire", "one", "worker-one", "scratch-one")) == 0
+    capsys.readouterr()
+    assert main(command("acquire", "two", "worker-two", "scratch-two")) == 0
+    capsys.readouterr()
+
+    inspector = ClaimBoard(repo, "inspector", tmp_path / "inspection")
+    keys = {lease["_key"] for lease in inspector.list()}
+    assert workspace_author_claim_key("one", article_id) in keys
+    assert workspace_author_claim_key("two", article_id) in keys
+    assert main(command("renew", "two", "worker-one", "scratch-one")) == 1
+    assert "ownership is held" in capsys.readouterr().out
+    assert main(command("release", "two", "worker-one", "scratch-one")) == 1
+    assert "ownership is held" in capsys.readouterr().out
+
+    assert main(command("release", "one", "worker-one", "scratch-one")) == 0
+    capsys.readouterr()
+    assert main(command("release", "two", "worker-two", "scratch-two")) == 0
 
 
 def test_claim_cli_transport_failure_is_nonzero(tmp_path: Path, capsys) -> None:

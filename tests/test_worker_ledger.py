@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import autoform_worker.ledger as ledger_module
-from autoform_cli.claims import CLAIM_REF_PREFIX, author_claim_key
+from autoform_cli.claims import CLAIM_REF_PREFIX, author_claim_key, workspace_author_claim_key
 from autoform_worker.ledger import (
     ArticleClaimToken,
     AttemptRecord,
@@ -91,11 +91,23 @@ def _identity(project: Path, config: RunConfig | None = None) -> RunIdentity:
         toolchain_fingerprint=config.toolchain_fingerprint,
         execution_input_sha256=config.execution_input_sha256,
         config_sha256=config.sha256,
+        workspace_project_id=config.workspace_project_id,
+        workspace_manifest_sha256=config.workspace_manifest_sha256,
+        blueprint_path=config.blueprint_path,
     )
 
 
-def _claim_token(article_id: str, *, observed_ref_oid: str = "8" * 40) -> ArticleClaimToken:
-    claim_key = author_claim_key(article_id)
+def _claim_token(
+    article_id: str,
+    *,
+    observed_ref_oid: str = "8" * 40,
+    workspace_project_id: str | None = None,
+) -> ArticleClaimToken:
+    claim_key = (
+        author_claim_key(article_id)
+        if workspace_project_id is None
+        else workspace_author_claim_key(workspace_project_id, article_id)
+    )
     return ArticleClaimToken(
         article_id=article_id,
         claim_key=claim_key,
@@ -103,6 +115,7 @@ def _claim_token(article_id: str, *, observed_ref_oid: str = "8" * 40) -> Articl
         lease_id="e" * 64,
         observed_ref_oid=observed_ref_oid,
         object_format="sha1" if len(observed_ref_oid) == 40 else "sha256",
+        workspace_project_id=workspace_project_id,
     )
 
 
@@ -737,6 +750,115 @@ def test_attempt_claim_token_is_typed_canonical_and_durable(tmp_path: Path) -> N
 
     with RunLedger(path) as reopened:
         assert reopened.get_attempt("attempt-typed").claim_token == token
+
+
+def test_workspace_run_accepts_only_its_project_scoped_claim_token(tmp_path: Path) -> None:
+    config = replace(
+        _config(),
+        workspace_project_id="one",
+        workspace_manifest_sha256="a" * 64,
+        blueprint_path="Plans/One",
+    )
+    ledger, run_id = _running_ledger(tmp_path, config=config)
+    path = ledger.path
+    try:
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+
+        def begin(claim_key: str, token: ArticleClaimToken, attempt_id: str):
+            return ledger.begin_attempt(
+                run_id,
+                task.article_id,
+                task.phase,
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=task.generation,
+                worktree_path=tmp_path / attempt_id,
+                branch=f"autoform/{run_id}/{task.article_id}/1",
+                base_oid=ledger.get_run(run_id).current_oid,
+                backend="codex",
+                claim_key=claim_key,
+                claim_token=token,
+                attempt_id=attempt_id,
+            )
+
+        with pytest.raises(LedgerError, match="run workspace project"):
+            begin(
+                author_claim_key(_ARTICLE_A),
+                _claim_token(_ARTICLE_A),
+                "legacy-token",
+            )
+        wrong_key = workspace_author_claim_key("two", _ARTICLE_A)
+        with pytest.raises(LedgerError, match="run workspace project"):
+            begin(
+                wrong_key,
+                _claim_token(_ARTICLE_A, workspace_project_id="two"),
+                "wrong-project-token",
+            )
+
+        key = workspace_author_claim_key("one", _ARTICLE_A)
+        token = _claim_token(_ARTICLE_A, workspace_project_id="one")
+        attempt = begin(key, token, "workspace-token")
+        assert attempt.claim_token == token
+        assert ledger.get_run(run_id).identity.workspace_project_id == "one"
+        assert ledger.get_run(run_id).identity.workspace_manifest_sha256 == "a" * 64
+        assert ledger.get_run(run_id).identity.blueprint_path == "Plans/One"
+    finally:
+        ledger.close()
+
+    with RunLedger(path) as reopened:
+        assert reopened.get_attempt("workspace-token").claim_token.workspace_project_id == "one"
+
+    with RunLedger(path) as reopened:
+        wrong_key = workspace_author_claim_key("two", _ARTICLE_A)
+        wrong_token = _claim_token(_ARTICLE_A, workspace_project_id="two")
+        with _disabled_triggers(reopened._connection, "attempts_identity_no_update"):
+            reopened._connection.execute(
+                "UPDATE attempts SET claim_key = ?, claim_token_json = ? WHERE attempt_id = ?",
+                (
+                    wrong_key,
+                    json.dumps(wrong_token.as_dict(), sort_keys=True, separators=(",", ":")),
+                    "workspace-token",
+                ),
+            )
+
+    with pytest.raises(LedgerError, match="run workspace project"):
+        RunLedger(path)
+
+
+def test_legacy_positional_schema_arguments_remain_compatible() -> None:
+    config = _config()
+    positional_config = RunConfig(
+        config.repository_id,
+        config.target_ref,
+        config.remote,
+        config.backend,
+        config.reviewer_backend,
+        config.start_oid,
+        config.plugin_version,
+        config.toolchain_fingerprint,
+        config.coverage_contract_sha256,
+        config.execution_input_sha256,
+        config.source_artifacts_sha256,
+        config.gate_policy_version,
+        config.max_attempts,
+        config.max_steers,
+        config.timeout_seconds,
+        config.claim_ttl_seconds,
+        config.heartbeat_interval_seconds,
+        config.schema_version,
+    )
+    token = _claim_token(_ARTICLE_A)
+    positional_token = ArticleClaimToken(
+        token.article_id,
+        token.claim_key,
+        token.claim_ref,
+        token.lease_id,
+        token.observed_ref_oid,
+        token.object_format,
+        token.schema_version,
+    )
+
+    assert positional_config == config
+    assert positional_token == token
 
 
 @pytest.mark.parametrize(

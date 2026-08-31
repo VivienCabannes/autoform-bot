@@ -30,6 +30,9 @@ _WINDOWS_RESERVED = frozenset(
     | {f"COM{number}" for number in range(1, 10)}
     | {f"LPT{number}" for number in range(1, 10)}
 )
+_RESERVED_REPOSITORY_ROOTS = frozenset(
+    {WORKSPACE_FILE.casefold(), ".git", ".hg", ".jj", ".svn"}
+)
 
 
 class WorkspaceError(ValueError):
@@ -109,6 +112,12 @@ def parse_workspace(text: str) -> WorkspaceManifest:
         raise WorkspaceError([f"{WORKSPACE_FILE} must contain a TOML table"])
 
     issues: list[str] = []
+    _reject_unknown_keys(
+        payload,
+        allowed=frozenset({"schema", "locations", "projects"}),
+        label=WORKSPACE_FILE,
+        issues=issues,
+    )
     schema = payload.get("schema")
     if schema != WORKSPACE_SCHEMA:
         issues.append(f"schema must be exactly {WORKSPACE_SCHEMA!r}")
@@ -133,10 +142,19 @@ def parse_workspace(text: str) -> WorkspaceManifest:
         if not isinstance(raw, dict):
             issues.append(f"{label} must be a table")
             continue
+        _reject_unknown_keys(
+            raw,
+            allowed=frozenset({"path", "provides"}),
+            label=label,
+            issues=issues,
+        )
         path = raw.get("path")
         provides = raw.get("provides")
         if not isinstance(path, str) or not valid_relative_path(path, allow_dot=True):
             issues.append(f"{label}.path must be a portable repository-relative path")
+            continue
+        if uses_reserved_repository_root(path):
+            issues.append(f"{label}.path uses a reserved repository path")
             continue
         if (
             not isinstance(provides, list)
@@ -179,6 +197,12 @@ def parse_workspace(text: str) -> WorkspaceManifest:
         if not isinstance(raw, dict):
             issues.append(f"{label} must be a table")
             continue
+        _reject_unknown_keys(
+            raw,
+            allowed=frozenset({"title", "blueprint"}),
+            label=label,
+            issues=issues,
+        )
         title = raw.get("title")
         if title is not None and (not isinstance(title, str) or not title.strip()):
             issues.append(f"{label}.title must be a non-empty string when present")
@@ -187,6 +211,12 @@ def parse_workspace(text: str) -> WorkspaceManifest:
         if not isinstance(blueprint, dict):
             issues.append(f"{label}.blueprint must be a table")
             continue
+        _reject_unknown_keys(
+            blueprint,
+            allowed=frozenset({"location", "path"}),
+            label=f"{label}.blueprint",
+            issues=issues,
+        )
         location_id = blueprint.get("location")
         path = blueprint.get("path")
         if not isinstance(location_id, str) or location_id not in locations_by_id:
@@ -204,6 +234,9 @@ def parse_workspace(text: str) -> WorkspaceManifest:
             )
             continue
         combined = PurePosixPath(location.path, path).as_posix()
+        if uses_reserved_repository_root(combined):
+            issues.append(f"{label}.blueprint uses a reserved repository path")
+            continue
         combined_key = portable_path_key(combined)
         overlap = next(
             (
@@ -230,8 +263,23 @@ def parse_workspace(text: str) -> WorkspaceManifest:
     return WorkspaceManifest(WORKSPACE_SCHEMA, tuple(locations), tuple(projects))
 
 
+def _reject_unknown_keys(
+    table: dict[str, object],
+    *,
+    allowed: frozenset[str],
+    label: str,
+    issues: list[str],
+) -> None:
+    for key in sorted(set(table) - allowed):
+        issues.append(f"{label}: unknown key {key!r}")
+
+
 def valid_identifier(value: object) -> bool:
-    return isinstance(value, str) and bool(_IDENTIFIER.fullmatch(value))
+    return (
+        isinstance(value, str)
+        and bool(_IDENTIFIER.fullmatch(value))
+        and valid_path_component(value)
+    )
 
 
 def valid_relative_path(value: str, *, allow_dot: bool) -> bool:
@@ -276,6 +324,11 @@ def path_keys_overlap(first: tuple[str, ...], second: tuple[str, ...]) -> bool:
     return first[:common] == second[:common]
 
 
+def uses_reserved_repository_root(value: str | PurePosixPath) -> bool:
+    parts = PurePosixPath(value).parts
+    return bool(parts) and portable_name_key(parts[0]) in _RESERVED_REPOSITORY_ROOTS
+
+
 __all__ = [
     "BLUEPRINT_CHANGE_SCHEMA",
     "BLUEPRINT_LIST_SCHEMA",
@@ -291,4 +344,5 @@ __all__ = [
     "WorkspaceManifest",
     "WorkspaceProject",
     "parse_workspace",
+    "uses_reserved_repository_root",
 ]

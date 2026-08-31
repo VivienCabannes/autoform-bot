@@ -17,8 +17,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from autoform_cli.claims import CLAIM_REF_PREFIX, author_claim_key
+from autoform_cli.claims import (
+    CLAIM_REF_PREFIX,
+    author_claim_key,
+    workspace_author_claim_key,
+)
 from autoform_cli.graph import ARTICLE_ID_PATTERN
+from autoform_cli.workspace_manifest import valid_identifier, valid_relative_path
 
 try:
     import fcntl
@@ -106,6 +111,9 @@ class RunConfig:
     claim_ttl_seconds: float
     heartbeat_interval_seconds: float
     schema_version: int = RUN_CONFIG_SCHEMA_VERSION
+    workspace_project_id: str | None = None
+    workspace_manifest_sha256: str | None = None
+    blueprint_path: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != RUN_CONFIG_SCHEMA_VERSION:
@@ -141,9 +149,19 @@ class RunConfig:
         object.__setattr__(self, "timeout_seconds", timeout)
         object.__setattr__(self, "claim_ttl_seconds", claim_ttl)
         object.__setattr__(self, "heartbeat_interval_seconds", heartbeat)
+        _validate_workspace_binding(
+            self.workspace_project_id,
+            self.workspace_manifest_sha256,
+            self.blueprint_path,
+        )
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.workspace_project_id is None:
+            payload.pop("workspace_project_id")
+            payload.pop("workspace_manifest_sha256")
+            payload.pop("blueprint_path")
+        return payload
 
     @property
     def sha256(self) -> str:
@@ -165,9 +183,17 @@ class RunIdentity:
     toolchain_fingerprint: str
     execution_input_sha256: str
     config_sha256: str
+    workspace_project_id: str | None = None
+    workspace_manifest_sha256: str | None = None
+    blueprint_path: str | None = None
 
     def as_dict(self) -> dict[str, str]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.workspace_project_id is None:
+            payload.pop("workspace_project_id")
+            payload.pop("workspace_manifest_sha256")
+            payload.pop("blueprint_path")
+        return payload
 
     @property
     def sha256(self) -> str:
@@ -185,6 +211,7 @@ class ArticleClaimToken:
     observed_ref_oid: str
     object_format: str
     schema_version: int = ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION
+    workspace_project_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION:
@@ -193,7 +220,15 @@ class ArticleClaimToken:
                 f"expected {ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION}"
             )
         _validate_article_id(self.article_id)
-        expected_key = author_claim_key(self.article_id)
+        if self.workspace_project_id is not None and not valid_identifier(
+            self.workspace_project_id
+        ):
+            raise LedgerError("article claim workspace project id is not portable")
+        expected_key = (
+            author_claim_key(self.article_id)
+            if self.workspace_project_id is None
+            else workspace_author_claim_key(self.workspace_project_id, self.article_id)
+        )
         if self.claim_key != expected_key:
             raise LedgerError(f"article claim key must equal {expected_key}")
         expected_ref = CLAIM_REF_PREFIX + expected_key
@@ -208,7 +243,10 @@ class ArticleClaimToken:
             raise LedgerError("observed claim ref OID does not match its Git object format")
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.workspace_project_id is None:
+            payload.pop("workspace_project_id")
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -881,12 +919,8 @@ class RunLedger:
         backend = _canonical_backend("backend", backend)
         _validate_identifier("claim key", claim_key)
         _validate_article_id(article_id)
-        if claim_key != author_claim_key(article_id):
-            raise LedgerError(f"claim key is not anchored to durable article id {article_id}")
         if not isinstance(claim_token, ArticleClaimToken):
             raise LedgerError("attempt claim token must be an ArticleClaimToken")
-        if claim_token.article_id != article_id or claim_token.claim_key != claim_key:
-            raise LedgerError("attempt claim token does not match the article claim")
         _validate_oid(base_oid)
         claim_json = _json_text(claim_token.as_dict())
         now = self._clock_ns()
@@ -905,6 +939,21 @@ class RunLedger:
             if run["status"] != "running" or run["stop_requested"]:
                 raise InvalidTransition(f"run is not accepting attempts: {run['status']}")
             run_record = _run_record(run)
+            workspace_project_id = run_record.identity.workspace_project_id
+            expected_claim_key = (
+                author_claim_key(article_id)
+                if workspace_project_id is None
+                else workspace_author_claim_key(workspace_project_id, article_id)
+            )
+            if claim_key != expected_claim_key:
+                raise LedgerError(
+                    f"claim key is not anchored to durable article id {article_id} "
+                    "and the run workspace project"
+                )
+            if claim_token.article_id != article_id or claim_token.claim_key != claim_key:
+                raise LedgerError("attempt claim token does not match the article claim")
+            if claim_token.workspace_project_id != workspace_project_id:
+                raise LedgerError("attempt claim token does not match the run workspace project")
             if base_oid != run_record.current_oid:
                 raise GenerationConflict(
                     f"attempt base {base_oid} does not match run current OID {run_record.current_oid}"
@@ -3394,6 +3443,14 @@ def _validate_lifecycle_rows(
         tasks_for_run[task.run_id].append(task)
         external = external_integrations_by_task.get(task_key)
         attempts = sorted(attempts_by_task[task_key], key=lambda attempt: attempt.number)
+        if any(
+            attempt.claim_token.workspace_project_id != run.identity.workspace_project_id
+            for attempt in attempts
+        ):
+            raise LedgerError(
+                f"attempt claim token does not match run workspace project: "
+                f"{task.article_id}:{task.phase}"
+            )
         numbers = tuple(attempt.number for attempt in attempts)
         if numbers != tuple(range(1, task.attempts + 1)):
             raise LedgerError(f"task attempt history is incomplete: {task.article_id}:{task.phase}")
@@ -3720,7 +3777,15 @@ def _attempt_record(row: sqlite3.Row) -> AttemptRecord:
     _validate_identifier("attempt id", row["attempt_id"])
     _validate_identifier("attempt branch", row["branch"])
     _validate_identifier("attempt backend", row["backend"])
-    if row["claim_key"] != author_claim_key(row["article_id"]):
+    expected_claim_key = (
+        author_claim_key(row["article_id"])
+        if claim_token.workspace_project_id is None
+        else workspace_author_claim_key(
+            claim_token.workspace_project_id,
+            row["article_id"],
+        )
+    )
+    if row["claim_key"] != expected_claim_key:
         raise LedgerError(f"{label} claim key is not anchored to its article ID")
     if claim_token.article_id != row["article_id"] or claim_token.claim_key != row["claim_key"]:
         raise LedgerError(f"{label} claim token does not match its article claim")
@@ -3922,6 +3987,11 @@ def _validate_identity(identity: RunIdentity) -> None:
         "config_sha256",
     ):
         _validate_sha256(getattr(identity, field), field)
+    _validate_workspace_binding(
+        identity.workspace_project_id,
+        identity.workspace_manifest_sha256,
+        identity.blueprint_path,
+    )
 
 
 def _validate_config_binding(identity: RunIdentity, config: RunConfig) -> None:
@@ -3935,10 +4005,35 @@ def _validate_config_binding(identity: RunIdentity, config: RunConfig) -> None:
         ("source_artifact_sha256", identity.source_artifact_sha256, config.source_artifacts_sha256),
         ("toolchain_fingerprint", identity.toolchain_fingerprint, config.toolchain_fingerprint),
         ("execution_input_sha256", identity.execution_input_sha256, config.execution_input_sha256),
+        ("workspace_project_id", identity.workspace_project_id, config.workspace_project_id),
+        (
+            "workspace_manifest_sha256",
+            identity.workspace_manifest_sha256,
+            config.workspace_manifest_sha256,
+        ),
+        ("blueprint_path", identity.blueprint_path, config.blueprint_path),
     )
     for field, identity_value, config_value in matching:
         if identity_value != config_value:
             raise LedgerError(f"run identity {field} does not match the run config")
+
+
+def _validate_workspace_binding(
+    project_id: str | None,
+    manifest_sha256: str | None,
+    blueprint_path: str | None,
+) -> None:
+    values = (project_id, manifest_sha256, blueprint_path)
+    if all(value is None for value in values):
+        return
+    if any(value is None for value in values):
+        raise LedgerError("workspace run binding must include project id, manifest SHA-256, and blueprint path")
+    assert project_id is not None and manifest_sha256 is not None and blueprint_path is not None
+    if not valid_identifier(project_id):
+        raise LedgerError("workspace project id is not portable")
+    _validate_sha256(manifest_sha256, "workspace manifest")
+    if not valid_relative_path(blueprint_path, allow_dot=False):
+        raise LedgerError("workspace blueprint path is not a portable repository-relative path")
 
 
 def _validate_nonempty(label: str, value: object) -> None:

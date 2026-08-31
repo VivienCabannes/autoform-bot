@@ -40,6 +40,8 @@ class RuntimePaths:
 
     project_root: Path
     blueprint_dir: Path
+    workspace_project_id: str | None = None
+    workspace_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,23 +235,34 @@ def resolve_runtime_paths(
             raise RuntimeProjectionError(list(error.issues)) from None
         workspace = None
 
+    workspace_project_id: str | None = None
+    workspace_manifest_sha256 = workspace.manifest_sha256 if workspace is not None else None
     is_blueprint = (candidate / "roadmap").is_dir()
     is_project = (candidate / "blueprint" / "roadmap").is_dir()
     if workspace is not None and project_id is not None:
         try:
-            _, _, blueprint_dir = resolve_blueprint(candidate, project_id=project_id)
+            _, project, blueprint_dir = resolve_blueprint(candidate, project_id=project_id)
         except WorkspaceError as error:
             raise RuntimeProjectionError(list(error.issues)) from None
         project_root = workspace.root
+        workspace_project_id = project.id
     elif workspace is not None and is_blueprint:
         project_root = workspace.root
         blueprint_dir = candidate
+        matches = tuple(
+            project
+            for project in workspace.manifest.projects
+            if workspace.blueprint_path(project).resolve() == candidate
+        )
+        if len(matches) == 1:
+            workspace_project_id = matches[0].id
     elif workspace is not None:
         try:
-            _, _, blueprint_dir = resolve_blueprint(candidate)
+            _, project, blueprint_dir = resolve_blueprint(candidate)
         except WorkspaceError as error:
             raise RuntimeProjectionError(list(error.issues)) from None
         project_root = workspace.root
+        workspace_project_id = project.id
     elif project_id is not None:
         raise RuntimeProjectionError(["--project requires an enclosing .autoform.toml"])
     elif is_blueprint and is_project:
@@ -268,7 +281,12 @@ def resolve_runtime_paths(
     except ValueError as error:
         raise RuntimeProjectionError(["blueprint directory escapes the project root"]) from error
     _reject_roadmap_symlinks(blueprint_dir)
-    return RuntimePaths(project_root=project_root, blueprint_dir=blueprint_dir)
+    return RuntimePaths(
+        project_root=project_root,
+        blueprint_dir=blueprint_dir,
+        workspace_project_id=workspace_project_id,
+        workspace_manifest_sha256=workspace_manifest_sha256,
+    )
 
 
 def load_runtime_graph(

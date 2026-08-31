@@ -169,6 +169,7 @@ def _item(base: ExecutionInput) -> WorkItem:
         base.runtime.source_revision,
         base.source_contract_sha256,
         _protected_roadmap_sha256(base.runtime, base.runtime.nodes[0]),
+        blueprint_path=base.runtime.blueprint_path,
     )
 
 

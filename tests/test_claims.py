@@ -502,6 +502,7 @@ def test_ambiguous_cas_failure_accepts_the_desired_remote_state(
     remote_output: str,
 ) -> None:
     board = claims.ClaimBoard(tmp_path / "claims.git", "worker", tmp_path / "scratch")
+    board._object_format = "sha1"
     responses = iter(
         [
             subprocess.CompletedProcess([], 1, stdout="", stderr="remote failure"),
@@ -511,6 +512,65 @@ def test_ambiguous_cas_failure_accepts_the_desired_remote_state(
     monkeypatch.setattr(board, "_git", lambda *args, **kwargs: next(responses))
 
     assert board._cas_push("race", "a" * 40, new)
+
+
+@pytest.mark.parametrize(
+    ("remote_oid", "expected"),
+    [("a" * 40, "raises"), ("c" * 40, "contended")],
+)
+def test_ambiguous_cas_failure_distinguishes_transport_error_from_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote_oid: str,
+    expected: str,
+) -> None:
+    board = claims.ClaimBoard(tmp_path / "claims.git", "worker", tmp_path / "scratch")
+    board._object_format = "sha1"
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="remote failure"),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=f"{remote_oid}\t{claims.CLAIM_REF_PREFIX}race\n",
+                stderr="",
+            ),
+        ]
+    )
+    monkeypatch.setattr(board, "_git", lambda *args, **kwargs: next(responses))
+
+    if expected == "raises":
+        with pytest.raises(claims.ClaimTransportError, match="CAS push failed"):
+            board._cas_push("race", "a" * 40, "b" * 40)
+    else:
+        assert not board._cas_push("race", "a" * 40, "b" * 40)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "malformed\n",
+        (
+            f"{'a' * 40}\t{claims.CLAIM_REF_PREFIX}race\n"
+            f"{'b' * 40}\t{claims.CLAIM_REF_PREFIX}race\n"
+        ),
+    ],
+)
+def test_exact_remote_oid_rejects_malformed_or_multiple_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output: str,
+) -> None:
+    board = claims.ClaimBoard(tmp_path / "claims.git", "worker", tmp_path / "scratch")
+    board._object_format = "sha1"
+    monkeypatch.setattr(
+        board,
+        "_git",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, output, ""),
+    )
+
+    with pytest.raises(claims.ClaimTransportError):
+        board._remote_oid("race")
 
 
 def test_expired_lease_can_be_taken_over(tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:

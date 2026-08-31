@@ -19,7 +19,10 @@ from .graph import GraphValidationError
 from .lean import SourceIndex, project_source_revision, snapshot_project_sources
 from .runtime import RuntimeGraph, RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
 
-EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v1"
+# V2 deliberately invalidates V1 snapshots, including snapshots of legacy
+# single-blueprint projects. Workspace identity is part of the trust boundary,
+# so a controller must not resume from bytes that predate that binding.
+EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v2"
 _EXECUTION_INPUT_READ_ATTEMPTS = 3
 
 
@@ -98,6 +101,8 @@ class ExecutionInput:
     node_bindings: tuple[ExecutionNodeBinding, ...]
     authority_sha256: str | None = None
     lean_source_revision: str | None = None
+    workspace_project_id: str | None = None
+    workspace_manifest_sha256: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -117,6 +122,11 @@ class ExecutionInput:
             "lean_source_revision": self.lean_source_revision,
             "schema": self.schema,
             "units": [unit.as_dict() for unit in self.units],
+            "workspace": {
+                "blueprint_path": self.runtime.blueprint_path,
+                "manifest_sha256": self.workspace_manifest_sha256,
+                "project_id": self.workspace_project_id,
+            },
         }
 
     def to_json(self) -> str:
@@ -149,21 +159,39 @@ def load_execution_input(
     project_or_blueprint: str | Path,
     *,
     lean_root: str | Path | None = None,
+    project_id: str | None = None,
 ) -> ExecutionInput:
     """Read a stable runtime and exhaustive coverage snapshot, or fail closed."""
 
-    try:
-        paths = resolve_runtime_paths(project_or_blueprint)
-    except (GraphValidationError, RuntimeProjectionError) as error:
-        raise ExecutionInputError(
-            [ExecutionInputIssue("runtime-invalid", reason) for reason in error.issues]
-        ) from error
-
     resolved_lean_root = Path(lean_root).expanduser().resolve() if lean_root is not None else None
+    paths = None
     runtime: RuntimeGraph | None = None
     coverage: CoverageSummary | None = None
     authority: _ExecutionAuthorityRevision | None = None
     for _ in range(_EXECUTION_INPUT_READ_ATTEMPTS):
+        try:
+            paths = resolve_runtime_paths(project_or_blueprint, project_id=project_id)
+        except (GraphValidationError, RuntimeProjectionError) as error:
+            raise ExecutionInputError(
+                [ExecutionInputIssue("runtime-invalid", reason) for reason in error.issues]
+            ) from error
+        except OSError:
+            continue
+        if paths.workspace_manifest_sha256 is not None and paths.workspace_project_id is None:
+            raise ExecutionInputError(
+                [
+                    ExecutionInputIssue(
+                        "workspace-project-required",
+                        "autonomous execution requires a registered workspace project",
+                    )
+                ]
+            )
+        binding = (
+            paths.project_root,
+            paths.blueprint_dir,
+            paths.workspace_project_id,
+            paths.workspace_manifest_sha256,
+        )
         before: _ExecutionAuthorityRevision | None = None
         lean_index: SourceIndex | None = None
         try:
@@ -173,7 +201,11 @@ def load_execution_input(
                 if lean_snapshot.revision != before.lean_source_revision:
                     continue
                 lean_index = lean_snapshot.index
-            runtime = load_runtime_graph(project_or_blueprint, lean_root=lean_root)
+            runtime = load_runtime_graph(
+                paths.blueprint_dir,
+                lean_root=lean_root,
+                project_id=paths.workspace_project_id,
+            )
         except (GraphValidationError, RuntimeProjectionError) as error:
             if _authority_changed(paths.blueprint_dir, resolved_lean_root, before):
                 continue
@@ -204,13 +236,27 @@ def load_execution_input(
             after = _execution_authority_revision(paths.blueprint_dir, resolved_lean_root)
         except OSError:
             continue
-        if before == between == after and _coverage_matches_authority(coverage, before):
+        try:
+            final_paths = resolve_runtime_paths(project_or_blueprint, project_id=project_id)
+        except (GraphValidationError, RuntimeProjectionError, OSError):
+            continue
+        final_binding = (
+            final_paths.project_root,
+            final_paths.blueprint_dir,
+            final_paths.workspace_project_id,
+            final_paths.workspace_manifest_sha256,
+        )
+        if (
+            before == between == after
+            and binding == final_binding
+            and _coverage_matches_authority(coverage, before)
+        ):
             authority = after
             break
     else:
         raise _changed_execution_input()
 
-    assert runtime is not None and coverage is not None and authority is not None
+    assert paths is not None and runtime is not None and coverage is not None and authority is not None
     missing_article_ids = tuple(node.id for node in runtime.nodes if node.article_id is None)
     if missing_article_ids:
         raise ExecutionInputError(
@@ -252,6 +298,8 @@ def load_execution_input(
             ExecutionNodeBinding(binding.node_id, binding.unit)
             for binding in coverage.node_bindings
         ),
+        workspace_project_id=paths.workspace_project_id,
+        workspace_manifest_sha256=paths.workspace_manifest_sha256,
     )
 
 

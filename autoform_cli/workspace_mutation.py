@@ -33,6 +33,7 @@ from .workspace_manifest import (
     path_keys_overlap,
     portable_name_key,
     portable_path_key,
+    uses_reserved_repository_root,
     valid_blueprint_member,
     valid_identifier,
     valid_relative_path,
@@ -95,10 +96,16 @@ def initialize_workspace(
 ) -> WorkspaceInitResult:
     """Create a root manifest and its blueprint collection without creating a vault."""
 
+    _require_workspace_mutation_support()
     if not valid_identifier(location_id):
         raise WorkspaceError(["location id is not portable"])
     if not valid_relative_path(blueprint_root, allow_dot=False):
         raise WorkspaceError(["blueprint root must be a portable repository-relative path"])
+    first_component = PurePosixPath(blueprint_root).parts[0]
+    if uses_reserved_repository_root(blueprint_root):
+        raise WorkspaceError(
+            [f"blueprint root uses reserved repository path: {first_component}"]
+        )
     try:
         root = Path(target).expanduser()
     except (OSError, RuntimeError, ValueError):
@@ -110,6 +117,7 @@ def initialize_workspace(
     except (OSError, RuntimeError, ValueError):
         raise WorkspaceError(["workspace target cannot be resolved"]) from None
     manifest_path = root / WORKSPACE_FILE
+    _reject_case_collisions(root, PurePosixPath(WORKSPACE_FILE))
     if manifest_path.exists() or manifest_path.is_symlink():
         raise WorkspaceError([f"{WORKSPACE_FILE} already exists"])
     collection = root / PurePosixPath(blueprint_root)
@@ -117,13 +125,19 @@ def initialize_workspace(
     _reject_existing_symlink_chain(collection, root)
     if collection.exists() and not collection.is_dir():
         raise WorkspaceError(["blueprint root exists and is not a directory"])
-    try:
-        collection.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        raise WorkspaceError(["blueprint root could not be created"]) from None
 
     text = _initial_manifest(location_id=location_id, blueprint_root=blueprint_root)
-    _publish_new_file(manifest_path, text.encode("utf-8"), mode=0o644)
+    manifest_identity = _publish_new_file(manifest_path, text.encode("utf-8"), mode=0o644)
+    created_directories: tuple[Path, ...] = ()
+    try:
+        created_directories = _create_directory_chain(
+            root,
+            PurePosixPath(blueprint_root),
+        )
+    except WorkspaceError:
+        _remove_created_directories(created_directories)
+        _remove_owned_file(manifest_path, manifest_identity)
+        raise
     return WorkspaceInitResult(root, WORKSPACE_FILE, location_id, blueprint_root)
 
 
@@ -295,6 +309,8 @@ def _validate_project_registration(
         raise WorkspaceError([f"workspace location {location_id!r} does not provide blueprints"])
 
     combined = PurePosixPath(location.path, path).as_posix()
+    if uses_reserved_repository_root(combined):
+        raise WorkspaceError([f"blueprint path uses reserved repository path: {combined}"])
     if expected_blueprint_path is not None and combined != expected_blueprint_path:
         raise WorkspaceError(["blueprint location changed during registration"])
     combined_key = portable_path_key(combined)
@@ -478,6 +494,9 @@ def _require_workspace_mutation_support() -> None:
         fcntl is not None,
         hasattr(os, "O_NOFOLLOW"),
         hasattr(os, "O_DIRECTORY"),
+        hasattr(os, "link"),
+        os.mkdir in os.supports_dir_fd,
+        os.open in os.supports_dir_fd,
     )
     if not all(required):
         raise WorkspaceError(
@@ -485,10 +504,10 @@ def _require_workspace_mutation_support() -> None:
         )
 
 
-def _publish_new_file(path: Path, content: bytes, *, mode: int) -> None:
-    if not hasattr(os, "link"):
-        raise WorkspaceError(["this platform cannot create a workspace manifest atomically"])
+def _publish_new_file(path: Path, content: bytes, *, mode: int) -> tuple[int, int]:
     temporary: Path | None = None
+    identity: tuple[int, int] | None = None
+    published = False
     try:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=path.parent,
@@ -501,11 +520,19 @@ def _publish_new_file(path: Path, content: bytes, *, mode: int) -> None:
             output.flush()
             os.fsync(output.fileno())
         temporary.chmod(mode)
+        metadata = temporary.stat(follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino)
         os.link(temporary, path)
+        published = True
         _fsync_directory(path.parent)
     except FileExistsError:
+        if published and identity is not None:
+            _remove_owned_file(path, identity)
+            raise WorkspaceError([f"could not create {path.name}"]) from None
         raise WorkspaceError([f"{path.name} already exists"]) from None
-    except OSError:
+    except Exception:
+        if published and identity is not None:
+            _remove_owned_file(path, identity)
         raise WorkspaceError([f"could not create {path.name}"]) from None
     finally:
         if temporary is not None:
@@ -513,6 +540,61 @@ def _publish_new_file(path: Path, content: bytes, *, mode: int) -> None:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+    assert identity is not None
+    return identity
+
+
+def _create_directory_chain(root: Path, relative: PurePosixPath) -> tuple[Path, ...]:
+    """Create a confined directory chain and report only directories created here."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    created: list[Path] = []
+    descriptor: int | None = None
+    current = root
+    try:
+        descriptor = os.open(root, flags)
+        for part in relative.parts:
+            next_path = current / part
+            try:
+                os.mkdir(part, mode=0o755, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise WorkspaceError(["blueprint root could not be created"]) from None
+            else:
+                created.append(next_path)
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except OSError:
+                raise WorkspaceError(["blueprint root could not be opened safely"]) from None
+            os.close(descriptor)
+            descriptor = next_descriptor
+            current = next_path
+    except WorkspaceError:
+        _remove_created_directories(tuple(created))
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return tuple(created)
+
+
+def _remove_created_directories(paths: tuple[Path, ...]) -> None:
+    for path in reversed(paths):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+def _remove_owned_file(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) == identity and stat.S_ISREG(metadata.st_mode):
+            path.unlink()
+            _fsync_directory(path.parent)
+    except OSError:
+        pass
 
 
 def _fsync_directory(path: Path) -> None:

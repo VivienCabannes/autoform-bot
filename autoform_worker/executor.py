@@ -53,12 +53,14 @@ class ProverExecutor:
         adapter_factory: AdapterFactory,
         *,
         max_steers: int = 3,
+        project_id: str | None = None,
     ) -> None:
         if max_steers < 0:
             raise ValueError("max_steers must be nonnegative")
         self.project_dir = Path(project_dir).expanduser().resolve()
         self._adapter_factory = adapter_factory
         self.max_steers = max_steers
+        self.project_id = project_id
 
     def __call__(self, item: WorkItem, cancelled: CancellationSignal) -> AttemptResult:
         adapter = self._adapter_factory()
@@ -177,11 +179,31 @@ class ProverExecutor:
 
     def _refreshed_runtime(self, item: WorkItem) -> tuple[RuntimeGraph | None, str]:
         if item.source_contract_sha256 is None:
-            return load_runtime_graph(self.project_dir, lean_root=self.project_dir), ""
+            return load_runtime_graph(
+                self.project_dir,
+                lean_root=self.project_dir,
+                project_id=item.workspace_project_id or self.project_id,
+            ), ""
         try:
-            execution_input = load_execution_input(self.project_dir, lean_root=self.project_dir)
+            execution_input = load_execution_input(
+                self.project_dir,
+                lean_root=self.project_dir,
+                project_id=item.workspace_project_id or self.project_id,
+            )
         except ExecutionInputError as error:
             return None, f"execution input became invalid during attempt: {error}"
+        if item.workspace_project_id is not None and (
+            getattr(execution_input, "workspace_project_id", None)
+            != item.workspace_project_id
+            or getattr(execution_input, "workspace_manifest_sha256", None)
+            != item.workspace_manifest_sha256
+        ):
+            return None, "workspace binding changed during attempt"
+        if (
+            item.blueprint_path is not None
+            and execution_input.runtime.blueprint_path != item.blueprint_path
+        ):
+            return None, "workspace binding changed during attempt"
         if execution_input.source_contract_sha256 != item.source_contract_sha256:
             return None, "source-coverage contract changed during attempt"
         if (

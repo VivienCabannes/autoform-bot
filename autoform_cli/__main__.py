@@ -30,6 +30,7 @@ from .claims import (
     pin_claim_repository,
     pin_claim_scratch,
     resource_claim_key,
+    workspace_author_claim_key,
 )
 from .doctor import diagnose_project
 from .graph import ARTICLE_ID_PATTERN, GraphValidationError, load_graph
@@ -104,7 +105,7 @@ class _PinnedDirectory:
 class _ResolvedClaimTarget:
     key: str
     label: str
-    legacy_key: str | None
+    compatibility_keys: tuple[str, ...]
     canonical_keys: tuple[str, ...]
     board_identity: _ClaimBoardIdentity
 
@@ -229,6 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             default=".",
             help="project or blueprint directory used to resolve the article (default: current directory)",
         )
+        command.add_argument("--project", help="registered workspace project id")
         _add_claim_board_arguments(command)
         if operation in {"acquire", "renew"}:
             command.add_argument("--ttl", type=int, default=CLAIM_TTL_S)
@@ -242,6 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--blueprint",
         help="project or blueprint directory required to retire legacy author refs safely",
     )
+    claim_cleanup.add_argument("--project", help="registered workspace project id")
 
     migrate = subparsers.add_parser("migrate", help="inspect authored migration contracts")
     migrate_subparsers = migrate.add_subparsers(dest="migrate_command", required=True)
@@ -261,7 +264,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
     render.add_argument("--project", help="registered workspace project id")
-    render.add_argument("-o", "--output", default="site-src", help="output directory")
+    render.add_argument(
+        "-o",
+        "--output",
+        help="output directory (default: site-src, or site-src/<project-id> in a workspace)",
+    )
     render.add_argument("--lean-root", type=Path, help="Lean project to link code from")
     render.add_argument("--repository-url", help="project URL, e.g. https://github.com/owner/repo")
     render.add_argument("--ref", help="commit or branch the code links should pin")
@@ -611,7 +618,7 @@ def _claim(args: argparse.Namespace) -> int:
             board_identity = None
             if args.blueprint is not None:
                 try:
-                    paths = resolve_runtime_paths(args.blueprint)
+                    paths = resolve_runtime_paths(args.blueprint, project_id=args.project)
                     blueprint = paths.blueprint_dir
                     project_pin = _PinnedDirectory.capture(
                         paths.project_root,
@@ -633,8 +640,15 @@ def _claim(args: argparse.Namespace) -> int:
                     raise ValueError(str(exc)) from exc
                 except GraphValidationError as exc:
                     raise ValueError("; ".join(exc.issues)) from exc
+                key_factory = (
+                    (lambda article_id: workspace_author_claim_key(
+                        paths.workspace_project_id, article_id
+                    ))
+                    if paths.workspace_project_id is not None
+                    else author_claim_key
+                )
                 canonical_keys = tuple(
-                    author_claim_key(node.article_id)
+                    key_factory(node.article_id)
                     for node in graph.nodes.values()
                     if node.article_id is not None
                 )
@@ -651,10 +665,10 @@ def _claim(args: argparse.Namespace) -> int:
 
         target = _resolve_claim_target(args)
         board = _claim_board(args, identity=target.board_identity)
-        if operation in {"acquire", "renew"} and target.legacy_key is not None:
+        if operation in {"acquire", "renew"} and target.compatibility_keys:
             if not board.prepare_v2_claim(
                 target.key,
-                [target.legacy_key],
+                target.compatibility_keys,
                 canonical_keys=target.canonical_keys,
             ):
                 print(
@@ -774,7 +788,7 @@ def _resolve_claim_target(
         return _ResolvedClaimTarget(
             resource_claim_key(resource),
             resource,
-            author_claim_key(resource),
+            (author_claim_key(resource),),
             (),
             identity,
         )
@@ -782,7 +796,7 @@ def _resolve_claim_target(
         raise ValueError("an article target or --resource is required")
 
     try:
-        paths = resolve_runtime_paths(args.blueprint)
+        paths = resolve_runtime_paths(args.blueprint, project_id=args.project)
         blueprint = paths.blueprint_dir
         project_pin = _PinnedDirectory.capture(paths.project_root, label="claim project")
         blueprint_pin = _PinnedDirectory.capture(blueprint, label="claim blueprint")
@@ -812,18 +826,32 @@ def _resolve_claim_target(
             f"article {node.id!r} has no durable article_id; "
             f"run 'autoform migrate article-ids {blueprint}' and add the proposed ID"
         )
-    canonical_keys = tuple(
-        author_claim_key(candidate.article_id)
-        for candidate in graph.nodes.values()
-        if candidate.article_id is not None
-    )
+    if paths.workspace_project_id is None:
+        key = author_claim_key(node.article_id)
+        compatibility_keys = (author_claim_key(node.id),)
+        canonical_keys = tuple(
+            author_claim_key(candidate.article_id)
+            for candidate in graph.nodes.values()
+            if candidate.article_id is not None
+        )
+    else:
+        key = workspace_author_claim_key(paths.workspace_project_id, node.article_id)
+        compatibility_keys = (
+            author_claim_key(node.article_id),
+            author_claim_key(node.id),
+        )
+        canonical_keys = tuple(
+            workspace_author_claim_key(paths.workspace_project_id, candidate.article_id)
+            for candidate in graph.nodes.values()
+            if candidate.article_id is not None
+        )
     identity = _resolve_claim_board_identity(args, context=paths.project_root)
     project_pin.verify(label="claim project")
     blueprint_pin.verify(label="claim blueprint")
     return _ResolvedClaimTarget(
-        author_claim_key(node.article_id),
+        key,
         node.id,
-        author_claim_key(node.id),
+        compatibility_keys,
         canonical_keys,
         identity,
     )
@@ -996,10 +1024,18 @@ def _default_claim_scratch(repo: str, session_id: str) -> Path:
 
 def _render(args: argparse.Namespace) -> int:
     try:
-        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
+        paths = resolve_runtime_paths(args.blueprint_dir, project_id=args.project)
+        blueprint_dir = paths.blueprint_dir
+        output = args.output
+        if output is None:
+            output = (
+                str(Path("site-src") / paths.workspace_project_id)
+                if paths.workspace_project_id is not None
+                else "site-src"
+            )
         report = render_site(
             blueprint_dir,
-            args.output,
+            output,
             lean_root=args.lean_root,
             repository_url=args.repository_url,
             ref=args.ref,

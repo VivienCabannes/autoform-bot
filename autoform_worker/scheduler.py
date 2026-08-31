@@ -22,6 +22,7 @@ from autoform_cli.claims import (
     ClaimBoard,
     ClaimTransportError,
     author_claim_key,
+    workspace_author_claim_key,
 )
 from autoform_cli.execution_input import ExecutionInput, load_execution_input
 from autoform_cli.runtime import RuntimeGraph, RuntimeNode
@@ -65,6 +66,9 @@ class WorkItem:
     source_revision: str
     source_contract_sha256: str | None = None
     protected_roadmap_sha256: str | None = None
+    workspace_project_id: str | None = None
+    workspace_manifest_sha256: str | None = None
+    blueprint_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +225,7 @@ class Scheduler:
         claim_scratch: str | Path,
         executor: Executor,
         lean_root: str | Path | None = None,
+        project_id: str | None = None,
         max_attempts: int = 3,
         claim_ttl: int | float = CLAIM_TTL_S,
         heartbeat_interval: float = CLAIM_HEARTBEAT_S,
@@ -228,7 +233,11 @@ class Scheduler:
         """Build a scheduler using the shared runtime loader and claim board."""
 
         def runtime_loader() -> ExecutionInput:
-            return load_execution_input(project_or_blueprint, lean_root=lean_root)
+            return load_execution_input(
+                project_or_blueprint,
+                lean_root=lean_root,
+                project_id=project_id,
+            )
 
         board = ClaimBoard(claim_repo, worker_id, claim_scratch)
         return cls(
@@ -280,7 +289,9 @@ class Scheduler:
         race-safe readiness check and happens in :meth:`run_once`.
         """
 
-        runtime, source_contract_sha256 = _runtime_projection(runtime or self._runtime_loader())
+        projection = _runtime_projection(runtime or self._runtime_loader())
+        runtime = projection.runtime
+        source_contract_sha256 = projection.source_contract_sha256
         with self._lock:
             self._propagate_blocked(runtime)
             items: list[WorkItem] = []
@@ -307,6 +318,9 @@ class Scheduler:
                             if source_contract_sha256 is not None
                             else None
                         ),
+                        workspace_project_id=projection.workspace_project_id,
+                        workspace_manifest_sha256=projection.workspace_manifest_sha256,
+                        blueprint_path=runtime.blueprint_path,
                     )
                 )
             return tuple(sorted(items, key=lambda item: item.node.id))
@@ -328,7 +342,8 @@ class Scheduler:
             return RoundResult(None, None, "scheduler cancelled before selection")
 
         projection = self._runtime_loader()
-        runtime, _source_contract_sha256 = _runtime_projection(projection)
+        runtime_projection = _runtime_projection(projection)
+        runtime = runtime_projection.runtime
         candidates = self.ready_items(projection)
         if node_id is not None:
             candidates = tuple(item for item in candidates if item.node.id == node_id)
@@ -336,19 +351,30 @@ class Scheduler:
             return RoundResult(None, None, "no ready work")
 
         canonical_keys = tuple(
-            author_claim_key(_required_article_id(node))
+            _article_claim_key(
+                runtime_projection.workspace_project_id,
+                _required_article_id(node),
+            )
             for node in runtime.nodes
             if node.article_id is not None
         )
         for item in candidates:
             if cancelled.is_set():
                 return RoundResult(None, None, "scheduler cancelled before claim")
-            key = author_claim_key(_required_article_id(item.node))
-            legacy_key = author_claim_key(item.node.id)
+            key = _article_claim_key(
+                runtime_projection.workspace_project_id,
+                _required_article_id(item.node),
+            )
+            compatibility_keys = [author_claim_key(item.node.id)]
+            if runtime_projection.workspace_project_id is not None:
+                compatibility_keys.insert(
+                    0,
+                    author_claim_key(_required_article_id(item.node)),
+                )
             try:
                 prepared = self._board.prepare_v2_claim(
                     key,
-                    (legacy_key,),
+                    tuple(compatibility_keys),
                     canonical_keys=canonical_keys,
                 )
             except ClaimTransportError as error:
@@ -368,9 +394,17 @@ class Scheduler:
         return RoundResult(None, None, "ready work is claimed by other workers")
 
     def _refresh_claimed(self, item: WorkItem) -> WorkItem | RoundResult:
-        runtime, source_contract_sha256 = _runtime_projection(self._runtime_loader())
+        projection = _runtime_projection(self._runtime_loader())
+        runtime = projection.runtime
+        source_contract_sha256 = projection.source_contract_sha256
         if item.source_contract_sha256 != source_contract_sha256:
             return RoundResult(None, None, "claimed work source-coverage contract changed")
+        if (
+            item.workspace_project_id != projection.workspace_project_id
+            or item.workspace_manifest_sha256 != projection.workspace_manifest_sha256
+            or item.blueprint_path != runtime.blueprint_path
+        ):
+            return RoundResult(None, None, "claimed work workspace binding changed")
         node = next((candidate for candidate in runtime.nodes if candidate.id == item.node.id), None)
         if node is None:
             return RoundResult(None, None, f"claimed node {item.node.id!r} no longer exists")
@@ -408,6 +442,9 @@ class Scheduler:
             source_revision=runtime.source_revision,
             source_contract_sha256=source_contract_sha256,
             protected_roadmap_sha256=item.protected_roadmap_sha256,
+            workspace_project_id=item.workspace_project_id,
+            workspace_manifest_sha256=item.workspace_manifest_sha256,
+            blueprint_path=item.blueprint_path,
         )
 
     def _run_claimed(self, item: WorkItem, key: str, cancelled: CancellationSignal) -> RoundResult:
@@ -524,10 +561,29 @@ def _required_article_id(node: RuntimeNode) -> str:
     return article_id
 
 
-def _runtime_projection(value: RuntimeGraph | ExecutionInput) -> tuple[RuntimeGraph, str | None]:
+@dataclass(frozen=True, slots=True)
+class _RuntimeProjection:
+    runtime: RuntimeGraph
+    source_contract_sha256: str | None
+    workspace_project_id: str | None
+    workspace_manifest_sha256: str | None
+
+
+def _runtime_projection(value: RuntimeGraph | ExecutionInput) -> _RuntimeProjection:
     if isinstance(value, ExecutionInput):
-        return value.runtime, value.source_contract_sha256
-    return value, None
+        return _RuntimeProjection(
+            value.runtime,
+            value.source_contract_sha256,
+            value.workspace_project_id,
+            value.workspace_manifest_sha256,
+        )
+    return _RuntimeProjection(value, None, None, None)
+
+
+def _article_claim_key(project_id: str | None, article_id: str) -> str:
+    if project_id is None:
+        return author_claim_key(article_id)
+    return workspace_author_claim_key(project_id, article_id)
 
 
 def _protected_roadmap_sha256(runtime: RuntimeGraph, selected: RuntimeNode) -> str:

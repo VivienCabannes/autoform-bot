@@ -346,6 +346,16 @@ def target_resolution_ref(key: str) -> str:
     return TARGET_RESOLUTION_REF_PREFIX + key.removeprefix("merge/")
 
 
+def workspace_author_claim_key(project_id: str, article_id: str) -> str:
+    """Return an article claim key scoped to one stable workspace project id."""
+
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("workspace project id must not be empty")
+    project = author_claim_key(project_id).removeprefix("author/")
+    article = author_claim_key(article_id).removeprefix("author/")
+    return f"author/workspace-{project}/{article}"
+
+
 def resource_claim_key(resource: str) -> str:
     """Return a ref-safe key in the namespace for non-article resources."""
     if not isinstance(resource, str):
@@ -1212,7 +1222,7 @@ class ClaimBoard:
             if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
                 return True
             if (
-                lease.get("schema") != LEGACY_CLAIM_SCHEMA
+                lease.get("schema") not in {LEGACY_CLAIM_SCHEMA, CLAIM_SCHEMA}
                 or self.recovery_required(lease)
                 or not self.expired(lease)
             ):
@@ -1747,4 +1757,5 @@ __all__ = [
     "resource_claim_key",
     "target_resolution_ref",
     "TARGET_RESOLUTION_REF_PREFIX",
+    "workspace_author_claim_key",
 ]

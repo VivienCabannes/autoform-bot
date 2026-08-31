@@ -13,7 +13,8 @@ from autoform_cli.execution_input import (
     ExecutionInputError,
     load_execution_input,
 )
-from autoform_cli.runtime import RUNTIME_SCHEMA, load_runtime_graph
+from autoform_cli.runtime import RUNTIME_SCHEMA, RuntimeProjectionError, load_runtime_graph
+from autoform_cli.workspace_mutation import initialize_workspace, register_blueprint_project
 
 
 def _digest(data: bytes) -> str:
@@ -91,6 +92,52 @@ def test_builds_deterministic_deeply_immutable_execution_input(tmp_path: Path) -
         first.artifact_path = "changed"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         first.units[0].unit = "changed"  # type: ignore[misc]
+
+
+def test_execution_input_binds_registered_workspace_project_and_manifest(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    initialize_workspace(project, blueprint_root="Plans")
+    (project / "blueprint").rename(project / "Plans/One")
+    register_blueprint_project(project, project_id="one", title="One", path="One")
+
+    first = load_execution_input(project, project_id="one")
+    assert first.workspace_project_id == "one"
+    assert first.workspace_manifest_sha256 is not None
+    assert first.runtime.blueprint_path == "Plans/One"
+    assert first.as_dict()["workspace"] == {
+        "blueprint_path": "Plans/One",
+        "manifest_sha256": first.workspace_manifest_sha256,
+        "project_id": "one",
+    }
+
+    manifest = project / ".autoform.toml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8")
+        + '\n[locations.notes]\npath = "Notes"\nprovides = ["lean-source"]\n',
+        encoding="utf-8",
+    )
+    second = load_execution_input(project, project_id="one")
+    assert second.workspace_manifest_sha256 != first.workspace_manifest_sha256
+    assert second.sha256 != first.sha256
+
+
+def test_legacy_project_snapshot_explicitly_uses_workspace_aware_v2(tmp_path: Path) -> None:
+    snapshot = load_execution_input(_project(tmp_path))
+
+    assert snapshot.as_dict()["workspace"] == {
+        "blueprint_path": "blueprint",
+        "manifest_sha256": None,
+        "project_id": None,
+    }
+    legacy_payload = snapshot.as_dict()
+    legacy_payload["schema"] = "autoform-execution-input/v1"
+    legacy_payload.pop("workspace")
+    legacy_sha256 = _digest(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    assert snapshot.sha256 != legacy_sha256
 
 
 def test_runtime_v1_shape_does_not_gain_coverage_fields(tmp_path: Path) -> None:
@@ -439,3 +486,31 @@ def test_execution_input_fails_closed_after_bounded_continuous_mutation(
 
     assert calls == execution_module._EXECUTION_INPUT_READ_ATTEMPTS
     assert [issue.code for issue in raised.value.issues] == ["execution-input-changed"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeProjectionError(["transient projection failure"]), OSError("transient read failure")],
+)
+def test_execution_input_retries_final_path_projection_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    project = _project(tmp_path)
+    original = execution_module.resolve_runtime_paths
+    calls = 0
+
+    def fail_first_final_read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise failure
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module, "resolve_runtime_paths", fail_first_final_read)
+
+    snapshot = load_execution_input(project)
+
+    assert calls == 4
+    assert snapshot.runtime.blueprint_path == "blueprint"

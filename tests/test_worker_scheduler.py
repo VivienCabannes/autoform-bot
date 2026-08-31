@@ -6,8 +6,8 @@ from dataclasses import dataclass, replace
 
 import pytest
 
-from autoform_cli.claims import author_claim_key
-from autoform_cli.execution_input import ExecutionInputError
+from autoform_cli.claims import author_claim_key, workspace_author_claim_key
+from autoform_cli.execution_input import EXECUTION_INPUT_SCHEMA, ExecutionInput, ExecutionInputError
 from autoform_cli.runtime import (
     RuntimeAssertions,
     RuntimeGraph,
@@ -85,6 +85,26 @@ def _runtime(*nodes: RuntimeNode) -> RuntimeGraph:
     )
 
 
+def _workspace_input(project_id: str, *nodes: RuntimeNode) -> ExecutionInput:
+    runtime = replace(_runtime(*nodes), blueprint_path=f"Plans/{project_id}")
+    return ExecutionInput(
+        schema=EXECUTION_INPUT_SCHEMA,
+        runtime=runtime,
+        runtime_sha256="1" * 64,
+        coverage_schema="autoform-coverage/v2",
+        coverage_path="coverage/README.md",
+        coverage_sha256="2" * 64,
+        artifact_path="sources/source.md",
+        artifact_sha256="3" * 64,
+        units=(),
+        node_bindings=(),
+        authority_sha256="4" * 64,
+        lean_source_revision=None,
+        workspace_project_id=project_id,
+        workspace_manifest_sha256="5" * 64,
+    )
+
+
 class FakeHeartbeat:
     def __init__(self, *, lose_on_exit: bool = False) -> None:
         self.lost = threading.Event()
@@ -151,6 +171,54 @@ def test_ready_items_are_sorted_and_distinguish_statement_from_proof() -> None:
         ("z-statement", WorkPhase.STATEMENT, 1),
     ]
     assert all(item.source_revision == runtime.source_revision for item in items)
+
+
+def test_scheduler_namespaces_workspace_claims_and_binds_work_items() -> None:
+    node = _node("same")
+    first_input = _workspace_input("one", node)
+    second_input = _workspace_input("two", node)
+    first_board = FakeBoard()
+    second_board = FakeBoard()
+
+    def executor(item, cancelled):
+        return AttemptResult.succeeded()
+
+    first = Scheduler(lambda: first_input, first_board, executor, claim_ttl=60, heartbeat_interval=5)
+    second = Scheduler(lambda: second_input, second_board, executor, claim_ttl=60, heartbeat_interval=5)
+
+    first_item = first.ready_items()[0]
+    second_item = second.ready_items()[0]
+    assert first_item.workspace_project_id == "one"
+    assert first_item.workspace_manifest_sha256 == "5" * 64
+    assert first_item.blueprint_path == "Plans/one"
+    assert second_item.workspace_project_id == "two"
+    assert first.run_once().progressed
+    assert second.run_once().progressed
+    assert first_board.acquired[0][0] == workspace_author_claim_key("one", node.article_id)
+    assert second_board.acquired[0][0] == workspace_author_claim_key("two", node.article_id)
+    assert first_board.acquired[0][0] != second_board.acquired[0][0]
+
+
+def test_scheduler_fails_closed_when_workspace_manifest_changes_after_claim() -> None:
+    node = _node("target")
+    first = _workspace_input("one", node)
+    changed = replace(first, workspace_manifest_sha256="6" * 64)
+    projections = iter((first, changed))
+    board = FakeBoard()
+    executed = []
+    scheduler = Scheduler(
+        lambda: next(projections),
+        board,
+        lambda item, cancelled: executed.append(item) or AttemptResult.succeeded(),
+        claim_ttl=60,
+        heartbeat_interval=5,
+    )
+
+    result = scheduler.run_once()
+
+    assert not result.progressed
+    assert result.detail == "claimed work workspace binding changed"
+    assert executed == []
 
 
 def test_fresh_projection_advances_successful_statement_to_proof() -> None:

@@ -11,6 +11,7 @@ from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .runtime import RuntimeProjectionError, resolve_runtime_paths
 from .workspace import (
+    WorkspaceDiagnostic,
     discover_workspace,
     inspect_workspace,
 )
@@ -18,6 +19,7 @@ from .workspace_manifest import (
     BLUEPRINT_LIST_SCHEMA,
     WORKSPACE_CHECK_SCHEMA,
     WORKSPACE_ERROR_SCHEMA,
+    WORKSPACE_FILE,
     WorkspaceError,
 )
 from .workspace_mutation import (
@@ -242,8 +244,18 @@ def run_blueprint_command(args: argparse.Namespace) -> int:
 def _check_workspace(args: argparse.Namespace) -> int:
     inspection = inspect_workspace(args.target)
     workspace = inspection.workspace
+    diagnostics = list(inspection.diagnostics)
+    if not workspace.manifest.projects:
+        diagnostics.append(
+            WorkspaceDiagnostic(
+                "error",
+                "projects-empty",
+                "Workspace verification requires at least one registered blueprint.",
+                WORKSPACE_FILE,
+            )
+        )
     results: list[dict[str, object]] = []
-    failed = not inspection.ok
+    failed = any(item.severity == "error" for item in diagnostics)
     linker = build_linker(args.lean_root) if args.lean_root is not None else None
     for project in workspace.manifest.projects:
         blueprint_dir = workspace.blueprint_path(project)
@@ -284,7 +296,7 @@ def _check_workspace(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "diagnostics": [item.as_dict() for item in inspection.diagnostics],
+                    "diagnostics": [item.as_dict() for item in diagnostics],
                     "ok": not failed,
                     "projects": results,
                     "schema": WORKSPACE_CHECK_SCHEMA,
@@ -302,7 +314,7 @@ def _check_workspace(args: argparse.Namespace) -> int:
             )
             for issue in result["issues"]:
                 print(f"error: {result['project']}: {issue}")
-        for diagnostic in inspection.diagnostics:
+        for diagnostic in diagnostics:
             location = f" {diagnostic.path}" if diagnostic.path else ""
             print(
                 f"{diagnostic.severity}: {diagnostic.code}{location}: {diagnostic.message}",

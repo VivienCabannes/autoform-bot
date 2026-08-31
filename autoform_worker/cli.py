@@ -18,6 +18,7 @@ from .scheduler import Scheduler
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autoform-worker")
     parser.add_argument("--project", type=Path, default=Path.cwd())
+    parser.add_argument("--workspace-project", help="registered workspace project id")
     parser.add_argument("--claim-repo", required=True, help="Git repository used for claim refs")
     parser.add_argument(
         "--worker-id",
@@ -41,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
         project,
         backend_factory(args.backend, timeout=args.timeout),
         max_steers=args.max_steers,
+        project_id=args.workspace_project,
     )
     with tempfile.TemporaryDirectory(prefix="autoform-claims-") as scratch:
         scheduler = Scheduler.for_project(
@@ -50,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             claim_scratch=scratch,
             executor=executor,
             lean_root=project,
+            project_id=args.workspace_project,
             max_attempts=args.max_attempts,
             claim_ttl=args.claim_ttl,
             heartbeat_interval=args.heartbeat_interval,

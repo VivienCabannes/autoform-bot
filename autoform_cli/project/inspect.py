@@ -108,7 +108,7 @@ def _inspection(
         lake_manifest_sha256=None,
         lean=None,
         mathlib=None,
-        autoform=AutoformProject(False, None, (), None, None, None, None, None),
+        autoform=AutoformProject(False, None, None, None, None),
         compatibility=ProjectCompatibility(
             catalog=catalog.schema,
             status="indeterminate",
@@ -555,6 +555,10 @@ def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]
             WORKSPACE_FILE,
         )
     elif manifest_status == "file":
+        # A root workspace manifest owns blueprint selection. On a
+        # case-insensitive filesystem, probing the legacy lowercase path can
+        # otherwise alias a registered location such as ``Blueprint``.
+        values["blueprint_path"] = None
         content = _read_file(root_descriptor, WORKSPACE_FILE, "autoform-manifest", diagnostics)
         if content is not None:
             manifest_sha256 = hashlib.sha256(content).hexdigest()

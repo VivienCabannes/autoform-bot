@@ -61,6 +61,59 @@ def test_manifest_uses_repository_neutral_named_locations() -> None:
     assert manifest.project("problem-a").blueprint_path == "ProblemA"
 
 
+@pytest.mark.parametrize(
+    ("text", "unknown"),
+    [
+        (
+            'schema = "autoform-workspace/v1"\nproject = {}\n'
+            '[locations.plans]\npath = "Plans"\nprovides = ["blueprints"]\n',
+            "project",
+        ),
+        (
+            'schema = "autoform-workspace/v1"\n'
+            '[locations.plans]\npath = "Plans"\nprovide = ["blueprints"]\n',
+            "provide",
+        ),
+        (
+            'schema = "autoform-workspace/v1"\n'
+            '[locations.plans]\npath = "Plans"\nprovides = ["blueprints"]\n'
+            '[projects.one]\ntitel = "One"\n'
+            'blueprint = { location = "plans", path = "One" }\n',
+            "titel",
+        ),
+        (
+            'schema = "autoform-workspace/v1"\n'
+            '[locations.plans]\npath = "Plans"\nprovides = ["blueprints"]\n'
+            '[projects.one]\nblueprint = { location = "plans", paths = "One" }\n',
+            "paths",
+        ),
+    ],
+)
+def test_manifest_rejects_unknown_keys_at_every_schema_level(text: str, unknown: str) -> None:
+    with pytest.raises(WorkspaceError, match=unknown):
+        parse_workspace(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            'schema = "autoform-workspace/v1"\n'
+            '[locations.plans]\npath = ".git"\nprovides = ["blueprints"]\n'
+        ),
+        (
+            'schema = "autoform-workspace/v1"\n'
+            '[locations.root]\npath = "."\nprovides = ["blueprints"]\n'
+            '[projects.control]\n'
+            'blueprint = { location = "root", path = ".autoform.toml" }\n'
+        ),
+    ],
+)
+def test_manifest_rejects_reserved_repository_paths(text: str) -> None:
+    with pytest.raises(WorkspaceError, match="reserved repository path"):
+        parse_workspace(text)
+
+
 def test_workspace_init_creates_only_root_manifest_and_collection(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     root.mkdir()
@@ -71,7 +124,28 @@ def test_workspace_init_creates_only_root_manifest_and_collection(tmp_path: Path
     assert (root / ".autoform.toml").is_file()
     assert (root / "Blueprint").is_dir()
     assert list((root / "Blueprint").iterdir()) == []
-    assert not (root / "blueprint").exists()
+    assert {path.name for path in root.iterdir()} == {".autoform.toml", "Blueprint"}
+
+
+def test_workspace_manifest_name_must_have_canonical_case(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    alias = root / ".AUTOFORM.TOML"
+    alias.write_text(
+        'schema = "autoform-workspace/v1"\n'
+        '[locations.plans]\npath = "Plans"\nprovides = ["blueprints"]\n'
+        '[projects]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkspaceError, match="not portable"):
+        initialize_workspace(root, blueprint_root="Plans")
+    with pytest.raises(WorkspaceError, match="not portable"):
+        load_workspace(root)
+    with pytest.raises(WorkspaceError, match="not portable"):
+        discover_workspace(root)
+
+    assert {path.name for path in root.iterdir()} == {alias.name}
 
 
 def test_workspace_init_rejects_case_colliding_collection(tmp_path: Path) -> None:
@@ -274,6 +348,92 @@ def test_workspace_mutation_fails_before_writing_on_an_unsupported_platform(
     assert load_workspace(root).manifest.projects == ()
 
 
+def test_workspace_init_fails_before_writing_on_an_unsupported_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    monkeypatch.setattr(workspace_module, "fcntl", None)
+
+    with pytest.raises(WorkspaceError, match="platform"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("blueprint_root", [".autoform.toml/vaults", ".git/autoform", ".HG/plans"])
+def test_workspace_init_rejects_reserved_roots_without_writing(
+    tmp_path: Path, blueprint_root: str
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    with pytest.raises(WorkspaceError, match="reserved"):
+        initialize_workspace(root, blueprint_root=blueprint_root)
+
+    assert list(root.iterdir()) == []
+
+
+def test_workspace_init_path_collision_restores_exact_tree(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    collision = root / "Control"
+    collision.write_text("repository-owned\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="blueprint root"):
+        initialize_workspace(root, blueprint_root="Control/Plans")
+
+    assert {path.name for path in root.iterdir()} == {"Control"}
+    assert collision.read_text(encoding="utf-8") == "repository-owned\n"
+
+
+def test_workspace_init_removes_manifest_after_post_link_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def fail_fsync(_path: Path) -> None:
+        raise OSError("injected directory sync failure")
+
+    monkeypatch.setattr(workspace_module, "_fsync_directory", fail_fsync)
+    with pytest.raises(WorkspaceError, match="could not create"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert list(root.iterdir()) == []
+
+
+def test_concurrent_workspace_init_loser_leaves_no_collection(tmp_path: Path) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "autoform_cli",
+                "workspace",
+                "init",
+                str(root),
+                "--blueprint-root",
+                collection,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for collection in ("PlansA", "PlansB")
+    ]
+    results = [process.communicate(timeout=30) + (process.returncode,) for process in processes]
+
+    assert sorted(result[2] for result in results) == [0, 1], results
+    manifest = load_workspace(root).manifest
+    winner = manifest.locations[0].path
+    loser = "PlansB" if winner == "PlansA" else "PlansA"
+    assert (root / winner).is_dir()
+    assert not (root / loser).exists()
+
+
 def test_workspace_resolution_requires_a_project_at_multi_project_root(tmp_path: Path) -> None:
     root = _workspace(tmp_path)
     create_blueprint_project(root, project_id="one", title="One", path="One")
@@ -285,10 +445,14 @@ def test_workspace_resolution_requires_a_project_at_multi_project_root(tmp_path:
     selected = resolve_runtime_paths(root, project_id="two")
     assert selected.project_root == root.resolve()
     assert selected.blueprint_dir == (root / "Plans/Two").resolve()
+    assert selected.workspace_project_id == "two"
+    assert selected.workspace_manifest_sha256 is not None
 
     inferred = resolve_runtime_paths(root / "Plans/One/roadmap")
     assert inferred.project_root == root.resolve()
     assert inferred.blueprint_dir == (root / "Plans/One").resolve()
+    assert inferred.workspace_project_id == "one"
+    assert inferred.workspace_manifest_sha256 == selected.workspace_manifest_sha256
 
 
 def test_project_selector_requires_a_workspace_manifest(tmp_path: Path) -> None:
@@ -344,6 +508,32 @@ def test_workspace_check_visits_only_registered_blueprints(tmp_path: Path, capsy
     assert [project["project"] for project in payload["projects"]] == ["one", "two"]
 
 
+def test_workspace_check_refuses_to_succeed_without_registered_projects(
+    tmp_path: Path, capsys
+) -> None:
+    root = _workspace(tmp_path)
+
+    assert main(["workspace", "check", str(root), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["projects"] == []
+    assert [item["code"] for item in payload["diagnostics"]] == ["projects-empty"]
+
+
+def test_workspace_check_with_lean_root_rejects_missing_declarations(
+    tmp_path: Path, capsys
+) -> None:
+    root = _workspace(tmp_path)
+    create_blueprint_project(root, project_id="one", title="One", path="One")
+    (root / "Plans/One/roadmap/missing.md").write_text(
+        "---\ndeclaration: theorem\nlean: Definitely.Missing\n---\n\n# Missing\n",
+        encoding="utf-8",
+    )
+
+    assert main(["workspace", "check", str(root), "--lean-root", str(root)]) == 1
+    assert "declaration not found: Definitely.Missing" in capsys.readouterr().out
+
+
 def test_workspace_check_rejects_roadmap_symlinks_like_single_project_check(
     tmp_path: Path, capsys
 ) -> None:
@@ -362,6 +552,7 @@ def test_workspace_check_rejects_roadmap_symlinks_like_single_project_check(
 
 def test_workspace_check_labels_nonfatal_diagnostics_as_warnings(tmp_path: Path, capsys) -> None:
     root = _workspace(tmp_path)
+    create_blueprint_project(root, project_id="one", title="One", path="One")
     manifest = root / ".autoform.toml"
     manifest.write_text(
         manifest.read_text(encoding="utf-8")
@@ -452,6 +643,23 @@ def test_workspace_cli_creates_lists_and_checks_projects(tmp_path: Path, capsys)
     assert (root / "Roadmaps/FiniteFlat/structure.md").is_file()
 
 
+def test_workspace_render_defaults_to_project_scoped_output(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    create_blueprint_project(root, project_id="one", title="One", path="One")
+    create_blueprint_project(root, project_id="two", title="Two", path="Two")
+    monkeypatch.chdir(root)
+
+    assert main(["render", ".", "--project", "one"]) == 0
+    capsys.readouterr()
+    assert main(["render", ".", "--project", "two"]) == 0
+    capsys.readouterr()
+
+    assert (root / "site-src/one/README.md").is_file()
+    assert (root / "site-src/two/README.md").is_file()
+
+
 def test_manifest_rejects_case_colliding_blueprint_paths() -> None:
     with pytest.raises(WorkspaceError, match="same path"):
         parse_workspace(
@@ -511,6 +719,16 @@ def test_workspace_paths_are_portable_to_windows(tmp_path: Path, path: str) -> N
     assert not (root / ".autoform.toml").exists()
 
 
+def test_workspace_project_id_is_safe_as_a_publication_directory(tmp_path: Path) -> None:
+    root = _workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="project id is not portable"):
+        create_blueprint_project(root, project_id="CON", title="Reserved")
+
+    assert list((root / "Plans").iterdir()) == []
+    assert load_workspace(root).manifest.projects == ()
+
+
 def test_workspace_json_results_have_operation_specific_schemas(tmp_path: Path, capsys) -> None:
     root = tmp_path / "repository"
     root.mkdir()
@@ -554,13 +772,15 @@ def test_creation_rejects_case_collision_with_unregistered_sibling(tmp_path: Pat
             path="existingwork",
         )
 
-    assert not (root / "Plans/existingwork").exists()
+    assert {path.name for path in (root / "Plans").iterdir()} == {"ExistingWork"}
     assert discover_workspace(root).manifest.projects == ()
 
 
 def test_loading_rejects_case_colliding_registered_and_unregistered_paths(tmp_path: Path) -> None:
     root = _workspace(tmp_path)
     create_blueprint_project(root, project_id="example", title="Example", path="Example")
+    if (root / "Plans/example").exists():
+        pytest.skip("case-only sibling names cannot coexist on this filesystem")
     (root / "Plans/example").mkdir()
 
     with pytest.raises(WorkspaceError, match="not portable"):
