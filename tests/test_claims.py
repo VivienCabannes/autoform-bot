@@ -138,6 +138,58 @@ def test_claim_fence_rejects_mismatched_or_malformed_fields() -> None:
         claims.ClaimFence("author/node", claims.CLAIM_REF_PREFIX + "author/node", "1" * 40, "bad")
 
 
+def test_author_claim_handoff_ref_is_deterministic_and_namespaced() -> None:
+    first = claims.claim_handoff_ref("author/chapter-1")
+
+    assert first == claims.claim_handoff_ref("author/chapter-1")
+    assert first.startswith(claims.CLAIM_HANDOFF_REF_PREFIX)
+    assert first != claims.claim_handoff_ref("author/chapter-2")
+    with pytest.raises(ValueError, match="only author claims"):
+        claims.claim_handoff_ref("resource/lean-server")
+
+
+def test_author_handoff_barrier_blocks_claim_acquisition(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    key = "author/node"
+    tree = _git("mktree", cwd=board_repo, input_text="")
+    candidate = _git("commit-tree", tree, "-m", "queued candidate", cwd=board_repo)
+    _git("update-ref", claims.claim_handoff_ref(key), candidate, cwd=board_repo)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert not board.acquire(key, ttl=600)
+    assert board.read(key) is None
+
+
+def test_author_handoff_race_rolls_back_new_claim(
+    tmp_path: Path,
+    board_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "author/node"
+    handoff_ref = claims.claim_handoff_ref(key)
+    tree = _git("mktree", cwd=board_repo, input_text="")
+    candidate = _git("commit-tree", tree, "-m", "queued candidate", cwd=board_repo)
+    board = _board(tmp_path, board_repo, "worker-a")
+    original_remote_ref_oid = board._remote_ref_oid
+    handoff_reads = 0
+
+    def race_remote_ref_oid(ref: str) -> str | None:
+        nonlocal handoff_reads
+        if ref == handoff_ref:
+            handoff_reads += 1
+            if handoff_reads == 2:
+                _git("update-ref", handoff_ref, candidate, cwd=board_repo)
+        return original_remote_ref_oid(ref)
+
+    monkeypatch.setattr(board, "_remote_ref_oid", race_remote_ref_oid)
+
+    assert not board.acquire(key, ttl=600)
+    assert board.read(key) is None
+    assert _git("rev-parse", handoff_ref, cwd=board_repo) == candidate
+
+
 def test_sha256_repository_uses_matching_claim_scratch(tmp_path: Path) -> None:
     repo = tmp_path / "claims-sha256.git"
     _git("init", "--bare", "--quiet", "--object-format=sha256", str(repo))

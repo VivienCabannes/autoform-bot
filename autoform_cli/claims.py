@@ -30,6 +30,7 @@ from urllib.request import url2pathname
 
 CLAIM_REF_PREFIX = "refs/autoform-claims/"
 CLAIM_RECEIPT_REF_PREFIX = "refs/autoform-claim-receipts/"
+CLAIM_HANDOFF_REF_PREFIX = "refs/autoform-claim-handoffs/"
 CLAIM_SCHEMA = "autoform-claim/v2"
 LEGACY_CLAIM_SCHEMA = "autoform-claim/v1"
 LEGACY_BLOCK_SCHEMA = "autoform-claim/legacy-block/v1"
@@ -322,6 +323,14 @@ def author_claim_key(node_id: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", node_id.lower()).strip("-")[:48] or "node"
     digest = hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:16]
     return f"author/{slug}-{digest}"
+
+
+def claim_handoff_ref(key: str) -> str:
+    """Return the deterministic remote barrier for a queued author claim."""
+    key = _validate_key(key)
+    if not key.startswith("author/"):
+        raise ValueError("only author claims have queue handoff refs")
+    return CLAIM_HANDOFF_REF_PREFIX + hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 def resource_claim_key(resource: str) -> str:
@@ -885,8 +894,7 @@ class ClaimBoard:
         ):
             raise ClaimTransportError("claim repository object format changed")
 
-    def _remote_oid(self, key: str) -> str | None:
-        ref = self._ref(key)
+    def _remote_ref_oid(self, ref: str) -> str | None:
         proc = self._remote_git(["ls-remote", self.repo_url, ref])
         entries = _parse_ls_remote_output(proc.stdout)
         if not entries:
@@ -897,6 +905,9 @@ class ClaimBoard:
             )
         self._verify_object_id_format(entries[0][0])
         return entries[0][0]
+
+    def _remote_oid(self, key: str) -> str | None:
+        return self._remote_ref_oid(self._ref(key))
 
     def _receipt_oid(self, key: str) -> str | None:
         proc = self._git(
@@ -1250,6 +1261,9 @@ class ClaimBoard:
         key = _validate_key(key)
         _validate_ttl(ttl)
         self._ensure_scratch()
+        handoff_ref = claim_handoff_ref(key) if key.startswith("author/") else None
+        if handoff_ref is not None and self._remote_ref_oid(handoff_ref) is not None:
+            return False
         if self._legacy_author_claim_blocks_v2(key):
             return False
         old = self._remote_oid(key)
@@ -1283,6 +1297,13 @@ class ClaimBoard:
             previous_expires_at=previous_expires_at,
         )
         if not self._cas_push(key, old, new):
+            return False
+        if handoff_ref is not None and self._remote_ref_oid(handoff_ref) is not None:
+            if not self._cas_push(key, new, old or ""):
+                raise ClaimTransportError(
+                    "an author queue handoff appeared while its claim was acquired, and "
+                    "the claim could not be rolled back"
+                )
             return False
         if self._legacy_author_claim_blocks_v2(key):
             if not self._cas_push(key, new, old or ""):

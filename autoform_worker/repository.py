@@ -29,6 +29,7 @@ from autoform_cli.claims import (
     CLAIM_TTL_S,
     ClaimBoard,
     ClaimFence,
+    claim_handoff_ref,
 )
 
 from ._paths import GENERATED_DIRECTORY_NAMES
@@ -53,7 +54,7 @@ _MAX_CANDIDATE_ABANDONED_INDEX_STAGES = 8
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
 _CANDIDATE_SCHEMA = "autoform-candidate/v5"
 _READY_CANDIDATE_INDEX_TOPOLOGY = frozenset({"stage", "index", "displaced-backup"})
-_PUBLICATION_SCHEMA = "autoform-merge-publication/v3"
+_PUBLICATION_SCHEMA = "autoform-merge-publication/v4"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
 _PUBLICATION_STATES = frozenset({"prepared", "queueing", "queued", "publishing", "integrated", "stale", "uncertain"})
@@ -246,6 +247,8 @@ class PublicationReceipt:
     article_claim_oid: str
     article_claim_lease_id: str
     observed_article_claim_oid: str | None
+    article_handoff_ref: str
+    observed_article_handoff_oid: str | None
     claim_key: str
     claim_ref: str
     claim_oid: str | None
@@ -3604,6 +3607,7 @@ class RemoteMergeQueue:
         """Consume one article claim and publish its descendant candidate."""
         self._validate_publication_identity(queue_item_id, target_ref, queue_ref, expected_target_oid, candidate_oid)
         self._validate_article_claim(article_claim)
+        article_handoff_ref = claim_handoff_ref(article_claim.key)
         self._verify_state()
         claim_key = _merge_claim_key(target_ref)
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
@@ -3619,6 +3623,7 @@ class RemoteMergeQueue:
                 article_claim_ref=article_claim.ref,
                 article_claim_oid=article_claim.oid,
                 article_claim_lease_id=article_claim.lease_id,
+                article_handoff_ref=article_handoff_ref,
                 claim_key=claim_key,
                 claim_ref=CLAIM_REF_PREFIX + claim_key,
             )
@@ -3729,6 +3734,7 @@ class RemoteMergeQueue:
         """
         self._validate_publication_identity(queue_item_id, target_ref, queue_ref, expected_target_oid, candidate_oid)
         self._validate_article_claim(article_claim)
+        article_handoff_ref = claim_handoff_ref(article_claim.key)
         self._verify_state()
         _, journal = self._publication_paths(queue_item_id)
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
@@ -3743,6 +3749,7 @@ class RemoteMergeQueue:
                 "article_claim_key": article_claim.key,
                 "article_claim_ref": article_claim.ref,
                 "article_claim_lease_id": article_claim.lease_id,
+                "article_handoff_ref": article_handoff_ref,
                 "claim_key": _merge_claim_key(target_ref),
                 "claim_ref": CLAIM_REF_PREFIX + _merge_claim_key(target_ref),
             }
@@ -3773,17 +3780,27 @@ class RemoteMergeQueue:
         candidate = str(record["candidate_oid"])
         article_claim_ref = str(record["article_claim_ref"])
         article_claim_oid = str(record["article_claim_oid"])
+        article_handoff_ref = str(record["article_handoff_ref"])
         observed_queue = self._remote_oid(queue_ref)
         observed_article_claim = self._remote_oid(article_claim_ref)
+        observed_article_handoff = self._remote_oid(article_handoff_ref)
         record["observed_queue_oid"] = observed_queue
         record["observed_article_claim_oid"] = observed_article_claim
+        record["observed_article_handoff_oid"] = observed_article_handoff
         if observed_queue == candidate:
-            if observed_article_claim == article_claim_oid:
+            if observed_article_handoff != candidate:
                 return _transition_journal(
                     journal,
                     record,
                     "uncertain",
-                    "queue ref exists but the exact article claim was not consumed",
+                    "queue ref exists without its exact author handoff barrier",
+                )
+            if observed_article_claim is not None:
+                return _transition_journal(
+                    journal,
+                    record,
+                    "uncertain",
+                    "queue ref exists while an article claim is still present",
                 )
             return _transition_journal(
                 journal,
@@ -3797,6 +3814,13 @@ class RemoteMergeQueue:
                 record,
                 "uncertain",
                 f"queue ref {queue_ref} points to unexpected object {observed_queue}",
+            )
+        if observed_article_handoff is not None:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"author handoff ref {article_handoff_ref} has no matching queue ref",
             )
         if observed_article_claim != article_claim_oid:
             return _transition_journal(
@@ -3831,13 +3855,20 @@ class RemoteMergeQueue:
             candidate=candidate,
             article_claim_ref=article_claim_ref,
             article_claim_oid=article_claim_oid,
+            article_handoff_ref=article_handoff_ref,
         )
         _checkpoint("queue-pushed")
         observed_queue = self._remote_oid(queue_ref)
         observed_article_claim = self._remote_oid(article_claim_ref)
+        observed_article_handoff = self._remote_oid(article_handoff_ref)
         record["observed_queue_oid"] = observed_queue
         record["observed_article_claim_oid"] = observed_article_claim
-        if observed_queue == candidate and observed_article_claim != article_claim_oid:
+        record["observed_article_handoff_oid"] = observed_article_handoff
+        if (
+            observed_queue == candidate
+            and observed_article_handoff == candidate
+            and observed_article_claim is None
+        ):
             return _transition_journal(
                 journal,
                 record,
@@ -3850,6 +3881,20 @@ class RemoteMergeQueue:
                 record,
                 "uncertain",
                 f"queue ref {queue_ref} changed during article-claim handoff",
+            )
+        if observed_article_handoff not in {None, candidate}:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"author handoff ref {article_handoff_ref} changed during queue handoff",
+            )
+        if (observed_queue is None) != (observed_article_handoff is None):
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "queue and author handoff refs were not changed atomically",
             )
         if observed_article_claim != article_claim_oid:
             return _transition_journal(
@@ -3879,6 +3924,7 @@ class RemoteMergeQueue:
         target_ref = str(record["target_ref"])
         queue_ref = str(record["queue_ref"])
         claim_ref = str(record["claim_ref"])
+        article_handoff_ref = str(record["article_handoff_ref"])
         expected = str(record["expected_target_oid"])
         candidate = str(record["candidate_oid"])
         observed_claim = self._remote_oid(claim_ref)
@@ -3899,6 +3945,15 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"queue ref {queue_ref} changed before target publication",
             )
+        observed_article_handoff = self._remote_oid(article_handoff_ref)
+        record["observed_article_handoff_oid"] = observed_article_handoff
+        if observed_article_handoff != candidate:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"author handoff ref {article_handoff_ref} changed before target publication",
+            )
         observed = self._remote_oid(target_ref)
         record["observed_target_oid"] = observed
         if observed not in {_expected_oid(expected), candidate}:
@@ -3913,6 +3968,7 @@ class RemoteMergeQueue:
         pushed = self._atomic_target_push(
             target_ref=target_ref,
             queue_ref=queue_ref,
+            article_handoff_ref=article_handoff_ref,
             claim_ref=claim_ref,
             claim_oid=claim_oid,
             expected_target=observed,
@@ -3921,24 +3977,31 @@ class RemoteMergeQueue:
         _checkpoint("target-pushed")
         observed = self._remote_oid(target_ref)
         observed_queue = self._remote_oid(queue_ref)
+        observed_article_handoff = self._remote_oid(article_handoff_ref)
         observed_claim = self._remote_oid(claim_ref)
         record["observed_target_oid"] = observed
         record["observed_queue_oid"] = observed_queue
+        record["observed_article_handoff_oid"] = observed_article_handoff
         record["observed_claim_oid"] = observed_claim
         if pushed:
-            if observed == candidate and observed_queue is None and observed_claim != claim_oid:
+            if (
+                observed == candidate
+                and observed_queue is None
+                and observed_article_handoff is None
+                and observed_claim != claim_oid
+            ):
                 _checkpoint("target-verified")
                 return _transition_journal(
                     journal,
                     record,
                     "integrated",
-                    "atomic target advance and queue/claim consumption verified",
+                    "atomic target advance and queue/handoff/claim consumption verified",
                 )
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
-                "atomic publication reported success without the exact three-ref result",
+                "atomic publication reported success without the exact four-ref result",
             )
         if observed_claim != claim_oid:
             return _transition_journal(
@@ -3954,14 +4017,32 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"queue ref {queue_ref} changed during target publication",
             )
-        if observed == candidate and observed_queue is None:
+        if observed_article_handoff not in {None, candidate}:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"author handoff ref {article_handoff_ref} changed during target publication",
+            )
+        if (observed_queue is None) != (observed_article_handoff is None):
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "queue and author handoff refs were not consumed atomically",
+            )
+        if observed == candidate and observed_queue is None and observed_article_handoff is None:
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
                 "target advanced and queue disappeared without consuming the exact merge claim",
             )
-        if observed in {_expected_oid(expected), candidate} and observed_queue == candidate:
+        if (
+            observed in {_expected_oid(expected), candidate}
+            and observed_queue == candidate
+            and observed_article_handoff == candidate
+        ):
             return _transition_journal(journal, record, "queued", "target CAS was rejected without drift")
         if observed != _expected_oid(expected):
             return _transition_journal(
@@ -3980,6 +4061,7 @@ class RemoteMergeQueue:
         target_ref = str(record["target_ref"])
         claim_ref = str(record["claim_ref"])
         article_claim_ref = str(record["article_claim_ref"])
+        article_handoff_ref = str(record["article_handoff_ref"])
         article_claim_oid = str(record["article_claim_oid"])
         recorded_claim_oid = record.get("claim_oid")
         expected = _expected_oid(str(record["expected_target_oid"]))
@@ -3988,10 +4070,12 @@ class RemoteMergeQueue:
         target_oid = self._remote_oid(target_ref)
         claim_oid = self._remote_oid(claim_ref)
         article_claim_oid_observed = self._remote_oid(article_claim_ref)
+        article_handoff_oid = self._remote_oid(article_handoff_ref)
         record["observed_queue_oid"] = queue_oid
         record["observed_target_oid"] = target_oid
         record["observed_claim_oid"] = claim_oid
         record["observed_article_claim_oid"] = article_claim_oid_observed
+        record["observed_article_handoff_oid"] = article_handoff_oid
         if queue_oid not in {None, candidate}:
             return _transition_journal(
                 journal,
@@ -3999,8 +4083,22 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"recovery found queue-ref collision: {queue_oid}",
             )
+        if article_handoff_oid not in {None, candidate}:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                f"recovery found author-handoff collision: {article_handoff_oid}",
+            )
+        if (queue_oid is None) != (article_handoff_oid is None):
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "recovery found non-atomic queue and author-handoff state",
+            )
         if target_oid == candidate:
-            if queue_oid is None:
+            if queue_oid is None and article_handoff_oid is None:
                 if article_claim_oid_observed == article_claim_oid:
                     return _transition_journal(
                         journal,
@@ -4008,7 +4106,10 @@ class RemoteMergeQueue:
                         "uncertain",
                         "target advanced without consuming the exact article claim",
                     )
-                if recorded_claim_oid is not None and claim_oid == recorded_claim_oid:
+                if (
+                    (recorded_claim_oid is not None and claim_oid == recorded_claim_oid)
+                    or (recorded_claim_oid is None and claim_oid is not None)
+                ):
                     return _transition_journal(
                         journal,
                         record,
@@ -4019,14 +4120,14 @@ class RemoteMergeQueue:
                     journal,
                     record,
                     "integrated",
-                    "recovery verified target and consumed queue ref",
+                    "recovery verified target and consumed queue and author-handoff refs",
                 )
-            if article_claim_oid_observed == article_claim_oid:
+            if article_claim_oid_observed is not None:
                 return _transition_journal(
                     journal,
                     record,
                     "uncertain",
-                    "target and queue point to the candidate while the article claim remains",
+                    "target and queue point to the candidate while an article claim is present",
                 )
             recovered_status = "queued"
         elif target_oid != expected:
@@ -4036,16 +4137,20 @@ class RemoteMergeQueue:
                 "stale",
                 f"recovery found target drift: {target_oid or 'absent'}",
             )
-        elif queue_oid == candidate:
-            if article_claim_oid_observed == article_claim_oid:
+        elif queue_oid == candidate and article_handoff_oid == candidate:
+            if article_claim_oid_observed is not None:
                 return _transition_journal(
                     journal,
                     record,
                     "uncertain",
-                    "recovery found a queue ref without consuming the article claim",
+                    "recovery found queued work while an article claim is present",
                 )
             recovered_status = "queued"
-        elif article_claim_oid_observed == article_claim_oid:
+        elif (
+            queue_oid is None
+            and article_handoff_oid is None
+            and article_claim_oid_observed == article_claim_oid
+        ):
             recovered_status = "prepared"
         else:
             return _transition_journal(
@@ -4120,6 +4225,7 @@ class RemoteMergeQueue:
             "observed_target_oid": None,
             "observed_queue_oid": None,
             "observed_article_claim_oid": None,
+            "observed_article_handoff_oid": None,
             "claim_oid": None,
             "observed_claim_oid": None,
             "claim_lease_id": None,
@@ -4177,6 +4283,7 @@ class RemoteMergeQueue:
             "article_claim_oid",
             "claim_oid",
             "observed_article_claim_oid",
+            "observed_article_handoff_oid",
             "observed_claim_oid",
             "observed_target_oid",
             "observed_queue_oid",
@@ -4264,6 +4371,7 @@ class RemoteMergeQueue:
         candidate: str,
         article_claim_ref: str,
         article_claim_oid: str,
+        article_handoff_ref: str,
     ) -> bool:
         proc = self._remote_git(
             [
@@ -4272,9 +4380,11 @@ class RemoteMergeQueue:
                 "--porcelain",
                 "--atomic",
                 f"--force-with-lease={queue_ref}:",
+                f"--force-with-lease={article_handoff_ref}:",
                 f"--force-with-lease={article_claim_ref}:{article_claim_oid}",
                 self.remote_url,
                 f"{candidate}:{queue_ref}",
+                f"{candidate}:{article_handoff_ref}",
                 f":{article_claim_ref}",
             ],
             check=False,
@@ -4319,6 +4429,7 @@ class RemoteMergeQueue:
         *,
         target_ref: str,
         queue_ref: str,
+        article_handoff_ref: str,
         claim_ref: str,
         claim_oid: str,
         expected_target: str | None,
@@ -4331,10 +4442,12 @@ class RemoteMergeQueue:
                 "--porcelain",
                 "--atomic",
                 f"--force-with-lease={queue_ref}:{candidate}",
+                f"--force-with-lease={article_handoff_ref}:{candidate}",
                 f"--force-with-lease={target_ref}:{expected_target or ''}",
                 f"--force-with-lease={claim_ref}:{claim_oid}",
                 self.remote_url,
                 f":{queue_ref}",
+                f":{article_handoff_ref}",
                 f"{candidate}:{target_ref}",
                 f":{claim_ref}",
             ],
@@ -4707,6 +4820,12 @@ def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
         observed_article_claim_oid=(
             str(record["observed_article_claim_oid"])
             if record.get("observed_article_claim_oid") is not None
+            else None
+        ),
+        article_handoff_ref=str(record["article_handoff_ref"]),
+        observed_article_handoff_oid=(
+            str(record["observed_article_handoff_oid"])
+            if record.get("observed_article_handoff_oid") is not None
             else None
         ),
         claim_key=str(record["claim_key"]),
