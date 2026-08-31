@@ -681,6 +681,24 @@ class RunLedger:
                 return self.get_run(run_id)
             if current["status"] not in {"stopped", "blocked"}:
                 raise InvalidTransition(f"cannot resume a {current['status']} run")
+            retained = self._connection.execute(
+                """
+                SELECT merge_items.queue_item_id FROM merge_items
+                JOIN attempts USING(attempt_id)
+                JOIN tasks ON tasks.run_id = attempts.run_id
+                    AND tasks.article_id = attempts.article_id
+                    AND tasks.phase = attempts.phase
+                WHERE tasks.run_id = ? AND tasks.status = 'stopped'
+                    AND merge_items.status NOT IN ('integrated','failed')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if retained is not None:
+                raise InvalidTransition(
+                    "run cannot resume while a stopped task retains an unresolved merge item: "
+                    f"{retained['queue_item_id']}"
+                )
             max_attempts = _run_record(current).config.max_attempts
             now = self._clock_ns()
             cursor = self._connection.execute(
@@ -763,6 +781,18 @@ class RunLedger:
                 return _task_record(task)
             if task["status"] not in _TASK_RECOVERY_SOURCES:
                 raise InvalidTransition(f"cannot recover task from {task['status']} to {status}")
+            retained = self._connection.execute(
+                """
+                SELECT merge_items.queue_item_id FROM merge_items
+                JOIN attempts USING(attempt_id)
+                WHERE attempts.run_id = ? AND attempts.article_id = ? AND attempts.phase = ?
+                    AND merge_items.status NOT IN ('integrated','failed')
+                LIMIT 1
+                """,
+                (run_id, article_id, phase),
+            ).fetchone()
+            if retained is not None:
+                raise InvalidTransition(f"task retains an unresolved merge item: {retained['queue_item_id']}")
             if status == "failed":
                 if requested_status == "failed" and task["status"] != "candidate":
                     raise InvalidTransition("only a rejected candidate may use terminal task failure")
@@ -1567,6 +1597,24 @@ class RunLedger:
                     f"expected {expected_item_generation}"
                 )
             run = self._active_run_row(item["run_id"], expected_generation)
+            attempt = self._attempt_row(item["attempt_id"])
+            task = self._task_row(attempt["run_id"], attempt["article_id"], attempt["phase"])
+            if replay["status"] == "integrated":
+                if replay["publication_evidence_sha256"] != publication_evidence_sha256:
+                    raise GenerationConflict(f"merge replay {replay_id} names different publication evidence")
+                if (
+                    item["status"] != "integrated"
+                    or item["integrated_oid"] != replay["candidate_oid"]
+                    or attempt["status"] != "integrated"
+                    or attempt["candidate_oid"] != item["candidate_oid"]
+                    or attempt["base_oid"] != item["expected_target_oid"]
+                    or task["status"] != "integrated"
+                    or task["candidate_oid"] != item["candidate_oid"]
+                    or task["integrated_oid"] != replay["candidate_oid"]
+                    or task["attempts"] != attempt["number"]
+                ):
+                    raise GenerationConflict(f"integrated replay result changed before retry: {replay_id}")
+                return self.get_run(item["run_id"])
             if replay["status"] != "publishing":
                 raise InvalidTransition("only a publishing replay may be integrated")
             if item["status"] != "stale":
@@ -1576,8 +1624,6 @@ class RunLedger:
                     f"run {item['run_id']} current OID changed from replay base "
                     f"{replay['target_oid']} to {run['current_oid']}"
                 )
-            attempt = self._attempt_row(item["attempt_id"])
-            task = self._task_row(attempt["run_id"], attempt["article_id"], attempt["phase"])
             if (
                 attempt["status"] != "candidate"
                 or attempt["candidate_oid"] != item["candidate_oid"]
@@ -2404,6 +2450,7 @@ class RunLedger:
             _verify_schema(self._connection, _SCHEMA_V3, version=3)
             _execute_schema(self._connection, _SCHEMA)
             now = self._clock_ns()
+            self._normalize_legacy_stale_merge_items(from_schema=3, now=now)
             self._connection.execute(
                 """
                 UPDATE runs SET status = 'failed', stop_requested = 0,
@@ -2677,6 +2724,8 @@ class RunLedger:
                 SELECT sha256, kind, size, relative_path, created_ns FROM artifacts_v2
                 """
             )
+            migration_now = self._clock_ns()
+            self._normalize_legacy_stale_merge_items(from_schema=2, now=migration_now)
             for row in self._connection.execute(
                 "SELECT run_id, status, config_sha256 FROM runs ORDER BY run_id"
             ).fetchall():
@@ -2689,7 +2738,7 @@ class RunLedger:
                         "status": row["status"],
                         "to_schema": LEDGER_SCHEMA_VERSION,
                     },
-                    self._clock_ns(),
+                    migration_now,
                 )
             for table in reversed(renamed):
                 self._connection.execute(f"DROP TABLE {table}_v2")
@@ -2699,6 +2748,34 @@ class RunLedger:
             )
             _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
             self._validate_content_rows()
+
+    def _normalize_legacy_stale_merge_items(self, *, from_schema: int, now: int) -> None:
+        """Close pre-replay stale entries while retaining their original rows and events."""
+
+        stale_items = self._connection.execute(
+            "SELECT queue_item_id, run_id FROM merge_items WHERE status = 'stale'"
+        ).fetchall()
+        detail = f"legacy stale item closed because v{from_schema} retained no replay evidence"
+        for item in stale_items:
+            self._connection.execute(
+                """
+                UPDATE merge_items SET status = 'failed', detail = ?,
+                    generation = generation + 1, updated_ns = ?
+                WHERE queue_item_id = ? AND status = 'stale'
+                """,
+                (detail, now, item["queue_item_id"]),
+            )
+            self._append_event(
+                item["run_id"],
+                "merge-item.transition",
+                {
+                    "detail": detail,
+                    "from": "stale",
+                    "queue_item_id": item["queue_item_id"],
+                    "to": "failed",
+                },
+                now,
+            )
 
     def _normalize_v2_exhausted_retries(self) -> None:
         """Close retry states that the persisted v2 attempt policy cannot resume."""
@@ -3191,6 +3268,7 @@ def _validate_replay_event_history(
         "prepared": frozenset({"publishing", "stale", "uncertain", "failed"}),
         "publishing": frozenset({"stale", "uncertain", "failed"}),
     }
+    preparations_by_item: dict[str, list[tuple[int, int]]] = {}
     for replay_id, replay in replays.items():
         item = merge_items[replay.queue_item_id]
         status = "prepared"
@@ -3209,8 +3287,16 @@ def _validate_replay_event_history(
                     "review_evidence_sha256": replay.review_evidence_sha256,
                     "target_oid": replay.target_oid,
                 }
-                if prepared or event.payload != expected or event.created_ns != replay.created_ns:
+                enriched = {**expected, "ordinal": replay.ordinal}
+                if (
+                    prepared
+                    or event.payload not in (expected, enriched)
+                    or event.created_ns != replay.created_ns
+                ):
                     raise LedgerError(f"merge replay preparation event is invalid: {replay_id}")
+                preparations_by_item.setdefault(replay.queue_item_id, []).append(
+                    (event.sequence, replay.ordinal)
+                )
                 prepared = True
                 continue
             if not prepared or integrated:
@@ -3257,6 +3343,10 @@ def _validate_replay_event_history(
             or replay.updated_ns != updated_ns
         ):
             raise LedgerError(f"merge replay row disagrees with its event history: {replay_id}")
+    for queue_item_id, preparations in preparations_by_item.items():
+        observed = tuple(ordinal for _, ordinal in sorted(preparations))
+        if observed != tuple(range(1, len(preparations) + 1)):
+            raise LedgerError(f"merge replay preparation order is invalid: {queue_item_id}")
 
 
 def _target_adoption_event_tasks(value: object, *, run_id: str) -> list[tuple[str, str]]:
@@ -3462,6 +3552,7 @@ def _validate_lifecycle_rows(
                     or event.payload.get("target_oid") != adoption.target_oid
                     or event.payload.get("evidence_sha256") != adoption.evidence_sha256
                     or event.payload.get("ordinal") != adoption.ordinal
+                    or event.created_ns != adoption.created_ns
                     or payload_tasks != expected_tasks
                     or adoption.previous_oid != current_oid
                     or len(adoption.target_oid) != len(current_oid)
