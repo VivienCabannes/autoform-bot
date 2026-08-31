@@ -1176,6 +1176,11 @@ class RunLedger:
                 )
             if attempt["status"] != "candidate" or attempt["candidate_oid"] != candidate_oid:
                 raise InvalidTransition("only a candidate attempt may enter the merge queue")
+            if attempt["base_oid"] != expected_target_oid:
+                raise GenerationConflict(
+                    f"candidate attempt base {attempt['base_oid']} for {attempt_id} "
+                    f"does not match merge base {expected_target_oid}"
+                )
             if run["current_oid"] != expected_target_oid:
                 raise GenerationConflict(
                     f"run {attempt['run_id']} current OID is {run['current_oid']}, "
@@ -1356,6 +1361,7 @@ class RunLedger:
             if (
                 attempt["run_id"] != item["run_id"]
                 or attempt["candidate_oid"] != item["candidate_oid"]
+                or attempt["base_oid"] != item["expected_target_oid"]
             ):
                 raise LedgerError(f"merge item candidate disagrees with attempt: {queue_item_id}")
             cursor = self._connection.execute(
@@ -1626,6 +1632,7 @@ class RunLedger:
                 raise LedgerError("ledger schema changed while preparing the v1 migration")
             _verify_schema(self._connection, _SCHEMA_V1, version=1)
             migrations = self._prepare_v1_run_migrations()
+            events = self._prepare_v1_events()
             self._connection.execute("DROP TRIGGER events_no_update")
             self._connection.execute("DROP TRIGGER events_no_delete")
             for table in renamed:
@@ -1683,11 +1690,9 @@ class RunLedger:
                 FROM merge_items_v1
                 """
             )
-            self._connection.execute(
-                """
-                INSERT INTO events(sequence, run_id, kind, payload_json, created_ns)
-                SELECT sequence, run_id, kind, payload_json, created_ns FROM events_v1
-                """
+            self._connection.executemany(
+                "INSERT INTO events(sequence, run_id, kind, payload_json, created_ns) VALUES (?, ?, ?, ?, ?)",
+                events,
             )
             self._connection.execute(
                 """
@@ -1817,6 +1822,55 @@ class RunLedger:
                     detail,
                     row["created_ns"],
                     row["updated_ns"],
+                )
+            )
+        return tuple(prepared)
+
+    def _prepare_v1_events(self) -> tuple[tuple[object, ...], ...]:
+        """Add v3 chain fields only when a v1 event and merge item jointly prove them."""
+        prepared: list[tuple[object, ...]] = []
+        rows = self._connection.execute("SELECT * FROM events ORDER BY sequence").fetchall()
+        for row in rows:
+            payload_json = row["payload_json"]
+            if row["kind"] == "candidate.integrated":
+                payload = _decode_json_object(
+                    payload_json,
+                    f"v1 integration event {row['sequence']} payload",
+                )
+                queue_item_id = payload.get("queue_item_id")
+                integrated_oid = payload.get("integrated_oid")
+                item = self._connection.execute(
+                    """
+                    SELECT run_id, expected_target_oid, candidate_oid, integrated_oid, status
+                    FROM merge_items WHERE queue_item_id = ?
+                    """,
+                    (queue_item_id,),
+                ).fetchone()
+                if (
+                    not isinstance(queue_item_id, str)
+                    or not isinstance(integrated_oid, str)
+                    or item is None
+                    or item["run_id"] != row["run_id"]
+                    or item["status"] != "integrated"
+                    or item["candidate_oid"] != integrated_oid
+                    or item["integrated_oid"] != integrated_oid
+                    or (
+                        "expected_target_oid" in payload
+                        and payload["expected_target_oid"] != item["expected_target_oid"]
+                    )
+                ):
+                    raise LedgerError(
+                        f"v1 integration event does not match its merge item: {row['run_id']}"
+                    )
+                payload["expected_target_oid"] = item["expected_target_oid"]
+                payload_json = _json_text(payload)
+            prepared.append(
+                (
+                    row["sequence"],
+                    row["run_id"],
+                    row["kind"],
+                    payload_json,
+                    row["created_ns"],
                 )
             )
         return tuple(prepared)
@@ -2085,6 +2139,7 @@ class RunLedger:
             JOIN attempts USING(attempt_id)
             WHERE merge_items.run_id != attempts.run_id
                 OR merge_items.candidate_oid != attempts.candidate_oid
+                OR merge_items.expected_target_oid != attempts.base_oid
             LIMIT 1
             """
         ).fetchone()

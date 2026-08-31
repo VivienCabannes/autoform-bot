@@ -1657,6 +1657,61 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
         ledger.close()
 
 
+def test_enqueue_rejects_candidate_built_before_current_oid_advanced(tmp_path: Path) -> None:
+    ledger = RunLedger(tmp_path / "run.sqlite3")
+    try:
+        config = _config()
+        created = ledger.create_run(
+            _identity(tmp_path, config),
+            config,
+            tasks=[(_ARTICLE_A, "proof"), (_ARTICLE_B, "proof")],
+            run_id="run-1",
+        )
+        ledger.transition_run(created.run_id, "running", expected_generation=created.generation)
+        for article_id, attempt_id, candidate_oid in (
+            (_ARTICLE_A, "attempt-a", "9" * 40),
+            (_ARTICLE_B, "attempt-b", "a" * 40),
+        ):
+            _begin_task(ledger, created.run_id, tmp_path, article_id, "proof", attempt_id)
+            _finish(ledger, attempt_id, "candidate", candidate_oid=candidate_oid)
+            evidence = ledger.put_artifact("gate", f"{attempt_id} passed\n".encode())
+            _record_gate(ledger, attempt_id, "lean-build", True, evidence_sha256=evidence)
+
+        first_queue_item = _enqueue(
+            ledger,
+            "attempt-a",
+            required_gates=("lean-build",),
+            queue_ref="refs/autoform/queue/queue-a",
+            expected_target_oid=config.start_oid,
+            queue_item_id="queue-a",
+        )
+        first_item = ledger.get_merge_item(first_queue_item)
+        advanced = ledger.mark_integrated(
+            first_queue_item,
+            integrated_oid="9" * 40,
+            expected_generation=ledger.get_run(created.run_id).generation,
+            expected_item_generation=first_item.generation,
+        )
+        stale_attempt = ledger.get_attempt("attempt-b")
+        stale_task = ledger.get_task(created.run_id, _ARTICLE_B, "proof")
+
+        with pytest.raises(GenerationConflict, match="attempt base"):
+            _enqueue(
+                ledger,
+                stale_attempt.attempt_id,
+                required_gates=("lean-build",),
+                queue_ref="refs/autoform/queue/queue-b",
+                expected_target_oid=advanced.current_oid,
+                queue_item_id="queue-b",
+            )
+
+        assert stale_attempt.base_oid == config.start_oid
+        assert ledger.get_task(created.run_id, _ARTICLE_B, "proof") == stale_task
+        assert [item.queue_item_id for item in ledger.list_merge_items(created.run_id)] == ["queue-a"]
+    finally:
+        ledger.close()
+
+
 def test_invalid_task_plan_does_not_create_partial_rows_or_events(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "run.sqlite3", clock_ns=iter(range(100)).__next__)
     config = _config()
@@ -1918,6 +1973,140 @@ def test_ledger_rejects_hardlinks_and_unsafe_sqlite_sidecars_before_wal(tmp_path
             RunLedger(path)
 
 
+def _write_v1_integrated_ledger(
+    path: Path,
+    project_root: Path,
+    *,
+    include_integration_event: bool,
+) -> tuple[str, str]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config = _config()
+    legacy_identity = _identity(project_root, config).as_dict()
+    legacy_identity.pop("config_sha256")
+    identity_json = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    identity_sha256 = hashlib.sha256(identity_json.encode()).hexdigest()
+    claim_json = json.dumps(
+        _claim_token(_ARTICLE_A).as_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    candidate_oid = "9" * 40
+    evidence_content = b"lean build passed\n"
+    evidence_sha256 = hashlib.sha256(evidence_content).hexdigest()
+    evidence_path = path.parent / "artifacts" / "sha256" / evidence_sha256[:2] / evidence_sha256
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_bytes(evidence_content)
+
+    connection = sqlite3.connect(path)
+    ledger_module._execute_schema(connection, ledger_module._SCHEMA_V1)
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+    connection.execute(
+        "INSERT INTO runs VALUES (?, ?, ?, 'complete', 2, 0, '', 1, 9)",
+        ("run-1", identity_json, identity_sha256),
+    )
+    connection.execute(
+        "INSERT INTO tasks VALUES (?, ?, 'statement', 'integrated', 1, 4, '[]', '', ?, ?)",
+        ("run-1", _ARTICLE_A, candidate_oid, candidate_oid),
+    )
+    connection.execute(
+        """
+        INSERT INTO attempts VALUES (
+            'attempt-1', ?, ?, 'statement', 1, 'integrated', ?, ?, ?, 'codex', ?, ?, ?, '', 4, 8
+        )
+        """,
+        (
+            "run-1",
+            _ARTICLE_A,
+            str((project_root / "worktree").resolve()),
+            f"autoform/run-1/{_ARTICLE_A}/1",
+            config.start_oid,
+            author_claim_key(_ARTICLE_A),
+            claim_json,
+            candidate_oid,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO artifacts VALUES (?, 'gate', ?, ?, 6)",
+        (
+            evidence_sha256,
+            len(evidence_content),
+            str(evidence_path.relative_to(path.parent)),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO gates VALUES ('attempt-1', 'lean-build', 1, ?, '', 6)",
+        (evidence_sha256,),
+    )
+    connection.execute(
+        """
+        INSERT INTO merge_items VALUES (
+            'queue-1', 'run-1', 'attempt-1', ?, ?, ?, 'integrated', ?, 7, 8
+        )
+        """,
+        (
+            f"refs/autoform/queue/run-1/{_ARTICLE_A}",
+            config.start_oid,
+            candidate_oid,
+            candidate_oid,
+        ),
+    )
+    events: list[tuple[str, dict[str, object], int]] = [
+        ("run.created", {"identity_sha256": identity_sha256}, 1),
+        ("task.created", {"node_id": _ARTICLE_A, "phase": "statement"}, 2),
+        ("run.transition", {"detail": "", "from": "created", "to": "running"}, 3),
+        (
+            "attempt.started",
+            {"attempt_id": "attempt-1", "node_id": _ARTICLE_A, "number": 1, "phase": "statement"},
+            4,
+        ),
+        (
+            "attempt.finished",
+            {"attempt_id": "attempt-1", "candidate_oid": candidate_oid, "detail": "", "outcome": "candidate"},
+            5,
+        ),
+        (
+            "gate.recorded",
+            {
+                "attempt_id": "attempt-1",
+                "evidence_sha256": evidence_sha256,
+                "name": "lean-build",
+                "passed": True,
+            },
+            6,
+        ),
+        (
+            "candidate.queued",
+            {
+                "attempt_id": "attempt-1",
+                "queue_item_id": "queue-1",
+                "queue_ref": f"refs/autoform/queue/run-1/{_ARTICLE_A}",
+            },
+            7,
+        ),
+    ]
+    if include_integration_event:
+        events.append(
+            (
+                "candidate.integrated",
+                {"integrated_oid": candidate_oid, "queue_item_id": "queue-1"},
+                8,
+            )
+        )
+    events.append(
+        ("run.transition", {"detail": "", "from": "running", "to": "complete"}, 9)
+    )
+    connection.executemany(
+        "INSERT INTO events(run_id, kind, payload_json, created_ns) VALUES ('run-1', ?, ?, ?)",
+        (
+            (kind, json.dumps(payload, sort_keys=True, separators=(",", ":")), created_ns)
+            for kind, payload, created_ns in events
+        ),
+    )
+    connection.commit()
+    connection.close()
+    return candidate_oid, evidence_sha256
+
+
 def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Path) -> None:
     path = tmp_path / "state/run.sqlite3"
     path.parent.mkdir()
@@ -1987,6 +2176,46 @@ def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Pat
 
     with RunLedger(path) as reopened:
         assert reopened.get_run("run-1").config == migrated.config
+
+
+def test_v1_integrated_history_is_canonicalized_without_inventing_an_event(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    candidate_oid, evidence_sha256 = _write_v1_integrated_ledger(
+        path,
+        tmp_path,
+        include_integration_event=True,
+    )
+
+    with RunLedger(path) as ledger:
+        assert ledger.get_run("run-1").current_oid == candidate_oid
+        assert ledger.get_run("run-1").status == "complete"
+        integration_event = next(
+            event for event in ledger.events("run-1") if event.kind == "candidate.integrated"
+        )
+        assert integration_event.payload == {
+            "expected_target_oid": _config().start_oid,
+            "integrated_oid": candidate_oid,
+            "queue_item_id": "queue-1",
+        }
+        assert ledger.read_artifact(evidence_sha256) == b"lean build passed\n"
+
+    with RunLedger(path) as reopened:
+        assert reopened.get_run("run-1").current_oid == candidate_oid
+
+
+def test_v1_migration_does_not_synthesize_a_missing_integration_event(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    _write_v1_integrated_ledger(path, tmp_path, include_integration_event=False)
+
+    with pytest.raises(LedgerError, match="current OID does not match its integration history"):
+        RunLedger(path)
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "1"
+    finally:
+        connection.close()
 
 
 def test_v2_ledger_migration_seals_even_a_zero_row_task_plan(tmp_path: Path) -> None:
@@ -2339,6 +2568,20 @@ def test_reopen_rejects_current_oid_outside_integrated_event_chain(tmp_path: Pat
         )
 
     with pytest.raises(LedgerError, match="current OID does not match its integration history"):
+        RunLedger(path)
+
+
+def test_reopen_rejects_merge_target_that_does_not_match_attempt_base(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+    path = ledger.path
+    ledger._connection.execute(
+        "UPDATE merge_items SET expected_target_oid = ? WHERE queue_item_id = ?",
+        ("a" * 40, queue_item_id),
+    )
+    ledger.close()
+
+    with pytest.raises(LedgerError, match="merge item binding is invalid"):
         RunLedger(path)
 
 
