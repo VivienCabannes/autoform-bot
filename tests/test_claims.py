@@ -99,6 +99,92 @@ def test_acquire_read_list_and_release_round_trip(tmp_path: Path, board_repo: Pa
     assert board.release("author/node")
 
 
+def test_sha256_repository_uses_matching_claim_scratch(tmp_path: Path) -> None:
+    repo = tmp_path / "claims-sha256.git"
+    _git("init", "--bare", "--quiet", "--object-format=sha256", str(repo))
+    scratch = tmp_path / "scratch"
+    board = claims.ClaimBoard(
+        repo,
+        "worker-a",
+        scratch,
+        session_id="session-a",
+        expected_object_format="sha256",
+    )
+
+    assert board.acquire("article", ttl=600)
+    oid = board.held_claim_oid("article")
+    assert oid is not None and len(oid) == 64
+    assert _git("--git-dir", str(scratch), "rev-parse", "--show-object-format") == "sha256"
+    assert board.release("article")
+
+
+def test_local_sha256_repository_format_is_detected(tmp_path: Path) -> None:
+    repo = tmp_path / "claims-sha256.git"
+    _git("init", "--bare", "--quiet", "--object-format=sha256", str(repo))
+    board = claims.ClaimBoard(repo, "worker-a", tmp_path / "scratch")
+
+    assert board.acquire("article", ttl=600)
+    assert len(board.held_claim_oid("article") or "") == 64
+
+
+def test_claim_repository_object_format_mismatch_fails_before_push(tmp_path: Path) -> None:
+    repo = tmp_path / "claims-sha256.git"
+    _git("init", "--bare", "--quiet", "--object-format=sha256", str(repo))
+    board = claims.ClaimBoard(
+        repo,
+        "worker-a",
+        tmp_path / "scratch",
+        expected_object_format="sha1",
+    )
+
+    with pytest.raises(claims.ClaimTransportError, match="does not match expected"):
+        board.acquire("article", ttl=600)
+    assert _git("--git-dir", str(repo), "for-each-ref", claims.CLAIM_REF_PREFIX) == ""
+
+
+def test_existing_claim_scratch_must_match_repository_object_format(tmp_path: Path) -> None:
+    repo = tmp_path / "claims-sha256.git"
+    scratch = tmp_path / "scratch"
+    _git("init", "--bare", "--quiet", "--object-format=sha256", str(repo))
+    _git("init", "--bare", "--quiet", "--object-format=sha1", str(scratch))
+    board = claims.ClaimBoard(
+        repo,
+        "worker-a",
+        scratch,
+        expected_object_format="sha256",
+    )
+
+    with pytest.raises(claims.ClaimTransportError, match="scratch object format"):
+        board.acquire("article", ttl=600)
+
+
+def test_invalid_expected_object_format_creates_no_scratch(tmp_path: Path, board_repo: Path) -> None:
+    scratch = tmp_path / "scratch"
+
+    with pytest.raises(ValueError, match="object format"):
+        claims.ClaimBoard(
+            board_repo,
+            "worker-a",
+            scratch,
+            expected_object_format="sha512",
+        )
+
+    assert not scratch.exists()
+
+
+def test_unknown_empty_remote_format_is_not_guessed(
+    tmp_path: Path, board_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch = tmp_path / "scratch"
+    board = claims.ClaimBoard(board_repo, "worker-a", scratch)
+    monkeypatch.setattr(board, "_repository_object_format", lambda: None)
+
+    with pytest.raises(claims.ClaimTransportError, match="pass expected_object_format"):
+        board.acquire("article", ttl=600)
+
+    assert not (scratch / "HEAD").exists()
+
+
 def test_cas_acquire_race_has_exactly_one_winner(tmp_path: Path, board_repo: Path) -> None:
     boards = [_board(tmp_path, board_repo, owner) for owner in ("worker-a", "worker-b")]
     barrier = threading.Barrier(2)
@@ -1118,6 +1204,7 @@ def test_remote_board_anchors_scratch_leaf_with_directory_fd(
         "https://example.invalid/claims.git",
         "worker-a",
         scratch,
+        expected_object_format="sha1",
     )
     board._ensure_scratch()
     oid = board._git(["hash-object", "-w", "--stdin"], input_text="payload").stdout.strip()

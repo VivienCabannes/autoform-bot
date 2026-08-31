@@ -39,6 +39,7 @@ CLAIM_CLOCK_SKEW_S = 300
 CLAIM_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 LEASE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_OBJECT_FORMAT_LENGTHS = {"sha1": 40, "sha256": 64}
 
 _SCP_REPOSITORY_RE = re.compile(
     r"^(?:[^/@:]+@)?(?:\[[^\]]+\]|[^/:]+):.+$"
@@ -89,12 +90,6 @@ _GIT_ENV_ALLOWLIST = frozenset(
         "no_proxy",
     }
 )
-_CANONICAL_SCRATCH_CONFIG = (
-    "[core]\n"
-    "\trepositoryformatversion = 0\n"
-    "\tbare = true\n"
-    f"\thooksPath = {os.devnull}\n"
-).encode()
 _CAS_REJECTIONS = (
     "stale info",
     "fetch first",
@@ -140,6 +135,26 @@ def _validate_ttl(ttl: int | float) -> int | float:
     if ttl > CLAIM_MAX_TTL_S:
         raise ValueError(f"claim TTL must not exceed {CLAIM_MAX_TTL_S} seconds")
     return ttl
+
+
+def _validate_object_format(value: str) -> str:
+    if not isinstance(value, str) or value not in _OBJECT_FORMAT_LENGTHS:
+        choices = ", ".join(sorted(_OBJECT_FORMAT_LENGTHS))
+        raise ValueError(f"Git object format must be one of: {choices}")
+    return value
+
+
+def _canonical_scratch_config(object_format: str) -> bytes:
+    object_format = _validate_object_format(object_format)
+    version = 0 if object_format == "sha1" else 1
+    extension = "" if object_format == "sha1" else "[extensions]\n\tobjectFormat = sha256\n"
+    return (
+        "[core]\n"
+        f"\trepositoryformatversion = {version}\n"
+        "\tbare = true\n"
+        f"\thooksPath = {os.devnull}\n"
+        f"{extension}"
+    ).encode()
 
 
 def _reject_json_constant(value: str) -> None:
@@ -362,11 +377,17 @@ class ClaimBoard:
         scratch: str | os.PathLike[str],
         *,
         session_id: str | None = None,
+        expected_object_format: str | None = None,
         expected_repo_identity: object = _UNPINNED_REPOSITORY,
         expected_scratch_identity: object = _UNPINNED_SCRATCH,
     ):
         if not worker_id:
             raise ValueError("worker_id must not be empty")
+        validated_object_format = (
+            _validate_object_format(expected_object_format)
+            if expected_object_format is not None
+            else None
+        )
         self.repo_url, current_repo_identity = pin_claim_repository(repo_url)
         self._repo_path = (
             None if claim_repository_is_remote(self.repo_url) else Path(self.repo_url)
@@ -423,6 +444,8 @@ class ClaimBoard:
                 self._fd_finalizers.append(weakref.finalize(self, os.close, descriptor))
         self._transport_helper = Path(__file__).with_name("_git_fd_transport.py").resolve()
         self._scratch_ready = False
+        self._expected_object_format = validated_object_format
+        self._object_format: str | None = None
         if session_id is None:
             session_id = f"scratch:{self.scratch}"
         if not isinstance(session_id, str) or not session_id:
@@ -583,7 +606,104 @@ class ClaimBoard:
         if current != self._scratch_identity:
             raise ClaimTransportError("claim scratch directory was replaced")
 
-    def _install_canonical_scratch_config(self) -> None:
+    def _repository_object_format(self) -> str | None:
+        if self._expected_object_format is not None and self._repo_path is None:
+            return self._expected_object_format
+        self._verify_repo_identity()
+        if self._repo_path is not None:
+            command = ["git", "rev-parse", "--show-object-format"]
+            run_options: dict[str, Any] = {"cwd": self._repo_path}
+            if self._repo_fd is not None:
+                command = [
+                    sys.executable,
+                    "-c",
+                    _FCHDIR_EXEC,
+                    str(self._repo_fd),
+                    "git",
+                    "rev-parse",
+                    "--show-object-format",
+                ]
+                run_options = {"pass_fds": (self._repo_fd,)}
+            try:
+                proc = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=_claim_git_environment(),
+                    **run_options,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ClaimTransportError(
+                    f"cannot inspect claim repository object format: {exc}"
+                ) from exc
+            self._verify_repo_identity()
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout).strip()[:300]
+                raise ClaimTransportError(
+                    f"cannot inspect claim repository object format: {detail}"
+                )
+            detected = proc.stdout.strip()
+        else:
+            try:
+                proc = subprocess.run(
+                    ["git", "ls-remote", self.repo_url, "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=_claim_git_environment(),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ClaimTransportError(
+                    f"cannot inspect claim repository object format: {exc}"
+                ) from exc
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout).strip()[:300]
+                raise ClaimTransportError(
+                    f"cannot inspect claim repository object format: {detail}"
+                )
+            widths = {
+                len(oid)
+                for line in proc.stdout.splitlines()
+                if (oid := line.partition("\t")[0])
+                and OBJECT_ID_RE.fullmatch(oid) is not None
+            }
+            if not widths:
+                return self._expected_object_format
+            if len(widths) != 1:
+                raise ClaimTransportError("claim repository returned mixed object formats")
+            width = widths.pop()
+            detected = next(
+                name for name, length in _OBJECT_FORMAT_LENGTHS.items() if length == width
+            )
+        try:
+            detected = _validate_object_format(detected)
+        except ValueError as exc:
+            raise ClaimTransportError("claim repository has an unsupported object format") from exc
+        if (
+            self._expected_object_format is not None
+            and detected != self._expected_object_format
+        ):
+            raise ClaimTransportError(
+                f"claim repository object format {detected!r} does not match expected "
+                f"{self._expected_object_format!r}"
+            )
+        return detected
+
+    def _scratch_object_format(self) -> str:
+        proc = self._git(["rev-parse", "--show-object-format"], check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[:300]
+            raise ClaimTransportError(
+                f"cannot inspect claim scratch object format: {detail}"
+            )
+        try:
+            return _validate_object_format(proc.stdout.strip())
+        except ValueError as exc:
+            raise ClaimTransportError("claim scratch has an unsupported object format") from exc
+
+    def _install_canonical_scratch_config(self, object_format: str) -> None:
+        canonical_config = _canonical_scratch_config(object_format)
         read_flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             read_flags |= os.O_NOFOLLOW
@@ -594,8 +714,8 @@ class ClaimBoard:
             else:
                 existing = os.open(self.scratch / "config", read_flags)
             info = os.fstat(existing)
-            content = os.read(existing, len(_CANONICAL_SCRATCH_CONFIG) + 1)
-            if stat.S_ISREG(info.st_mode) and content == _CANONICAL_SCRATCH_CONFIG:
+            content = os.read(existing, len(canonical_config) + 1)
+            if stat.S_ISREG(info.st_mode) and content == canonical_config:
                 return
         except OSError:
             pass
@@ -620,7 +740,7 @@ class ClaimBoard:
                 )
             else:
                 descriptor = os.open(self.scratch / temporary_name, flags, 0o600)
-            remaining = memoryview(_CANONICAL_SCRATCH_CONFIG)
+            remaining = memoryview(canonical_config)
             while remaining:
                 written = os.write(descriptor, remaining)
                 if written <= 0:
@@ -668,21 +788,50 @@ class ClaimBoard:
                 raise ClaimTransportError("claim scratch HEAD must not be a symbolic link")
             if not (self.scratch / "HEAD").is_file():
                 raise ClaimTransportError("claim scratch is no longer a bare Git repository")
-            self._install_canonical_scratch_config()
+            object_format = self._scratch_object_format()
+            if self._object_format != object_format:
+                raise ClaimTransportError("claim scratch object format changed")
+            self._install_canonical_scratch_config(object_format)
             return
         if (self.scratch / "HEAD").is_symlink():
             raise ClaimTransportError("claim scratch HEAD must not be a symbolic link")
         if (self.scratch / "HEAD").is_file():
-            self._install_canonical_scratch_config()
             proc = self._git(["rev-parse", "--is-bare-repository"], check=False)
             if proc.returncode != 0 or proc.stdout.strip() != "true":
                 raise ClaimTransportError("claim scratch must be a bare Git repository")
+            object_format = self._scratch_object_format()
+            expected = self._repository_object_format()
+            if expected is not None and object_format != expected:
+                raise ClaimTransportError(
+                    f"claim scratch object format {object_format!r} does not match repository "
+                    f"object format {expected!r}"
+                )
+            self._install_canonical_scratch_config(object_format)
+            self._object_format = object_format
             self._scratch_ready = True
             return
-        self._git(["init", "--bare", "--quiet", "--template="])
+        object_format = self._repository_object_format()
+        if object_format is None:
+            raise ClaimTransportError(
+                "cannot determine an empty remote claim repository's object format; "
+                "pass expected_object_format"
+            )
+        self._git(
+            [
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                f"--object-format={object_format}",
+            ]
+        )
         if (self.scratch / "HEAD").is_symlink() or not (self.scratch / "HEAD").is_file():
             raise ClaimTransportError("claim scratch initialization could not be verified")
-        self._install_canonical_scratch_config()
+        actual_format = self._scratch_object_format()
+        if actual_format != object_format:
+            raise ClaimTransportError("claim scratch initialized with the wrong object format")
+        self._install_canonical_scratch_config(actual_format)
+        self._object_format = actual_format
         self._scratch_ready = True
 
     @staticmethod
@@ -691,6 +840,13 @@ class ClaimBoard:
 
     def _receipt_ref(self, key: str) -> str:
         return f"{CLAIM_RECEIPT_REF_PREFIX}{self._session_key}/{_validate_key(key)}"
+
+    def _verify_object_id_format(self, oid: str) -> None:
+        if (
+            self._object_format is None
+            or len(oid) != _OBJECT_FORMAT_LENGTHS[self._object_format]
+        ):
+            raise ClaimTransportError("claim repository object format changed")
 
     def _remote_oid(self, key: str) -> str | None:
         ref = self._ref(key)
@@ -702,6 +858,7 @@ class ClaimBoard:
             raise ClaimTransportError(
                 f"claim board did not resolve exact requested ref {ref!r}"
             )
+        self._verify_object_id_format(entries[0][0])
         return entries[0][0]
 
     def _receipt_oid(self, key: str) -> str | None:
@@ -1219,6 +1376,7 @@ class ClaimBoard:
         leases: list[dict[str, Any]] = []
         seen_refs: set[str] = set()
         for oid, ref in _parse_ls_remote_output(proc.stdout):
+            self._verify_object_id_format(oid)
             if not ref.startswith(CLAIM_REF_PREFIX) or ref in seen_refs:
                 raise ClaimTransportError(
                     "claim board returned an unexpected or duplicate claim ref"
