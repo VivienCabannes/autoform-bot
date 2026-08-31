@@ -78,6 +78,27 @@ def test_recommended_release_matches_a_project_pinned_to_it(tmp_path: Path) -> N
     assert result.compatibility.release == recommended.id
 
 
+def test_lean_4_33_0_is_supported_without_being_recommended(tmp_path: Path) -> None:
+    catalog = load_release_catalog()
+    release = next(
+        release
+        for release in catalog.releases
+        if release.id == "lean-v4.33.0-mathlib-v4.33.0"
+    )
+    assert not release.recommended
+    assert catalog.recommended.id == "lean-v4.33.1-mathlib-v4.33.1"
+
+    root = _project(tmp_path, revision="v4.33.0")
+    (root / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.33.0\n", encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+    assert result.ok
+    assert result.compatibility.status == "supported"
+    assert result.compatibility.release == release.id
+
+
 def test_catalog_loader_converts_decode_and_recursion_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
