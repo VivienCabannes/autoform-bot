@@ -9,6 +9,12 @@ import autoform_cli.render as render_module
 from autoform_cli.render import PUBLICATION_MANIFEST, PublicationError, render_site
 
 
+@pytest.fixture(autouse=True)
+def _clear_github_repository_coordinates(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in ("GITHUB_REPOSITORY", "GITHUB_SERVER_URL", "GITHUB_SHA"):
+        monkeypatch.delenv(variable, raising=False)
+
+
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
