@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -28,8 +29,9 @@ from .ledger import CoordinatorLock
 
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CANDIDATE_INDEX_STAGE_NAME = re.compile(r"^\.autoform-candidate-index-[0-9a-f]{32}\.stage$")
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
-_CANDIDATE_SCHEMA = "autoform-candidate/v2"
+_CANDIDATE_SCHEMA = "autoform-candidate/v3"
 _PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
@@ -198,6 +200,8 @@ class _CandidateAdminBinding:
     path: Path
     identity: tuple[int, int]
     index_path: Path
+    head_snapshot: _CandidateFileSnapshot
+    static_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +441,8 @@ class AttemptWorktrees:
 
             base_entries = self._candidate_base_entries(worktree.base_oid)
             admin = self._candidate_admin_binding(tree)
+            if _candidate_head_oid(admin.head_snapshot) != worktree.base_oid:
+                raise CandidateUncertain("attempt Git HEAD does not match the recorded base")
             config_snapshot = self._candidate_config_snapshot(admin)
             config_sha256 = hashlib.sha256(_json_bytes(config_snapshot)).hexdigest()
             base_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
@@ -470,6 +476,7 @@ class AttemptWorktrees:
             if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != base_index:
                 raise CandidateUncertain("attempt Git index changed before candidate intent was recorded")
             self._assert_candidate_index_lock_absent(admin)
+            stage_name = self._new_candidate_index_stage_name(admin)
             root_device, root_inode = _directory_identity(attempt_root)
             record: dict[str, object] = {
                 "schema": _CANDIDATE_SCHEMA,
@@ -480,11 +487,18 @@ class AttemptWorktrees:
                 "git_dir": str(admin.path),
                 "git_dir_device": admin.identity[0],
                 "git_dir_inode": admin.identity[1],
+                "git_admin_static_sha256": admin.static_sha256,
+                "base_head_identity": list(admin.head_snapshot.identity),
+                "base_head_sha256": admin.head_snapshot.sha256,
+                "candidate_head_identity": None,
                 "base_index_identity": list(base_index.identity),
                 "base_index_sha256": base_index.sha256,
                 "candidate_index_size": len(candidate_index.content),
                 "candidate_index_sha256": candidate_index.sha256,
                 "candidate_index_identity": None,
+                "candidate_index_stage_name": stage_name,
+                "candidate_index_stage_device": None,
+                "candidate_index_stage_inode": None,
                 "config_snapshot_sha256": config_sha256,
                 "root_device": root_device,
                 "root_inode": root_inode,
@@ -530,31 +544,44 @@ class AttemptWorktrees:
         )
         record = self._read_candidate_journal(journal)
         self._validate_candidate_record(record, marker_record)
+        admin = self._assert_candidate_admin_binding(tree, record)
+        config_sha256 = (
+            hashlib.sha256(_json_bytes(self._candidate_config_snapshot(admin))).hexdigest()
+            if record["state"] == "ready"
+            else str(record["config_snapshot_sha256"])
+        )
         paths = tuple(str(path) for path in record["allowed_paths"])
         base_entries = self._candidate_base_entries(worktree.base_oid)
         snapshot = self._candidate_snapshot(tree, base_entries, paths)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
         tree_oid, objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
         if tree_oid != record["tree_oid"]:
             raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record)
-        admin = self._assert_candidate_admin_binding(tree, record)
-        self._assert_candidate_config_snapshot(admin, str(record["config_snapshot_sha256"]))
         candidate_entries = dict(snapshot.entries)
         candidate_index = self._candidate_index_image(tree, str(record["candidate_oid"]), candidate_entries)
         self._assert_recorded_candidate_index(record, candidate_index)
-        staged_index = self._candidate_staged_index(admin, candidate_index)
         observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        topology = self._candidate_index_stage_topology(admin, record, candidate_index)
 
         candidate_oid = str(record["candidate_oid"])
         head_oid = self._tree_head(tree)
+        admin = self._assert_candidate_admin_binding(tree, record)
+        if _candidate_head_oid(admin.head_snapshot) != head_oid:
+            raise CandidateUncertain("attempt Git HEAD changed during candidate inspection")
         if head_oid != candidate_oid:
             if record["state"] == "prepared" and head_oid == worktree.base_oid:
                 raise CandidateUncertain("candidate intent exists but its commit is not current")
             raise CandidateUncertain("attempt HEAD conflicts with the candidate journal")
+        candidate_head_identity = record.get("candidate_head_identity")
+        if candidate_head_identity is not None and list(admin.head_snapshot.identity) != candidate_head_identity:
+            raise CandidateUncertain("candidate Git HEAD identity changed")
         if record["state"] == "ready":
-            if staged_index is not None:
-                raise CandidateUncertain("ready candidate has an unresolved Git index lock")
+            if topology != frozenset({"index"}):  # pragma: no cover - checked by topology validator
+                raise CandidateUncertain("ready candidate has unresolved Git index staging")
+            if self._candidate_index_state(record, observed_index) != "candidate":
+                raise CandidateUncertain("ready candidate Git index does not match its tree")
             self._assert_candidate_index(
                 tree,
                 candidate_entries,
@@ -562,6 +589,7 @@ class AttemptWorktrees:
                 index_path=admin.index_path,
                 index_snapshot=observed_index,
             )
+            self._assert_candidate_config_snapshot(admin, config_sha256)
             return self._candidate_receipt(record, state="ready")
         index_state = self._candidate_index_state(record, observed_index)
         expected_entries = base_entries if index_state == "base" else candidate_entries
@@ -572,6 +600,7 @@ class AttemptWorktrees:
             index_path=admin.index_path,
             index_snapshot=observed_index,
         )
+        self._assert_candidate_config_snapshot(admin, config_sha256)
         return self._candidate_receipt(record, state="recoverable")
 
     def _finish_candidate(
@@ -588,9 +617,16 @@ class AttemptWorktrees:
     ) -> CandidateReceipt:
         base_oid = str(record["base_oid"])
         paths = tuple(str(path) for path in record["allowed_paths"])
+        admin = self._assert_candidate_admin_binding(tree, record)
+        config_sha256 = (
+            hashlib.sha256(_json_bytes(self._candidate_config_snapshot(admin))).hexdigest()
+            if record["state"] == "ready"
+            else str(record["config_snapshot_sha256"])
+        )
         base_entries = self._candidate_base_entries(base_oid)
         if snapshot is None:
             snapshot = self._candidate_snapshot(tree, base_entries, paths)
+        self._assert_candidate_config_snapshot(admin, config_sha256)
         tree_oid, rebuilt_objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
         if tree_oid != record["tree_oid"]:
             raise CandidateUncertain("candidate worktree differs from its durable intent")
@@ -609,22 +645,26 @@ class AttemptWorktrees:
             objects = rebuilt_objects
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record, expected_content=commit_content)
-        admin = self._assert_candidate_admin_binding(tree, record)
-        config_sha256 = str(record["config_snapshot_sha256"])
-        self._assert_candidate_config_snapshot(admin, config_sha256)
         candidate_entries = dict(snapshot.entries)
         if candidate_index is None:
             candidate_index = self._candidate_index_image(tree, candidate_oid, candidate_entries)
         self._assert_recorded_candidate_index(record, candidate_index)
-        staged_index = self._candidate_staged_index(admin, candidate_index)
         observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        topology = self._candidate_index_stage_topology(admin, record, candidate_index)
 
         head_oid = self._tree_head(tree)
+        admin = self._assert_candidate_admin_binding(tree, record)
+        if _candidate_head_oid(admin.head_snapshot) != head_oid:
+            raise CandidateUncertain("attempt Git HEAD changed during candidate recovery")
         if record["state"] == "ready":
             if head_oid != candidate_oid:
                 raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
-            if staged_index is not None:
-                raise CandidateUncertain("ready candidate has an unresolved Git index lock")
+            if list(admin.head_snapshot.identity) != record.get("candidate_head_identity"):
+                raise CandidateUncertain("ready candidate Git HEAD identity changed")
+            if topology != frozenset({"index"}):  # pragma: no cover - checked by topology validator
+                raise CandidateUncertain("ready candidate has unresolved Git index staging")
+            if self._candidate_index_state(record, observed_index) != "candidate":
+                raise CandidateUncertain("ready candidate Git index does not match its tree")
             self._assert_candidate_index(
                 tree,
                 candidate_entries,
@@ -639,6 +679,21 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate journal has an unknown state")
         if head_oid not in {base_oid, candidate_oid}:
             raise CandidateUncertain("attempt HEAD conflicts with the prepared candidate")
+        if head_oid == base_oid and (
+            list(admin.head_snapshot.identity) != record.get("base_head_identity")
+            or admin.head_snapshot.sha256 != record.get("base_head_sha256")
+        ):
+            raise CandidateUncertain("attempt Git HEAD changed before candidate installation")
+        candidate_head_identity = record.get("candidate_head_identity")
+        if (
+            head_oid == candidate_oid
+            and candidate_head_identity is not None
+            and (
+                not isinstance(candidate_head_identity, list)
+                or list(admin.head_snapshot.identity) != candidate_head_identity
+            )
+        ):
+            raise CandidateUncertain("candidate Git HEAD identity changed during recovery")
         index_state = self._candidate_index_state(record, observed_index)
         expected_entries = base_entries if index_state == "base" else candidate_entries
         self._assert_candidate_index(
@@ -650,6 +705,8 @@ class AttemptWorktrees:
         )
         if head_oid == base_oid and index_state != "base":
             raise CandidateUncertain("candidate Git index advanced before its HEAD")
+        if head_oid == base_oid and topology:
+            raise CandidateUncertain("candidate Git index staging advanced before its HEAD")
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
 
@@ -661,8 +718,22 @@ class AttemptWorktrees:
         self._verify_candidate_object(record, expected_content=commit_content)
         if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != observed_index:
             raise CandidateUncertain("attempt Git index changed before candidate HEAD update")
-        if self._candidate_staged_index(admin, candidate_index) != staged_index:
-            raise CandidateUncertain("attempt Git index lock changed before candidate HEAD update")
+        if self._candidate_index_stage_topology(admin, record, candidate_index) != topology:
+            raise CandidateUncertain("attempt Git index staging changed before candidate HEAD update")
+        admin = self._assert_candidate_admin_binding(tree, record)
+        if _candidate_head_oid(admin.head_snapshot) != head_oid:
+            raise CandidateUncertain("attempt Git HEAD changed before candidate HEAD update")
+        if head_oid == base_oid and (
+            list(admin.head_snapshot.identity) != record.get("base_head_identity")
+            or admin.head_snapshot.sha256 != record.get("base_head_sha256")
+        ):
+            raise CandidateUncertain("attempt Git HEAD changed before candidate installation")
+        if (
+            head_oid == candidate_oid
+            and record.get("candidate_head_identity") is not None
+            and list(admin.head_snapshot.identity) != record.get("candidate_head_identity")
+        ):
+            raise CandidateUncertain("candidate Git HEAD identity changed before recovery")
 
         if head_oid == base_oid:
             updated = self._run_tree_git(
@@ -677,14 +748,31 @@ class AttemptWorktrees:
         _checkpoint("candidate-head-updated")
         if self._tree_head(tree) != candidate_oid:
             raise CandidateUncertain("candidate HEAD update could not be verified")
+        admin = self._assert_candidate_admin_binding(tree, record)
+        if _candidate_head_oid(admin.head_snapshot) != candidate_oid:
+            raise CandidateUncertain("candidate Git HEAD update could not be bound")
+        if record.get("candidate_head_identity") is None:
+            updated = dict(record)
+            updated["candidate_head_identity"] = list(admin.head_snapshot.identity)
+            self._write_candidate_journal(journal, updated)
+            record.clear()
+            record.update(updated)
+            _checkpoint("candidate-head-recorded")
+        elif list(admin.head_snapshot.identity) != record.get("candidate_head_identity"):
+            raise CandidateUncertain("candidate Git HEAD identity changed after installation")
         self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
 
         observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
         index_state = self._candidate_index_state(record, observed_index)
         if index_state == "base":
-            observed_index = self._replace_candidate_index(admin, observed_index, candidate_index)
+            observed_index = self._replace_candidate_index(record, journal, admin, observed_index, candidate_index)
         _checkpoint("candidate-index-updated")
+        admin = self._assert_candidate_admin_binding(tree, record)
+        if _candidate_head_oid(admin.head_snapshot) != candidate_oid or list(
+            admin.head_snapshot.identity
+        ) != record.get("candidate_head_identity"):
+            raise CandidateUncertain("candidate Git HEAD changed before candidate result recording")
         if self._candidate_index_state(record, observed_index) != "candidate":  # pragma: no cover - invariant
             raise CandidateUncertain("candidate Git index update could not be verified")
         self._assert_candidate_index(
@@ -707,12 +795,18 @@ class AttemptWorktrees:
         )
         self._write_candidate_journal(journal, ready)
         _checkpoint("candidate-result-recorded")
-        if self._tree_head(tree) != candidate_oid:
+        admin = self._assert_candidate_admin_binding(tree, ready)
+        if self._tree_head(tree) != candidate_oid or _candidate_head_oid(admin.head_snapshot) != candidate_oid:
             raise CandidateUncertain("candidate HEAD changed after its result was recorded")
+        if list(admin.head_snapshot.identity) != ready.get("candidate_head_identity"):
+            raise CandidateUncertain("candidate Git HEAD identity changed after its result was recorded")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(ready, expected_content=commit_content)
         final_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
-        self._assert_candidate_index_lock_absent(admin)
+        if self._candidate_index_stage_topology(admin, ready, candidate_index) != frozenset({"index"}):
+            raise CandidateUncertain("ready candidate has unresolved Git index staging")
+        if self._candidate_index_state(ready, final_index) != "candidate":
+            raise CandidateUncertain("ready candidate Git index identity could not be verified")
         self._assert_candidate_index(
             tree,
             candidate_entries,
@@ -820,7 +914,6 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate path was replaced or changed during commit creation")
 
     def _candidate_admin_binding(self, tree: Path) -> _CandidateAdminBinding:
-        self._verify_tree_binding(tree, require_head=True)
         dot_git = tree / ".git"
         try:
             info = dot_git.stat(follow_symlinks=False)
@@ -849,11 +942,71 @@ class AttemptWorktrees:
             raise CandidateUncertain(str(error)) from error
         if git_dir.parent != worktrees:
             raise CandidateUncertain("attempt Git directory is outside the repository worktree administration area")
-        return _CandidateAdminBinding(
+        head_snapshot, static_sha256 = self._candidate_admin_control_snapshot(tree, dot_git, git_dir)
+        binding = _CandidateAdminBinding(
             path=git_dir,
             identity=_directory_identity(git_dir),
             index_path=git_dir / "index",
+            head_snapshot=head_snapshot,
+            static_sha256=static_sha256,
         )
+        self._verify_tree_binding(tree, require_head=True)
+        final_head, final_static_sha256 = self._candidate_admin_control_snapshot(tree, dot_git, git_dir)
+        if final_head != head_snapshot or final_static_sha256 != static_sha256:
+            raise CandidateUncertain("attempt Git administration changed during inspection")
+        if _directory_identity(git_dir) != binding.identity:
+            raise CandidateUncertain("attempt Git directory changed during inspection")
+        return binding
+
+    def _candidate_admin_control_snapshot(
+        self,
+        tree: Path,
+        dot_git: Path,
+        git_dir: Path,
+    ) -> tuple[_CandidateFileSnapshot, str]:
+        """Validate linked-worktree control files without following aliases."""
+        head = _candidate_private_file_snapshot(git_dir / "HEAD", label="attempt Git HEAD")
+        _candidate_head_oid(head)
+        head_lock = git_dir / "HEAD.lock"
+        if head_lock.exists() or head_lock.is_symlink():
+            raise CandidateUncertain("attempt Git HEAD lock contains foreign state")
+        commondir_path = git_dir / "commondir"
+        commondir = _candidate_private_file_snapshot(commondir_path, label="attempt Git commondir")
+        common_value = _candidate_control_path(commondir.content, base=git_dir, label="attempt Git commondir")
+        try:
+            observed_common = _existing_real_directory(common_value, label="attempt Git common directory")
+        except RepositoryError as error:
+            raise CandidateUncertain(str(error)) from error
+        if observed_common != self.common_git_dir:
+            raise CandidateUncertain("attempt Git commondir points outside the recorded repository")
+
+        gitdir_path = git_dir / "gitdir"
+        gitdir = _candidate_private_file_snapshot(gitdir_path, label="attempt Git worktree pointer")
+        worktree_value = _candidate_control_path(gitdir.content, base=git_dir, label="attempt Git worktree pointer")
+        if worktree_value != dot_git:
+            raise CandidateUncertain("attempt Git worktree pointer names a different checkout")
+
+        directory_values: list[tuple[str, tuple[int, int] | None]] = []
+        for name in ("logs", "refs"):
+            path = git_dir / name
+            if not path.exists() and not path.is_symlink():
+                directory_values.append((name, None))
+                continue
+            try:
+                directory = _existing_real_directory(path, label=f"attempt Git {name} directory")
+            except RepositoryError as error:
+                raise CandidateUncertain(str(error)) from error
+            directory_values.append((name, _directory_identity(directory)))
+        logs_head = git_dir / "logs" / "HEAD"
+        if logs_head.exists() or logs_head.is_symlink():
+            _candidate_private_file_snapshot(logs_head, label="attempt Git HEAD reflog")
+
+        static = (
+            (str(commondir_path), commondir.identity, commondir.sha256),
+            (str(gitdir_path), gitdir.identity, gitdir.sha256),
+            *directory_values,
+        )
+        return head, hashlib.sha256(_json_bytes(static)).hexdigest()
 
     def _assert_candidate_admin_binding(
         self,
@@ -865,8 +1018,9 @@ class AttemptWorktrees:
             record.get("git_dir"),
             record.get("git_dir_device"),
             record.get("git_dir_inode"),
+            record.get("git_admin_static_sha256"),
         )
-        if (str(observed.path), *observed.identity) != expected:
+        if (str(observed.path), *observed.identity, observed.static_sha256) != expected:
             raise CandidateUncertain("attempt Git directory changed after candidate preparation")
         return observed
 
@@ -969,6 +1123,8 @@ class AttemptWorktrees:
 
     def _replace_candidate_index(
         self,
+        record: dict[str, object],
+        journal: Path,
         admin: _CandidateAdminBinding,
         expected_base: _CandidateFileSnapshot,
         candidate: _CandidateFileSnapshot,
@@ -978,60 +1134,204 @@ class AttemptWorktrees:
         observed = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
         if observed != expected_base:
             raise CandidateUncertain("attempt Git index does not match its recorded base before update")
+        self._ensure_candidate_index_stage(record, journal, admin, candidate)
+        topology = self._candidate_index_stage_topology(admin, record, candidate)
+        stage = self._candidate_index_stage_path(admin, record)
         lock = admin.index_path.with_name("index.lock")
-        staged = self._candidate_staged_index(admin, candidate)
-        if staged is None:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
+        if topology == frozenset({"stage"}):
             try:
-                descriptor = os.open(lock, flags, 0o600)
+                os.link(stage, lock, follow_symlinks=False)
             except OSError as error:
-                raise CandidateUncertain("candidate Git index lock could not be acquired") from error
-            try:
-                with os.fdopen(descriptor, "wb", closefd=True) as stream:
-                    stream.write(candidate.content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            except BaseException:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-                raise
-            staged = _candidate_private_file_snapshot(lock, label="staged candidate Git index")
-            if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
-                raise CandidateUncertain("staged candidate Git index differs from its durable intent")
+                raise CandidateUncertain("candidate Git index lock could not be acquired atomically") from error
             _fsync_directory(admin.path)
-            _checkpoint("candidate-index-staged")
+            _checkpoint("candidate-index-locked")
+            topology = self._candidate_index_stage_topology(admin, record, candidate)
+        if topology == frozenset({"stage", "lock"}):
+            stage.unlink()
+            _fsync_directory(admin.path)
+            _checkpoint("candidate-index-stage-unlinked")
+            topology = self._candidate_index_stage_topology(admin, record, candidate)
+        if topology != frozenset({"lock"}):
+            raise CandidateUncertain("candidate Git index staging has an invalid durable state")
         if _directory_identity(admin.path) != admin.identity:
             raise CandidateUncertain("attempt Git directory changed during index staging")
         if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != expected_base:
             raise CandidateUncertain("attempt Git index changed during index staging")
-        if _candidate_private_file_snapshot(lock, label="staged candidate Git index") != staged:
-            raise CandidateUncertain("staged candidate Git index changed before installation")
         try:
             os.replace(lock, admin.index_path)
             _fsync_directory(admin.path)
         except OSError as error:
             raise CandidateUncertain("candidate Git index could not be replaced atomically") from error
         installed = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
-        if installed.sha256 != candidate.sha256 or installed.content != candidate.content:
+        if (
+            installed.identity[:2]
+            != (record.get("candidate_index_stage_device"), record.get("candidate_index_stage_inode"))
+            or installed.sha256 != candidate.sha256
+            or installed.content != candidate.content
+        ):
             raise CandidateUncertain("candidate Git index replacement could not be verified")
         return installed
 
-    def _candidate_staged_index(
+    def _new_candidate_index_stage_name(self, admin: _CandidateAdminBinding) -> str:
+        for _ in range(128):
+            name = f".autoform-candidate-index-{secrets.token_hex(16)}.stage"
+            path = admin.path / name
+            if not path.exists() and not path.is_symlink():
+                return name
+        raise CandidateUncertain("candidate Git index stage name could not be allocated")
+
+    def _ensure_candidate_index_stage(
         self,
+        record: dict[str, object],
+        journal: Path,
         admin: _CandidateAdminBinding,
         candidate: _CandidateFileSnapshot,
-    ) -> _CandidateFileSnapshot | None:
+    ) -> None:
+        stage = self._candidate_index_stage_path(admin, record)
+        stage_device = record.get("candidate_index_stage_device")
+        stage_inode = record.get("candidate_index_stage_inode")
+        if _is_integer(stage_device) and _is_integer(stage_inode):
+            self._candidate_index_stage_topology(admin, record, candidate)
+            return
+        if stage_device is not None or stage_inode is not None:
+            raise CandidateUncertain("candidate journal has incomplete index staging identity")
+        self._assert_candidate_index_lock_absent(admin)
+        if stage.exists() or stage.is_symlink():
+            try:
+                stage.unlink()
+                _fsync_directory(admin.path)
+            except OSError as error:
+                raise CandidateUncertain("incomplete candidate Git index stage cannot be discarded") from error
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(stage, flags, 0o600)
+        except OSError as error:
+            raise CandidateUncertain("candidate Git index stage could not be created safely") from error
+        open_descriptor = descriptor
+        try:
+            _checkpoint("candidate-index-stage-created")
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                open_descriptor = -1
+                stream.write(candidate.content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            staged = _candidate_private_file_snapshot(stage, label="candidate Git index stage")
+            if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
+                raise CandidateUncertain("candidate Git index stage differs from its durable intent")
+            _fsync_directory(admin.path)
+            _checkpoint("candidate-index-stage-written")
+            updated = dict(record)
+            updated.update(
+                {
+                    "candidate_index_stage_device": staged.identity[0],
+                    "candidate_index_stage_inode": staged.identity[1],
+                }
+            )
+            self._write_candidate_journal(journal, updated)
+            record.clear()
+            record.update(updated)
+            _checkpoint("candidate-index-staged")
+        except BaseException:
+            if open_descriptor >= 0:
+                os.close(open_descriptor)
+            raise
+
+    def _candidate_index_stage_path(self, admin: _CandidateAdminBinding, record: Mapping[str, object]) -> Path:
+        name = record.get("candidate_index_stage_name")
+        if not isinstance(name, str) or not _CANDIDATE_INDEX_STAGE_NAME.fullmatch(name):
+            raise CandidateUncertain("candidate journal has an invalid index stage name")
+        return admin.path / name
+
+    def _candidate_index_stage_topology(
+        self,
+        admin: _CandidateAdminBinding,
+        record: Mapping[str, object],
+        candidate: _CandidateFileSnapshot,
+    ) -> frozenset[str]:
+        device = record.get("candidate_index_stage_device")
+        inode = record.get("candidate_index_stage_inode")
         lock = admin.index_path.with_name("index.lock")
-        if not lock.exists() and not lock.is_symlink():
-            return None
-        staged = _candidate_private_file_snapshot(lock, label="candidate Git index lock")
-        if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
-            raise CandidateUncertain("candidate Git index lock contains foreign state")
-        return staged
+        stage = self._candidate_index_stage_path(admin, record)
+        try:
+            before = admin.path.stat(follow_symlinks=False)
+            with os.scandir(admin.path) as iterator:
+                foreign_stages = sorted(
+                    entry.name
+                    for entry in iterator
+                    if entry.name.startswith(".autoform-candidate-index-")
+                    and entry.name.endswith(".stage")
+                    and entry.name != stage.name
+                )
+            after = admin.path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise CandidateUncertain("candidate Git index stage inventory cannot be inspected") from error
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or (before.st_dev, before.st_ino) != admin.identity
+            or _candidate_stat_identity(after) != _candidate_stat_identity(before)
+        ):
+            raise CandidateUncertain("attempt Git directory changed during index stage inspection")
+        if foreign_stages:
+            raise CandidateUncertain("attempt Git directory contains a foreign candidate index stage")
+        if device is None and inode is None:
+            if record.get("state") == "ready":
+                raise CandidateUncertain("ready candidate has no durable index staging identity")
+            if lock.exists() or lock.is_symlink():
+                raise CandidateUncertain("attempt Git index lock contains foreign state")
+            if stage.exists() or stage.is_symlink():
+                try:
+                    info = stage.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise CandidateUncertain("candidate Git index stage cannot be inspected") from error
+                if stat.S_ISDIR(info.st_mode):
+                    raise CandidateUncertain("candidate Git index stage is a directory")
+                return frozenset({"pending"})
+            return frozenset()
+        if not _is_integer(device) or not _is_integer(inode):
+            raise CandidateUncertain("candidate journal has an invalid index staging identity")
+
+        locations = {
+            "stage": stage,
+            "lock": lock,
+            "index": admin.index_path,
+        }
+        present: dict[str, _CandidateFileSnapshot] = {}
+        expected = (int(device), int(inode))
+        for label, path in locations.items():
+            try:
+                info = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                if path.is_symlink():
+                    raise CandidateUncertain(f"candidate Git index {label} is a dangling symbolic link")
+                continue
+            except OSError as error:
+                raise CandidateUncertain(f"candidate Git index {label} cannot be inspected") from error
+            if (info.st_dev, info.st_ino) != expected:
+                if label == "index":
+                    continue
+                raise CandidateUncertain(f"candidate Git index {label} is foreign state")
+            present[label] = _candidate_bound_file_snapshot(
+                path, expected=expected, label=f"candidate Git index {label}"
+            )
+        topology = frozenset(present)
+        if topology not in {
+            frozenset({"stage"}),
+            frozenset({"stage", "lock"}),
+            frozenset({"lock"}),
+            frozenset({"index"}),
+        }:
+            raise CandidateUncertain("candidate Git index stage has an invalid link topology")
+        for snapshot in present.values():
+            if snapshot.identity[3] != len(topology):
+                raise CandidateUncertain("candidate Git index stage has an external hard link")
+            if snapshot.sha256 != candidate.sha256 or snapshot.content != candidate.content:
+                raise CandidateUncertain("candidate Git index stage differs from its durable intent")
+        if record.get("state") == "ready" and topology != frozenset({"index"}):
+            raise CandidateUncertain("ready candidate has unresolved Git index staging")
+        return topology
 
     def _assert_candidate_index_lock_absent(self, admin: _CandidateAdminBinding) -> None:
         lock = admin.index_path.with_name("index.lock")
@@ -1063,6 +1363,17 @@ class AttemptWorktrees:
         if len(observed.content) == record.get("candidate_index_size") and observed.sha256 == record.get(
             "candidate_index_sha256"
         ):
+            if record.get("state") == "ready":
+                expected_identity = record.get("candidate_index_identity")
+                if not isinstance(expected_identity, list) or list(observed.identity) != expected_identity:
+                    raise CandidateUncertain("ready candidate Git index identity changed")
+            else:
+                stage_device = record.get("candidate_index_stage_device")
+                stage_inode = record.get("candidate_index_stage_inode")
+                if not _is_integer(stage_device) or not _is_integer(stage_inode):
+                    raise CandidateUncertain("candidate Git index advanced without a durable staged identity")
+                if observed.identity[:2] != (stage_device, stage_inode):
+                    raise CandidateUncertain("candidate Git index does not match its durable staged identity")
             return "candidate"
         raise CandidateUncertain("attempt Git index conflicts with the durable candidate transition")
 
@@ -1157,6 +1468,8 @@ class AttemptWorktrees:
     def _assert_ready_candidate_tree(self, record: Mapping[str, object], tree: Path) -> None:
         if record["state"] != "ready":
             raise CandidateUncertain("candidate recovery must finish before cleanup")
+        admin = self._assert_candidate_admin_binding(tree, record)
+        config_sha256 = hashlib.sha256(_json_bytes(self._candidate_config_snapshot(admin))).hexdigest()
         base_entries = self._candidate_base_entries(str(record["base_oid"]))
         paths = tuple(str(path) for path in record["allowed_paths"])
         snapshot = self._candidate_snapshot(tree, base_entries, paths)
@@ -1165,12 +1478,19 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record)
-        if self._tree_head(tree) != record["candidate_oid"]:
+        if (
+            self._tree_head(tree) != record["candidate_oid"]
+            or _candidate_head_oid(admin.head_snapshot) != record["candidate_oid"]
+            or list(admin.head_snapshot.identity) != record.get("candidate_head_identity")
+        ):
             raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
-        admin = self._assert_candidate_admin_binding(tree, record)
-        self._assert_candidate_config_snapshot(admin, str(record["config_snapshot_sha256"]))
-        self._assert_candidate_index_lock_absent(admin)
         index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        candidate_index = self._candidate_index_image(tree, str(record["candidate_oid"]), dict(snapshot.entries))
+        self._assert_recorded_candidate_index(record, candidate_index)
+        if self._candidate_index_stage_topology(admin, record, candidate_index) != frozenset({"index"}):
+            raise CandidateUncertain("ready candidate has unresolved Git index staging")
+        if self._candidate_index_state(record, index) != "candidate":
+            raise CandidateUncertain("ready candidate Git index identity changed")
         self._assert_candidate_index(
             tree,
             dict(snapshot.entries),
@@ -1178,6 +1498,7 @@ class AttemptWorktrees:
             index_path=admin.index_path,
             index_snapshot=index,
         )
+        self._assert_candidate_config_snapshot(admin, config_sha256)
 
     def _candidate_receipt(self, record: Mapping[str, object], *, state: str) -> CandidateReceipt:
         identity = {
@@ -1199,11 +1520,18 @@ class AttemptWorktrees:
                 "git_dir",
                 "git_dir_device",
                 "git_dir_inode",
+                "git_admin_static_sha256",
+                "base_head_identity",
+                "base_head_sha256",
+                "candidate_head_identity",
                 "base_index_identity",
                 "base_index_sha256",
                 "candidate_index_size",
                 "candidate_index_sha256",
                 "candidate_index_identity",
+                "candidate_index_stage_name",
+                "candidate_index_stage_device",
+                "candidate_index_stage_inode",
                 "config_snapshot_sha256",
             )
         }
@@ -1274,7 +1602,14 @@ class AttemptWorktrees:
             _validate_candidate_identity(str(record["author_name"]), str(record["author_email"]))
         except RepositoryError as error:
             raise CandidateUncertain("candidate journal has an invalid author identity") from error
-        for key in ("message_sha256", "base_index_sha256", "candidate_index_sha256", "config_snapshot_sha256"):
+        for key in (
+            "message_sha256",
+            "git_admin_static_sha256",
+            "base_head_sha256",
+            "base_index_sha256",
+            "candidate_index_sha256",
+            "config_snapshot_sha256",
+        ):
             if not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", str(record.get(key))):
                 raise CandidateUncertain(f"candidate journal has an invalid {key}")
         if not isinstance(record.get("git_dir"), str) or not Path(str(record["git_dir"])).is_absolute():
@@ -1282,23 +1617,53 @@ class AttemptWorktrees:
         for key in ("git_dir_device", "git_dir_inode", "candidate_index_size"):
             if not _is_integer(record.get(key)) or int(record[key]) < 0:
                 raise CandidateUncertain(f"candidate journal has an invalid {key}")
-        base_index_identity = record.get("base_index_identity")
-        if (
-            not isinstance(base_index_identity, list)
-            or len(base_index_identity) != 7
-            or any(not _is_integer(value) or int(value) < 0 for value in base_index_identity)
+        for key in ("base_head_identity", "base_index_identity"):
+            identity = record.get(key)
+            if (
+                not isinstance(identity, list)
+                or len(identity) != 7
+                or any(not _is_integer(value) or int(value) < 0 for value in identity)
+            ):
+                raise CandidateUncertain(f"candidate journal has an invalid {key}")
+        candidate_head_identity = record.get("candidate_head_identity")
+        if candidate_head_identity is not None and (
+            not isinstance(candidate_head_identity, list)
+            or len(candidate_head_identity) != 7
+            or any(not _is_integer(value) or int(value) < 0 for value in candidate_head_identity)
         ):
-            raise CandidateUncertain("candidate journal has an invalid base index identity")
+            raise CandidateUncertain("candidate journal has an invalid candidate HEAD identity")
         candidate_index_identity = record.get("candidate_index_identity")
         if record.get("state") == "ready":
             if (
-                not isinstance(candidate_index_identity, list)
+                candidate_head_identity is None
+                or not isinstance(candidate_index_identity, list)
                 or len(candidate_index_identity) != 7
                 or any(not _is_integer(value) or int(value) < 0 for value in candidate_index_identity)
             ):
                 raise CandidateUncertain("ready candidate journal has an invalid candidate index identity")
         elif candidate_index_identity is not None:
             raise CandidateUncertain("prepared candidate journal has a premature candidate index identity")
+        stage_name = record.get("candidate_index_stage_name")
+        stage_device = record.get("candidate_index_stage_device")
+        stage_inode = record.get("candidate_index_stage_inode")
+        if not isinstance(stage_name, str) or not _CANDIDATE_INDEX_STAGE_NAME.fullmatch(stage_name):
+            raise CandidateUncertain("candidate journal has an invalid index staging identity")
+        if stage_device is None and stage_inode is None:
+            if record.get("state") == "ready":
+                raise CandidateUncertain("ready candidate journal has no index staging identity")
+        elif (
+            not _is_integer(stage_device)
+            or not _is_integer(stage_inode)
+            or int(stage_device) < 0
+            or int(stage_inode) < 0
+        ):
+            raise CandidateUncertain("candidate journal has an invalid index staging identity")
+        if (
+            isinstance(candidate_index_identity, list)
+            and stage_device is not None
+            and (candidate_index_identity[:2] != [stage_device, stage_inode])
+        ):
+            raise CandidateUncertain("ready candidate index does not match its staged identity")
         try:
             for key in ("base_oid", "tree_oid", "candidate_oid"):
                 _validate_oid(str(record.get(key, "")))
@@ -3589,44 +3954,88 @@ def _snapshot_regular_tree(
     contents: dict[str, bytes] = {}
     identities: dict[str, tuple[int, ...]] = {}
     directories: dict[str, tuple[int, ...]] = {}
-    pending: list[tuple[Path, str]] = [(tree, "")]
-    while pending:
-        directory, relative_directory = pending.pop()
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+
+    def visit(directory_fd: int, relative_directory: str) -> None:
         try:
-            before = directory.stat(follow_symlinks=False)
-            entries = list(os.scandir(directory))
-            after = directory.stat(follow_symlinks=False)
+            before = os.fstat(directory_fd)
+            with os.scandir(directory_fd) as iterator:
+                entries = list(iterator)
+            listed = os.fstat(directory_fd)
         except OSError as error:
             label = relative_directory or "."
             raise CandidateUncertain(f"candidate directory cannot be inspected safely: {label}") from error
         before_identity = _candidate_stat_identity(before)
-        if not stat.S_ISDIR(before.st_mode) or before_identity != _candidate_stat_identity(after):
+        if not stat.S_ISDIR(before.st_mode) or before_identity != _candidate_stat_identity(listed):
             label = relative_directory or "."
             raise CandidateUncertain(f"candidate directory changed while being inspected: {label}")
         if relative_directory:
             directories[relative_directory] = before_identity
-        for entry in entries:
+        _checkpoint(f"candidate-directory-listed:{relative_directory or '.'}")
+        for entry in sorted(entries, key=lambda item: item.name.encode("utf-8", errors="surrogateescape")):
             relative = f"{relative_directory}/{entry.name}" if relative_directory else entry.name
             if relative == ".git":
                 continue
             if not _safe_candidate_path(relative):
                 raise CandidateUncertain(f"candidate contains an unsafe or reserved path: {relative!r}")
-            path = Path(entry.path)
             try:
-                info = entry.stat(follow_symlinks=False)
+                info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as error:
                 raise CandidateUncertain(f"candidate path cannot be inspected safely: {relative}") from error
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                pending.append((path, relative))
+                try:
+                    child_fd = os.open(entry.name, directory_flags, dir_fd=directory_fd)
+                except OSError as error:
+                    raise CandidateUncertain(f"candidate directory cannot be opened safely: {relative}") from error
+                try:
+                    if _candidate_stat_identity(os.fstat(child_fd)) != _candidate_stat_identity(info):
+                        raise CandidateUncertain(f"candidate directory changed while being opened: {relative}")
+                    visit(child_fd, relative)
+                    current = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                    if _candidate_stat_identity(current) != _candidate_stat_identity(info):
+                        raise CandidateUncertain(f"candidate directory was replaced after being read: {relative}")
+                finally:
+                    os.close(child_fd)
                 continue
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 kind = "symbolic link" if stat.S_ISLNK(info.st_mode) else "special file"
                 raise CandidateUncertain(f"candidate commits reject {kind}: {relative}")
-            content, identity = _read_candidate_regular_file(path, info, relative)
+            content, identity = _read_candidate_regular_file_at(directory_fd, entry.name, info, relative)
             mode = "100755" if info.st_mode & 0o111 else "100644"
             files[relative] = (mode, _git_blob_oid(content, object_format))
             contents[relative] = content
             identities[relative] = identity
+        try:
+            finished = os.fstat(directory_fd)
+        except OSError as error:
+            label = relative_directory or "."
+            raise CandidateUncertain(f"candidate directory cannot be rechecked safely: {label}") from error
+        if _candidate_stat_identity(finished) != before_identity:
+            label = relative_directory or "."
+            raise CandidateUncertain(f"candidate directory changed while being read: {label}")
+
+    try:
+        root_info = tree.stat(follow_symlinks=False)
+        root_fd = os.open(tree, directory_flags)
+    except OSError as error:
+        raise CandidateUncertain("candidate worktree root cannot be opened safely") from error
+    try:
+        root_identity = _candidate_stat_identity(root_info)
+        if not stat.S_ISDIR(root_info.st_mode) or _candidate_stat_identity(os.fstat(root_fd)) != root_identity:
+            raise CandidateUncertain("candidate worktree root changed while being opened")
+        visit(root_fd, "")
+    finally:
+        os.close(root_fd)
+    try:
+        current_root = tree.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain("candidate worktree root disappeared after inspection") from error
+    if _candidate_stat_identity(current_root) != root_identity:
+        raise CandidateUncertain("candidate worktree root was replaced after inspection")
 
     expected_directories: set[str] = set()
     for path in files:
@@ -3636,6 +4045,49 @@ def _snapshot_regular_tree(
     if foreign_directories:
         raise CandidateUncertain(f"candidate contains foreign directory output: {foreign_directories[0]}")
     return files, contents, identities, directories
+
+
+def _read_candidate_regular_file_at(
+    directory_fd: int,
+    name: str,
+    expected: os.stat_result,
+    relative: str,
+) -> tuple[bytes, tuple[int, ...]]:
+    if not stat.S_ISREG(expected.st_mode) or stat.S_ISLNK(expected.st_mode) or expected.st_nlink != 1:
+        raise CandidateUncertain(f"candidate path is not a private regular file: {relative}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise CandidateUncertain(f"candidate regular file cannot be opened safely: {relative}") from error
+    try:
+        opened = os.fstat(descriptor)
+        expected_identity = _candidate_stat_identity(expected)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _candidate_stat_identity(opened) != expected_identity
+        ):
+            raise CandidateUncertain(f"candidate regular file changed while being opened: {relative}")
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+        if _candidate_stat_identity(os.fstat(descriptor)) != expected_identity or len(content) != opened.st_size:
+            raise CandidateUncertain(f"candidate regular file changed while being read: {relative}")
+    finally:
+        os.close(descriptor)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain(f"candidate regular file disappeared after being read: {relative}") from error
+    if _candidate_stat_identity(current) != expected_identity:
+        raise CandidateUncertain(f"candidate regular file was replaced after being read: {relative}")
+    return bytes(content), expected_identity
 
 
 def _read_candidate_regular_file(path: Path, expected: os.stat_result, relative: str) -> tuple[bytes, tuple[int, ...]]:
@@ -3746,6 +4198,53 @@ def _candidate_private_file_snapshot(path: Path, *, label: str) -> _CandidateFil
     )
 
 
+def _candidate_bound_file_snapshot(
+    path: Path,
+    *,
+    expected: tuple[int, int],
+    label: str,
+) -> _CandidateFileSnapshot:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be inspected safely: {path}") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or (info.st_dev, info.st_ino) != expected:
+        raise CandidateUncertain(f"{label} does not match its durable file identity")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be opened safely: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = _candidate_stat_identity(opened)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != expected:
+            raise CandidateUncertain(f"{label} changed while being opened")
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+        if _candidate_stat_identity(os.fstat(descriptor)) != opened_identity or len(content) != opened.st_size:
+            raise CandidateUncertain(f"{label} changed while being read")
+    finally:
+        os.close(descriptor)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} disappeared after being read") from error
+    if _candidate_stat_identity(current) != opened_identity:
+        raise CandidateUncertain(f"{label} changed after being read")
+    return _CandidateFileSnapshot(
+        identity=opened_identity,
+        sha256=hashlib.sha256(content).hexdigest(),
+        content=bytes(content),
+    )
+
+
 def _optional_candidate_private_file_snapshot(
     path: Path,
     *,
@@ -3765,6 +4264,42 @@ def _optional_candidate_private_file_snapshot(
         sha256=hashlib.sha256(content).hexdigest(),
         content=content,
     )
+
+
+def _candidate_head_oid(snapshot: _CandidateFileSnapshot) -> str:
+    try:
+        content = snapshot.content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise CandidateUncertain("attempt Git HEAD is not ASCII") from error
+    oid = content[:-1] if content.endswith("\n") else content
+    if not oid or "\n" in oid or "\r" in oid or content not in {oid, f"{oid}\n"}:
+        raise CandidateUncertain("attempt Git HEAD is not a detached object id")
+    try:
+        _validate_oid(oid)
+    except RepositoryError as error:
+        raise CandidateUncertain("attempt Git HEAD is not a detached object id") from error
+    return oid
+
+
+def _candidate_control_path(content: bytes, *, base: Path, label: str) -> Path:
+    try:
+        line = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise CandidateUncertain(f"{label} is not UTF-8") from error
+    value = line[:-1] if line.endswith("\n") else line
+    if not value or "\n" in value or "\r" in value or "\0" in value or line not in {value, f"{value}\n"}:
+        raise CandidateUncertain(f"{label} is malformed")
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    path = _absolute_path(path)
+    try:
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise CandidateUncertain(f"{label} cannot be resolved safely") from error
+    if canonical != path:
+        raise CandidateUncertain(f"{label} traverses a symbolic link")
+    return path
 
 
 def _assert_candidate_config_is_self_contained(repository: AttemptWorktrees, content: bytes) -> None:

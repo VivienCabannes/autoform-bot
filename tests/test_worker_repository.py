@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import autoform_worker
 import autoform_worker.repository as repository_module
 from autoform_worker.ledger import RunLedger
 from autoform_worker.repository import (
@@ -950,7 +952,7 @@ def test_candidate_commit_is_deterministic_idempotent_and_preserves_allowed_chan
         receipt.candidate_oid,
         base,
     ]
-    assert _git("status", "--porcelain=v1", "--untracked-files=all", cwd=tree) == ""
+    assert _git("--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", cwd=tree) == ""
     assert _git("ls-tree", receipt.candidate_oid, "script.sh", cwd=tree).startswith("100755 blob ")
     assert _git("ls-tree", receipt.candidate_oid, "delete.txt", cwd=tree) == ""
     assert _git("show", f"{receipt.candidate_oid}:./:(literal)proof.txt", cwd=tree) == "literal path"
@@ -971,6 +973,19 @@ def test_candidate_commit_is_deterministic_idempotent_and_preserves_allowed_chan
     manager.cleanup("run-1", "attempt-1")
     with pytest.raises(CandidateNotFound):
         manager.inspect_candidate("run-1", "attempt-1")
+
+
+def test_candidate_types_are_exported_from_worker_package() -> None:
+    assert autoform_worker.CandidateError is repository_module.CandidateError
+    assert autoform_worker.CandidateNotFound is repository_module.CandidateNotFound
+    assert autoform_worker.CandidateReceipt is repository_module.CandidateReceipt
+    assert autoform_worker.CandidateUncertain is repository_module.CandidateUncertain
+    assert {
+        "CandidateError",
+        "CandidateNotFound",
+        "CandidateReceipt",
+        "CandidateUncertain",
+    } <= set(autoform_worker.__all__)
 
 
 def test_candidate_commit_rejects_unallowed_ignored_symlink_special_and_reserved_paths(
@@ -1076,6 +1091,132 @@ def test_candidate_commit_rejects_nonprivate_worktree_index(
     assert (tree / "book.txt").read_text(encoding="utf-8") == "candidate\n"
 
 
+@pytest.mark.parametrize(
+    ("control", "replacement"),
+    (("HEAD", "hardlink"), ("commondir", "symlink"), ("gitdir", "hardlink"), ("logs/HEAD", "hardlink")),
+)
+def test_candidate_commit_rejects_nonprivate_worktree_admin_controls(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    control: str,
+    replacement: str,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / f"state-{control}-{replacement}")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    target = git_dir.joinpath(*control.split("/"))
+    outside = tmp_path / f"outside-{control.replace('/', '-')}"
+    target.rename(outside)
+    if replacement == "symlink":
+        target.symlink_to(outside)
+    else:
+        os.link(outside, target)
+    before = outside.read_bytes()
+
+    with pytest.raises(CandidateUncertain, match="private regular file"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert outside.read_bytes() == before
+
+
+@pytest.mark.parametrize("control", ("logs", "refs"))
+def test_candidate_commit_rejects_aliased_worktree_admin_directories(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    control: str,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / f"state-{control}")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    target = git_dir / control
+    target.mkdir(exist_ok=True)
+    outside = tmp_path / f"outside-{control}"
+    target.rename(outside)
+    target.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(CandidateUncertain, match="real canonical directory"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert outside.is_dir()
+
+
+def test_candidate_commit_rejects_foreign_head_lock(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    lock = git_dir / "HEAD.lock"
+    lock.write_bytes(b"foreign HEAD transaction")
+
+    with pytest.raises(CandidateUncertain, match="HEAD lock contains foreign state"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert lock.read_bytes() == b"foreign HEAD transaction"
+
+
+def test_candidate_commit_rechecks_head_reflog_before_ref_update(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    head_log = git_dir / "logs" / "HEAD"
+    outside = tmp_path / "outside-head-log"
+    before = head_log.read_bytes()
+
+    def replace_head_log(name: str) -> None:
+        if name == "candidate-objects-written":
+            head_log.rename(outside)
+            os.link(outside, head_log)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_head_log)
+    with pytest.raises(CandidateUncertain, match="private regular file"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert outside.read_bytes() == before
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
 def test_candidate_commit_preserves_and_rejects_foreign_index_lock(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
@@ -1100,6 +1241,43 @@ def test_candidate_commit_preserves_and_rejects_foreign_index_lock(
 
     assert lock.read_bytes() == b"foreign index transaction"
     assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+def test_candidate_recovery_rejects_same_byte_foreign_index_lock(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"book.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "candidate-index-staged":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
+
+    journal = manager.worktree_root / "run-1" / "attempt-1" / "candidate.json"
+    record = json.loads(journal.read_text(encoding="utf-8"))
+    git_dir = Path(record["git_dir"])
+    stage = git_dir / record["candidate_index_stage_name"]
+    lock = git_dir / "index.lock"
+    lock.write_bytes(stage.read_bytes())
+    stage.unlink()
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    with pytest.raises(CandidateUncertain, match="foreign state"):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
 
 
 def test_candidate_commit_rejects_explicitly_allowed_ignored_output(
@@ -1235,6 +1413,32 @@ def test_candidate_recovery_rejects_base_index_aba(
     assert (tree / "book.txt").read_text(encoding="utf-8") == "candidate\n"
 
 
+def test_ready_candidate_rejects_same_byte_index_replacement(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    index = git_dir / "index"
+    replacement = git_dir / "replacement-index"
+    replacement.write_bytes(index.read_bytes())
+    os.replace(replacement, index)
+
+    with pytest.raises(CandidateUncertain, match="identity|topology"):
+        manager.inspect_candidate("run-1", "attempt-1")
+
+
 def test_candidate_commit_rejects_index_replacement_before_head_update(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
@@ -1340,7 +1544,12 @@ def test_candidate_commit_does_not_execute_filters_hooks_signing_or_external_dif
         ("candidate-intent-recorded", None),
         ("candidate-objects-written", None),
         ("candidate-head-updated", "recoverable"),
+        ("candidate-head-recorded", "recoverable"),
+        ("candidate-index-stage-created", "recoverable"),
+        ("candidate-index-stage-written", "recoverable"),
         ("candidate-index-staged", "recoverable"),
+        ("candidate-index-locked", "recoverable"),
+        ("candidate-index-stage-unlinked", "recoverable"),
         ("candidate-index-updated", "recoverable"),
         ("candidate-result-recorded", "ready"),
     ),
@@ -1381,6 +1590,9 @@ def test_candidate_commit_recovers_every_durable_crash_boundary(
     recovered = manager.commit_candidate("run-1", "attempt-1", **arguments)
     assert recovered.state == "ready"
     assert manager.commit_candidate("run-1", "attempt-1", **arguments) == recovered
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    assert not list(git_dir.glob(".autoform-candidate-index-*.stage"))
+    assert not (git_dir / "index.lock").exists()
 
 
 def test_candidate_commit_detects_path_and_config_replacement_before_ref_update(
@@ -1433,6 +1645,96 @@ def test_candidate_commit_detects_path_and_config_replacement_before_ref_update(
             author_email="autoform@example.invalid",
         )
     assert _git("rev-parse", "HEAD", cwd=config_tree) == base
+
+
+def test_candidate_recovery_rejects_repository_config_drift(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"book.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "candidate-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
+
+    _git("config", "autoform.testSetting", "changed", cwd=coordinator)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    with pytest.raises(CandidateUncertain, match="configuration changed"):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+def test_candidate_snapshot_rejects_directory_replacement_after_open(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    chapter = tree / "chapter"
+    chapter.mkdir()
+    (chapter / "proof.lean").write_text("candidate\n", encoding="utf-8")
+    replaced = False
+
+    def replace_directory(name: str) -> None:
+        nonlocal replaced
+        if name == "candidate-directory-listed:chapter" and not replaced:
+            original = tree / "chapter-original"
+            chapter.rename(original)
+            chapter.mkdir()
+            (chapter / "proof.lean").write_text("replacement\n", encoding="utf-8")
+            replaced = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_directory)
+    with pytest.raises(CandidateUncertain, match="directory (?:changed|was replaced)"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"chapter/proof.lean"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+
+def test_ready_candidate_allows_benign_repository_config_drift(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    (tree / "book.txt").write_text("candidate\n", encoding="utf-8")
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    _git("config", "autoform.testSetting", "benign", cwd=coordinator)
+
+    assert manager.inspect_candidate("run-1", "attempt-1") == candidate
+    manager.cleanup("run-1", "attempt-1")
+    with pytest.raises(CandidateNotFound):
+        manager.inspect_candidate("run-1", "attempt-1")
 
 
 @pytest.mark.parametrize("object_format", ("sha1", "sha256"))

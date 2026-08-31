@@ -25,6 +25,10 @@ from .ledger import (
 )
 from .repository import (
     AttemptWorktrees,
+    CandidateError,
+    CandidateNotFound,
+    CandidateReceipt,
+    CandidateUncertain,
     MergeQueueBusy,
     MergeQueueError,
     PublicationReceipt,
@@ -69,8 +73,12 @@ __all__ = [
     "AttemptRecord",
     "ArticleClaimToken",
     "CancellationSignal",
+    "CandidateError",
+    "CandidateNotFound",
+    "CandidateReceipt",
     "CandidateReviewRequest",
     "CandidateReviewResult",
+    "CandidateUncertain",
     "CoordinatorLock",
     "EventRecord",
     "ExternalIntegrationRecord",
