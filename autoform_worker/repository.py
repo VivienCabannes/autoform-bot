@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Set
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -29,6 +29,7 @@ from .ledger import CoordinatorLock
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
+_CANDIDATE_SCHEMA = "autoform-candidate/v1"
 _PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
@@ -89,6 +90,18 @@ class WorktreeUncertain(RepositoryError):
     """An interrupted worktree operation cannot be recovered automatically."""
 
 
+class CandidateError(RepositoryError):
+    """A candidate commit is absent, conflicted, or cannot be verified."""
+
+
+class CandidateNotFound(CandidateError):
+    """No durable candidate intent exists for the attempt."""
+
+
+class CandidateUncertain(CandidateError):
+    """Candidate evidence is incomplete or conflicts with repository state."""
+
+
 class MergeQueueError(RepositoryError):
     """A merge-queue operation failed before integration was verified."""
 
@@ -143,6 +156,34 @@ class WorktreeReceipt:
     head_oid: str
     state: str
     identity_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReceipt:
+    """Verified durable evidence for one deterministic attempt candidate."""
+
+    run_id: str
+    attempt_id: str
+    repository_id: str
+    path: str
+    base_oid: str
+    tree_oid: str
+    candidate_oid: str
+    state: str
+    allowed_paths: tuple[str, ...]
+    author_name: str
+    author_email: str
+    message_sha256: str
+    identity_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateSnapshot:
+    entries: tuple[tuple[str, tuple[str, str]], ...]
+    blobs: tuple[tuple[str, bytes], ...]
+    git_identity: tuple[int, int, str]
+    file_identities: tuple[tuple[str, tuple[int, ...]], ...]
+    directory_identities: tuple[tuple[str, tuple[int, ...]], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +363,551 @@ class AttemptWorktrees:
             raise WorktreeConflict("candidate commit is not descended from its recorded base")
         return receipt.head_oid
 
+    def commit_candidate(
+        self,
+        run_id: str,
+        attempt_id: str,
+        *,
+        allowed_paths: Set[str],
+        message: str,
+        author_name: str,
+        author_email: str,
+    ) -> CandidateReceipt:
+        """Commit exactly the allowed regular-file changes without Git's porcelain."""
+        _validate_name("run id", run_id)
+        _validate_name("attempt id", attempt_id)
+        paths = _validate_candidate_paths(allowed_paths)
+        message_bytes = _validate_candidate_message(message)
+        _validate_candidate_identity(author_name, author_email)
+        message_sha256 = hashlib.sha256(message_bytes).hexdigest()
+        attempt_root, tree, marker = self._attempt_paths(run_id, attempt_id)
+        journal = attempt_root / "candidate.json"
+
+        with self._attempt_lock(run_id, attempt_id):
+            worktree = self.inspect(run_id, attempt_id)
+            if worktree.state != "ready":
+                raise CandidateUncertain(f"attempt worktree is {worktree.state}")
+            marker_record = self._read_attempt_marker(marker)
+            self._validate_attempt_record(
+                marker_record,
+                run_id,
+                attempt_id,
+                attempt_root,
+                tree,
+                worktree.base_oid,
+            )
+            expected_identity = {
+                "repository_id": self.repository_id,
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "base_oid": worktree.base_oid,
+                "path": str(tree),
+                "worktree_identity_sha256": worktree.identity_sha256,
+                "allowed_paths": list(paths),
+                "author_name": author_name,
+                "author_email": author_email,
+                "message_sha256": message_sha256,
+            }
+            if journal.exists() or journal.is_symlink():
+                record = self._read_candidate_journal(journal)
+                self._validate_candidate_record(record, marker_record, expected_identity=expected_identity)
+                return self._finish_candidate(
+                    record,
+                    journal,
+                    tree,
+                    message_bytes=message_bytes,
+                )
+            _remove_atomic_write_orphans(journal)
+            if worktree.head_oid != worktree.base_oid:
+                raise CandidateUncertain("attempt HEAD advanced without a durable candidate intent")
+
+            base_entries = self._candidate_base_entries(worktree.base_oid)
+            self._assert_candidate_index(tree, base_entries, label="recorded base")
+            config_snapshot = self._candidate_config_snapshot(tree)
+            snapshot = self._candidate_snapshot(tree, base_entries, paths)
+            tree_oid, objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
+            commit_content = _candidate_commit_content(
+                tree_oid,
+                worktree.base_oid,
+                author_name,
+                author_email,
+                message_bytes,
+            )
+            candidate_oid = _git_object_oid("commit", commit_content, self.object_format)
+            root_device, root_inode = _directory_identity(attempt_root)
+            record: dict[str, object] = {
+                "schema": _CANDIDATE_SCHEMA,
+                **expected_identity,
+                "state": "prepared",
+                "tree_oid": tree_oid,
+                "candidate_oid": candidate_oid,
+                "root_device": root_device,
+                "root_inode": root_inode,
+                "created_ns": time.time_ns(),
+                "ready_ns": None,
+            }
+            self._write_candidate_journal(journal, record)
+            _checkpoint("candidate-intent-recorded")
+            self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+            self._assert_candidate_config_snapshot(tree, config_snapshot)
+            return self._finish_candidate(
+                record,
+                journal,
+                tree,
+                message_bytes=message_bytes,
+                snapshot=snapshot,
+                objects=objects,
+                commit_content=commit_content,
+                config_snapshot=config_snapshot,
+            )
+
+    def inspect_candidate(self, run_id: str, attempt_id: str) -> CandidateReceipt:
+        """Inspect durable candidate evidence without repairing or cleaning it."""
+        _validate_name("run id", run_id)
+        _validate_name("attempt id", attempt_id)
+        attempt_root, tree, marker = self._attempt_paths(run_id, attempt_id)
+        if not attempt_root.exists() and not attempt_root.is_symlink():
+            raise CandidateNotFound(f"candidate does not exist: {run_id}/{attempt_id}")
+        worktree = self.inspect(run_id, attempt_id)
+        if worktree.state != "ready":
+            raise CandidateUncertain(f"attempt worktree is {worktree.state}")
+        journal = attempt_root / "candidate.json"
+        if not journal.exists() and not journal.is_symlink():
+            raise CandidateNotFound(f"candidate does not exist: {run_id}/{attempt_id}")
+        marker_record = self._read_attempt_marker(marker)
+        self._validate_attempt_record(
+            marker_record,
+            run_id,
+            attempt_id,
+            attempt_root,
+            tree,
+            worktree.base_oid,
+        )
+        record = self._read_candidate_journal(journal)
+        self._validate_candidate_record(record, marker_record)
+        paths = tuple(str(path) for path in record["allowed_paths"])
+        base_entries = self._candidate_base_entries(worktree.base_oid)
+        snapshot = self._candidate_snapshot(tree, base_entries, paths)
+        tree_oid, objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
+        if tree_oid != record["tree_oid"]:
+            raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
+        self._verify_candidate_objects(objects)
+        self._verify_candidate_object(record)
+
+        candidate_oid = str(record["candidate_oid"])
+        head_oid = self._tree_head(tree)
+        if head_oid != candidate_oid:
+            if record["state"] == "prepared" and head_oid == worktree.base_oid:
+                raise CandidateUncertain("candidate intent exists but its commit is not current")
+            raise CandidateUncertain("attempt HEAD conflicts with the candidate journal")
+        candidate_entries = dict(snapshot.entries)
+        if record["state"] == "ready":
+            self._assert_candidate_index(tree, candidate_entries, label="candidate")
+            return self._candidate_receipt(record, state="ready")
+        index_entries = self._candidate_index_entries(tree)
+        if index_entries not in (base_entries, candidate_entries):
+            raise CandidateUncertain("candidate index conflicts with its recorded base and tree")
+        return self._candidate_receipt(record, state="recoverable")
+
+    def _finish_candidate(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        tree: Path,
+        *,
+        message_bytes: bytes,
+        snapshot: _CandidateSnapshot | None = None,
+        objects: tuple[tuple[str, str, bytes], ...] | None = None,
+        commit_content: bytes | None = None,
+        config_snapshot: tuple[tuple[str, object], ...] | None = None,
+    ) -> CandidateReceipt:
+        base_oid = str(record["base_oid"])
+        paths = tuple(str(path) for path in record["allowed_paths"])
+        base_entries = self._candidate_base_entries(base_oid)
+        if snapshot is None:
+            snapshot = self._candidate_snapshot(tree, base_entries, paths)
+        tree_oid, rebuilt_objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
+        if tree_oid != record["tree_oid"]:
+            raise CandidateUncertain("candidate worktree differs from its durable intent")
+        if commit_content is None:
+            commit_content = _candidate_commit_content(
+                tree_oid,
+                base_oid,
+                str(record["author_name"]),
+                str(record["author_email"]),
+                message_bytes,
+            )
+        candidate_oid = _git_object_oid("commit", commit_content, self.object_format)
+        if candidate_oid != record["candidate_oid"]:
+            raise CandidateUncertain("candidate inputs do not reproduce the journaled commit")
+        if objects is None:
+            objects = rebuilt_objects
+        if config_snapshot is None:
+            config_snapshot = self._candidate_config_snapshot(tree)
+
+        head_oid = self._tree_head(tree)
+        candidate_entries = dict(snapshot.entries)
+        if record["state"] == "ready":
+            if head_oid != candidate_oid:
+                raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
+            self._verify_candidate_objects(objects)
+            self._verify_candidate_object(record, expected_content=commit_content)
+            self._assert_candidate_index(tree, candidate_entries, label="candidate")
+            self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+            self._assert_candidate_config_snapshot(tree, config_snapshot)
+            return self._candidate_receipt(record, state="ready")
+        if record["state"] != "prepared":  # pragma: no cover - validated before dispatch
+            raise CandidateUncertain("candidate journal has an unknown state")
+        if head_oid not in {base_oid, candidate_oid}:
+            raise CandidateUncertain("attempt HEAD conflicts with the prepared candidate")
+        index_entries = self._candidate_index_entries(tree)
+        if head_oid == base_oid and index_entries != base_entries:
+            raise CandidateUncertain("candidate index does not match the recorded base")
+        if head_oid == candidate_oid and index_entries not in (base_entries, candidate_entries):
+            raise CandidateUncertain("candidate index conflicts with its recorded base and tree")
+        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+        self._assert_candidate_config_snapshot(tree, config_snapshot)
+
+        for object_type, expected_oid, content in (*objects, ("commit", candidate_oid, commit_content)):
+            self._write_candidate_object(object_type, expected_oid, content)
+        _checkpoint("candidate-objects-written")
+        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        self._verify_candidate_object(record, expected_content=commit_content)
+
+        if head_oid == base_oid:
+            updated = self._run_tree_git(
+                tree,
+                ["update-ref", "--no-deref", "HEAD", candidate_oid, base_oid],
+                check=False,
+            )
+            if updated.returncode != 0:
+                observed = self._tree_head(tree)
+                if observed != candidate_oid:
+                    raise CandidateUncertain(_git_failure("git update-ref", updated))
+        _checkpoint("candidate-head-updated")
+        if self._tree_head(tree) != candidate_oid:
+            raise CandidateUncertain("candidate HEAD update could not be verified")
+        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+        self._assert_candidate_config_snapshot(tree, config_snapshot)
+
+        index_entries = self._candidate_index_entries(tree)
+        if index_entries == base_entries:
+            self._run_tree_git(tree, ["read-tree", candidate_oid])
+        elif index_entries != candidate_entries:
+            raise CandidateUncertain("candidate index changed during commit recovery")
+        _checkpoint("candidate-index-updated")
+        self._assert_candidate_index(tree, candidate_entries, label="candidate")
+        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+        self._assert_candidate_config_snapshot(tree, config_snapshot)
+
+        ready = dict(record)
+        ready.update({"state": "ready", "ready_ns": time.time_ns()})
+        self._write_candidate_journal(journal, ready)
+        _checkpoint("candidate-result-recorded")
+        if self._tree_head(tree) != candidate_oid:
+            raise CandidateUncertain("candidate HEAD changed after its result was recorded")
+        self._verify_candidate_objects(objects)
+        self._verify_candidate_object(ready, expected_content=commit_content)
+        self._assert_candidate_index(tree, candidate_entries, label="candidate")
+        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+        self._assert_candidate_config_snapshot(tree, config_snapshot)
+        return self._candidate_receipt(ready, state="ready")
+
+    def _candidate_base_entries(self, base_oid: str) -> dict[str, tuple[str, str]]:
+        proc = self._run_git(["ls-tree", "-r", "-z", "--full-tree", base_oid])
+        entries: dict[str, tuple[str, str]] = {}
+        for entry in proc.stdout.split("\0"):
+            if not entry:
+                continue
+            metadata, separator, path = entry.partition("\t")
+            fields = metadata.split()
+            if not separator or not _safe_candidate_path(path) or len(fields) != 3:
+                raise CandidateUncertain("base commit tree output is malformed")
+            mode, object_type, oid = fields
+            if object_type == "commit" or mode == "160000":
+                raise CandidateUncertain(f"candidate commits reject submodules: {path}")
+            if object_type != "blob" or mode not in {"100644", "100755"}:
+                kind = "symbolic links" if mode == "120000" else "unsupported entries"
+                raise CandidateUncertain(f"candidate commits reject {kind}: {path}")
+            _validate_oid(oid)
+            if path in entries:
+                raise CandidateUncertain("base commit tree contains duplicate paths")
+            entries[path] = (mode, oid)
+        return entries
+
+    def _candidate_snapshot(
+        self,
+        tree: Path,
+        base_entries: Mapping[str, tuple[str, str]],
+        allowed_paths: tuple[str, ...],
+    ) -> _CandidateSnapshot:
+        allowed = frozenset(allowed_paths)
+        git_identity = _git_entry_identity(tree)
+        files, contents, identities, directories = _snapshot_regular_tree(tree, self.object_format)
+        if _git_entry_identity(tree) != git_identity:
+            raise CandidateUncertain("attempt worktree .git entry changed during candidate inspection")
+        current_paths = frozenset(files)
+        changed_outside = sorted(
+            path
+            for path in current_paths | frozenset(base_entries)
+            if path not in allowed and files.get(path) != base_entries.get(path)
+        )
+        if changed_outside:
+            raise CandidateUncertain(f"candidate changed path outside the allowed set: {changed_outside[0]}")
+        extra = sorted(current_paths - frozenset(base_entries) - allowed)
+        if extra:  # pragma: no cover - included in changed_outside, retained for a precise invariant
+            raise CandidateUncertain(f"candidate contains foreign output: {extra[0]}")
+        entries = dict(base_entries)
+        for path in allowed:
+            value = files.get(path)
+            if value is None:
+                entries.pop(path, None)
+            else:
+                entries[path] = value
+        blobs: dict[str, bytes] = {}
+        for path in allowed:
+            if path not in entries:
+                continue
+            _, oid = entries[path]
+            content = contents[path]
+            if _git_blob_oid(content, self.object_format) != oid:  # pragma: no cover - snapshot invariant
+                raise CandidateUncertain(f"candidate blob identity changed while collecting {path}")
+            blobs[oid] = content
+        return _CandidateSnapshot(
+            entries=tuple(sorted(entries.items())),
+            blobs=tuple(sorted(blobs.items())),
+            git_identity=git_identity,
+            file_identities=tuple(sorted(identities.items())),
+            directory_identities=tuple(sorted(directories.items())),
+        )
+
+    def _assert_candidate_snapshot(
+        self,
+        tree: Path,
+        base_entries: Mapping[str, tuple[str, str]],
+        allowed_paths: tuple[str, ...],
+        expected: _CandidateSnapshot,
+    ) -> None:
+        self._verify_tree_binding(tree, require_head=True)
+        observed = self._candidate_snapshot(tree, base_entries, allowed_paths)
+        if observed != expected:
+            raise CandidateUncertain("candidate path was replaced or changed during commit creation")
+
+    def _candidate_index_entries(self, tree: Path) -> dict[str, tuple[str, str]]:
+        self._assert_canonical_index_flags(tree)
+        proc = self._run_tree_git(tree, ["ls-files", "--stage", "-z", "--cached"])
+        entries: dict[str, tuple[str, str]] = {}
+        for entry in proc.stdout.split("\0"):
+            if not entry:
+                continue
+            metadata, separator, path = entry.partition("\t")
+            fields = metadata.split()
+            if not separator or not _safe_candidate_path(path) or len(fields) != 3:
+                raise CandidateUncertain("candidate index output is malformed")
+            mode, oid, stage = fields
+            if mode not in {"100644", "100755"} or stage != "0":
+                raise CandidateUncertain(f"candidate index contains an unsupported entry: {path}")
+            _validate_oid(oid)
+            if path in entries:
+                raise CandidateUncertain("candidate index contains duplicate paths")
+            entries[path] = (mode, oid)
+        return entries
+
+    def _assert_candidate_index(
+        self,
+        tree: Path,
+        expected: Mapping[str, tuple[str, str]],
+        *,
+        label: str,
+    ) -> None:
+        if self._candidate_index_entries(tree) != dict(expected):
+            raise CandidateUncertain(f"candidate index does not match the {label}")
+
+    def _candidate_config_snapshot(self, tree: Path) -> tuple[tuple[str, object], ...]:
+        git_dir = self._run_tree_git(tree, ["rev-parse", "--path-format=absolute", "--absolute-git-dir"])
+        worktree_git_dir = _existing_real_directory(git_dir.stdout.strip(), label="attempt Git directory")
+        paths = (self.common_git_dir / "config", worktree_git_dir / "config.worktree")
+        return tuple((str(path), _optional_regular_file_snapshot(path)) for path in paths)
+
+    def _assert_candidate_config_snapshot(
+        self,
+        tree: Path,
+        expected: tuple[tuple[str, object], ...],
+    ) -> None:
+        if self._candidate_config_snapshot(tree) != expected:
+            raise CandidateUncertain("repository configuration changed during candidate creation")
+
+    def _write_candidate_object(self, object_type: str, expected_oid: str, content: bytes) -> None:
+        proc = self._run_git_bytes(
+            ["hash-object", "-t", object_type, "-w", "--stdin", "--no-filters"],
+            input_bytes=content,
+        )
+        try:
+            observed = proc.stdout.decode("ascii").strip()
+        except UnicodeDecodeError as error:  # pragma: no cover - Git object IDs are ASCII
+            raise CandidateUncertain("git hash-object returned a malformed object id") from error
+        if observed != expected_oid:
+            raise CandidateUncertain(f"git wrote an unexpected {object_type} object")
+        stored = self._run_git_bytes(["cat-file", object_type, expected_oid]).stdout
+        if stored != content:
+            raise CandidateUncertain(f"stored {object_type} object does not match its expected bytes")
+
+    def _verify_candidate_objects(self, objects: tuple[tuple[str, str, bytes], ...]) -> None:
+        for object_type, expected_oid, content in objects:
+            stored = self._run_git_bytes(["cat-file", object_type, expected_oid], check=False)
+            if stored.returncode != 0 or stored.stdout != content:
+                raise CandidateUncertain(f"candidate {object_type} object is missing or invalid")
+
+    def _verify_candidate_object(
+        self,
+        record: Mapping[str, object],
+        *,
+        expected_content: bytes | None = None,
+    ) -> None:
+        candidate_oid = str(record["candidate_oid"])
+        proc = self._run_git_bytes(["cat-file", "commit", candidate_oid], check=False)
+        if proc.returncode != 0:
+            raise CandidateUncertain("candidate commit object is missing")
+        content = proc.stdout
+        if _git_object_oid("commit", content, self.object_format) != candidate_oid:
+            raise CandidateUncertain("candidate commit object has an invalid identity")
+        if expected_content is not None:
+            if content != expected_content:
+                raise CandidateUncertain("candidate commit bytes differ from the durable intent")
+        else:
+            prefix = _candidate_commit_prefix(
+                str(record["tree_oid"]),
+                str(record["base_oid"]),
+                str(record["author_name"]),
+                str(record["author_email"]),
+            )
+            if not content.startswith(prefix):
+                raise CandidateUncertain("candidate commit metadata differs from the durable intent")
+            if hashlib.sha256(content[len(prefix) :]).hexdigest() != record["message_sha256"]:
+                raise CandidateUncertain("candidate commit message differs from the durable intent")
+
+    def _assert_ready_candidate_tree(self, record: Mapping[str, object], tree: Path) -> None:
+        if record["state"] != "ready":
+            raise CandidateUncertain("candidate recovery must finish before cleanup")
+        base_entries = self._candidate_base_entries(str(record["base_oid"]))
+        paths = tuple(str(path) for path in record["allowed_paths"])
+        snapshot = self._candidate_snapshot(tree, base_entries, paths)
+        tree_oid, objects = _candidate_tree_objects(snapshot.entries, snapshot.blobs, self.object_format)
+        if tree_oid != record["tree_oid"]:
+            raise CandidateUncertain("candidate worktree no longer matches the recorded tree")
+        self._verify_candidate_objects(objects)
+        self._verify_candidate_object(record)
+        if self._tree_head(tree) != record["candidate_oid"]:
+            raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
+        self._assert_candidate_index(tree, dict(snapshot.entries), label="candidate")
+
+    def _candidate_receipt(self, record: Mapping[str, object], *, state: str) -> CandidateReceipt:
+        identity = {
+            key: record[key]
+            for key in (
+                "schema",
+                "repository_id",
+                "run_id",
+                "attempt_id",
+                "base_oid",
+                "path",
+                "worktree_identity_sha256",
+                "allowed_paths",
+                "author_name",
+                "author_email",
+                "message_sha256",
+                "tree_oid",
+                "candidate_oid",
+            )
+        }
+        return CandidateReceipt(
+            run_id=str(record["run_id"]),
+            attempt_id=str(record["attempt_id"]),
+            repository_id=self.repository_id,
+            path=str(record["path"]),
+            base_oid=str(record["base_oid"]),
+            tree_oid=str(record["tree_oid"]),
+            candidate_oid=str(record["candidate_oid"]),
+            state=state,
+            allowed_paths=tuple(str(path) for path in record["allowed_paths"]),
+            author_name=str(record["author_name"]),
+            author_email=str(record["author_email"]),
+            message_sha256=str(record["message_sha256"]),
+            identity_sha256=hashlib.sha256(_json_bytes(identity)).hexdigest(),
+        )
+
+    def _read_candidate_journal(self, journal: Path) -> dict[str, object]:
+        return _read_json_file(journal, label="candidate journal")
+
+    def _write_candidate_journal(self, journal: Path, record: Mapping[str, object]) -> None:
+        if _canonical_existing_directory(journal.parent) != journal.parent or _directory_identity(journal.parent) != (
+            record.get("root_device"),
+            record.get("root_inode"),
+        ):
+            raise CandidateUncertain("attempt directory changed before its candidate journal update")
+        _write_json_file(journal, record)
+
+    def _validate_candidate_record(
+        self,
+        record: Mapping[str, object],
+        marker_record: Mapping[str, object],
+        *,
+        expected_identity: Mapping[str, object] | None = None,
+    ) -> None:
+        expected = {
+            "schema": _CANDIDATE_SCHEMA,
+            "repository_id": self.repository_id,
+            "run_id": marker_record["run_id"],
+            "attempt_id": marker_record["attempt_id"],
+            "base_oid": marker_record["base_oid"],
+            "path": marker_record["path"],
+            "worktree_identity_sha256": self._receipt(
+                marker_record,
+                head_oid=str(marker_record["base_oid"]),
+                state="ready",
+            ).identity_sha256,
+        }
+        if expected_identity is not None:
+            expected.update(expected_identity)
+        for key, value in expected.items():
+            if record.get(key) != value:
+                raise CandidateUncertain(f"candidate journal has a different {key}")
+        if record.get("state") not in {"prepared", "ready"}:
+            raise CandidateUncertain("candidate journal has an unknown state")
+        paths = record.get("allowed_paths")
+        try:
+            validated_paths = _validate_candidate_paths(frozenset(paths)) if isinstance(paths, list) else None
+        except (RepositoryError, TypeError) as error:
+            raise CandidateUncertain("candidate journal has an invalid allowed path set") from error
+        if validated_paths is None or tuple(paths) != validated_paths:
+            raise CandidateUncertain("candidate journal has an invalid allowed path set")
+        if not isinstance(record.get("author_name"), str) or not isinstance(record.get("author_email"), str):
+            raise CandidateUncertain("candidate journal has an invalid author identity")
+        try:
+            _validate_candidate_identity(str(record["author_name"]), str(record["author_email"]))
+        except RepositoryError as error:
+            raise CandidateUncertain("candidate journal has an invalid author identity") from error
+        for key in ("message_sha256",):
+            if not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", str(record.get(key))):
+                raise CandidateUncertain(f"candidate journal has an invalid {key}")
+        try:
+            for key in ("base_oid", "tree_oid", "candidate_oid"):
+                _validate_oid(str(record.get(key, "")))
+        except RepositoryError as error:
+            raise CandidateUncertain("candidate journal has an invalid object id") from error
+        if not _is_integer(record.get("root_device")) or not _is_integer(record.get("root_inode")):
+            raise CandidateUncertain("candidate journal has an invalid attempt directory identity")
+        if (record["root_device"], record["root_inode"]) != (
+            marker_record["root_device"],
+            marker_record["root_inode"],
+        ):
+            raise CandidateUncertain("candidate journal belongs to a different attempt directory")
+        if not _is_integer(record.get("created_ns")):
+            raise CandidateUncertain("candidate journal has an invalid creation time")
+        if record["state"] == "ready" and not _is_integer(record.get("ready_ns")):
+            raise CandidateUncertain("ready candidate journal has no valid completion time")
+
     def cleanup(self, run_id: str, attempt_id: str) -> None:
         """Remove only a worktree whose durable identity is still exact."""
         _validate_name("run id", run_id)
@@ -355,6 +941,19 @@ class AttemptWorktrees:
                     tree,
                     str(record.get("base_oid", "")),
                 )
+            candidate_journal = attempt_root / "candidate.json"
+            candidate_record: dict[str, object] | None = None
+            if candidate_journal.exists() or candidate_journal.is_symlink():
+                candidate_record = self._read_candidate_journal(candidate_journal)
+                self._validate_candidate_record(candidate_record, record)
+                if record["state"] != "cleaning":
+                    candidate = self.inspect_candidate(run_id, attempt_id)
+                    if candidate.state != "ready":  # pragma: no cover - inspect returns or raises
+                        raise CandidateUncertain("candidate recovery must finish before cleanup")
+                elif candidate_record["state"] != "ready" or candidate_record["candidate_oid"] != record.get(
+                    "cleanup_head_oid"
+                ):
+                    raise CandidateUncertain("interrupted cleanup has unresolved candidate evidence")
             cleanup_tree = attempt_root / "tree-cleaning"
             if record["state"] != "cleaning":
                 if tree not in self._registered_worktrees():
@@ -369,18 +968,23 @@ class AttemptWorktrees:
                         raise WorktreeConflict("registered attempt worktree disappeared before cleanup")
                 else:
                     self._verify_tree_binding(tree, require_head=False)
-                    self._assert_canonical_index(tree)
-                    status = self._run_tree_git(
-                        tree,
-                        ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
-                    )
-                    if status.stdout:
-                        raise WorktreeConflict(
-                            "attempt worktree contains tracked, untracked, or ignored state; cleanup stopped"
+                    if candidate_record is None:
+                        self._assert_canonical_index(tree)
+                        status = self._run_tree_git(
+                            tree,
+                            ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
                         )
-                    foreign = self._foreign_tree_entry(tree)
-                    if foreign is not None:
-                        raise WorktreeConflict(f"attempt worktree contains unowned path {foreign}; cleanup stopped")
+                        if status.stdout:
+                            raise WorktreeConflict(
+                                "attempt worktree contains tracked, untracked, or ignored state; cleanup stopped"
+                            )
+                        foreign = self._foreign_tree_entry(tree)
+                        if foreign is not None:
+                            raise WorktreeConflict(
+                                f"attempt worktree contains unowned path {foreign}; cleanup stopped"
+                            )
+                    else:
+                        self._assert_ready_candidate_tree(candidate_record, tree)
                     if cleanup_tree.exists() or cleanup_tree.is_symlink():
                         raise WorktreeConflict("attempt cleanup quarantine already exists")
                     cleanup_identity = _directory_identity(tree)
@@ -400,13 +1004,25 @@ class AttemptWorktrees:
                     self._write_attempt_marker(marker, record)
                     _checkpoint("worktree-cleanup-intent-recorded")
             if record["state"] == "cleaning":
-                self._continue_cleanup(record, marker, tree, cleanup_tree)
+                self._continue_cleanup(record, marker, tree, cleanup_tree, candidate_record=candidate_record)
             elif tree.exists() or tree.is_symlink():
                 self._verify_tree_binding(tree, require_head=False)
                 try:
                     tree.rmdir()
                 except OSError as error:
                     raise WorktreeConflict("unregistered attempt path is not an empty owned directory") from error
+            if candidate_record is not None:
+                if not candidate_journal.exists() and not candidate_journal.is_symlink():
+                    raise CandidateUncertain("candidate journal disappeared during cleanup")
+                final_candidate_record = self._read_candidate_journal(candidate_journal)
+                self._validate_candidate_record(final_candidate_record, record)
+                if final_candidate_record["state"] != "ready" or final_candidate_record["candidate_oid"] != record.get(
+                    "cleanup_head_oid"
+                ):
+                    raise CandidateUncertain("candidate journal changed during cleanup")
+                candidate_journal.unlink()
+                _fsync_directory(attempt_root)
+                _checkpoint("candidate-journal-removed")
             if marker.exists() or marker.is_symlink():
                 marker.unlink()
                 _fsync_directory(attempt_root)
@@ -423,6 +1039,8 @@ class AttemptWorktrees:
         marker: Path,
         tree: Path,
         cleanup_tree: Path,
+        *,
+        candidate_record: Mapping[str, object] | None,
     ) -> None:
         cleanup_parent_mode = int(record["cleanup_parent_mode"])
         current_parent_mode = stat.S_IMODE(marker.parent.stat(follow_symlinks=False).st_mode)
@@ -435,13 +1053,16 @@ class AttemptWorktrees:
             if cleanup_tree.exists() or cleanup_tree.is_symlink():
                 raise WorktreeConflict("attempt cleanup has both live and quarantined worktree paths")
             self._verify_tree_binding(tree, require_head=False)
-            self._assert_canonical_index(tree)
-            status = self._run_tree_git(
-                tree,
-                ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
-            )
-            if status.stdout or self._foreign_tree_entry(tree) is not None:
-                raise WorktreeConflict("attempt worktree changed after cleanup intent was recorded")
+            if candidate_record is None:
+                self._assert_canonical_index(tree)
+                status = self._run_tree_git(
+                    tree,
+                    ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
+                )
+                if status.stdout or self._foreign_tree_entry(tree) is not None:
+                    raise WorktreeConflict("attempt worktree changed after cleanup intent was recorded")
+            else:
+                self._assert_ready_candidate_tree(candidate_record, tree)
             os.rename(tree, cleanup_tree)
             _fsync_directory(cleanup_tree.parent)
             _checkpoint("worktree-quarantined")
@@ -513,10 +1134,11 @@ class AttemptWorktrees:
                     raise WorktreeConflict(f"tracked cleanup symlink changed: {relative}") from error
                 hashed = _git_blob_oid(link_target, self.object_format)
             else:
-                hashed = self._run_tree_git(
-                    cleanup_tree,
-                    ["hash-object", f"--path={relative}", "--", relative],
-                ).stdout.strip()
+                try:
+                    content, _ = _read_candidate_regular_file(path, before, relative)
+                except CandidateUncertain as error:
+                    raise WorktreeConflict(f"tracked cleanup path changed: {relative}") from error
+                hashed = _git_blob_oid(content, self.object_format)
             after = path.lstat()
             before_snapshot = (
                 before.st_dev,
@@ -1032,6 +1654,33 @@ class AttemptWorktrees:
             self._verify_repository()
         if check and proc.returncode != 0:
             raise RepositoryError(_git_failure(f"git {args[0] if args else ''}", proc))
+        return proc
+
+    def _run_git_bytes(
+        self,
+        args: list[str],
+        *,
+        check: bool = True,
+        input_bytes: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if hasattr(self, "_repository_identity"):
+            self._verify_repository()
+        try:
+            proc = subprocess.run(
+                _git_command(args),
+                cwd=self.repository_root,
+                capture_output=True,
+                input=input_bytes,
+                timeout=120,
+                env=_git_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RepositoryError(f"Git operation failed: {error}") from error
+        if hasattr(self, "_repository_identity"):
+            self._verify_repository()
+        if check and proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()[:500]
+            raise RepositoryError(f"git {args[0] if args else ''} failed: {detail}")
         return proc
 
     def _verify_repository(self) -> None:
@@ -2387,11 +3036,265 @@ def _safe_git_path(path: str) -> bool:
     return bool(path) and not path.startswith("/") and all(part not in {"", ".", ".."} for part in path.split("/"))
 
 
+def _safe_candidate_path(path: str) -> bool:
+    if not isinstance(path, str) or not _safe_git_path(path) or "\\" in path or "\0" in path:
+        return False
+    if any(part.casefold() == ".git" for part in path.split("/")):
+        return False
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _validate_candidate_paths(paths: Set[str]) -> tuple[str, ...]:
+    if not isinstance(paths, Set) or isinstance(paths, (str, bytes)):
+        raise RepositoryError("allowed_paths must be an explicit finite set of repository-relative strings")
+    values: list[str] = []
+    for path in paths:
+        if not _safe_candidate_path(path):
+            raise RepositoryError(f"candidate path is unsafe, reserved, or not repository-relative: {path!r}")
+        values.append(path)
+    values.sort(key=lambda value: value.encode("utf-8"))
+    selected = frozenset(values)
+    for path in values:
+        parts = path.split("/")
+        if any("/".join(parts[:index]) in selected for index in range(1, len(parts))):
+            raise RepositoryError(f"candidate allowed paths overlap as file and directory: {path}")
+    return tuple(values)
+
+
+def _validate_candidate_message(message: str) -> bytes:
+    if not isinstance(message, str) or not message or "\0" in message:
+        raise RepositoryError("candidate message must be a nonempty NUL-free string")
+    try:
+        encoded = message.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise RepositoryError("candidate message must be valid UTF-8") from error
+    if len(encoded) > 1024 * 1024:
+        raise RepositoryError("candidate message exceeds the 1 MiB safety limit")
+    return encoded
+
+
+def _validate_candidate_identity(author_name: str, author_email: str) -> None:
+    if not isinstance(author_name, str) or not author_name or author_name != author_name.strip():
+        raise RepositoryError("candidate author name must be a nonempty trimmed string")
+    if not isinstance(author_email, str) or not author_email or author_email != author_email.strip():
+        raise RepositoryError("candidate author email must be a nonempty trimmed string")
+    if len(author_name.encode("utf-8", errors="ignore")) > 256 or any(
+        character in "<>" or ord(character) < 32 or ord(character) == 127 for character in author_name
+    ):
+        raise RepositoryError("candidate author name contains a forbidden commit-header character")
+    if len(author_email.encode("utf-8", errors="ignore")) > 256 or any(
+        character in "<>" or character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in author_email
+    ) or "@" not in author_email:
+        raise RepositoryError("candidate author email is not safe for a commit header")
+    try:
+        author_name.encode("utf-8")
+        author_email.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise RepositoryError("candidate author identity must be valid UTF-8") from error
+
+
 def _git_blob_oid(content: bytes, object_format: str) -> str:
+    return _git_object_oid("blob", content, object_format)
+
+
+def _git_object_oid(object_type: str, content: bytes, object_format: str) -> str:
+    if object_type not in {"blob", "tree", "commit"}:
+        raise RepositoryError(f"unsupported Git object type: {object_type}")
+    if object_format not in {"sha1", "sha256"}:
+        raise RepositoryError(f"unsupported Git object format: {object_format}")
     digest = hashlib.new(object_format)
-    digest.update(f"blob {len(content)}\0".encode())
+    digest.update(f"{object_type} {len(content)}\0".encode())
     digest.update(content)
     return digest.hexdigest()
+
+
+def _candidate_commit_prefix(tree_oid: str, base_oid: str, author_name: str, author_email: str) -> bytes:
+    _validate_oid(tree_oid)
+    _validate_oid(base_oid)
+    _validate_candidate_identity(author_name, author_email)
+    identity = f"{author_name} <{author_email}> 0 +0000"
+    return f"tree {tree_oid}\nparent {base_oid}\nauthor {identity}\ncommitter {identity}\n\n".encode("utf-8")
+
+
+def _candidate_commit_content(
+    tree_oid: str,
+    base_oid: str,
+    author_name: str,
+    author_email: str,
+    message: bytes,
+) -> bytes:
+    return _candidate_commit_prefix(tree_oid, base_oid, author_name, author_email) + message
+
+
+def _snapshot_regular_tree(
+    tree: Path,
+    object_format: str,
+) -> tuple[
+    dict[str, tuple[str, str]],
+    dict[str, bytes],
+    dict[str, tuple[int, ...]],
+    dict[str, tuple[int, ...]],
+]:
+    files: dict[str, tuple[str, str]] = {}
+    contents: dict[str, bytes] = {}
+    identities: dict[str, tuple[int, ...]] = {}
+    directories: dict[str, tuple[int, ...]] = {}
+    pending: list[tuple[Path, str]] = [(tree, "")]
+    while pending:
+        directory, relative_directory = pending.pop()
+        try:
+            before = directory.stat(follow_symlinks=False)
+            entries = list(os.scandir(directory))
+            after = directory.stat(follow_symlinks=False)
+        except OSError as error:
+            label = relative_directory or "."
+            raise CandidateUncertain(f"candidate directory cannot be inspected safely: {label}") from error
+        before_identity = _candidate_stat_identity(before)
+        if not stat.S_ISDIR(before.st_mode) or before_identity != _candidate_stat_identity(after):
+            label = relative_directory or "."
+            raise CandidateUncertain(f"candidate directory changed while being inspected: {label}")
+        if relative_directory:
+            directories[relative_directory] = before_identity
+        for entry in entries:
+            relative = f"{relative_directory}/{entry.name}" if relative_directory else entry.name
+            if relative == ".git":
+                continue
+            if not _safe_candidate_path(relative):
+                raise CandidateUncertain(f"candidate contains an unsafe or reserved path: {relative!r}")
+            path = Path(entry.path)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise CandidateUncertain(f"candidate path cannot be inspected safely: {relative}") from error
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                pending.append((path, relative))
+                continue
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                kind = "symbolic link" if stat.S_ISLNK(info.st_mode) else "special file"
+                raise CandidateUncertain(f"candidate commits reject {kind}: {relative}")
+            content, identity = _read_candidate_regular_file(path, info, relative)
+            mode = "100755" if info.st_mode & 0o111 else "100644"
+            files[relative] = (mode, _git_blob_oid(content, object_format))
+            contents[relative] = content
+            identities[relative] = identity
+
+    expected_directories: set[str] = set()
+    for path in files:
+        parts = path.split("/")
+        expected_directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
+    foreign_directories = sorted(set(directories) - expected_directories)
+    if foreign_directories:
+        raise CandidateUncertain(f"candidate contains foreign directory output: {foreign_directories[0]}")
+    return files, contents, identities, directories
+
+
+def _read_candidate_regular_file(path: Path, expected: os.stat_result, relative: str) -> tuple[bytes, tuple[int, ...]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CandidateUncertain(f"candidate regular file cannot be opened safely: {relative}") from error
+    try:
+        opened = os.fstat(descriptor)
+        expected_identity = _candidate_stat_identity(expected)
+        if not stat.S_ISREG(opened.st_mode) or _candidate_stat_identity(opened) != expected_identity:
+            raise CandidateUncertain(f"candidate regular file changed while being opened: {relative}")
+        content = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+        finished = os.fstat(descriptor)
+        if _candidate_stat_identity(finished) != expected_identity or len(content) != opened.st_size:
+            raise CandidateUncertain(f"candidate regular file changed while being read: {relative}")
+    finally:
+        os.close(descriptor)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain(f"candidate regular file disappeared after being read: {relative}") from error
+    if _candidate_stat_identity(current) != expected_identity:
+        raise CandidateUncertain(f"candidate regular file was replaced after being read: {relative}")
+    return bytes(content), expected_identity
+
+
+def _candidate_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _candidate_tree_objects(
+    entries: tuple[tuple[str, tuple[str, str]], ...],
+    blobs: tuple[tuple[str, bytes], ...],
+    object_format: str,
+) -> tuple[str, tuple[tuple[str, str, bytes], ...]]:
+    root: dict[str, object] = {}
+    for path, leaf in entries:
+        node = root
+        parts = path.split("/")
+        for part in parts[:-1]:
+            child = node.setdefault(part, {})
+            if not isinstance(child, dict):
+                raise CandidateUncertain(f"candidate tree has a file/directory collision: {path}")
+            node = child
+        if parts[-1] in node:
+            raise CandidateUncertain(f"candidate tree has a duplicate or colliding path: {path}")
+        node[parts[-1]] = leaf
+
+    tree_objects: list[tuple[str, str, bytes]] = []
+
+    def build(node: dict[str, object]) -> str:
+        encoded: list[tuple[bytes, bytes]] = []
+        for name, value in node.items():
+            name_bytes = name.encode("utf-8")
+            if isinstance(value, dict):
+                oid = build(value)
+                mode = "40000"
+                sort_name = name_bytes + b"/"
+            else:
+                mode, oid = value
+                sort_name = name_bytes
+            raw = mode.encode("ascii") + b" " + name_bytes + b"\0" + bytes.fromhex(oid)
+            encoded.append((sort_name, raw))
+        content = b"".join(raw for _, raw in sorted(encoded, key=lambda item: item[0]))
+        oid = _git_object_oid("tree", content, object_format)
+        tree_objects.append(("tree", oid, content))
+        return oid
+
+    root_oid = build(root)
+    blob_objects = [("blob", oid, content) for oid, content in blobs]
+    objects = tuple(sorted((*blob_objects, *tree_objects), key=lambda item: (item[0], item[1])))
+    return root_oid, objects
+
+
+def _optional_regular_file_snapshot(path: Path) -> object:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise CandidateUncertain(f"repository config path is a dangling symbolic link: {path}")
+        return None
+    except OSError as error:
+        raise CandidateUncertain(f"repository config cannot be inspected: {path}") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise CandidateUncertain(f"repository config is not a regular file: {path}")
+    content, identity = _read_candidate_regular_file(path, info, str(path))
+    return (*identity, hashlib.sha256(content).hexdigest())
 
 
 def _assert_missing_worktree_path(tree: Path, path: Path) -> None:
@@ -2707,6 +3610,10 @@ def _checkpoint(_name: str) -> None:
 
 __all__ = [
     "AttemptWorktrees",
+    "CandidateError",
+    "CandidateNotFound",
+    "CandidateReceipt",
+    "CandidateUncertain",
     "MergeQueueBusy",
     "MergeQueueError",
     "PublicationReceipt",
