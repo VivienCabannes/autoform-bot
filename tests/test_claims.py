@@ -242,9 +242,14 @@ def test_list_rejects_non_utf8_claim_ref_without_decode_error(
     tmp_path: Path, board_repo: Path
 ) -> None:
     oid = _plant_message(board_repo, "valid", "not used")
-    raw_key = os.fsdecode(b"invalid-\xff")
-    raw_ref = claims.CLAIM_REF_PREFIX + raw_key
-    _git("update-ref", raw_ref, oid, cwd=board_repo)
+    raw_ref = claims.CLAIM_REF_PREFIX.encode() + b"invalid-\xff"
+    (board_repo / "packed-refs").write_bytes(
+        b"# pack-refs with: peeled fully-peeled sorted\n"
+        + oid.encode()
+        + b" "
+        + raw_ref
+        + b"\n"
+    )
     board = _board(tmp_path, board_repo, "worker-a")
 
     with pytest.raises(claims.ClaimTransportError, match="invalid claim ref"):
