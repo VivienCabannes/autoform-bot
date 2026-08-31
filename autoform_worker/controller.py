@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from autoform_cli.runtime import RuntimeGraph, RuntimeNode
 from autoform_cli.status import DEFINITION_DECLARATIONS
 
-from .ledger import TaskRecord
+from .ledger import AttemptRecord, MergeItemRecord, RunRecord, TaskRecord
 from .scheduler import WorkPhase, _ready_phase
 
 
@@ -28,6 +29,55 @@ class TaskSpec:
     article_id: str
     phase: str
     node_id: str
+
+
+EXECUTE_OUTPUT_SCHEMA = "autoform-execute/v1"
+
+
+def status_payload(
+    run: RunRecord,
+    tasks: tuple[TaskRecord, ...],
+    attempts: tuple[AttemptRecord, ...],
+    merge_items: tuple[MergeItemRecord, ...],
+) -> dict[str, Any]:
+    """Return stable public status without paths, remotes, tokens, or backend output."""
+
+    counts: dict[str, int] = {}
+    for task in tasks:
+        counts[task.status] = counts.get(task.status, 0) + 1
+    return {
+        "attempts": [
+            {
+                "article_id": attempt.article_id,
+                "attempt": attempt.number,
+                "attempt_id": attempt.attempt_id,
+                "phase": attempt.phase,
+                "status": attempt.status,
+            }
+            for attempt in sorted(
+                attempts,
+                key=lambda value: (value.article_id, value.phase, value.number, value.attempt_id),
+            )
+        ],
+        "current_oid": run.current_oid,
+        "generation": run.generation,
+        "merge_items": [
+            {
+                "candidate_oid": item.candidate_oid,
+                "queue_item_id": item.queue_item_id,
+                "status": item.status,
+            }
+            for item in sorted(merge_items, key=lambda value: value.queue_item_id)
+        ],
+        "run_id": run.run_id,
+        "schema": EXECUTE_OUTPUT_SCHEMA,
+        "status": run.status,
+        "stop_requested": run.stop_requested,
+        "tasks": {
+            "counts": {key: counts[key] for key in sorted(counts)},
+            "total": len(tasks),
+        },
+    }
 
 
 def build_task_specs(runtime: RuntimeGraph) -> tuple[TaskSpec, ...]:
@@ -130,8 +180,10 @@ def _article_id(node: RuntimeNode) -> str:
 
 __all__ = [
     "ControllerError",
+    "EXECUTE_OUTPUT_SCHEMA",
     "TaskSpec",
     "build_task_specs",
     "classify_no_work",
     "select_ready_task",
+    "status_payload",
 ]

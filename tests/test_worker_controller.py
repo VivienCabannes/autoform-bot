@@ -10,8 +10,9 @@ from autoform_worker.controller import (
     build_task_specs,
     classify_no_work,
     select_ready_task,
+    status_payload,
 )
-from autoform_worker.ledger import TaskRecord
+from autoform_worker.ledger import AttemptRecord, MergeItemRecord, RunConfig, RunIdentity, RunRecord, TaskRecord
 from autoform_worker.scheduler import WorkPhase
 
 
@@ -184,3 +185,89 @@ def test_planning_requires_durable_article_ids() -> None:
 
     with pytest.raises(ControllerError, match="durable article id"):
         build_task_specs(_runtime(node))
+
+
+def test_status_payload_is_stable_and_redacts_private_controller_data() -> None:
+    config = RunConfig(
+        repository_id="repository",
+        target_ref="refs/heads/main",
+        remote="https://example.test/private.git",
+        backend="claude",
+        start_oid="1" * 40,
+        plugin_version="revision",
+        toolchain_fingerprint="2" * 64,
+        coverage_contract_sha256="3" * 64,
+        execution_input_sha256="4" * 64,
+        source_artifacts_sha256="5" * 64,
+        gate_policy_version="gates-v1",
+    )
+    identity = RunIdentity(
+        repository_id="repository",
+        project_root="/secret/project",
+        target_ref=config.target_ref,
+        base_oid=config.start_oid,
+        runtime_revision="runtime",
+        coverage_revision="6" * 64,
+        source_artifact_sha256=config.source_artifacts_sha256,
+        plugin_revision=config.plugin_version,
+        toolchain_fingerprint=config.toolchain_fingerprint,
+        execution_input_sha256=config.execution_input_sha256,
+        config_sha256=config.sha256,
+    )
+    run = RunRecord(
+        run_id="run",
+        identity=identity,
+        identity_sha256=identity.sha256,
+        config=config,
+        config_sha256=config.sha256,
+        status="running",
+        generation=7,
+        current_oid="7" * 40,
+        stop_requested=False,
+        detail="secret backend output",
+        created_ns=1,
+        updated_ns=2,
+    )
+    task = _task("af_000000000000000000000001", "proof", "running")
+    attempt = AttemptRecord(
+        attempt_id="attempt",
+        run_id="run",
+        article_id=task.article_id,
+        phase="proof",
+        number=2,
+        status="running",
+        worktree_path="/secret/worktree",
+        branch="detached/attempt",
+        base_oid="7" * 40,
+        backend="claude",
+        claim_key="secret-claim-key",
+        claim_token={"secret": "token"},
+        candidate_oid=None,
+        detail="private transcript",
+        started_ns=1,
+        finished_ns=None,
+    )
+    item = MergeItemRecord(
+        queue_item_id="queue",
+        run_id="run",
+        attempt_id="attempt",
+        queue_ref="refs/autoform/queue/private",
+        expected_target_oid="7" * 40,
+        candidate_oid="8" * 40,
+        status="pending",
+        generation=0,
+        integrated_oid=None,
+        detail="private remote detail",
+        created_ns=1,
+        updated_ns=2,
+    )
+
+    payload = status_payload(run, (task,), (attempt,), (item,))
+    encoded = str(payload)
+
+    assert payload["schema"] == "autoform-execute/v1"
+    assert payload["tasks"] == {"counts": {"running": 1}, "total": 1}
+    assert payload["attempts"][0]["attempt_id"] == "attempt"
+    assert payload["merge_items"][0]["candidate_oid"] == "8" * 40
+    for private in ("/secret/project", "/secret/worktree", "private.git", "secret-claim-key", "token", "transcript"):
+        assert private not in encoded
