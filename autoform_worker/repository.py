@@ -13,12 +13,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import weakref
 from collections.abc import Mapping, Set
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Callable, Protocol
 from urllib.parse import unquote, urlsplit
 
 import autoform_cli.claims as claims_module
@@ -30,6 +31,12 @@ from .ledger import CoordinatorLock
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CANDIDATE_INDEX_STAGE_NAME = re.compile(r"^\.autoform-candidate-index-[0-9a-f]{32}\.stage$")
+_CANDIDATE_BLOB_CHUNK_BYTES = 1024 * 1024
+_CANDIDATE_BATCH_HEADER_BYTES = 256
+_CANDIDATE_BATCH_STDERR_BYTES = 500
+_CANDIDATE_BATCH_TIMEOUT_S = 120
+_MAX_CANDIDATE_BLOB_BYTES = 16 * 1024 * 1024
+_MAX_CANDIDATE_TOTAL_BLOB_BYTES = 64 * 1024 * 1024
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
 _CANDIDATE_SCHEMA = "autoform-candidate/v3"
 _PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
@@ -822,16 +829,23 @@ class AttemptWorktrees:
         return self._candidate_receipt(ready, state="ready")
 
     def _candidate_base_entries(self, base_oid: str) -> dict[str, tuple[str, str]]:
-        proc = self._run_git(["ls-tree", "-r", "-z", "--full-tree", base_oid])
+        tree_oid = self._verified_candidate_commit_tree_oid(base_oid)
+        proc = self._run_git_bytes(
+            ["--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", tree_oid]
+        )
         entries: dict[str, tuple[str, str]] = {}
-        for entry in proc.stdout.split("\0"):
+        for entry in proc.stdout.split(b"\0"):
             if not entry:
                 continue
-            metadata, separator, path = entry.partition("\t")
+            metadata, separator, encoded_path = entry.partition(b"\t")
             fields = metadata.split()
+            try:
+                path = encoded_path.decode("utf-8")
+                mode, object_type, oid = (field.decode("ascii") for field in fields)
+            except (UnicodeDecodeError, ValueError):
+                raise CandidateUncertain("base commit tree output is malformed") from None
             if not separator or not _safe_candidate_path(path) or len(fields) != 3:
                 raise CandidateUncertain("base commit tree output is malformed")
-            mode, object_type, oid = fields
             if object_type == "commit" or mode == "160000":
                 raise CandidateUncertain(f"candidate commits reject submodules: {path}")
             if object_type != "blob" or mode not in {"100644", "100755"}:
@@ -841,6 +855,10 @@ class AttemptWorktrees:
             if path in entries:
                 raise CandidateUncertain("base commit tree contains duplicate paths")
             entries[path] = (mode, oid)
+        reconstructed_tree_oid = _candidate_tree_oid(tuple(sorted(entries.items())), self.object_format)
+        if reconstructed_tree_oid != tree_oid:
+            raise CandidateUncertain("base commit tree object has an invalid identity")
+        self._verify_candidate_blob_batch(tuple(sorted({oid for _, oid in entries.values()})))
         return entries
 
     def _candidate_snapshot(
@@ -851,7 +869,11 @@ class AttemptWorktrees:
     ) -> _CandidateSnapshot:
         allowed = frozenset(allowed_paths)
         git_identity = _git_entry_identity(tree)
-        files, contents, identities, directories = _snapshot_regular_tree(tree, self.object_format)
+        files, contents, identities, directories = _snapshot_regular_tree(
+            tree,
+            self.object_format,
+            retained_paths=allowed,
+        )
         if _git_entry_identity(tree) != git_identity:
             raise CandidateUncertain("attempt worktree .git entry changed during candidate inspection")
         current_paths = frozenset(files)
@@ -1425,27 +1447,185 @@ class AttemptWorktrees:
         admin: _CandidateAdminBinding,
         expected_config_sha256: str,
     ) -> None:
-        """Require every blob referenced by the exact candidate tree to be available."""
+        """Require every blob in the exact candidate tree to be available and hash-valid."""
         oids = tuple(sorted({oid for _, (_, oid) in entries}))
         for oid in oids:
             _validate_oid(oid)
             if len(oid) != hashlib.new(self.object_format).digest_size * 2:
                 raise CandidateUncertain("candidate blob id does not match the repository object format")
         self._assert_candidate_config_snapshot(admin, expected_config_sha256)
-        proc = self._run_git(
-            [
-                "--no-replace-objects",
-                "cat-file",
-                "--batch-check=%(objectname) %(objecttype)",
-            ],
-            check=False,
-            input_text="".join(f"{oid}\n" for oid in oids),
-        )
+        self._verify_candidate_blob_batch(oids)
         self._assert_candidate_config_snapshot(admin, expected_config_sha256)
-        expected = "".join(f"{oid} blob\n" for oid in oids)
-        if proc.returncode != 0 or proc.stdout != expected:
-            detail = (proc.stderr or proc.stdout).strip()[:500]
-            raise CandidateUncertain(f"candidate tree closure is incomplete: {detail}")
+
+    def _verify_candidate_blob_batch(self, oids: tuple[str, ...]) -> None:
+        """Stream and independently hash exact blobs through one hardened Git process."""
+        self._verify_candidate_object_batch(
+            tuple((oid, "blob") for oid in oids),
+            label="candidate tree closure",
+        )
+
+    def _verified_candidate_commit_tree_oid(self, oid: str) -> str:
+        """Return the tree named by an independently hash-verified commit object."""
+        (tree_oid,) = self._verify_candidate_object_batch(((oid, "commit"),), label="base commit")
+        if tree_oid is None:  # pragma: no cover - commit parser invariant
+            raise CandidateUncertain("base commit has an invalid commit tree header")
+        return tree_oid
+
+    def _verify_candidate_object_batch(
+        self,
+        objects: tuple[tuple[str, str], ...],
+        *,
+        label: str,
+    ) -> tuple[str | None, ...]:
+        """Stream and independently hash exact objects through one hardened Git process."""
+        self._verify_repository()
+        process: subprocess.Popen[bytes] | None = None
+        stderr_thread: threading.Thread | None = None
+        watchdog_thread: threading.Thread | None = None
+        timed_out = threading.Event()
+        stderr_seen = threading.Event()
+        stderr_prefix = bytearray()
+        stderr_errors: list[BaseException] = []
+        cleanup_error: BaseException | None = None
+        watchdog_condition = threading.Condition()
+        watchdog_finished = False
+        watchdog_deadline = time.monotonic() + _CANDIDATE_BATCH_TIMEOUT_S
+
+        def note_progress() -> None:
+            nonlocal watchdog_deadline
+            with watchdog_condition:
+                watchdog_deadline = time.monotonic() + _CANDIDATE_BATCH_TIMEOUT_S
+                watchdog_condition.notify_all()
+
+        def finish_watchdog() -> None:
+            nonlocal watchdog_finished
+            with watchdog_condition:
+                watchdog_finished = True
+                watchdog_condition.notify_all()
+
+        try:
+            with tempfile.TemporaryFile() as requests:
+                for oid, _ in objects:
+                    requests.write(f"{oid}\n".encode("ascii"))
+                requests.seek(0)
+                try:
+                    process = subprocess.Popen(
+                        _git_command(
+                            [
+                                "--no-replace-objects",
+                                "cat-file",
+                                "--batch=%(objectname) %(objecttype) %(objectsize)",
+                            ]
+                        ),
+                        cwd=self.repository_root,
+                        env=_git_environment(),
+                        stdin=requests,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                except OSError as error:
+                    raise CandidateUncertain(f"{label} Git process failed: {error}") from error
+                if process.stdout is None or process.stderr is None:  # pragma: no cover - PIPE invariant
+                    raise CandidateUncertain(f"{label} Git process has no output pipes")
+
+                def drain_stderr() -> None:
+                    assert process is not None and process.stderr is not None
+                    try:
+                        while chunk := process.stderr.read(64 * 1024):
+                            stderr_seen.set()
+                            remaining = _CANDIDATE_BATCH_STDERR_BYTES - len(stderr_prefix)
+                            if remaining > 0:
+                                stderr_prefix.extend(chunk[:remaining])
+                    except (OSError, ValueError) as error:  # pragma: no cover - operating-system pipe failure
+                        stderr_errors.append(error)
+
+                stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+                stderr_thread.start()
+
+                def watch_for_inactivity() -> None:
+                    assert process is not None
+                    with watchdog_condition:
+                        while not watchdog_finished:
+                            remaining = watchdog_deadline - time.monotonic()
+                            if remaining > 0:
+                                watchdog_condition.wait(timeout=remaining)
+                                continue
+                            timed_out.set()
+                            break
+                        if watchdog_finished:
+                            return
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+
+                note_progress()
+                watchdog_thread = threading.Thread(target=watch_for_inactivity, daemon=True)
+                watchdog_thread.start()
+                try:
+                    result = _verify_candidate_object_batch_output(
+                        process.stdout,
+                        objects,
+                        self.object_format,
+                        label=label,
+                        progress=note_progress,
+                    )
+                except CandidateUncertain as error:
+                    if timed_out.is_set():
+                        raise CandidateUncertain(f"{label} Git process timed out") from error
+                    raise
+                finally:
+                    finish_watchdog()
+                try:
+                    returncode = process.wait(timeout=5)
+                except subprocess.TimeoutExpired as error:
+                    raise CandidateUncertain(f"{label} Git process did not exit") from error
+                stderr_thread.join(timeout=5)
+                if timed_out.is_set():
+                    raise CandidateUncertain(f"{label} Git process timed out")
+                if stderr_thread.is_alive() or stderr_errors:
+                    raise CandidateUncertain(f"{label} Git stderr could not be drained")
+                if returncode != 0 or stderr_seen.is_set():
+                    detail = stderr_prefix.decode("utf-8", errors="replace").strip()
+                    raise CandidateUncertain(f"{label} is incomplete: {detail}")
+                return result
+        finally:
+            finish_watchdog()
+            if watchdog_thread is not None:
+                watchdog_thread.join(timeout=1)
+                if watchdog_thread.is_alive():  # pragma: no cover - operating-system thread failure
+                    cleanup_error = CandidateUncertain(f"{label} timeout thread did not stop")
+            if process is not None:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    except OSError as error:  # pragma: no cover - operating-system process failure
+                        cleanup_error = error
+                try:
+                    process.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError) as error:  # pragma: no cover - OS process failure
+                    cleanup_error = error
+                if process.stdout is not None:
+                    try:
+                        process.stdout.close()
+                    except OSError as error:  # pragma: no cover - operating-system pipe failure
+                        cleanup_error = error
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=5)
+                if process.stderr is not None:
+                    try:
+                        process.stderr.close()
+                    except OSError as error:  # pragma: no cover - operating-system pipe failure
+                        cleanup_error = error
+                if stderr_thread is not None and stderr_thread.is_alive():
+                    stderr_thread.join(timeout=1)
+                    if stderr_thread.is_alive():  # pragma: no cover - operating-system thread failure
+                        cleanup_error = CandidateUncertain(f"{label} stderr thread did not stop")
+            self._verify_repository()
+            if cleanup_error is not None:
+                raise CandidateUncertain(f"{label} Git process could not be reaped") from cleanup_error
 
     def _write_candidate_object(self, object_type: str, expected_oid: str, content: bytes) -> None:
         proc = self._run_git_bytes(
@@ -2403,9 +2583,10 @@ class AttemptWorktrees:
             flagged_paths.add(path)
 
     def _verify_commit(self, oid: str) -> None:
-        proc = self._run_git(["rev-parse", "--verify", f"{oid}^{{commit}}"], check=False)
-        if proc.returncode != 0 or proc.stdout.strip() != oid:
-            raise RepositoryError(f"base object does not resolve exactly to a commit: {oid}")
+        try:
+            self._verified_candidate_commit_tree_oid(oid)
+        except CandidateUncertain as error:
+            raise RepositoryError(f"base object does not resolve exactly to a valid commit: {oid}") from error
 
     def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
         proc = self._run_git(["merge-base", "--is-ancestor", ancestor, descendant], check=False)
@@ -3944,6 +4125,102 @@ def _git_blob_oid(content: bytes, object_format: str) -> str:
     return _git_object_oid("blob", content, object_format)
 
 
+def _verify_candidate_blob_batch_output(
+    stream: BinaryIO,
+    oids: tuple[str, ...],
+    object_format: str,
+    *,
+    progress: Callable[[], None] | None = None,
+) -> None:
+    _verify_candidate_object_batch_output(
+        stream,
+        tuple((oid, "blob") for oid in oids),
+        object_format,
+        label="candidate tree closure",
+        progress=progress,
+    )
+
+
+def _verify_candidate_object_batch_output(
+    stream: BinaryIO,
+    objects: tuple[tuple[str, str], ...],
+    object_format: str,
+    *,
+    label: str,
+    progress: Callable[[], None] | None = None,
+) -> tuple[str | None, ...]:
+    tree_oids: list[str | None] = []
+    for oid, object_type in objects:
+        if object_type not in {"blob", "commit"}:
+            raise CandidateUncertain(f"{label} requested an unsupported object type")
+        header = stream.readline(_CANDIDATE_BATCH_HEADER_BYTES + 1)
+        if header and progress is not None:
+            progress()
+        if len(header) > _CANDIDATE_BATCH_HEADER_BYTES or not header.endswith(b"\n"):
+            raise CandidateUncertain(f"{label} is incomplete: truncated batch header")
+        fields = header[:-1].split(b" ")
+        if (
+            len(fields) != 3
+            or fields[0] != oid.encode("ascii")
+            or fields[1] != object_type.encode("ascii")
+        ):
+            raise CandidateUncertain(f"{label} is incomplete: invalid batch header")
+        try:
+            size = int(fields[2])
+        except ValueError as error:
+            raise CandidateUncertain(f"{label} is incomplete: invalid {object_type} size") from error
+        if size < 0 or fields[2] != str(size).encode("ascii"):
+            raise CandidateUncertain(f"{label} is incomplete: invalid {object_type} size")
+
+        digest = hashlib.new(object_format)
+        digest.update(f"{object_type} {size}\0".encode("ascii"))
+        first_line = bytearray() if object_type == "commit" else None
+        first_line_complete = False
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(remaining, _CANDIDATE_BLOB_CHUNK_BYTES))
+            if not chunk:
+                raise CandidateUncertain(f"{label} is incomplete: truncated {object_type} content")
+            if progress is not None:
+                progress()
+            digest.update(chunk)
+            if first_line is not None and not first_line_complete:
+                prefix, separator, _ = chunk.partition(b"\n")
+                first_line.extend(prefix)
+                if len(first_line) > _CANDIDATE_BATCH_HEADER_BYTES:
+                    raise CandidateUncertain(f"{label} has an invalid commit tree header")
+                first_line_complete = bool(separator)
+            remaining -= len(chunk)
+        delimiter = stream.read(1)
+        if not delimiter:
+            raise CandidateUncertain(f"{label} is incomplete: truncated {object_type} content")
+        if progress is not None:
+            progress()
+        if delimiter != b"\n":
+            raise CandidateUncertain(f"{label} is incomplete: invalid {object_type} delimiter")
+        if digest.hexdigest() != oid:
+            raise CandidateUncertain(f"{label} is incomplete: {object_type} identity mismatch")
+        tree_oid: str | None = None
+        if first_line is not None:
+            prefix, separator, encoded_oid = bytes(first_line).partition(b" ")
+            try:
+                tree_oid = encoded_oid.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise CandidateUncertain(f"{label} has an invalid commit tree header") from error
+            if not first_line_complete or prefix != b"tree" or not separator:
+                raise CandidateUncertain(f"{label} has an invalid commit tree header")
+            try:
+                _validate_oid(tree_oid)
+            except RepositoryError as error:
+                raise CandidateUncertain(f"{label} has an invalid commit tree header") from error
+            if len(tree_oid) != hashlib.new(object_format).digest_size * 2:
+                raise CandidateUncertain(f"{label} has an invalid commit tree header")
+        tree_oids.append(tree_oid)
+    if stream.read(1):
+        raise CandidateUncertain(f"{label} is incomplete: trailing batch output")
+    return tuple(tree_oids)
+
+
 def _git_object_oid(object_type: str, content: bytes, object_format: str) -> str:
     if object_type not in {"blob", "tree", "commit"}:
         raise RepositoryError(f"unsupported Git object type: {object_type}")
@@ -3976,6 +4253,8 @@ def _candidate_commit_content(
 def _snapshot_regular_tree(
     tree: Path,
     object_format: str,
+    *,
+    retained_paths: frozenset[str],
 ) -> tuple[
     dict[str, tuple[str, str]],
     dict[str, bytes],
@@ -3986,6 +4265,7 @@ def _snapshot_regular_tree(
     contents: dict[str, bytes] = {}
     identities: dict[str, tuple[int, ...]] = {}
     directories: dict[str, tuple[int, ...]] = {}
+    retained_bytes = 0
     directory_flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_DIRECTORY"):
         directory_flags |= os.O_DIRECTORY
@@ -3993,6 +4273,7 @@ def _snapshot_regular_tree(
         directory_flags |= os.O_NOFOLLOW
 
     def visit(directory_fd: int, relative_directory: str) -> None:
+        nonlocal retained_bytes
         try:
             before = os.fstat(directory_fd)
             with os.scandir(directory_fd) as iterator:
@@ -4036,10 +4317,26 @@ def _snapshot_regular_tree(
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 kind = "symbolic link" if stat.S_ISLNK(info.st_mode) else "special file"
                 raise CandidateUncertain(f"candidate commits reject {kind}: {relative}")
-            content, identity = _read_candidate_regular_file_at(directory_fd, entry.name, info, relative)
+            retain = relative in retained_paths
+            if retain and info.st_size > _MAX_CANDIDATE_BLOB_BYTES:
+                limit_mib = _MAX_CANDIDATE_BLOB_BYTES // (1024 * 1024)
+                raise CandidateUncertain(f"candidate allowed file exceeds the {limit_mib} MiB safety limit: {relative}")
+            if retain and retained_bytes + info.st_size > _MAX_CANDIDATE_TOTAL_BLOB_BYTES:
+                limit_mib = _MAX_CANDIDATE_TOTAL_BLOB_BYTES // (1024 * 1024)
+                raise CandidateUncertain(f"candidate allowed files exceed the {limit_mib} MiB aggregate safety limit")
+            oid, content, identity = _hash_candidate_regular_file_at(
+                directory_fd,
+                entry.name,
+                info,
+                relative,
+                object_format=object_format,
+                retain=retain,
+            )
             mode = "100755" if info.st_mode & 0o111 else "100644"
-            files[relative] = (mode, _git_blob_oid(content, object_format))
-            contents[relative] = content
+            files[relative] = (mode, oid)
+            if content is not None:
+                contents[relative] = content
+                retained_bytes += len(content)
             identities[relative] = identity
         try:
             finished = os.fstat(directory_fd)
@@ -4079,12 +4376,15 @@ def _snapshot_regular_tree(
     return files, contents, identities, directories
 
 
-def _read_candidate_regular_file_at(
+def _hash_candidate_regular_file_at(
     directory_fd: int,
     name: str,
     expected: os.stat_result,
     relative: str,
-) -> tuple[bytes, tuple[int, ...]]:
+    *,
+    object_format: str,
+    retain: bool,
+) -> tuple[str, bytes | None, tuple[int, ...]]:
     if not stat.S_ISREG(expected.st_mode) or stat.S_ISLNK(expected.st_mode) or expected.st_nlink != 1:
         raise CandidateUncertain(f"candidate path is not a private regular file: {relative}")
     flags = os.O_RDONLY | os.O_CLOEXEC
@@ -4103,13 +4403,29 @@ def _read_candidate_regular_file_at(
             or _candidate_stat_identity(opened) != expected_identity
         ):
             raise CandidateUncertain(f"candidate regular file changed while being opened: {relative}")
-        content = bytearray()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+        digest = hashlib.new(object_format)
+        digest.update(f"blob {opened.st_size}\0".encode("ascii"))
+        content = bytearray() if retain else None
+        observed_size = 0
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, _CANDIDATE_BLOB_CHUNK_BYTES))
             if not chunk:
                 break
-            content.extend(chunk)
-        if _candidate_stat_identity(os.fstat(descriptor)) != expected_identity or len(content) != opened.st_size:
+            digest.update(chunk)
+            observed_size += len(chunk)
+            remaining -= len(chunk)
+            if content is not None:
+                content.extend(chunk)
+            _checkpoint(f"candidate-file-chunk:{relative}")
+        extra = os.read(descriptor, 1) if not remaining else b""
+        _checkpoint(f"candidate-file-read:{relative}")
+        if (
+            remaining
+            or extra
+            or _candidate_stat_identity(os.fstat(descriptor)) != expected_identity
+            or observed_size != opened.st_size
+        ):
             raise CandidateUncertain(f"candidate regular file changed while being read: {relative}")
     finally:
         os.close(descriptor)
@@ -4119,7 +4435,7 @@ def _read_candidate_regular_file_at(
         raise CandidateUncertain(f"candidate regular file disappeared after being read: {relative}") from error
     if _candidate_stat_identity(current) != expected_identity:
         raise CandidateUncertain(f"candidate regular file was replaced after being read: {relative}")
-    return bytes(content), expected_identity
+    return digest.hexdigest(), None if content is None else bytes(content), expected_identity
 
 
 def _read_candidate_regular_file(path: Path, expected: os.stat_result, relative: str) -> tuple[bytes, tuple[int, ...]]:
@@ -4178,6 +4494,19 @@ def _candidate_tree_objects(
     blobs: tuple[tuple[str, bytes], ...],
     object_format: str,
 ) -> tuple[str, tuple[tuple[str, str, bytes], ...]]:
+    tree_objects: list[tuple[str, str, bytes]] = []
+    root_oid = _candidate_tree_oid(entries, object_format, tree_objects=tree_objects)
+    blob_objects = [("blob", oid, content) for oid, content in blobs]
+    objects = tuple(sorted((*blob_objects, *tree_objects), key=lambda item: (item[0], item[1])))
+    return root_oid, objects
+
+
+def _candidate_tree_oid(
+    entries: tuple[tuple[str, tuple[str, str]], ...],
+    object_format: str,
+    *,
+    tree_objects: list[tuple[str, str, bytes]] | None = None,
+) -> str:
     root: dict[str, object] = {}
     for path, leaf in entries:
         node = root
@@ -4190,8 +4519,6 @@ def _candidate_tree_objects(
         if parts[-1] in node:
             raise CandidateUncertain(f"candidate tree has a duplicate or colliding path: {path}")
         node[parts[-1]] = leaf
-
-    tree_objects: list[tuple[str, str, bytes]] = []
 
     def build(node: dict[str, object]) -> str:
         encoded: list[tuple[bytes, bytes]] = []
@@ -4208,13 +4535,11 @@ def _candidate_tree_objects(
             encoded.append((sort_name, raw))
         content = b"".join(raw for _, raw in sorted(encoded, key=lambda item: item[0]))
         oid = _git_object_oid("tree", content, object_format)
-        tree_objects.append(("tree", oid, content))
+        if tree_objects is not None:
+            tree_objects.append(("tree", oid, content))
         return oid
 
-    root_oid = build(root)
-    blob_objects = [("blob", oid, content) for oid, content in blobs]
-    objects = tuple(sorted((*blob_objects, *tree_objects), key=lambda item: (item[0], item[1])))
-    return root_oid, objects
+    return build(root)
 
 
 def _candidate_private_file_snapshot(path: Path, *, label: str) -> _CandidateFileSnapshot:

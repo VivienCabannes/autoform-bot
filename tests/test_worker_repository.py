@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import stat
 import subprocess
 import sys
 import threading
+import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -119,6 +122,30 @@ def _git(*args: str, cwd: Path | None = None) -> str:
         },
     )
     return proc.stdout.strip()
+
+
+def _git_bytes(*args: str, cwd: Path | None = None) -> bytes:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Autoform test",
+            "GIT_AUTHOR_EMAIL": "autoform@example.test",
+            "GIT_COMMITTER_NAME": "Autoform test",
+            "GIT_COMMITTER_EMAIL": "autoform@example.test",
+        },
+    )
+    return proc.stdout
+
+
+def _replace_loose_object(manager: AttemptWorktrees, oid: str, object_type: str, content: bytes) -> None:
+    object_path = manager.common_git_dir / "objects" / oid[:2] / oid[2:]
+    assert object_path.is_file()
+    object_path.chmod(0o600)
+    object_path.write_bytes(zlib.compress(f"{object_type} {len(content)}\0".encode() + content))
 
 
 @pytest.fixture
@@ -1815,6 +1842,495 @@ def test_candidate_commit_and_inspection_reject_missing_reachable_base_blob(
     assert _git("rev-parse", "HEAD", cwd=ready_tree) == ready.candidate_oid
 
 
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_candidate_commit_rejects_corrupt_reachable_base_blob(
+    tmp_path: Path,
+    object_format: str,
+) -> None:
+    repository = tmp_path / f"repository-{object_format}"
+    initialized = subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main", f"--object-format={object_format}", str(repository)],
+        capture_output=True,
+        text=True,
+    )
+    if initialized.returncode != 0 and object_format == "sha256":
+        pytest.skip("installed Git does not support SHA-256 repositories")
+    initialized.check_returncode()
+    (repository / "changed.txt").write_text("original changed content\n", encoding="utf-8")
+    (repository / "unchanged.txt").write_text("required unchanged content\n", encoding="utf-8")
+    _git("add", "changed.txt", "unchanged.txt", cwd=repository)
+    _git("commit", "--quiet", "-m", "base", cwd=repository)
+    base = _git("rev-parse", "HEAD", cwd=repository)
+    manager = AttemptWorktrees(repository, tmp_path / "state")
+    ready_tree = Path(manager.prepare("run-1", "ready", base_oid=base).path)
+    pending_tree = Path(manager.prepare("run-1", "pending", base_oid=base).path)
+    ready_tree.joinpath("changed.txt").write_text("ready candidate\n", encoding="utf-8")
+    pending_tree.joinpath("changed.txt").write_text("pending candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"changed.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+    ready = manager.commit_candidate("run-1", "ready", **arguments)
+
+    blob_oid = _git("rev-parse", f"{base}:unchanged.txt", cwd=repository)
+    object_path = manager.common_git_dir / "objects" / blob_oid[:2] / blob_oid[2:]
+    assert object_path.is_file()
+    corrupt = b"corrupt object content\n"
+    object_path.chmod(0o600)
+    object_path.write_bytes(zlib.compress(f"blob {len(corrupt)}\0".encode() + corrupt))
+    assert _git("cat-file", "-t", blob_oid, cwd=repository) == "blob"
+
+    with pytest.raises(CandidateUncertain, match="tree closure is incomplete: blob identity mismatch"):
+        manager.inspect_candidate("run-1", "ready")
+    with pytest.raises(CandidateUncertain, match="tree closure is incomplete: blob identity mismatch"):
+        manager.commit_candidate("run-1", "pending", **arguments)
+    assert _git("rev-parse", "HEAD", cwd=pending_tree) == base
+    assert _git("rev-parse", "HEAD", cwd=ready_tree) == ready.candidate_oid
+
+
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_candidate_commit_rejects_corrupt_base_commit(
+    tmp_path: Path,
+    object_format: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / f"repository-{object_format}"
+    initialized = subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main", f"--object-format={object_format}", str(repository)],
+        capture_output=True,
+        text=True,
+    )
+    if initialized.returncode != 0 and object_format == "sha256":
+        pytest.skip("installed Git does not support SHA-256 repositories")
+    initialized.check_returncode()
+    repository.joinpath("changed.txt").write_text("base changed content\n", encoding="utf-8")
+    _git("add", "changed.txt", cwd=repository)
+    _git("commit", "--quiet", "-m", "base", cwd=repository)
+    base = _git("rev-parse", "HEAD", cwd=repository)
+    base_content = _git_bytes("cat-file", "commit", base, cwd=repository)
+    manager = AttemptWorktrees(repository, tmp_path / "state")
+    ready_tree = Path(manager.prepare("run-1", "ready", base_oid=base).path)
+    pending_tree = Path(manager.prepare("run-1", "pending", base_oid=base).path)
+    ready_tree.joinpath("changed.txt").write_text("ready candidate\n", encoding="utf-8")
+    pending_tree.joinpath("changed.txt").write_text("pending candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"changed.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+    ready = manager.commit_candidate("run-1", "ready", **arguments)
+    corrupt_content = base_content + b"forged commit bytes\n"
+    original_candidate_base_entries = manager._candidate_base_entries
+
+    def corrupt_before_base_inspection(base_oid: str) -> dict[str, tuple[str, str]]:
+        _replace_loose_object(manager, base, "commit", corrupt_content)
+        return original_candidate_base_entries(base_oid)
+
+    monkeypatch.setattr(manager, "_candidate_base_entries", corrupt_before_base_inspection)
+    with pytest.raises(CandidateUncertain, match="base commit.*commit identity mismatch"):
+        manager.inspect_candidate("run-1", "ready")
+    assert _git("rev-parse", "HEAD", cwd=ready_tree) == ready.candidate_oid
+
+    _replace_loose_object(manager, base, "commit", base_content)
+    with pytest.raises(CandidateUncertain, match="base commit.*commit identity mismatch"):
+        manager.commit_candidate(
+            "run-1",
+            "pending",
+            **arguments,
+        )
+    assert _git("rev-parse", "HEAD", cwd=pending_tree) == base
+
+
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_candidate_commit_rejects_corrupt_nested_base_tree(
+    tmp_path: Path,
+    object_format: str,
+) -> None:
+    repository = tmp_path / f"repository-{object_format}"
+    initialized = subprocess.run(
+        ["git", "init", "--quiet", "--initial-branch=main", f"--object-format={object_format}", str(repository)],
+        capture_output=True,
+        text=True,
+    )
+    if initialized.returncode != 0 and object_format == "sha256":
+        pytest.skip("installed Git does not support SHA-256 repositories")
+    initialized.check_returncode()
+    repository.joinpath("nested").mkdir()
+    repository.joinpath("changed.txt").write_text("base changed content\n", encoding="utf-8")
+    repository.joinpath("nested/stable.txt").write_text("base stable content\n", encoding="utf-8")
+    _git("add", "changed.txt", "nested/stable.txt", cwd=repository)
+    _git("commit", "--quiet", "-m", "base", cwd=repository)
+    base = _git("rev-parse", "HEAD", cwd=repository)
+    original_nested_tree_oid = _git("rev-parse", f"{base}:nested", cwd=repository)
+    manager = AttemptWorktrees(repository, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("changed.txt").write_text("candidate\n", encoding="utf-8")
+    tree.joinpath("nested/stable.txt").write_text("forged stable content\n", encoding="utf-8")
+    _git("add", "nested/stable.txt", cwd=tree)
+
+    repository.joinpath("nested/stable.txt").write_text("forged stable content\n", encoding="utf-8")
+    _git("add", "nested/stable.txt", cwd=repository)
+    _git("commit", "--quiet", "-m", "forged nested tree source", cwd=repository)
+    forged_nested_tree_oid = _git("rev-parse", "HEAD:nested", cwd=repository)
+    forged_nested_tree = _git_bytes("cat-file", "tree", forged_nested_tree_oid, cwd=repository)
+    _replace_loose_object(manager, original_nested_tree_oid, "tree", forged_nested_tree)
+    assert _git("cat-file", "-t", original_nested_tree_oid, cwd=repository) == "tree"
+
+    with pytest.raises(CandidateUncertain, match="base commit tree object has an invalid identity"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"changed.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+@pytest.mark.parametrize(
+    ("malformation", "message"),
+    (
+        ("truncated-header", "truncated batch header"),
+        ("ambiguous-header", "invalid batch header"),
+        ("truncated-content", "truncated blob content"),
+        ("invalid-delimiter", "invalid blob delimiter"),
+        ("trailing-data", "trailing batch output"),
+    ),
+)
+def test_candidate_tree_closure_rejects_malformed_batch_output(
+    malformation: str,
+    message: str,
+) -> None:
+    content = b"candidate\n"
+    oid = repository_module._git_blob_oid(content, "sha1")
+    valid = f"{oid} blob {len(content)}\n".encode() + content + b"\n"
+    if malformation == "truncated-header":
+        output = valid.split(b"\n", 1)[0]
+    elif malformation == "ambiguous-header":
+        output = valid.replace(b" blob ", b"  blob ", 1)
+    elif malformation == "truncated-content":
+        output = valid[:-1]
+    elif malformation == "invalid-delimiter":
+        output = valid[:-1] + b"x"
+    else:
+        output = valid + b"foreign"
+    with pytest.raises(CandidateUncertain, match=message):
+        repository_module._verify_candidate_blob_batch_output(io.BytesIO(output), (oid,), "sha1")
+
+
+def test_candidate_tree_closure_streams_large_unallowed_blob_without_retaining_it(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    large = coordinator / "large.bin"
+    with large.open("wb") as stream:
+        stream.seek(repository_module._CANDIDATE_BLOB_CHUNK_BYTES * 3)
+        stream.write(b"x")
+    _git("add", "large.bin", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "large base blob", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+
+    base_entries = manager._candidate_base_entries(base)
+    snapshot = manager._candidate_snapshot(tree, base_entries, ("book.txt",))
+    assert {oid for oid, _ in snapshot.blobs} == {dict(snapshot.entries)["book.txt"][1]}
+    assert sum(len(content) for _, content in snapshot.blobs) < repository_module._CANDIDATE_BLOB_CHUNK_BYTES
+
+    original_popen = subprocess.Popen
+    guarded_streams: list[object] = []
+
+    class GuardedReader:
+        def __init__(self, stream: object) -> None:
+            self.stream = stream
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = -1) -> bytes:
+            assert 0 <= size <= repository_module._CANDIDATE_BLOB_CHUNK_BYTES
+            self.read_sizes.append(size)
+            return self.stream.read(size)  # type: ignore[union-attr,no-any-return]
+
+        def readline(self, size: int = -1) -> bytes:
+            assert 0 <= size <= repository_module._CANDIDATE_BATCH_HEADER_BYTES + 1
+            return self.stream.readline(size)  # type: ignore[union-attr,no-any-return]
+
+        def close(self) -> None:
+            self.stream.close()  # type: ignore[union-attr]
+
+    def guarded_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = original_popen(*args, **kwargs)
+        command = args[0] if args else kwargs.get("args")
+        if isinstance(command, list) and "cat-file" in command and any(
+            isinstance(argument, str) and argument.startswith("--batch=") for argument in command
+        ):
+            assert "--no-replace-objects" in command
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict) and environment.get("GIT_NO_LAZY_FETCH") == "1"
+            assert process.stdout is not None
+            guarded = GuardedReader(process.stdout)
+            process.stdout = guarded  # type: ignore[assignment]
+            guarded_streams.append(guarded)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert candidate.state == "ready"
+    assert guarded_streams
+    assert any(
+        repository_module._CANDIDATE_BLOB_CHUNK_BYTES in guarded.read_sizes  # type: ignore[union-attr]
+        for guarded in guarded_streams
+    )
+
+
+def test_candidate_snapshot_rejects_nonallowed_file_growth_during_streaming(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    stable = coordinator / "stable.bin"
+    with stable.open("wb") as stream:
+        stream.seek(repository_module._CANDIDATE_BLOB_CHUNK_BYTES * 2)
+        stream.write(b"x")
+    _git("add", "stable.bin", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "large base blob", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    mutated = False
+
+    def grow_during_read(name: str) -> None:
+        nonlocal mutated
+        if name == "candidate-file-chunk:stable.bin" and not mutated:
+            with tree.joinpath("stable.bin").open("ab") as stream:
+                stream.write(b"growth")
+            mutated = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", grow_during_read)
+    with pytest.raises(CandidateUncertain, match="changed while being read"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+def test_candidate_snapshot_rejects_oversized_allowed_file(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    with tree.joinpath("oversized.lean").open("wb") as stream:
+        stream.truncate(repository_module._MAX_CANDIDATE_BLOB_BYTES + 1)
+
+    with pytest.raises(CandidateUncertain, match="allowed file exceeds the 16 MiB safety limit"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"oversized.lean"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+def test_candidate_snapshot_rejects_oversized_allowed_files_in_aggregate(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("first.lean").write_text("1234", encoding="utf-8")
+    tree.joinpath("second.lean").write_text("5678", encoding="utf-8")
+    monkeypatch.setattr(repository_module, "_MAX_CANDIDATE_BLOB_BYTES", 8)
+    monkeypatch.setattr(repository_module, "_MAX_CANDIDATE_TOTAL_BLOB_BYTES", 6)
+
+    with pytest.raises(CandidateUncertain, match="allowed files exceed the .* aggregate safety limit"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"first.lean", "second.lean"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
+
+
+def test_candidate_tree_closure_reaps_git_after_protocol_failure(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+
+    class MalformedProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(b"malformed\n")
+            self.stderr = io.BytesIO()
+            self.returncode: int | None = None
+            self.killed = False
+            self.waited = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            assert timeout is not None
+            return self.returncode if self.returncode is not None else 0
+
+    process = MalformedProcess()
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(CandidateUncertain, match="invalid batch header"):
+        manager._verify_candidate_blob_batch(("0" * len(base),))
+    assert process.killed
+    assert process.waited
+    assert process.stdout.closed
+    assert process.stderr.closed
+
+
+def test_candidate_tree_closure_progress_extends_inactivity_deadline(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    content = b"continuous bounded progress"
+    oid = repository_module._git_blob_oid(content, "sha1")
+    output = f"{oid} blob {len(content)}\n".encode() + content + b"\n"
+
+    class SlowReader(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            time.sleep(0.05)
+            return super().read(size)
+
+        def readline(self, size: int = -1) -> bytes:
+            time.sleep(0.05)
+            return super().readline(size)
+
+    class ProgressProcess:
+        def __init__(self) -> None:
+            self.stdout = SlowReader(output)
+            self.stderr = io.BytesIO()
+            self.returncode: int | None = None
+            self.killed = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    process = ProgressProcess()
+    monkeypatch.setattr(repository_module, "_CANDIDATE_BLOB_CHUNK_BYTES", 1)
+    monkeypatch.setattr(repository_module, "_CANDIDATE_BATCH_TIMEOUT_S", 1)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+
+    manager._verify_candidate_blob_batch((oid,))
+
+    assert not process.killed
+    assert process.returncode == 0
+
+
+def test_candidate_tree_closure_kills_and_reaps_inactive_git(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    released = threading.Event()
+
+    class BlockingReader:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def readline(self, size: int = -1) -> bytes:
+            assert size > 0
+            assert released.wait(timeout=5)
+            return b""
+
+        def read(self, size: int = -1) -> bytes:
+            assert size > 0
+            assert released.wait(timeout=5)
+            return b""
+
+        def close(self) -> None:
+            self.closed = True
+
+    class InactiveProcess:
+        def __init__(self) -> None:
+            self.stdout = BlockingReader()
+            self.stderr = io.BytesIO()
+            self.returncode: int | None = None
+            self.killed = False
+            self.waited = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            released.set()
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            assert timeout is not None
+            return self.returncode if self.returncode is not None else 0
+
+    process = InactiveProcess()
+    monkeypatch.setattr(repository_module, "_CANDIDATE_BATCH_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(CandidateUncertain, match="Git process timed out"):
+        manager._verify_candidate_blob_batch(("0" * len(base),))
+    assert process.killed
+    assert process.waited
+    assert process.stdout.closed
+    assert process.stderr.closed
+
+
 def test_candidate_tree_closure_ignores_replacement_refs(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
@@ -1882,20 +2398,13 @@ def test_candidate_tree_closure_rechecks_repository_config(
     manager = AttemptWorktrees(coordinator, tmp_path / "state")
     tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
     tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
-    original_run_git = manager._run_git
+    original_verify_candidate_blob_batch = manager._verify_candidate_blob_batch
 
-    def mutate_after_closure_check(
-        args: list[str],
-        *,
-        check: bool = True,
-        input_text: str | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        proc = original_run_git(args, check=check, input_text=input_text)
-        if "cat-file" in args and any(argument.startswith("--batch-check=") for argument in args):
-            _git("config", "autoform.closureProbe", "changed", cwd=coordinator)
-        return proc
+    def mutate_after_closure_check(oids: tuple[str, ...]) -> None:
+        original_verify_candidate_blob_batch(oids)
+        _git("config", "autoform.closureProbe", "changed", cwd=coordinator)
 
-    monkeypatch.setattr(manager, "_run_git", mutate_after_closure_check)
+    monkeypatch.setattr(manager, "_verify_candidate_blob_batch", mutate_after_closure_check)
     with pytest.raises(CandidateUncertain, match="configuration changed"):
         manager.commit_candidate(
             "run-1",
