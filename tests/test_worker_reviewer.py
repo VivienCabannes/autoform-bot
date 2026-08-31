@@ -591,6 +591,40 @@ def test_review_uses_inline_commit_bound_evidence_and_retains_replay_data(review
     assert load_candidate_review_result(result.evidence_bytes()) == result
 
 
+def test_durable_review_loader_accepts_valid_evidence_larger_than_contract_limit(
+    review_case,
+) -> None:
+    large_path = "large-review-evidence.txt"
+    (review_case.repo / large_path).write_bytes(b"x" * (6 * 1024 * 1024))
+    _git(review_case.repo, "add", large_path)
+    _git(review_case.repo, "commit", "-qm", "large review evidence")
+    candidate_oid = _git(review_case.repo, "rev-parse", "HEAD")
+    request = bind_candidate_review_request(
+        base_oid=review_case.request.base_oid,
+        candidate_oid=candidate_oid,
+        article_id=review_case.request.article_id,
+        node_id=review_case.request.node_id,
+        phase=review_case.request.phase,
+        article_path=review_case.request.article_path,
+        changed_paths=tuple(sorted((*review_case.request.changed_paths, large_path))),
+        prover_backend=review_case.request.prover_backend,
+        reviewer_backend=review_case.request.reviewer_backend,
+        base_execution_input=review_case.request.base_execution_input,
+        candidate_execution_input=review_case.request.candidate_execution_input,
+        gate_evidence=review_case.request.gate_evidence,
+    )
+    result = review_candidate(
+        review_case.repo,
+        request,
+        _factory(_Adapter()),
+        threading.Event(),
+    )
+
+    durable = result.evidence_bytes()
+    assert len(durable) > 32 * 1024 * 1024
+    assert load_candidate_review_result(durable) == result
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [

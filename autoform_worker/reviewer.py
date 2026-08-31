@@ -467,7 +467,11 @@ def load_candidate_review_result(content: bytes) -> CandidateReviewResult:
         raise ReviewError("durable review evidence must be nonempty bytes")
     if len(content) > 4 * _MAX_BUNDLE_BYTES:
         raise ReviewError("durable review evidence exceeds the size limit")
-    value = _canonical_json_object(content, "durable review evidence")
+    value = _canonical_json_object(
+        content,
+        "durable review evidence",
+        maximum=4 * _MAX_BUNDLE_BYTES,
+    )
     if _json_bytes(value) != content:
         raise ReviewError("durable review evidence must use canonical JSON")
     expected_result_keys = {
@@ -2039,8 +2043,13 @@ def _canonical_backend(value: str, *, reviewer: bool) -> str:
     return normalized
 
 
-def _canonical_json_object(value: bytes, label: str) -> Mapping[str, object]:
-    if not isinstance(value, bytes) or not value or len(value) > _MAX_CONTRACT_BYTES:
+def _canonical_json_object(
+    value: bytes,
+    label: str,
+    *,
+    maximum: int = _MAX_CONTRACT_BYTES,
+) -> Mapping[str, object]:
+    if not isinstance(value, bytes) or not value or len(value) > maximum:
         raise ReviewError(f"{label} must be nonempty bounded bytes")
     try:
         payload = json.loads(
