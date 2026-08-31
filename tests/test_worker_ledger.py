@@ -4,14 +4,17 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
 import autoform_worker.ledger as ledger_module
-from autoform_cli.claims import author_claim_key
+from autoform_cli.claims import CLAIM_REF_PREFIX, author_claim_key
 from autoform_worker.ledger import (
+    ArticleClaimToken,
     AttemptRecord,
     GateRecord,
     GenerationConflict,
@@ -70,16 +73,36 @@ def _identity(project: Path, config: RunConfig | None = None) -> RunIdentity:
     )
 
 
+def _claim_token(article_id: str, *, observed_ref_oid: str = "8" * 40) -> ArticleClaimToken:
+    claim_key = author_claim_key(article_id)
+    return ArticleClaimToken(
+        article_id=article_id,
+        claim_key=claim_key,
+        claim_ref=CLAIM_REF_PREFIX + claim_key,
+        lease_id="e" * 64,
+        observed_ref_oid=observed_ref_oid,
+        object_format="sha1" if len(observed_ref_oid) == 40 else "sha256",
+    )
+
+
+def _task_plan_digest(tasks: list[tuple[str, str]]) -> str:
+    payload = [
+        {"article_id": article_id, "phase": phase}
+        for article_id, phase in sorted(tasks)
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _running_ledger(tmp_path: Path) -> tuple[RunLedger, str]:
     ledger = RunLedger(tmp_path / "state/run.sqlite3", clock_ns=iter(range(100, 10_000)).__next__)
     config = _config()
-    run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
-    ledger.add_tasks(
-        run.run_id,
-        [(_ARTICLE_A, "statement")],
-        expected_generation=run.generation,
+    run = ledger.create_run(
+        _identity(tmp_path, config),
+        config,
+        tasks=[(_ARTICLE_A, "statement")],
+        run_id="run-1",
     )
-    run = ledger.get_run(run.run_id)
     run = ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
     return ledger, run.run_id
 
@@ -90,13 +113,14 @@ def _begin(ledger: RunLedger, run_id: str, tmp_path: Path, *, attempt_id: str = 
         run_id,
         task.node_id,
         task.phase,
+        expected_generation=ledger.get_run(run_id).generation,
         expected_task_generation=task.generation,
         worktree_path=tmp_path / "worktree",
         branch=f"autoform/run-1/{task.article_id}/1",
         base_oid="1" * 40,
         backend="codex",
         claim_key=author_claim_key(task.article_id),
-        claim_token={"claim_id": "claim-1", "ref_oid": "8" * 40},
+        claim_token=_claim_token(task.article_id),
         attempt_id=attempt_id,
     )
 
@@ -114,13 +138,14 @@ def _begin_task(
         run_id,
         article_id,
         phase,
+        expected_generation=ledger.get_run(run_id).generation,
         expected_task_generation=task.generation,
         worktree_path=tmp_path / attempt_id,
         branch=f"autoform/{run_id}/{article_id}/{task.attempts + 1}",
         base_oid=ledger.get_run(run_id).current_oid,
         backend="codex",
         claim_key=author_claim_key(article_id),
-        claim_token={"claim_id": attempt_id, "ref_oid": "8" * 40},
+        claim_token=_claim_token(article_id),
         attempt_id=attempt_id,
     )
 
@@ -217,7 +242,7 @@ def test_run_identity_and_events_survive_reopen(tmp_path: Path) -> None:
     config = _config()
     identity = _identity(tmp_path, config)
     with RunLedger(path, clock_ns=lambda: 123) as ledger:
-        created = ledger.create_run(identity, config, run_id="run-1")
+        created = ledger.create_run(identity, config, tasks=[], run_id="run-1")
         assert created.identity == identity
         assert created.identity_sha256 == identity.sha256
         assert created.config == config
@@ -225,6 +250,8 @@ def test_run_identity_and_events_survive_reopen(tmp_path: Path) -> None:
         assert created.current_oid == config.start_oid
         assert created.status == "created"
         assert created.generation == 0
+        assert created.task_count == 0
+        assert created.task_plan_sha256 == _task_plan_digest([])
         assert [event.kind for event in ledger.events("run-1")] == ["run.created"]
         assert ledger._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert ledger._connection.execute("PRAGMA synchronous").fetchone()[0] == 2
@@ -237,6 +264,8 @@ def test_run_identity_and_events_survive_reopen(tmp_path: Path) -> None:
                 "config_sha256": config.sha256,
                 "current_oid": config.start_oid,
                 "identity_sha256": identity.sha256,
+                "task_count": 0,
+                "task_plan_sha256": _task_plan_digest([]),
             }
         ]
 
@@ -256,17 +285,27 @@ def test_run_config_is_canonical_validated_and_immutable(tmp_path: Path) -> None
         replace(config, schema_version=2)
     with pytest.raises(LedgerError, match="reviewer backend must differ"):
         replace(config, reviewer_backend=config.backend)
+    with pytest.raises(LedgerError, match="reviewer backend must differ"):
+        replace(config, backend="CODEX", reviewer_backend="codex")
     with pytest.raises(LedgerError, match="reviewer backend"):
         replace(config, reviewer_backend="not a backend")
+    canonical = replace(config, backend="CODEX", reviewer_backend="CLAUDE")
+    assert canonical.backend == "codex"
+    assert canonical.reviewer_backend == "claude"
 
     path = tmp_path / "state/run.sqlite3"
     with RunLedger(path) as ledger:
         identity = _identity(tmp_path, config)
         with pytest.raises(LedgerError, match="does not match the run config digest"):
-            ledger.create_run(replace(identity, config_sha256="a" * 64), config, run_id="bad-run")
+            ledger.create_run(
+                replace(identity, config_sha256="a" * 64),
+                config,
+                tasks=[],
+                run_id="bad-run",
+            )
         assert ledger.list_runs() == ()
 
-        run = ledger.create_run(identity, config, run_id="run-1")
+        run = ledger.create_run(identity, config, tasks=[], run_id="run-1")
         assert ledger.list_runs() == (run,)
         stored = ledger._connection.execute(
             "SELECT config_json FROM runs WHERE run_id = ?", (run.run_id,)
@@ -289,6 +328,7 @@ def test_run_config_is_canonical_validated_and_immutable(tmp_path: Path) -> None
         ("timeout_seconds", True, "timeout"),
         ("timeout_seconds", float("nan"), "timeout"),
         ("timeout_seconds", float("inf"), "timeout"),
+        ("timeout_seconds", 10**400, "timeout"),
         ("timeout_seconds", 0, "timeout"),
         ("claim_ttl_seconds", False, "claim TTL"),
         ("claim_ttl_seconds", float("-inf"), "claim TTL"),
@@ -311,14 +351,20 @@ def test_run_config_rejects_invalid_retry_and_timeout_controls(
 def test_generation_checks_and_idempotent_stop(tmp_path: Path) -> None:
     with RunLedger(tmp_path / "run.sqlite3", clock_ns=iter(range(100)).__next__) as ledger:
         config = _config()
-        run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
+        run = ledger.create_run(_identity(tmp_path, config), config, tasks=[], run_id="run-1")
         running = ledger.transition_run("run-1", "running", expected_generation=run.generation)
         assert running.generation == 1
-        assert ledger.transition_run("run-1", "running", expected_generation=run.generation) == running
+        with pytest.raises(GenerationConflict):
+            ledger.transition_run("run-1", "running", expected_generation=run.generation)
+        assert ledger.transition_run(
+            "run-1", "running", expected_generation=running.generation
+        ) == running
         with pytest.raises(GenerationConflict):
             ledger.transition_run("run-1", "failed", expected_generation=0)
         stopped = ledger.request_stop("run-1", expected_generation=running.generation)
-        repeated = ledger.request_stop("run-1", expected_generation=running.generation)
+        with pytest.raises(GenerationConflict):
+            ledger.request_stop("run-1", expected_generation=running.generation)
+        repeated = ledger.request_stop("run-1", expected_generation=stopped.generation)
         assert stopped == repeated
         assert stopped.stop_requested
         assert stopped.generation == 2
@@ -330,7 +376,9 @@ def test_stop_request_rejects_a_stale_controller_generation(tmp_path: Path) -> N
     path = tmp_path / "run.sqlite3"
     config = _config()
     with RunLedger(path) as first:
-        created = first.create_run(_identity(tmp_path, config), config, run_id="run-1")
+        created = first.create_run(
+            _identity(tmp_path, config), config, tasks=[], run_id="run-1"
+        )
         running = first.transition_run("run-1", "running", expected_generation=created.generation)
         with RunLedger(path) as stale:
             blocked = first.transition_run(
@@ -345,45 +393,80 @@ def test_stop_request_rejects_a_stale_controller_generation(tmp_path: Path) -> N
 
             stopped = stale.request_stop("run-1", expected_generation=blocked.generation)
             before_events = stale.events("run-1")
-            assert stale.request_stop("run-1", expected_generation=blocked.generation) == stopped
+            with pytest.raises(GenerationConflict):
+                stale.request_stop("run-1", expected_generation=blocked.generation)
+            assert stale.request_stop("run-1", expected_generation=stopped.generation) == stopped
             assert stale.events("run-1") == before_events
 
 
-def test_add_tasks_advances_the_run_generation_and_rejects_stale_writers(tmp_path: Path) -> None:
+def test_create_run_atomically_persists_and_binds_the_complete_task_plan(tmp_path: Path) -> None:
     path = tmp_path / "run.sqlite3"
     config = _config()
     with RunLedger(path) as first:
-        created = first.create_run(_identity(tmp_path, config), config, run_id="run-1")
+        plan = [(_ARTICLE_B, "proof"), (_ARTICLE_A, "statement")]
+        created = first.create_run(
+            _identity(tmp_path, config),
+            config,
+            tasks=plan,
+            run_id="run-1",
+        )
+        assert created.generation == 0
+        assert created.task_count == 2
+        assert created.task_plan_sha256 == _task_plan_digest(plan)
+        assert [(task.article_id, task.phase) for task in first.tasks(created.run_id)] == sorted(plan)
+        assert [event.kind for event in first.events(created.run_id)] == [
+            "run.created",
+            "task.created",
+            "task.created",
+        ]
+        assert not hasattr(first, "add_tasks")
         with RunLedger(path) as stale:
-            first.add_tasks(
-                created.run_id,
-                [(_ARTICLE_A, "statement")],
-                expected_generation=created.generation,
-            )
-            advanced = first.get_run(created.run_id)
-            assert advanced.generation == created.generation + 1
-            with pytest.raises(GenerationConflict):
-                stale.add_tasks(
-                    created.run_id,
-                    [(_ARTICLE_B, "proof")],
-                    expected_generation=created.generation,
-                )
-            with pytest.raises(GenerationConflict):
-                stale.transition_run(
-                    created.run_id,
-                    "running",
-                    expected_generation=created.generation,
-                )
+            assert stale.get_run(created.run_id).task_plan_sha256 == created.task_plan_sha256
             assert stale.tasks(created.run_id) == first.tasks(created.run_id)
+        with pytest.raises(sqlite3.IntegrityError, match="task plan is immutable"):
+            first._connection.execute(
+                """
+                INSERT INTO tasks(
+                    run_id, article_id, phase, status, attempts, generation,
+                    blocked_by_json, detail, candidate_oid, integrated_oid
+                ) VALUES (?, ?, 'proof', 'pending', 0, 0, '[]', '', NULL, NULL)
+                """,
+                (created.run_id, _ARTICLE_DEPENDENCY),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="task plan is immutable"):
+            first._connection.execute(
+                "DELETE FROM tasks WHERE run_id = ? AND article_id = ? AND phase = ?",
+                (created.run_id, _ARTICLE_A, "statement"),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            first._connection.execute(
+                "UPDATE runs SET task_count = 3 WHERE run_id = ?", (created.run_id,)
+            )
 
 
-def test_add_tasks_rejects_an_empty_batch_without_advancing_generation(tmp_path: Path) -> None:
+def test_empty_task_plan_is_explicit_and_survives_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "run.sqlite3"
     config = _config()
-    with RunLedger(tmp_path / "run.sqlite3") as ledger:
-        created = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
-        with pytest.raises(LedgerError, match="at least one task"):
-            ledger.add_tasks(created.run_id, [], expected_generation=created.generation)
-        assert ledger.get_run(created.run_id) == created
+    with RunLedger(path) as ledger:
+        created = ledger.create_run(
+            _identity(tmp_path, config), config, tasks=[], run_id="run-1"
+        )
+        assert created.task_count == 0
+        assert created.task_plan_sha256 == _task_plan_digest([])
+        assert ledger.tasks(created.run_id) == ()
+        with pytest.raises(sqlite3.IntegrityError, match="task plan is immutable"):
+            ledger._connection.execute(
+                """
+                INSERT INTO tasks(
+                    run_id, article_id, phase, status, attempts, generation,
+                    blocked_by_json, detail, candidate_oid, integrated_oid
+                ) VALUES (?, ?, 'statement', 'pending', 0, 0, '[]', '', NULL, NULL)
+                """,
+                (created.run_id, _ARTICLE_A),
+            )
+    with RunLedger(path) as reopened:
+        assert reopened.get_run("run-1") == created
+        assert reopened.tasks("run-1") == ()
 
 
 def test_complete_requires_every_persisted_task_to_be_integrated(tmp_path: Path) -> None:
@@ -400,33 +483,36 @@ def test_complete_requires_every_persisted_task_to_be_integrated(tmp_path: Path)
 def test_tasks_and_attempt_claims_require_durable_article_ids(tmp_path: Path) -> None:
     config = _config()
     with RunLedger(tmp_path / "run.sqlite3") as ledger:
-        run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
         with pytest.raises(LedgerError, match="durable article_id"):
-            ledger.add_tasks(
-                run.run_id,
-                [("chapter/path-derived-id", "proof")],
-                expected_generation=run.generation,
+            ledger.create_run(
+                _identity(tmp_path, config),
+                config,
+                tasks=[("chapter/path-derived-id", "proof")],
+                run_id="bad-run",
             )
-        task = ledger.add_tasks(
-            run.run_id,
-            [(_ARTICLE_A, "proof")],
-            expected_generation=run.generation,
-        )[0]
+        assert ledger.list_runs() == ()
+        run = ledger.create_run(
+            _identity(tmp_path, config),
+            config,
+            tasks=[(_ARTICLE_A, "proof")],
+            run_id="run-1",
+        )
+        task = ledger.tasks(run.run_id)[0]
         assert task.article_id == task.node_id == _ARTICLE_A
-        run = ledger.get_run(run.run_id)
-        ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
+        run = ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
         with pytest.raises(LedgerError, match="not anchored"):
             ledger.begin_attempt(
                 run.run_id,
                 task.article_id,
                 task.phase,
+                expected_generation=run.generation,
                 expected_task_generation=task.generation,
                 worktree_path=tmp_path / "attempt",
                 branch=f"autoform/run-1/{task.article_id}/1",
                 base_oid=run.current_oid,
                 backend=config.backend,
                 claim_key="author/path-derived-id",
-                claim_token={"claim_id": "claim-1", "ref_oid": "8" * 40},
+                claim_token=_claim_token(_ARTICLE_A),
             )
         assert ledger.list_attempts(run.run_id) == ()
 
@@ -449,7 +535,9 @@ def test_resume_clears_stop_and_is_idempotent(tmp_path: Path) -> None:
         )
 
         resumed = ledger.resume_run(run_id, expected_generation=stopped.generation)
-        repeated = ledger.resume_run(run_id, expected_generation=stopped.generation)
+        with pytest.raises(GenerationConflict):
+            ledger.resume_run(run_id, expected_generation=stopped.generation)
+        repeated = ledger.resume_run(run_id, expected_generation=resumed.generation)
         assert resumed == repeated
         assert resumed.status == "running"
         assert not resumed.stop_requested
@@ -489,10 +577,27 @@ def test_task_attempt_recovery_is_explicit_and_idempotent(tmp_path: Path) -> Non
         assert ledger.recover_interrupted(run_id) == ()
 
         retry = _begin(ledger, run_id, tmp_path, attempt_id="attempt-2")
-        result = _finish(ledger, retry.attempt_id, "retrying", detail="backend unavailable")
+        retry_task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        run_generation = ledger.get_run(run_id).generation
+        result = ledger.finish_attempt(
+            retry.attempt_id,
+            "retrying",
+            expected_generation=run_generation,
+            expected_task_generation=retry_task.generation,
+            detail="backend unavailable",
+        )
         assert result.status == "retrying"
         assert result.finished_ns is not None
         assert ledger.tasks(run_id)[0].attempts == 2
+        with pytest.raises(GenerationConflict, match="task"):
+            ledger.finish_attempt(
+                retry.attempt_id,
+                "retrying",
+                expected_generation=run_generation,
+                expected_task_generation=retry_task.generation,
+                detail="backend unavailable",
+            )
+        assert _finish(ledger, retry.attempt_id, "retrying", detail="backend unavailable") == result
         with pytest.raises(InvalidTransition):
             _finish(ledger, retry.attempt_id, "failed", detail="different result")
     finally:
@@ -518,6 +623,91 @@ def test_recovery_inspection_is_read_only_and_keeps_running_attempt_evidence(tmp
         assert ledger.events(run_id) == before_events
     finally:
         ledger.close()
+
+
+def test_attempt_claim_token_is_typed_canonical_and_durable(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    path = ledger.path
+    try:
+        token = _claim_token(_ARTICLE_A)
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        with pytest.raises(LedgerError, match="ArticleClaimToken"):
+            ledger.begin_attempt(
+                run_id,
+                task.article_id,
+                task.phase,
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=task.generation,
+                worktree_path=tmp_path / "untyped",
+                branch=f"autoform/{run_id}/{task.article_id}/1",
+                base_oid=ledger.get_run(run_id).current_oid,
+                backend="codex",
+                claim_key=author_claim_key(task.article_id),
+                claim_token=token.as_dict(),  # type: ignore[arg-type]
+            )
+        with pytest.raises(LedgerError, match="does not match"):
+            ledger.begin_attempt(
+                run_id,
+                task.article_id,
+                task.phase,
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=task.generation,
+                worktree_path=tmp_path / "mismatched",
+                branch=f"autoform/{run_id}/{task.article_id}/1",
+                base_oid=ledger.get_run(run_id).current_oid,
+                backend="codex",
+                claim_key=author_claim_key(task.article_id),
+                claim_token=_claim_token(_ARTICLE_B),
+            )
+        attempt = ledger.begin_attempt(
+            run_id,
+            task.article_id,
+            task.phase,
+            expected_generation=ledger.get_run(run_id).generation,
+            expected_task_generation=task.generation,
+            worktree_path=tmp_path / "typed",
+            branch=f"autoform/{run_id}/{task.article_id}/1",
+            base_oid=ledger.get_run(run_id).current_oid,
+            backend="CODEX",
+            claim_key=author_claim_key(task.article_id),
+            claim_token=token,
+            attempt_id="attempt-typed",
+        )
+        assert attempt.claim_token == token
+        assert attempt.backend == "codex"
+        renewed_observation = replace(token, observed_ref_oid="9" * 40)
+        assert renewed_observation.lease_id == token.lease_id
+        assert renewed_observation.claim_ref == token.claim_ref
+        assert renewed_observation.observed_ref_oid != token.observed_ref_oid
+        stored = ledger._connection.execute(
+            "SELECT claim_token_json FROM attempts WHERE attempt_id = ?",
+            (attempt.attempt_id,),
+        ).fetchone()[0]
+        assert stored == json.dumps(token.as_dict(), sort_keys=True, separators=(",", ":"))
+    finally:
+        ledger.close()
+
+    with RunLedger(path) as reopened:
+        assert reopened.get_attempt("attempt-typed").claim_token == token
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    (
+        ({"claim_key": "author/wrong"}, "claim key"),
+        ({"claim_ref": "refs/autoform/claims/author/wrong"}, "claim ref"),
+        ({"lease_id": "short"}, "lease id"),
+        ({"object_format": "sha256"}, "object format"),
+        ({"object_format": "sha512"}, "object format"),
+        ({"schema_version": 2}, "claim token schema"),
+    ),
+)
+def test_article_claim_token_rejects_incomplete_recovery_identity(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(LedgerError, match=message):
+        replace(_claim_token(_ARTICLE_A), **changes)
 
 
 def test_crash_recovery_records_inspected_candidate_without_destroying_it(tmp_path: Path) -> None:
@@ -661,6 +851,7 @@ def test_active_tasks_have_cas_safe_recovery_transitions(
                 queue_item_id="queue-1",
             )
         task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        run_generation = ledger.get_run(run_id).generation
         assert task.status == source
 
         changed = ledger.transition_task(
@@ -669,6 +860,7 @@ def test_active_tasks_have_cas_safe_recovery_transitions(
             task.phase,
             target,
             expected_generation=task.generation,
+            expected_run_generation=run_generation,
             detail=f"recover {source}",
             blocked_by=blockers,
         )
@@ -696,13 +888,25 @@ def test_active_tasks_have_cas_safe_recovery_transitions(
             assert ledger.get_attempt(attempt.attempt_id).status == "candidate"
 
         before_events = ledger.events(run_id)
-        assert (
+        with pytest.raises(GenerationConflict):
             ledger.transition_task(
                 run_id,
                 task.node_id,
                 task.phase,
                 target,
                 expected_generation=task.generation,
+                expected_run_generation=run_generation,
+                detail=f"recover {source}",
+                blocked_by=blockers,
+            )
+        assert (
+            ledger.transition_task(
+                run_id,
+                task.node_id,
+                task.phase,
+                target,
+                expected_generation=changed.generation,
+                expected_run_generation=run_generation,
                 detail=f"recover {source}",
                 blocked_by=blockers,
             )
@@ -716,8 +920,83 @@ def test_active_tasks_have_cas_safe_recovery_transitions(
                 task.phase,
                 "stopped" if target != "stopped" else "retrying",
                 expected_generation=task.generation,
+                expected_run_generation=run_generation,
                 detail="stale controller",
             )
+    finally:
+        ledger.close()
+
+
+def test_rejected_candidate_retries_then_fails_at_max_attempts_with_evidence(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        run_generation = ledger.get_run(run_id).generation
+        candidate_oids = ("9" * 40, "a" * 40, "b" * 40)
+        for number, candidate_oid in enumerate(candidate_oids, start=1):
+            attempt = _begin(ledger, run_id, tmp_path, attempt_id=f"attempt-{number}")
+            _finish(ledger, attempt.attempt_id, "candidate", candidate_oid=candidate_oid)
+            evidence = ledger.put_artifact("review", f"candidate {number} rejected\n".encode())
+            _record_gate(
+                ledger,
+                attempt.attempt_id,
+                "independent-review",
+                False,
+                evidence_sha256=evidence,
+            )
+            candidate = ledger.get_task(run_id, _ARTICLE_A, "statement")
+            if number < 3:
+                with pytest.raises(InvalidTransition, match="retry is required"):
+                    ledger.transition_task(
+                        run_id,
+                        candidate.article_id,
+                        candidate.phase,
+                        "failed",
+                        expected_generation=candidate.generation,
+                        expected_run_generation=run_generation,
+                        detail="candidate rejected",
+                    )
+                ledger.transition_task(
+                    run_id,
+                    candidate.article_id,
+                    candidate.phase,
+                    "retrying",
+                    expected_generation=candidate.generation,
+                    expected_run_generation=run_generation,
+                    detail="candidate rejected",
+                )
+            else:
+                with pytest.raises(InvalidTransition, match="must transition to failed"):
+                    ledger.transition_task(
+                        run_id,
+                        candidate.article_id,
+                        candidate.phase,
+                        "retrying",
+                        expected_generation=candidate.generation,
+                        expected_run_generation=run_generation,
+                        detail="candidate rejected",
+                    )
+                failed = ledger.transition_task(
+                    run_id,
+                    candidate.article_id,
+                    candidate.phase,
+                    "failed",
+                    expected_generation=candidate.generation,
+                    expected_run_generation=run_generation,
+                    detail="candidate rejected after maximum attempts",
+                )
+
+        assert failed.status == "failed"
+        assert failed.attempts == 3
+        assert failed.candidate_oid == candidate_oids[-1]
+        attempts = ledger.list_attempts(run_id)
+        assert [attempt.status for attempt in attempts] == ["candidate"] * 3
+        assert [attempt.candidate_oid for attempt in attempts] == list(candidate_oids)
+        assert all(
+            not ledger.get_gate(attempt.attempt_id, "independent-review").passed
+            for attempt in attempts
+        )
+        with pytest.raises(InvalidTransition, match="not ready"):
+            _begin(ledger, run_id, tmp_path, attempt_id="attempt-4")
     finally:
         ledger.close()
 
@@ -726,11 +1005,56 @@ def test_stop_request_turns_interrupted_work_into_stopped(tmp_path: Path) -> Non
     ledger, run_id = _running_ledger(tmp_path)
     try:
         attempt = _begin(ledger, run_id, tmp_path)
-        ledger.request_stop(run_id, expected_generation=ledger.get_run(run_id).generation)
+        stale_run = ledger.get_run(run_id)
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        stopped = ledger.request_stop(run_id, expected_generation=stale_run.generation)
+
+        with pytest.raises(GenerationConflict, match="run"):
+            ledger.transition_task(
+                run_id,
+                task.article_id,
+                task.phase,
+                "stopped",
+                expected_generation=task.generation,
+                expected_run_generation=stale_run.generation,
+                detail="stale stop recovery",
+            )
+        assert ledger.get_run(run_id) == stopped
+        assert ledger.get_task(run_id, _ARTICLE_A, "statement") == task
 
         assert ledger.recover_interrupted(run_id) == (attempt.attempt_id,)
         _recover_attempt(ledger, attempt.attempt_id, "stopped", detail="operator stop")
         assert ledger.tasks(run_id)[0].status == "stopped"
+    finally:
+        ledger.close()
+
+
+def test_begin_attempt_rejects_a_stale_parent_run_generation(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        stale_run = ledger.get_run(run_id)
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        blocked = ledger.transition_run(
+            run_id,
+            "blocked",
+            expected_generation=stale_run.generation,
+            detail="operator review",
+        )
+        with pytest.raises(GenerationConflict, match="run"):
+            ledger.begin_attempt(
+                run_id,
+                task.article_id,
+                task.phase,
+                expected_generation=stale_run.generation,
+                expected_task_generation=task.generation,
+                worktree_path=tmp_path / "stale-attempt",
+                branch=f"autoform/{run_id}/{task.article_id}/1",
+                base_oid=blocked.current_oid,
+                backend="codex",
+                claim_key=author_claim_key(task.article_id),
+                claim_token=_claim_token(task.article_id),
+            )
+        assert ledger.list_attempts(run_id) == ()
     finally:
         ledger.close()
 
@@ -835,12 +1159,7 @@ def test_candidate_requires_all_gates_before_queue_and_integration(tmp_path: Pat
                 evidence_sha256=ledger.put_artifact("gate", b"source review passed\n"),
             )
 
-        with pytest.raises(InvalidTransition, match="cannot add tasks"):
-            ledger.add_tasks(
-                run_id,
-                [(_ARTICLE_B, "proof")],
-                expected_generation=ledger.get_run(run_id).generation,
-            )
+        assert ledger.get_run(run_id).task_count == 1
     finally:
         ledger.close()
 
@@ -915,6 +1234,7 @@ def test_old_attempt_cannot_enqueue_after_a_retry_rebinds_the_task(tmp_path: Pat
             "statement",
             "retrying",
             expected_generation=old_candidate_task.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
             detail="retry after review",
         )
         new_attempt = _begin(ledger, run_id, tmp_path, attempt_id="attempt-new")
@@ -953,25 +1273,26 @@ def test_candidate_can_be_queued_and_integrated(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "second/run.sqlite3", clock_ns=iter(range(10_000, 20_000)).__next__)
     try:
         config = _config()
-        run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-2")
-        second_task = ledger.add_tasks(
-            run.run_id,
-            [(_ARTICLE_B, "proof")],
-            expected_generation=run.generation,
-        )[0]
-        run = ledger.get_run(run.run_id)
+        run = ledger.create_run(
+            _identity(tmp_path, config),
+            config,
+            tasks=[(_ARTICLE_B, "proof")],
+            run_id="run-2",
+        )
+        second_task = ledger.tasks(run.run_id)[0]
         ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
         second = ledger.begin_attempt(
             run.run_id,
             second_task.node_id,
             second_task.phase,
+            expected_generation=ledger.get_run(run.run_id).generation,
             expected_task_generation=second_task.generation,
             worktree_path=tmp_path / "worktree-2",
             branch=f"autoform/run-2/{_ARTICLE_B}/1",
             base_oid="1" * 40,
             backend="codex",
             claim_key=author_claim_key(_ARTICLE_B),
-            claim_token={"claim_id": "claim-2", "ref_oid": "8" * 40},
+            claim_token=_claim_token(_ARTICLE_B),
             attempt_id="attempt-2",
         )
         _finish(ledger, second.attempt_id, "candidate", candidate_oid="c" * 40)
@@ -1005,6 +1326,7 @@ def test_candidate_can_be_queued_and_integrated(tmp_path: Path) -> None:
             item,
             "uncertain",
             expected_generation=queued_item.generation,
+            expected_run_generation=before_integration.generation,
             detail="publication result was not observed",
         )
         with pytest.raises(GenerationConflict, match="merge item"):
@@ -1018,6 +1340,7 @@ def test_candidate_can_be_queued_and_integrated(tmp_path: Path) -> None:
             item,
             "queued",
             expected_generation=uncertain.generation,
+            expected_run_generation=before_integration.generation,
             detail="remote ref still names the candidate",
         )
         ledger.mark_integrated(
@@ -1052,13 +1375,12 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
     ledger = RunLedger(tmp_path / "run.sqlite3", clock_ns=iter(range(20_000)).__next__)
     try:
         config = _config()
-        created = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
-        ledger.add_tasks(
-            created.run_id,
-            [(_ARTICLE_A, "proof"), (_ARTICLE_B, "proof")],
-            expected_generation=created.generation,
+        created = ledger.create_run(
+            _identity(tmp_path, config),
+            config,
+            tasks=[(_ARTICLE_A, "proof"), (_ARTICLE_B, "proof")],
+            run_id="run-1",
         )
-        created = ledger.get_run(created.run_id)
         running = ledger.transition_run(
             created.run_id,
             "running",
@@ -1087,14 +1409,24 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
             first.queue_item_id,
             "publishing",
             expected_generation=first.generation,
+            expected_run_generation=running.generation,
             detail="remote CAS started",
         )
         before_replay_events = ledger.events(created.run_id)
-        assert (
+        with pytest.raises(GenerationConflict):
             ledger.transition_merge_item(
                 first.queue_item_id,
                 "publishing",
                 expected_generation=first.generation,
+                expected_run_generation=running.generation,
+                detail="remote CAS started",
+            )
+        assert (
+            ledger.transition_merge_item(
+                first.queue_item_id,
+                "publishing",
+                expected_generation=publishing.generation,
+                expected_run_generation=running.generation,
                 detail="remote CAS started",
             )
             == publishing
@@ -1105,12 +1437,14 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
                 first.queue_item_id,
                 "queued",
                 expected_generation=first.generation,
+                expected_run_generation=running.generation,
                 detail="stale recovery result",
             )
         recovered = ledger.record_merge_recovery(
             first.queue_item_id,
             "queued",
             expected_generation=publishing.generation,
+            expected_run_generation=running.generation,
             detail="remote queue ref verified",
         )
 
@@ -1137,6 +1471,13 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
 
         replay_events = ledger.events(created.run_id)
         integrated_item = ledger.get_merge_item(first.queue_item_id)
+        with pytest.raises(GenerationConflict):
+            ledger.mark_integrated(
+                first.queue_item_id,
+                integrated_oid="9" * 40,
+                expected_generation=running.generation,
+                expected_item_generation=recovered.generation,
+            )
         assert (
             ledger.mark_integrated(
                 first.queue_item_id,
@@ -1149,6 +1490,14 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
         assert ledger.events(created.run_id) == replay_events
 
         second = ledger.get_merge_item("queue-b")
+        with pytest.raises(GenerationConflict, match="run"):
+            ledger.transition_merge_item(
+                second.queue_item_id,
+                "publishing",
+                expected_generation=second.generation,
+                expected_run_generation=running.generation,
+                detail="stale parent generation",
+            )
         with pytest.raises(GenerationConflict):
             ledger.mark_integrated(
                 second.queue_item_id,
@@ -1170,30 +1519,20 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
         ledger.close()
 
 
-def test_failed_multi_task_insert_rolls_back_rows_and_events(tmp_path: Path) -> None:
+def test_invalid_task_plan_does_not_create_partial_rows_or_events(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "run.sqlite3", clock_ns=iter(range(100)).__next__)
     config = _config()
-    created = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
-    run_id = created.run_id
-    ledger.add_tasks(
-        run_id,
-        [(_ARTICLE_A, "statement")],
-        expected_generation=created.generation,
-    )
     try:
-        before = ledger.events(run_id)
-        generation = ledger.get_run(run_id).generation
         with pytest.raises(LedgerError, match="duplicate task"):
-            ledger.add_tasks(
-                run_id,
-                [(_ARTICLE_B, "proof"), (_ARTICLE_A, "statement")],
-                expected_generation=generation,
+            ledger.create_run(
+                _identity(tmp_path, config),
+                config,
+                tasks=[(_ARTICLE_A, "statement"), (_ARTICLE_A, "statement")],
+                run_id="run-1",
             )
-        assert [(task.node_id, task.phase) for task in ledger.tasks(run_id)] == [
-            (_ARTICLE_A, "statement")
-        ]
-        assert ledger.get_run(run_id).generation == generation
-        assert ledger.events(run_id) == before
+        assert ledger.list_runs() == ()
+        assert ledger._connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert ledger._connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
     finally:
         ledger.close()
 
@@ -1306,7 +1645,9 @@ def test_stale_process_cannot_advance_run_generation(tmp_path: Path) -> None:
     path = tmp_path / "state/run.sqlite3"
     with RunLedger(path) as first:
         config = _config()
-        created = first.create_run(_identity(tmp_path, config), config, run_id="run-1")
+        created = first.create_run(
+            _identity(tmp_path, config), config, tasks=[], run_id="run-1"
+        )
         with RunLedger(path) as second:
             advanced = first.transition_run(
                 created.run_id,
@@ -1320,6 +1661,27 @@ def test_stale_process_cannot_advance_run_generation(tmp_path: Path) -> None:
                     expected_generation=created.generation,
                 )
             assert second.get_run(created.run_id) == advanced
+
+
+def test_one_hundred_concurrent_constructors_initialize_one_fresh_ledger(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    barrier = threading.Barrier(100)
+
+    def construct(_: int) -> tuple[str, str]:
+        barrier.wait()
+        with RunLedger(path) as ledger:
+            version = ledger._connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            mode = ledger._connection.execute("PRAGMA journal_mode").fetchone()[0]
+            return version, mode
+
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        results = tuple(executor.map(construct, range(100)))
+
+    assert results == ((str(ledger_module.LEDGER_SCHEMA_VERSION), "wal"),) * 100
+    with RunLedger(path) as reopened:
+        assert reopened.list_runs() == ()
 
 
 @pytest.mark.parametrize(
@@ -1405,7 +1767,7 @@ def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Pat
             f"autoform/run-1/{_ARTICLE_A}/1",
             config.start_oid,
             author_claim_key(_ARTICLE_A),
-            '{"claim_id":"claim-1"}',
+            json.dumps(_claim_token(_ARTICLE_A).as_dict(), sort_keys=True, separators=(",", ":")),
         ),
     )
     connection.execute(
@@ -1423,20 +1785,117 @@ def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Pat
         assert migrated.config.reviewer_backend == "claude"
         assert migrated.config.max_attempts == 3
         assert migrated.config.timeout_seconds == 1800.0
+        assert migrated.task_count == 1
+        assert migrated.task_plan_sha256 == _task_plan_digest([(_ARTICLE_A, "statement")])
         assert ledger.get_task("run-1", _ARTICLE_A, "statement").article_id == _ARTICLE_A
-        assert ledger.get_attempt("attempt-1").claim_key == author_claim_key(_ARTICLE_A)
+        assert ledger.get_attempt("attempt-1").claim_token == _claim_token(_ARTICLE_A)
         migration_event = ledger.events("run-1")[-1]
         assert migration_event.kind == "ledger.migrated"
         assert migration_event.payload["status"] == "failed"
         assert ledger._connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == "3"
         assert "article_id" in {
             row["name"] for row in ledger._connection.execute("PRAGMA table_info(tasks)")
         }
 
     with RunLedger(path) as reopened:
         assert reopened.get_run("run-1").config == migrated.config
+
+
+def test_v2_ledger_migration_seals_even_a_zero_row_task_plan(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    path.parent.mkdir()
+    config = _config()
+    identity = _identity(tmp_path, config)
+    legacy_config = config.as_dict()
+    legacy_config["backend"] = "CODEX"
+    legacy_config["reviewer_backend"] = "CLAUDE"
+    config_json = json.dumps(legacy_config, sort_keys=True, separators=(",", ":"))
+    legacy_config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
+    legacy_identity = identity.as_dict()
+    legacy_identity["config_sha256"] = legacy_config_sha256
+    identity_json = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    connection = sqlite3.connect(path)
+    ledger_module._execute_schema(connection, ledger_module._SCHEMA_V2)
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '2')")
+    connection.execute(
+        """
+        INSERT INTO runs VALUES (?, ?, ?, ?, ?, 'created', 0, ?, 0, '', 1, 1)
+        """,
+        (
+            "run-1",
+            identity_json,
+            hashlib.sha256(identity_json.encode()).hexdigest(),
+            config_json,
+            legacy_config_sha256,
+            config.start_oid,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    with RunLedger(path) as ledger:
+        migrated = ledger.get_run("run-1")
+        assert migrated.status == "failed"
+        assert "complete task plan was not atomically persisted" in migrated.detail
+        assert migrated.config.backend == "codex"
+        assert migrated.config.reviewer_backend == "claude"
+        assert migrated.task_count == 0
+        assert migrated.task_plan_sha256 == _task_plan_digest([])
+        assert ledger.tasks("run-1") == ()
+        assert ledger.events("run-1")[-1].payload["from_schema"] == 2
+        with pytest.raises(sqlite3.IntegrityError, match="task plan is immutable"):
+            ledger._connection.execute(
+                """
+                INSERT INTO tasks(
+                    run_id, article_id, phase, status, attempts, generation,
+                    blocked_by_json, detail, candidate_oid, integrated_oid
+                ) VALUES ('run-1', ?, 'proof', 'pending', 0, 0, '[]', '', NULL, NULL)
+                """,
+                (_ARTICLE_A,),
+            )
+
+
+def test_malformed_v2_config_is_wrapped_and_migration_rolls_back(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    path.parent.mkdir()
+    config = _config()
+    malformed_config = config.as_dict()
+    malformed_config["unexpected"] = True
+    config_json = json.dumps(malformed_config, sort_keys=True, separators=(",", ":"))
+    config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
+    identity_values = _identity(tmp_path, config).as_dict()
+    identity_values["config_sha256"] = config_sha256
+    identity_json = json.dumps(identity_values, sort_keys=True, separators=(",", ":"))
+    connection = sqlite3.connect(path)
+    ledger_module._execute_schema(connection, ledger_module._SCHEMA_V2)
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '2')")
+    connection.execute(
+        """
+        INSERT INTO runs VALUES (?, ?, ?, ?, ?, 'created', 0, ?, 0, '', 1, 1)
+        """,
+        (
+            "run-1",
+            identity_json,
+            hashlib.sha256(identity_json.encode()).hexdigest(),
+            config_json,
+            config_sha256,
+            config.start_oid,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(LedgerError, match="v2 run identity or config is invalid"):
+        RunLedger(path)
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "2"
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -1448,15 +1907,14 @@ def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Pat
         "missing-foreign-key",
     ),
 )
-def test_full_v2_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None:
+def test_full_v3_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None:
     path = tmp_path / f"{mutation}.sqlite3"
     connection = sqlite3.connect(path)
     script = ledger_module._SCHEMA
     if mutation == "missing-trigger":
         script = script.replace(
-            "CREATE TRIGGER IF NOT EXISTS runs_identity_no_update\n"
-            "BEFORE UPDATE OF identity_json, identity_sha256, config_json, config_sha256 ON runs\n"
-            "BEGIN SELECT RAISE(ABORT, 'run identity and config are immutable'); END;",
+            "CREATE TRIGGER IF NOT EXISTS tasks_plan_no_delete BEFORE DELETE ON tasks\n"
+            "BEGIN SELECT RAISE(ABORT, 'run task plan is immutable'); END;",
             "",
         )
     elif mutation == "missing-column":
@@ -1470,7 +1928,7 @@ def test_full_v2_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None
             1,
         )
     ledger_module._execute_schema(connection, script)
-    connection.execute("INSERT INTO metadata VALUES ('schema_version', '2')")
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '3')")
     connection.commit()
     connection.close()
 

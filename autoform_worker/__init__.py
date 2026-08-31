@@ -2,6 +2,8 @@
 
 from .executor import AdapterFactory, ProverExecutor, backend_factory
 from .ledger import (
+    ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION,
+    ArticleClaimToken,
     AttemptRecord,
     CoordinatorLock,
     EventRecord,
@@ -56,11 +58,13 @@ from .scheduler import (
 )
 
 __all__ = [
+    "ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION",
     "AdapterFactory",
     "AttemptWorktrees",
     "AttemptOutcome",
     "AttemptResult",
     "AttemptRecord",
+    "ArticleClaimToken",
     "CancellationSignal",
     "CandidateReviewRequest",
     "CandidateReviewResult",
