@@ -4534,6 +4534,7 @@ def test_local_remote_replacement_is_rejected_before_any_ref_mutation(
         content="candidate\n",
     )
     queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
     original = remote.with_name("original.git")
     remote.rename(original)
     _git("init", "--bare", "--quiet", str(remote))
@@ -4545,7 +4546,7 @@ def test_local_remote_replacement_is_rejected_before_any_ref_mutation(
             queue_ref="refs/autoform/queue/queue-1",
             expected_target_oid=base,
             candidate_oid=candidate,
-            article_claim=_article_claim(queue),
+            article_claim=article_claim,
         )
     assert _git("for-each-ref", "--format=%(refname)", cwd=remote) == ""
 
@@ -4670,6 +4671,18 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
 
         def acquire(self, *_args: object, **_kwargs: object) -> bool:
             return True
+
+        def holds(self, _key: str) -> bool:
+            return True
+
+        def heartbeat(
+            self,
+            key: str,
+            *,
+            interval: float = 300,
+            ttl: int | float = 600,
+        ) -> _StaticHeartbeat:
+            return _StaticHeartbeat(self, key)  # type: ignore[arg-type]
 
         def held_lease_id(self, _key: str) -> str:
             raise RuntimeError("receipt unavailable")
