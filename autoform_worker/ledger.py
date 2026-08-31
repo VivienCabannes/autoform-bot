@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
     fcntl = None  # type: ignore[assignment]
 
 
-LEDGER_SCHEMA_VERSION = 3
+LEDGER_SCHEMA_VERSION = 4
 RUN_CONFIG_SCHEMA_VERSION = 1
 ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION = 1
 _BACKEND_IDS = frozenset({"claude", "codex", "muse"})
@@ -47,9 +47,21 @@ _ATTEMPT_OUTCOMES = frozenset({"candidate", "retrying", "failed", "stopped"})
 _TASK_RECOVERY_STATUSES = frozenset({"retrying", "blocked", "failed", "stopped"})
 _TASK_RECOVERY_SOURCES = frozenset({"running", "candidate", "queued"})
 _MERGE_ITEM_STATUSES = frozenset(
-    {"pending", "prepared", "queueing", "queued", "publishing", "integrated", "stale", "uncertain", "failed"}
+    {
+        "pending",
+        "prepared",
+        "queueing",
+        "queued",
+        "publishing",
+        "integrated",
+        "stale",
+        "uncertain",
+        "failed",
+    }
 )
-_MERGE_ITEM_TERMINAL_STATUSES = frozenset({"integrated", "stale", "failed"})
+_MERGE_ITEM_TERMINAL_STATUSES = frozenset({"integrated", "failed"})
+_MERGE_REPLAY_STATUSES = frozenset({"prepared", "publishing", "integrated", "stale", "uncertain", "failed"})
+_MERGE_REPLAY_TERMINAL_STATUSES = frozenset({"integrated", "stale", "uncertain", "failed"})
 _PHASES = frozenset({"statement", "proof"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$")
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$|^0{40}$")
@@ -287,6 +299,49 @@ class MergeItemRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class MergeReplayRecord:
+    """One immutable replay candidate and its append-only publication lifecycle."""
+
+    replay_id: str
+    queue_item_id: str
+    ordinal: int
+    target_oid: str
+    candidate_oid: str
+    gate_evidence_sha256: str
+    review_evidence_sha256: str
+    status: str
+    generation: int
+    publication_evidence_sha256: str | None
+    detail: str
+    created_ns: int
+    updated_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class TargetAdoptionRecord:
+    """A verified external first-parent advance accepted by one run."""
+
+    adoption_id: str
+    run_id: str
+    ordinal: int
+    previous_oid: str
+    target_oid: str
+    evidence_sha256: str
+    created_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalIntegrationRecord:
+    """One task transition proved by a verified target-head adoption."""
+
+    adoption_id: str
+    run_id: str
+    article_id: str
+    phase: str
+    integrated_oid: str
+
+
+@dataclass(frozen=True, slots=True)
 class EventRecord:
     sequence: int
     run_id: str
@@ -304,6 +359,9 @@ class RecoverySnapshot:
     attempts: tuple[AttemptRecord, ...]
     gates: tuple[GateRecord, ...]
     merge_items: tuple[MergeItemRecord, ...]
+    merge_replays: tuple[MergeReplayRecord, ...]
+    target_adoptions: tuple[TargetAdoptionRecord, ...]
+    external_integrations: tuple[ExternalIntegrationRecord, ...]
 
     @property
     def running_attempts(self) -> tuple[AttemptRecord, ...]:
@@ -312,6 +370,12 @@ class RecoverySnapshot:
     @property
     def unresolved_merge_items(self) -> tuple[MergeItemRecord, ...]:
         return tuple(item for item in self.merge_items if item.status not in _MERGE_ITEM_TERMINAL_STATUSES)
+
+    @property
+    def unresolved_merge_replays(self) -> tuple[MergeReplayRecord, ...]:
+        return tuple(
+            replay for replay in self.merge_replays if replay.status not in _MERGE_REPLAY_TERMINAL_STATUSES
+        )
 
 
 class CoordinatorLock:
@@ -877,7 +941,13 @@ class RunLedger:
             self._append_event(
                 run_id,
                 "attempt.started",
-                {"attempt_id": identifier, "article_id": article_id, "phase": phase, "number": number},
+                {
+                    "article_id": article_id,
+                    "attempt_id": identifier,
+                    "base_oid": base_oid,
+                    "number": number,
+                    "phase": phase,
+                },
                 now,
             )
         return self.get_attempt(identifier)
@@ -1243,7 +1313,13 @@ class RunLedger:
             self._append_event(
                 attempt["run_id"],
                 "candidate.queued",
-                {"attempt_id": attempt_id, "queue_item_id": identifier, "queue_ref": queue_ref},
+                {
+                    "attempt_id": attempt_id,
+                    "candidate_oid": candidate_oid,
+                    "expected_target_oid": expected_target_oid,
+                    "queue_item_id": identifier,
+                    "queue_ref": queue_ref,
+                },
                 now,
             )
         return identifier
@@ -1263,6 +1339,558 @@ class RunLedger:
             (run_id,),
         ).fetchall()
         return tuple(_merge_item_record(row) for row in rows)
+
+    def prepare_merge_replay(
+        self,
+        queue_item_id: str,
+        *,
+        target_oid: str,
+        candidate_oid: str,
+        gate_evidence_sha256: str,
+        review_evidence_sha256: str,
+        expected_run_generation: int,
+        expected_item_generation: int,
+        replay_id: str | None = None,
+    ) -> MergeReplayRecord:
+        """Record a fresh, admitted replay without rewriting the original attempt."""
+
+        _validate_oid(target_oid)
+        _validate_oid(candidate_oid)
+        _validate_sha256(gate_evidence_sha256, "replay gate evidence")
+        _validate_sha256(review_evidence_sha256, "replay review evidence")
+        if gate_evidence_sha256 == review_evidence_sha256:
+            raise InvalidTransition("replay gate and review evidence must be distinct")
+        identifier = replay_id or uuid.uuid4().hex
+        _validate_identifier("replay id", identifier)
+        self.read_artifact(gate_evidence_sha256)
+        self.read_artifact(review_evidence_sha256)
+        now = self._clock_ns()
+        with self._transaction():
+            item = self._merge_item_row(queue_item_id)
+            run = self._active_run_row(item["run_id"], expected_run_generation)
+            if item["generation"] != expected_item_generation:
+                raise GenerationConflict(
+                    f"merge item {queue_item_id} is at generation {item['generation']}, "
+                    f"expected {expected_item_generation}"
+                )
+            existing = self._connection.execute(
+                "SELECT * FROM merge_replays WHERE replay_id = ?", (identifier,)
+            ).fetchone()
+            if existing is not None:
+                replay = _merge_replay_record(existing)
+                expected = (
+                    queue_item_id,
+                    target_oid,
+                    candidate_oid,
+                    gate_evidence_sha256,
+                    review_evidence_sha256,
+                )
+                observed = (
+                    replay.queue_item_id,
+                    replay.target_oid,
+                    replay.candidate_oid,
+                    replay.gate_evidence_sha256,
+                    replay.review_evidence_sha256,
+                )
+                if observed != expected:
+                    raise GenerationConflict(f"replay id already names different evidence: {identifier}")
+                return replay
+            if item["status"] != "stale":
+                raise InvalidTransition("only a stale merge item may prepare a replay")
+            if run["current_oid"] != target_oid:
+                raise GenerationConflict(
+                    f"replay target {target_oid} does not match run head {run['current_oid']}"
+                )
+            if len(target_oid) != len(item["candidate_oid"]) or len(candidate_oid) != len(target_oid):
+                raise InvalidTransition("replay object ids do not match the run object format")
+            if candidate_oid in {target_oid, item["candidate_oid"]}:
+                raise InvalidTransition("replay candidate must be a distinct commit")
+            active = self._connection.execute(
+                """
+                SELECT replay_id FROM merge_replays
+                WHERE queue_item_id = ? AND status NOT IN ('integrated','stale','uncertain','failed')
+                LIMIT 1
+                """,
+                (queue_item_id,),
+            ).fetchone()
+            if active is not None:
+                raise InvalidTransition(f"merge item already has an active replay: {active['replay_id']}")
+            uncertain = self._connection.execute(
+                """
+                SELECT replay_id FROM merge_replays
+                WHERE queue_item_id = ? AND status = 'uncertain' LIMIT 1
+                """,
+                (queue_item_id,),
+            ).fetchone()
+            if uncertain is not None:
+                raise InvalidTransition(
+                    f"merge item has an uncertain replay outcome: {uncertain['replay_id']}"
+                )
+            ordinal = self._connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM merge_replays WHERE queue_item_id = ?",
+                (queue_item_id,),
+            ).fetchone()[0]
+            self._connection.execute(
+                """
+                INSERT INTO merge_replays(
+                    replay_id, queue_item_id, ordinal, target_oid, candidate_oid,
+                    gate_evidence_sha256, review_evidence_sha256, status, generation,
+                    publication_evidence_sha256, detail, created_ns, updated_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', 0, NULL, '', ?, ?)
+                """,
+                (
+                    identifier,
+                    queue_item_id,
+                    ordinal,
+                    target_oid,
+                    candidate_oid,
+                    gate_evidence_sha256,
+                    review_evidence_sha256,
+                    now,
+                    now,
+                ),
+            )
+            self._append_event(
+                item["run_id"],
+                "candidate.replay-prepared",
+                {
+                    "candidate_oid": candidate_oid,
+                    "gate_evidence_sha256": gate_evidence_sha256,
+                    "queue_item_id": queue_item_id,
+                    "replay_id": identifier,
+                    "review_evidence_sha256": review_evidence_sha256,
+                    "target_oid": target_oid,
+                },
+                now,
+            )
+        return self.get_merge_replay(identifier)
+
+    def get_merge_replay(self, replay_id: str) -> MergeReplayRecord:
+        return _merge_replay_record(self._merge_replay_row(replay_id))
+
+    def list_merge_replays(self, queue_item_id: str) -> tuple[MergeReplayRecord, ...]:
+        self._merge_item_row(queue_item_id)
+        rows = self._connection.execute(
+            "SELECT * FROM merge_replays WHERE queue_item_id = ? ORDER BY ordinal",
+            (queue_item_id,),
+        ).fetchall()
+        return tuple(_merge_replay_record(row) for row in rows)
+
+    def transition_merge_replay(
+        self,
+        replay_id: str,
+        status: str,
+        *,
+        expected_generation: int,
+        expected_run_generation: int,
+        detail: str,
+    ) -> MergeReplayRecord:
+        if status not in _MERGE_REPLAY_STATUSES or status == "integrated":
+            raise InvalidTransition(f"invalid replay recovery status: {status}")
+        if not detail.strip():
+            raise InvalidTransition("merge replay transitions require a nonempty detail")
+        now = self._clock_ns()
+        with self._transaction():
+            replay = self._merge_replay_row(replay_id)
+            item = self._merge_item_row(replay["queue_item_id"])
+            run = self._active_run_row(item["run_id"], expected_run_generation)
+            if replay["generation"] != expected_generation:
+                raise GenerationConflict(
+                    f"merge replay {replay_id} is at generation {replay['generation']}, "
+                    f"expected {expected_generation}"
+                )
+            if replay["status"] == status and replay["detail"] == detail:
+                return _merge_replay_record(replay)
+            if replay["status"] in _MERGE_REPLAY_TERMINAL_STATUSES:
+                raise InvalidTransition(f"merge replay is already {replay['status']}")
+            if item["status"] != "stale":
+                raise InvalidTransition("merge replay no longer belongs to a stale merge item")
+            allowed = {
+                "prepared": frozenset({"publishing", "stale", "uncertain", "failed"}),
+                "publishing": frozenset({"stale", "uncertain", "failed"}),
+            }
+            if status not in allowed[replay["status"]]:
+                raise InvalidTransition(f"cannot move merge replay from {replay['status']} to {status}")
+            if status == "publishing" and run["current_oid"] != replay["target_oid"]:
+                raise GenerationConflict(
+                    f"run {item['run_id']} current OID changed from replay base "
+                    f"{replay['target_oid']} to {run['current_oid']}"
+                )
+            cursor = self._connection.execute(
+                """
+                UPDATE merge_replays SET status = ?, detail = ?, generation = generation + 1,
+                    updated_ns = ? WHERE replay_id = ? AND generation = ?
+                """,
+                (status, detail, now, replay_id, expected_generation),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"merge replay changed while updating: {replay_id}")
+            self._append_event(
+                item["run_id"],
+                "merge-replay.transition",
+                {"detail": detail, "from": replay["status"], "replay_id": replay_id, "to": status},
+                now,
+            )
+        return self.get_merge_replay(replay_id)
+
+    def mark_replay_integrated(
+        self,
+        replay_id: str,
+        *,
+        publication_evidence_sha256: str,
+        expected_generation: int,
+        expected_item_generation: int,
+        expected_replay_generation: int,
+    ) -> RunRecord:
+        """Integrate one exact replay while retaining the original candidate identity."""
+
+        _validate_sha256(publication_evidence_sha256, "replay publication evidence")
+        self.read_artifact(publication_evidence_sha256)
+        now = self._clock_ns()
+        with self._transaction():
+            replay = self._merge_replay_row(replay_id)
+            item = self._merge_item_row(replay["queue_item_id"])
+            if publication_evidence_sha256 in {
+                replay["gate_evidence_sha256"],
+                replay["review_evidence_sha256"],
+            }:
+                raise InvalidTransition("replay publication evidence must be distinct from admission evidence")
+            if replay["generation"] != expected_replay_generation:
+                raise GenerationConflict(
+                    f"merge replay {replay_id} is at generation {replay['generation']}, "
+                    f"expected {expected_replay_generation}"
+                )
+            if item["generation"] != expected_item_generation:
+                raise GenerationConflict(
+                    f"merge item {item['queue_item_id']} is at generation {item['generation']}, "
+                    f"expected {expected_item_generation}"
+                )
+            run = self._active_run_row(item["run_id"], expected_generation)
+            if replay["status"] != "publishing":
+                raise InvalidTransition("only a publishing replay may be integrated")
+            if item["status"] != "stale":
+                raise InvalidTransition("replay integration requires its original stale merge item")
+            if run["current_oid"] != replay["target_oid"]:
+                raise GenerationConflict(
+                    f"run {item['run_id']} current OID changed from replay base "
+                    f"{replay['target_oid']} to {run['current_oid']}"
+                )
+            attempt = self._attempt_row(item["attempt_id"])
+            task = self._task_row(attempt["run_id"], attempt["article_id"], attempt["phase"])
+            if (
+                attempt["status"] != "candidate"
+                or attempt["candidate_oid"] != item["candidate_oid"]
+                or attempt["base_oid"] != item["expected_target_oid"]
+                or task["status"] != "queued"
+                or task["candidate_oid"] != item["candidate_oid"]
+                or task["attempts"] != attempt["number"]
+            ):
+                raise GenerationConflict("replayed merge item no longer owns its original candidate task")
+            cursor = self._connection.execute(
+                """
+                UPDATE merge_replays SET status = 'integrated', publication_evidence_sha256 = ?,
+                    detail = 'atomic replay publication verified', generation = generation + 1,
+                    updated_ns = ?
+                WHERE replay_id = ? AND generation = ? AND status = 'publishing'
+                """,
+                (publication_evidence_sha256, now, replay_id, expected_replay_generation),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"merge replay changed while integrating: {replay_id}")
+            cursor = self._connection.execute(
+                """
+                UPDATE merge_items SET status = 'integrated', integrated_oid = ?,
+                    generation = generation + 1, updated_ns = ?
+                WHERE queue_item_id = ? AND generation = ? AND status = 'stale'
+                """,
+                (replay["candidate_oid"], now, item["queue_item_id"], expected_item_generation),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"merge item changed while replaying: {item['queue_item_id']}")
+            cursor = self._connection.execute(
+                "UPDATE attempts SET status = 'integrated' WHERE attempt_id = ? AND status = 'candidate'",
+                (item["attempt_id"],),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"attempt changed while replaying: {item['attempt_id']}")
+            cursor = self._connection.execute(
+                """
+                UPDATE tasks SET status = 'integrated', integrated_oid = ?, generation = generation + 1
+                WHERE run_id = ? AND article_id = ? AND phase = ? AND status = 'queued'
+                    AND attempts = ? AND candidate_oid = ?
+                """,
+                (
+                    replay["candidate_oid"],
+                    item["run_id"],
+                    attempt["article_id"],
+                    attempt["phase"],
+                    attempt["number"],
+                    item["candidate_oid"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict("queued task changed while integrating its replay")
+            cursor = self._connection.execute(
+                """
+                UPDATE runs SET current_oid = ?, generation = generation + 1, updated_ns = ?
+                WHERE run_id = ? AND generation = ? AND current_oid = ?
+                """,
+                (
+                    replay["candidate_oid"],
+                    now,
+                    item["run_id"],
+                    expected_generation,
+                    replay["target_oid"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"run changed while integrating replay: {item['run_id']}")
+            self._append_event(
+                item["run_id"],
+                "candidate.integrated",
+                {
+                    "expected_target_oid": replay["target_oid"],
+                    "integrated_oid": replay["candidate_oid"],
+                    "original_candidate_oid": item["candidate_oid"],
+                    "publication_evidence_sha256": publication_evidence_sha256,
+                    "queue_item_id": item["queue_item_id"],
+                    "replay_id": replay_id,
+                },
+                now,
+            )
+        return self.get_run(item["run_id"])
+
+    def adopt_target_head(
+        self,
+        run_id: str,
+        *,
+        target_oid: str,
+        evidence_sha256: str,
+        satisfied_tasks: Iterable[tuple[str, str]] = (),
+        expected_generation: int,
+        adoption_id: str | None = None,
+    ) -> RunRecord:
+        """Advance to an externally verified target and record satisfied tasks atomically.
+
+        Repository ancestry, changed-path, source-contract, gate, and review checks are
+        performed by the controller. The canonical evidence artifact and exact task set
+        are retained here so a restart cannot silently relabel the run head.
+        """
+
+        _validate_oid(target_oid)
+        _validate_sha256(evidence_sha256, "target adoption evidence")
+        try:
+            raw_tasks = tuple(satisfied_tasks)
+        except TypeError as error:
+            raise InvalidTransition("target adoption tasks must be iterable") from error
+        tasks_list: list[tuple[str, str]] = []
+        for item in raw_tasks:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise InvalidTransition("target adoption tasks must be (article_id, phase) pairs")
+            article_id, phase = item
+            if not isinstance(article_id, str) or not isinstance(phase, str):
+                raise InvalidTransition("target adoption tasks must contain strings")
+            _validate_article_id(article_id)
+            if phase not in _PHASES:
+                raise InvalidTransition(f"unknown task phase: {phase}")
+            tasks_list.append((article_id, phase))
+        if len(set(tasks_list)) != len(tasks_list):
+            raise InvalidTransition("target adoption contains duplicate tasks")
+        tasks = tuple(sorted(tasks_list))
+        identifier = adoption_id or uuid.uuid4().hex
+        _validate_identifier("target adoption id", identifier)
+        self.read_artifact(evidence_sha256)
+        now = self._clock_ns()
+        with self._transaction():
+            run = self._active_run_row(run_id, expected_generation)
+            existing = self._connection.execute(
+                "SELECT * FROM target_adoptions WHERE adoption_id = ?", (identifier,)
+            ).fetchone()
+            if existing is not None:
+                adoption = _target_adoption_record(existing)
+                existing_tasks = tuple(
+                    sorted(
+                        (row["article_id"], row["phase"])
+                        for row in self._connection.execute(
+                            """
+                            SELECT article_id, phase FROM external_integrations
+                            WHERE adoption_id = ?
+                            """,
+                            (identifier,),
+                        ).fetchall()
+                    )
+                )
+                if (
+                    adoption.run_id != run_id
+                    or adoption.target_oid != target_oid
+                    or adoption.evidence_sha256 != evidence_sha256
+                    or existing_tasks != tasks
+                ):
+                    raise GenerationConflict(f"target adoption id names different evidence: {identifier}")
+                if run["current_oid"] != target_oid:
+                    raise GenerationConflict(
+                        f"target adoption {identifier} is no longer the run head"
+                    )
+                return self.get_run(run_id)
+            previous_oid = run["current_oid"]
+            if previous_oid == target_oid:
+                raise InvalidTransition("target adoption must advance to a different object")
+            if len(previous_oid) != len(target_oid):
+                raise InvalidTransition("target adoption object id does not match the run object format")
+            unsafe_item = self._connection.execute(
+                """
+                SELECT queue_item_id FROM merge_items
+                WHERE run_id = ? AND status NOT IN ('integrated','failed','stale') LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if unsafe_item is not None:
+                raise InvalidTransition(
+                    f"target head cannot be adopted while merge item is active: {unsafe_item['queue_item_id']}"
+                )
+            unsafe_replay = self._connection.execute(
+                """
+                SELECT merge_replays.replay_id FROM merge_replays
+                JOIN merge_items USING(queue_item_id)
+                WHERE merge_items.run_id = ?
+                    AND merge_replays.status NOT IN ('integrated','stale','failed')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if unsafe_replay is not None:
+                raise InvalidTransition(
+                    "target head cannot be adopted while merge replay is unresolved: "
+                    f"{unsafe_replay['replay_id']}"
+                )
+            rows: list[sqlite3.Row] = []
+            selected = set(tasks)
+            for article_id, phase in tasks:
+                task = self._task_row(run_id, article_id, phase)
+                if task["status"] not in {"pending", "retrying", "blocked"}:
+                    raise InvalidTransition(
+                        f"externally satisfied task is already active or terminal: {article_id}:{phase}"
+                    )
+                retained = self._connection.execute(
+                    """
+                    SELECT merge_items.queue_item_id FROM merge_items
+                    JOIN attempts USING(attempt_id)
+                    WHERE attempts.run_id = ? AND attempts.article_id = ? AND attempts.phase = ?
+                        AND merge_items.status NOT IN ('integrated','failed')
+                    LIMIT 1
+                    """,
+                    (run_id, article_id, phase),
+                ).fetchone()
+                if retained is not None:
+                    raise InvalidTransition(
+                        f"externally satisfied task retains merge ownership: {retained['queue_item_id']}"
+                    )
+                if phase == "proof":
+                    statement = self._connection.execute(
+                        """
+                        SELECT status FROM tasks
+                        WHERE run_id = ? AND article_id = ? AND phase = 'statement'
+                        """,
+                        (run_id, article_id),
+                    ).fetchone()
+                    if statement is None:
+                        raise InvalidTransition(
+                            f"external proof integration has no statement task: {article_id}"
+                        )
+                    if (
+                        statement["status"] != "integrated"
+                        and (article_id, "statement") not in selected
+                    ):
+                        raise InvalidTransition(
+                            f"external proof integration omits its statement task: {article_id}"
+                        )
+                rows.append(task)
+            ordinal = self._connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM target_adoptions WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            self._connection.execute(
+                """
+                INSERT INTO target_adoptions(
+                    adoption_id, run_id, ordinal, previous_oid, target_oid, evidence_sha256, created_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (identifier, run_id, ordinal, previous_oid, target_oid, evidence_sha256, now),
+            )
+            for task in rows:
+                self._connection.execute(
+                    """
+                    INSERT INTO external_integrations(
+                        adoption_id, run_id, article_id, phase, integrated_oid
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (identifier, run_id, task["article_id"], task["phase"], target_oid),
+                )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET status = 'integrated', integrated_oid = ?,
+                        blocked_by_json = '[]', detail = 'verified external integration',
+                        generation = generation + 1
+                    WHERE run_id = ? AND article_id = ? AND phase = ?
+                        AND generation = ? AND status = ?
+                    """,
+                    (
+                        target_oid,
+                        run_id,
+                        task["article_id"],
+                        task["phase"],
+                        task["generation"],
+                        task["status"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise GenerationConflict(
+                        f"task changed during target adoption: {task['article_id']}:{task['phase']}"
+                    )
+            cursor = self._connection.execute(
+                """
+                UPDATE runs SET current_oid = ?, generation = generation + 1, updated_ns = ?
+                WHERE run_id = ? AND generation = ? AND current_oid = ?
+                """,
+                (target_oid, now, run_id, expected_generation, previous_oid),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"run changed while adopting target: {run_id}")
+            self._append_event(
+                run_id,
+                "target.adopted",
+                {
+                    "adoption_id": identifier,
+                    "evidence_sha256": evidence_sha256,
+                    "ordinal": ordinal,
+                    "previous_oid": previous_oid,
+                    "satisfied_tasks": [
+                        {"article_id": article_id, "phase": phase} for article_id, phase in tasks
+                    ],
+                    "target_oid": target_oid,
+                },
+                now,
+            )
+        return self.get_run(run_id)
+
+    def list_target_adoptions(self, run_id: str) -> tuple[TargetAdoptionRecord, ...]:
+        self._run_row(run_id)
+        rows = self._connection.execute(
+            "SELECT * FROM target_adoptions WHERE run_id = ? ORDER BY ordinal",
+            (run_id,),
+        ).fetchall()
+        return tuple(_target_adoption_record(row) for row in rows)
+
+    def list_external_integrations(self, run_id: str) -> tuple[ExternalIntegrationRecord, ...]:
+        self._run_row(run_id)
+        rows = self._connection.execute(
+            """
+            SELECT * FROM external_integrations
+            WHERE run_id = ? ORDER BY adoption_id, article_id, phase
+            """,
+            (run_id,),
+        ).fetchall()
+        return tuple(_external_integration_record(row) for row in rows)
 
     def transition_merge_item(
         self,
@@ -1293,6 +1921,8 @@ class RunLedger:
                 return _merge_item_record(item)
             if item["status"] in _MERGE_ITEM_TERMINAL_STATUSES:
                 raise InvalidTransition(f"merge item is already {item['status']}")
+            if item["status"] == "stale" and status != "failed":
+                raise InvalidTransition("a stale merge item may only be replayed or failed")
             cursor = self._connection.execute(
                 """
                 UPDATE merge_items SET status = ?, detail = ?, generation = generation + 1, updated_ns = ?
@@ -1352,6 +1982,8 @@ class RunLedger:
                 return self.get_run(item["run_id"])
             if item["status"] in _MERGE_ITEM_TERMINAL_STATUSES:
                 raise InvalidTransition(f"merge item is already {item['status']}")
+            if item["status"] == "stale":
+                raise InvalidTransition("a stale merge item must use an admitted replay")
             if run["current_oid"] != item["expected_target_oid"]:
                 raise GenerationConflict(
                     f"run {item['run_id']} current OID changed from merge base {item['expected_target_oid']} "
@@ -1473,12 +2105,29 @@ class RunLedger:
                     (run_id,),
                 ).fetchall()
             )
+            merge_replays = tuple(
+                _merge_replay_record(row)
+                for row in self._connection.execute(
+                    """
+                    SELECT merge_replays.* FROM merge_replays
+                    JOIN merge_items USING(queue_item_id)
+                    WHERE merge_items.run_id = ?
+                    ORDER BY merge_replays.queue_item_id, merge_replays.ordinal
+                    """,
+                    (run_id,),
+                ).fetchall()
+            )
+            target_adoptions = self.list_target_adoptions(run_id)
+            external_integrations = self.list_external_integrations(run_id)
         return RecoverySnapshot(
             run=run,
             tasks=tasks,
             attempts=attempts,
             gates=gates,
             merge_items=merge_items,
+            merge_replays=merge_replays,
+            target_adoptions=target_adoptions,
+            external_integrations=external_integrations,
         )
 
     def events(self, run_id: str, *, after: int = 0) -> tuple[EventRecord, ...]:
@@ -1601,6 +2250,8 @@ class RunLedger:
                         self._migrate_v1()
                     elif row["value"] == "2":
                         self._migrate_v2()
+                    elif row["value"] == "3":
+                        self._migrate_v3()
                     elif row["value"] != str(LEDGER_SCHEMA_VERSION):
                         raise LedgerError(
                             f"unsupported ledger schema {row['value']}; expected {LEDGER_SCHEMA_VERSION}"
@@ -1716,6 +2367,50 @@ class RunLedger:
                 )
             for table in reversed(renamed):
                 self._connection.execute(f"DROP TABLE {table}_v1")
+            self._connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(LEDGER_SCHEMA_VERSION),),
+            )
+            _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
+            self._validate_content_rows()
+
+    def _migrate_v3(self) -> None:
+        """Add append-only replay and verified target-adoption history."""
+
+        with self._transaction():
+            version = self._connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if version is not None and version["value"] == str(LEDGER_SCHEMA_VERSION):
+                return
+            if version is None or version["value"] != "3":
+                raise LedgerError("ledger schema changed while preparing the v3 migration")
+            _verify_schema(self._connection, _SCHEMA_V3, version=3)
+            _execute_schema(self._connection, _SCHEMA)
+            now = self._clock_ns()
+            self._connection.execute(
+                """
+                UPDATE runs SET status = 'failed', stop_requested = 0,
+                    detail = 'v3 run cannot resume because attempt bases were not append-only',
+                    updated_ns = ?
+                WHERE status NOT IN ('complete', 'failed')
+                """,
+                (now,),
+            )
+            for row in self._connection.execute(
+                "SELECT run_id, status, config_sha256 FROM runs ORDER BY run_id"
+            ).fetchall():
+                self._append_event(
+                    row["run_id"],
+                    "ledger.migrated",
+                    {
+                        "config_sha256": row["config_sha256"],
+                        "from_schema": 3,
+                        "status": row["status"],
+                        "to_schema": LEDGER_SCHEMA_VERSION,
+                    },
+                    now,
+                )
             self._connection.execute(
                 "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                 (str(LEDGER_SCHEMA_VERSION),),
@@ -2118,6 +2813,56 @@ class RunLedger:
             item = _merge_item_record(row)
             merge_items_by_id[item.queue_item_id] = item
             merge_items_by_attempt[item.attempt_id] = item
+        merge_replays_by_id: dict[str, MergeReplayRecord] = {}
+        merge_replays_by_item: dict[str, list[MergeReplayRecord]] = {
+            queue_item_id: [] for queue_item_id in merge_items_by_id
+        }
+        for row in self._connection.execute(
+            "SELECT * FROM merge_replays ORDER BY queue_item_id, ordinal"
+        ).fetchall():
+            replay = _merge_replay_record(row)
+            if replay.queue_item_id not in merge_items_by_id:
+                raise LedgerError(f"merge replay has no merge item: {replay.replay_id}")
+            merge_replays_by_id[replay.replay_id] = replay
+            merge_replays_by_item[replay.queue_item_id].append(replay)
+        target_adoptions_by_id: dict[str, TargetAdoptionRecord] = {}
+        for row in self._connection.execute(
+            "SELECT * FROM target_adoptions ORDER BY created_ns, adoption_id"
+        ).fetchall():
+            adoption = _target_adoption_record(row)
+            if adoption.run_id not in run_plans:
+                raise LedgerError(f"target adoption has no run: {adoption.adoption_id}")
+            target_adoptions_by_id[adoption.adoption_id] = adoption
+        external_integrations_by_task: dict[tuple[str, str, str], ExternalIntegrationRecord] = {}
+        for row in self._connection.execute(
+            "SELECT * FROM external_integrations ORDER BY adoption_id, article_id, phase"
+        ).fetchall():
+            integration = _external_integration_record(row)
+            adoption = target_adoptions_by_id.get(integration.adoption_id)
+            task_key = (integration.run_id, integration.article_id, integration.phase)
+            if (
+                adoption is None
+                or adoption.run_id != integration.run_id
+                or adoption.target_oid != integration.integrated_oid
+                or task_key not in tasks_by_key
+            ):
+                raise LedgerError(
+                    f"external integration binding is invalid: {integration.adoption_id}:"
+                    f"{integration.article_id}:{integration.phase}"
+                )
+            external_integrations_by_task[task_key] = integration
+        for task_key, integration in external_integrations_by_task.items():
+            if integration.phase != "proof":
+                continue
+            statement = tasks_by_key.get((integration.run_id, integration.article_id, "statement"))
+            if statement is None:
+                raise LedgerError(
+                    f"external proof integration has no statement task: {integration.article_id}"
+                )
+            if statement.status != "integrated":
+                raise LedgerError(
+                    f"external proof integration has an unintegrated statement: {integration.article_id}"
+                )
         events_by_run: dict[str, list[EventRecord]] = {run_id: [] for run_id in run_plans}
         for row in self._connection.execute("SELECT * FROM events ORDER BY sequence").fetchall():
             event = _event_record(row)
@@ -2152,6 +2897,10 @@ class RunLedger:
             attempts_by_id,
             merge_items_by_id,
             merge_items_by_attempt,
+            merge_replays_by_id,
+            merge_replays_by_item,
+            target_adoptions_by_id,
+            external_integrations_by_task,
             events_by_run,
         )
 
@@ -2221,6 +2970,14 @@ class RunLedger:
             raise LedgerError(f"unknown merge item: {queue_item_id}")
         return row
 
+    def _merge_replay_row(self, replay_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT * FROM merge_replays WHERE replay_id = ?", (replay_id,)
+        ).fetchone()
+        if row is None:
+            raise LedgerError(f"unknown merge replay: {replay_id}")
+        return row
+
     def _append_event(self, run_id: str, kind: str, payload: Mapping[str, object], created_ns: int) -> None:
         self._connection.execute(
             "INSERT INTO events(run_id, kind, payload_json, created_ns) VALUES (?, ?, ?, ?)",
@@ -2256,6 +3013,254 @@ def _reconstruct_integrated_oid(
     return current_oid
 
 
+def _validate_attempt_queue_event_history(
+    runs: Mapping[str, RunRecord],
+    attempts: Mapping[str, AttemptRecord],
+    merge_items: Mapping[str, MergeItemRecord],
+    events_by_run: Mapping[str, list[EventRecord]],
+) -> None:
+    """Bind mutable lifecycle rows to their append-only creation events."""
+
+    migrated_runs: set[str] = set()
+    for run_id, events in events_by_run.items():
+        for event in events:
+            if (
+                event.kind == "ledger.migrated"
+                and event.payload.get("from_schema") in {1, 2, 3}
+                and event.payload.get("to_schema") == LEDGER_SCHEMA_VERSION
+            ):
+                migrated_runs.add(run_id)
+    legacy_terminal_runs = {
+        run_id
+        for run_id in migrated_runs
+        if runs[run_id].status in {"complete", "failed"}
+    }
+
+    start_sequence: dict[str, int] = {}
+    finish_sequence: dict[str, int] = {}
+    queue_sequence: dict[str, int] = {}
+    integration_sequence: dict[str, int] = {}
+    for run_id, events in events_by_run.items():
+        allow_legacy = run_id in legacy_terminal_runs
+        for event in events:
+            if event.kind == "attempt.started":
+                attempt_id = event.payload.get("attempt_id")
+                attempt = attempts.get(attempt_id) if isinstance(attempt_id, str) else None
+                if attempt is None or attempt.run_id != run_id or attempt_id in start_sequence:
+                    raise LedgerError(f"attempt start event is invalid: {run_id}")
+                expected = {
+                    "article_id": attempt.article_id,
+                    "attempt_id": attempt.attempt_id,
+                    "base_oid": attempt.base_oid,
+                    "number": attempt.number,
+                    "phase": attempt.phase,
+                }
+                legacy_payloads = (
+                    {
+                        "article_id": attempt.article_id,
+                        "attempt_id": attempt.attempt_id,
+                        "number": attempt.number,
+                        "phase": attempt.phase,
+                    },
+                    {
+                        "attempt_id": attempt.attempt_id,
+                        "node_id": attempt.article_id,
+                        "number": attempt.number,
+                        "phase": attempt.phase,
+                    },
+                )
+                if (
+                    event.payload != expected
+                    and (not allow_legacy or event.payload not in legacy_payloads)
+                ) or (not allow_legacy and event.created_ns != attempt.started_ns):
+                    raise LedgerError(f"attempt start event disagrees with its row: {attempt_id}")
+                start_sequence[attempt_id] = event.sequence
+                continue
+            if event.kind in {"attempt.finished", "attempt.recovered"}:
+                attempt_id = event.payload.get("attempt_id")
+                attempt = attempts.get(attempt_id) if isinstance(attempt_id, str) else None
+                if attempt is None or attempt.run_id != run_id:
+                    raise LedgerError(f"attempt finish event is invalid: {run_id}")
+                if event.payload.get("outcome") != "candidate":
+                    continue
+                if attempt_id in finish_sequence:
+                    raise LedgerError(f"attempt has duplicate candidate finish events: {attempt_id}")
+                if (
+                    event.payload.get("candidate_oid") != attempt.candidate_oid
+                    or event.payload.get("detail") != attempt.detail
+                    or (not allow_legacy and event.created_ns != attempt.finished_ns)
+                ):
+                    raise LedgerError(f"candidate finish event disagrees with its row: {attempt_id}")
+                finish_sequence[attempt_id] = event.sequence
+                continue
+            if event.kind == "candidate.queued":
+                queue_item_id = event.payload.get("queue_item_id")
+                item = merge_items.get(queue_item_id) if isinstance(queue_item_id, str) else None
+                if item is None or item.run_id != run_id or queue_item_id in queue_sequence:
+                    raise LedgerError(f"candidate queue event is invalid: {run_id}")
+                expected = {
+                    "attempt_id": item.attempt_id,
+                    "candidate_oid": item.candidate_oid,
+                    "expected_target_oid": item.expected_target_oid,
+                    "queue_item_id": item.queue_item_id,
+                    "queue_ref": item.queue_ref,
+                }
+                legacy = {
+                    "attempt_id": item.attempt_id,
+                    "queue_item_id": item.queue_item_id,
+                    "queue_ref": item.queue_ref,
+                }
+                if (
+                    event.payload != expected and (not allow_legacy or event.payload != legacy)
+                ) or (not allow_legacy and event.created_ns != item.created_ns):
+                    raise LedgerError(
+                        f"candidate queue event disagrees with its row: {queue_item_id}"
+                    )
+                queue_sequence[queue_item_id] = event.sequence
+                continue
+            if event.kind == "candidate.integrated":
+                queue_item_id = event.payload.get("queue_item_id")
+                if isinstance(queue_item_id, str):
+                    integration_sequence.setdefault(queue_item_id, event.sequence)
+
+    for attempt_id, attempt in attempts.items():
+        if attempt_id not in start_sequence:
+            if attempt.run_id in legacy_terminal_runs:
+                continue
+            raise LedgerError(f"attempt has no append-only start event: {attempt_id}")
+    for queue_item_id, item in merge_items.items():
+        start = start_sequence.get(item.attempt_id)
+        finish = finish_sequence.get(item.attempt_id)
+        queued = queue_sequence.get(queue_item_id)
+        if item.run_id in legacy_terminal_runs and None in {start, finish, queued}:
+            continue
+        if start is None:
+            raise LedgerError(f"queued candidate has no start event: {item.attempt_id}")
+        if finish is None:
+            raise LedgerError(f"queued candidate has no finish event: {item.attempt_id}")
+        if queued is None:
+            raise LedgerError(f"merge item has no append-only queue event: {queue_item_id}")
+        if not start < finish < queued:
+            raise LedgerError(f"candidate lifecycle event order is invalid: {queue_item_id}")
+        integrated = integration_sequence.get(queue_item_id)
+        if integrated is not None and integrated <= queued:
+            raise LedgerError(f"candidate integration precedes its queue event: {queue_item_id}")
+
+
+def _validate_replay_event_history(
+    merge_items: Mapping[str, MergeItemRecord],
+    replays: Mapping[str, MergeReplayRecord],
+    events_by_run: Mapping[str, list[EventRecord]],
+) -> None:
+    relevant: dict[str, list[EventRecord]] = {replay_id: [] for replay_id in replays}
+    for run_id, events in events_by_run.items():
+        for event in events:
+            if event.kind not in {
+                "candidate.replay-prepared",
+                "merge-replay.transition",
+                "candidate.integrated",
+            }:
+                continue
+            replay_id = event.payload.get("replay_id")
+            if event.kind == "candidate.integrated" and replay_id is None:
+                continue
+            if not isinstance(replay_id, str) or replay_id not in relevant:
+                raise LedgerError(f"run replay event references an unknown replay: {run_id}")
+            item = merge_items[replays[replay_id].queue_item_id]
+            if item.run_id != run_id:
+                raise LedgerError(f"run replay event has the wrong run: {replay_id}")
+            relevant[replay_id].append(event)
+
+    allowed = {
+        "prepared": frozenset({"publishing", "stale", "uncertain", "failed"}),
+        "publishing": frozenset({"stale", "uncertain", "failed"}),
+    }
+    for replay_id, replay in replays.items():
+        item = merge_items[replay.queue_item_id]
+        status = "prepared"
+        generation = 0
+        detail = ""
+        updated_ns = replay.created_ns
+        prepared = False
+        integrated = False
+        for event in relevant[replay_id]:
+            if event.kind == "candidate.replay-prepared":
+                expected = {
+                    "candidate_oid": replay.candidate_oid,
+                    "gate_evidence_sha256": replay.gate_evidence_sha256,
+                    "queue_item_id": replay.queue_item_id,
+                    "replay_id": replay_id,
+                    "review_evidence_sha256": replay.review_evidence_sha256,
+                    "target_oid": replay.target_oid,
+                }
+                if prepared or event.payload != expected or event.created_ns != replay.created_ns:
+                    raise LedgerError(f"merge replay preparation event is invalid: {replay_id}")
+                prepared = True
+                continue
+            if not prepared or integrated:
+                raise LedgerError(f"merge replay event ordering is invalid: {replay_id}")
+            if event.kind == "merge-replay.transition":
+                if set(event.payload) != {"detail", "from", "replay_id", "to"}:
+                    raise LedgerError(f"merge replay transition event is malformed: {replay_id}")
+                next_status = event.payload.get("to")
+                next_detail = event.payload.get("detail")
+                if (
+                    event.payload.get("from") != status
+                    or not isinstance(next_status, str)
+                    or next_status not in allowed.get(status, frozenset())
+                    or not isinstance(next_detail, str)
+                    or not next_detail.strip()
+                ):
+                    raise LedgerError(f"merge replay transition event is invalid: {replay_id}")
+                status = next_status
+                detail = next_detail
+                generation += 1
+                updated_ns = event.created_ns
+                continue
+            expected = {
+                "expected_target_oid": replay.target_oid,
+                "integrated_oid": replay.candidate_oid,
+                "original_candidate_oid": item.candidate_oid,
+                "publication_evidence_sha256": replay.publication_evidence_sha256,
+                "queue_item_id": replay.queue_item_id,
+                "replay_id": replay_id,
+            }
+            if status != "publishing" or event.payload != expected:
+                raise LedgerError(f"merge replay integration event is invalid: {replay_id}")
+            status = "integrated"
+            detail = "atomic replay publication verified"
+            generation += 1
+            updated_ns = event.created_ns
+            integrated = True
+        if not prepared:
+            raise LedgerError(f"merge replay has no preparation event: {replay_id}")
+        if (
+            replay.status != status
+            or replay.generation != generation
+            or replay.detail != detail
+            or replay.updated_ns != updated_ns
+        ):
+            raise LedgerError(f"merge replay row disagrees with its event history: {replay_id}")
+
+
+def _target_adoption_event_tasks(value: object, *, run_id: str) -> list[tuple[str, str]]:
+    if not isinstance(value, list):
+        raise LedgerError(f"run target-adoption event has invalid tasks: {run_id}")
+    result: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"article_id", "phase"}:
+            raise LedgerError(f"run target-adoption event has invalid tasks: {run_id}")
+        article_id = item.get("article_id")
+        phase = item.get("phase")
+        if not isinstance(article_id, str) or not isinstance(phase, str) or phase not in _PHASES:
+            raise LedgerError(f"run target-adoption event has invalid tasks: {run_id}")
+        _validate_article_id(article_id)
+        result.append((article_id, phase))
+    if result != sorted(set(result)):
+        raise LedgerError(f"run target-adoption event tasks are not canonical: {run_id}")
+    return result
+
+
 def _validate_lifecycle_rows(
     runs: Mapping[str, RunRecord],
     tasks: Mapping[tuple[str, str, str], TaskRecord],
@@ -2263,13 +3268,25 @@ def _validate_lifecycle_rows(
     attempts_by_id: Mapping[str, AttemptRecord],
     merge_items_by_id: Mapping[str, MergeItemRecord],
     merge_items_by_attempt: Mapping[str, MergeItemRecord],
+    merge_replays_by_id: Mapping[str, MergeReplayRecord],
+    merge_replays_by_item: Mapping[str, list[MergeReplayRecord]],
+    target_adoptions_by_id: Mapping[str, TargetAdoptionRecord],
+    external_integrations_by_task: Mapping[tuple[str, str, str], ExternalIntegrationRecord],
     events_by_run: Mapping[str, list[EventRecord]],
 ) -> None:
+    _validate_attempt_queue_event_history(
+        runs,
+        attempts_by_id,
+        merge_items_by_id,
+        events_by_run,
+    )
+    _validate_replay_event_history(merge_items_by_id, merge_replays_by_id, events_by_run)
     tasks_for_run: dict[str, list[TaskRecord]] = {run_id: [] for run_id in runs}
     integrated_items_for_run: dict[str, set[str]] = {run_id: set() for run_id in runs}
     for task_key, task in tasks.items():
         run = runs[task.run_id]
         tasks_for_run[task.run_id].append(task)
+        external = external_integrations_by_task.get(task_key)
         attempts = sorted(attempts_by_task[task_key], key=lambda attempt: attempt.number)
         numbers = tuple(attempt.number for attempt in attempts)
         if numbers != tuple(range(1, task.attempts + 1)):
@@ -2279,6 +3296,16 @@ def _validate_lifecycle_rows(
         if task.status == "pending":
             if attempts:
                 raise LedgerError(f"pending task has attempt history: {task.article_id}:{task.phase}")
+            continue
+        if external is not None:
+            if task.status != "integrated" or task.integrated_oid != external.integrated_oid:
+                raise LedgerError(
+                    f"external integration disagrees with task: {task.article_id}:{task.phase}"
+                )
+            if any(attempt.status == "running" for attempt in attempts):
+                raise LedgerError(
+                    f"externally integrated task retains a running attempt: {task.article_id}:{task.phase}"
+                )
             continue
         if not attempts:
             raise LedgerError(f"active task has no attempt history: {task.article_id}:{task.phase}")
@@ -2338,8 +3365,41 @@ def _validate_lifecycle_rows(
         ):
             raise LedgerError(f"unresolved merge item is not bound to the current task: {item.queue_item_id}")
 
+        replays = merge_replays_by_item[item.queue_item_id]
+        for replay in replays:
+            if (
+                len(replay.target_oid) != len(item.candidate_oid)
+                or len(replay.candidate_oid) != len(item.candidate_oid)
+                or replay.candidate_oid in {replay.target_oid, item.candidate_oid}
+                or replay.gate_evidence_sha256 == replay.review_evidence_sha256
+            ):
+                raise LedgerError(f"merge replay identity is invalid: {replay.replay_id}")
+        if tuple(replay.ordinal for replay in replays) != tuple(range(1, len(replays) + 1)):
+            raise LedgerError(f"merge replay history is incomplete: {item.queue_item_id}")
+        active = [replay for replay in replays if replay.status not in _MERGE_REPLAY_TERMINAL_STATUSES]
+        if len(active) > 1 or (active and active != replays[-1:]):
+            raise LedgerError(f"merge replay history overlaps: {item.queue_item_id}")
+        if active and item.status != "stale":
+            raise LedgerError(f"active merge replay does not belong to a stale item: {item.queue_item_id}")
+        integrated_replays = [replay for replay in replays if replay.status == "integrated"]
+        if item.status == "integrated" and item.integrated_oid != item.candidate_oid:
+            if len(integrated_replays) != 1 or integrated_replays[0].candidate_oid != item.integrated_oid:
+                raise LedgerError(f"merge item replay integration is inconsistent: {item.queue_item_id}")
+        elif integrated_replays:
+            raise LedgerError(f"merge item has unexpected integrated replay: {item.queue_item_id}")
+        if integrated_replays and integrated_replays[0] is not replays[-1]:
+            raise LedgerError(f"merge replay continued after integration: {item.queue_item_id}")
+
     for run_id, run in runs.items():
         run_tasks = tasks_for_run[run_id]
+        run_adoption_records = sorted(
+            (adoption for adoption in target_adoptions_by_id.values() if adoption.run_id == run_id),
+            key=lambda adoption: adoption.ordinal,
+        )
+        if tuple(adoption.ordinal for adoption in run_adoption_records) != tuple(
+            range(1, len(run_adoption_records) + 1)
+        ):
+            raise LedgerError(f"run target-adoption history is incomplete: {run_id}")
         if run.status == "created" and any(task.status != "pending" for task in run_tasks):
             raise LedgerError(f"created run contains active tasks: {run_id}")
         if run.status == "complete" and any(task.status != "integrated" for task in run_tasks):
@@ -2349,7 +3409,51 @@ def _validate_lifecycle_rows(
 
         current_oid = run.config.start_oid
         seen_items: set[str] = set()
+        seen_adoptions: set[str] = set()
         for event in events_by_run[run_id]:
+            if event.kind == "target.adopted":
+                adoption_id = event.payload.get("adoption_id")
+                adoption = (
+                    target_adoptions_by_id.get(adoption_id)
+                    if isinstance(adoption_id, str)
+                    else None
+                )
+                expected_tasks = sorted(
+                    (
+                        integration.article_id,
+                        integration.phase,
+                    )
+                    for integration in external_integrations_by_task.values()
+                    if integration.adoption_id == adoption_id
+                )
+                payload_tasks = _target_adoption_event_tasks(
+                    event.payload.get("satisfied_tasks"), run_id=run_id
+                )
+                if (
+                    adoption is None
+                    or adoption.run_id != run_id
+                    or adoption_id in seen_adoptions
+                    or set(event.payload)
+                    != {
+                        "adoption_id",
+                        "evidence_sha256",
+                        "ordinal",
+                        "previous_oid",
+                        "satisfied_tasks",
+                        "target_oid",
+                    }
+                    or event.payload.get("previous_oid") != adoption.previous_oid
+                    or event.payload.get("target_oid") != adoption.target_oid
+                    or event.payload.get("evidence_sha256") != adoption.evidence_sha256
+                    or event.payload.get("ordinal") != adoption.ordinal
+                    or payload_tasks != expected_tasks
+                    or adoption.previous_oid != current_oid
+                    or len(adoption.target_oid) != len(current_oid)
+                ):
+                    raise LedgerError(f"run target-adoption event is invalid: {run_id}")
+                current_oid = adoption.target_oid
+                seen_adoptions.add(adoption_id)
+                continue
             if event.kind != "candidate.integrated":
                 continue
             queue_item_id = event.payload.get("queue_item_id")
@@ -2358,19 +3462,44 @@ def _validate_lifecycle_rows(
             if not isinstance(queue_item_id, str) or queue_item_id in seen_items:
                 raise LedgerError(f"run integration event is invalid: {run_id}")
             item = merge_items_by_id.get(queue_item_id)
+            replay_id = event.payload.get("replay_id")
+            replay = merge_replays_by_id.get(replay_id) if isinstance(replay_id, str) else None
+            direct = replay_id is None
+            expected_matches = (
+                item is not None
+                and event.payload
+                == {
+                    "expected_target_oid": item.expected_target_oid,
+                    "integrated_oid": item.integrated_oid,
+                    "queue_item_id": item.queue_item_id,
+                }
+                if direct and item is not None
+                else item is not None
+                and replay is not None
+                and replay.queue_item_id == queue_item_id
+                and replay.status == "integrated"
+                and expected_target_oid == replay.target_oid
+                and integrated_oid == replay.candidate_oid
+                and event.payload.get("original_candidate_oid") == item.candidate_oid
+            )
             if (
                 item is None
                 or item.run_id != run_id
                 or item.status != "integrated"
-                or expected_target_oid != item.expected_target_oid
                 or integrated_oid != item.integrated_oid
+                or not expected_matches
             ):
                 raise LedgerError(f"run integration event does not match its merge item: {run_id}")
-            if item.expected_target_oid != current_oid:
+            if expected_target_oid != current_oid:
                 raise LedgerError(f"run integration history is not linear: {run_id}")
-            current_oid = item.candidate_oid
+            current_oid = integrated_oid
             seen_items.add(queue_item_id)
-        if seen_items != integrated_items_for_run[run_id] or run.current_oid != current_oid:
+        run_adoptions = {adoption.adoption_id for adoption in run_adoption_records}
+        if (
+            seen_items != integrated_items_for_run[run_id]
+            or seen_adoptions != run_adoptions
+            or run.current_oid != current_oid
+        ):
             raise LedgerError(f"run current OID does not match its integration history: {run_id}")
 
 
@@ -2441,10 +3570,10 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
     _validate_nonnegative_integer(f"{label} generation", row["generation"])
     _validate_optional_oid(row["candidate_oid"])
     _validate_optional_oid(row["integrated_oid"])
-    if row["status"] in {"candidate", "queued", "integrated"} and row["candidate_oid"] is None:
+    if row["status"] in {"candidate", "queued"} and row["candidate_oid"] is None:
         raise LedgerError(f"{label} is missing its candidate OID")
-    if row["status"] == "integrated" and row["integrated_oid"] != row["candidate_oid"]:
-        raise LedgerError(f"{label} integrated OID does not match its candidate")
+    if row["status"] == "integrated" and row["integrated_oid"] is None:
+        raise LedgerError(f"{label} has no integrated OID")
     return TaskRecord(
         run_id=row["run_id"],
         article_id=row["article_id"],
@@ -2549,8 +3678,8 @@ def _merge_item_record(row: sqlite3.Row) -> MergeItemRecord:
     if row["status"] not in _MERGE_ITEM_STATUSES:
         raise LedgerError(f"{label} status is invalid")
     _validate_nonnegative_integer(f"{label} generation", row["generation"])
-    if row["status"] == "integrated" and row["integrated_oid"] != row["candidate_oid"]:
-        raise LedgerError(f"{label} integrated OID does not match its candidate")
+    if row["status"] == "integrated" and row["integrated_oid"] is None:
+        raise LedgerError(f"{label} has no integrated OID")
     if row["status"] != "integrated" and row["integrated_oid"] is not None:
         raise LedgerError(f"{label} has an integrated OID before integration")
     _validate_timestamp(f"{label} creation time", row["created_ns"])
@@ -2570,6 +3699,87 @@ def _merge_item_record(row: sqlite3.Row) -> MergeItemRecord:
         detail=row["detail"],
         created_ns=row["created_ns"],
         updated_ns=row["updated_ns"],
+    )
+
+
+def _merge_replay_record(row: sqlite3.Row) -> MergeReplayRecord:
+    label = f"merge replay {row['replay_id']}"
+    _validate_identifier("replay id", row["replay_id"])
+    _validate_identifier("queue item id", row["queue_item_id"])
+    _validate_nonnegative_integer(f"{label} ordinal", row["ordinal"])
+    if row["ordinal"] < 1:
+        raise LedgerError(f"{label} ordinal must be positive")
+    _validate_oid(row["target_oid"])
+    _validate_oid(row["candidate_oid"])
+    _validate_sha256(row["gate_evidence_sha256"], f"{label} gate evidence")
+    _validate_sha256(row["review_evidence_sha256"], f"{label} review evidence")
+    if row["status"] not in _MERGE_REPLAY_STATUSES:
+        raise LedgerError(f"{label} status is invalid")
+    _validate_nonnegative_integer(f"{label} generation", row["generation"])
+    publication = row["publication_evidence_sha256"]
+    if publication is not None:
+        _validate_sha256(publication, f"{label} publication evidence")
+    if row["status"] == "integrated" and publication is None:
+        raise LedgerError(f"{label} has no publication evidence")
+    if row["status"] != "integrated" and publication is not None:
+        raise LedgerError(f"{label} has publication evidence before integration")
+    _validate_timestamp(f"{label} creation time", row["created_ns"])
+    _validate_timestamp(f"{label} update time", row["updated_ns"])
+    if row["updated_ns"] < row["created_ns"]:
+        raise LedgerError(f"{label} timestamps are inconsistent")
+    return MergeReplayRecord(
+        replay_id=row["replay_id"],
+        queue_item_id=row["queue_item_id"],
+        ordinal=row["ordinal"],
+        target_oid=row["target_oid"],
+        candidate_oid=row["candidate_oid"],
+        gate_evidence_sha256=row["gate_evidence_sha256"],
+        review_evidence_sha256=row["review_evidence_sha256"],
+        status=row["status"],
+        generation=row["generation"],
+        publication_evidence_sha256=publication,
+        detail=row["detail"],
+        created_ns=row["created_ns"],
+        updated_ns=row["updated_ns"],
+    )
+
+
+def _target_adoption_record(row: sqlite3.Row) -> TargetAdoptionRecord:
+    _validate_identifier("target adoption id", row["adoption_id"])
+    _validate_identifier("target adoption run id", row["run_id"])
+    _validate_nonnegative_integer("target adoption ordinal", row["ordinal"])
+    if row["ordinal"] < 1:
+        raise LedgerError(f"target adoption ordinal must be positive: {row['adoption_id']}")
+    _validate_oid(row["previous_oid"])
+    _validate_oid(row["target_oid"])
+    if row["previous_oid"] == row["target_oid"]:
+        raise LedgerError(f"target adoption does not advance: {row['adoption_id']}")
+    _validate_sha256(row["evidence_sha256"], "target adoption evidence")
+    _validate_timestamp("target adoption creation time", row["created_ns"])
+    return TargetAdoptionRecord(
+        adoption_id=row["adoption_id"],
+        run_id=row["run_id"],
+        ordinal=row["ordinal"],
+        previous_oid=row["previous_oid"],
+        target_oid=row["target_oid"],
+        evidence_sha256=row["evidence_sha256"],
+        created_ns=row["created_ns"],
+    )
+
+
+def _external_integration_record(row: sqlite3.Row) -> ExternalIntegrationRecord:
+    _validate_identifier("target adoption id", row["adoption_id"])
+    _validate_identifier("external integration run id", row["run_id"])
+    _validate_article_id(row["article_id"])
+    if row["phase"] not in _PHASES:
+        raise LedgerError("external integration phase is invalid")
+    _validate_oid(row["integrated_oid"])
+    return ExternalIntegrationRecord(
+        adoption_id=row["adoption_id"],
+        run_id=row["run_id"],
+        article_id=row["article_id"],
+        phase=row["phase"],
+        integrated_oid=row["integrated_oid"],
     )
 
 
@@ -3254,6 +4464,70 @@ _SCHEMA = _SCHEMA_V2.replace(
     1,
 )
 
+_SCHEMA_V3 = _SCHEMA
+_SCHEMA = _SCHEMA_V3 + """
+CREATE TABLE IF NOT EXISTS merge_replays(
+    replay_id TEXT PRIMARY KEY,
+    queue_item_id TEXT NOT NULL REFERENCES merge_items(queue_item_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    target_oid TEXT NOT NULL,
+    candidate_oid TEXT NOT NULL,
+    gate_evidence_sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
+    review_evidence_sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
+    status TEXT NOT NULL CHECK(status IN ('prepared','publishing','integrated','stale','uncertain','failed')),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    publication_evidence_sha256 TEXT REFERENCES artifacts(sha256),
+    detail TEXT NOT NULL,
+    created_ns INTEGER NOT NULL,
+    updated_ns INTEGER NOT NULL,
+    UNIQUE(queue_item_id, ordinal),
+    UNIQUE(queue_item_id, candidate_oid)
+);
+CREATE TABLE IF NOT EXISTS target_adoptions(
+    adoption_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    previous_oid TEXT NOT NULL,
+    target_oid TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL REFERENCES artifacts(sha256),
+    created_ns INTEGER NOT NULL,
+    UNIQUE(run_id, ordinal),
+    UNIQUE(run_id, target_oid)
+);
+CREATE TABLE IF NOT EXISTS external_integrations(
+    adoption_id TEXT NOT NULL REFERENCES target_adoptions(adoption_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    article_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('statement','proof')),
+    integrated_oid TEXT NOT NULL,
+    PRIMARY KEY(adoption_id, article_id, phase),
+    UNIQUE(run_id, article_id, phase),
+    FOREIGN KEY(run_id, article_id, phase) REFERENCES tasks(run_id, article_id, phase) ON DELETE CASCADE
+);
+CREATE TRIGGER IF NOT EXISTS merge_replays_identity_no_update
+BEFORE UPDATE OF replay_id, queue_item_id, ordinal, target_oid, candidate_oid,
+    gate_evidence_sha256, review_evidence_sha256, created_ns ON merge_replays
+BEGIN SELECT RAISE(ABORT, 'merge replay identity is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS merge_replays_no_delete BEFORE DELETE ON merge_replays
+BEGIN SELECT RAISE(ABORT, 'merge replay history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS target_adoptions_no_update BEFORE UPDATE ON target_adoptions
+BEGIN SELECT RAISE(ABORT, 'target adoption history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS target_adoptions_no_delete BEFORE DELETE ON target_adoptions
+BEGIN SELECT RAISE(ABORT, 'target adoption history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS external_integrations_no_update BEFORE UPDATE ON external_integrations
+BEGIN SELECT RAISE(ABORT, 'external integration history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS external_integrations_no_delete BEFORE DELETE ON external_integrations
+BEGIN SELECT RAISE(ABORT, 'external integration history is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS attempts_identity_no_update
+BEFORE UPDATE OF attempt_id, run_id, article_id, phase, number, worktree_path,
+    branch, base_oid, backend, claim_key, claim_token_json, started_ns ON attempts
+BEGIN SELECT RAISE(ABORT, 'attempt identity is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS merge_items_identity_no_update
+BEFORE UPDATE OF queue_item_id, run_id, attempt_id, queue_ref, expected_target_oid,
+    candidate_oid, created_ns ON merge_items
+BEGIN SELECT RAISE(ABORT, 'merge item identity is immutable'); END;
+"""
+
 
 __all__ = [
     "ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION",
@@ -3262,12 +4536,14 @@ __all__ = [
     "CoordinatorLock",
     "EventRecord",
     "GateRecord",
+    "ExternalIntegrationRecord",
     "GenerationConflict",
     "InvalidTransition",
     "LEDGER_SCHEMA_VERSION",
     "LedgerBusy",
     "LedgerError",
     "MergeItemRecord",
+    "MergeReplayRecord",
     "RUN_CONFIG_SCHEMA_VERSION",
     "RecoverySnapshot",
     "RunConfig",
@@ -3275,4 +4551,5 @@ __all__ = [
     "RunLedger",
     "RunRecord",
     "TaskRecord",
+    "TargetAdoptionRecord",
 ]

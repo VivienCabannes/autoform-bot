@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -22,16 +23,36 @@ from autoform_worker.ledger import (
     LedgerBusy,
     LedgerError,
     MergeItemRecord,
+    MergeReplayRecord,
     RecoverySnapshot,
     RunConfig,
     RunIdentity,
     RunLedger,
+    TargetAdoptionRecord,
 )
 
 
 _ARTICLE_A = "af_aaaaaaaaaaaaaaaaaaaaaaaa"
 _ARTICLE_B = "af_bbbbbbbbbbbbbbbbbbbbbbbb"
 _ARTICLE_DEPENDENCY = "af_dddddddddddddddddddddddd"
+
+
+@contextmanager
+def _disabled_triggers(connection: sqlite3.Connection, *names: str):
+    definitions: list[str] = []
+    for name in names:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        assert row is not None and isinstance(row[0], str)
+        definitions.append(row[0])
+        connection.execute(f'DROP TRIGGER "{name}"')
+    try:
+        yield
+    finally:
+        for definition in definitions:
+            connection.execute(definition)
 
 
 def _config() -> RunConfig:
@@ -1657,6 +1678,431 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
         ledger.close()
 
 
+def test_stale_candidate_replay_preserves_original_history_and_reopens(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+    item = ledger.get_merge_item(queue_item_id)
+    stale = ledger.transition_merge_item(
+        queue_item_id,
+        "stale",
+        expected_generation=item.generation,
+        expected_run_generation=ledger.get_run(run_id).generation,
+        detail="target advanced before publication",
+    )
+    adoption_evidence = ledger.put_artifact("target-adoption", b"verified first-parent advance\n")
+    adopted = ledger.adopt_target_head(
+        run_id,
+        target_oid="a" * 40,
+        evidence_sha256=adoption_evidence,
+        expected_generation=ledger.get_run(run_id).generation,
+        adoption_id="adoption-1",
+    )
+    gate_evidence = ledger.put_artifact("replay-gates", b"fresh gates passed\n")
+    review_evidence = ledger.put_artifact("replay-review", b"fresh review approved\n")
+    replay = ledger.prepare_merge_replay(
+        queue_item_id,
+        target_oid=adopted.current_oid,
+        candidate_oid="b" * 40,
+        gate_evidence_sha256=gate_evidence,
+        review_evidence_sha256=review_evidence,
+        expected_run_generation=adopted.generation,
+        expected_item_generation=stale.generation,
+        replay_id="replay-1",
+    )
+    publishing = ledger.transition_merge_replay(
+        replay.replay_id,
+        "publishing",
+        expected_generation=replay.generation,
+        expected_run_generation=adopted.generation,
+        detail="atomic replay publication started",
+    )
+    publication_evidence = ledger.put_artifact("replay-publication", b"atomic refs verified\n")
+    integrated = ledger.mark_replay_integrated(
+        replay.replay_id,
+        publication_evidence_sha256=publication_evidence,
+        expected_generation=adopted.generation,
+        expected_item_generation=stale.generation,
+        expected_replay_generation=publishing.generation,
+    )
+
+    assert integrated.current_oid == "b" * 40
+    assert ledger.get_attempt("attempt-1").base_oid == "1" * 40
+    assert ledger.get_attempt("attempt-1").candidate_oid == "9" * 40
+    integrated_item = ledger.get_merge_item(queue_item_id)
+    assert integrated_item.candidate_oid == "9" * 40
+    assert integrated_item.integrated_oid == "b" * 40
+    task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+    assert task.candidate_oid == "9" * 40
+    assert task.integrated_oid == "b" * 40
+    assert ledger.get_merge_replay("replay-1") == MergeReplayRecord(
+        replay_id="replay-1",
+        queue_item_id=queue_item_id,
+        ordinal=1,
+        target_oid="a" * 40,
+        candidate_oid="b" * 40,
+        gate_evidence_sha256=gate_evidence,
+        review_evidence_sha256=review_evidence,
+        status="integrated",
+        generation=2,
+        publication_evidence_sha256=publication_evidence,
+        detail="atomic replay publication verified",
+        created_ns=replay.created_ns,
+        updated_ns=ledger.get_merge_replay("replay-1").updated_ns,
+    )
+    path = ledger.path
+    ledger.close()
+
+    with RunLedger(path) as reopened:
+        assert reopened.get_run(run_id).current_oid == "b" * 40
+        snapshot = reopened.inspect_recovery(run_id)
+        assert snapshot.merge_replays[0].status == "integrated"
+        assert snapshot.target_adoptions == (
+            TargetAdoptionRecord(
+                adoption_id="adoption-1",
+                run_id=run_id,
+                ordinal=1,
+                previous_oid="1" * 40,
+                target_oid="a" * 40,
+                evidence_sha256=adoption_evidence,
+                created_ns=snapshot.target_adoptions[0].created_ns,
+            ),
+        )
+
+
+def test_repeated_stale_replays_are_append_only(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+        item = ledger.get_merge_item(queue_item_id)
+        stale = ledger.transition_merge_item(
+            queue_item_id,
+            "stale",
+            expected_generation=item.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="first target drift",
+        )
+        gate = ledger.put_artifact("replay-gates", b"gates\n")
+        review = ledger.put_artifact("replay-review", b"review\n")
+        adoption = ledger.put_artifact("target-adoption", b"advance one\n")
+        first_head = ledger.adopt_target_head(
+            run_id,
+            target_oid="a" * 40,
+            evidence_sha256=adoption,
+            expected_generation=ledger.get_run(run_id).generation,
+            adoption_id="adoption-1",
+        )
+        first = ledger.prepare_merge_replay(
+            queue_item_id,
+            target_oid=first_head.current_oid,
+            candidate_oid="b" * 40,
+            gate_evidence_sha256=gate,
+            review_evidence_sha256=review,
+            expected_run_generation=first_head.generation,
+            expected_item_generation=stale.generation,
+            replay_id="replay-1",
+        )
+        first = ledger.transition_merge_replay(
+            first.replay_id,
+            "publishing",
+            expected_generation=first.generation,
+            expected_run_generation=first_head.generation,
+            detail="first replay started",
+        )
+        ledger.transition_merge_replay(
+            first.replay_id,
+            "stale",
+            expected_generation=first.generation,
+            expected_run_generation=first_head.generation,
+            detail="target drifted again",
+        )
+        adoption = ledger.put_artifact("target-adoption", b"advance two\n")
+        second_head = ledger.adopt_target_head(
+            run_id,
+            target_oid="c" * 40,
+            evidence_sha256=adoption,
+            expected_generation=first_head.generation,
+            adoption_id="adoption-2",
+        )
+        second = ledger.prepare_merge_replay(
+            queue_item_id,
+            target_oid=second_head.current_oid,
+            candidate_oid="d" * 40,
+            gate_evidence_sha256=gate,
+            review_evidence_sha256=review,
+            expected_run_generation=second_head.generation,
+            expected_item_generation=stale.generation,
+            replay_id="replay-2",
+        )
+
+        assert stale.status == "stale"
+        assert [(value.replay_id, value.ordinal, value.status) for value in ledger.list_merge_replays(queue_item_id)] == [
+            ("replay-1", 1, "stale"),
+            ("replay-2", 2, "prepared"),
+        ]
+        assert second.target_oid == "c" * 40
+        assert ledger.get_merge_item(queue_item_id).candidate_oid == "9" * 40
+    finally:
+        ledger.close()
+
+
+def test_target_adoption_can_integrate_verified_peer_work_without_an_attempt(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        evidence = ledger.put_artifact("target-adoption", b"peer transition and source contract verified\n")
+        adopted = ledger.adopt_target_head(
+            run_id,
+            target_oid="a" * 40,
+            evidence_sha256=evidence,
+            satisfied_tasks=[(_ARTICLE_A, "statement")],
+            expected_generation=ledger.get_run(run_id).generation,
+            adoption_id="peer-1",
+        )
+
+        assert adopted.current_oid == "a" * 40
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        assert task.status == "integrated"
+        assert task.candidate_oid is None
+        assert task.integrated_oid == "a" * 40
+        assert ledger.list_attempts(run_id) == ()
+        path = ledger.path
+        ledger.close()
+        ledger = RunLedger(path)
+        assert ledger.get_task(run_id, _ARTICLE_A, "statement") == task
+        assert ledger.list_external_integrations(run_id)[0].adoption_id == "peer-1"
+    finally:
+        ledger.close()
+
+
+def test_target_adoption_idempotency_binds_tasks_and_current_head(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        evidence = ledger.put_artifact("target-adoption", b"first verified head\n")
+        adopted = ledger.adopt_target_head(
+            run_id,
+            target_oid="a" * 40,
+            evidence_sha256=evidence,
+            satisfied_tasks=[(_ARTICLE_A, "statement")],
+            expected_generation=ledger.get_run(run_id).generation,
+            adoption_id="peer-1",
+        )
+        assert ledger.adopt_target_head(
+            run_id,
+            target_oid="a" * 40,
+            evidence_sha256=evidence,
+            satisfied_tasks=[(_ARTICLE_A, "statement")],
+            expected_generation=adopted.generation,
+            adoption_id="peer-1",
+        ) == adopted
+
+        with pytest.raises(GenerationConflict, match="different evidence"):
+            ledger.adopt_target_head(
+                run_id,
+                target_oid="a" * 40,
+                evidence_sha256=evidence,
+                satisfied_tasks=[],
+                expected_generation=adopted.generation,
+                adoption_id="peer-1",
+            )
+
+        second_evidence = ledger.put_artifact("target-adoption", b"second verified head\n")
+        advanced = ledger.adopt_target_head(
+            run_id,
+            target_oid="b" * 40,
+            evidence_sha256=second_evidence,
+            expected_generation=adopted.generation,
+            adoption_id="peer-2",
+        )
+        with pytest.raises(GenerationConflict, match="no longer the run head"):
+            ledger.adopt_target_head(
+                run_id,
+                target_oid="a" * 40,
+                evidence_sha256=evidence,
+                satisfied_tasks=[(_ARTICLE_A, "statement")],
+                expected_generation=advanced.generation,
+                adoption_id="peer-1",
+            )
+    finally:
+        ledger.close()
+
+
+def test_external_proof_adoption_requires_a_statement_task(tmp_path: Path) -> None:
+    ledger = RunLedger(tmp_path / "state/run.sqlite3")
+    config = _config()
+    try:
+        run = ledger.create_run(
+            _identity(tmp_path, config),
+            config,
+            tasks=[(_ARTICLE_A, "proof")],
+            run_id="run-1",
+        )
+        run = ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
+        evidence = ledger.put_artifact("target-adoption", b"verified proof-only head\n")
+
+        with pytest.raises(InvalidTransition, match="has no statement task"):
+            ledger.adopt_target_head(
+                run.run_id,
+                target_oid="a" * 40,
+                evidence_sha256=evidence,
+                satisfied_tasks=[(_ARTICLE_A, "proof")],
+                expected_generation=run.generation,
+            )
+    finally:
+        ledger.close()
+
+
+def test_target_adoption_cannot_relabel_a_task_with_retained_merge_ownership(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+        item = ledger.get_merge_item(queue_item_id)
+        ledger.transition_merge_item(
+            queue_item_id,
+            "stale",
+            expected_generation=item.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="target drift",
+        )
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        ledger.transition_task(
+            run_id,
+            _ARTICLE_A,
+            "statement",
+            "retrying",
+            expected_generation=task.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="candidate needs replay",
+        )
+        evidence = ledger.put_artifact("target-adoption", b"peer head\n")
+
+        with pytest.raises(InvalidTransition, match="retains merge ownership"):
+            ledger.adopt_target_head(
+                run_id,
+                target_oid="a" * 40,
+                evidence_sha256=evidence,
+                satisfied_tasks=[(_ARTICLE_A, "statement")],
+                expected_generation=ledger.get_run(run_id).generation,
+            )
+    finally:
+        ledger.close()
+
+
+def test_replay_is_generation_fenced_stop_safe_and_fail_closed_after_uncertainty(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+        item = ledger.get_merge_item(queue_item_id)
+        ledger.transition_merge_item(
+            queue_item_id,
+            "stale",
+            expected_generation=item.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="target drift",
+        )
+        adoption = ledger.put_artifact("target-adoption", b"verified target\n")
+        adopted = ledger.adopt_target_head(
+            run_id,
+            target_oid="a" * 40,
+            evidence_sha256=adoption,
+            expected_generation=ledger.get_run(run_id).generation,
+        )
+        gate = ledger.put_artifact("replay-gates", b"fresh gates\n")
+        review = ledger.put_artifact("replay-review", b"fresh review\n")
+        replay = ledger.prepare_merge_replay(
+            queue_item_id,
+            target_oid="a" * 40,
+            candidate_oid="b" * 40,
+            gate_evidence_sha256=gate,
+            review_evidence_sha256=review,
+            expected_run_generation=adopted.generation,
+            expected_item_generation=ledger.get_merge_item(queue_item_id).generation,
+        )
+
+        with pytest.raises(GenerationConflict, match="merge replay"):
+            ledger.transition_merge_replay(
+                replay.replay_id,
+                "publishing",
+                expected_generation=replay.generation + 1,
+                expected_run_generation=adopted.generation,
+                detail="stale replay generation",
+            )
+        uncertain = ledger.transition_merge_replay(
+            replay.replay_id,
+            "uncertain",
+            expected_generation=replay.generation,
+            expected_run_generation=adopted.generation,
+            detail="remote outcome cannot be classified",
+        )
+        assert uncertain.status == "uncertain"
+        with pytest.raises(InvalidTransition, match="uncertain replay outcome"):
+            ledger.prepare_merge_replay(
+                queue_item_id,
+                target_oid="a" * 40,
+                candidate_oid="c" * 40,
+                gate_evidence_sha256=gate,
+                review_evidence_sha256=review,
+                expected_run_generation=adopted.generation,
+                expected_item_generation=ledger.get_merge_item(queue_item_id).generation,
+            )
+        with pytest.raises(InvalidTransition, match="merge replay is unresolved"):
+            ledger.adopt_target_head(
+                run_id,
+                target_oid="c" * 40,
+                evidence_sha256=adoption,
+                expected_generation=adopted.generation,
+            )
+
+        stopped = ledger.request_stop(run_id, expected_generation=adopted.generation)
+        with pytest.raises(InvalidTransition, match="pending stop request"):
+            ledger.adopt_target_head(
+                run_id,
+                target_oid="d" * 40,
+                evidence_sha256=adoption,
+                expected_generation=stopped.generation,
+            )
+    finally:
+        ledger.close()
+
+
+def test_reopen_rejects_replay_row_without_matching_append_only_event(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+    item = ledger.get_merge_item(queue_item_id)
+    ledger.transition_merge_item(
+        queue_item_id,
+        "stale",
+        expected_generation=item.generation,
+        expected_run_generation=ledger.get_run(run_id).generation,
+        detail="target drift",
+    )
+    adoption = ledger.put_artifact("target-adoption", b"verified target\n")
+    adopted = ledger.adopt_target_head(
+        run_id,
+        target_oid="a" * 40,
+        evidence_sha256=adoption,
+        expected_generation=ledger.get_run(run_id).generation,
+    )
+    gate = ledger.put_artifact("replay-gates", b"fresh gates\n")
+    review = ledger.put_artifact("replay-review", b"fresh review\n")
+    replay = ledger.prepare_merge_replay(
+        queue_item_id,
+        target_oid="a" * 40,
+        candidate_oid="b" * 40,
+        gate_evidence_sha256=gate,
+        review_evidence_sha256=review,
+        expected_run_generation=adopted.generation,
+        expected_item_generation=ledger.get_merge_item(queue_item_id).generation,
+    )
+    ledger._connection.execute(
+        "UPDATE merge_replays SET detail = 'tampered' WHERE replay_id = ?",
+        (replay.replay_id,),
+    )
+    path = ledger.path
+    ledger.close()
+
+    with pytest.raises(LedgerError, match="disagrees with its event history"):
+        RunLedger(path)
+
+
 def test_enqueue_rejects_candidate_built_before_current_oid_advanced(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "run.sqlite3")
     try:
@@ -2169,7 +2615,7 @@ def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Pat
         assert migration_event.payload["status"] == "failed"
         assert ledger._connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone()[0] == "3"
+        ).fetchone()[0] == str(ledger_module.LEDGER_SCHEMA_VERSION)
         assert "article_id" in {
             row["name"] for row in ledger._connection.execute("PRAGMA table_info(tasks)")
         }
@@ -2495,6 +2941,52 @@ def test_malformed_v2_config_is_wrapped_and_migration_rolls_back(tmp_path: Path)
         connection.close()
 
 
+def test_v3_migration_adds_empty_replay_and_target_adoption_history(tmp_path: Path) -> None:
+    path = tmp_path / "v3.sqlite3"
+    connection = sqlite3.connect(path)
+    ledger_module._execute_schema(connection, ledger_module._SCHEMA_V3)
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '3')")
+    connection.commit()
+    connection.close()
+
+    with RunLedger(path) as ledger:
+        version = ledger._connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in ledger._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert version == str(ledger_module.LEDGER_SCHEMA_VERSION)
+    assert {"merge_replays", "target_adoptions", "external_integrations"} <= tables
+
+
+def test_v3_migration_terminalizes_a_run_without_append_only_attempt_bases(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    path = ledger.path
+    ledger.close()
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE external_integrations")
+    connection.execute("DROP TABLE target_adoptions")
+    connection.execute("DROP TABLE merge_replays")
+    connection.execute("DROP TRIGGER attempts_identity_no_update")
+    connection.execute("DROP TRIGGER merge_items_identity_no_update")
+    connection.execute("UPDATE metadata SET value = '3' WHERE key = 'schema_version'")
+    connection.commit()
+    connection.close()
+
+    with RunLedger(path) as migrated:
+        run = migrated.get_run(run_id)
+        assert run.status == "failed"
+        assert run.stop_requested is False
+        assert run.detail == "v3 run cannot resume because attempt bases were not append-only"
+        with pytest.raises(InvalidTransition, match="cannot resume"):
+            migrated.resume_run(run_id, expected_generation=run.generation)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -2502,9 +2994,10 @@ def test_malformed_v2_config_is_wrapped_and_migration_rolls_back(tmp_path: Path)
         "missing-column",
         "missing-index",
         "missing-foreign-key",
+        "missing-replay-trigger",
     ),
 )
-def test_full_v3_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None:
+def test_full_v4_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None:
     path = tmp_path / f"{mutation}.sqlite3"
     connection = sqlite3.connect(path)
     script = ledger_module._SCHEMA
@@ -2518,14 +3011,20 @@ def test_full_v3_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None
         script = script.replace("    detail TEXT NOT NULL,\n    created_ns", "    created_ns", 1)
     elif mutation == "missing-index":
         script = script.replace("    UNIQUE(run_id, article_id, phase, number),\n", "")
-    else:
+    elif mutation == "missing-foreign-key":
         script = script.replace(
             "    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,",
             "    run_id TEXT NOT NULL,",
             1,
         )
+    else:
+        script = script.replace(
+            "CREATE TRIGGER IF NOT EXISTS merge_replays_no_delete BEFORE DELETE ON merge_replays\n"
+            "BEGIN SELECT RAISE(ABORT, 'merge replay history is append-only'); END;",
+            "",
+        )
     ledger_module._execute_schema(connection, script)
-    connection.execute("INSERT INTO metadata VALUES ('schema_version', '3')")
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '4')")
     connection.commit()
     connection.close()
 
@@ -2575,14 +3074,56 @@ def test_reopen_rejects_merge_target_that_does_not_match_attempt_base(tmp_path: 
     ledger, run_id = _running_ledger(tmp_path)
     queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
     path = ledger.path
-    ledger._connection.execute(
-        "UPDATE merge_items SET expected_target_oid = ? WHERE queue_item_id = ?",
-        ("a" * 40, queue_item_id),
-    )
+    with _disabled_triggers(ledger._connection, "merge_items_identity_no_update"):
+        ledger._connection.execute(
+            "UPDATE merge_items SET expected_target_oid = ? WHERE queue_item_id = ?",
+            ("a" * 40, queue_item_id),
+        )
     ledger.close()
 
     with pytest.raises(LedgerError, match="merge item binding is invalid"):
         RunLedger(path)
+
+
+def test_reopen_rejects_paired_attempt_base_and_merge_target_relabel(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+    path = ledger.path
+    with _disabled_triggers(
+        ledger._connection,
+        "attempts_identity_no_update",
+        "merge_items_identity_no_update",
+    ):
+        ledger._connection.execute(
+            "UPDATE attempts SET base_oid = ? WHERE attempt_id = 'attempt-1'",
+            ("a" * 40,),
+        )
+        ledger._connection.execute(
+            "UPDATE merge_items SET expected_target_oid = ? WHERE queue_item_id = ?",
+            ("a" * 40, queue_item_id),
+        )
+    ledger.close()
+
+    with pytest.raises(LedgerError, match="attempt start event disagrees with its row"):
+        RunLedger(path)
+
+
+def test_attempt_and_merge_identity_updates_are_rejected_immediately(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+        with pytest.raises(sqlite3.IntegrityError, match="attempt identity is immutable"):
+            ledger._connection.execute(
+                "UPDATE attempts SET base_oid = ? WHERE attempt_id = 'attempt-1'",
+                ("a" * 40,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="merge item identity is immutable"):
+            ledger._connection.execute(
+                "UPDATE merge_items SET expected_target_oid = ? WHERE queue_item_id = ?",
+                ("a" * 40, queue_item_id),
+            )
+    finally:
+        ledger.close()
 
 
 @pytest.mark.parametrize(
@@ -2609,10 +3150,11 @@ def test_malformed_persisted_json_is_wrapped_and_rejected(
         )
     elif target == "claim":
         attempt = _begin(ledger, run_id, tmp_path)
-        ledger._connection.execute(
-            "UPDATE attempts SET claim_token_json = ? WHERE attempt_id = ?",
-            (value, attempt.attempt_id),
-        )
+        with _disabled_triggers(ledger._connection, "attempts_identity_no_update"):
+            ledger._connection.execute(
+                "UPDATE attempts SET claim_token_json = ? WHERE attempt_id = ?",
+                (value, attempt.attempt_id),
+            )
     else:
         ledger._connection.execute(
             "INSERT INTO events(run_id, kind, payload_json, created_ns) VALUES (?, ?, ?, ?)",
