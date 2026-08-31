@@ -1923,6 +1923,21 @@ class RunLedger:
                 raise InvalidTransition(f"merge item is already {item['status']}")
             if item["status"] == "stale" and status != "failed":
                 raise InvalidTransition("a stale merge item may only be replayed or failed")
+            if item["status"] == "stale" and status == "failed":
+                unresolved_replay = self._connection.execute(
+                    """
+                    SELECT replay_id FROM merge_replays
+                    WHERE queue_item_id = ?
+                        AND status NOT IN ('integrated','stale','failed')
+                    LIMIT 1
+                    """,
+                    (queue_item_id,),
+                ).fetchone()
+                if unresolved_replay is not None:
+                    raise InvalidTransition(
+                        "merge item cannot fail while a replay is unresolved: "
+                        f"{unresolved_replay['replay_id']}"
+                    )
             cursor = self._connection.execute(
                 """
                 UPDATE merge_items SET status = ?, detail = ?, generation = generation + 1, updated_ns = ?

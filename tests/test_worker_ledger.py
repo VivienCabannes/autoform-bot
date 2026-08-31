@@ -2017,6 +2017,15 @@ def test_replay_is_generation_fenced_stop_safe_and_fail_closed_after_uncertainty
             expected_item_generation=ledger.get_merge_item(queue_item_id).generation,
         )
 
+        with pytest.raises(InvalidTransition, match="replay is unresolved"):
+            ledger.transition_merge_item(
+                queue_item_id,
+                "failed",
+                expected_generation=ledger.get_merge_item(queue_item_id).generation,
+                expected_run_generation=adopted.generation,
+                detail="cannot discard a prepared replay",
+            )
+
         with pytest.raises(GenerationConflict, match="merge replay"):
             ledger.transition_merge_replay(
                 replay.replay_id,
@@ -2033,6 +2042,14 @@ def test_replay_is_generation_fenced_stop_safe_and_fail_closed_after_uncertainty
             detail="remote outcome cannot be classified",
         )
         assert uncertain.status == "uncertain"
+        with pytest.raises(InvalidTransition, match="replay is unresolved"):
+            ledger.transition_merge_item(
+                queue_item_id,
+                "failed",
+                expected_generation=ledger.get_merge_item(queue_item_id).generation,
+                expected_run_generation=adopted.generation,
+                detail="cannot discard an uncertain replay",
+            )
         with pytest.raises(InvalidTransition, match="uncertain replay outcome"):
             ledger.prepare_merge_replay(
                 queue_item_id,
