@@ -27,6 +27,15 @@ from .repository import (
     WorktreeReceipt,
     WorktreeUncertain,
 )
+from .reviewer import (
+    CandidateReviewRequest,
+    CandidateReviewResult,
+    ReviewAdapterFactory,
+    ReviewError,
+    review_candidate,
+    reviewer_factory,
+    validate_independent_backends,
+)
 from .scheduler import (
     AttemptOutcome,
     AttemptResult,
@@ -47,6 +56,8 @@ __all__ = [
     "AttemptResult",
     "AttemptRecord",
     "CancellationSignal",
+    "CandidateReviewRequest",
+    "CandidateReviewResult",
     "CoordinatorLock",
     "EventRecord",
     "Executor",
@@ -64,6 +75,8 @@ __all__ = [
     "RemoteDrift",
     "RemoteMergeQueue",
     "RepositoryError",
+    "ReviewAdapterFactory",
+    "ReviewError",
     "RoundResult",
     "RunIdentity",
     "RunLedger",
@@ -76,4 +89,7 @@ __all__ = [
     "WorktreeReceipt",
     "WorktreeUncertain",
     "backend_factory",
+    "review_candidate",
+    "reviewer_factory",
+    "validate_independent_backends",
 ]
