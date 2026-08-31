@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -76,6 +77,7 @@ class RunConfig:
     target_ref: str
     remote: str
     backend: str
+    reviewer_backend: str
     start_oid: str
     plugin_version: str
     toolchain_fingerprint: str
@@ -83,6 +85,11 @@ class RunConfig:
     execution_input_sha256: str
     source_artifacts_sha256: str
     gate_policy_version: str
+    max_attempts: int
+    max_steers: int
+    timeout_seconds: float
+    claim_ttl_seconds: float
+    heartbeat_interval_seconds: float
     schema_version: int = RUN_CONFIG_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -94,6 +101,9 @@ class RunConfig:
             _validate_nonempty(field.replace("_", " "), getattr(self, field))
         _validate_branch_ref(self.target_ref)
         _validate_identifier("backend", self.backend)
+        _validate_identifier("reviewer backend", self.reviewer_backend)
+        if self.reviewer_backend == self.backend:
+            raise LedgerError("reviewer backend must differ from the prover backend")
         _validate_oid(self.start_oid)
         for field in (
             "toolchain_fingerprint",
@@ -102,6 +112,18 @@ class RunConfig:
             "source_artifacts_sha256",
         ):
             _validate_sha256(getattr(self, field), field)
+        if type(self.max_attempts) is not int or self.max_attempts < 1:
+            raise LedgerError("max attempts must be an integer of at least one")
+        if type(self.max_steers) is not int or self.max_steers < 0:
+            raise LedgerError("max steers must be a nonnegative integer")
+        timeout = _positive_finite_number("timeout", self.timeout_seconds)
+        claim_ttl = _positive_finite_number("claim TTL", self.claim_ttl_seconds)
+        heartbeat = _positive_finite_number("heartbeat interval", self.heartbeat_interval_seconds)
+        if heartbeat >= claim_ttl:
+            raise LedgerError("heartbeat interval must be shorter than claim TTL")
+        object.__setattr__(self, "timeout_seconds", timeout)
+        object.__setattr__(self, "claim_ttl_seconds", claim_ttl)
+        object.__setattr__(self, "heartbeat_interval_seconds", heartbeat)
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -523,10 +545,22 @@ class RunLedger:
             self._append_event(run_id, "run.resumed", {"from": current["status"]}, now)
         return self.get_run(run_id)
 
-    def add_tasks(self, run_id: str, tasks: Iterable[tuple[str, str]]) -> tuple[TaskRecord, ...]:
+    def add_tasks(
+        self,
+        run_id: str,
+        tasks: Iterable[tuple[str, str]],
+        *,
+        expected_generation: int,
+    ) -> tuple[TaskRecord, ...]:
         canonical = sorted(set(tasks))
+        if not canonical:
+            raise LedgerError("at least one task is required")
         with self._transaction():
             run = self._run_row(run_id)
+            if run["generation"] != expected_generation:
+                raise GenerationConflict(
+                    f"run {run_id} is at generation {run['generation']}, expected {expected_generation}"
+                )
             if run["status"] != "created":
                 raise InvalidTransition(f"cannot add tasks to {run['status']} run")
             now = self._clock_ns()
@@ -547,6 +581,15 @@ class RunLedger:
                 except sqlite3.IntegrityError as error:
                     raise LedgerError(f"duplicate task: {article_id}:{phase}") from error
                 self._append_event(run_id, "task.created", {"article_id": article_id, "phase": phase}, now)
+            cursor = self._connection.execute(
+                """
+                UPDATE runs SET generation = generation + 1, updated_ns = ?
+                WHERE run_id = ? AND generation = ?
+                """,
+                (now, run_id, expected_generation),
+            )
+            if cursor.rowcount != 1:
+                raise GenerationConflict(f"run changed while adding tasks: {run_id}")
         return self.tasks(run_id)
 
     def tasks(self, run_id: str) -> tuple[TaskRecord, ...]:
@@ -586,7 +629,7 @@ class RunLedger:
             if (
                 task["status"] == status
                 and task["detail"] == detail
-                and tuple(json.loads(task["blocked_by_json"])) == blockers
+                and _task_record(task).blocked_by == blockers
             ):
                 return _task_record(task)
             if task["generation"] != expected_generation:
@@ -762,8 +805,68 @@ class RunLedger:
         attempt_id: str,
         outcome: str,
         *,
+        expected_generation: int,
+        expected_task_generation: int,
         detail: str = "",
         candidate_oid: str | None = None,
+    ) -> AttemptRecord:
+        return self._finish_attempt(
+            attempt_id,
+            outcome,
+            expected_generation=expected_generation,
+            expected_task_generation=expected_task_generation,
+            detail=detail,
+            candidate_oid=candidate_oid,
+            recovery_evidence=None,
+        )
+
+    def recover_attempt(
+        self,
+        attempt_id: str,
+        outcome: str,
+        *,
+        expected_generation: int,
+        expected_task_generation: int,
+        observed_worktree_path: str | Path,
+        observed_base_oid: str,
+        observed_head_oid: str,
+        detail: str,
+        candidate_oid: str | None = None,
+    ) -> AttemptRecord:
+        """Resolve one interrupted attempt after inspecting its repository worktree."""
+        _validate_oid(observed_base_oid)
+        _validate_oid(observed_head_oid)
+        evidence = {
+            "worktree_path": str(Path(observed_worktree_path).expanduser().resolve()),
+            "base_oid": observed_base_oid,
+            "head_oid": observed_head_oid,
+        }
+        if not detail.strip():
+            raise InvalidTransition("attempt recovery requires a nonempty detail")
+        if outcome == "candidate" and candidate_oid != observed_head_oid:
+            raise InvalidTransition("a recovered candidate must equal the inspected worktree HEAD")
+        if outcome != "candidate" and observed_head_oid != observed_base_oid:
+            raise InvalidTransition("a non-candidate recovery cannot discard an inspected commit")
+        return self._finish_attempt(
+            attempt_id,
+            outcome,
+            expected_generation=expected_generation,
+            expected_task_generation=expected_task_generation,
+            detail=detail,
+            candidate_oid=candidate_oid,
+            recovery_evidence=evidence,
+        )
+
+    def _finish_attempt(
+        self,
+        attempt_id: str,
+        outcome: str,
+        *,
+        expected_generation: int,
+        expected_task_generation: int,
+        detail: str,
+        candidate_oid: str | None,
+        recovery_evidence: Mapping[str, str] | None,
     ) -> AttemptRecord:
         if outcome not in _ATTEMPT_OUTCOMES:
             raise InvalidTransition(f"unknown attempt outcome: {outcome}")
@@ -776,6 +879,30 @@ class RunLedger:
         now = self._clock_ns()
         with self._transaction():
             attempt = self._attempt_row(attempt_id)
+            run = self._run_row(attempt["run_id"])
+            if run["generation"] != expected_generation:
+                raise GenerationConflict(
+                    f"run {attempt['run_id']} is at generation {run['generation']}, "
+                    f"expected {expected_generation}"
+                )
+            if recovery_evidence is None:
+                if run["status"] != "running" or run["stop_requested"]:
+                    raise InvalidTransition(f"run is not accepting attempt results: {run['status']}")
+            else:
+                if recovery_evidence["worktree_path"] != attempt["worktree_path"]:
+                    raise GenerationConflict("recovery inspected a different attempt worktree")
+                if recovery_evidence["base_oid"] != attempt["base_oid"]:
+                    raise GenerationConflict("recovery inspected a different attempt base")
+                if run["stop_requested"] and outcome != "stopped":
+                    raise InvalidTransition("a stop-requested run may recover an attempt only as stopped")
+                if run["status"] not in {"running", "stopped"}:
+                    raise InvalidTransition(f"cannot recover an attempt for a {run['status']} run")
+            task = self._task_row(attempt["run_id"], attempt["article_id"], attempt["phase"])
+            if task["generation"] != expected_task_generation:
+                raise GenerationConflict(
+                    f"task {attempt['article_id']}:{attempt['phase']} is at generation "
+                    f"{task['generation']}, expected {expected_task_generation}"
+                )
             if attempt["status"] != "running":
                 if (
                     attempt["status"] == outcome
@@ -784,6 +911,11 @@ class RunLedger:
                 ):
                     return self.get_attempt(attempt_id)
                 raise InvalidTransition(f"attempt is already {attempt['status']}")
+            if task["status"] != "running" or task["attempts"] != attempt["number"]:
+                raise GenerationConflict(
+                    f"task no longer names running attempt {attempt_id}: "
+                    f"{attempt['article_id']}:{attempt['phase']}"
+                )
             cursor = self._connection.execute(
                 """
                 UPDATE attempts SET status = ?, candidate_oid = ?, detail = ?, finished_ns = ?
@@ -797,6 +929,7 @@ class RunLedger:
                 """
                 UPDATE tasks SET status = ?, candidate_oid = ?, detail = ?, generation = generation + 1
                 WHERE run_id = ? AND article_id = ? AND phase = ? AND status = 'running'
+                    AND attempts = ? AND generation = ?
                 """,
                 (
                     outcome,
@@ -805,16 +938,26 @@ class RunLedger:
                     attempt["run_id"],
                     attempt["article_id"],
                     attempt["phase"],
+                    attempt["number"],
+                    expected_task_generation,
                 ),
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(
                     f"task changed while finishing attempt: {attempt['article_id']}:{attempt['phase']}"
                 )
+            payload: dict[str, object] = {
+                "attempt_id": attempt_id,
+                "outcome": outcome,
+                "candidate_oid": candidate_oid,
+                "detail": detail,
+            }
+            if recovery_evidence is not None:
+                payload["repository_inspection"] = dict(recovery_evidence)
             self._append_event(
                 attempt["run_id"],
-                "attempt.finished",
-                {"attempt_id": attempt_id, "outcome": outcome, "candidate_oid": candidate_oid, "detail": detail},
+                "attempt.recovered" if recovery_evidence is not None else "attempt.finished",
+                payload,
                 now,
             )
         return self.get_attempt(attempt_id)
@@ -840,51 +983,8 @@ class RunLedger:
         return tuple(_attempt_record(row) for row in rows)
 
     def recover_interrupted(self, run_id: str) -> tuple[str, ...]:
-        """Make every persisted running attempt explicitly retryable or stopped."""
-        recovered: list[str] = []
-        now = self._clock_ns()
-        with self._transaction():
-            run = self._run_row(run_id)
-            rows = self._connection.execute(
-                "SELECT * FROM attempts WHERE run_id = ? AND status = 'running' ORDER BY attempt_id",
-                (run_id,),
-            ).fetchall()
-            task_status = "stopped" if run["stop_requested"] else "retrying"
-            for attempt in rows:
-                recovered.append(attempt["attempt_id"])
-                cursor = self._connection.execute(
-                    """
-                    UPDATE attempts SET status = 'interrupted', detail = ?, finished_ns = ?
-                    WHERE attempt_id = ? AND status = 'running'
-                    """,
-                    ("coordinator exited before recording a terminal result", now, attempt["attempt_id"]),
-                )
-                if cursor.rowcount != 1:
-                    continue
-                cursor = self._connection.execute(
-                    """
-                    UPDATE tasks SET status = ?, detail = ?, generation = generation + 1
-                    WHERE run_id = ? AND article_id = ? AND phase = ? AND status = 'running'
-                    """,
-                    (
-                        task_status,
-                        "previous attempt was interrupted",
-                        run_id,
-                        attempt["article_id"],
-                        attempt["phase"],
-                    ),
-                )
-                if cursor.rowcount != 1:
-                    raise GenerationConflict(
-                        f"task changed while recovering attempt: {attempt['article_id']}:{attempt['phase']}"
-                    )
-                self._append_event(
-                    run_id,
-                    "attempt.interrupted",
-                    {"attempt_id": attempt["attempt_id"], "next_task_status": task_status},
-                    now,
-                )
-        return tuple(recovered)
+        """Compatibility alias for read-only interrupted-attempt inspection."""
+        return tuple(attempt.attempt_id for attempt in self.inspect_interrupted(run_id))
 
     def record_gate(
         self,
@@ -892,6 +992,7 @@ class RunLedger:
         name: str,
         passed: bool,
         *,
+        expected_generation: int,
         evidence_sha256: str,
         detail: str = "",
     ) -> GateRecord:
@@ -902,6 +1003,7 @@ class RunLedger:
         now = self._clock_ns()
         with self._transaction():
             attempt = self._attempt_row(attempt_id)
+            self._active_run_row(attempt["run_id"], expected_generation)
             existing = self._connection.execute(
                 "SELECT * FROM gates WHERE attempt_id = ? AND name = ?",
                 (attempt_id, name),
@@ -957,6 +1059,9 @@ class RunLedger:
         self,
         attempt_id: str,
         *,
+        expected_generation: int,
+        expected_task_generation: int,
+        candidate_oid: str,
         required_gates: Iterable[str],
         queue_ref: str,
         expected_target_oid: str,
@@ -969,19 +1074,32 @@ class RunLedger:
             _validate_identifier("gate name", name)
         _validate_identifier("queue ref", queue_ref)
         _validate_oid(expected_target_oid)
+        _validate_oid(candidate_oid)
         identifier = queue_item_id or uuid.uuid4().hex
         _validate_identifier("queue item id", identifier)
         now = self._clock_ns()
         with self._transaction():
             attempt = self._attempt_row(attempt_id)
-            if attempt["status"] != "candidate" or attempt["candidate_oid"] is None:
+            run = self._active_run_row(attempt["run_id"], expected_generation)
+            if attempt["status"] != "candidate" or attempt["candidate_oid"] != candidate_oid:
                 raise InvalidTransition("only a candidate attempt may enter the merge queue")
-            run = self._run_row(attempt["run_id"])
             if run["current_oid"] != expected_target_oid:
                 raise GenerationConflict(
                     f"run {attempt['run_id']} current OID is {run['current_oid']}, "
                     f"not merge base {expected_target_oid}"
                 )
+            task = self._task_row(attempt["run_id"], attempt["article_id"], attempt["phase"])
+            if task["generation"] != expected_task_generation:
+                raise GenerationConflict(
+                    f"task {attempt['article_id']}:{attempt['phase']} is at generation "
+                    f"{task['generation']}, expected {expected_task_generation}"
+                )
+            if (
+                task["status"] != "candidate"
+                or task["candidate_oid"] != candidate_oid
+                or task["attempts"] != attempt["number"]
+            ):
+                raise GenerationConflict(f"task no longer names candidate attempt {attempt_id}")
             rows = self._connection.execute(
                 "SELECT name, passed, evidence_sha256 FROM gates WHERE attempt_id = ?",
                 (attempt_id,),
@@ -1006,7 +1124,7 @@ class RunLedger:
                     attempt_id,
                     queue_ref,
                     expected_target_oid,
-                    attempt["candidate_oid"],
+                    candidate_oid,
                     now,
                     now,
                 ),
@@ -1015,8 +1133,16 @@ class RunLedger:
                 """
                 UPDATE tasks SET status = 'queued', generation = generation + 1
                 WHERE run_id = ? AND article_id = ? AND phase = ? AND status = 'candidate'
+                    AND generation = ? AND attempts = ? AND candidate_oid = ?
                 """,
-                (attempt["run_id"], attempt["article_id"], attempt["phase"]),
+                (
+                    attempt["run_id"],
+                    attempt["article_id"],
+                    attempt["phase"],
+                    expected_task_generation,
+                    attempt["number"],
+                    candidate_oid,
+                ),
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(
@@ -1112,17 +1238,15 @@ class RunLedger:
         *,
         integrated_oid: str,
         expected_generation: int,
-        expected_item_generation: int | None = None,
+        expected_item_generation: int,
     ) -> RunRecord:
         _validate_oid(integrated_oid)
         now = self._clock_ns()
         with self._transaction():
             item = self._merge_item_row(queue_item_id)
-            if item["status"] == "integrated" and item["integrated_oid"] == integrated_oid:
-                return self.get_run(item["run_id"])
-            if item["status"] in _MERGE_ITEM_TERMINAL_STATUSES:
-                raise InvalidTransition(f"merge item is already {item['status']}")
-            if expected_item_generation is not None and item["generation"] != expected_item_generation:
+            if integrated_oid != item["candidate_oid"]:
+                raise InvalidTransition("integrated OID must equal the queued candidate OID")
+            if item["generation"] != expected_item_generation:
                 raise GenerationConflict(
                     f"merge item {queue_item_id} is at generation {item['generation']}, "
                     f"expected {expected_item_generation}"
@@ -1132,25 +1256,44 @@ class RunLedger:
                 raise GenerationConflict(
                     f"run {item['run_id']} is at generation {run['generation']}, expected {expected_generation}"
                 )
+            if item["status"] == "integrated" and item["integrated_oid"] == integrated_oid:
+                return self.get_run(item["run_id"])
+            if item["status"] in _MERGE_ITEM_TERMINAL_STATUSES:
+                raise InvalidTransition(f"merge item is already {item['status']}")
             if run["current_oid"] != item["expected_target_oid"]:
                 raise GenerationConflict(
                     f"run {item['run_id']} current OID changed from merge base {item['expected_target_oid']} "
                     f"to {run['current_oid']}"
                 )
             attempt = self._attempt_row(item["attempt_id"])
+            if (
+                attempt["run_id"] != item["run_id"]
+                or attempt["candidate_oid"] != item["candidate_oid"]
+            ):
+                raise LedgerError(f"merge item candidate disagrees with attempt: {queue_item_id}")
             cursor = self._connection.execute(
                 """
                 UPDATE merge_items SET status = 'integrated', integrated_oid = ?,
                     generation = generation + 1, updated_ns = ?
-                WHERE queue_item_id = ? AND generation = ? AND status = ?
+                WHERE queue_item_id = ? AND generation = ? AND status = ? AND candidate_oid = ?
                 """,
-                (integrated_oid, now, queue_item_id, item["generation"], item["status"]),
+                (
+                    integrated_oid,
+                    now,
+                    queue_item_id,
+                    expected_item_generation,
+                    item["status"],
+                    item["candidate_oid"],
+                ),
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(f"merge item changed while integrating: {queue_item_id}")
             cursor = self._connection.execute(
-                "UPDATE attempts SET status = 'integrated' WHERE attempt_id = ? AND status = 'candidate'",
-                (item["attempt_id"],),
+                """
+                UPDATE attempts SET status = 'integrated'
+                WHERE attempt_id = ? AND status = 'candidate' AND candidate_oid = ?
+                """,
+                (item["attempt_id"], item["candidate_oid"]),
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(f"attempt changed while integrating: {item['attempt_id']}")
@@ -1158,8 +1301,16 @@ class RunLedger:
                 """
                 UPDATE tasks SET status = 'integrated', integrated_oid = ?, generation = generation + 1
                 WHERE run_id = ? AND article_id = ? AND phase = ? AND status = 'queued'
+                    AND attempts = ? AND candidate_oid = ?
                 """,
-                (integrated_oid, item["run_id"], attempt["article_id"], attempt["phase"]),
+                (
+                    integrated_oid,
+                    item["run_id"],
+                    attempt["article_id"],
+                    attempt["phase"],
+                    attempt["number"],
+                    item["candidate_oid"],
+                ),
             )
             if cursor.rowcount != 1:
                 raise GenerationConflict(
@@ -1243,16 +1394,7 @@ class RunLedger:
             "SELECT * FROM events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
             (run_id, after),
         ).fetchall()
-        return tuple(
-            EventRecord(
-                sequence=row["sequence"],
-                run_id=row["run_id"],
-                kind=row["kind"],
-                payload=json.loads(row["payload_json"]),
-                created_ns=row["created_ns"],
-            )
-            for row in rows
-        )
+        return tuple(_event_record(row) for row in rows)
 
     def put_artifact(self, kind: str, content: bytes) -> str:
         _validate_identifier("artifact kind", kind)
@@ -1314,37 +1456,300 @@ class RunLedger:
         self._connection.execute("PRAGMA busy_timeout = 5000")
 
     def _initialize_schema(self) -> None:
-        has_metadata = self._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
-        ).fetchone()
-        if has_metadata:
-            row = self._connection.execute(
+        try:
+            tables = {
+                row["name"]
+                for row in self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            if not tables:
+                with self._transaction():
+                    _execute_schema(self._connection, _SCHEMA)
+                    self._connection.execute(
+                        "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
+                        (str(LEDGER_SCHEMA_VERSION),),
+                    )
+            else:
+                if "metadata" not in tables:
+                    raise LedgerError("ledger has tables but no schema metadata")
+                row = self._connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+                if row is None:
+                    raise LedgerError("ledger schema version is missing")
+                if row["value"] == "1":
+                    self._migrate_v1()
+                elif row["value"] != str(LEDGER_SCHEMA_VERSION):
+                    raise LedgerError(
+                        f"unsupported ledger schema {row['value']}; expected {LEDGER_SCHEMA_VERSION}"
+                    )
+            _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
+            self._validate_contents()
+        except LedgerError:
+            raise
+        except sqlite3.DatabaseError as error:
+            raise LedgerError(f"ledger database is malformed: {self.path}") from error
+
+    def _migrate_v1(self) -> None:
+        renamed = (
+            "runs",
+            "tasks",
+            "attempts",
+            "gates",
+            "merge_items",
+            "events",
+            "artifacts",
+        )
+        with self._transaction():
+            version = self._connection.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            if row is None:
-                raise LedgerError("ledger schema version is missing")
-            if row["value"] != str(LEDGER_SCHEMA_VERSION):
-                raise LedgerError(
-                    f"unsupported ledger schema {row['value']}; expected {LEDGER_SCHEMA_VERSION}"
+            if version is not None and version["value"] == str(LEDGER_SCHEMA_VERSION):
+                return
+            if version is None or version["value"] != "1":
+                raise LedgerError("ledger schema changed while preparing the v1 migration")
+            _verify_schema(self._connection, _SCHEMA_V1, version=1)
+            migrations = self._prepare_v1_run_migrations()
+            self._connection.execute("DROP TRIGGER events_no_update")
+            self._connection.execute("DROP TRIGGER events_no_delete")
+            for table in renamed:
+                self._connection.execute(f"ALTER TABLE {table} RENAME TO {table}_v1")
+            _execute_schema(self._connection, _SCHEMA)
+            for migration in migrations:
+                self._connection.execute(
+                    """
+                    INSERT INTO runs(
+                        run_id, identity_json, identity_sha256, config_json, config_sha256,
+                        status, generation, current_oid, stop_requested, detail, created_ns, updated_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    migration,
                 )
-        else:
-            existing = self._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchone()
-            if existing is not None:
-                raise LedgerError("ledger has tables but no schema metadata")
-        script = (
-            "BEGIN IMMEDIATE;\n"
-            + _SCHEMA
-            + "\nINSERT OR IGNORE INTO metadata(key, value) VALUES "
-            + f"('schema_version', '{LEDGER_SCHEMA_VERSION}');\nCOMMIT;"
-        )
-        try:
-            self._connection.executescript(script)
-        except BaseException:
-            if self._connection.in_transaction:
-                self._connection.execute("ROLLBACK")
-            raise
+            self._connection.execute(
+                """
+                INSERT INTO tasks(
+                    run_id, article_id, phase, status, attempts, generation,
+                    blocked_by_json, detail, candidate_oid, integrated_oid
+                )
+                SELECT run_id, node_id, phase, status, attempts, generation,
+                    blocked_by_json, detail, candidate_oid, integrated_oid
+                FROM tasks_v1
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO attempts(
+                    attempt_id, run_id, article_id, phase, number, status, worktree_path,
+                    branch, base_oid, backend, claim_key, claim_token_json, candidate_oid,
+                    detail, started_ns, finished_ns
+                )
+                SELECT attempt_id, run_id, node_id, phase, number, status, worktree_path,
+                    branch, base_oid, backend, claim_key, claim_token_json, candidate_oid,
+                    detail, started_ns, finished_ns
+                FROM attempts_v1
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO gates(attempt_id, name, passed, evidence_sha256, detail, created_ns)
+                SELECT attempt_id, name, passed, evidence_sha256, detail, created_ns FROM gates_v1
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO merge_items(
+                    queue_item_id, run_id, attempt_id, queue_ref, expected_target_oid,
+                    candidate_oid, status, generation, integrated_oid, detail, created_ns, updated_ns
+                )
+                SELECT queue_item_id, run_id, attempt_id, queue_ref, expected_target_oid,
+                    candidate_oid, status, 0, integrated_oid, '', created_ns, updated_ns
+                FROM merge_items_v1
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO events(sequence, run_id, kind, payload_json, created_ns)
+                SELECT sequence, run_id, kind, payload_json, created_ns FROM events_v1
+                """
+            )
+            self._connection.execute(
+                """
+                INSERT INTO artifacts(sha256, kind, size, relative_path, created_ns)
+                SELECT sha256, kind, size, relative_path, created_ns FROM artifacts_v1
+                """
+            )
+            for row in self._connection.execute(
+                "SELECT run_id, status, config_sha256 FROM runs ORDER BY run_id"
+            ).fetchall():
+                self._append_event(
+                    row["run_id"],
+                    "ledger.migrated",
+                    {
+                        "config_sha256": row["config_sha256"],
+                        "from_schema": 1,
+                        "status": row["status"],
+                        "to_schema": LEDGER_SCHEMA_VERSION,
+                    },
+                    self._clock_ns(),
+                )
+            for table in reversed(renamed):
+                self._connection.execute(f"DROP TABLE {table}_v1")
+            self._connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(LEDGER_SCHEMA_VERSION),),
+            )
+            _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
+            self._validate_content_rows()
+
+    def _prepare_v1_run_migrations(self) -> tuple[tuple[object, ...], ...]:
+        prepared: list[tuple[object, ...]] = []
+        rows = self._connection.execute("SELECT * FROM runs ORDER BY run_id").fetchall()
+        for row in rows:
+            run_id = row["run_id"]
+            values = _decode_json_object(row["identity_json"], f"v1 run identity {run_id}")
+            expected_fields = {
+                "repository_id",
+                "project_root",
+                "target_ref",
+                "base_oid",
+                "runtime_revision",
+                "coverage_revision",
+                "source_artifact_sha256",
+                "plugin_revision",
+                "toolchain_fingerprint",
+                "execution_input_sha256",
+            }
+            if set(values) != expected_fields or any(not isinstance(value, str) for value in values.values()):
+                raise LedgerError(f"v1 run identity is invalid: {run_id}")
+            legacy_sha = hashlib.sha256(_json_bytes(values)).hexdigest()
+            if row["identity_sha256"] != legacy_sha:
+                raise LedgerError(f"v1 run identity is inconsistent: {run_id}")
+            base_oid = values["base_oid"]
+            _validate_oid(base_oid)  # type: ignore[arg-type]
+            backends = {
+                backend_row["backend"]
+                for backend_row in self._connection.execute(
+                    "SELECT DISTINCT backend FROM attempts WHERE run_id = ?",
+                    (run_id,),
+                ).fetchall()
+            }
+            if len(backends) > 1:
+                raise LedgerError(f"v1 run used more than one prover backend: {run_id}")
+            backend = next(iter(backends), "claude")
+            reviewer_backend = "claude" if backend != "claude" else "codex"
+            # V1 did not persist these controller inputs. Historical defaults make the
+            # archived record readable, while the terminal status below prevents resume.
+            config = RunConfig(
+                repository_id=values["repository_id"],  # type: ignore[arg-type]
+                target_ref=values["target_ref"],  # type: ignore[arg-type]
+                remote=values["repository_id"],  # type: ignore[arg-type]
+                backend=backend,
+                reviewer_backend=reviewer_backend,
+                start_oid=base_oid,  # type: ignore[arg-type]
+                plugin_version=values["plugin_revision"],  # type: ignore[arg-type]
+                toolchain_fingerprint=values["toolchain_fingerprint"],  # type: ignore[arg-type]
+                coverage_contract_sha256=values["coverage_revision"],  # type: ignore[arg-type]
+                execution_input_sha256=values["execution_input_sha256"],  # type: ignore[arg-type]
+                source_artifacts_sha256=values["source_artifact_sha256"],  # type: ignore[arg-type]
+                gate_policy_version="legacy-v1",
+                max_attempts=3,
+                max_steers=3,
+                timeout_seconds=1800.0,
+                claim_ttl_seconds=1500.0,
+                heartbeat_interval_seconds=300.0,
+            )
+            identity = RunIdentity(**values, config_sha256=config.sha256)  # type: ignore[arg-type]
+            _validate_identity(identity)
+            _validate_config_binding(identity, config)
+            current_oid = base_oid
+            integrated = self._connection.execute(
+                """
+                SELECT expected_target_oid, candidate_oid, integrated_oid
+                FROM merge_items
+                WHERE run_id = ? AND status = 'integrated'
+                ORDER BY created_ns, queue_item_id
+                """,
+                (run_id,),
+            ).fetchall()
+            for item in integrated:
+                if (
+                    item["expected_target_oid"] != current_oid
+                    or item["candidate_oid"] != item["integrated_oid"]
+                ):
+                    raise LedgerError(f"v1 integration history is ambiguous: {run_id}")
+                current_oid = item["candidate_oid"]
+            status = row["status"]
+            detail = row["detail"]
+            stop_requested = row["stop_requested"]
+            if status not in {"complete", "failed"}:
+                status = "failed"
+                stop_requested = 0
+                detail = "v1 run cannot resume because its controller settings were not persisted"
+            prepared.append(
+                (
+                    run_id,
+                    _json_text(identity.as_dict()),
+                    identity.sha256,
+                    _json_text(config.as_dict()),
+                    config.sha256,
+                    status,
+                    row["generation"],
+                    current_oid,
+                    stop_requested,
+                    detail,
+                    row["created_ns"],
+                    row["updated_ns"],
+                )
+            )
+        return tuple(prepared)
+
+    def _validate_contents(self) -> None:
+        with self._read_transaction():
+            self._validate_content_rows()
+
+    def _validate_content_rows(self) -> None:
+        run_backends: dict[str, str] = {}
+        for row in self._connection.execute("SELECT * FROM runs").fetchall():
+            run = _run_record(row)
+            run_backends[run.run_id] = run.config.backend
+        task_attempts: dict[tuple[str, str, str], int] = {}
+        for row in self._connection.execute("SELECT * FROM tasks").fetchall():
+            task = _task_record(row)
+            task_attempts[(task.run_id, task.article_id, task.phase)] = task.attempts
+        for row in self._connection.execute("SELECT * FROM attempts").fetchall():
+            attempt = _attempt_record(row)
+            task_key = (attempt.run_id, attempt.article_id, attempt.phase)
+            if attempt.number > task_attempts[task_key] or attempt.backend != run_backends[attempt.run_id]:
+                raise LedgerError(f"attempt binding is invalid: {attempt.attempt_id}")
+        for row in self._connection.execute("SELECT * FROM gates").fetchall():
+            _gate_record(row)
+        for row in self._connection.execute("SELECT * FROM merge_items").fetchall():
+            _merge_item_record(row)
+        for row in self._connection.execute("SELECT * FROM events").fetchall():
+            _event_record(row)
+        for row in self._connection.execute("SELECT * FROM artifacts").fetchall():
+            _validate_artifact_row(row)
+        bad_gate = self._connection.execute(
+            """
+            SELECT gates.attempt_id, gates.name FROM gates
+            LEFT JOIN artifacts ON artifacts.sha256 = gates.evidence_sha256
+            WHERE artifacts.sha256 IS NULL LIMIT 1
+            """
+        ).fetchone()
+        if bad_gate is not None:
+            raise LedgerError(f"gate evidence is missing: {bad_gate['attempt_id']}:{bad_gate['name']}")
+        bad_merge = self._connection.execute(
+            """
+            SELECT merge_items.queue_item_id FROM merge_items
+            JOIN attempts USING(attempt_id)
+            WHERE merge_items.run_id != attempts.run_id
+                OR merge_items.candidate_oid != attempts.candidate_oid
+            LIMIT 1
+            """
+        ).fetchone()
+        if bad_merge is not None:
+            raise LedgerError(f"merge item binding is invalid: {bad_merge['queue_item_id']}")
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -1373,6 +1778,18 @@ class RunLedger:
         if row is None:
             raise LedgerError(f"unknown run: {run_id}")
         return row
+
+    def _active_run_row(self, run_id: str, expected_generation: int) -> sqlite3.Row:
+        run = self._run_row(run_id)
+        if run["generation"] != expected_generation:
+            raise GenerationConflict(
+                f"run {run_id} is at generation {run['generation']}, expected {expected_generation}"
+            )
+        if run["stop_requested"]:
+            raise InvalidTransition("run has a pending stop request")
+        if run["status"] != "running":
+            raise InvalidTransition(f"run is not accepting mutations: {run['status']}")
+        return run
 
     def _task_row(self, run_id: str, article_id: str, phase: str) -> sqlite3.Row:
         row = self._connection.execute(
@@ -1407,17 +1824,15 @@ class RunLedger:
 def _run_record(row: sqlite3.Row) -> RunRecord:
     run_id = row["run_id"]
     try:
-        identity_values = json.loads(row["identity_json"])
-        config_values = json.loads(row["config_json"])
-        if not isinstance(identity_values, dict) or not isinstance(config_values, dict):
-            raise TypeError("run identity and config must be JSON objects")
-        if _json_text(identity_values) != row["identity_json"]:
-            raise ValueError("identity JSON is not canonical")
-        if _json_text(config_values) != row["config_json"]:
-            raise ValueError("config JSON is not canonical")
+        identity_values = _decode_json_object(row["identity_json"], f"run identity {run_id}")
+        config_values = _decode_json_object(row["config_json"], f"run config {run_id}")
         identity = RunIdentity(**identity_values)
         config = RunConfig(**config_values)
-    except (KeyError, TypeError, ValueError) as error:
+        if _json_text(identity.as_dict()) != row["identity_json"]:
+            raise LedgerError("run identity fields are incomplete")
+        if _json_text(config.as_dict()) != row["config_json"]:
+            raise LedgerError("run config fields are incomplete")
+    except (KeyError, TypeError, ValueError, LedgerError) as error:
         raise LedgerError(f"run identity or config is invalid: {run_id}") from error
     _validate_identity(identity)
     _validate_config_binding(identity, config)
@@ -1425,7 +1840,17 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
         raise LedgerError(f"run identity is inconsistent: {run_id}")
     if config.sha256 != row["config_sha256"]:
         raise LedgerError(f"run config is inconsistent: {run_id}")
+    _validate_identifier("run id", run_id)
     _validate_oid(row["current_oid"])
+    if row["status"] not in _RUN_STATUSES:
+        raise LedgerError(f"run status is invalid: {run_id}")
+    _validate_nonnegative_integer("run generation", row["generation"])
+    if type(row["stop_requested"]) is not int or row["stop_requested"] not in (0, 1):
+        raise LedgerError(f"run stop flag is invalid: {run_id}")
+    _validate_timestamp("run creation time", row["created_ns"])
+    _validate_timestamp("run update time", row["updated_ns"])
+    if row["updated_ns"] < row["created_ns"]:
+        raise LedgerError(f"run timestamps are inconsistent: {run_id}")
     return RunRecord(
         run_id=run_id,
         identity=identity,
@@ -1443,6 +1868,26 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
 
 
 def _task_record(row: sqlite3.Row) -> TaskRecord:
+    label = f"task {row['run_id']}:{row['article_id']}:{row['phase']}"
+    blockers = _decode_json_array(row["blocked_by_json"], f"{label} blockers")
+    if any(not isinstance(blocker, str) for blocker in blockers):
+        raise LedgerError(f"{label} blockers must contain only article IDs")
+    canonical_blockers = tuple(sorted(set(blockers)))
+    if tuple(blockers) != canonical_blockers:
+        raise LedgerError(f"{label} blockers must be sorted and unique")
+    for blocker in canonical_blockers:
+        _validate_article_id(blocker)
+    _validate_article_id(row["article_id"])
+    if row["phase"] not in _PHASES or row["status"] not in _TASK_STATUSES:
+        raise LedgerError(f"{label} lifecycle value is invalid")
+    _validate_nonnegative_integer(f"{label} attempts", row["attempts"])
+    _validate_nonnegative_integer(f"{label} generation", row["generation"])
+    _validate_optional_oid(row["candidate_oid"])
+    _validate_optional_oid(row["integrated_oid"])
+    if row["status"] in {"candidate", "queued", "integrated"} and row["candidate_oid"] is None:
+        raise LedgerError(f"{label} is missing its candidate OID")
+    if row["status"] == "integrated" and row["integrated_oid"] != row["candidate_oid"]:
+        raise LedgerError(f"{label} integrated OID does not match its candidate")
     return TaskRecord(
         run_id=row["run_id"],
         article_id=row["article_id"],
@@ -1450,7 +1895,7 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
         status=row["status"],
         attempts=row["attempts"],
         generation=row["generation"],
-        blocked_by=tuple(json.loads(row["blocked_by_json"])),
+        blocked_by=canonical_blockers,
         detail=row["detail"],
         candidate_oid=row["candidate_oid"],
         integrated_oid=row["integrated_oid"],
@@ -1458,6 +1903,41 @@ def _task_record(row: sqlite3.Row) -> TaskRecord:
 
 
 def _attempt_record(row: sqlite3.Row) -> AttemptRecord:
+    label = f"attempt {row['attempt_id']}"
+    claim_token = _decode_json_object(row["claim_token_json"], f"{label} claim token")
+    _validate_article_id(row["article_id"])
+    if row["phase"] not in _PHASES or row["status"] not in {
+        "running",
+        "candidate",
+        "retrying",
+        "failed",
+        "stopped",
+        "interrupted",
+        "integrated",
+    }:
+        raise LedgerError(f"{label} lifecycle value is invalid")
+    if type(row["number"]) is not int or row["number"] < 1:
+        raise LedgerError(f"{label} number is invalid")
+    _validate_identifier("attempt id", row["attempt_id"])
+    _validate_identifier("attempt branch", row["branch"])
+    _validate_identifier("attempt backend", row["backend"])
+    if row["claim_key"] != author_claim_key(row["article_id"]):
+        raise LedgerError(f"{label} claim key is not anchored to its article ID")
+    if not Path(row["worktree_path"]).is_absolute():
+        raise LedgerError(f"{label} worktree path must be absolute")
+    _validate_oid(row["base_oid"])
+    _validate_optional_oid(row["candidate_oid"])
+    _validate_timestamp(f"{label} start time", row["started_ns"])
+    if row["finished_ns"] is not None:
+        _validate_timestamp(f"{label} finish time", row["finished_ns"])
+        if row["finished_ns"] < row["started_ns"]:
+            raise LedgerError(f"{label} timestamps are inconsistent")
+    if row["status"] == "running" and row["finished_ns"] is not None:
+        raise LedgerError(f"{label} is running with a finish time")
+    if row["status"] != "running" and row["finished_ns"] is None:
+        raise LedgerError(f"{label} is finished without a finish time")
+    if row["status"] in {"candidate", "integrated"} and row["candidate_oid"] is None:
+        raise LedgerError(f"{label} is missing its candidate OID")
     return AttemptRecord(
         attempt_id=row["attempt_id"],
         run_id=row["run_id"],
@@ -1470,7 +1950,7 @@ def _attempt_record(row: sqlite3.Row) -> AttemptRecord:
         base_oid=row["base_oid"],
         backend=row["backend"],
         claim_key=row["claim_key"],
-        claim_token=json.loads(row["claim_token_json"]),
+        claim_token=claim_token,
         candidate_oid=row["candidate_oid"],
         detail=row["detail"],
         started_ns=row["started_ns"],
@@ -1479,6 +1959,11 @@ def _attempt_record(row: sqlite3.Row) -> AttemptRecord:
 
 
 def _gate_record(row: sqlite3.Row) -> GateRecord:
+    _validate_identifier("gate name", row["name"])
+    if type(row["passed"]) is not int or row["passed"] not in (0, 1):
+        raise LedgerError(f"gate pass value is invalid: {row['attempt_id']}:{row['name']}")
+    _validate_sha256(row["evidence_sha256"], "gate evidence")
+    _validate_timestamp("gate creation time", row["created_ns"])
     return GateRecord(
         attempt_id=row["attempt_id"],
         name=row["name"],
@@ -1490,6 +1975,23 @@ def _gate_record(row: sqlite3.Row) -> GateRecord:
 
 
 def _merge_item_record(row: sqlite3.Row) -> MergeItemRecord:
+    label = f"merge item {row['queue_item_id']}"
+    _validate_identifier("queue item id", row["queue_item_id"])
+    _validate_identifier("queue ref", row["queue_ref"])
+    _validate_oid(row["expected_target_oid"])
+    _validate_oid(row["candidate_oid"])
+    _validate_optional_oid(row["integrated_oid"])
+    if row["status"] not in _MERGE_ITEM_STATUSES:
+        raise LedgerError(f"{label} status is invalid")
+    _validate_nonnegative_integer(f"{label} generation", row["generation"])
+    if row["status"] == "integrated" and row["integrated_oid"] != row["candidate_oid"]:
+        raise LedgerError(f"{label} integrated OID does not match its candidate")
+    if row["status"] != "integrated" and row["integrated_oid"] is not None:
+        raise LedgerError(f"{label} has an integrated OID before integration")
+    _validate_timestamp(f"{label} creation time", row["created_ns"])
+    _validate_timestamp(f"{label} update time", row["updated_ns"])
+    if row["updated_ns"] < row["created_ns"]:
+        raise LedgerError(f"{label} timestamps are inconsistent")
     return MergeItemRecord(
         queue_item_id=row["queue_item_id"],
         run_id=row["run_id"],
@@ -1503,6 +2005,22 @@ def _merge_item_record(row: sqlite3.Row) -> MergeItemRecord:
         detail=row["detail"],
         created_ns=row["created_ns"],
         updated_ns=row["updated_ns"],
+    )
+
+
+def _event_record(row: sqlite3.Row) -> EventRecord:
+    payload = _decode_json_object(row["payload_json"], f"event {row['sequence']} payload")
+    if type(row["sequence"]) is not int or row["sequence"] < 1:
+        raise LedgerError("event sequence is invalid")
+    _validate_nonempty("event run id", row["run_id"])
+    _validate_nonempty("event kind", row["kind"])
+    _validate_timestamp("event creation time", row["created_ns"])
+    return EventRecord(
+        sequence=row["sequence"],
+        run_id=row["run_id"],
+        kind=row["kind"],
+        payload=payload,
+        created_ns=row["created_ns"],
     )
 
 
@@ -1546,6 +2064,24 @@ def _validate_nonempty(label: str, value: object) -> None:
         raise LedgerError(f"{label} must be a nonempty canonical string")
 
 
+def _validate_nonnegative_integer(label: str, value: object) -> None:
+    if type(value) is not int or value < 0:
+        raise LedgerError(f"{label} must be a nonnegative integer")
+
+
+def _validate_timestamp(label: str, value: object) -> None:
+    _validate_nonnegative_integer(label, value)
+
+
+def _positive_finite_number(label: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LedgerError(f"{label} must be a finite positive number")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise LedgerError(f"{label} must be a finite positive number")
+    return normalized
+
+
 def _validate_branch_ref(value: str) -> None:
     _validate_nonempty("target ref", value)
     if not value.startswith("refs/heads/") or not _IDENTIFIER.fullmatch(value):
@@ -1567,6 +2103,11 @@ def _validate_oid(value: str) -> None:
         raise LedgerError(f"invalid Git object id: {value!r}")
 
 
+def _validate_optional_oid(value: object) -> None:
+    if value is not None:
+        _validate_oid(value)  # type: ignore[arg-type]
+
+
 def _validate_sha256(value: str, label: str) -> None:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise LedgerError(f"{label} is not a lowercase SHA-256 digest")
@@ -1581,6 +2122,32 @@ def _json_text(value: object) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError) as error:
         raise LedgerError(f"value is not canonical JSON: {error}") from error
+
+
+def _decode_json_value(raw: object, label: str) -> object:
+    if not isinstance(raw, str):
+        raise LedgerError(f"{label} is not stored as JSON text")
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise LedgerError(f"{label} is malformed JSON") from error
+    if _json_text(value) != raw:
+        raise LedgerError(f"{label} is not canonical JSON")
+    return value
+
+
+def _decode_json_object(raw: object, label: str) -> dict[str, object]:
+    value = _decode_json_value(raw, label)
+    if not isinstance(value, dict):
+        raise LedgerError(f"{label} must be a JSON object")
+    return value
+
+
+def _decode_json_array(raw: object, label: str) -> list[object]:
+    value = _decode_json_value(raw, label)
+    if not isinstance(value, list):
+        raise LedgerError(f"{label} must be a JSON array")
+    return value
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -1650,6 +2217,216 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _execute_schema(connection: sqlite3.Connection, script: str) -> None:
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise LedgerError("ledger schema contains an incomplete SQL statement")
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _normalize_schema_sql(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return " ".join(value.split())
+
+
+def _schema_signature(connection: sqlite3.Connection) -> tuple[object, ...]:
+    objects = tuple(
+        (
+            row["type"],
+            row["name"],
+            row["tbl_name"],
+            _normalize_schema_sql(row["sql"]),
+        )
+        for row in connection.execute(
+            """
+            SELECT type, name, tbl_name, sql FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall()
+    )
+    tables = tuple(
+        row["name"]
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        ).fetchall()
+    )
+    table_details: list[object] = []
+    for table in tables:
+        quoted_table = _quote_identifier(table)
+        columns = tuple(tuple(row) for row in connection.execute(f"PRAGMA table_xinfo({quoted_table})"))
+        foreign_keys = tuple(
+            tuple(row) for row in connection.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        )
+        indexes: list[object] = []
+        for row in connection.execute(f"PRAGMA index_list({quoted_table})").fetchall():
+            index_name = row["name"]
+            index_columns = tuple(
+                tuple(index_row)
+                for index_row in connection.execute(
+                    f"PRAGMA index_xinfo({_quote_identifier(index_name)})"
+                )
+            )
+            indexes.append(
+                (
+                    index_name,
+                    row["unique"],
+                    row["origin"],
+                    row["partial"],
+                    index_columns,
+                )
+            )
+        table_details.append((table, columns, foreign_keys, tuple(sorted(indexes))))
+    return objects, tuple(table_details)
+
+
+_EXPECTED_SCHEMA_SIGNATURES: dict[str, tuple[object, ...]] = {}
+
+
+def _expected_schema_signature(script: str) -> tuple[object, ...]:
+    signature = _EXPECTED_SCHEMA_SIGNATURES.get(script)
+    if signature is not None:
+        return signature
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    try:
+        reference.execute("PRAGMA foreign_keys = ON")
+        _execute_schema(reference, script)
+        signature = _schema_signature(reference)
+    finally:
+        reference.close()
+    _EXPECTED_SCHEMA_SIGNATURES[script] = signature
+    return signature
+
+
+def _verify_schema(connection: sqlite3.Connection, script: str, *, version: int) -> None:
+    if _schema_signature(connection) != _expected_schema_signature(script):
+        raise LedgerError(
+            f"ledger schema {version} objects, columns, indexes, or foreign keys are invalid"
+        )
+    integrity = tuple(tuple(row) for row in connection.execute("PRAGMA integrity_check").fetchall())
+    if integrity != (("ok",),):
+        raise LedgerError(f"ledger schema {version} failed SQLite integrity checking")
+    foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if foreign_key_errors:
+        raise LedgerError(f"ledger schema {version} has broken foreign keys")
+
+
+def _validate_artifact_row(row: sqlite3.Row) -> None:
+    _validate_sha256(row["sha256"], "artifact")
+    _validate_identifier("artifact kind", row["kind"])
+    _validate_nonnegative_integer("artifact size", row["size"])
+    _validate_nonempty("artifact relative path", row["relative_path"])
+    expected = str(Path("artifacts") / "sha256" / row["sha256"][:2] / row["sha256"])
+    if row["relative_path"] != expected:
+        raise LedgerError(f"artifact path is inconsistent: {row['sha256']}")
+    _validate_timestamp("artifact creation time", row["created_ns"])
+
+
+_SCHEMA_V1 = """
+CREATE TABLE IF NOT EXISTS metadata(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs(
+    run_id TEXT PRIMARY KEY,
+    identity_json TEXT NOT NULL,
+    identity_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('created','running','complete','blocked','failed','stopped')),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    stop_requested INTEGER NOT NULL CHECK(stop_requested IN (0,1)),
+    detail TEXT NOT NULL,
+    created_ns INTEGER NOT NULL,
+    updated_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks(
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('statement','proof')),
+    status TEXT NOT NULL CHECK(status IN ('pending','running','retrying','candidate','queued','integrated','blocked','failed','stopped')),
+    attempts INTEGER NOT NULL CHECK(attempts >= 0),
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    blocked_by_json TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    candidate_oid TEXT,
+    integrated_oid TEXT,
+    PRIMARY KEY(run_id, node_id, phase)
+);
+CREATE TABLE IF NOT EXISTS attempts(
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    number INTEGER NOT NULL CHECK(number > 0),
+    status TEXT NOT NULL CHECK(status IN ('running','candidate','retrying','failed','stopped','interrupted','integrated')),
+    worktree_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    base_oid TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    claim_key TEXT NOT NULL,
+    claim_token_json TEXT NOT NULL,
+    candidate_oid TEXT,
+    detail TEXT NOT NULL,
+    started_ns INTEGER NOT NULL,
+    finished_ns INTEGER,
+    UNIQUE(run_id, node_id, phase, number),
+    FOREIGN KEY(run_id, node_id, phase) REFERENCES tasks(run_id, node_id, phase) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS gates(
+    attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    passed INTEGER NOT NULL CHECK(passed IN (0,1)),
+    evidence_sha256 TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    created_ns INTEGER NOT NULL,
+    PRIMARY KEY(attempt_id, name)
+);
+CREATE TABLE IF NOT EXISTS merge_items(
+    queue_item_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+    queue_ref TEXT NOT NULL,
+    expected_target_oid TEXT NOT NULL,
+    candidate_oid TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','integrated','failed')),
+    integrated_oid TEXT,
+    created_ns INTEGER NOT NULL,
+    updated_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events(
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_ns INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+CREATE TABLE IF NOT EXISTS artifacts(
+    sha256 TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    relative_path TEXT NOT NULL,
+    created_ns INTEGER NOT NULL
+);
+"""
 
 
 _SCHEMA = """

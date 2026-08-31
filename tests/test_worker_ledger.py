@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -36,6 +37,7 @@ def _config() -> RunConfig:
         target_ref="refs/heads/main",
         remote="https://example.test/owner/repo.git",
         backend="codex",
+        reviewer_backend="claude",
         start_oid="1" * 40,
         plugin_version="0.5.0",
         toolchain_fingerprint="6" * 64,
@@ -43,6 +45,11 @@ def _config() -> RunConfig:
         execution_input_sha256="7" * 64,
         source_artifacts_sha256="4" * 64,
         gate_policy_version="v1",
+        max_attempts=3,
+        max_steers=3,
+        timeout_seconds=1800.0,
+        claim_ttl_seconds=1500.0,
+        heartbeat_interval_seconds=300.0,
     )
 
 
@@ -67,7 +74,12 @@ def _running_ledger(tmp_path: Path) -> tuple[RunLedger, str]:
     ledger = RunLedger(tmp_path / "state/run.sqlite3", clock_ns=iter(range(100, 10_000)).__next__)
     config = _config()
     run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
-    ledger.add_tasks(run.run_id, [(_ARTICLE_A, "statement")])
+    ledger.add_tasks(
+        run.run_id,
+        [(_ARTICLE_A, "statement")],
+        expected_generation=run.generation,
+    )
+    run = ledger.get_run(run.run_id)
     run = ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
     return ledger, run.run_id
 
@@ -113,6 +125,93 @@ def _begin_task(
     )
 
 
+def _finish(
+    ledger: RunLedger,
+    attempt_id: str,
+    outcome: str,
+    *,
+    detail: str = "",
+    candidate_oid: str | None = None,
+):
+    attempt = ledger.get_attempt(attempt_id)
+    task = ledger.get_task(attempt.run_id, attempt.article_id, attempt.phase)
+    return ledger.finish_attempt(
+        attempt_id,
+        outcome,
+        expected_generation=ledger.get_run(attempt.run_id).generation,
+        expected_task_generation=task.generation,
+        detail=detail,
+        candidate_oid=candidate_oid,
+    )
+
+
+def _record_gate(
+    ledger: RunLedger,
+    attempt_id: str,
+    name: str,
+    passed: bool,
+    *,
+    evidence_sha256: str,
+    detail: str = "",
+):
+    attempt = ledger.get_attempt(attempt_id)
+    return ledger.record_gate(
+        attempt_id,
+        name,
+        passed,
+        expected_generation=ledger.get_run(attempt.run_id).generation,
+        evidence_sha256=evidence_sha256,
+        detail=detail,
+    )
+
+
+def _enqueue(
+    ledger: RunLedger,
+    attempt_id: str,
+    *,
+    required_gates: tuple[str, ...],
+    queue_ref: str,
+    expected_target_oid: str,
+    queue_item_id: str | None = None,
+) -> str:
+    attempt = ledger.get_attempt(attempt_id)
+    task = ledger.get_task(attempt.run_id, attempt.article_id, attempt.phase)
+    assert attempt.candidate_oid is not None
+    return ledger.enqueue_candidate(
+        attempt_id,
+        expected_generation=ledger.get_run(attempt.run_id).generation,
+        expected_task_generation=task.generation,
+        candidate_oid=attempt.candidate_oid,
+        required_gates=required_gates,
+        queue_ref=queue_ref,
+        expected_target_oid=expected_target_oid,
+        queue_item_id=queue_item_id,
+    )
+
+
+def _recover_attempt(
+    ledger: RunLedger,
+    attempt_id: str,
+    outcome: str,
+    *,
+    detail: str,
+    candidate_oid: str | None = None,
+):
+    attempt = ledger.get_attempt(attempt_id)
+    task = ledger.get_task(attempt.run_id, attempt.article_id, attempt.phase)
+    return ledger.recover_attempt(
+        attempt_id,
+        outcome,
+        expected_generation=ledger.get_run(attempt.run_id).generation,
+        expected_task_generation=task.generation,
+        observed_worktree_path=attempt.worktree_path,
+        observed_base_oid=attempt.base_oid,
+        observed_head_oid=candidate_oid or attempt.base_oid,
+        detail=detail,
+        candidate_oid=candidate_oid,
+    )
+
+
 def test_run_identity_and_events_survive_reopen(tmp_path: Path) -> None:
     path = tmp_path / "state/run.sqlite3"
     config = _config()
@@ -146,6 +245,7 @@ def test_run_config_is_canonical_validated_and_immutable(tmp_path: Path) -> None
     config = _config()
     assert config.sha256 == _config().sha256
     assert "project_root" not in config.as_dict()
+    assert config.reviewer_backend == "claude"
     with pytest.raises(FrozenInstanceError):
         config.backend = "claude"  # type: ignore[misc]
     with pytest.raises(LedgerError, match="full branch ref"):
@@ -154,6 +254,10 @@ def test_run_config_is_canonical_validated_and_immutable(tmp_path: Path) -> None
         replace(config, coverage_contract_sha256="not-a-digest")
     with pytest.raises(LedgerError, match="unsupported run config schema"):
         replace(config, schema_version=2)
+    with pytest.raises(LedgerError, match="reviewer backend must differ"):
+        replace(config, reviewer_backend=config.backend)
+    with pytest.raises(LedgerError, match="reviewer backend"):
+        replace(config, reviewer_backend="not a backend")
 
     path = tmp_path / "state/run.sqlite3"
     with RunLedger(path) as ledger:
@@ -173,6 +277,35 @@ def test_run_config_is_canonical_validated_and_immutable(tmp_path: Path) -> None
                 "UPDATE runs SET config_sha256 = ? WHERE run_id = ?",
                 ("b" * 64, run.run_id),
             )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("max_attempts", True, "max attempts"),
+        ("max_attempts", 0, "max attempts"),
+        ("max_steers", False, "max steers"),
+        ("max_steers", -1, "max steers"),
+        ("timeout_seconds", True, "timeout"),
+        ("timeout_seconds", float("nan"), "timeout"),
+        ("timeout_seconds", float("inf"), "timeout"),
+        ("timeout_seconds", 0, "timeout"),
+        ("claim_ttl_seconds", False, "claim TTL"),
+        ("claim_ttl_seconds", float("-inf"), "claim TTL"),
+        ("claim_ttl_seconds", 0, "claim TTL"),
+        ("heartbeat_interval_seconds", True, "heartbeat interval"),
+        ("heartbeat_interval_seconds", float("nan"), "heartbeat interval"),
+        ("heartbeat_interval_seconds", 0, "heartbeat interval"),
+        ("heartbeat_interval_seconds", 1500, "shorter than claim TTL"),
+    ),
+)
+def test_run_config_rejects_invalid_retry_and_timeout_controls(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(LedgerError, match=message):
+        replace(_config(), **{field: value})
 
 
 def test_generation_checks_and_idempotent_stop(tmp_path: Path) -> None:
@@ -216,6 +349,43 @@ def test_stop_request_rejects_a_stale_controller_generation(tmp_path: Path) -> N
             assert stale.events("run-1") == before_events
 
 
+def test_add_tasks_advances_the_run_generation_and_rejects_stale_writers(tmp_path: Path) -> None:
+    path = tmp_path / "run.sqlite3"
+    config = _config()
+    with RunLedger(path) as first:
+        created = first.create_run(_identity(tmp_path, config), config, run_id="run-1")
+        with RunLedger(path) as stale:
+            first.add_tasks(
+                created.run_id,
+                [(_ARTICLE_A, "statement")],
+                expected_generation=created.generation,
+            )
+            advanced = first.get_run(created.run_id)
+            assert advanced.generation == created.generation + 1
+            with pytest.raises(GenerationConflict):
+                stale.add_tasks(
+                    created.run_id,
+                    [(_ARTICLE_B, "proof")],
+                    expected_generation=created.generation,
+                )
+            with pytest.raises(GenerationConflict):
+                stale.transition_run(
+                    created.run_id,
+                    "running",
+                    expected_generation=created.generation,
+                )
+            assert stale.tasks(created.run_id) == first.tasks(created.run_id)
+
+
+def test_add_tasks_rejects_an_empty_batch_without_advancing_generation(tmp_path: Path) -> None:
+    config = _config()
+    with RunLedger(tmp_path / "run.sqlite3") as ledger:
+        created = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
+        with pytest.raises(LedgerError, match="at least one task"):
+            ledger.add_tasks(created.run_id, [], expected_generation=created.generation)
+        assert ledger.get_run(created.run_id) == created
+
+
 def test_complete_requires_every_persisted_task_to_be_integrated(tmp_path: Path) -> None:
     ledger, run_id = _running_ledger(tmp_path)
     try:
@@ -232,9 +402,18 @@ def test_tasks_and_attempt_claims_require_durable_article_ids(tmp_path: Path) ->
     with RunLedger(tmp_path / "run.sqlite3") as ledger:
         run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
         with pytest.raises(LedgerError, match="durable article_id"):
-            ledger.add_tasks(run.run_id, [("chapter/path-derived-id", "proof")])
-        task = ledger.add_tasks(run.run_id, [(_ARTICLE_A, "proof")])[0]
+            ledger.add_tasks(
+                run.run_id,
+                [("chapter/path-derived-id", "proof")],
+                expected_generation=run.generation,
+            )
+        task = ledger.add_tasks(
+            run.run_id,
+            [(_ARTICLE_A, "proof")],
+            expected_generation=run.generation,
+        )[0]
         assert task.article_id == task.node_id == _ARTICLE_A
+        run = ledger.get_run(run.run_id)
         ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
         with pytest.raises(LedgerError, match="not anchored"):
             ledger.begin_attempt(
@@ -260,7 +439,8 @@ def test_resume_clears_stop_and_is_idempotent(tmp_path: Path) -> None:
             run_id,
             expected_generation=ledger.get_run(run_id).generation,
         )
-        ledger.recover_interrupted(run_id)
+        assert ledger.recover_interrupted(run_id) == (attempt.attempt_id,)
+        _recover_attempt(ledger, attempt.attempt_id, "stopped", detail="operator stop")
         stopped = ledger.transition_run(
             run_id,
             "stopped",
@@ -274,7 +454,7 @@ def test_resume_clears_stop_and_is_idempotent(tmp_path: Path) -> None:
         assert resumed.status == "running"
         assert not resumed.stop_requested
         assert ledger.tasks(run_id)[0].status == "retrying"
-        assert ledger.get_attempt(attempt.attempt_id).status == "interrupted"
+        assert ledger.get_attempt(attempt.attempt_id).status == "stopped"
     finally:
         ledger.close()
 
@@ -285,19 +465,36 @@ def test_task_attempt_recovery_is_explicit_and_idempotent(tmp_path: Path) -> Non
         attempt = _begin(ledger, run_id, tmp_path)
         assert attempt.status == "running"
         assert ledger.tasks(run_id)[0].status == "running"
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        with pytest.raises(GenerationConflict, match="task"):
+            ledger.finish_attempt(
+                attempt.attempt_id,
+                "retrying",
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=task.generation - 1,
+                detail="stale result",
+            )
 
         assert ledger.recover_interrupted(run_id) == (attempt.attempt_id,)
-        assert ledger.get_attempt(attempt.attempt_id).status == "interrupted"
+        assert ledger.get_attempt(attempt.attempt_id).status == "running"
+        assert ledger.tasks(run_id)[0].status == "running"
+        result = _recover_attempt(
+            ledger,
+            attempt.attempt_id,
+            "retrying",
+            detail="repository inspection found no candidate",
+        )
+        assert result.status == "retrying"
         assert ledger.tasks(run_id)[0].status == "retrying"
         assert ledger.recover_interrupted(run_id) == ()
 
         retry = _begin(ledger, run_id, tmp_path, attempt_id="attempt-2")
-        result = ledger.finish_attempt(retry.attempt_id, "retrying", detail="backend unavailable")
+        result = _finish(ledger, retry.attempt_id, "retrying", detail="backend unavailable")
         assert result.status == "retrying"
         assert result.finished_ns is not None
         assert ledger.tasks(run_id)[0].attempts == 2
         with pytest.raises(InvalidTransition):
-            ledger.finish_attempt(retry.attempt_id, "failed", detail="different result")
+            _finish(ledger, retry.attempt_id, "failed", detail="different result")
     finally:
         ledger.close()
 
@@ -323,6 +520,116 @@ def test_recovery_inspection_is_read_only_and_keeps_running_attempt_evidence(tmp
         ledger.close()
 
 
+def test_crash_recovery_records_inspected_candidate_without_destroying_it(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        attempt = _begin(ledger, run_id, tmp_path)
+        candidate_oid = "9" * 40
+        run = ledger.get_run(run_id)
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+
+        with pytest.raises(InvalidTransition, match="inspected worktree HEAD"):
+            ledger.recover_attempt(
+                attempt.attempt_id,
+                "candidate",
+                expected_generation=run.generation,
+                expected_task_generation=task.generation,
+                observed_worktree_path=attempt.worktree_path,
+                observed_base_oid=attempt.base_oid,
+                observed_head_oid="a" * 40,
+                detail="repository inspection found a commit",
+                candidate_oid=candidate_oid,
+            )
+        with pytest.raises(InvalidTransition, match="cannot discard"):
+            ledger.recover_attempt(
+                attempt.attempt_id,
+                "retrying",
+                expected_generation=run.generation,
+                expected_task_generation=task.generation,
+                observed_worktree_path=attempt.worktree_path,
+                observed_base_oid=attempt.base_oid,
+                observed_head_oid=candidate_oid,
+                detail="repository inspection found a commit",
+            )
+        with pytest.raises(GenerationConflict, match="run"):
+            ledger.recover_attempt(
+                attempt.attempt_id,
+                "candidate",
+                expected_generation=run.generation - 1,
+                expected_task_generation=task.generation,
+                observed_worktree_path=attempt.worktree_path,
+                observed_base_oid=attempt.base_oid,
+                observed_head_oid=candidate_oid,
+                detail="repository inspection found a commit",
+                candidate_oid=candidate_oid,
+            )
+        with pytest.raises(GenerationConflict, match="task"):
+            ledger.recover_attempt(
+                attempt.attempt_id,
+                "candidate",
+                expected_generation=run.generation,
+                expected_task_generation=task.generation - 1,
+                observed_worktree_path=attempt.worktree_path,
+                observed_base_oid=attempt.base_oid,
+                observed_head_oid=candidate_oid,
+                detail="repository inspection found a commit",
+                candidate_oid=candidate_oid,
+            )
+        with pytest.raises(GenerationConflict, match="different attempt worktree"):
+            ledger.recover_attempt(
+                attempt.attempt_id,
+                "candidate",
+                expected_generation=run.generation,
+                expected_task_generation=task.generation,
+                observed_worktree_path=tmp_path / "different-worktree",
+                observed_base_oid=attempt.base_oid,
+                observed_head_oid=candidate_oid,
+                detail="repository inspection found a commit",
+                candidate_oid=candidate_oid,
+            )
+        assert ledger.get_attempt(attempt.attempt_id).status == "running"
+
+        recovered = ledger.recover_attempt(
+            attempt.attempt_id,
+            "candidate",
+            expected_generation=run.generation,
+            expected_task_generation=task.generation,
+            observed_worktree_path=attempt.worktree_path,
+            observed_base_oid=attempt.base_oid,
+            observed_head_oid=candidate_oid,
+            detail="repository inspection found a commit",
+            candidate_oid=candidate_oid,
+        )
+        assert recovered.status == "candidate"
+        assert recovered.candidate_oid == candidate_oid
+        event = ledger.events(run_id)[-1]
+        assert event.kind == "attempt.recovered"
+        assert event.payload["repository_inspection"] == {
+            "base_oid": attempt.base_oid,
+            "head_oid": candidate_oid,
+            "worktree_path": attempt.worktree_path,
+        }
+        evidence = ledger.put_artifact("gate", b"passed\n")
+        _record_gate(
+            ledger,
+            attempt.attempt_id,
+            "lean-build",
+            True,
+            evidence_sha256=evidence,
+        )
+        _enqueue(
+            ledger,
+            attempt.attempt_id,
+            required_gates=("lean-build",),
+            queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
+            expected_target_oid=run.current_oid,
+            queue_item_id="recovered-candidate",
+        )
+        assert ledger.get_merge_item("recovered-candidate").candidate_oid == candidate_oid
+    finally:
+        ledger.close()
+
+
 @pytest.mark.parametrize(
     ("source", "target", "blockers"),
     (
@@ -341,11 +648,12 @@ def test_active_tasks_have_cas_safe_recovery_transitions(
     try:
         attempt = _begin(ledger, run_id, tmp_path)
         if source in {"candidate", "queued"}:
-            ledger.finish_attempt(attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+            _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="9" * 40)
         if source == "queued":
             evidence = ledger.put_artifact("gate", b"passed\n")
-            ledger.record_gate(attempt.attempt_id, "lean-build", True, evidence_sha256=evidence)
-            ledger.enqueue_candidate(
+            _record_gate(ledger, attempt.attempt_id, "lean-build", True, evidence_sha256=evidence)
+            _enqueue(
+                ledger,
                 attempt.attempt_id,
                 required_gates=("lean-build",),
                 queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
@@ -381,6 +689,7 @@ def test_active_tasks_have_cas_safe_recovery_transitions(
                     "queue-1",
                     integrated_oid="9" * 40,
                     expected_generation=run_before.generation,
+                    expected_item_generation=ledger.get_merge_item("queue-1").generation,
                 )
             assert ledger.get_run(run_id) == run_before
             assert ledger.get_merge_item("queue-1").status == "pending"
@@ -420,7 +729,74 @@ def test_stop_request_turns_interrupted_work_into_stopped(tmp_path: Path) -> Non
         ledger.request_stop(run_id, expected_generation=ledger.get_run(run_id).generation)
 
         assert ledger.recover_interrupted(run_id) == (attempt.attempt_id,)
+        _recover_attempt(ledger, attempt.attempt_id, "stopped", detail="operator stop")
         assert ledger.tasks(run_id)[0].status == "stopped"
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("operation", ("finish", "gate", "enqueue"))
+def test_stop_request_wins_races_with_attempt_mutations(tmp_path: Path, operation: str) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        attempt = _begin(ledger, run_id, tmp_path)
+        evidence = ""
+        if operation in {"gate", "enqueue"}:
+            _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+            evidence = ledger.put_artifact("gate", b"passed\n")
+        if operation == "enqueue":
+            _record_gate(
+                ledger,
+                attempt.attempt_id,
+                "lean-build",
+                True,
+                evidence_sha256=evidence,
+            )
+        stale_run = ledger.get_run(run_id)
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        with RunLedger(ledger.path) as stopper:
+            stopped = stopper.request_stop(run_id, expected_generation=stale_run.generation)
+
+        def mutate(expected_generation: int) -> object:
+            if operation == "finish":
+                return ledger.finish_attempt(
+                    attempt.attempt_id,
+                    "retrying",
+                    expected_generation=expected_generation,
+                    expected_task_generation=task.generation,
+                    detail="backend unavailable",
+                )
+            if operation == "gate":
+                return ledger.record_gate(
+                    attempt.attempt_id,
+                    "lean-build",
+                    True,
+                    expected_generation=expected_generation,
+                    evidence_sha256=evidence,
+                )
+            return ledger.enqueue_candidate(
+                attempt.attempt_id,
+                expected_generation=expected_generation,
+                expected_task_generation=task.generation,
+                candidate_oid="9" * 40,
+                required_gates=("lean-build",),
+                queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
+                expected_target_oid=stale_run.current_oid,
+            )
+
+        with pytest.raises(GenerationConflict):
+            mutate(stale_run.generation)
+        with pytest.raises(InvalidTransition, match="stop|accepting"):
+            mutate(stopped.generation)
+        assert ledger.list_merge_items(run_id) == ()
+        if operation == "finish":
+            assert ledger.get_attempt(attempt.attempt_id).status == "running"
+            assert ledger.get_task(run_id, _ARTICLE_A, "statement").status == "running"
+        elif operation == "gate":
+            assert ledger.list_gates(attempt.attempt_id) == ()
+        else:
+            assert len(ledger.list_gates(attempt.attempt_id)) == 1
+            assert ledger.get_task(run_id, _ARTICLE_A, "statement").status == "candidate"
     finally:
         ledger.close()
 
@@ -429,12 +805,13 @@ def test_candidate_requires_all_gates_before_queue_and_integration(tmp_path: Pat
     ledger, run_id = _running_ledger(tmp_path)
     try:
         attempt = _begin(ledger, run_id, tmp_path)
-        candidate = ledger.finish_attempt(attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+        candidate = _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="9" * 40)
         assert candidate.candidate_oid == "9" * 40
         build_evidence = ledger.put_artifact("gate", b"lean build passed\n")
         review_failure = ledger.put_artifact("gate", b"source review failed\n")
-        ledger.record_gate(candidate.attempt_id, "lean-build", True, evidence_sha256=build_evidence)
-        ledger.record_gate(
+        _record_gate(ledger, candidate.attempt_id, "lean-build", True, evidence_sha256=build_evidence)
+        _record_gate(
+            ledger,
             candidate.attempt_id,
             "source-review",
             False,
@@ -442,14 +819,16 @@ def test_candidate_requires_all_gates_before_queue_and_integration(tmp_path: Pat
         )
 
         with pytest.raises(InvalidTransition, match="source-review"):
-            ledger.enqueue_candidate(
+            _enqueue(
+                ledger,
                 candidate.attempt_id,
                 required_gates=("lean-build", "source-review"),
                 queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
                 expected_target_oid="1" * 40,
             )
         with pytest.raises(LedgerError, match="already recorded"):
-            ledger.record_gate(
+            _record_gate(
+                ledger,
                 candidate.attempt_id,
                 "source-review",
                 True,
@@ -457,7 +836,11 @@ def test_candidate_requires_all_gates_before_queue_and_integration(tmp_path: Pat
             )
 
         with pytest.raises(InvalidTransition, match="cannot add tasks"):
-            ledger.add_tasks(run_id, [(_ARTICLE_B, "proof")])
+            ledger.add_tasks(
+                run_id,
+                [(_ARTICLE_B, "proof")],
+                expected_generation=ledger.get_run(run_id).generation,
+            )
     finally:
         ledger.close()
 
@@ -466,16 +849,17 @@ def test_gate_replay_is_idempotent_only_when_every_input_matches(tmp_path: Path)
     ledger, run_id = _running_ledger(tmp_path)
     try:
         attempt = _begin(ledger, run_id, tmp_path)
-        candidate = ledger.finish_attempt(attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+        candidate = _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="9" * 40)
         assert (
-            ledger.finish_attempt(attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+            _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="9" * 40)
             == candidate
         )
         with pytest.raises(InvalidTransition, match="already candidate"):
-            ledger.finish_attempt(attempt.attempt_id, "candidate", candidate_oid="a" * 40)
+            _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="a" * 40)
         first_digest = ledger.put_artifact("gate", b"first evidence\n")
         second_digest = ledger.put_artifact("gate", b"second evidence\n")
-        recorded = ledger.record_gate(
+        recorded = _record_gate(
+            ledger,
             attempt.attempt_id,
             "lean-build",
             True,
@@ -485,7 +869,8 @@ def test_gate_replay_is_idempotent_only_when_every_input_matches(tmp_path: Path)
         assert isinstance(recorded, GateRecord)
         before_events = ledger.events(run_id)
         assert (
-            ledger.record_gate(
+            _record_gate(
+                ledger,
                 attempt.attempt_id,
                 "lean-build",
                 True,
@@ -503,9 +888,63 @@ def test_gate_replay_is_idempotent_only_when_every_input_matches(tmp_path: Path)
         )
         for values in mismatches:
             with pytest.raises(LedgerError, match="different evidence"):
-                ledger.record_gate(attempt.attempt_id, "lean-build", **values)
+                _record_gate(ledger, attempt.attempt_id, "lean-build", **values)
         assert ledger.get_gate(attempt.attempt_id, "lean-build") == recorded
         assert ledger.list_gates(attempt.attempt_id) == (recorded,)
+    finally:
+        ledger.close()
+
+
+def test_old_attempt_cannot_enqueue_after_a_retry_rebinds_the_task(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        old_attempt = _begin(ledger, run_id, tmp_path, attempt_id="attempt-old")
+        _finish(ledger, old_attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+        evidence = ledger.put_artifact("gate", b"passed\n")
+        _record_gate(
+            ledger,
+            old_attempt.attempt_id,
+            "lean-build",
+            True,
+            evidence_sha256=evidence,
+        )
+        old_candidate_task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        ledger.transition_task(
+            run_id,
+            _ARTICLE_A,
+            "statement",
+            "retrying",
+            expected_generation=old_candidate_task.generation,
+            detail="retry after review",
+        )
+        new_attempt = _begin(ledger, run_id, tmp_path, attempt_id="attempt-new")
+        _finish(ledger, new_attempt.attempt_id, "candidate", candidate_oid="a" * 40)
+        current_task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+
+        with pytest.raises(GenerationConflict, match="expected"):
+            ledger.enqueue_candidate(
+                old_attempt.attempt_id,
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=current_task.generation - 1,
+                candidate_oid="9" * 40,
+                required_gates=("lean-build",),
+                queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
+                expected_target_oid=ledger.get_run(run_id).current_oid,
+                queue_item_id="stale-generation",
+            )
+        with pytest.raises(GenerationConflict, match="no longer names candidate"):
+            ledger.enqueue_candidate(
+                old_attempt.attempt_id,
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=current_task.generation,
+                candidate_oid="9" * 40,
+                required_gates=("lean-build",),
+                queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
+                expected_target_oid=ledger.get_run(run_id).current_oid,
+                queue_item_id="stale-queue",
+            )
+        assert ledger.list_merge_items(run_id) == ()
+        assert ledger.get_task(run_id, _ARTICLE_A, "statement").candidate_oid == "a" * 40
     finally:
         ledger.close()
 
@@ -515,7 +954,12 @@ def test_candidate_can_be_queued_and_integrated(tmp_path: Path) -> None:
     try:
         config = _config()
         run = ledger.create_run(_identity(tmp_path, config), config, run_id="run-2")
-        second_task = ledger.add_tasks(run.run_id, [(_ARTICLE_B, "proof")])[0]
+        second_task = ledger.add_tasks(
+            run.run_id,
+            [(_ARTICLE_B, "proof")],
+            expected_generation=run.generation,
+        )[0]
+        run = ledger.get_run(run.run_id)
         ledger.transition_run(run.run_id, "running", expected_generation=run.generation)
         second = ledger.begin_attempt(
             run.run_id,
@@ -530,12 +974,13 @@ def test_candidate_can_be_queued_and_integrated(tmp_path: Path) -> None:
             claim_token={"claim_id": "claim-2", "ref_oid": "8" * 40},
             attempt_id="attempt-2",
         )
-        ledger.finish_attempt(second.attempt_id, "candidate", candidate_oid="c" * 40)
+        _finish(ledger, second.attempt_id, "candidate", candidate_oid="c" * 40)
         build_evidence = ledger.put_artifact("gate", b"lean build passed\n")
         review_evidence = ledger.put_artifact("gate", b"source review passed\n")
-        ledger.record_gate(second.attempt_id, "lean-build", True, evidence_sha256=build_evidence)
-        ledger.record_gate(second.attempt_id, "source-review", True, evidence_sha256=review_evidence)
-        item = ledger.enqueue_candidate(
+        _record_gate(ledger, second.attempt_id, "lean-build", True, evidence_sha256=build_evidence)
+        _record_gate(ledger, second.attempt_id, "source-review", True, evidence_sha256=review_evidence)
+        item = _enqueue(
+            ledger,
             second.attempt_id,
             required_gates=("source-review", "lean-build"),
             queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_B}",
@@ -545,18 +990,52 @@ def test_candidate_can_be_queued_and_integrated(tmp_path: Path) -> None:
         assert item == "queue-1"
         assert ledger.tasks(run.run_id)[-1].status == "queued"
         before_integration = ledger.get_run(run.run_id)
+        queued_item = ledger.get_merge_item(item)
+        with pytest.raises(InvalidTransition, match="must equal the queued candidate"):
+            ledger.mark_integrated(
+                item,
+                integrated_oid="d" * 40,
+                expected_generation=before_integration.generation,
+                expected_item_generation=queued_item.generation,
+            )
+        assert ledger.get_run(run.run_id) == before_integration
+        assert ledger.get_merge_item(item) == queued_item
+
+        uncertain = ledger.transition_merge_item(
+            item,
+            "uncertain",
+            expected_generation=queued_item.generation,
+            detail="publication result was not observed",
+        )
+        with pytest.raises(GenerationConflict, match="merge item"):
+            ledger.mark_integrated(
+                item,
+                integrated_oid="c" * 40,
+                expected_generation=before_integration.generation,
+                expected_item_generation=queued_item.generation,
+            )
+        ready = ledger.record_merge_recovery(
+            item,
+            "queued",
+            expected_generation=uncertain.generation,
+            detail="remote ref still names the candidate",
+        )
         ledger.mark_integrated(
             item,
-            integrated_oid="f" * 40,
+            integrated_oid="c" * 40,
             expected_generation=before_integration.generation,
+            expected_item_generation=ready.generation,
         )
         integrated = ledger.tasks(run.run_id)[-1]
         assert integrated.status == "integrated"
-        assert integrated.integrated_oid == "f" * 40
+        assert integrated.integrated_oid == "c" * 40
+        integrated_run = ledger.get_run(run.run_id)
+        integrated_item = ledger.get_merge_item(item)
         ledger.mark_integrated(
             item,
-            integrated_oid="f" * 40,
-            expected_generation=before_integration.generation,
+            integrated_oid="c" * 40,
+            expected_generation=integrated_run.generation,
+            expected_item_generation=integrated_item.generation,
         )
         current = ledger.get_run(run.run_id)
         complete = ledger.transition_run(
@@ -574,7 +1053,12 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
     try:
         config = _config()
         created = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
-        ledger.add_tasks(created.run_id, [(_ARTICLE_A, "proof"), (_ARTICLE_B, "proof")])
+        ledger.add_tasks(
+            created.run_id,
+            [(_ARTICLE_A, "proof"), (_ARTICLE_B, "proof")],
+            expected_generation=created.generation,
+        )
+        created = ledger.get_run(created.run_id)
         running = ledger.transition_run(
             created.run_id,
             "running",
@@ -585,10 +1069,11 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
             (_ARTICLE_B, "attempt-b", "a" * 40, "queue-b"),
         ):
             _begin_task(ledger, created.run_id, tmp_path, node_id, "proof", attempt_id)
-            ledger.finish_attempt(attempt_id, "candidate", candidate_oid=candidate_oid)
+            _finish(ledger, attempt_id, "candidate", candidate_oid=candidate_oid)
             evidence = ledger.put_artifact("gate", f"{node_id} passed\n".encode())
-            ledger.record_gate(attempt_id, "lean-build", True, evidence_sha256=evidence)
-            ledger.enqueue_candidate(
+            _record_gate(ledger, attempt_id, "lean-build", True, evidence_sha256=evidence)
+            _enqueue(
+                ledger,
                 attempt_id,
                 required_gates=("lean-build",),
                 queue_ref=f"refs/autoform/queue/{queue_item_id}",
@@ -651,12 +1136,13 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
         assert integrated_item.detail == "remote queue ref verified"
 
         replay_events = ledger.events(created.run_id)
+        integrated_item = ledger.get_merge_item(first.queue_item_id)
         assert (
             ledger.mark_integrated(
                 first.queue_item_id,
                 integrated_oid="9" * 40,
-                expected_generation=running.generation,
-                expected_item_generation=recovered.generation,
+                expected_generation=integrated_run.generation,
+                expected_item_generation=integrated_item.generation,
             )
             == integrated_run
         )
@@ -668,12 +1154,14 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
                 second.queue_item_id,
                 integrated_oid="a" * 40,
                 expected_generation=running.generation,
+                expected_item_generation=second.generation,
             )
         with pytest.raises(GenerationConflict, match="current OID changed"):
             ledger.mark_integrated(
                 second.queue_item_id,
                 integrated_oid="a" * 40,
                 expected_generation=integrated_run.generation,
+                expected_item_generation=second.generation,
             )
         assert ledger.get_merge_item(second.queue_item_id) == second
         assert ledger.get_task(created.run_id, _ARTICLE_B, "proof").status == "queued"
@@ -685,15 +1173,26 @@ def test_merge_status_recovery_and_integration_are_cas_safe(tmp_path: Path) -> N
 def test_failed_multi_task_insert_rolls_back_rows_and_events(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "run.sqlite3", clock_ns=iter(range(100)).__next__)
     config = _config()
-    run_id = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1").run_id
-    ledger.add_tasks(run_id, [(_ARTICLE_A, "statement")])
+    created = ledger.create_run(_identity(tmp_path, config), config, run_id="run-1")
+    run_id = created.run_id
+    ledger.add_tasks(
+        run_id,
+        [(_ARTICLE_A, "statement")],
+        expected_generation=created.generation,
+    )
     try:
         before = ledger.events(run_id)
+        generation = ledger.get_run(run_id).generation
         with pytest.raises(LedgerError, match="duplicate task"):
-            ledger.add_tasks(run_id, [(_ARTICLE_B, "proof"), (_ARTICLE_A, "statement")])
+            ledger.add_tasks(
+                run_id,
+                [(_ARTICLE_B, "proof"), (_ARTICLE_A, "statement")],
+                expected_generation=generation,
+            )
         assert [(task.node_id, task.phase) for task in ledger.tasks(run_id)] == [
             (_ARTICLE_A, "statement")
         ]
+        assert ledger.get_run(run_id).generation == generation
         assert ledger.events(run_id) == before
     finally:
         ledger.close()
@@ -715,18 +1214,31 @@ def test_gate_evidence_must_exist_and_remain_intact_until_enqueue(tmp_path: Path
     ledger, run_id = _running_ledger(tmp_path)
     try:
         attempt = _begin(ledger, run_id, tmp_path)
-        ledger.finish_attempt(attempt.attempt_id, "candidate", candidate_oid="9" * 40)
+        _finish(ledger, attempt.attempt_id, "candidate", candidate_oid="9" * 40)
         with pytest.raises(LedgerError, match="not in the artifact store"):
-            ledger.record_gate(attempt.attempt_id, "lean-build", True, evidence_sha256="a" * 64)
+            _record_gate(
+                ledger,
+                attempt.attempt_id,
+                "lean-build",
+                True,
+                evidence_sha256="a" * 64,
+            )
 
         digest = ledger.put_artifact("gate", b"passed\n")
-        ledger.record_gate(attempt.attempt_id, "lean-build", True, evidence_sha256=digest)
+        _record_gate(
+            ledger,
+            attempt.attempt_id,
+            "lean-build",
+            True,
+            evidence_sha256=digest,
+        )
         row = ledger._connection.execute(
             "SELECT relative_path FROM artifacts WHERE sha256 = ?", (digest,)
         ).fetchone()
         (ledger.path.parent / row[0]).write_bytes(b"failed\n")
         with pytest.raises(LedgerError, match="artifact (size|content) changed"):
-            ledger.enqueue_candidate(
+            _enqueue(
+                ledger,
                 attempt.attempt_id,
                 required_gates=("lean-build",),
                 queue_ref=f"refs/autoform/queue/run-1/{_ARTICLE_A}",
@@ -810,8 +1322,19 @@ def test_stale_process_cannot_advance_run_generation(tmp_path: Path) -> None:
             assert second.get_run(created.run_id) == advanced
 
 
-@pytest.mark.parametrize("schema_version", ("1", "99"))
-def test_unknown_schema_and_nonregular_ledger_fail_closed(tmp_path: Path, schema_version: str) -> None:
+@pytest.mark.parametrize(
+    ("schema_version", "message"),
+    (
+        ("1", "schema 1 objects"),
+        ("2", "schema 2 objects"),
+        ("99", "unsupported ledger schema"),
+    ),
+)
+def test_unknown_schema_and_nonregular_ledger_fail_closed(
+    tmp_path: Path,
+    schema_version: str,
+    message: str,
+) -> None:
     path = tmp_path / "state/run.sqlite3"
     path.parent.mkdir()
     connection = sqlite3.connect(path)
@@ -820,7 +1343,7 @@ def test_unknown_schema_and_nonregular_ledger_fail_closed(tmp_path: Path, schema
     connection.commit()
     connection.close()
 
-    with pytest.raises(LedgerError, match="unsupported ledger schema"):
+    with pytest.raises(LedgerError, match=message):
         RunLedger(path)
 
     path.unlink()
@@ -844,4 +1367,152 @@ def test_ledger_rejects_missing_schema_metadata_and_symlink_path(tmp_path: Path)
     sqlite3.connect(target).close()
     path.symlink_to(target)
     with pytest.raises(LedgerError, match="not a regular file"):
+        RunLedger(path)
+
+
+def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    path.parent.mkdir()
+    config = _config()
+    legacy_identity = _identity(tmp_path, config).as_dict()
+    legacy_identity.pop("config_sha256")
+    identity_json = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    connection = sqlite3.connect(path)
+    ledger_module._execute_schema(connection, ledger_module._SCHEMA_V1)
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+    connection.execute(
+        """
+        INSERT INTO runs VALUES (?, ?, ?, 'running', 2, 0, '', 1, 2)
+        """,
+        ("run-1", identity_json, hashlib.sha256(identity_json.encode()).hexdigest()),
+    )
+    connection.execute(
+        """
+        INSERT INTO tasks VALUES (?, ?, 'statement', 'running', 1, 1, '[]', '', NULL, NULL)
+        """,
+        ("run-1", _ARTICLE_A),
+    )
+    connection.execute(
+        """
+        INSERT INTO attempts VALUES (
+            'attempt-1', ?, ?, 'statement', 1, 'running', ?, ?, ?, 'codex', ?, ?, NULL, '', 3, NULL
+        )
+        """,
+        (
+            "run-1",
+            _ARTICLE_A,
+            str((tmp_path / "worktree").resolve()),
+            f"autoform/run-1/{_ARTICLE_A}/1",
+            config.start_oid,
+            author_claim_key(_ARTICLE_A),
+            '{"claim_id":"claim-1"}',
+        ),
+    )
+    connection.execute(
+        "INSERT INTO events(run_id, kind, payload_json, created_ns) VALUES (?, ?, ?, ?)",
+        ("run-1", "run.created", "{}", 1),
+    )
+    connection.commit()
+    connection.close()
+
+    with RunLedger(path) as ledger:
+        migrated = ledger.get_run("run-1")
+        assert migrated.status == "failed"
+        assert "controller settings were not persisted" in migrated.detail
+        assert migrated.config.backend == "codex"
+        assert migrated.config.reviewer_backend == "claude"
+        assert migrated.config.max_attempts == 3
+        assert migrated.config.timeout_seconds == 1800.0
+        assert ledger.get_task("run-1", _ARTICLE_A, "statement").article_id == _ARTICLE_A
+        assert ledger.get_attempt("attempt-1").claim_key == author_claim_key(_ARTICLE_A)
+        migration_event = ledger.events("run-1")[-1]
+        assert migration_event.kind == "ledger.migrated"
+        assert migration_event.payload["status"] == "failed"
+        assert ledger._connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0] == "2"
+        assert "article_id" in {
+            row["name"] for row in ledger._connection.execute("PRAGMA table_info(tasks)")
+        }
+
+    with RunLedger(path) as reopened:
+        assert reopened.get_run("run-1").config == migrated.config
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-trigger",
+        "missing-column",
+        "missing-index",
+        "missing-foreign-key",
+    ),
+)
+def test_full_v2_schema_shape_is_verified(tmp_path: Path, mutation: str) -> None:
+    path = tmp_path / f"{mutation}.sqlite3"
+    connection = sqlite3.connect(path)
+    script = ledger_module._SCHEMA
+    if mutation == "missing-trigger":
+        script = script.replace(
+            "CREATE TRIGGER IF NOT EXISTS runs_identity_no_update\n"
+            "BEFORE UPDATE OF identity_json, identity_sha256, config_json, config_sha256 ON runs\n"
+            "BEGIN SELECT RAISE(ABORT, 'run identity and config are immutable'); END;",
+            "",
+        )
+    elif mutation == "missing-column":
+        script = script.replace("    detail TEXT NOT NULL,\n    created_ns", "    created_ns", 1)
+    elif mutation == "missing-index":
+        script = script.replace("    UNIQUE(run_id, article_id, phase, number),\n", "")
+    else:
+        script = script.replace(
+            "    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,",
+            "    run_id TEXT NOT NULL,",
+            1,
+        )
+    ledger_module._execute_schema(connection, script)
+    connection.execute("INSERT INTO metadata VALUES ('schema_version', '2')")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(LedgerError, match="objects, columns, indexes, or foreign keys"):
+        RunLedger(path)
+
+
+@pytest.mark.parametrize(
+    ("target", "value", "message"),
+    (
+        ("blockers", '"not-an-array"', "JSON array"),
+        ("blockers", "{", "malformed JSON"),
+        ("claim", "[]", "JSON object"),
+        ("event", "[]", "JSON object"),
+        ("event", "{", "malformed JSON"),
+    ),
+)
+def test_malformed_persisted_json_is_wrapped_and_rejected(
+    tmp_path: Path,
+    target: str,
+    value: str,
+    message: str,
+) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    if target == "blockers":
+        ledger._connection.execute(
+            "UPDATE tasks SET blocked_by_json = ? WHERE run_id = ?",
+            (value, run_id),
+        )
+    elif target == "claim":
+        attempt = _begin(ledger, run_id, tmp_path)
+        ledger._connection.execute(
+            "UPDATE attempts SET claim_token_json = ? WHERE attempt_id = ?",
+            (value, attempt.attempt_id),
+        )
+    else:
+        ledger._connection.execute(
+            "INSERT INTO events(run_id, kind, payload_json, created_ns) VALUES (?, ?, ?, ?)",
+            (run_id, "corrupt", value, 999_999),
+        )
+    path = ledger.path
+    ledger.close()
+
+    with pytest.raises(LedgerError, match=message):
         RunLedger(path)
