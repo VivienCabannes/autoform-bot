@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 
-PROJECT_INSPECTION_SCHEMA = "autoform-project-inspection/v1"
+PROJECT_INSPECTION_SCHEMA = "autoform-project-inspection/v2"
 RELEASE_CATALOG_SCHEMA = "autoform-project-release-catalog/v1"
 
 
@@ -142,12 +142,24 @@ class MathlibProject:
 class AutoformProject:
     detected: bool
     blueprint_path: str | None
+    blueprint_paths: tuple[str, ...]
+    manifest_path: str | None
+    manifest_sha256: str | None
     mkdocs_path: str | None
     verification_workflow_path: str | None
     pages_workflow_path: str | None
 
-    def as_dict(self) -> dict[str, bool | str | None]:
-        return asdict(self)
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "blueprint_path": self.blueprint_path,
+            "blueprint_paths": list(self.blueprint_paths),
+            "detected": self.detected,
+            "manifest_path": self.manifest_path,
+            "manifest_sha256": self.manifest_sha256,
+            "mkdocs_path": self.mkdocs_path,
+            "pages_workflow_path": self.pages_workflow_path,
+            "verification_workflow_path": self.verification_workflow_path,
+        }
 
 
 @dataclass(frozen=True, slots=True)

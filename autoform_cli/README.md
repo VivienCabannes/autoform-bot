@@ -1,12 +1,14 @@
 # Blueprint format and CLI
 
 The Autoform CLI validates, visualizes, and publishes the multilevel dependency
-graph embedded in `blueprint/roadmap/`. The Markdown book is the graph: no
-separate authored or generated graph file exists.
+graph embedded in a blueprint vault's `roadmap/` directory. A root
+`.autoform.toml` can register multiple vaults in one repository; the original
+single-vault layout remains available at `blueprint/`. The Markdown book is the
+graph: no separate authored or generated graph file exists.
 
 ## Articles and containment
 
-Every Markdown file below `blueprint/roadmap/` is an article node. A
+Every Markdown file below a selected vault's `roadmap/` is an article node. A
 `README.md` represents its directory and strictly contains the articles below
 it; the nearest ancestor `README.md` is the single parent. This supports any
 number of levels, from book to chapter to section to declaration. Ordinary
@@ -120,9 +122,94 @@ the loaded plugin and prefix each one, running from the project root:
 uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
 ```
 
+### Multi-project workspaces
+
+Use a workspace manifest when a repository contains several blueprint efforts,
+when the legacy `blueprint/` name conflicts with its established layout, or when
+Autoform must coexist with unrelated documentation. Initialize the
+repository-level registry without creating a vault, then add projects
+independently:
+
+```bash
+autoform workspace init . --blueprint-root docs/blueprints
+autoform blueprint new finite-flat \
+  --path FiniteFlat --title "Finite Flat Group Schemes"
+autoform blueprint new another-project \
+  --path AnotherProject --title "Another Project"
+autoform blueprint register imported-project \
+  --path ExistingVault --title "Imported Project"
+autoform workspace inspect .
+autoform blueprint list .
+autoform workspace check . --lean-root .
+```
+
+The generated `.autoform.toml` is the sole ownership registry:
+
+```toml
+schema = "autoform-workspace/v1"
+
+[locations.blueprints]
+path = "docs/blueprints"
+provides = ["blueprints"]
+
+[projects."finite-flat"]
+title = "Finite Flat Group Schemes"
+blueprint = { location = "blueprints", path = "FiniteFlat" }
+```
+
+Location and project identifiers are user-defined. Autoform recognizes the
+generic `blueprints` capability; it never special-cases repository names such
+as those shown in examples. A repository may declare additional named locations
+and capabilities for other tooling or future Autoform features. Project
+blueprint paths name immediate child directories of their selected collection,
+and registered vault paths may not overlap, so every managed vault has a
+distinct boundary even when a repository declares several locations.
+
+No `autoform.toml` is written inside a vault. Autoform checks only entries under
+`projects`; unregistered siblings are ignored. Paths are repository-relative,
+portable to common case-sensitive and case-insensitive filesystems, confined
+beneath the workspace root, distinct under Unicode-normalized case-insensitive
+comparison, and may not traverse symbolic links. Windows-reserved names,
+forbidden characters, control characters, trailing dots, and surrounding
+whitespace are rejected before any filesystem mutation. Registration uses a
+TOML-aware edit, preserving comments and supporting both standard and inline
+`projects` tables while validating the complete result before publishing it
+atomically.
+Workspace mutation currently requires POSIX-style file locking, no-follow
+opens, and directory-descriptor support; unsupported platforms fail before
+writing. The manifest format itself remains portable across common
+case-sensitive and case-insensitive filesystems.
+
+From inside a registered vault, single-project commands select that project. A
+workspace root also selects its sole registered project. Autoform never infers
+a project from an unrelated directory; pass `--project` there and at a
+workspace root containing multiple projects:
+
+```bash
+autoform check . --project finite-flat --lean-root .
+autoform audit . --project finite-flat --lean-root .
+autoform doctor . --project finite-flat --lean-root .
+autoform-visualize . --project finite-flat
+autoform render . --project finite-flat --output site-src/finite-flat
+```
+
+`workspace check` is the repository-wide verification command and visits every
+registered project exactly once, applying the same path and symlink checks as
+single-project commands. Explicit vault paths continue to work for
+ad-hoc inspection, but do not add an unregistered directory to repository-wide
+checks. Workspace initialization currently creates only the manifest and its
+blueprint collection; publication remains an explicit per-vault setup decision.
+`blueprint register` validates an existing vault and adds only the root registry
+entry, which is the migration path for pre-existing blueprint directories.
+Workspace JSON responses carry operation-specific versioned schemas so callers
+can distinguish initialization, blueprint changes, listing, inspection,
+checking, and errors.
+
+### Legacy single-vault setup
+
 Create a new project's vault, site configuration, and CI. The layout is fixed,
-so it is written rather than described; existing files are left alone, which
-makes the same command the repair path:
+so it is written rather than described. This command is retained for dedicated
+repositories already using the canonical lowercase `blueprint/` layout:
 
 ```bash
 autoform init . --title "Finite Flat Group Schemes" \
@@ -133,6 +220,12 @@ Pass `--autoform-source <credential-free-https-git-url>` and
 `--autoform-ref <sha>` together to pin the generated workflows at an immutable
 commit. Passing only one is an error. Use `--force` to overwrite and `--json`
 for machine-readable output.
+
+Do not run legacy `init` in a manifest-managed workspace: it would create an
+unregistered `blueprint/` vault. Use `workspace init` and `blueprint new`
+instead. Likewise, `project repair` deliberately refuses manifest-managed
+workspaces until shared publication infrastructure has a workspace-aware repair
+contract.
 
 Create or inspect a Lean project and list Autoform's bundled known-good release pairs:
 
@@ -196,8 +289,9 @@ rather than deleting by pathname after a separate identity check. Like creation
 and inspection, repair runs no Git, Lake, Lean, subprocess, or network operation.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
-nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and
-known Autoform paths; records configuration hashes; and reports whether the
+nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, the
+optional `.autoform.toml`, and known Autoform paths; records configuration
+hashes; and reports whether the
 configured Lean/Mathlib pair exactly matches the bundled catalog. It does not
 run Lake, Lean, Git, subprocesses, or network operations. A `lakefile.lean` is
 reported as present but unevaluated because executing it would violate that

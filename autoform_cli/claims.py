@@ -1130,6 +1130,18 @@ class ClaimBoard:
         detail = f"{proc.stdout}\n{proc.stderr}".strip()
         if any(marker in detail.lower() for marker in _CAS_REJECTIONS):
             return False
+        # Some Git transports report a compare-and-swap loss only as a generic
+        # remote "failed to update ref" error. Re-read the ref: a value that
+        # differs from our lease proves another claimant won, while an unchanged
+        # value remains a genuine transport failure.
+        try:
+            current = self._remote_oid(key)
+        except ClaimTransportError:
+            current = old
+        if current == (new or None):
+            return True
+        if current != old:
+            return False
         raise ClaimTransportError(f"claim CAS push failed: {detail[:300]}")
 
     def read(self, key: str) -> dict[str, Any] | None:

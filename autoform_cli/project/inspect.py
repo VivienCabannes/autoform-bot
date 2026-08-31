@@ -30,10 +30,17 @@ from .model import (
     ProjectInspection,
     ReleaseCatalog,
 )
+from ..workspace_manifest import WORKSPACE_FILE, WorkspaceError, parse_workspace
 
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_STRUCTURAL_DEPTH = 128
-_PROJECT_MARKERS = ("lakefile.toml", "lakefile.lean", "lean-toolchain", "blueprint")
+_PROJECT_MARKERS = (
+    "lakefile.toml",
+    "lakefile.lean",
+    "lean-toolchain",
+    "blueprint",
+    WORKSPACE_FILE,
+)
 _TOOLCHAIN = re.compile(r"leanprover/lean4:(?P<version>v[0-9]+\.[0-9]+\.[0-9]+)")
 _RESERVOIR_SCOPE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 # Lake's StdVer: a major.minor.patch triple with an optional `-` suffix that
@@ -101,7 +108,7 @@ def _inspection(
         lake_manifest_sha256=None,
         lean=None,
         mathlib=None,
-        autoform=AutoformProject(False, None, None, None, None),
+        autoform=AutoformProject(False, None, (), None, None, None, None, None),
         compatibility=ProjectCompatibility(
             catalog=catalog.schema,
             status="indeterminate",
@@ -452,6 +459,12 @@ def _open_parent_descriptor(root_descriptor: int, relative: str) -> tuple[int, s
 
 
 def _relative_status(root_descriptor: int, relative: str) -> str:
+    if relative == ".":
+        try:
+            metadata = os.fstat(root_descriptor)
+        except OSError:
+            return "unsafe"
+        return "directory" if stat.S_ISDIR(metadata.st_mode) else "unsafe"
     try:
         parent, name = _open_parent_descriptor(root_descriptor, relative)
     except FileNotFoundError:
@@ -521,6 +534,106 @@ def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]
             values[field] = None
         else:
             values[field] = relative
+    manifest_path: str | None = None
+    manifest_sha256: str | None = None
+    blueprint_paths: tuple[str, ...] = ()
+    manifest_status = _relative_status(root_descriptor, WORKSPACE_FILE)
+    if manifest_status == "unsafe":
+        _issue(
+            diagnostics,
+            "error",
+            "autoform-manifest-is-symlink",
+            "The Autoform workspace manifest cannot be inspected safely.",
+            WORKSPACE_FILE,
+        )
+    elif manifest_status not in {"missing", "file"}:
+        _issue(
+            diagnostics,
+            "error",
+            "autoform-manifest-unexpected-type",
+            "The Autoform workspace manifest is not a regular file.",
+            WORKSPACE_FILE,
+        )
+    elif manifest_status == "file":
+        content = _read_file(root_descriptor, WORKSPACE_FILE, "autoform-manifest", diagnostics)
+        if content is not None:
+            manifest_sha256 = hashlib.sha256(content).hexdigest()
+            try:
+                manifest = parse_workspace(content.decode("utf-8"))
+            except (UnicodeDecodeError, WorkspaceError) as error:
+                detail = (
+                    "; ".join(error.issues)
+                    if isinstance(error, WorkspaceError)
+                    else f"{WORKSPACE_FILE} is not valid UTF-8 TOML"
+                )
+                _issue(
+                    diagnostics,
+                    "error",
+                    "autoform-manifest-invalid",
+                    detail,
+                    WORKSPACE_FILE,
+                )
+            else:
+                manifest_path = WORKSPACE_FILE
+                locations = {location.id: location for location in manifest.locations}
+                for location in manifest.locations:
+                    status = _relative_status(root_descriptor, location.path)
+                    if status == "unsafe":
+                        _issue(
+                            diagnostics,
+                            "error",
+                            "autoform-location-is-symlink",
+                            "A declared Autoform location cannot be inspected safely.",
+                            location.path,
+                        )
+                    elif status == "missing":
+                        _issue(
+                            diagnostics,
+                            "warning",
+                            "autoform-location-missing",
+                            "A declared Autoform location does not exist.",
+                            location.path,
+                        )
+                    elif status != "directory":
+                        _issue(
+                            diagnostics,
+                            "error",
+                            "autoform-location-unexpected-type",
+                            "A declared Autoform location is not a directory.",
+                            location.path,
+                        )
+                resolved: list[str] = []
+                for project in manifest.projects:
+                    location = locations[project.blueprint_location]
+                    relative = PurePosixPath(location.path, project.blueprint_path).as_posix()
+                    resolved.append(relative)
+                    status = _relative_status(root_descriptor, relative)
+                    if status == "unsafe":
+                        _issue(
+                            diagnostics,
+                            "error",
+                            "autoform-blueprint-is-symlink",
+                            "A registered blueprint cannot be inspected safely.",
+                            relative,
+                        )
+                    elif status == "missing":
+                        _issue(
+                            diagnostics,
+                            "error",
+                            "autoform-blueprint-missing",
+                            "A registered blueprint directory is missing.",
+                            relative,
+                        )
+                    elif status != "directory":
+                        _issue(
+                            diagnostics,
+                            "error",
+                            "autoform-blueprint-unexpected-type",
+                            "A registered blueprint path is not a directory.",
+                            relative,
+                        )
+                blueprint_paths = tuple(sorted(resolved))
+
     workflow_count = sum(
         values[field] is not None
         for field in ("verification_workflow_path", "pages_workflow_path")
@@ -530,8 +643,11 @@ def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]
     if workflow_count == 1:
         _issue(diagnostics, "warning", "autoform-workflows-partial", "Only one standard Autoform workflow exists.")
     return AutoformProject(
-        detected=values["blueprint_path"] is not None,
+        detected=values["blueprint_path"] is not None or manifest_path is not None,
         blueprint_path=values["blueprint_path"],
+        blueprint_paths=blueprint_paths,
+        manifest_path=manifest_path,
+        manifest_sha256=manifest_sha256,
         mkdocs_path=values["mkdocs_path"],
         verification_workflow_path=values["verification_workflow_path"],
         pages_workflow_path=values["pages_workflow_path"],

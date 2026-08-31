@@ -5,7 +5,7 @@ description: >-
   dependency DAG in an existing Autoform Markdown blueprint. Use for discovering
   prior work, choosing or drafting mathematical sources, confirming scope,
   writing roadmap and coverage notes, decomposing mathematics into Markdown
-  article pages under blueprint/roadmap/, or
+  article pages under a selected vault's roadmap/, or
   checking roadmap completeness; do not install repository infrastructure or
   prove Lean declarations.
 ---
@@ -35,15 +35,22 @@ choose whether to adopt a reference, ask the agent to locate one, or develop a
 project-authored specification collaboratively. For the last option, brainstorm
 the representation and downstream API first, then record explicit definitions,
 assumptions, intended equivalences, and unresolved choices under
-`blueprint/sources/`; label this material as project-authored rather than
+`<BLUEPRINT>/sources/`; label this material as project-authored rather than
 implying external provenance. Do not expand a fine DAG until its statements are
 grounded in an adopted reference or this agreed specification.
 
 ## Establish the planning boundary
 
-Inspect the Lean repository and existing `blueprint/` before writing. Require
-the vault, ignore rules, and site configuration to exist; if they do not, hand
-the task to Setup rather than creating repository infrastructure here.
+Inspect the Lean repository and resolve the exact vault before writing. When a
+root `.autoform.toml` exists, run `autoform workspace inspect`, select one
+registered project, and use only its resolved path as `<BLUEPRINT>`; never scan
+the collection for marker files or treat unregistered siblings as managed. At a
+workspace root with several projects, pass `--project` to single-vault commands.
+Do the same from any directory outside the selected registered vault; a sole
+project is inferred only at the workspace root itself.
+Without a manifest, `<BLUEPRINT>` is the explicitly supplied vault, normally
+the legacy `blueprint/`. Require the vault and ignore rules to exist; if they do
+not, hand the task to Setup rather than creating repository infrastructure here.
 
 State the exact source files, requested chapters or sections, current roadmap
 state, and files that may change. Do not infer missing scope or silently reset
@@ -55,7 +62,7 @@ mathematics.
 
 ## Build from coarse to fine
 
-1. Record source notes under `blueprint/sources/`, including stable locations
+1. Record source notes under `<BLUEPRINT>/sources/`, including stable locations
    for every definition or theorem used in the plan. Work from the source text;
    for large sources, use targeted lookups for a named result or definition and
    record the exact passage rather than relying on memory. Surface prerequisites
@@ -63,7 +70,7 @@ mathematics.
    are vault material, not chapters: the site does not publish them, and a
    statement's `## Sources` list is rewritten to the file in the repository, so
    write them for a reader with the repository open.
-2. Write the high-level direction and milestones under `blueprint/roadmap/`.
+2. Write the high-level direction and milestones under `<BLUEPRINT>/roadmap/`.
    Group milestones by coherent mathematical significance, not by source
    section size.
    A chapter page needs no frontmatter at all: its H1 is the title and its
@@ -73,13 +80,13 @@ mathematics.
    chapter page leaves every article in that directory hanging off the root
    and publishes a book with no chapters. `autoform check` refuses a chapter
    directory with no chapter page, so a vault in that shape never renders.
-   Treat `blueprint/README.md` and the roadmap pages it
+   Treat `<BLUEPRINT>/README.md` and the roadmap pages it
    links as an ordered mathematical book: link meaningful chapter pages in
    their intended reading order. The renderer derives bottom-of-page previous
    and next chapter links from this Markdown structure, so do not maintain a
    second navigation manifest.
 3. Define project-specific coverage targets and completion rules in
-   `blueprint/coverage/README.md`. Include exactly one
+   `<BLUEPRINT>/coverage/README.md`. Include exactly one
    `Area | Coverage | Evidence` table. Use `MAPPED` when an area is known but
    not yet dispositioned, `DECOMPOSED` when it is represented by roadmap
    nodes, `DEFERRED` for an explicit later milestone, and `OUT` for material
@@ -124,7 +131,7 @@ mathematics.
 4. Present this coarse roadmap and coverage contract for user approval before
    expanding it into a fine DAG.
 5. After approval, create one file per pull-request-sized unit beside its
-   milestone under `blueprint/roadmap/**/*.md`. A node may contain several
+   milestone under `<BLUEPRINT>/roadmap/**/*.md`. A node may contain several
    supporting definitions or statements when they should land and be reviewed
    together, but it must identify one unique main result that determines when
    the node is complete. Nothing authored in an article predicts how much Lean
@@ -153,7 +160,7 @@ mathematics.
    formalization status.
 8. Reconcile every page whose claims this work has just invalidated. That means
    the coarse milestone pages and the coverage contract, and also the two
-   landing pages Setup wrote before any scope existed: `blueprint/README.md`
+   landing pages Setup wrote before any scope existed: `<BLUEPRINT>/README.md`
    and the repository `README.md`. Setup states there that no chapters exist
    and nothing is planned. The moment a chapter exists that is false, and it is
    the first thing a visitor to the published site reads. Newly discovered
@@ -169,7 +176,7 @@ never start proof workers merely to advance a state. The
 
 ## Validate and report
 
-Validate `<PROJECT>/blueprint` and refresh its Mermaid graph before handing
+Validate `<BLUEPRINT>` and refresh its Mermaid graph before handing
 off. Rendering and the strict site build belong to Setup and Human Review; here
 only the first two steps of the publication sequence in the
 [CLI reference](../../autoform_cli/README.md#commands) apply.

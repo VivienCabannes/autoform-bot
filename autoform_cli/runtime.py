@@ -19,6 +19,8 @@ from urllib.parse import unquote, urlsplit
 from .graph import ARTICLE_ID_PATTERN, Graph, load_graph
 from .lean import declaration_names, index_project
 from .status import derive, is_definition
+from .workspace import discover_workspace, resolve_blueprint
+from .workspace_manifest import WorkspaceError
 
 RUNTIME_SCHEMA = "autoform-runtime/v1"
 RUNTIME_AUTHORITY = "markdown-articles"
@@ -205,11 +207,16 @@ class RuntimeGraph(_RuntimeGraphCache):
         return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
 
 
-def resolve_runtime_paths(project_or_blueprint: str | Path) -> RuntimePaths:
-    """Resolve an Autoform project root or its ``blueprint`` directory.
+def resolve_runtime_paths(
+    project_or_blueprint: str | Path,
+    *,
+    project_id: str | None = None,
+) -> RuntimePaths:
+    """Resolve a workspace project, legacy project, or explicit blueprint.
 
-    A directory that simultaneously looks like both forms is rejected rather
-    than choosing an interpretation that could change project-relative paths.
+    A root ``.autoform.toml`` is authoritative for project selection. Explicit
+    vault paths remain usable, including unregistered vaults, while repository-
+    wide operations see only projects registered in the manifest.
     """
 
     supplied = Path(project_or_blueprint).expanduser()
@@ -219,11 +226,35 @@ def resolve_runtime_paths(project_or_blueprint: str | Path) -> RuntimePaths:
     if not candidate.is_dir():
         raise RuntimeProjectionError(["project or blueprint directory does not exist"])
 
+    try:
+        workspace = discover_workspace(candidate)
+    except WorkspaceError as error:
+        if error.issues != ("no enclosing .autoform.toml was found",):
+            raise RuntimeProjectionError(list(error.issues)) from None
+        workspace = None
+
     is_blueprint = (candidate / "roadmap").is_dir()
     is_project = (candidate / "blueprint" / "roadmap").is_dir()
-    if is_blueprint and is_project:
+    if workspace is not None and project_id is not None:
+        try:
+            _, _, blueprint_dir = resolve_blueprint(candidate, project_id=project_id)
+        except WorkspaceError as error:
+            raise RuntimeProjectionError(list(error.issues)) from None
+        project_root = workspace.root
+    elif workspace is not None and is_blueprint:
+        project_root = workspace.root
+        blueprint_dir = candidate
+    elif workspace is not None:
+        try:
+            _, _, blueprint_dir = resolve_blueprint(candidate)
+        except WorkspaceError as error:
+            raise RuntimeProjectionError(list(error.issues)) from None
+        project_root = workspace.root
+    elif project_id is not None:
+        raise RuntimeProjectionError(["--project requires an enclosing .autoform.toml"])
+    elif is_blueprint and is_project:
         raise RuntimeProjectionError(["input is ambiguous between a project and blueprint directory"])
-    if is_project:
+    elif is_project:
         project_root = candidate
         blueprint_dir = (candidate / "blueprint").resolve()
     elif is_blueprint:
@@ -244,10 +275,11 @@ def load_runtime_graph(
     project_or_blueprint: str | Path,
     *,
     lean_root: str | Path | None = None,
+    project_id: str | None = None,
 ) -> RuntimeGraph:
     """Load the canonical graph once and return its immutable runtime view."""
 
-    paths = resolve_runtime_paths(project_or_blueprint)
+    paths = resolve_runtime_paths(project_or_blueprint, project_id=project_id)
     graph = load_graph(paths.blueprint_dir)
     return build_runtime_graph(graph, project_root=paths.project_root, lean_root=lean_root)
 

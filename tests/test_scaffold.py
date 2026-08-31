@@ -1,4 +1,4 @@
-"""The vault layout is fixed, so the tool writes it rather than describing it.
+"""The internal vault layout is fixed, so the tool writes it rather than describing it.
 
 A real project came back from an agent-driven setup with chapter pages as
 siblings of their directories instead of ``<chapter>/README.md``. That parses
@@ -90,6 +90,17 @@ def test_init_does_not_create_a_lean_project_shell(tmp_path: Path) -> None:
     assert not (tmp_path / "src/FiniteFlat.lean").exists()
 
 
+def test_legacy_init_refuses_a_manifest_managed_workspace(tmp_path: Path) -> None:
+    (tmp_path / ".autoform.toml").write_text(
+        'schema = "autoform-workspace/v1"\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ScaffoldError, match="legacy single-vault"):
+        scaffold_project(tmp_path, title="Finite Flat", force=True)
+
+    assert not (tmp_path / "blueprint").exists()
+
+
 def test_scaffolded_vault_validates_immediately(tmp_path: Path) -> None:
     """A fresh project must pass `autoform check` before any mathematics."""
 
@@ -148,6 +159,9 @@ def test_substitutions_reach_the_site_config(tmp_path: Path) -> None:
     assert '"git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"' in verify
     assert "python .github/autoform_audit.py" in verify
     assert '"$AUTOFORM_ROOT_PACKAGE" "$archive" blueprint . "$probe"' in verify
+    assert "if [[ -f .autoform.toml ]]" in verify
+    assert "autoform workspace check . --lean-root ." in verify
+    assert "autoform check blueprint --lean-root ." in verify
 
 
 def test_no_placeholder_survives_anywhere(tmp_path: Path) -> None:
@@ -538,6 +552,78 @@ def test_a_dangling_destination_symlink_cannot_redirect_the_scaffold(tmp_path: P
         scaffold_module.scaffold_project(project, title="Probe")
 
     assert not outside.exists()
+
+
+def test_blueprint_scaffold_never_replaces_a_concurrently_created_file(tmp_path: Path) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    descriptor = os.open(
+        target,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        (target / "README.md").write_bytes(b"concurrent owner\n")
+        with pytest.raises(ScaffoldError, match="already exists"):
+            scaffold_module._exclusive_write_at(
+                descriptor,
+                "README.md",
+                b"Autoform content\n",
+                mode=0o644,
+            )
+    finally:
+        os.close(descriptor)
+
+    assert (target / "README.md").read_bytes() == b"concurrent owner\n"
+
+
+def test_blueprint_scaffold_closes_a_nonempty_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    (target / "concurrent-owner").write_text("claimed\n", encoding="utf-8")
+    original = scaffold_module._open_directory_chain
+    opened: list[int] = []
+
+    def record(path: Path) -> int:
+        descriptor = original(path)
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(scaffold_module, "_open_directory_chain", record)
+
+    with pytest.raises(ScaffoldError, match="not empty"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_blueprint_scaffold_rejects_a_racing_directory_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = scaffold_module._open_or_create_directory
+    injected = False
+
+    def race(parent_descriptor: int, name: str) -> int:
+        nonlocal injected
+        if not injected:
+            injected = True
+            os.symlink(outside, name, target_is_directory=True, dir_fd=parent_descriptor)
+        return original(parent_descriptor, name)
+
+    monkeypatch.setattr(scaffold_module, "_open_or_create_directory", race)
+
+    with pytest.raises(ScaffoldError, match="cannot open blueprint directory safely"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert injected
+    assert list(outside.iterdir()) == []
 
 
 def test_a_title_with_a_colon_stays_one_yaml_key(tmp_path: Path) -> None:

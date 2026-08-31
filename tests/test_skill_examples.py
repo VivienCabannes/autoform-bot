@@ -362,9 +362,9 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         assert required in setup
     for required in (
         "references/cabannes-thesis-roadmap.md",
-        "blueprint/roadmap/",
-        "blueprint/coverage/",
-        "blueprint/roadmap/**/*.md",
+        "<BLUEPRINT>/roadmap/",
+        "<BLUEPRINT>/coverage/",
+        "<BLUEPRINT>/roadmap/**/*.md",
         "declaration",
         "coarse roadmap",
         "## Depends on",
@@ -586,8 +586,60 @@ def test_roadmap_reconciles_the_pages_setup_wrote(repo_root: Path) -> None:
 
     roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
 
-    for required in ("blueprint/README.md", "repository `README.md`"):
+    for required in ("<BLUEPRINT>/README.md", "repository `README.md`"):
         assert required in roadmap, f"Roadmap never reconciles {required}"
+
+
+def test_workspace_guidance_is_registry_based_and_repository_neutral(repo_root: Path) -> None:
+    setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+    cli = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
+    implementation = "\n".join(
+        (repo_root / path).read_text(encoding="utf-8")
+        for path in (
+            "autoform_cli/workspace.py",
+            "autoform_cli/workspace_cli.py",
+            "autoform_cli/workspace_manifest.py",
+            "autoform_cli/workspace_mutation.py",
+        )
+    )
+
+    for required in (
+        ".autoform.toml",
+        "autoform workspace inspect",
+        "autoform workspace check",
+        "autoform blueprint new",
+        "autoform blueprint register",
+        "unregistered siblings",
+    ):
+        assert required in setup
+    for required in (
+        ".autoform.toml",
+        "registered project",
+        "<BLUEPRINT>",
+        "unregistered siblings",
+    ):
+        assert required in roadmap
+    for required in (
+        "sole ownership registry",
+        "No `autoform.toml` is written inside a vault",
+        "Location and project identifiers are user-defined",
+        "workspace check",
+        "--project",
+    ):
+        assert required in cli
+    for repository_specific_name in (
+        "formal-math",
+        "MathlibExt",
+        "OpenConjectures",
+        "Hartshorne",
+        "LieGroupoids",
+        "SyntheticHomotopy",
+    ):
+        assert repository_specific_name not in setup
+        assert repository_specific_name not in roadmap
+        assert repository_specific_name not in cli
+        assert repository_specific_name not in implementation
 
 
 def test_roadmap_commits_so_the_published_site_can_catch_up(repo_root: Path) -> None:

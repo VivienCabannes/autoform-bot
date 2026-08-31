@@ -47,6 +47,7 @@ from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
 from .runtime import RuntimeProjectionError, resolve_runtime_paths
 from .scaffold import ScaffoldError, scaffold_project
+from .workspace_cli import add_workspace_parsers, run_blueprint_command, run_workspace_command
 
 _CLAIM_TEMP_DIRECTORY = Path(tempfile.gettempdir()).resolve()
 
@@ -131,6 +132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     check = subparsers.add_parser("check", help="validate a Markdown blueprint")
     check.add_argument("blueprint_dir")
+    check.add_argument("--project", help="registered workspace project id")
     check.add_argument(
         "--lean-root",
         type=Path,
@@ -139,11 +141,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     audit = subparsers.add_parser("audit", help="audit roadmap completeness and checked facts")
     audit.add_argument("blueprint_dir")
+    audit.add_argument("--project", help="registered workspace project id")
     audit.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     audit.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     doctor = subparsers.add_parser("doctor", help="diagnose the local Markdown runtime contract")
     doctor.add_argument("project_or_blueprint")
+    doctor.add_argument("--project", help="registered workspace project id")
     doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
@@ -210,6 +214,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--json", action="store_true", help="write stable machine-readable output"
     )
 
+    add_workspace_parsers(subparsers)
+
     claim = subparsers.add_parser(
         "claim", help="coordinate temporary article and resource ownership through Git refs"
     )
@@ -244,6 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="plan durable roadmap article identifiers without writing files",
     )
     article_ids.add_argument("blueprint_dir")
+    article_ids.add_argument("--project", help="registered workspace project id")
     article_ids.add_argument(
         "--check",
         action="store_true",
@@ -251,10 +258,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     article_ids.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
-    render = subparsers.add_parser
-
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
+    render.add_argument("--project", help="registered workspace project id")
     render.add_argument("-o", "--output", default="site-src", help="output directory")
     render.add_argument("--lean-root", type=Path, help="Lean project to link code from")
     render.add_argument("--repository-url", help="project URL, e.g. https://github.com/owner/repo")
@@ -277,6 +283,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _doctor(args)
     if args.command == "project":
         return _project(args)
+    if args.command == "workspace":
+        return run_workspace_command(args)
+    if args.command == "blueprint":
+        return run_blueprint_command(args)
     if args.command == "claim":
         return _claim(args)
     if args.command == "migrate":
@@ -353,8 +363,9 @@ def _init(args: argparse.Namespace) -> int:
 
 def _check(args: argparse.Namespace) -> int:
     try:
-        graph = load_graph(args.blueprint_dir)
-    except GraphValidationError as exc:
+        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
+        graph = load_graph(blueprint_dir)
+    except (GraphValidationError, RuntimeProjectionError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1
@@ -385,7 +396,16 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _audit(args: argparse.Namespace) -> int:
-    result = audit_blueprint(args.blueprint_dir, lean_root=args.lean_root)
+    try:
+        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
+    except RuntimeProjectionError as error:
+        if args.json:
+            print(json.dumps({"clean": False, "errors": list(error.issues)}, sort_keys=True, separators=(",", ":")))
+        else:
+            for issue in error.issues:
+                print(f"error: {issue}")
+        return 1
+    result = audit_blueprint(blueprint_dir, lean_root=args.lean_root)
     if args.json:
         print(result.to_json())
     else:
@@ -406,7 +426,11 @@ def _audit(args: argparse.Namespace) -> int:
 
 
 def _doctor(args: argparse.Namespace) -> int:
-    result = diagnose_project(args.project_or_blueprint, lean_root=args.lean_root)
+    result = diagnose_project(
+        args.project_or_blueprint,
+        lean_root=args.lean_root,
+        project_id=args.project,
+    )
     if args.json:
         print(result.to_json())
     else:
@@ -414,6 +438,10 @@ def _doctor(args: argparse.Namespace) -> int:
             marker = "PASS" if check.ok else "FAIL"
             print(f"{marker}: {check.name}: {check.detail}")
     return 0 if result.clean else 1
+
+
+def _resolved_blueprint(target: str | Path, project_id: str | None) -> Path:
+    return resolve_runtime_paths(target, project_id=project_id).blueprint_dir
 
 
 def _project(args: argparse.Namespace) -> int:
@@ -553,6 +581,12 @@ def _print_project_inspection(result) -> None:
         print(f"Lean: {result.lean.toolchain}")
     if result.mathlib is not None:
         print(f"Mathlib: {result.mathlib.revision or 'none'} ({result.mathlib.git or 'none'})")
+    if result.autoform.manifest_path is not None:
+        print(f"Autoform workspace: {result.autoform.manifest_path}")
+        for path in result.autoform.blueprint_paths:
+            print(f"  blueprint: {path}")
+    elif result.autoform.blueprint_path is not None:
+        print(f"Autoform blueprint: {result.autoform.blueprint_path}")
     print(
         f"Compatibility: {result.compatibility.status}"
         + (f" ({result.compatibility.release})" if result.compatibility.release else "")
@@ -649,8 +683,9 @@ def _migrate(args: argparse.Namespace) -> int:
     if args.migrate_command != "article-ids":
         return 2
     try:
-        plan = plan_article_ids(args.blueprint_dir)
-    except GraphValidationError as error:
+        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
+        plan = plan_article_ids(blueprint_dir)
+    except (GraphValidationError, RuntimeProjectionError) as error:
         for issue in error.issues:
             print(f"error: {issue}", file=sys.stderr)
         return 2
@@ -961,14 +996,15 @@ def _default_claim_scratch(repo: str, session_id: str) -> Path:
 
 def _render(args: argparse.Namespace) -> int:
     try:
+        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
         report = render_site(
-            args.blueprint_dir,
+            blueprint_dir,
             args.output,
             lean_root=args.lean_root,
             repository_url=args.repository_url,
             ref=args.ref,
         )
-    except (GraphValidationError, PublicationError) as exc:
+    except (GraphValidationError, PublicationError, RuntimeProjectionError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1

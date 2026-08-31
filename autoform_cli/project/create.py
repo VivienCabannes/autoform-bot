@@ -408,6 +408,16 @@ def _open_stage(parent_descriptor: int, stage_name: str) -> int:
     return os.open(stage_name, flags, dir_fd=parent_descriptor)
 
 
+def _list_directory(directory_descriptor: int) -> list[str]:
+    """List through a fresh descriptor so earlier scans cannot leave it at EOF."""
+
+    fresh = _open_stage(directory_descriptor, ".")
+    try:
+        return os.listdir(fresh)
+    finally:
+        os.close(fresh)
+
+
 def _descriptor_identity(descriptor: int) -> tuple[int, int]:
     metadata = os.fstat(descriptor)
     if not stat.S_ISDIR(metadata.st_mode):
@@ -582,7 +592,7 @@ def _remove_owned_empty_stage(
 
 
 def _remove_directory_contents(directory_descriptor: int) -> None:
-    for name in os.listdir(directory_descriptor):
+    for name in _list_directory(directory_descriptor):
         metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
             child = os.open(
