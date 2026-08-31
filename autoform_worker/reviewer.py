@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from autoform_cli.graph import ARTICLE_ID_PATTERN
 from servers.prover import Event, EventKind, ProofResult, ProverAdapter
-from servers.prover._cli_common import CLI_LAUNCH_SCHEMA
+from servers.prover._cli_common import CLI_LAUNCH_SCHEMA, PROMPT_TRANSPORT_STDIN
 from servers.prover.claude_adapter import ClaudeAdapter
 from servers.prover.codex_adapter import CodexAdapter
 
@@ -90,7 +90,11 @@ _CODEX_REVIEW_EXTRA_ARGS = (
     "-c",
     "features.unified_exec=false",
     "-c",
-    "tools.view_image=false",
+    "features.view_image=false",
+    "-c",
+    "tools.update_plan.enabled=false",
+    "-c",
+    "tools.experimental_request_user_input.enabled=false",
     "-c",
     'web_search="disabled"',
     "-c",
@@ -487,6 +491,7 @@ def reviewer_factory(
             "tools=disabled",
             "user-config=ignored",
             "repository-rules=ignored",
+            "prompt=stdin",
         )
 
         def build(environment: Mapping[str, str]) -> ProverAdapter:
@@ -497,6 +502,7 @@ def reviewer_factory(
                 autonomy_args=list(_CODEX_REVIEW_AUTONOMY_ARGS),
                 extra_args=list(_CODEX_REVIEW_EXTRA_ARGS),
                 wrap_spec_prompt=False,
+                prompt_transport=PROMPT_TRANSPORT_STDIN,
                 max_wait_seconds=timeout,
                 environment=environment,
             )
@@ -507,6 +513,7 @@ def reviewer_factory(
             "cwd=filesystem-root",
             "mcp=explicit-empty-strict",
             "settings-sources=none",
+            "prompt=stdin",
         )
 
         def build(environment: Mapping[str, str]) -> ProverAdapter:
@@ -517,6 +524,7 @@ def reviewer_factory(
                 session_isolation_args=list(_CLAUDE_REVIEW_SESSION_ARGS),
                 mcp_config=_EMPTY_CLAUDE_MCP_CONFIG,
                 wrap_spec_prompt=False,
+                prompt_transport=PROMPT_TRANSPORT_STDIN,
                 max_wait_seconds=timeout,
                 environment=environment,
             )
@@ -684,6 +692,11 @@ def _run_reviewer(
             raise ReviewError("review result model does not match reviewer configuration")
         if not isinstance(terminal.proof_text, str):
             raise ReviewError("reviewer response must be text")
+        if not terminal.proved:
+            if not isinstance(terminal.reason, str):
+                raise ReviewError("reviewer failure reason must be text")
+            reason = terminal.reason.strip() or "reviewer did not produce an approval verdict"
+            return _result("backend_error", reason, request, adapter_factory, evidence)
         if saw_forbidden_event:
             return _result(
                 "backend_error",
@@ -692,11 +705,6 @@ def _run_reviewer(
                 adapter_factory,
                 evidence,
             )
-        if not terminal.proved:
-            if not isinstance(terminal.reason, str):
-                raise ReviewError("reviewer failure reason must be text")
-            reason = terminal.reason.strip() or "reviewer did not produce an approval verdict"
-            return _result("backend_error", reason, request, adapter_factory, evidence)
         try:
             verdict, reason = _parse_response(
                 terminal.proof_text,
@@ -733,7 +741,15 @@ def _validated_launch_identity(
     if len(launches) != 1:
         raise ReviewError("reviewer must make exactly one observable CLI launch")
     launch = _mapping(launches[0], "review launch identity")
-    expected_keys = {"argv", "backend", "cwd", "model", "prompt_sha256", "schema"}
+    expected_keys = {
+        "argv",
+        "backend",
+        "cwd",
+        "model",
+        "prompt_sha256",
+        "prompt_transport",
+        "schema",
+    }
     if set(launch) != expected_keys or launch.get("schema") != CLI_LAUNCH_SCHEMA:
         raise ReviewError("review launch identity does not match the required schema")
     if adapter_factory.backend == "codex":
@@ -747,14 +763,13 @@ def _validated_launch_identity(
             adapter_factory.model,
             *_CODEX_REVIEW_AUTONOMY_ARGS,
             *_CODEX_REVIEW_EXTRA_ARGS,
-            "<PROMPT>",
+            "-",
         ]
     else:
         launched_prompt = prompt
         expected_argv = [
             "claude",
             "-p",
-            "<PROMPT>",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -774,6 +789,7 @@ def _validated_launch_identity(
         "cwd": str(neutral_cwd),
         "model": adapter_factory.model,
         "prompt_sha256": _sha256(launched_prompt.encode("utf-8")),
+        "prompt_transport": PROMPT_TRANSPORT_STDIN,
         "schema": CLI_LAUNCH_SCHEMA,
     }
     if launch != expected:

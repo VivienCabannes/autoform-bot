@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import signal
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -684,6 +685,7 @@ def test_cli_adapters_expose_the_exact_launch_without_copying_prompt(adapter_typ
     prompt_index = 2 if adapter_type is ClaudeAdapter else -1
     assert launch["schema"] == _cli_common.CLI_LAUNCH_SCHEMA
     assert launch["cwd"] == cwd == "/neutral"
+    assert launch["prompt_transport"] == _cli_common.PROMPT_TRANSPORT_ARGV
     assert launch["argv"][prompt_index] == "<PROMPT>"
     assert launch["prompt_sha256"] == hashlib.sha256(
         args[prompt_index].encode("utf-8")
@@ -738,6 +740,30 @@ class FakeProcess:
         return 0
 
 
+class _EmptyStdout:
+    def __iter__(self):
+        return iter(())
+
+    def close(self) -> None:
+        pass
+
+
+class _RecordingStdin:
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.closed = False
+
+    def write(self, value: str) -> int:
+        self.parts.append(value)
+        return len(value)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_process_tree_cleanup_escalates_to_kill(monkeypatch) -> None:
     process = FakeProcess()
     signals: list[tuple[int, int]] = []
@@ -762,6 +788,157 @@ def test_process_runner_rejects_nonzero_exit(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setattr(_cli_common.subprocess, "Popen", lambda *args, **kwargs: process)
     with pytest.raises(_cli_common.ProverProcessError, match="status 7"):
         list(_cli_common._subprocess_line_runner(["worker"], {}, str(tmp_path)))
+
+
+def test_process_runner_writes_exact_prompt_and_closes_stdin(monkeypatch, tmp_path: Path) -> None:
+    process = FakeProcess()
+    process.running = False
+    process.stdout = _EmptyStdout()
+    process.stdin = _RecordingStdin()
+    process.wait = lambda timeout=None: 0
+    popen_kwargs: list[dict[str, object]] = []
+
+    def popen(_args, **kwargs):
+        popen_kwargs.append(kwargs)
+        return process
+
+    monkeypatch.setattr(_cli_common.subprocess, "Popen", popen)
+    monkeypatch.setattr(_cli_common, "_kill_process_tree", lambda _process: None)
+    prompt = "λ" + "x" * (_cli_common._STDIN_CHUNK_CHARS + 3)
+
+    assert list(
+        _cli_common._subprocess_line_runner(
+            ["worker"],
+            {},
+            str(tmp_path),
+            stdin_text=prompt,
+        )
+    ) == []
+    assert "".join(process.stdin.parts) == prompt
+    assert process.stdin.closed
+    assert popen_kwargs[0]["stdin"] is _cli_common.subprocess.PIPE
+    assert popen_kwargs[0]["encoding"] == "utf-8"
+
+
+@pytest.mark.parametrize("failure", ["short", "broken"])
+def test_process_runner_fails_closed_on_stdin_write_error(
+    monkeypatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    process = FakeProcess()
+    process.running = False
+    process.stdout = _EmptyStdout()
+
+    class FailingStdin(_RecordingStdin):
+        def write(self, value: str) -> int:
+            if failure == "broken":
+                raise BrokenPipeError("child closed stdin")
+            return len(value) - 1
+
+    process.stdin = FailingStdin()
+    process.wait = lambda timeout=None: 0
+    monkeypatch.setattr(_cli_common.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(_cli_common, "_kill_process_tree", lambda _process: None)
+
+    expected = "short stdin write" if failure == "short" else "child closed stdin"
+    with pytest.raises(_cli_common.ProverProcessError, match=expected):
+        list(
+            _cli_common._subprocess_line_runner(
+                ["worker"],
+                {},
+                str(tmp_path),
+                stdin_text="large prompt",
+            )
+        )
+    assert process.stdin.closed
+
+
+@pytest.mark.parametrize(
+    ("cancelled", "error"),
+    [(True, _cli_common.ProverCancelled), (False, _cli_common.ProverTimeout)],
+)
+def test_process_runner_interrupts_blocked_stdin_writer(
+    monkeypatch,
+    tmp_path: Path,
+    cancelled: bool,
+    error: type[Exception],
+) -> None:
+    process = FakeProcess()
+    process.stdout = _EmptyStdout()
+    release = threading.Event()
+
+    class BlockingStdin(_RecordingStdin):
+        def write(self, value: str) -> int:
+            release.wait(timeout=5)
+            return len(value)
+
+    process.stdin = BlockingStdin()
+    process.wait = lambda timeout=None: 0
+    killed: list[FakeProcess] = []
+
+    def kill(proc: FakeProcess) -> None:
+        killed.append(proc)
+        release.set()
+        proc.running = False
+
+    monkeypatch.setattr(_cli_common.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(_cli_common, "_kill_process_tree", kill)
+    cancel_event = threading.Event()
+    if cancelled:
+        cancel_event.set()
+    deadline = None if cancelled else time.monotonic() - 1
+
+    with pytest.raises(error):
+        list(
+            _cli_common._subprocess_line_runner(
+                ["worker"],
+                {},
+                str(tmp_path),
+                deadline=deadline,
+                cancel_event=cancel_event,
+                stdin_text="x" * (_cli_common._STDIN_CHUNK_CHARS * 2),
+            )
+        )
+    assert killed == [process]
+    assert process.stdin.closed
+
+
+def test_process_runner_deadline_precedes_concurrent_stdin_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    process = FakeProcess()
+    process.running = False
+    process.stdout = _EmptyStdout()
+
+    class BrokenStdin(_RecordingStdin):
+        def write(self, value: str) -> int:
+            raise BrokenPipeError("secondary broken pipe")
+
+    process.stdin = BrokenStdin()
+    process.wait = lambda timeout=None: 0
+    clock_calls = 0
+
+    def monotonic() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        return 0.0 if clock_calls == 1 else 2.0
+
+    monkeypatch.setattr(_cli_common.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(_cli_common, "_kill_process_tree", lambda _process: None)
+    monkeypatch.setattr(_cli_common.time, "monotonic", monotonic)
+
+    with pytest.raises(_cli_common.ProverTimeout):
+        list(
+            _cli_common._subprocess_line_runner(
+                ["worker"],
+                {},
+                str(tmp_path),
+                deadline=1.0,
+                stdin_text="large prompt",
+            )
+        )
 
 
 def test_silent_subprocess_runner_observes_cancellation(monkeypatch, tmp_path: Path) -> None:

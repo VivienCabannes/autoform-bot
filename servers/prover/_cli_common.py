@@ -26,7 +26,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-CLI_LAUNCH_SCHEMA = "autoform-cli-launch/v1"
+CLI_LAUNCH_SCHEMA = "autoform-cli-launch/v2"
+PROMPT_TRANSPORT_ARGV = "argv"
+PROMPT_TRANSPORT_STDIN = "stdin"
+PROMPT_TRANSPORTS = frozenset({PROMPT_TRANSPORT_ARGV, PROMPT_TRANSPORT_STDIN})
+_STDIN_CHUNK_CHARS = 64 * 1024
 
 
 class ProverTimeout(Exception):
@@ -70,26 +74,37 @@ def _cli_launch_record(
     model: str,
     args: list[str],
     prompt: str,
-    prompt_index: int,
+    prompt_transport: str,
+    prompt_index: int | None,
     cwd: str,
 ) -> dict[str, object]:
     """Return a safe, exact record of one CLI launch attempt.
 
-    The prompt can contain a large evidence payload, so the argv copy replaces it
-    with a fixed marker and records its digest separately. The record is created
-    from the final argv immediately before the runner is invoked.
+    The prompt can contain a large evidence payload. For argv transport, the
+    recorded argv replaces it with a fixed marker. For stdin transport, the
+    recorded argv is the exact launched argv. Both forms record the transport
+    and the digest of the exact UTF-8 prompt bytes. The record is created from
+    the final launch inputs immediately before the runner is invoked.
     """
 
-    if args[prompt_index] != prompt:
-        raise ValueError("CLI prompt index does not identify the launched prompt")
-    redacted = list(args)
-    redacted[prompt_index] = "<PROMPT>"
+    if prompt_transport not in PROMPT_TRANSPORTS:
+        raise ValueError(f"unsupported CLI prompt transport: {prompt_transport}")
+    recorded_args = list(args)
+    if prompt_transport == PROMPT_TRANSPORT_ARGV:
+        if prompt_index is None or args[prompt_index] != prompt:
+            raise ValueError("CLI prompt index does not identify the launched prompt")
+        recorded_args[prompt_index] = "<PROMPT>"
+    elif prompt_index is not None:
+        raise ValueError("stdin prompt transport cannot identify an argv prompt")
+    elif prompt in args:
+        raise ValueError("stdin prompt must not also appear in the launched argv")
     return {
-        "argv": redacted,
+        "argv": recorded_args,
         "backend": backend,
         "cwd": cwd,
         "model": model,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_transport": prompt_transport,
         "schema": CLI_LAUNCH_SCHEMA,
     }
 
@@ -183,6 +198,8 @@ def _subprocess_line_runner(
     cwd: str,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    *,
+    stdin_text: str | None = None,
 ) -> Iterator[str]:
     """Real launcher: run a CLI and yield its stdout lines (JSONL).
 
@@ -196,21 +213,28 @@ def _subprocess_line_runner(
     is closed early (``GeneratorExit``), so an abandoned run never leaks a
     fully-autonomous child process. Lines are pumped through a queue by a reader
     thread so the deadline and cancellation are enforced even while the child is
-    silent.
+    silent. When ``stdin_text`` is supplied, a second thread writes its exact
+    UTF-8 encoding and closes stdin. This keeps large prompts out of argv without
+    letting a blocked pipe bypass cancellation or the wall-clock deadline.
     """
     proc = subprocess.Popen(
         args,
         cwd=cwd or None,
         env=env,
+        stdin=subprocess.PIPE if stdin_text is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        encoding="utf-8",
         bufsize=1,
         start_new_session=True,  # own process group → the kill path reaps grandchildren
     )
     assert proc.stdout is not None
+    stdin_pipe = getattr(proc, "stdin", None)
     lines: queue.Queue[Any] = queue.Queue()
     _EOF = object()
+    _STDIN_DONE = object()
+    _STDIN_ERROR = object()
 
     def _pump() -> None:
         try:
@@ -222,8 +246,39 @@ def _subprocess_line_runner(
             lines.put(_EOF)
 
     threading.Thread(target=_pump, daemon=True).start()
+    stdin_thread: threading.Thread | None = None
+    if stdin_text is not None:
+        assert stdin_pipe is not None
+
+        def _write_prompt() -> None:
+            error: Exception | None = None
+            try:
+                for offset in range(0, len(stdin_text), _STDIN_CHUNK_CHARS):
+                    chunk = stdin_text[offset : offset + _STDIN_CHUNK_CHARS]
+                    written = stdin_pipe.write(chunk)
+                    if written != len(chunk):
+                        raise OSError(
+                            f"short stdin write: wrote {written!r} of {len(chunk)} characters"
+                        )
+                stdin_pipe.flush()
+            except Exception as caught:
+                error = caught
+            finally:
+                try:
+                    stdin_pipe.close()
+                except Exception as caught:
+                    if error is None:
+                        error = caught
+                if error is not None:
+                    lines.put((_STDIN_ERROR, error))
+                lines.put(_STDIN_DONE)
+
+        stdin_thread = threading.Thread(target=_write_prompt, daemon=True)
+        stdin_thread.start()
     try:
-        while True:
+        stdout_done = False
+        stdin_done = stdin_text is None
+        while not (stdout_done and stdin_done):
             if cancel_event is not None and cancel_event.is_set():
                 raise ProverCancelled(f"CLI worker was cancelled: {args[0]}")
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -236,9 +291,20 @@ def _subprocess_line_runner(
                 )
             except queue.Empty:
                 continue  # re-check the deadline, keep waiting for output
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProverCancelled(f"CLI worker was cancelled: {args[0]}")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ProverTimeout(f"CLI worker exceeded its deadline: {args[0]}")
             if item is _EOF:
-                break
-            yield item
+                stdout_done = True
+            elif item is _STDIN_DONE:
+                stdin_done = True
+            elif isinstance(item, tuple) and len(item) == 2 and item[0] is _STDIN_ERROR:
+                raise ProverProcessError(
+                    f"could not send stdin to CLI worker {args[0]}: {item[1]}"
+                )
+            else:
+                yield item
         returncode = proc.wait(timeout=5)
         if returncode != 0:
             raise ProverProcessError(
@@ -248,6 +314,15 @@ def _subprocess_line_runner(
         # Runs on normal exhaustion, on ProverTimeout, AND on generator close
         # (GeneratorExit) — the child never outlives its consumer.
         _kill_process_tree(proc)
+        if stdin_pipe is not None:
+            try:
+                stdin_pipe.close()
+            except Exception:
+                pass
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=5)
+            if stdin_thread.is_alive():
+                logger.warning("could not finish CLI stdin writer for pid %s", proc.pid)
         try:
             proc.stdout.close()
         except Exception:

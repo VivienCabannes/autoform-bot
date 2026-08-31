@@ -23,7 +23,7 @@ from autoform_worker.reviewer import (
     validate_independent_backends,
 )
 from servers.prover import Event, EventKind, ProofResult, ProverAdapter, Run
-from servers.prover._cli_common import CLI_LAUNCH_SCHEMA
+from servers.prover._cli_common import CLI_LAUNCH_SCHEMA, PROMPT_TRANSPORT_STDIN
 
 import autoform_worker.reviewer as reviewer_module
 
@@ -34,6 +34,69 @@ ARTICLE_PATH = "blueprint/roadmap/chapter/result.md"
 SOURCE = b"Every natural number equals itself.\n"
 COVERAGE = b"canonical coverage contract\n"
 MODEL = "review-test-model"
+_PARSER_STUB = r'''#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+backend = Path(sys.argv[0]).name
+parser = argparse.ArgumentParser(prog=backend)
+arguments = sys.argv[1:]
+if backend == "codex":
+    parser.add_argument("command", choices=("exec",))
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--skip-git-repo-check", action="store_true")
+    parser.add_argument("-m", "--model", required=True)
+    parser.add_argument("--sandbox", choices=("read-only",), required=True)
+    parser.add_argument("--ignore-user-config", action="store_true")
+    parser.add_argument("--ignore-rules", action="store_true")
+    parser.add_argument("--ephemeral", action="store_true")
+    parser.add_argument("--strict-config", action="store_true")
+    parser.add_argument("-c", "--config", action="append", default=[])
+    has_stdin_marker = arguments[-1:] == ["-"]
+    options = parser.parse_args(arguments[:-1] if has_stdin_marker else arguments)
+    if not has_stdin_marker:
+        parser.error("codex must use the explicit stdin prompt marker")
+    if "features.view_image=false" not in options.config:
+        parser.error("view_image was not disabled through a supported feature key")
+    if "tools.view_image=false" in options.config:
+        parser.error("unsupported tools.view_image key was retained")
+else:
+    parser.add_argument("-p", "--print", action="store_true")
+    parser.add_argument("--output-format", choices=("stream-json",), required=True)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--append-system-prompt", required=True)
+    parser.add_argument("--setting-sources")
+    parser.add_argument("--settings", required=True)
+    parser.add_argument("--disable-slash-commands", action="store_true")
+    parser.add_argument("--permission-mode", choices=("dontAsk",), required=True)
+    parser.add_argument("--tools", required=True)
+    parser.add_argument("--strict-mcp-config", action="store_true")
+    parser.add_argument("--mcp-config", required=True)
+    parser.add_argument("prompt", nargs="?")
+    options = parser.parse_args(arguments)
+    if options.prompt is not None:
+        parser.error("claude prompt must not be present in argv")
+    if options.tools != "":
+        parser.error("claude tools must be disabled")
+
+prompt = sys.stdin.read()
+if len(prompt.encode("utf-8")) <= os.sysconf("SC_ARG_MAX"):
+    parser.error("fixture prompt did not exceed ARG_MAX")
+prefix = "AUTOFORM_REVIEW_JSON: "
+template = json.loads(prompt.rsplit(prefix, 1)[1])
+template["reason"] = "The independent parser received the complete stdin evidence."
+template["verdict"] = "approve"
+response = prefix + json.dumps(template, sort_keys=True, separators=(",", ":"))
+if backend == "codex":
+    event = {"type": "item.completed", "item": {"type": "agent_message", "text": response}}
+else:
+    event = {"type": "result", "result": response, "session_id": "stub-session", "usage": {}}
+print(json.dumps(event, separators=(",", ":")))
+'''
 
 
 def _json_bytes(value: object) -> bytes:
@@ -281,14 +344,13 @@ class _Adapter(ProverAdapter):
                     self.configured_model,
                     *reviewer_module._CODEX_REVIEW_AUTONOMY_ARGS,
                     *reviewer_module._CODEX_REVIEW_EXTRA_ARGS,
-                    "<PROMPT>",
+                    "-",
                 ]
             else:
                 launched_prompt = spec
                 argv = [
                     "claude",
                     "-p",
-                    "<PROMPT>",
                     "--output-format",
                     "stream-json",
                     "--verbose",
@@ -308,6 +370,7 @@ class _Adapter(ProverAdapter):
                 "cwd": project_dir,
                 "model": self.configured_model,
                 "prompt_sha256": _sha(launched_prompt.encode()),
+                "prompt_transport": PROMPT_TRANSPORT_STDIN,
                 "schema": CLI_LAUNCH_SCHEMA,
             }
             launch.update(self.launch_updates)
@@ -666,6 +729,7 @@ def test_review_cancellation_after_stream_exhaustion_cannot_approve(review_case)
         _Adapter(launch_updates={"backend": "claude"}),
         _Adapter(launch_updates={"cwd": "/tmp"}),
         _Adapter(launch_updates={"prompt_sha256": "0" * 64}),
+        _Adapter(launch_updates={"prompt_transport": "argv"}),
     ],
 )
 def test_review_rejects_missing_or_spoofed_launch_identity(review_case, adapter) -> None:
@@ -819,12 +883,14 @@ def test_reviewer_factory_has_bound_model_and_no_claude_bash_permission() -> Non
     assert "--ignore-user-config" in codex._extra_args
     assert codex._environment == {"SAFE": "1"}
     assert codex._wrap_spec_prompt is False
+    assert codex._prompt_transport == PROMPT_TRANSPORT_STDIN
     assert claude._model == "opus"
     assert claude._autonomy_args == list(reviewer_module._CLAUDE_REVIEW_AUTONOMY_ARGS)
     assert claude._session_isolation_args == list(reviewer_module._CLAUDE_REVIEW_SESSION_ARGS)
     assert claude._mcp_config == '{"mcpServers":{}}'
     assert claude._environment == {"SAFE": "1"}
     assert claude._wrap_spec_prompt is False
+    assert claude._prompt_transport == PROMPT_TRANSPORT_STDIN
     assert validate_independent_backends("claude", "codex") == ("claude", "codex")
     with pytest.raises(ReviewError, match="must be different"):
         validate_independent_backends("codex", "codex")
@@ -838,10 +904,10 @@ def test_reviewer_factory_has_bound_model_and_no_claude_bash_permission() -> Non
 
 @pytest.mark.parametrize("backend", ["claude", "codex"])
 def test_reviewer_factory_launches_with_no_tools_and_records_exact_policy(backend) -> None:
-    captured: list[list[str]] = []
+    captured: list[tuple[list[str], str | None]] = []
 
-    def runner(args, _environment, _cwd, _deadline):
-        captured.append(args)
+    def runner(args, _environment, _cwd, _deadline, *, stdin_text=None):
+        captured.append((args, stdin_text))
         return iter(())
 
     factory = reviewer_factory(backend, model="review-model", timeout=10)
@@ -852,15 +918,89 @@ def test_reviewer_factory_launches_with_no_tools_and_records_exact_policy(backen
     list(adapter.events(run))
 
     assert captured
-    argv = captured[0]
-    assert run.meta["launches"][0]["argv"].count("<PROMPT>") == 1
+    argv, stdin_text = captured[0]
+    launch = run.meta["launches"][0]
+    assert stdin_text is not None and "inline evidence" in stdin_text
+    assert "inline evidence" not in argv
+    assert launch["argv"] == argv
+    assert launch["prompt_transport"] == PROMPT_TRANSPORT_STDIN
+    assert launch["prompt_sha256"] == _sha(stdin_text.encode())
     if backend == "claude":
+        assert argv[:3] == ["claude", "-p", "--output-format"]
         assert ["--tools", ""] == argv[argv.index("--tools") : argv.index("--tools") + 2]
         assert "--strict-mcp-config" in argv
         assert argv[argv.index("--mcp-config") + 1] == '{"mcpServers":{}}'
         assert argv[argv.index("--setting-sources") + 1] == ""
     else:
+        assert argv[-1] == "-"
         assert "features.shell_tool=false" in argv
         assert "features.unified_exec=false" in argv
+        assert "features.view_image=false" in argv
+        assert "tools.view_image=false" not in argv
+        assert "tools.update_plan.enabled=false" in argv
+        assert "tools.experimental_request_user_input.enabled=false" in argv
         assert 'web_search="disabled"' in argv
         assert "mcp_servers={}" in argv
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+def test_large_commit_bound_review_reaches_real_stdin_parser(
+    review_case,
+    monkeypatch,
+    backend: str,
+) -> None:
+    arg_max = int(os.sysconf("SC_ARG_MAX"))
+    large_path = "large-review-evidence.txt"
+    line = b"untrusted candidate evidence\n"
+    large_size = arg_max + 8 * 1024
+    payload = (line * (large_size // len(line) + 1))[:large_size]
+    (review_case.repo / large_path).write_bytes(payload)
+    _git(review_case.repo, "add", large_path)
+    _git(review_case.repo, "commit", "-qm", "large candidate evidence")
+    candidate_oid = _git(review_case.repo, "rev-parse", "HEAD")
+    request = bind_candidate_review_request(
+        base_oid=review_case.request.base_oid,
+        candidate_oid=candidate_oid,
+        article_id=review_case.request.article_id,
+        node_id=review_case.request.node_id,
+        phase=review_case.request.phase,
+        article_path=review_case.request.article_path,
+        changed_paths=tuple(sorted((*review_case.request.changed_paths, large_path))),
+        prover_backend="codex" if backend == "claude" else "claude",
+        reviewer_backend=backend,
+        base_execution_input=review_case.request.base_execution_input,
+        candidate_execution_input=review_case.request.candidate_execution_input,
+        gate_evidence=review_case.request.gate_evidence,
+    )
+    stub_dir = review_case.repo.parent / f"{backend}-parser-bin"
+    stub_dir.mkdir()
+    executable = stub_dir / backend
+    executable.write_text(_PARSER_STUB, encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(stub_dir) + os.pathsep + os.environ["PATH"])
+
+    result = review_candidate(
+        review_case.repo,
+        request,
+        reviewer_factory(backend, model="review-model", timeout=60),
+        threading.Event(),
+    )
+
+    blobs = _blobs(result)
+    review_prompt = blobs["review-prompt.txt"].decode("utf-8")
+    launched_prompt = (
+        f"{reviewer_module._REVIEW_SYSTEM_PROMPT}\n\n{review_prompt}"
+        if backend == "codex"
+        else review_prompt
+    )
+    assert result.approved, (result.reason, blobs["transcript.json"])
+    assert len(launched_prompt.encode("utf-8")) > arg_max
+    launch = json.loads(blobs["reviewer-launch.json"])
+    assert launch["prompt_transport"] == PROMPT_TRANSPORT_STDIN
+    assert launch["prompt_sha256"] == _sha(launched_prompt.encode("utf-8"))
+    assert max(map(len, launch["argv"])) < arg_max
+    assert large_path not in "\n".join(launch["argv"])
+    if backend == "codex":
+        assert launch["argv"][-1] == "-"
+    else:
+        assert launch["argv"][:3] == ["claude", "-p", "--output-format"]

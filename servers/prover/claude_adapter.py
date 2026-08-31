@@ -54,11 +54,13 @@ from pathlib import Path
 from typing import Any
 
 from ._cli_common import (
-    _cli_launch_record,
+    PROMPT_TRANSPORT_ARGV,
+    PROMPT_TRANSPORTS,
     ProverCancelled,
     ProverProcessError,
     ProverTimeout,
     _build_spec_prompt,
+    _cli_launch_record,
     _failure_reason,
     _iter_json_lines,
     _looks_failed,
@@ -257,6 +259,8 @@ class ClaudeAdapter(ProverAdapter):
             list.
         wrap_spec_prompt: Wrap the supplied spec in the normal proof-worker
             instruction. Review-only callers pass ``False``.
+        prompt_transport: Deliver prompts through argv (the prover default) or
+            stdin (used by independent review for large evidence bundles).
         max_wait_seconds: Wall-clock ceiling for the WHOLE run (all turns). On
             expiry the child process group is killed, a terminal error event is
             yielded, and the run reports ``failed`` with meta sub-status
@@ -285,6 +289,7 @@ class ClaudeAdapter(ProverAdapter):
         extra_args: list[str] | None = None,
         session_isolation_args: list[str] | None = None,
         wrap_spec_prompt: bool = True,
+        prompt_transport: str = PROMPT_TRANSPORT_ARGV,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         runner: Any | None = None,
         environment: Mapping[str, str] | None = None,
@@ -302,6 +307,9 @@ class ClaudeAdapter(ProverAdapter):
             else session_isolation_args
         )
         self._wrap_spec_prompt = wrap_spec_prompt
+        if prompt_transport not in PROMPT_TRANSPORTS:
+            raise ValueError(f"unsupported prompt transport: {prompt_transport}")
+        self._prompt_transport = prompt_transport
         if not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
         self._max_wait_seconds = max_wait_seconds
@@ -449,7 +457,15 @@ class ClaudeAdapter(ProverAdapter):
     # ------------------------------------------------------------------
 
     def _run_turn(self, state: _ClaudeRun, prompt: str, *, resume: bool) -> Iterator[Event]:
-        args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", state.model]
+        args = ["claude", "-p"]
+        prompt_index: int | None = None
+        stdin_text: str | None = None
+        if self._prompt_transport == PROMPT_TRANSPORT_ARGV:
+            args.append(prompt)
+            prompt_index = 2
+        else:
+            stdin_text = prompt
+        args += ["--output-format", "stream-json", "--verbose", "--model", state.model]
         if resume and state.session_id:
             args += ["--resume", state.session_id]
         elif not resume:
@@ -464,7 +480,8 @@ class ClaudeAdapter(ProverAdapter):
                 model=state.model,
                 args=args,
                 prompt=prompt,
-                prompt_index=2,
+                prompt_transport=self._prompt_transport,
+                prompt_index=prompt_index,
                 cwd=state.project_dir,
             )
         )
@@ -486,9 +503,16 @@ class ClaudeAdapter(ProverAdapter):
                     state.project_dir,
                     state.deadline,
                     self._cancel_event,
+                    stdin_text=stdin_text,
                 )
                 if self._uses_builtin_runner
-                else self._runner(args, env, state.project_dir, state.deadline)
+                else self._runner(
+                    args,
+                    env,
+                    state.project_dir,
+                    state.deadline,
+                    **({"stdin_text": stdin_text} if stdin_text is not None else {}),
+                )
             )
         ):
             # Capture the session id (emitted on the ``system: init`` line and the

@@ -38,11 +38,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ._cli_common import (
-    _cli_launch_record,
+    PROMPT_TRANSPORT_ARGV,
+    PROMPT_TRANSPORTS,
     ProverCancelled,
     ProverProcessError,
     ProverTimeout,
     _build_spec_prompt,
+    _cli_launch_record,
     _failure_reason,
     _iter_json_lines,
     _looks_failed,
@@ -182,6 +184,8 @@ class CodexAdapter(ProverAdapter):
     supply an exact subprocess environment; the default preserves existing
     scrubbed-host behavior. ``wrap_spec_prompt=False`` is reserved for callers
     such as independent review that supply a complete task prompt.
+    ``prompt_transport="stdin"`` keeps large prompts out of argv; the default
+    remains argv for ordinary prover runs.
     """
 
     name = "codex"
@@ -198,6 +202,7 @@ class CodexAdapter(ProverAdapter):
         autonomy_args: list[str] | None = None,
         extra_args: list[str] | None = None,
         wrap_spec_prompt: bool = True,
+        prompt_transport: str = PROMPT_TRANSPORT_ARGV,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         runner: Any | None = None,
         environment: Mapping[str, str] | None = None,
@@ -210,6 +215,9 @@ class CodexAdapter(ProverAdapter):
         )
         self._extra_args = list(extra_args or [])
         self._wrap_spec_prompt = wrap_spec_prompt
+        if prompt_transport not in PROMPT_TRANSPORTS:
+            raise ValueError(f"unsupported prompt transport: {prompt_transport}")
+        self._prompt_transport = prompt_transport
         if not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
         self._max_wait_seconds = max_wait_seconds
@@ -339,14 +347,23 @@ class CodexAdapter(ProverAdapter):
             if resume
             else self._autonomy_args
         )
-        args += autonomy + state.extra_args + [prompt]
+        args += autonomy + state.extra_args
+        prompt_index: int | None = None
+        stdin_text: str | None = None
+        if self._prompt_transport == PROMPT_TRANSPORT_ARGV:
+            args.append(prompt)
+            prompt_index = -1
+        else:
+            args.append("-")
+            stdin_text = prompt
         state.launches.append(
             _cli_launch_record(
                 backend=self.name,
                 model=state.model or "codex-default",
                 args=args,
                 prompt=prompt,
-                prompt_index=-1,
+                prompt_transport=self._prompt_transport,
+                prompt_index=prompt_index,
                 cwd=state.project_dir,
             )
         )
@@ -358,9 +375,16 @@ class CodexAdapter(ProverAdapter):
                 state.project_dir,
                 state.deadline,
                 self._cancel_event,
+                stdin_text=stdin_text,
             )
             if self._uses_builtin_runner
-            else self._runner(args, self._subprocess_environment(), state.project_dir, state.deadline)
+            else self._runner(
+                args,
+                self._subprocess_environment(),
+                state.project_dir,
+                state.deadline,
+                **({"stdin_text": stdin_text} if stdin_text is not None else {}),
+            )
         )
         for obj in _iter_json_lines(lines):
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
