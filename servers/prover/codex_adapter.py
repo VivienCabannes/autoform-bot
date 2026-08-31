@@ -33,6 +33,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -175,7 +176,9 @@ class CodexAdapter(ProverAdapter):
     Args mirror :class:`~servers.prover.claude_adapter.ClaudeAdapter`. ``runner`` is
     injectable ``(args, env, cwd, deadline) -> Iterator[str]`` (tests pass a fake
     so no live ``codex`` runs). ``autonomy_args`` defaults to a workspace-write
-    sandbox, and environment variables cannot disable it.
+    sandbox, and environment variables cannot disable it. ``environment`` may
+    supply an exact subprocess environment; the default preserves existing
+    scrubbed-host behavior.
     """
 
     name = "codex"
@@ -193,6 +196,7 @@ class CodexAdapter(ProverAdapter):
         extra_args: list[str] | None = None,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         runner: Any | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self._model = model
         self._system_prompt = system_prompt
@@ -206,6 +210,7 @@ class CodexAdapter(ProverAdapter):
         self._max_wait_seconds = max_wait_seconds
         self._runner = runner or _subprocess_line_runner
         self._uses_builtin_runner = runner is None
+        self._environment = dict(environment) if environment is not None else None
         self._cancel_event: threading.Event | None = None
 
     # ------------------------------------------------------------------ surface
@@ -327,13 +332,13 @@ class CodexAdapter(ProverAdapter):
         lines = (
             self._runner(
                 args,
-                _scrubbed_env(),
+                self._subprocess_environment(),
                 state.project_dir,
                 state.deadline,
                 self._cancel_event,
             )
             if self._uses_builtin_runner
-            else self._runner(args, _scrubbed_env(), state.project_dir, state.deadline)
+            else self._runner(args, self._subprocess_environment(), state.project_dir, state.deadline)
         )
         for obj in _iter_json_lines(lines):
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
@@ -358,3 +363,6 @@ class CodexAdapter(ProverAdapter):
                 if event.kind is EventKind.RESULT and event.content and not state.final_text:
                     state.final_text = event.content
                 yield event
+
+    def _subprocess_environment(self) -> dict[str, str]:
+        return dict(self._environment) if self._environment is not None else _scrubbed_env()

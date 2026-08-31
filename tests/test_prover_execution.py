@@ -643,6 +643,27 @@ def test_claude_clean_run_has_initialized_terminal_error() -> None:
     assert result.reason == ""
 
 
+@pytest.mark.parametrize(
+    "adapter_type",
+    [ClaudeAdapter, CodexAdapter],
+)
+def test_cli_adapters_copy_explicit_subprocess_environment(adapter_type) -> None:
+    captured: list[dict[str, str]] = []
+
+    def runner(_args, environment, _cwd, _deadline):
+        captured.append(environment)
+        return iter(())
+
+    supplied = {"SAFE": "original"}
+    kwargs = {"mcp_config": ""} if adapter_type is ClaudeAdapter else {}
+    adapter = adapter_type(environment=supplied, runner=runner, **kwargs)
+    supplied["SAFE"] = "changed"
+    run = adapter.start("node", "spec", "/project")
+    list(adapter.events(run))
+
+    assert captured and captured[0]["SAFE"] == "original"
+
+
 def test_backend_sandbox_policy_cannot_be_disabled_by_environment(monkeypatch) -> None:
     monkeypatch.setenv("AUTOFORM_UNSAFE_FULL_ACCESS", "1")
     claude = ClaudeAdapter(mcp_config="")

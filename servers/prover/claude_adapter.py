@@ -48,7 +48,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -258,6 +258,8 @@ class ClaudeAdapter(ProverAdapter):
             Iterator[str]`` yielding stream-json lines. Defaults to a real
             ``subprocess`` launcher; tests inject a fake so no live ``claude``
             process is spawned.
+        environment: Optional exact subprocess environment. The default keeps
+            the adapter's existing scrubbed host environment behavior.
     """
 
     name = "claude"
@@ -276,6 +278,7 @@ class ClaudeAdapter(ProverAdapter):
         extra_args: list[str] | None = None,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         runner: Any | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self._model = model
         self._system_prompt = system_prompt
@@ -289,6 +292,7 @@ class ClaudeAdapter(ProverAdapter):
         self._max_wait_seconds = max_wait_seconds
         self._runner = runner or _subprocess_line_runner
         self._uses_builtin_runner = runner is None
+        self._environment = dict(environment) if environment is not None else None
         self._cancel_event: threading.Event | None = None
 
     # ------------------------------------------------------------------
@@ -430,7 +434,7 @@ class ClaudeAdapter(ProverAdapter):
             args += ["--strict-mcp-config", "--mcp-config", self._mcp_config]
         args += state.extra_args
 
-        env = _scrubbed_env()
+        env = dict(self._environment) if self._environment is not None else _scrubbed_env()
         plugin_root = str(Path(__file__).resolve().parents[2])
         # The shared headless MCP config uses Claude's documented variable.
         # Set it explicitly because a Claude worker may be launched by Codex or
