@@ -238,6 +238,11 @@ def test_malformed_v2_frontmatter_cannot_downgrade_to_v1(
         ("'schema': 'autoform-coverage/v2'", "coverage-schema-ambiguous"),
         ('"schema": "autoform-coverage\\u002fv2"', "coverage-schema-ambiguous"),
         ('"\\u0073chema": "autoform-coverage\\u002fv2"', "coverage-schema-ambiguous"),
+        (
+            '"\\U00000073chema": "autoform-coverage\\U0000002Fv2"',
+            "coverage-schema-ambiguous",
+        ),
+        ('"\\x73chema": "autoform-coverage\\x2Fv2"', "coverage-schema-ambiguous"),
         ("schema = autoform-coverage/v2", "coverage-frontmatter-invalid"),
         ("schema=\"autoform-coverage/v2\"", "coverage-frontmatter-invalid"),
         ("scema autoform-coverage/v2", "coverage-frontmatter-invalid"),

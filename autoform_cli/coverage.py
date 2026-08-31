@@ -54,8 +54,9 @@ _FRONTMATTER_LIKE_FENCE = re.compile(
 )
 _FRONTMATTER_KEY = re.compile(r"^[ \t]*[\"']?(?P<key>[A-Za-z][A-Za-z0-9_-]*)[\"']?")
 _YAML_HEX_ESCAPE = re.compile(
-    r"\\u(?P<short>[0-9a-f]{4})|\\U(?P<long>[0-9a-f]{8})|\\x(?P<byte>[0-9a-f]{2})",
-    re.IGNORECASE,
+    r"\\U(?P<long>[0-9A-Fa-f]{8})|"
+    r"\\u(?P<short>[0-9A-Fa-f]{4})|"
+    r"\\x(?P<byte>[0-9A-Fa-f]{2})"
 )
 
 #: Stem of the marker that stands in for a row's cells when tracing which
