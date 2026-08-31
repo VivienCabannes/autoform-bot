@@ -546,6 +546,29 @@ def _candidate_admission_case(
     )
 
 
+def _candidate_gate_result(
+    context: CandidateAdmissionContext,
+    *,
+    passed: bool,
+) -> CandidateGateResult:
+    return CandidateGateResult(
+        passed=passed,
+        node_id=context.work_item.node.id,
+        article_id=context.work_item.node.article_id,
+        phase="proof",
+        attempt=1,
+        source_revision=context.work_item.source_revision,
+        source_contract_sha256=context.work_item.source_contract_sha256,
+        protected_roadmap_sha256=context.work_item.protected_roadmap_sha256,
+        work_item_sha256="8" * 64,
+        base_execution_input_sha256=None,
+        candidate_execution_input_sha256=None,
+        base_toolchain=None,
+        candidate_toolchain=None,
+        checks=(),
+    )
+
+
 def test_recovery_plan_prioritizes_replay_over_stale_merge_item() -> None:
     snapshot = _recovery_snapshot(
         run=_run_record(),
@@ -691,22 +714,7 @@ def test_candidate_admission_obeys_stop_before_enqueue() -> None:
 def test_candidate_admission_records_failed_fixed_gate_before_rejection(tmp_path) -> None:
     snapshot, context = _candidate_admission_case(tmp_path)
     ledger = _AdmissionLedger()
-    gate_result = CandidateGateResult(
-        passed=False,
-        node_id=context.work_item.node.id,
-        article_id=context.work_item.node.article_id,
-        phase="proof",
-        attempt=1,
-        source_revision=context.work_item.source_revision,
-        source_contract_sha256=context.work_item.source_contract_sha256,
-        protected_roadmap_sha256=context.work_item.protected_roadmap_sha256,
-        work_item_sha256="8" * 64,
-        base_execution_input_sha256=None,
-        candidate_execution_input_sha256=None,
-        base_toolchain=None,
-        candidate_toolchain=None,
-        checks=(),
-    )
+    gate_result = _candidate_gate_result(context, passed=False)
     reviewer = ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None)
 
     action = advance_candidate_admission(
@@ -729,6 +737,53 @@ def test_candidate_admission_records_failed_fixed_gate_before_rejection(tmp_path
         snapshot.run.generation,
     )
     assert ledger.enqueued is None
+
+
+def test_candidate_admission_validates_review_request_before_recording_passed_gate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    snapshot, context = _candidate_admission_case(tmp_path)
+    ledger = _AdmissionLedger()
+    gate_result = _candidate_gate_result(context, passed=True)
+    events: list[str] = []
+
+    def bind_request(**values: object) -> _ReviewRequestStub:
+        assert values["gate_evidence"] == gate_result.evidence_bytes()
+        events.append("request")
+        return _ReviewRequestStub()
+
+    original_put_artifact = ledger.put_artifact
+
+    def put_artifact(kind: str, content: bytes) -> str:
+        events.append("artifact")
+        return original_put_artifact(kind, content)
+
+    ledger.put_artifact = put_artifact  # type: ignore[method-assign]
+    monkeypatch.setattr(controller_module, "bind_candidate_review_request", bind_request)
+    reviewer = ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None)
+
+    action = advance_candidate_admission(
+        ledger,  # type: ignore[arg-type]
+        snapshot,
+        "attempt",
+        context,
+        reviewer,
+        threading.Event(),
+        gate_runner=lambda *_: gate_result,
+        execution_input_reader=lambda _: b"{}",
+    )
+
+    assert action == RecoveryAction("run-independent-review", "attempt")
+    assert events == ["request", "artifact"]
+    assert ledger.recorded[0][0:2] == ("artifact", "candidate-gate")
+    assert ledger.recorded[1][0:5] == (
+        "gate",
+        "attempt",
+        CANDIDATE_GATE_NAME,
+        True,
+        snapshot.run.generation,
+    )
 
 
 def test_candidate_admission_records_review_rejection_once(tmp_path, monkeypatch) -> None:
