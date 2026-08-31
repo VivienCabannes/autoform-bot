@@ -62,6 +62,7 @@ _MERGE_ITEM_STATUSES = frozenset(
 _MERGE_ITEM_TERMINAL_STATUSES = frozenset({"integrated", "failed"})
 _MERGE_REPLAY_STATUSES = frozenset({"prepared", "publishing", "integrated", "stale", "uncertain", "failed"})
 _MERGE_REPLAY_TERMINAL_STATUSES = frozenset({"integrated", "stale", "uncertain", "failed"})
+_MERGE_REPLAY_RESOLVED_STATUSES = frozenset({"integrated", "stale", "failed"})
 _PHASES = frozenset({"statement", "proof"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$")
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$|^0{40}$")
@@ -374,7 +375,7 @@ class RecoverySnapshot:
     @property
     def unresolved_merge_replays(self) -> tuple[MergeReplayRecord, ...]:
         return tuple(
-            replay for replay in self.merge_replays if replay.status not in _MERGE_REPLAY_TERMINAL_STATUSES
+            replay for replay in self.merge_replays if replay.status not in _MERGE_REPLAY_RESOLVED_STATUSES
         )
 
 
@@ -893,7 +894,7 @@ class RunLedger:
                 SELECT merge_items.queue_item_id FROM merge_items
                 JOIN attempts USING(attempt_id)
                 WHERE attempts.run_id = ? AND attempts.article_id = ? AND attempts.phase = ?
-                    AND merge_items.status NOT IN ('integrated', 'stale', 'failed')
+                    AND merge_items.status NOT IN ('integrated', 'failed')
                 ORDER BY merge_items.created_ns LIMIT 1
                 """,
                 (run_id, article_id, phase),

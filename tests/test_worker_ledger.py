@@ -2042,6 +2042,7 @@ def test_replay_is_generation_fenced_stop_safe_and_fail_closed_after_uncertainty
             detail="remote outcome cannot be classified",
         )
         assert uncertain.status == "uncertain"
+        assert ledger.inspect_recovery(run_id).unresolved_merge_replays == (uncertain,)
         with pytest.raises(InvalidTransition, match="replay is unresolved"):
             ledger.transition_merge_item(
                 queue_item_id,
@@ -2076,6 +2077,62 @@ def test_replay_is_generation_fenced_stop_safe_and_fail_closed_after_uncertainty
                 evidence_sha256=adoption,
                 expected_generation=stopped.generation,
             )
+    finally:
+        ledger.close()
+
+
+def test_stale_merge_item_must_be_closed_before_a_new_attempt(tmp_path: Path) -> None:
+    ledger, run_id = _running_ledger(tmp_path)
+    try:
+        queue_item_id = _queue_single_candidate(ledger, run_id, tmp_path)
+        item = ledger.get_merge_item(queue_item_id)
+        stale = ledger.transition_merge_item(
+            queue_item_id,
+            "stale",
+            expected_generation=item.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="target drift",
+        )
+        task = ledger.get_task(run_id, _ARTICLE_A, "statement")
+        retried = ledger.transition_task(
+            run_id,
+            _ARTICLE_A,
+            "statement",
+            "retrying",
+            expected_generation=task.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="retry after abandoning stale publication",
+        )
+
+        with pytest.raises(InvalidTransition, match="unresolved merge item"):
+            ledger.begin_attempt(
+                run_id,
+                _ARTICLE_A,
+                "statement",
+                expected_generation=ledger.get_run(run_id).generation,
+                expected_task_generation=retried.generation,
+                worktree_path=tmp_path / "worktree-2",
+                branch=f"autoform/{run_id}/{_ARTICLE_A}/2",
+                base_oid=ledger.get_run(run_id).current_oid,
+                backend="codex",
+                claim_key=author_claim_key(_ARTICLE_A),
+                claim_token=_claim_token(_ARTICLE_A),
+                attempt_id="attempt-2",
+            )
+
+        ledger.transition_merge_item(
+            queue_item_id,
+            "failed",
+            expected_generation=stale.generation,
+            expected_run_generation=ledger.get_run(run_id).generation,
+            detail="remote barrier removed and publication abandoned",
+        )
+        assert _begin(
+            ledger,
+            run_id,
+            tmp_path,
+            attempt_id="attempt-2",
+        ).status == "running"
     finally:
         ledger.close()
 
