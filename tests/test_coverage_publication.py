@@ -247,6 +247,43 @@ def test_raw_html_source_link_examples_in_code_remain_publishable(tmp_path: Path
     render_site(project / "blueprint", tmp_path / "site", lean_root=project)
 
 
+@pytest.mark.parametrize("image", ["", "!"])
+@pytest.mark.parametrize("with_coordinates", [False, True])
+def test_angle_bracket_inline_source_destinations_with_spaces_are_whole(
+    tmp_path: Path, image: str, with_coordinates: bool
+) -> None:
+    project, _, _ = _project(tmp_path, ".txt")
+    source = project / "blueprint/sources/nested/spaced source.txt"
+    source.write_text("A second source.\n", encoding="utf-8")
+    article = project / "blueprint/roadmap/result.md"
+    relative = source.relative_to(project / "blueprint")
+    article.write_text(
+        article.read_text(encoding="utf-8")
+        + f'\n{image}[Spaced source](<../{relative.as_posix()}> "Source title")\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "site"
+    kwargs = (
+        {"repository_url": "https://github.com/owner/repo", "ref": "abc123"}
+        if with_coordinates
+        else {"repository_url": "", "ref": ""}
+    )
+
+    render_site(project / "blueprint", output, lean_root=project, **kwargs)
+
+    chapter = (output / "roadmap/README.md").read_text(encoding="utf-8")
+    assert f"<../{relative.as_posix()}>" not in chapter
+    if with_coordinates:
+        expected = (
+            "https://github.com/owner/repo/blob/abc123/blueprint/"
+            + relative.as_posix().replace(" ", "%20")
+        )
+        assert f'{image}[Spaced source]({expected} "Source title")' in chapter
+    else:
+        assert "Spaced source" in chapter
+        assert f"{image}[Spaced source](" not in chapter
+
+
 def test_nonclean_v2_rejects_raw_source_link_carried_from_prior_site(
     tmp_path: Path,
 ) -> None:
@@ -277,6 +314,54 @@ def test_nonclean_v2_rejects_raw_source_link_carried_from_prior_site(
     stale.unlink()
     coverage.write_bytes(v2_contract)
     with pytest.raises(PublicationError, match="raw HTML link targets an excluded source"):
+        render_site(blueprint, output, lean_root=project, clean=False)
+
+    after = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "stale_link",
+    [
+        "[Old source](sources/nested/book.txt)",
+        "![Old scan](sources/nested/book.txt)",
+        "[Old source](<sources/nested/book note.txt>)",
+        "[Old [nested] source](sources/nested/book.txt)",
+        "[Old source][old-source]\n\n[old-source]: sources/nested/book.txt",
+        "<./sources/nested/book.txt>",
+    ],
+)
+def test_nonclean_v2_rejects_stale_markdown_source_links_from_prior_site(
+    tmp_path: Path, stale_link: str
+) -> None:
+    project, _, _ = _project(tmp_path, ".txt")
+    blueprint = project / "blueprint"
+    coverage = blueprint / "coverage/README.md"
+    v2_contract = coverage.read_bytes()
+    coverage.write_text(
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Book | OUT | Kept only to seed a legacy publication |\n",
+        encoding="utf-8",
+    )
+    stale = blueprint / "retired.md"
+    stale.write_text(f"# Retired\n\n{stale_link}\n", encoding="utf-8")
+    output = tmp_path / "site"
+    render_site(blueprint, output, lean_root=project)
+    before = {
+        path.relative_to(output).as_posix(): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+
+    stale.unlink()
+    coverage.write_bytes(v2_contract)
+    with pytest.raises(PublicationError, match="Markdown link targets an excluded source"):
         render_site(blueprint, output, lean_root=project, clean=False)
 
     after = {

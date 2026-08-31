@@ -149,6 +149,104 @@ def test_concurrent_authority_change_is_not_snapshotted(
     assert snapshot.runtime.source_revision == load_runtime_graph(project).source_revision
 
 
+def test_runtime_aba_hidden_inside_loader_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    stable = article.read_bytes()
+    transient = stable + b"\nA transient generation that must not escape.\n"
+    original = execution_module.load_runtime_graph
+    calls = 0
+
+    def load_transient_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            return original(*args, **kwargs)
+        article.write_bytes(transient)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            article.write_bytes(stable)
+
+    monkeypatch.setattr(execution_module, "load_runtime_graph", load_transient_once)
+
+    snapshot = load_execution_input(project)
+
+    assert calls == 2
+    assert snapshot.runtime.source_revision == load_runtime_graph(project).source_revision
+
+
+def test_coverage_roadmap_aba_hidden_inside_loader_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    stable = article.read_bytes()
+    transient = stable + b"\nA transient coverage-binding generation.\n"
+    original = execution_module.load_coverage
+    calls = 0
+
+    def load_transient_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            return original(*args, **kwargs)
+        article.write_bytes(transient)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            article.write_bytes(stable)
+
+    monkeypatch.setattr(execution_module, "load_coverage", load_transient_once)
+
+    snapshot = load_execution_input(project)
+
+    assert calls == 2
+    assert snapshot.runtime.source_revision == load_runtime_graph(project).source_revision
+
+
+def test_lean_aba_hidden_inside_runtime_loader_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "declaration: theorem\n",
+            "declaration: theorem\nlean: Project.result\n",
+        ),
+        encoding="utf-8",
+    )
+    stable = project / "Project/Stable.lean"
+    transient = project / "Project/Transient.lean"
+    stable.parent.mkdir()
+    stable.write_text("theorem Project.result : True := by trivial\n", encoding="utf-8")
+    original = execution_module.load_runtime_graph
+    calls = 0
+
+    def load_transient_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls != 1:
+            return original(*args, **kwargs)
+        stable.rename(transient)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            transient.rename(stable)
+
+    monkeypatch.setattr(execution_module, "load_runtime_graph", load_transient_once)
+
+    snapshot = load_execution_input(project, lean_root=project)
+
+    assert calls == 2
+    result = snapshot.runtime.get("result")
+    assert result is not None
+    assert result.lean_targets[0].source_file == "Project/Stable.lean"
+
+
 def _mutate_roadmap(project: Path) -> None:
     article = project / "blueprint/roadmap/result.md"
     article.write_text(

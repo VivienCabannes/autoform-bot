@@ -236,6 +236,8 @@ def test_malformed_v2_frontmatter_cannot_downgrade_to_v1(
     [
         ('"schema": autoform-coverage/v2', "coverage-schema-ambiguous"),
         ("'schema': 'autoform-coverage/v2'", "coverage-schema-ambiguous"),
+        ('"schema": "autoform-coverage\\u002fv2"', "coverage-schema-ambiguous"),
+        ('"\\u0073chema": "autoform-coverage\\u002fv2"', "coverage-schema-ambiguous"),
         ("schema = autoform-coverage/v2", "coverage-frontmatter-invalid"),
         ("schema=\"autoform-coverage/v2\"", "coverage-frontmatter-invalid"),
         ("scema autoform-coverage/v2", "coverage-frontmatter-invalid"),
@@ -280,6 +282,63 @@ def test_v2_schema_token_in_frontmatter_comment_or_body_prose_is_not_intent(
         "# Coverage\n\n"
         'Migration prose may quote `"schema": autoform-coverage/v2`.\n\n'
         "Compatibility: autoform-coverage/v2\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Whole source | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+    assert summary.schema == "autoform-coverage/v1"
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "--",
+        "-- yaml",
+        "---yaml",
+        "--- yaml",
+        "---decorated",
+        "--- # coverage metadata",
+    ],
+)
+def test_malformed_opening_fence_with_v2_intent_cannot_downgrade(
+    tmp_path: Path, opening: str
+) -> None:
+    blueprint, _ = _project(tmp_path)
+    contract = blueprint / "coverage/README.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        f"{opening}\n"
+        '"schema": "autoform-coverage\\u002fv2"\n'
+        "---\n\n"
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Whole source | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.code for issue in issues] == ["coverage-schema-ambiguous"]
+
+
+def test_two_hyphen_v1_prose_and_v2_example_do_not_select_schema(tmp_path: Path) -> None:
+    blueprint, _ = _project(tmp_path)
+    contract = blueprint / "coverage/README.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        "-- This is prose, not a frontmatter fence.\n\n"
+        "# Coverage\n\n"
+        "```yaml\n"
+        '"schema": "autoform-coverage\\u002fv2"\n'
+        "```\n\n"
         "| Area | Coverage | Evidence |\n"
         "| --- | --- | --- |\n"
         "| Whole source | OUT | Explicitly outside scope |\n",

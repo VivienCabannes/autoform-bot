@@ -9,9 +9,14 @@ import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .coverage import COVERAGE_V2_SCHEMA, CoverageSummary, load_coverage
+from .coverage import (
+    COVERAGE_V2_SCHEMA,
+    CoverageSummary,
+    _roadmap_source_provenance,
+    load_coverage,
+)
 from .graph import GraphValidationError
-from .lean import project_source_revision
+from .lean import SourceIndex, project_source_revision, snapshot_project_sources
 from .runtime import RuntimeGraph, RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
 
 EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v1"
@@ -32,6 +37,18 @@ class ExecutionInputError(ValueError):
     def __init__(self, issues: tuple[ExecutionInputIssue, ...] | list[ExecutionInputIssue]) -> None:
         self.issues = tuple(sorted(set(issues)))
         super().__init__("; ".join(f"{issue.code}: {issue.reason}" for issue in self.issues))
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutionAuthorityRevision:
+    """Digests needed to prove loader results came from this generation."""
+
+    sha256: str
+    runtime_source_revision: str
+    roadmap_sha256: str
+    coverage_sha256: str | None
+    source_sha256s: tuple[tuple[str, str], ...]
+    lean_source_revision: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +141,15 @@ def load_execution_input(
     runtime: RuntimeGraph | None = None
     coverage: CoverageSummary | None = None
     for _ in range(_EXECUTION_INPUT_READ_ATTEMPTS):
-        before: str | None = None
+        before: _ExecutionAuthorityRevision | None = None
+        lean_index: SourceIndex | None = None
         try:
             before = _execution_authority_revision(paths.blueprint_dir, resolved_lean_root)
+            if resolved_lean_root is not None:
+                lean_snapshot = snapshot_project_sources(resolved_lean_root)
+                if lean_snapshot.revision != before.lean_source_revision:
+                    continue
+                lean_index = lean_snapshot.index
             runtime = load_runtime_graph(project_or_blueprint, lean_root=lean_root)
         except (GraphValidationError, RuntimeProjectionError) as error:
             if _authority_changed(paths.blueprint_dir, resolved_lean_root, before):
@@ -141,7 +164,11 @@ def load_execution_input(
             between = _execution_authority_revision(paths.blueprint_dir, resolved_lean_root)
         except OSError:
             continue
-        if before != between:
+        if (
+            before != between
+            or runtime.source_revision != before.runtime_source_revision
+            or not _runtime_matches_lean_index(runtime, lean_index)
+        ):
             continue
 
         try:
@@ -154,7 +181,7 @@ def load_execution_input(
             after = _execution_authority_revision(paths.blueprint_dir, resolved_lean_root)
         except OSError:
             continue
-        if before == between == after:
+        if before == between == after and _coverage_matches_authority(coverage, before):
             break
     else:
         raise _changed_execution_input()
@@ -203,7 +230,9 @@ def _changed_execution_input() -> ExecutionInputError:
 
 
 def _authority_changed(
-    blueprint: Path, lean_root: Path | None, expected: str | None
+    blueprint: Path,
+    lean_root: Path | None,
+    expected: _ExecutionAuthorityRevision | None,
 ) -> bool:
     if expected is None:
         return True
@@ -213,16 +242,23 @@ def _authority_changed(
         return True
 
 
-def _execution_authority_revision(blueprint: Path, lean_root: Path | None) -> str:
-    """Hash every file that can affect runtime or exhaustive coverage.
+def _execution_authority_revision(
+    blueprint: Path,
+    lean_root: Path | None,
+) -> _ExecutionAuthorityRevision:
+    """Identify every file that can affect runtime or exhaustive coverage.
 
-    The digest brackets each authority loader. Reading before, between, and
-    after the loaders supplies a stable interval in which both results describe
-    one generation. A changed or unreadable generation is retried only a fixed
-    number of times.
+    Boundary equality detects ordinary concurrent edits. The component digests
+    also authenticate each loader result, so an A-to-B-to-A edit wholly inside
+    one loader cannot hide behind equal endpoint hashes. A changed or unreadable
+    generation is retried only a fixed number of times.
     """
 
     digest = hashlib.sha256(b"autoform-execution-authority/v1\0")
+    runtime_digest = hashlib.sha256(b"autoform-runtime-source/v1\0")
+    roadmap_sources: list[tuple[str, str]] = []
+    source_sha256s: list[tuple[str, str]] = []
+    coverage_sha256: str | None = None
     first = _authority_entries(blueprint)
     for path, relative in first:
         data = _stable_authority_bytes(path)
@@ -231,13 +267,37 @@ def _execution_authority_revision(blueprint: Path, lean_root: Path | None) -> st
         digest.update(encoded)
         digest.update(len(data).to_bytes(8, "big"))
         digest.update(data)
+        if not data.startswith(b"F"):
+            continue
+        file_bytes = data[1:]
+        file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+        if relative == Path("coverage/README.md"):
+            coverage_sha256 = file_sha256
+        if relative.parts[:1] == ("sources",):
+            source_sha256s.append((relative.as_posix(), file_sha256))
+        if relative.parts[:1] == ("roadmap",) and relative.suffix == ".md":
+            roadmap_sources.append((relative.as_posix(), file_sha256))
+            article_path = relative.as_posix().encode("utf-8")
+            runtime_digest.update(len(article_path).to_bytes(8, "big"))
+            runtime_digest.update(article_path)
+            runtime_digest.update(len(file_bytes).to_bytes(8, "big"))
+            runtime_digest.update(file_bytes)
     if first != _authority_entries(blueprint):
         raise OSError("execution authority changed while it was enumerated")
+    lean_source_revision: str | None = None
     if lean_root is not None:
-        lean_revision = project_source_revision(lean_root).encode("ascii")
+        lean_source_revision = project_source_revision(lean_root)
+        lean_revision = lean_source_revision.encode("ascii")
         digest.update(len(lean_revision).to_bytes(8, "big"))
         digest.update(lean_revision)
-    return digest.hexdigest()
+    return _ExecutionAuthorityRevision(
+        sha256=digest.hexdigest(),
+        runtime_source_revision=runtime_digest.hexdigest(),
+        roadmap_sha256=_roadmap_source_provenance(roadmap_sources),
+        coverage_sha256=coverage_sha256,
+        source_sha256s=tuple(sorted(source_sha256s)),
+        lean_source_revision=lean_source_revision,
+    )
 
 
 def _authority_entries(blueprint: Path) -> tuple[tuple[Path, Path], ...]:
@@ -256,7 +316,23 @@ def _authority_entries(blueprint: Path) -> tuple[tuple[Path, Path], ...]:
                     paths.add(path)
         except OSError as error:
             raise OSError("execution authority changed while it was enumerated") from error
-    return tuple(sorted((path, path.relative_to(blueprint)) for path in paths))
+    entries = tuple((path, path.relative_to(blueprint)) for path in paths)
+    return tuple(sorted(entries, key=lambda entry: _authority_entry_sort_key(entry[1])))
+
+
+def _authority_entry_sort_key(relative: Path) -> tuple[int, str]:
+    """Put roadmap files in the node order used by RuntimeGraph provenance."""
+
+    if relative.parts[:1] != ("roadmap",) or relative.suffix != ".md":
+        return 1, relative.as_posix()
+    article = relative.relative_to("roadmap")
+    if article.name == "README.md":
+        node_id = article.parent.as_posix()
+        if node_id == ".":
+            node_id = "roadmap"
+    else:
+        node_id = article.with_suffix("").as_posix()
+    return 0, node_id
 
 
 def _stable_authority_bytes(path: Path) -> bytes:
@@ -313,6 +389,31 @@ def _stable_authority_bytes(path: Path) -> bytes:
     ):
         raise OSError("execution authority changed while it was read")
     return b"F" + b"".join(chunks)
+
+
+def _coverage_matches_authority(
+    coverage: CoverageSummary,
+    authority: _ExecutionAuthorityRevision,
+) -> bool:
+    artifact_sha256s = dict(authority.source_sha256s)
+    return (
+        coverage.source_sha256 == authority.coverage_sha256
+        and coverage._roadmap_sha256 == authority.roadmap_sha256
+        and coverage.artifact_path is not None
+        and coverage.artifact_sha256 == artifact_sha256s.get(coverage.artifact_path)
+    )
+
+
+def _runtime_matches_lean_index(runtime: RuntimeGraph, index: SourceIndex | None) -> bool:
+    if index is None:
+        return True
+    for node in runtime.nodes:
+        for target in node.lean_targets:
+            declaration = index.find(target.declaration)
+            expected = declaration.path.as_posix() if declaration is not None else None
+            if target.source_file != expected:
+                return False
+    return True
 
 
 def _require_v2_coverage(blueprint: Path) -> CoverageSummary:

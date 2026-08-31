@@ -14,7 +14,8 @@ import os
 import re
 import stat
 from collections import Counter
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 
@@ -47,8 +48,15 @@ _V2_EXPECTED_HEADER = (
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LINE_SPAN = re.compile(r"([1-9][0-9]*)-([1-9][0-9]*)\Z")
-_FRONTMATTER_LIKE_FENCE = re.compile(r"-{3,}\Z")
+_FRONTMATTER_LIKE_FENCE = re.compile(
+    r"(?:--(?:[ \t]*(?:ya?ml|#.*))?|-{3,}.*)\Z",
+    re.IGNORECASE,
+)
 _FRONTMATTER_KEY = re.compile(r"^[ \t]*[\"']?(?P<key>[A-Za-z][A-Za-z0-9_-]*)[\"']?")
+_YAML_HEX_ESCAPE = re.compile(
+    r"\\u(?P<short>[0-9a-f]{4})|\\U(?P<long>[0-9a-f]{8})|\\x(?P<byte>[0-9a-f]{2})",
+    re.IGNORECASE,
+)
 
 #: Stem of the marker that stands in for a row's cells when tracing which
 #: published table those source lines became. Grown by `_unique_marker` until
@@ -141,6 +149,7 @@ class CoverageSummary:
     artifact_sha256: str | None = None
     units: tuple[CoverageUnit, ...] = ()
     node_bindings: tuple[CoverageNodeBinding, ...] = ()
+    _roadmap_sha256: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -361,13 +370,21 @@ def _ambiguous_v2_schema_line(text: str) -> int | None:
 
 
 def _frontmatter_line_signals_v2(line: str) -> bool:
-    folded = line.casefold()
+    def decode_hex_escape(match: re.Match[str]) -> str:
+        value = match.group("short") or match.group("long") or match.group("byte")
+        assert value is not None
+        try:
+            return chr(int(value, 16))
+        except ValueError:
+            return match.group(0)
+
+    folded = _YAML_HEX_ESCAPE.sub(decode_hex_escape, line).casefold()
     if COVERAGE_V2_SCHEMA.casefold() in folded:
         return True
     normalized = re.sub(r"[\s\"'\\]", "", folded).replace("_", "-")
     if COVERAGE_V2_SCHEMA.casefold() in normalized:
         return True
-    key_match = _FRONTMATTER_KEY.match(line)
+    key_match = _FRONTMATTER_KEY.match(folded)
     return (
         key_match is not None
         and _within_one_schema_edit(key_match.group("key").casefold())
@@ -477,8 +494,9 @@ def _load_coverage_v2(
     if not table_issues:
         issues.extend(_validate_unit_partition(units, artifact_bytes))
     bindings: tuple[CoverageNodeBinding, ...] = ()
+    roadmap_sha256: str | None = None
     if not issues:
-        units, bindings, binding_issues = _validate_v2_bindings(
+        units, bindings, roadmap_sha256, binding_issues = _validate_v2_bindings(
             units,
             blueprint=blueprint,
             coverage_path=path,
@@ -500,6 +518,7 @@ def _load_coverage_v2(
             artifact_sha256=actual_artifact_hash,
             units=tuple(units),
             node_bindings=bindings,
+            _roadmap_sha256=roadmap_sha256,
         ),
         (),
     )
@@ -844,15 +863,36 @@ def _validate_v2_bindings(
     *,
     blueprint: Path,
     coverage_path: Path,
-) -> tuple[list[CoverageUnit], tuple[CoverageNodeBinding, ...], list[CoverageIssue]]:
+) -> tuple[
+    list[CoverageUnit],
+    tuple[CoverageNodeBinding, ...],
+    str | None,
+    list[CoverageIssue],
+]:
     issues: list[CoverageIssue] = []
     try:
         graph = load_graph(blueprint)
     except GraphValidationError as error:
-        return units, (), [
-            CoverageIssue(0, f"roadmap cannot be validated for source bindings: {reason}", "coverage-roadmap-invalid")
-            for reason in error.issues
-        ]
+        return (
+            units,
+            (),
+            None,
+            [
+                CoverageIssue(
+                    0,
+                    f"roadmap cannot be validated for source bindings: {reason}",
+                    "coverage-roadmap-invalid",
+                )
+                for reason in error.issues
+            ],
+        )
+    roadmap_sha256 = _roadmap_source_provenance(
+        (
+            node.path.resolve().relative_to(graph.blueprint_dir.resolve()).as_posix(),
+            node.source_sha256 or "",
+        )
+        for node in graph.nodes.values()
+    )
     by_path = {node.path.resolve(): node for node in graph.nodes.values()}
     units_by_id = {unit.unit: unit for unit in units}
     expected: set[tuple[str, str]] = set()
@@ -973,7 +1013,20 @@ def _validate_v2_bindings(
         CoverageNodeBinding(node_id=node_id, unit=unit_id)
         for unit_id, node_id in sorted(expected & authored)
     )
-    return updated, bindings, issues
+    return updated, bindings, roadmap_sha256, issues
+
+
+def _roadmap_source_provenance(sources: Iterable[tuple[str, str]]) -> str:
+    """Identify exact roadmap bytes without retaining another source copy."""
+
+    digest = hashlib.sha256(b"autoform-roadmap-provenance/v1\0")
+    for relative, source_sha256 in sorted(sources):
+        encoded_path = relative.encode("utf-8")
+        encoded_sha256 = source_sha256.encode("ascii")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(encoded_sha256)
+    return digest.hexdigest()
 
 
 def _parse_table(text: str) -> tuple[list[CoverageEntry], list[CoverageIssue]]:

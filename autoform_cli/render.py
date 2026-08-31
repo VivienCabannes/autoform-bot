@@ -37,7 +37,7 @@ from .lean import (
     project_source_revision,
     snapshot_project_sources,
 )
-from .markdown import INLINE_CODE, content
+from .markdown import INLINE_CODE, content, render_html
 from .status import is_definition
 
 try:
@@ -47,9 +47,13 @@ except ImportError:  # pragma: no cover - Windows import compatibility
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_MARKDOWN_LINK = re.compile(r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)")
+_MARKDOWN_LINK = re.compile(
+    r"(?<!!)\[(?P<label>[^\]]*)\]\(\s*"
+    r"(?P<target><[^>\r\n]+>|[^)\s]+)(?P<suffix>\s+[^)]*)?\)"
+)
 _ANY_INLINE_LINK = re.compile(
-    r"(?P<image>!?)\[(?P<label>[^\]]*)\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)"
+    r"(?P<image>!?)\[(?P<label>[^\]]*)\]\(\s*"
+    r"(?P<target><[^>\r\n]+>|[^)\s]+)(?P<suffix>\s+[^)]*)?\)"
 )
 _AUTOLINK = re.compile(r"<(?P<target>(?:\.{1,2}/|/)[^<>\s]+)>")
 #: A reference-style link definition, `[label]: target "title"`. Markdown
@@ -63,7 +67,8 @@ _RAW_HTML_LINK_ATTRIBUTES = frozenset(
     {"action", "data", "formaction", "href", "poster", "src", "srcset"}
 )
 _ARTICLE_SLOT = re.compile(
-    r"^(?P<indent>[ \t]*)[-*+]\s+\[[^\]]+\]\(\s*(?P<target>[^)\s]+)(?:\s+[^)]*)?\)\s*$"
+    r"^(?P<indent>[ \t]*)[-*+]\s+\[[^\]]+\]\(\s*"
+    r"(?P<target><[^>\r\n]+>|[^)\s]+)(?:\s+[^)]*)?\)\s*$"
 )
 _DEPENDENCY_SECTIONS = frozenset({"depends on", "proof depends on"})
 _SKIPPED_DIRECTORIES = frozenset({".obsidian", ".trash", ".git"})
@@ -2432,7 +2437,8 @@ def _rewrite_links(
         href = moved_target(match.group("target"))
         if href is strip_link:
             return match.group("label")
-        return match.group(0) if href is None else f"[{match.group('label')}]({href})"
+        suffix = match.group("suffix") or ""
+        return match.group(0) if href is None else f"[{match.group('label')}]({href}{suffix})"
 
     def replace_artifact_link(match: re.Match[str]) -> str:
         if match.group("image") != "!" or not is_unpublished_target(match.group("target")):
@@ -2442,7 +2448,8 @@ def _rewrite_links(
             return match.group("label")
         if href is None:
             return match.group(0)
-        return f"{match.group('image')}[{match.group('label')}]({href})"
+        suffix = match.group("suffix") or ""
+        return f"{match.group('image')}[{match.group('label')}]({href}{suffix})"
 
     def replace_autolink(match: re.Match[str]) -> str:
         if not is_unpublished_target(match.group("target")):
@@ -2542,10 +2549,31 @@ def _link_targets_excluded_root(raw: str, *, source_dir: Path, excluded_root: Pa
     return candidate == root or _is_within(candidate, root)
 
 
+def _reject_excluded_markdown_links(text: str, is_excluded) -> None:
+    """Reject visible Markdown destinations into a purged source tree."""
+
+    parser = _RawHtmlTargetParser()
+    try:
+        parser.feed(render_html(text))
+        parser.close()
+    except Exception as error:
+        raise PublicationError(["could not inspect Markdown links in staged publication"]) from error
+    if any(is_excluded(target) for _, _, target in parser.targets):
+        raise PublicationError(["Markdown link targets an excluded source"])
+
+    # Autoform has historically accepted local angle autolinks even though the
+    # configured Markdown renderer treats them as raw text. Keep auditing that
+    # compatibility syntax while the rendered HTML handles every real link.
+    for line in content(text).lines:
+        visible = INLINE_CODE.sub("", line)
+        if any(is_excluded(match.group("target")) for match in _AUTOLINK.finditer(visible)):
+            raise PublicationError(["Markdown link targets an excluded source"])
+
+
 def _reject_staged_excluded_raw_html_links(
     destination: Path, excluded_source_root: Path
 ) -> None:
-    """Reject raw links carried forward from an older incremental site."""
+    """Reject links carried forward from an older incremental site."""
 
     root = destination / excluded_source_root
     for page in sorted(destination.rglob("*")):
@@ -2564,6 +2592,15 @@ def _reject_staged_excluded_raw_html_links(
             ),
             markdown=page.suffix.casefold() == ".md",
         )
+        if page.suffix.casefold() == ".md":
+            _reject_excluded_markdown_links(
+                text,
+                lambda raw, parent=page.parent: _link_targets_excluded_root(
+                    raw,
+                    source_dir=parent,
+                    excluded_root=root,
+                ),
+            )
 
 
 def _is_within(path: Path, directory: Path) -> bool:
@@ -2715,7 +2752,12 @@ def _place_environments(
         if slot is None:
             output.append(line)
             continue
-        target = slot.group("target")
+        raw_target = slot.group("target")
+        target = (
+            raw_target[1:-1]
+            if raw_target.startswith("<") and raw_target.endswith(">")
+            else raw_target
+        )
         path, separator, fragment = target.partition("#")
         if not path and separator:
             node_id = anchor_nodes.get(fragment)
