@@ -92,6 +92,14 @@ or every remaining node has an explicit mathematical or ownership blocker.
 Report changed nodes, claims released, Lean checks, independent review results,
 and blockers without claiming more coverage than was verified.
 
+Before promoting a worker result, reconstruct it in a fresh candidate worktree
+and use `autoform_worker.gates.run_candidate_gates` against the exact base
+worktree and `WorkItem`. The fixed gate binds the durable article identity and
+source contract, checks the transition and blueprint, performs a full Lake
+build, and audits forbidden tokens, axioms, and root-package artifacts. Never
+execute `.github/autoform_audit.py` from the candidate; the gate imports the
+artifact policy from the installed Autoform package.
+
 For a concrete dependency-based handoff, read the concise
 [Cabannes thesis walkthrough](references/thesis-worked-node.md). It demonstrates
 the protocol, not a theorem or declaration to copy.

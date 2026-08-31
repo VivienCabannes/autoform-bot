@@ -11,12 +11,15 @@ import stat
 import subprocess
 import sys
 import tarfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
 
 from autoform_cli.graph import GraphValidationError, load_graph
 from autoform_cli.lean import declaration_names
+
+CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 try:
     from autoform_cli.lean import declaration_kind, mathlib_module_name
@@ -58,6 +61,7 @@ except ImportError:
 
 _MAX_ILEAN_BYTES = 16 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_AUDIT_COMMAND_TIMEOUT_SECONDS = 5 * 60
 _CANONICAL_MATHLIB_URL = "https://github.com/leanprover-community/mathlib4.git"
 _FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
 _LAKE_HASH = re.compile(r"[0-9a-f]{16}")
@@ -210,10 +214,15 @@ def _validate_trace(trace: object, module: str, root_package: str, display_path:
 
 
 def mathlib_modules_from_lake(
-    lean_root: Path, targets: tuple[BlueprintTarget, ...]
+    lean_root: Path,
+    targets: tuple[BlueprintTarget, ...],
+    *,
+    runner: CommandRunner | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Resolve claims through the manifest-pinned canonical Mathlib checkout."""
 
+    command_runner = runner or subprocess.run
     modules = tuple(
         sorted(
             {
@@ -225,21 +234,27 @@ def mathlib_modules_from_lake(
     )
     if not modules:
         return ()
-    checkout = _mathlib_checkout_from_manifest(lean_root)
+    checkout = _mathlib_checkout_from_manifest(
+        lean_root,
+        runner=command_runner,
+        environment=environment,
+    )
     signatures: dict[Path, _FileSignature] = {}
 
     for module in modules:
         target = f"@mathlib/+{module}:ilean"
         try:
-            queried = subprocess.run(
+            queried = command_runner(
                 ["lake", "query", "--json", target],
                 cwd=checkout.project,
                 capture_output=True,
                 text=True,
                 check=False,
-                env=_audit_subprocess_environment(),
+                env=_audit_subprocess_environment(environment),
+                shell=False,
+                timeout=_AUDIT_COMMAND_TIMEOUT_SECONDS,
             )
-        except OSError as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             raise AuditInputError(f"cannot query Lake package id 'mathlib': {exc}") from exc
         if queried.returncode != 0:
             detail = queried.stderr.strip().splitlines()
@@ -261,9 +276,21 @@ def mathlib_modules_from_lake(
         ilean = Path(ilean_value)
         if not ilean.is_absolute():
             ilean = checkout.project / ilean
-        signatures.update(_validate_mathlib_artifacts(ilean, module, checkout))
+        signatures.update(
+            _validate_mathlib_artifacts(
+                ilean,
+                module,
+                checkout,
+                runner=command_runner,
+                environment=environment,
+            )
+        )
 
-    if _mathlib_checkout_from_manifest(checkout.project) != checkout:
+    if _mathlib_checkout_from_manifest(
+        checkout.project,
+        runner=command_runner,
+        environment=environment,
+    ) != checkout:
         raise AuditInputError("Mathlib manifest or checkout changed during artifact validation")
     for path, expected in signatures.items():
         if _regular_file_signature(path, "Mathlib build artifact") != expected:
@@ -271,12 +298,18 @@ def mathlib_modules_from_lake(
     return modules
 
 
-def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
+def _mathlib_checkout_from_manifest(
+    lean_root: Path,
+    *,
+    runner: CommandRunner | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> _MathlibCheckout:
+    command_runner = runner or subprocess.run
     if lean_root.is_symlink():
         raise AuditInputError("Lean project root must not be a symbolic link")
     try:
         project = lean_root.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise AuditInputError(f"cannot resolve Lean project root: {exc}") from exc
     if not project.is_dir():
         raise AuditInputError(f"Lean project root is not a directory: {project}")
@@ -325,21 +358,49 @@ def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
         raise AuditInputError(f"Mathlib checkout has no readable .git directory: {checkout}") from exc
     if stat.S_ISLNK(marker_status.st_mode) or not stat.S_ISDIR(marker_status.st_mode):
         raise AuditInputError(f"Mathlib checkout .git must be a real directory: {git_marker}")
-    _validate_git_repository_metadata(checkout, git_marker)
+    _validate_git_repository_metadata(
+        checkout,
+        git_marker,
+        runner=command_runner,
+        environment=environment,
+    )
 
-    top = Path(_git_output(checkout, "rev-parse", "--show-toplevel", label="top level"))
+    top = Path(
+        _git_output(
+            checkout,
+            "rev-parse",
+            "--show-toplevel",
+            label="top level",
+            runner=command_runner,
+            environment=environment,
+        )
+    )
     try:
         top = top.resolve(strict=True)
     except OSError as exc:
         raise AuditInputError(f"cannot resolve Mathlib Git top level: {exc}") from exc
     if top != checkout:
         raise AuditInputError("Mathlib package directory is not the Git checkout root")
-    head = _git_output(checkout, "rev-parse", "--verify", "HEAD^{commit}", label="HEAD")
+    head = _git_output(
+        checkout,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        label="HEAD",
+        runner=command_runner,
+        environment=environment,
+    )
     if head != revision:
         raise AuditInputError(
             f"Mathlib checkout HEAD {head!r} does not match manifest revision {revision!r}"
         )
-    remotes = _git_output(checkout, "remote", label="remote list").splitlines()
+    remotes = _git_output(
+        checkout,
+        "remote",
+        label="remote list",
+        runner=command_runner,
+        environment=environment,
+    ).splitlines()
     if remotes != ["origin"]:
         raise AuditInputError("Mathlib checkout must have exactly one Git remote named origin")
     remote_urls = _git_output(
@@ -349,6 +410,8 @@ def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
         "--get-all",
         "remote.origin.url",
         label="origin URL",
+        runner=command_runner,
+        environment=environment,
     ).splitlines()
     if remote_urls != [_CANONICAL_MATHLIB_URL]:
         raise AuditInputError(
@@ -361,6 +424,8 @@ def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
         "--untracked-files=all",
         label="status",
         allow_empty=True,
+        runner=command_runner,
+        environment=environment,
     )
     if status:
         raise AuditInputError("Mathlib checkout is dirty")
@@ -372,11 +437,19 @@ def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
         ":!.lake/**",
         label="untracked files",
         allow_empty=True,
+        runner=command_runner,
+        environment=environment,
     )
     if untracked_outside_build:
         raise AuditInputError("Mathlib checkout has untracked files outside .lake")
     tracked_flags = _git_output(
-        checkout, "ls-files", "-v", label="index flags", allow_empty=True
+        checkout,
+        "ls-files",
+        "-v",
+        label="index flags",
+        allow_empty=True,
+        runner=command_runner,
+        environment=environment,
     ).splitlines()
     if any(not line.startswith("H ") for line in tracked_flags):
         raise AuditInputError("Mathlib checkout uses nonstandard Git index flags")
@@ -422,10 +495,16 @@ def _resolved_child_directory(root: Path, relative: Path, label: str) -> Path:
 
 
 def _git_output(
-    checkout: Path, *arguments: str, label: str, allow_empty: bool = False
+    checkout: Path,
+    *arguments: str,
+    label: str,
+    allow_empty: bool = False,
+    runner: CommandRunner | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> str:
     try:
-        result = subprocess.run(
+        command_runner = runner or subprocess.run
+        result = command_runner(
             [
                 "git",
                 "--no-replace-objects",
@@ -440,7 +519,9 @@ def _git_output(
             capture_output=True,
             text=True,
             check=False,
-            env=_audit_subprocess_environment(),
+            env=_audit_subprocess_environment(environment),
+            shell=False,
+            timeout=_AUDIT_COMMAND_TIMEOUT_SECONDS,
         )
     except OSError as exc:
         raise AuditInputError(f"cannot inspect Mathlib Git {label}: {exc}") from exc
@@ -454,26 +535,38 @@ def _git_output(
     return output
 
 
-def _audit_subprocess_environment() -> dict[str, str]:
+def _audit_subprocess_environment(
+    supplied: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Return the host environment without caller-controlled Git behavior."""
 
-    environment = {
-        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
-    }
+    source = os.environ if supplied is None else supplied
+    environment = {key: value for key, value in source.items() if not key.startswith("GIT_")}
     environment.update(
         {
+            "GIT_CONFIG_COUNT": "0",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_GRAFT_FILE": os.devnull,
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
         }
     )
     return environment
 
 
-def _validate_git_repository_metadata(checkout: Path, git_directory: Path) -> None:
+def _validate_git_repository_metadata(
+    checkout: Path,
+    git_directory: Path,
+    *,
+    runner: CommandRunner | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> None:
     """Reject Git metadata that can rewrite objects or run local programs."""
 
+    command_runner = runner or subprocess.run
     object_directory = _resolved_child_directory(
         git_directory, Path("objects"), "Mathlib Git object database"
     )
@@ -506,6 +599,8 @@ def _validate_git_repository_metadata(checkout: Path, git_directory: Path) -> No
         "--list",
         label="local configuration",
         allow_empty=True,
+        runner=command_runner,
+        environment=environment,
     ).splitlines()
     unsafe_config = sorted(
         key
@@ -532,6 +627,8 @@ def _validate_git_repository_metadata(checkout: Path, git_directory: Path) -> No
         "refs/replace/",
         label="replacement references",
         allow_empty=True,
+        runner=command_runner,
+        environment=environment,
     )
     if replacements:
         raise AuditInputError("Mathlib checkout uses Git replacement references")
@@ -550,8 +647,14 @@ def _reject_tree_symlinks(root: Path, label: str) -> None:
 
 
 def _validate_mathlib_artifacts(
-    ilean: Path, module: str, checkout: _MathlibCheckout
+    ilean: Path,
+    module: str,
+    checkout: _MathlibCheckout,
+    *,
+    runner: CommandRunner | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[Path, _FileSignature]:
+    command_runner = runner or subprocess.run
     if any(part == ".." for part in ilean.parts):
         raise AuditInputError(f"Mathlib ILean artifact path contains traversal: {ilean}")
     build_root = _resolved_child_directory(
@@ -573,6 +676,8 @@ def _validate_mathlib_artifacts(
         "--",
         source_relative.as_posix(),
         label=f"tracked source for {module}",
+        runner=command_runner,
+        environment=environment,
     )
     if tracked_source != source_relative.as_posix():
         raise AuditInputError(f"Mathlib module is not tracked at the pinned revision: {module}")

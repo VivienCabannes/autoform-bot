@@ -233,6 +233,10 @@ def _proof_transition_error(before: RuntimeNode, after: RuntimeNode) -> str:
         return metadata_error
     if before.assertions.proof_formalized or not after.assertions.proof_formalized:
         return "proof_formalized did not transition from false to true"
+    if before.assertions.statement_formalized != after.assertions.statement_formalized:
+        return "proof transition changed statement_formalized"
+    if before.assertions.not_ready != after.assertions.not_ready:
+        return "proof transition changed not_ready"
     return ""
 
 
@@ -251,6 +255,10 @@ def _statement_transition_error(
         return metadata_error
     if before.assertions.statement_formalized or not after.assertions.statement_formalized:
         return "statement_formalized did not transition from false to true"
+    if before.assertions.proof_formalized != after.assertions.proof_formalized:
+        return "statement transition changed proof_formalized"
+    if before.assertions.not_ready != after.assertions.not_ready:
+        return "statement transition changed not_ready"
 
     current = _capture_statement_baseline(project_dir).files
     target_files = {target.source_file for target in after.lean_targets if target.source_file}
@@ -387,7 +395,12 @@ def _diagnostics_are_clean(value: object) -> bool:
     return summary is not None and int(summary.group(1)) == 0
 
 
-def _verify_statement(node: RuntimeNode, project_dir: Path) -> str:
+def _verify_statement(
+    node: RuntimeNode,
+    project_dir: Path,
+    *,
+    runtime: LeanRuntimeClient | None = None,
+) -> str:
     """Return an error unless every authored declaration resolves and compiles."""
 
     targets = list(node.lean_targets)
@@ -406,7 +419,7 @@ def _verify_statement(node: RuntimeNode, project_dir: Path) -> str:
         if target.source_file not in files:
             files.append(target.source_file)
 
-    client = LeanRuntimeClient()
+    client = runtime or LeanRuntimeClient()
     for source_file in files:
         try:
             diagnostics = client.request(

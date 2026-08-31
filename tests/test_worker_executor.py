@@ -16,12 +16,15 @@ from autoform_cli.runtime import (
 from autoform_worker.executor import (
     ProverExecutor,
     _attempt_result,
+    _proof_transition_error,
+    _statement_transition_error,
     _verify_statement,
     _work_prompt,
     backend_factory,
 )
 from autoform_worker.scheduler import AttemptOutcome, WorkItem, WorkPhase
 from servers.prover import Event, EventKind, ProofResult, ProverAdapter, Run
+from servers.prover.verify import Baseline
 
 
 def _node(
@@ -120,6 +123,43 @@ def test_proof_prompt_requires_verified_roadmap_transition() -> None:
 
     assert "Complete the Lean proof without changing the declaration statement." in prompt
     assert "Update the roadmap article's proof metadata only after Lean accepts it." in prompt
+
+
+@pytest.mark.parametrize(
+    ("assertions", "message"),
+    [
+        (RuntimeAssertions(False, True, False), "statement_formalized"),
+        (RuntimeAssertions(True, True, True), "not_ready"),
+    ],
+)
+def test_proof_transition_preserves_other_assertions(
+    assertions: RuntimeAssertions,
+    message: str,
+) -> None:
+    before = _node(stated=True)
+    after = replace(_node(stated=True, proved=True), assertions=assertions)
+
+    assert message in _proof_transition_error(before, after)
+
+
+@pytest.mark.parametrize(
+    ("assertions", "message"),
+    [
+        (RuntimeAssertions(True, True, False), "proof_formalized"),
+        (RuntimeAssertions(True, False, True), "not_ready"),
+    ],
+)
+def test_statement_transition_preserves_other_assertions(
+    tmp_path,
+    assertions: RuntimeAssertions,
+    message: str,
+) -> None:
+    before = _node()
+    after = replace(_node(stated=True), assertions=assertions)
+
+    error = _statement_transition_error(before, after, Baseline(tmp_path), None, tmp_path)
+
+    assert message in error
 
 
 def test_proof_result_mapping_distinguishes_retry_cancel_and_failure() -> None:

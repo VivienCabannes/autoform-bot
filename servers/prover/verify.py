@@ -58,10 +58,11 @@ _CONFIG_NAMES = frozenset({"lakefile.lean", "lakefile.toml", "lake-manifest.json
 _SORRY = re.compile(r"\b(?:sorry|admit|sorryAx)\b(?!-)")
 _ASSUMPTION = re.compile(r"\b(?:axiom|constant)\b")
 _UNSAFE_ELABORATION = re.compile(
-    r"\b(?:run_cmd|initialize|elab|foreign|extern|syntax|"
+    r"\b(?:run_cmd|initialize|builtin_initialize|elab|foreign|extern|syntax|"
     r"macro|macro_rules|native_decide|run_tac|include_str|include_bytes)\b|"
     r"#(?:eval|reduce|run)\b|"
-    r"\bunsafe\s+(?:def|abbrev|theorem|instance)\b"
+    r"\bskipKernelTC\b|"
+    r"\b(?:unsafe|partial)\s+(?:def|abbrev|theorem|instance)\b"
 )
 _DECLARATION_END = re.compile(r":=|\bwhere\b")
 _CLEAN_DIAGNOSTICS = "No diagnostics — file compiles cleanly."
@@ -70,7 +71,8 @@ _MODULE_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_']*$")
 _TOP_LEVEL_COMMAND = re.compile(
     r"^(?:@\[|attribute\b|open\b|export\b|set_option\b|namespace\b|section\b|"
     r"end\b|variable\b|include\b|omit\b|theorem\b|lemma\b|def\b|abbrev\b|"
-    r"instance\b|structure\b|class\b|inductive\b|opaque\b|axiom\b|constant\b)"
+    r"instance\b|structure\b|class\b|inductive\b|opaque\b|axiom\b|constant\b|"
+    r"initialize\b|builtin_initialize\b)"
 )
 _ALLOWED_AXIOMS = ("propext", "Classical.choice", "Quot.sound")
 
@@ -157,6 +159,10 @@ def _relevant_files(root: Path) -> dict[str, bytes]:
 def _target_files(node: RuntimeNode, project_dir: str) -> list[tuple[str, Path]]:
     if not node.dispatchable or not node.status.can_prove or node.assertions.not_ready:
         raise ValueError(f"runtime node is not ready to prove: {node.id}")
+    return _local_target_files(node, project_dir)
+
+
+def _local_target_files(node: RuntimeNode, project_dir: str) -> list[tuple[str, Path]]:
     paths: list[tuple[str, Path]] = []
     seen: set[str] = set()
     for target in node.lean_targets:
@@ -653,11 +659,161 @@ def verify_proof(
     return VerifyResult(True, checks=checks)
 
 
+def verify_candidate_trust(
+    node: RuntimeNode,
+    project_dir: str,
+    *,
+    baseline: Baseline,
+    runtime: RuntimeClient | None = None,
+) -> VerifyResult:
+    """Verify changed target text and target axioms without freezing headers.
+
+    Statement work is expected to introduce declaration headers, so it cannot
+    use :func:`verify_proof`.  Its transition checker confines the mutation;
+    this check applies the proof verifier's static, LSP, and kernel-trust rules
+    to the resulting declarations.
+    """
+
+    static = verify_candidate_static(node, project_dir, baseline=baseline)
+    if not static.ok:
+        return static
+    checks: dict[str, Any] = static.checks
+    try:
+        root = resolve_lean_project_dir(project_dir)
+    except (OSError, UnicodeError, ValueError) as error:
+        return VerifyResult(False, str(error), checks)
+
+    client = runtime or LeanRuntimeClient()
+    for item in checks["targets"]:
+        relative = item["file"]
+        try:
+            diagnostics = client.request(
+                "lsp.diagnostics",
+                {"project_dir": str(root), "file_path": relative},
+            )
+        except LeanRuntimeError as error:
+            return VerifyResult(False, f"Lean verification failed for {relative}: {error}", checks)
+        item["lsp"] = diagnostics
+        if not isinstance(diagnostics, str) or not _diagnostics_are_clean(diagnostics):
+            return VerifyResult(
+                False,
+                f"Lean diagnostics were not a recognized clean result for {relative}: {diagnostics!r}",
+                checks,
+            )
+
+    try:
+        _audit_file, audit_diagnostics = _run_axiom_audit(client, root, node)
+    except (LeanRuntimeError, OSError, UnicodeError, ValueError) as error:
+        return VerifyResult(False, f"Lean kernel trust audit failed: {error}", checks)
+    checks["axiom_audit"] = {
+        "diagnostics": audit_diagnostics,
+        "allowed": list(_ALLOWED_AXIOMS),
+    }
+    if not _diagnostics_are_clean(audit_diagnostics):
+        return VerifyResult(
+            False,
+            f"Lean kernel trust audit rejected target declarations: {audit_diagnostics!r}",
+            checks,
+        )
+
+    checks["declarations"] = [target.declaration for target in node.lean_targets]
+    return VerifyResult(True, checks=checks)
+
+
+def verify_candidate_static(
+    node: RuntimeNode,
+    project_dir: str,
+    *,
+    baseline: Baseline,
+    confine_changes: bool = False,
+) -> VerifyResult:
+    """Reject unsafe target text without invoking Lean or repository code."""
+
+    checks: dict[str, Any] = {"node": node.id, "targets": []}
+    try:
+        root = resolve_lean_project_dir(project_dir)
+        targets = _local_target_files(node, str(root))
+        current = _relevant_files(root)
+    except (OSError, UnicodeError, ValueError) as error:
+        return VerifyResult(False, str(error), checks)
+
+    if confine_changes:
+        target_names = {relative for relative, _path in targets}
+        protected = baseline.files.keys() - target_names
+        changed_protected = sorted(
+            relative
+            for relative in protected
+            if current.get(relative) != baseline.files[relative]
+        )
+        created = sorted(current.keys() - baseline.files.keys() - target_names)
+        missing = sorted(baseline.files.keys() - current.keys())
+        if changed_protected or created or missing:
+            affected = changed_protected + created + missing
+            return VerifyResult(
+                False,
+                f"candidate changed non-target Lean/config inputs: {affected}",
+                checks,
+            )
+        try:
+            contexts = _declaration_contexts(root, node)
+        except (OSError, UnicodeError, ValueError) as error:
+            return VerifyResult(False, str(error), checks)
+        changed_contexts = sorted(
+            relative
+            for relative in target_names
+            if contexts.get(relative) != baseline.target_contexts.get(relative)
+        )
+        if changed_contexts:
+            return VerifyResult(
+                False,
+                f"candidate changed bytes outside target declarations: {changed_contexts}",
+                checks,
+            )
+
+    for relative, _path in targets:
+        raw = current.get(relative)
+        if raw is None:
+            return VerifyResult(False, f"Lean target disappeared: {relative}", checks)
+        try:
+            source = raw.decode("utf-8")
+            before = baseline.files.get(relative, b"").decode("utf-8")
+        except UnicodeError as error:
+            return VerifyResult(False, f"cannot decode Lean target {relative}: {error}", checks)
+        forbidden = _new_forbidden(before, source)
+        if forbidden:
+            return VerifyResult(
+                False,
+                f"{relative} introduced forbidden token {forbidden!r}",
+                checks,
+            )
+        checks["targets"].append({"file": relative, "static": "clean"})
+
+    for target in node.lean_targets:
+        if not target.source_file:
+            continue
+        try:
+            segment = _declaration_segment(root, target.declaration, target.source_file)
+        except (OSError, UnicodeError, ValueError) as error:
+            return VerifyResult(False, str(error), checks)
+        forbidden = _new_forbidden("", segment)
+        if forbidden:
+            return VerifyResult(
+                False,
+                f"target declaration {target.declaration} contains forbidden token {forbidden!r}",
+                checks,
+            )
+
+    checks["declarations"] = [target.declaration for target in node.lean_targets]
+    return VerifyResult(True, checks=checks)
+
+
 __all__ = [
     "Baseline",
     "VerifyResult",
     "capture_baseline",
     "restore_baseline",
     "unsafe_elaboration_directive",
+    "verify_candidate_static",
+    "verify_candidate_trust",
     "verify_proof",
 ]
