@@ -325,7 +325,7 @@ def _mathlib_checkout_from_manifest(lean_root: Path) -> _MathlibCheckout:
         raise AuditInputError(f"Mathlib checkout has no readable .git directory: {checkout}") from exc
     if stat.S_ISLNK(marker_status.st_mode) or not stat.S_ISDIR(marker_status.st_mode):
         raise AuditInputError(f"Mathlib checkout .git must be a real directory: {git_marker}")
-    _validate_git_object_database(checkout, git_marker)
+    _validate_git_repository_metadata(checkout, git_marker)
 
     top = Path(_git_output(checkout, "rev-parse", "--show-toplevel", label="top level"))
     try:
@@ -471,12 +471,17 @@ def _audit_subprocess_environment() -> dict[str, str]:
     return environment
 
 
-def _validate_git_object_database(checkout: Path, git_directory: Path) -> None:
-    """Reject Git indirection that can change what a pinned commit means."""
+def _validate_git_repository_metadata(checkout: Path, git_directory: Path) -> None:
+    """Reject Git metadata that can rewrite objects or run local programs."""
 
-    _resolved_child_directory(git_directory, Path("objects"), "Mathlib Git object database")
+    object_directory = _resolved_child_directory(
+        git_directory, Path("objects"), "Mathlib Git object database"
+    )
+    _reject_tree_symlinks(object_directory, "Mathlib Git object database")
     forbidden = (
         (Path("commondir"), "alternate common directory"),
+        (Path("config.worktree"), "worktree-specific configuration"),
+        (Path("info/attributes"), "private attributes file"),
         (Path("info/grafts"), "graft file"),
         (Path("objects/info/alternates"), "alternate object database"),
         (Path("objects/info/http-alternates"), "HTTP alternate object database"),
@@ -493,6 +498,33 @@ def _validate_git_object_database(checkout: Path, git_directory: Path) -> None:
             ) from exc
         raise AuditInputError(f"Mathlib checkout uses a Git {description}: {path}")
 
+    config_keys = _git_output(
+        checkout,
+        "config",
+        "--local",
+        "--name-only",
+        "--list",
+        label="local configuration",
+        allow_empty=True,
+    ).splitlines()
+    unsafe_config = sorted(
+        key
+        for key in config_keys
+        if key.casefold().startswith("filter.")
+        or key.casefold()
+        in {
+            "core.attributesfile",
+            "include.path",
+            "extensions.worktreeconfig",
+        }
+        or key.casefold().startswith("includeif.")
+    )
+    if unsafe_config:
+        raise AuditInputError(
+            "Mathlib checkout uses unsafe local Git configuration: "
+            + ", ".join(unsafe_config)
+        )
+
     replacements = _git_output(
         checkout,
         "for-each-ref",
@@ -503,6 +535,18 @@ def _validate_git_object_database(checkout: Path, git_directory: Path) -> None:
     )
     if replacements:
         raise AuditInputError("Mathlib checkout uses Git replacement references")
+
+
+def _reject_tree_symlinks(root: Path, label: str) -> None:
+    try:
+        for directory, names, files in os.walk(root, followlinks=False):
+            base = Path(directory)
+            for name in (*names, *files):
+                path = base / name
+                if path.is_symlink():
+                    raise AuditInputError(f"{label} contains a symbolic link: {path}")
+    except OSError as exc:
+        raise AuditInputError(f"cannot inspect {label}: {root}: {exc}") from exc
 
 
 def _validate_mathlib_artifacts(

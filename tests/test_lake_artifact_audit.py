@@ -439,6 +439,7 @@ def test_mathlib_checkout_rejects_git_replacement_refs(
     counterfeit = _run(checkout, "git", "rev-parse", "HEAD").stdout.strip()
     assert _run(checkout, "git", "replace", canonical, counterfeit).returncode == 0
     assert _run(checkout, "git", "reset", "--hard", canonical).returncode == 0
+    assert _run(checkout, "git", "pack-refs", "--all", "--prune").returncode == 0
     assert "counterfeit" in (checkout / "Mathlib/Provenance.lean").read_text(encoding="utf-8")
 
     with pytest.raises(helper.AuditInputError, match="replacement references"):
@@ -462,6 +463,51 @@ def test_mathlib_checkout_rejects_git_object_indirection(
     _write(path, "/counterfeit/object/store\n")
 
     with pytest.raises(helper.AuditInputError, match=message):
+        helper._mathlib_checkout_from_manifest(project)
+
+
+def test_mathlib_checkout_rejects_local_clean_filter_before_it_runs(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project, _, _ = _canonical_mathlib_fixture(tmp_path)
+    checkout = project / ".lake/packages/mathlib"
+    marker = tmp_path / "filter-ran"
+    configured = _run(
+        checkout,
+        "git",
+        "config",
+        "filter.reviewevil.clean",
+        f"sh -c 'touch {marker}; cat'",
+    )
+    assert configured.returncode == 0, configured.stderr
+
+    with pytest.raises(helper.AuditInputError, match="unsafe local Git configuration"):
+        helper._mathlib_checkout_from_manifest(project)
+    assert not marker.exists()
+
+
+def test_mathlib_checkout_rejects_private_attributes_before_status(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project, _, _ = _canonical_mathlib_fixture(tmp_path)
+    _write(project / ".lake/packages/mathlib/.git/info/attributes", "* filter=reviewevil\n")
+
+    with pytest.raises(helper.AuditInputError, match="private attributes file"):
+        helper._mathlib_checkout_from_manifest(project)
+
+
+def test_mathlib_checkout_rejects_nested_object_store_symlink(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project, _, _ = _canonical_mathlib_fixture(tmp_path)
+    object_root = project / ".lake/packages/mathlib/.git/objects"
+    external = tmp_path / "external-pack"
+    external.mkdir()
+    pack = object_root / "pack"
+    pack.rmdir()
+    pack.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(helper.AuditInputError, match="object database contains a symbolic link"):
         helper._mathlib_checkout_from_manifest(project)
 
 
