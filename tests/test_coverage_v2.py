@@ -231,6 +231,68 @@ def test_malformed_v2_frontmatter_cannot_downgrade_to_v1(
     assert [issue.code for issue in issues] == [expected_code]
 
 
+@pytest.mark.parametrize(
+    ("selector", "expected_code"),
+    [
+        ('"schema": autoform-coverage/v2', "coverage-schema-ambiguous"),
+        ("'schema': 'autoform-coverage/v2'", "coverage-schema-ambiguous"),
+        ("schema = autoform-coverage/v2", "coverage-frontmatter-invalid"),
+        ("schema=\"autoform-coverage/v2\"", "coverage-frontmatter-invalid"),
+        ("scema autoform-coverage/v2", "coverage-frontmatter-invalid"),
+        ("scema: autoform-coverage/v2", "coverage-schema-ambiguous"),
+        ("Schema: AUTOFORM-COVERAGE/v2", "coverage-schema-ambiguous"),
+        ('"schema" = "autoform-coverage\\/v2"', "coverage-frontmatter-invalid"),
+        ('"scehma": autoform_coverage/v02', "coverage-schema-ambiguous"),
+    ],
+)
+def test_valid_frontmatter_with_malformed_v2_intent_cannot_downgrade(
+    tmp_path: Path, selector: str, expected_code: str
+) -> None:
+    blueprint, _ = _project(tmp_path)
+    contract = blueprint / "coverage/README.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        f"---\ntitle: Coverage\n{selector}\n---\n\n"
+        "# Coverage\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Whole source | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert summary is None
+    assert [issue.code for issue in issues] == [expected_code]
+
+
+def test_v2_schema_token_in_frontmatter_comment_or_body_prose_is_not_intent(
+    tmp_path: Path,
+) -> None:
+    blueprint, _ = _project(tmp_path)
+    contract = blueprint / "coverage/README.md"
+    contract.parent.mkdir(parents=True, exist_ok=True)
+    contract.write_text(
+        "---\n"
+        "title: Coverage\n"
+        "# schema: autoform-coverage/v2\n"
+        "---\n\n"
+        "# Coverage\n\n"
+        'Migration prose may quote `"schema": autoform-coverage/v2`.\n\n'
+        "Compatibility: autoform-coverage/v2\n\n"
+        "| Area | Coverage | Evidence |\n"
+        "| --- | --- | --- |\n"
+        "| Whole source | OUT | Explicitly outside scope |\n",
+        encoding="utf-8",
+    )
+
+    summary, issues = load_coverage(blueprint)
+
+    assert issues == ()
+    assert summary is not None
+    assert summary.schema == "autoform-coverage/v1"
+
+
 def test_v2_schema_example_inside_code_fence_does_not_select_v2(tmp_path: Path) -> None:
     blueprint, _ = _project(tmp_path)
     contract = blueprint / "coverage/README.md"

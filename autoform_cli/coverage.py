@@ -47,12 +47,8 @@ _V2_EXPECTED_HEADER = (
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LINE_SPAN = re.compile(r"([1-9][0-9]*)-([1-9][0-9]*)\Z")
-_V2_SCHEMA_SIGNAL = re.compile(
-    r"^[ \t]*(?:schema[ \t]*(?::[ \t]*|[ \t]+)|"
-    r"[A-Za-z_][A-Za-z0-9_-]*[ \t]*:[ \t]*)"
-    r"[\"']?autoform-coverage/v2[\"']?[ \t]*$",
-    re.IGNORECASE,
-)
+_FRONTMATTER_LIKE_FENCE = re.compile(r"-{3,}\Z")
+_FRONTMATTER_KEY = re.compile(r"^[ \t]*[\"']?(?P<key>[A-Za-z][A-Za-z0-9_-]*)[\"']?")
 
 #: Stem of the marker that stands in for a row's cells when tracing which
 #: published table those source lines became. Grown by `_unique_marker` until
@@ -245,7 +241,7 @@ def load_coverage(blueprint_dir: str | Path) -> tuple[CoverageSummary | None, tu
         return None, (
             CoverageIssue(
                 ambiguous_schema_line,
-                "autoform-coverage/v2 appears outside valid coverage frontmatter",
+                "autoform-coverage/v2 appears in malformed or unsupported coverage frontmatter",
                 "coverage-schema-ambiguous",
             ),
         )
@@ -336,18 +332,75 @@ def _coverage_frontmatter(
 
 
 def _ambiguous_v2_schema_line(text: str) -> int | None:
-    """Find a visible, frontmatter-shaped v2 selector we could not parse.
+    """Find v2 intent inside a frontmatter block we could not select.
 
-    A malformed opening fence or key must not turn an intended exhaustive v2
-    contract into permissive legacy v1. Fenced examples remain documentation,
-    not schema selection.
+    Exact frontmatter is strict about the selector's spelling, quoting, and
+    separator. Detection is deliberately broader only inside that block: any
+    un-commented v2 schema token means a malformed selector must not downgrade
+    to permissive legacy v1. A near frontmatter fence at the start gets the same
+    treatment, while prose and fenced examples in the Markdown body do not.
     """
 
-    view = content(text)
-    for line_number, line in enumerate(view.lines, start=1):
-        if _V2_SCHEMA_SIGNAL.fullmatch(line):
+    lines = text.splitlines()
+    if not lines:
+        return None
+    opening = lines[0].lstrip("\ufeff").strip()
+    if _FRONTMATTER_LIKE_FENCE.fullmatch(opening) is None:
+        return None
+    try:
+        end = next(index for index in range(1, len(lines)) if lines[index].strip() == "---")
+    except StopIteration:
+        end = len(lines)
+    for line_number, line in enumerate(lines[1:end], start=2):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if _frontmatter_line_signals_v2(stripped):
             return line_number
     return None
+
+
+def _frontmatter_line_signals_v2(line: str) -> bool:
+    folded = line.casefold()
+    if COVERAGE_V2_SCHEMA.casefold() in folded:
+        return True
+    normalized = re.sub(r"[\s\"'\\]", "", folded).replace("_", "-")
+    if COVERAGE_V2_SCHEMA.casefold() in normalized:
+        return True
+    key_match = _FRONTMATTER_KEY.match(line)
+    return (
+        key_match is not None
+        and _within_one_schema_edit(key_match.group("key").casefold())
+        and "autoform-coverage/" in normalized
+    )
+
+
+def _within_one_schema_edit(value: str) -> bool:
+    expected = "schema"
+    if value == expected:
+        return True
+    if abs(len(value) - len(expected)) > 1:
+        return False
+    if len(value) == len(expected):
+        differences = [
+            index
+            for index, pair in enumerate(zip(value, expected))
+            if pair[0] != pair[1]
+        ]
+        if len(differences) == 1:
+            return True
+        return (
+            len(differences) == 2
+            and differences[1] == differences[0] + 1
+            and value[differences[0]] == expected[differences[1]]
+            and value[differences[1]] == expected[differences[0]]
+        )
+    shorter, longer = (value, expected) if len(value) < len(expected) else (expected, value)
+    mismatch = next(
+        (index for index, pair in enumerate(zip(shorter, longer)) if pair[0] != pair[1]),
+        len(shorter),
+    )
+    return shorter[mismatch:] == longer[mismatch + 1 :]
 
 
 def _unquote_frontmatter_scalar(value: str) -> str:
