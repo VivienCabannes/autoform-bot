@@ -744,6 +744,10 @@ def test_candidate_admission_validates_review_request_before_recording_passed_ga
     monkeypatch,
 ) -> None:
     snapshot, context = _candidate_admission_case(tmp_path)
+    context = replace(
+        context,
+        work_item=replace(context.work_item, source_revision="a" * 64),
+    )
     ledger = _AdmissionLedger()
     gate_result = _candidate_gate_result(context, passed=True)
     events: list[str] = []
@@ -922,6 +926,51 @@ def test_candidate_admission_cancellation_wins_before_enqueue(tmp_path, monkeypa
             ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None),
             cancelled,
             execution_input_reader=lambda _: b"{}",
+        )
+    assert ledger.enqueued is None
+
+
+def test_candidate_admission_cancellation_during_evidence_reload_prevents_enqueue(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    fixed_digest = "8" * 64
+    review_digest = "9" * 64
+    snapshot, context = _candidate_admission_case(
+        tmp_path,
+        gates=(
+            GateRecord("attempt", CANDIDATE_GATE_NAME, True, fixed_digest, "", 1),
+            GateRecord("attempt", REVIEW_GATE_NAME, True, review_digest, "", 2),
+        ),
+    )
+    ledger = _AdmissionLedger(
+        {fixed_digest: b"fixed evidence", review_digest: b"review evidence"}
+    )
+    request = _ReviewRequestStub()
+    monkeypatch.setattr(controller_module, "bind_candidate_review_request", lambda **_: request)
+    reviewer = ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None)
+    cancelled = threading.Event()
+    durable = SimpleNamespace(
+        approved=True,
+        request=request,
+        reviewer_backend="codex",
+        reviewer_model="review-model",
+    )
+
+    def cancel_during_reload(_: bytes) -> object:
+        cancelled.set()
+        return durable
+
+    with pytest.raises(ControllerError, match="cancelled after review evidence validation"):
+        advance_candidate_admission(
+            ledger,  # type: ignore[arg-type]
+            snapshot,
+            "attempt",
+            context,
+            reviewer,
+            cancelled,
+            execution_input_reader=lambda _: b"{}",
+            review_evidence_loader=cancel_during_reload,  # type: ignore[arg-type]
         )
     assert ledger.enqueued is None
 

@@ -489,6 +489,7 @@ def advance_candidate_admission(
                 "reviewer-config-mismatch",
                 "stored review approval does not match the configured reviewer",
             )
+        _require_active_candidate(cancelled, "after review evidence validation")
         queue_item_id, queue_ref = _candidate_queue_identity(snapshot.run.run_id, attempt)
         queued = ledger.enqueue_candidate(
             attempt_id,
@@ -540,7 +541,6 @@ def _validate_candidate_context(
         item.node.article_id != attempt.article_id
         or item.phase.value != attempt.phase
         or item.attempt != attempt.number
-        or item.source_revision != snapshot.run.identity.runtime_revision
         or item.source_contract_sha256 != snapshot.run.config.coverage_contract_sha256
     ):
         raise ControllerError(

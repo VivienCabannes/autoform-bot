@@ -621,6 +621,7 @@ def test_durable_review_loader_accepts_valid_evidence_larger_than_contract_limit
     )
 
     durable = result.evidence_bytes()
+    assert result.approved
     assert len(durable) > 32 * 1024 * 1024
     assert load_candidate_review_result(durable) == result
 
