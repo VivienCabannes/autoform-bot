@@ -142,6 +142,57 @@ def test_claim_repository_object_format_mismatch_fails_before_push(tmp_path: Pat
     assert _git("--git-dir", str(repo), "for-each-ref", claims.CLAIM_REF_PREFIX) == ""
 
 
+def test_remote_expected_object_format_is_verified_against_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=f"{'a' * 64}\trefs/autoform-claims/existing\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    board = claims.ClaimBoard(
+        "https://example.invalid/claims.git",
+        "worker-a",
+        tmp_path / "scratch",
+        expected_object_format="sha1",
+    )
+
+    with pytest.raises(claims.ClaimTransportError, match="does not match expected"):
+        board._repository_object_format()
+
+    assert commands == [
+        ["git", "ls-remote", "--refs", "https://example.invalid/claims.git"]
+    ]
+
+
+def test_remote_claim_only_ref_detects_object_format_without_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=f"{'a' * 64}\trefs/autoform-claims/existing\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    board = claims.ClaimBoard(
+        "https://example.invalid/claims.git",
+        "worker-a",
+        tmp_path / "scratch",
+    )
+
+    assert board._repository_object_format() == "sha256"
+
+
 def test_existing_claim_scratch_must_match_repository_object_format(tmp_path: Path) -> None:
     repo = tmp_path / "claims-sha256.git"
     scratch = tmp_path / "scratch"
@@ -1206,6 +1257,7 @@ def test_remote_board_anchors_scratch_leaf_with_directory_fd(
         scratch,
         expected_object_format="sha1",
     )
+    monkeypatch.setattr(board, "_repository_object_format", lambda: "sha1")
     board._ensure_scratch()
     oid = board._git(["hash-object", "-w", "--stdin"], input_text="payload").stdout.strip()
     redirected = tmp_path / "redirected-scratch"

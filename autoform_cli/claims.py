@@ -607,8 +607,6 @@ class ClaimBoard:
             raise ClaimTransportError("claim scratch directory was replaced")
 
     def _repository_object_format(self) -> str | None:
-        if self._expected_object_format is not None and self._repo_path is None:
-            return self._expected_object_format
         self._verify_repo_identity()
         if self._repo_path is not None:
             command = ["git", "rev-parse", "--show-object-format"]
@@ -647,7 +645,7 @@ class ClaimBoard:
         else:
             try:
                 proc = subprocess.run(
-                    ["git", "ls-remote", self.repo_url, "HEAD"],
+                    ["git", "ls-remote", "--refs", self.repo_url],
                     capture_output=True,
                     text=True,
                     timeout=120,
@@ -662,12 +660,7 @@ class ClaimBoard:
                 raise ClaimTransportError(
                     f"cannot inspect claim repository object format: {detail}"
                 )
-            widths = {
-                len(oid)
-                for line in proc.stdout.splitlines()
-                if (oid := line.partition("\t")[0])
-                and OBJECT_ID_RE.fullmatch(oid) is not None
-            }
+            widths = {len(oid) for oid, _ref in _parse_ls_remote_output(proc.stdout)}
             if not widths:
                 return self._expected_object_format
             if len(widths) != 1:
