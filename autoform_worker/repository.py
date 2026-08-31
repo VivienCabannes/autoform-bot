@@ -54,10 +54,18 @@ _MAX_CANDIDATE_ABANDONED_INDEX_STAGES = 8
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
 _CANDIDATE_SCHEMA = "autoform-candidate/v5"
 _READY_CANDIDATE_INDEX_TOPOLOGY = frozenset({"stage", "index", "displaced-backup"})
-_PUBLICATION_SCHEMA = "autoform-merge-publication/v4"
+_PUBLICATION_SCHEMA = "autoform-merge-publication/v5"
+_LEGACY_PUBLICATION_SCHEMA = "autoform-merge-publication/v4"
+_REPLAY_INTENT_SCHEMA = "autoform-merge-replay-intent/v1"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
-_PUBLICATION_STATES = frozenset({"prepared", "queueing", "queued", "publishing", "integrated", "stale", "uncertain"})
+_PUBLICATION_STATES = frozenset(
+    {"prepared", "queueing", "queued", "publishing", "replaying", "integrated", "stale", "uncertain"}
+)
+_REPLAY_EVENT_STATES = frozenset({"prepared", "publishing", "retry", "stale", "integrated", "uncertain"})
+_REPLAY_TERMINAL_STATES = frozenset({"retry", "stale", "integrated", "uncertain"})
+_MAX_REPLAY_ATTEMPTS = 128
+_MAX_REPLAY_EVENTS = 512
 _ZERO_OIDS = frozenset({"0" * 40, "0" * 64})
 _CAS_REJECTIONS = (
     "stale info",
@@ -256,10 +264,14 @@ class PublicationReceipt:
     claim_lease_id: str | None
     detail: str
     history: tuple[Mapping[str, object], ...]
+    replay_intents: tuple[Mapping[str, object], ...] = ()
+    replay_events: tuple[Mapping[str, object], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         value = asdict(self)
         value["history"] = [dict(item) for item in self.history]
+        value["replay_intents"] = [dict(item) for item in self.replay_intents]
+        value["replay_events"] = [dict(item) for item in self.replay_events]
         return value
 
     def evidence_bytes(self) -> bytes:
@@ -3629,13 +3641,15 @@ class RemoteMergeQueue:
             )
             if record["status"] != "integrated":
                 self._verify_candidate(expected_target_oid, candidate_oid)
-            recovered = self._recover_record(record, journal)
+            recovered = self._recover_current_record(record, journal)
             if recovered["status"] == "integrated":
                 return _publication_receipt(recovered)
             if recovered["status"] == "stale":
                 raise RemoteDrift(str(recovered["detail"]))
             if recovered["status"] == "uncertain":
                 raise PublicationUncertain(str(recovered["detail"]))
+            if recovered["status"] == "replaying":
+                raise MergeQueueBusy("a stale publication replay is already in progress")
             acquired = self.claim_board.acquire(
                 claim_key,
                 ttl=self.claim_ttl,
@@ -3660,7 +3674,7 @@ class RemoteMergeQueue:
                         raise PublicationUncertain("publication claim has no coherent ownership fence")
                     record["claim_lease_id"] = merge_fence.lease_id
                     self._assert_lease(claim_key, heartbeat)
-                    record = self._recover_record(record, journal)
+                    record = self._recover_current_record(record, journal)
                     if record["status"] == "integrated":
                         result = _publication_receipt(record)
                     elif record["status"] == "stale":
@@ -3768,7 +3782,513 @@ class RemoteMergeQueue:
             )
             if record["status"] != "integrated":
                 self._verify_candidate(expected_target_oid, candidate_oid)
-            return _publication_receipt(self._recover_record(record, journal))
+            return _publication_receipt(self._recover_current_record(record, journal))
+
+    def replay_stale(
+        self,
+        queue_item_id: str,
+        *,
+        target_ref: str,
+        queue_ref: str,
+        expected_target_oid: str,
+        candidate_oid: str,
+        article_claim: ClaimFence,
+        replay_target_oid: str,
+        replay_candidate_oid: str,
+    ) -> PublicationReceipt:
+        """Publish an exact replay of a queued candidate over a drifted target.
+
+        The original queue and author-handoff refs remain the ownership barrier
+        until one atomic push advances the target and consumes both barriers and
+        the exact merge claim. Every replay attempt is append-only in the original
+        publication journal.
+        """
+
+        self._validate_publication_identity(
+            queue_item_id,
+            target_ref,
+            queue_ref,
+            expected_target_oid,
+            candidate_oid,
+        )
+        self._validate_article_claim(article_claim)
+        _validate_oid(replay_target_oid)
+        _validate_oid(replay_candidate_oid)
+        article_handoff_ref = claim_handoff_ref(article_claim.key)
+        self._verify_state()
+        claim_key = _merge_claim_key(target_ref)
+        stable_identity = {
+            "queue_item_id": queue_item_id,
+            "target_ref": target_ref,
+            "queue_ref": queue_ref,
+            "expected_target_oid": expected_target_oid,
+            "candidate_oid": candidate_oid,
+            "article_claim_key": article_claim.key,
+            "article_claim_ref": article_claim.ref,
+            "article_claim_lease_id": article_claim.lease_id,
+            "article_handoff_ref": article_handoff_ref,
+            "claim_key": claim_key,
+            "claim_ref": CLAIM_REF_PREFIX + claim_key,
+        }
+        lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
+        merge_fence: ClaimFence | None = None
+        with CoordinatorLock(self.lock_root / f"publish-{lock_digest}.lock"):
+            self._verify_state()
+            _, journal = self._publication_paths(queue_item_id)
+            record = self._read_journal(journal)
+            self._validate_journal(record, journal=journal, **stable_identity)
+            self._verify_candidate(expected_target_oid, candidate_oid)
+            record = self._recover_current_record(record, journal)
+            if record["status"] == "integrated":
+                self._assert_replay_oids_if_present(
+                    record,
+                    replay_target_oid=replay_target_oid,
+                    replay_candidate_oid=replay_candidate_oid,
+                )
+                return _publication_receipt(record)
+            if record["status"] == "uncertain":
+                raise PublicationUncertain(str(record["detail"]))
+
+            active = self._active_replay_intent(record)
+            if record["status"] == "replaying":
+                if active is None:  # pragma: no cover - journal validation owns this invariant
+                    raise PublicationUncertain("replaying publication has no durable replay intent")
+                self._assert_replay_oids(
+                    active,
+                    replay_target_oid=replay_target_oid,
+                    replay_candidate_oid=replay_candidate_oid,
+                )
+                self.repository._verify_commit(replay_target_oid)
+                self.repository._verify_commit(replay_candidate_oid)
+                merge_fence = self._replay_claim_fence(active)
+            else:
+                if record["status"] != "stale":
+                    raise MergeQueueError("publication is not in a stale state that can be replayed")
+                intents = record.get("replay_intents")
+                if not isinstance(intents, list):  # pragma: no cover - journal validation owns this invariant
+                    raise PublicationUncertain("publication replay history is malformed")
+                if len(intents) >= _MAX_REPLAY_ATTEMPTS:
+                    detail = "stale replay attempt limit reached; manual reconciliation is required"
+                    _transition_journal(journal, record, "uncertain", detail)
+                    raise PublicationUncertain(detail)
+                delta_sha256, replay_tree_oid = self._verify_replay_candidate(
+                    expected_target_oid=expected_target_oid,
+                    candidate_oid=candidate_oid,
+                    replay_target_oid=replay_target_oid,
+                    replay_candidate_oid=replay_candidate_oid,
+                )
+                acquired = self.claim_board.acquire(
+                    claim_key,
+                    ttl=self.claim_ttl,
+                    note=f"stale merge queue replay {queue_item_id}",
+                )
+                if not acquired:
+                    raise MergeQueueBusy(f"another publisher owns {target_ref}")
+                try:
+                    merge_fence = self._held_claim_fence(claim_key)
+                    if merge_fence is None:
+                        raise PublicationUncertain("stale replay claim has no coherent ownership fence")
+                    record = self._prepare_replay_intent(
+                        record,
+                        journal,
+                        replay_target_oid=replay_target_oid,
+                        replay_candidate_oid=replay_candidate_oid,
+                        delta_sha256=delta_sha256,
+                        replay_tree_oid=replay_tree_oid,
+                        merge_fence=merge_fence,
+                    )
+                except BaseException:
+                    if merge_fence is not None:
+                        self._release_claim_fence(merge_fence.ref, merge_fence.oid)
+                    else:
+                        self.claim_board.release(claim_key)
+                    raise
+                active = self._active_replay_intent(record)
+                if active is None:  # pragma: no cover - journal validation owns this invariant
+                    raise PublicationUncertain("stale replay intent was not recorded")
+
+            pending_error: BaseException | None = None
+            result: PublicationReceipt | None = None
+            try:
+                record = self._execute_replay(record, journal, active)
+                if record["status"] == "integrated":
+                    result = _publication_receipt(record)
+                elif record["status"] == "stale":
+                    event = self._last_replay_event(record)
+                    if event is not None and event.get("status") == "retry":
+                        raise MergeQueueBusy(str(record["detail"]))
+                    raise RemoteDrift(str(record["detail"]))
+                elif record["status"] == "uncertain":
+                    raise PublicationUncertain(str(record["detail"]))
+                else:  # pragma: no cover - replay executor returns a classified state
+                    raise PublicationUncertain("stale replay ended without a classified outcome")
+            except BaseException as error:
+                pending_error = error
+            finally:
+                if merge_fence is not None:
+                    try:
+                        self._release_claim_fence(merge_fence.ref, merge_fence.oid)
+                    except Exception as error:
+                        if pending_error is None:
+                            pending_error = error
+            if pending_error is not None:
+                raise pending_error
+            if result is None:  # pragma: no cover - defensive state invariant
+                raise PublicationUncertain("stale replay ended without an outcome")
+            return result
+
+    def _recover_current_record(
+        self,
+        record: dict[str, object],
+        journal: Path,
+    ) -> dict[str, object]:
+        if record["status"] != "replaying":
+            return self._recover_record(record, journal)
+        active = self._active_replay_intent(record)
+        if active is None:  # pragma: no cover - journal validation owns this invariant
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "replaying publication has no durable replay intent",
+            )
+        return self._recover_replay_record(record, journal, active)
+
+    def _prepare_replay_intent(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        *,
+        replay_target_oid: str,
+        replay_candidate_oid: str,
+        delta_sha256: str,
+        replay_tree_oid: str,
+        merge_fence: ClaimFence,
+    ) -> dict[str, object]:
+        observation = self._observe_replay_refs(record)
+        self._record_replay_observation(record, observation)
+        original_candidate = str(record["candidate_oid"])
+        if observation["queue"] != original_candidate or observation["handoff"] != original_candidate:
+            detail = self._replay_barrier_error(record, observation, phase="before replay intent")
+            _transition_journal(journal, record, "uncertain", detail)
+            raise PublicationUncertain(detail)
+        if observation["article"] is not None:
+            detail = "an article claim reappeared before stale replay intent"
+            _transition_journal(journal, record, "uncertain", detail)
+            raise PublicationUncertain(detail)
+        if observation["claim"] != merge_fence.oid:
+            if observation["claim"] is None:
+                detail = "stale replay merge claim disappeared before intent; retry with a new fence"
+                _transition_journal(journal, record, "stale", detail)
+                raise MergeQueueBusy(detail)
+            detail = f"merge claim {merge_fence.ref} changed before stale replay intent"
+            _transition_journal(journal, record, "uncertain", detail)
+            raise PublicationUncertain(detail)
+        if observation["target"] != replay_target_oid:
+            detail = (
+                f"target {record['target_ref']} drifted from replay base {replay_target_oid} "
+                f"to {observation['target'] or 'absent'} before replay intent"
+            )
+            _transition_journal(journal, record, "stale", detail)
+            raise RemoteDrift(detail)
+
+        created_ns = time.time_ns()
+        intent_body: dict[str, object] = {
+            "schema": _REPLAY_INTENT_SCHEMA,
+            "object_format": self.repository.object_format,
+            "original_expected_oid": str(record["expected_target_oid"]),
+            "original_candidate_oid": original_candidate,
+            "replay_target_oid": replay_target_oid,
+            "replay_candidate_oid": replay_candidate_oid,
+            "replay_tree_oid": replay_tree_oid,
+            "source_delta_sha256": delta_sha256,
+            "target_ref": str(record["target_ref"]),
+            "queue_ref": str(record["queue_ref"]),
+            "expected_queue_oid": original_candidate,
+            "article_claim_ref": str(record["article_claim_ref"]),
+            "expected_article_claim_oid": None,
+            "article_handoff_ref": str(record["article_handoff_ref"]),
+            "expected_article_handoff_oid": original_candidate,
+            "claim_key": merge_fence.key,
+            "claim_ref": merge_fence.ref,
+            "claim_oid": merge_fence.oid,
+            "claim_lease_id": merge_fence.lease_id,
+            "created_ns": created_ns,
+        }
+        replay_id = hashlib.sha256(_json_bytes(intent_body)).hexdigest()
+        intent = {"replay_id": replay_id, **intent_body}
+        intents = record.get("replay_intents")
+        events = record.get("replay_events")
+        if not isinstance(intents, list) or not isinstance(events, list):
+            raise PublicationUncertain("publication replay history is malformed")
+        intents.append(intent)
+        events.append(
+            {
+                "replay_id": replay_id,
+                "status": "prepared",
+                "detail": "durable exact-diff stale replay intent recorded",
+                "created_ns": created_ns,
+            }
+        )
+        _checkpoint("replay-intent-recording")
+        record = _transition_journal(
+            journal,
+            record,
+            "replaying",
+            "durable exact-diff stale replay intent recorded",
+        )
+        _checkpoint("replay-intent-recorded")
+        return record
+
+    def _execute_replay(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        intent: Mapping[str, object],
+    ) -> dict[str, object]:
+        record = self._recover_replay_record(record, journal, intent)
+        if record["status"] != "replaying":
+            return record
+        events = record.get("replay_events")
+        if not isinstance(events, list):  # pragma: no cover - journal validation owns this invariant
+            raise PublicationUncertain("publication replay event history is malformed")
+        if len(events) >= _MAX_REPLAY_EVENTS:
+            return self._record_replay_classification(
+                record,
+                journal,
+                intent,
+                "uncertain",
+                "stale replay event limit reached; manual reconciliation is required",
+            )
+        replay_id = str(intent["replay_id"])
+        self._append_replay_event(
+            record,
+            journal,
+            replay_id=replay_id,
+            status="publishing",
+            detail="atomic stale replay publication about to run",
+            top_status="replaying",
+        )
+        _checkpoint("replay-push-attempted")
+        pushed = self._atomic_replay_push(intent)
+        _checkpoint("replay-pushed")
+        _checkpoint("replay-observation-started")
+        observation = self._observe_replay_refs(record)
+        self._record_replay_observation(record, observation)
+        _checkpoint("replay-observed")
+        status, detail = self._classify_replay_observation(
+            record,
+            intent,
+            observation,
+            reported_success=pushed,
+        )
+        return self._record_replay_classification(record, journal, intent, status, detail)
+
+    def _recover_replay_record(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        intent: Mapping[str, object],
+    ) -> dict[str, object]:
+        _checkpoint("replay-recovery-observation-started")
+        observation = self._observe_replay_refs(record)
+        self._record_replay_observation(record, observation)
+        _checkpoint("replay-recovery-observed")
+        status, detail = self._classify_replay_observation(
+            record,
+            intent,
+            observation,
+            reported_success=None,
+        )
+        if status == "replaying":
+            record["detail"] = detail
+            record["updated_ns"] = time.time_ns()
+            _write_json_file(journal, record)
+            return record
+        return self._record_replay_classification(record, journal, intent, status, detail)
+
+    def _classify_replay_observation(
+        self,
+        record: Mapping[str, object],
+        intent: Mapping[str, object],
+        observation: Mapping[str, str | None],
+        *,
+        reported_success: bool | None,
+    ) -> tuple[str, str]:
+        target = observation["target"]
+        queue = observation["queue"]
+        handoff = observation["handoff"]
+        article = observation["article"]
+        claim = observation["claim"]
+        old_candidate = str(intent["original_candidate_oid"])
+        replay_target = str(intent["replay_target_oid"])
+        replay_candidate = str(intent["replay_candidate_oid"])
+        replay_claim = str(intent["claim_oid"])
+
+        if target == replay_candidate and queue is None and handoff is None:
+            if claim == replay_claim:
+                return "uncertain", "replay target advanced without consuming the exact merge claim"
+            return "integrated", "recovery verified atomic stale replay publication"
+
+        if queue != old_candidate or handoff != old_candidate:
+            return "uncertain", self._replay_barrier_error(record, observation, phase="during stale replay")
+        if article is not None:
+            return "uncertain", "an article claim exists while stale replay barriers are active"
+        if claim not in {None, replay_claim}:
+            return "uncertain", f"merge claim {intent['claim_ref']} changed during stale replay"
+        if target != replay_target:
+            if target == replay_candidate:
+                return "uncertain", "replay target advanced without atomically consuming its barriers"
+            return (
+                "stale",
+                f"stale replay target drifted from {replay_target} to {target or 'absent'}",
+            )
+        if claim is None:
+            return "retry", "stale replay merge claim disappeared before publication; a new fence is required"
+        if reported_success is True:
+            return "uncertain", "atomic stale replay reported success without the exact four-ref result"
+        if reported_success is False:
+            return "retry", "stale replay CAS was rejected without remote drift; a new fenced retry is required"
+        return "replaying", "recovery verified the exact pre-push stale replay state"
+
+    def _record_replay_classification(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        intent: Mapping[str, object],
+        status: str,
+        detail: str,
+    ) -> dict[str, object]:
+        top_status = "stale" if status == "retry" else status
+        _checkpoint("replay-terminal-recording")
+        record = self._append_replay_event(
+            record,
+            journal,
+            replay_id=str(intent["replay_id"]),
+            status=status,
+            detail=detail,
+            top_status=top_status,
+        )
+        _checkpoint("replay-terminal-recorded")
+        return record
+
+    def _append_replay_event(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        *,
+        replay_id: str,
+        status: str,
+        detail: str,
+        top_status: str,
+    ) -> dict[str, object]:
+        events = record.get("replay_events")
+        if not isinstance(events, list):
+            raise PublicationUncertain("publication replay event history is malformed")
+        events.append(
+            {
+                "replay_id": replay_id,
+                "status": status,
+                "detail": detail,
+                "created_ns": time.time_ns(),
+                "observed_target_oid": record.get("observed_target_oid"),
+                "observed_queue_oid": record.get("observed_queue_oid"),
+                "observed_article_claim_oid": record.get("observed_article_claim_oid"),
+                "observed_article_handoff_oid": record.get("observed_article_handoff_oid"),
+                "observed_claim_oid": record.get("observed_claim_oid"),
+            }
+        )
+        return _transition_journal(journal, record, top_status, detail)
+
+    def _observe_replay_refs(self, record: Mapping[str, object]) -> dict[str, str | None]:
+        return {
+            "target": self._remote_oid(str(record["target_ref"])),
+            "queue": self._remote_oid(str(record["queue_ref"])),
+            "handoff": self._remote_oid(str(record["article_handoff_ref"])),
+            "article": self._remote_oid(str(record["article_claim_ref"])),
+            "claim": self._remote_oid(str(record["claim_ref"])),
+        }
+
+    @staticmethod
+    def _record_replay_observation(
+        record: dict[str, object],
+        observation: Mapping[str, str | None],
+    ) -> None:
+        record["observed_target_oid"] = observation["target"]
+        record["observed_queue_oid"] = observation["queue"]
+        record["observed_article_handoff_oid"] = observation["handoff"]
+        record["observed_article_claim_oid"] = observation["article"]
+        record["observed_claim_oid"] = observation["claim"]
+
+    @staticmethod
+    def _replay_barrier_error(
+        record: Mapping[str, object],
+        observation: Mapping[str, str | None],
+        *,
+        phase: str,
+    ) -> str:
+        candidate = str(record["candidate_oid"])
+        queue = observation["queue"]
+        handoff = observation["handoff"]
+        if (queue is None) != (handoff is None):
+            return f"queue and author-handoff refs split {phase}"
+        if queue != candidate:
+            return f"queue ref collision {phase}: {queue or 'absent'}"
+        return f"author-handoff ref collision {phase}: {handoff or 'absent'}"
+
+    @staticmethod
+    def _active_replay_intent(record: Mapping[str, object]) -> Mapping[str, object] | None:
+        intents = record.get("replay_intents")
+        if not isinstance(intents, list) or not intents:
+            return None
+        intent = intents[-1]
+        return intent if isinstance(intent, dict) else None
+
+    @staticmethod
+    def _last_replay_event(record: Mapping[str, object]) -> Mapping[str, object] | None:
+        events = record.get("replay_events")
+        if not isinstance(events, list) or not events:
+            return None
+        event = events[-1]
+        return event if isinstance(event, dict) else None
+
+    def _assert_replay_oids_if_present(
+        self,
+        record: Mapping[str, object],
+        *,
+        replay_target_oid: str,
+        replay_candidate_oid: str,
+    ) -> None:
+        active = self._active_replay_intent(record)
+        if active is not None:
+            self._assert_replay_oids(
+                active,
+                replay_target_oid=replay_target_oid,
+                replay_candidate_oid=replay_candidate_oid,
+            )
+
+    @staticmethod
+    def _assert_replay_oids(
+        intent: Mapping[str, object],
+        *,
+        replay_target_oid: str,
+        replay_candidate_oid: str,
+    ) -> None:
+        for key, value in (
+            ("replay_target_oid", replay_target_oid),
+            ("replay_candidate_oid", replay_candidate_oid),
+        ):
+            if intent.get(key) != value:
+                raise PublicationUncertain(f"stale replay journal has a different {key}")
+
+    @staticmethod
+    def _replay_claim_fence(intent: Mapping[str, object]) -> ClaimFence:
+        return ClaimFence(
+            key=str(intent["claim_key"]),
+            ref=str(intent["claim_ref"]),
+            oid=str(intent["claim_oid"]),
+            lease_id=str(intent["claim_lease_id"]),
+        )
 
     def _ensure_queue_ref(
         self,
@@ -4235,6 +4755,8 @@ class RemoteMergeQueue:
             "created_ns": now,
             "updated_ns": now,
             "history": [{"status": "prepared", "detail": detail, "created_ns": now}],
+            "replay_intents": [],
+            "replay_events": [],
         }
 
     def _publication_paths(self, queue_item_id: str) -> tuple[Path, Path]:
@@ -4252,6 +4774,7 @@ class RemoteMergeQueue:
         journal: Path,
         **identity: str,
     ) -> None:
+        legacy_schema = record.get("schema") == _LEGACY_PUBLICATION_SCHEMA
         expected = {
             "schema": _PUBLICATION_SCHEMA,
             "remote_id": self.remote_id,
@@ -4259,6 +4782,8 @@ class RemoteMergeQueue:
             **identity,
         }
         for key, value in expected.items():
+            if key == "schema" and legacy_schema:
+                continue
             if key not in record or record[key] != value:
                 raise PublicationUncertain(f"publication journal has a different {key}")
         if record["remote_kind"] == "local" and (
@@ -4301,6 +4826,156 @@ class RemoteMergeQueue:
                 or not _is_integer(entry.get("created_ns"))
             ):
                 raise PublicationUncertain("publication journal history is malformed")
+        if legacy_schema:
+            if not isinstance(record, dict) or "replay_intents" in record or "replay_events" in record:
+                raise PublicationUncertain("legacy publication journal has unexpected replay state")
+            if record.get("status") == "replaying" or any(
+                isinstance(entry, dict) and entry.get("status") == "replaying" for entry in record["history"]
+            ):
+                raise PublicationUncertain("legacy publication journal has an invalid replaying state")
+            record["schema"] = _PUBLICATION_SCHEMA
+            record["replay_intents"] = []
+            record["replay_events"] = []
+            _write_json_file(journal, record)
+            _checkpoint("publication-schema-upgraded")
+        self._validate_replay_history(record)
+
+    def _validate_replay_history(self, record: Mapping[str, object]) -> None:
+        intents = record.get("replay_intents")
+        events = record.get("replay_events")
+        if not isinstance(intents, list) or not isinstance(events, list):
+            raise PublicationUncertain("publication replay history is malformed")
+        intent_keys = {
+            "replay_id",
+            "schema",
+            "object_format",
+            "original_expected_oid",
+            "original_candidate_oid",
+            "replay_target_oid",
+            "replay_candidate_oid",
+            "replay_tree_oid",
+            "source_delta_sha256",
+            "target_ref",
+            "queue_ref",
+            "expected_queue_oid",
+            "article_claim_ref",
+            "expected_article_claim_oid",
+            "article_handoff_ref",
+            "expected_article_handoff_oid",
+            "claim_key",
+            "claim_ref",
+            "claim_oid",
+            "claim_lease_id",
+            "created_ns",
+        }
+        intent_ids: list[str] = []
+        oid_width = 64 if self.repository.object_format == "sha256" else 40
+        for intent in intents:
+            if not isinstance(intent, dict) or set(intent) != intent_keys:
+                raise PublicationUncertain("publication replay intent is malformed")
+            replay_id = intent.get("replay_id")
+            if not isinstance(replay_id, str) or re.fullmatch(r"[0-9a-f]{64}", replay_id) is None:
+                raise PublicationUncertain("publication replay intent has an invalid id")
+            if replay_id in intent_ids:
+                raise PublicationUncertain("publication replay intent id is duplicated")
+            body = {key: value for key, value in intent.items() if key != "replay_id"}
+            if hashlib.sha256(_json_bytes(body)).hexdigest() != replay_id:
+                raise PublicationUncertain("publication replay intent digest does not match its content")
+            if intent.get("schema") != _REPLAY_INTENT_SCHEMA:
+                raise PublicationUncertain("publication replay intent has an unknown schema")
+            if intent.get("object_format") != self.repository.object_format:
+                raise PublicationUncertain("publication replay intent has a different object format")
+            identity = {
+                "original_expected_oid": record.get("expected_target_oid"),
+                "original_candidate_oid": record.get("candidate_oid"),
+                "target_ref": record.get("target_ref"),
+                "queue_ref": record.get("queue_ref"),
+                "expected_queue_oid": record.get("candidate_oid"),
+                "article_claim_ref": record.get("article_claim_ref"),
+                "expected_article_claim_oid": None,
+                "article_handoff_ref": record.get("article_handoff_ref"),
+                "expected_article_handoff_oid": record.get("candidate_oid"),
+                "claim_key": record.get("claim_key"),
+                "claim_ref": record.get("claim_ref"),
+            }
+            if any(intent.get(key) != value for key, value in identity.items()):
+                raise PublicationUncertain("publication replay intent does not match its publication")
+            for key in (
+                "original_expected_oid",
+                "original_candidate_oid",
+                "replay_target_oid",
+                "replay_candidate_oid",
+                "replay_tree_oid",
+                "expected_queue_oid",
+                "expected_article_handoff_oid",
+                "claim_oid",
+            ):
+                value = intent.get(key)
+                if not isinstance(value, str) or not _OID.fullmatch(value) or len(value) != oid_width:
+                    raise PublicationUncertain(f"publication replay intent has an invalid {key}")
+            for key in ("source_delta_sha256", "claim_lease_id"):
+                value = intent.get(key)
+                if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                    raise PublicationUncertain(f"publication replay intent has an invalid {key}")
+            if not _is_integer(intent.get("created_ns")):
+                raise PublicationUncertain("publication replay intent has an invalid created_ns")
+            intent_ids.append(replay_id)
+
+        event_counts = {replay_id: 0 for replay_id in intent_ids}
+        terminal: set[str] = set()
+        greatest_intent_index = -1
+        for event in events:
+            if not isinstance(event, dict):
+                raise PublicationUncertain("publication replay event is malformed")
+            replay_id = event.get("replay_id")
+            if not isinstance(replay_id, str) or replay_id not in event_counts:
+                raise PublicationUncertain("publication replay event references an unknown intent")
+            intent_index = intent_ids.index(replay_id)
+            if intent_index < greatest_intent_index or replay_id in terminal:
+                raise PublicationUncertain("publication replay event ordering is malformed")
+            greatest_intent_index = intent_index
+            status = event.get("status")
+            if status not in _REPLAY_EVENT_STATES or not isinstance(event.get("detail"), str):
+                raise PublicationUncertain("publication replay event is malformed")
+            if not _is_integer(event.get("created_ns")):
+                raise PublicationUncertain("publication replay event has an invalid created_ns")
+            event_counts[replay_id] += 1
+            if event_counts[replay_id] == 1 and status != "prepared":
+                raise PublicationUncertain("publication replay intent has no prepared event")
+            if event_counts[replay_id] > 1 and status == "prepared":
+                raise PublicationUncertain("publication replay intent has duplicate prepared events")
+            if status in _REPLAY_TERMINAL_STATES:
+                terminal.add(replay_id)
+            for key in (
+                "observed_target_oid",
+                "observed_queue_oid",
+                "observed_article_claim_oid",
+                "observed_article_handoff_oid",
+                "observed_claim_oid",
+            ):
+                value = event.get(key)
+                if value is not None and (
+                    not isinstance(value, str) or not _OID.fullmatch(value) or len(value) != oid_width
+                ):
+                    raise PublicationUncertain(f"publication replay event has an invalid {key}")
+        if any(count == 0 for count in event_counts.values()):
+            raise PublicationUncertain("publication replay intent has no event history")
+        if any(replay_id not in terminal for replay_id in intent_ids[:-1]):
+            raise PublicationUncertain("publication replay intents overlap")
+        if record.get("status") == "replaying":
+            if not intent_ids or intent_ids[-1] in terminal:
+                raise PublicationUncertain("publication replay status has no active intent")
+        elif intent_ids and intent_ids[-1] not in terminal:
+            raise PublicationUncertain("publication has an unterminated replay intent")
+        elif intent_ids:
+            last_status = next(
+                str(event["status"])
+                for event in reversed(events)
+                if isinstance(event, dict) and event.get("replay_id") == intent_ids[-1]
+            )
+            expected_status = "stale" if last_status == "retry" else last_status
+            if record.get("status") not in {expected_status, "uncertain"}:
+                raise PublicationUncertain("publication status disagrees with its last replay event")
 
     def _validate_publication_identity(
         self,
@@ -4333,6 +5008,148 @@ class RemoteMergeQueue:
             self.repository._verify_commit(expected)
             if not self.repository._is_ancestor(expected, candidate):
                 raise MergeQueueError("candidate is not descended from the expected target object")
+
+    def _verify_replay_candidate(
+        self,
+        *,
+        expected_target_oid: str,
+        candidate_oid: str,
+        replay_target_oid: str,
+        replay_candidate_oid: str,
+    ) -> tuple[str, str]:
+        """Verify one direct replay commit by reproducing its tree in a private index."""
+
+        self._verify_candidate(expected_target_oid, candidate_oid)
+        self.repository._verify_commit(replay_target_oid)
+        self.repository._verify_commit(replay_candidate_oid)
+        parents = self.repository._run_git(
+            ["rev-list", "--parents", "--max-count=1", replay_candidate_oid]
+        ).stdout.split()
+        if parents != [replay_candidate_oid, replay_target_oid]:
+            raise MergeQueueError("replay candidate must have exactly the replay target as its single parent")
+
+        if expected_target_oid in _ZERO_OIDS:
+            source_tree = self.repository._run_git(["mktree"], input_text="").stdout.strip()
+        else:
+            source_tree = self.repository._run_git(
+                ["rev-parse", "--verify", f"{expected_target_oid}^{{tree}}"]
+            ).stdout.strip()
+        candidate_tree = self.repository._run_git(
+            ["rev-parse", "--verify", f"{candidate_oid}^{{tree}}"]
+        ).stdout.strip()
+        replay_tree = self.repository._run_git(
+            ["rev-parse", "--verify", f"{replay_candidate_oid}^{{tree}}"]
+        ).stdout.strip()
+        patch = self._run_local_git_bytes(
+            [
+                "-c",
+                "core.quotePath=true",
+                "-c",
+                "diff.noprefix=false",
+                "-c",
+                "diff.mnemonicPrefix=false",
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "--submodule=short",
+                "--no-color",
+                "--no-indent-heuristic",
+                "--diff-algorithm=myers",
+                "--unified=3",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                source_tree,
+                candidate_tree,
+                "--",
+            ]
+        ).stdout
+        delta_sha256 = hashlib.sha256(patch).hexdigest()
+
+        with tempfile.TemporaryDirectory(prefix=".replay-verify-", dir=self.state_root) as temporary:
+            index_path = Path(temporary) / "index"
+            environment = {"GIT_INDEX_FILE": str(index_path)}
+            index_config = [
+                "-c",
+                "core.sparseCheckout=false",
+                "-c",
+                "core.sparseCheckoutCone=false",
+                "-c",
+                "index.sparse=false",
+                "-c",
+                "rerere.enabled=false",
+                "-c",
+                "rerere.autoupdate=false",
+            ]
+            self._run_local_git_bytes(
+                [*index_config, "read-tree", replay_target_oid],
+                environment=environment,
+            )
+            if patch:
+                applied = self._run_local_git_bytes(
+                    [
+                        *index_config,
+                        "-c",
+                        "apply.ignoreWhitespace=no",
+                        "apply",
+                        "--cached",
+                        "--3way",
+                        "--binary",
+                        "--whitespace=nowarn",
+                        "-",
+                    ],
+                    input_bytes=patch,
+                    environment=environment,
+                    check=False,
+                )
+                if applied.returncode != 0:
+                    raise MergeQueueError("replay candidate does not carry the exact original tree delta")
+            reproduced_tree = self._run_local_git_bytes(
+                [*index_config, "write-tree"],
+                environment=environment,
+            ).stdout.decode("ascii").strip()
+        if reproduced_tree != replay_tree:
+            raise MergeQueueError("replay candidate contains changes outside the exact original tree delta")
+        return delta_sha256, replay_tree
+
+    def _run_local_git_bytes(
+        self,
+        args: list[str],
+        *,
+        input_bytes: bytes | None = None,
+        environment: Mapping[str, str] | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        self.repository._verify_repository()
+        self._verify_state()
+        self._verify_transport()
+        git_environment = _git_environment()
+        if environment is not None:
+            git_environment.update(environment)
+        git_environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(
+            self.repository.common_git_dir / "objects"
+        )
+        try:
+            proc = subprocess.run(
+                _git_command(args),
+                cwd=self.transport_root,
+                input=input_bytes,
+                capture_output=True,
+                timeout=120,
+                env=git_environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RepositoryError(f"Git replay verification failed: {error}") from error
+        self.repository._verify_repository()
+        self._verify_state()
+        self._verify_transport()
+        if check and proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()[:500]
+            raise RepositoryError(f"Git replay verification failed: {detail}")
+        return proc
 
     def _held_claim_fence(self, key: str) -> ClaimFence | None:
         method = getattr(self.claim_board, "held_claim_fence", None)
@@ -4463,6 +5280,45 @@ class RemoteMergeQueue:
             return False
         raise PublicationUncertain(
             f"remote atomic CAS push outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
+        )
+
+    def _atomic_replay_push(self, intent: Mapping[str, object]) -> bool:
+        target_ref = str(intent["target_ref"])
+        queue_ref = str(intent["queue_ref"])
+        handoff_ref = str(intent["article_handoff_ref"])
+        claim_ref = str(intent["claim_ref"])
+        old_candidate = str(intent["original_candidate_oid"])
+        replay_target = str(intent["replay_target_oid"])
+        replay_candidate = str(intent["replay_candidate_oid"])
+        claim_oid = str(intent["claim_oid"])
+        proc = self._remote_git(
+            [
+                "push",
+                "--quiet",
+                "--porcelain",
+                "--atomic",
+                f"--force-with-lease={queue_ref}:{old_candidate}",
+                f"--force-with-lease={handoff_ref}:{old_candidate}",
+                f"--force-with-lease={target_ref}:{replay_target}",
+                f"--force-with-lease={claim_ref}:{claim_oid}",
+                self.remote_url,
+                f":{queue_ref}",
+                f":{handoff_ref}",
+                f"{replay_candidate}:{target_ref}",
+                f":{claim_ref}",
+            ],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        detail = f"{proc.stdout}\n{proc.stderr}".strip()
+        folded = detail.casefold()
+        if "does not support --atomic" in folded:
+            raise MergeQueueError("publication remote does not support atomic pushes")
+        if any(marker in folded for marker in _CAS_REJECTIONS):
+            return False
+        raise PublicationUncertain(
+            f"remote atomic stale replay outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
         )
 
     def _remote_git(
@@ -4794,7 +5650,9 @@ class RemoteMergeQueue:
 
 def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
     history = record.get("history")
-    if not isinstance(history, list):
+    replay_intents = record.get("replay_intents")
+    replay_events = record.get("replay_events")
+    if not isinstance(history, list) or not isinstance(replay_intents, list) or not isinstance(replay_events, list):
         raise PublicationUncertain("publication journal history is malformed")
     return PublicationReceipt(
         queue_item_id=str(record["queue_item_id"]),
@@ -4837,6 +5695,8 @@ def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
         claim_lease_id=(str(record["claim_lease_id"]) if record.get("claim_lease_id") is not None else None),
         detail=str(record.get("detail", "")),
         history=tuple(dict(item) for item in history if isinstance(item, dict)),
+        replay_intents=tuple(dict(item) for item in replay_intents if isinstance(item, dict)),
+        replay_events=tuple(dict(item) for item in replay_events if isinstance(item, dict)),
     )
 
 

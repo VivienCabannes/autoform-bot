@@ -192,11 +192,15 @@ def _replace_loose_object(manager: AttemptWorktrees, oid: str, object_type: str,
 
 @pytest.fixture
 def git_repository(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    return _git_repository_with_format(tmp_path, "sha1")
+
+
+def _git_repository_with_format(tmp_path: Path, object_format: str) -> tuple[Path, Path, Path, str]:
     remote = tmp_path / "remote.git"
     seed = tmp_path / "seed"
     coordinator = tmp_path / "coordinator"
-    _git("init", "--bare", "--quiet", str(remote))
-    _git("init", "--quiet", "--initial-branch=main", str(seed))
+    _git("init", "--bare", "--quiet", f"--object-format={object_format}", str(remote))
+    _git("init", "--quiet", "--initial-branch=main", f"--object-format={object_format}", str(seed))
     (seed / "book.txt").write_text("base\n", encoding="utf-8")
     (seed / ".gitignore").write_text("ignored/\n", encoding="utf-8")
     _git("add", "book.txt", ".gitignore", cwd=seed)
@@ -216,11 +220,12 @@ def _candidate(
     attempt_id: str,
     base: str,
     content: str,
+    path: str = "book.txt",
 ) -> str:
     receipt = manager.prepare(run_id, attempt_id, base_oid=base)
     tree = Path(receipt.path)
-    (tree / "book.txt").write_text(content, encoding="utf-8")
-    _git("add", "book.txt", cwd=tree)
+    (tree / path).write_text(content, encoding="utf-8")
+    _git("add", path, cwd=tree)
     _git("commit", "--quiet", "-m", attempt_id, cwd=tree)
     return manager.candidate_oid(run_id, attempt_id)
 
@@ -253,6 +258,70 @@ def _article_claim(queue: RemoteMergeQueue) -> ClaimFence:
     assert fence is not None
     queue._test_article_claim = fence
     return fence
+
+
+def _stale_replay_case(
+    tmp_path: Path,
+    remote: Path,
+    coordinator: Path,
+    base: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    queue: RemoteMergeQueue | None = None,
+) -> tuple[AttemptWorktrees, RemoteMergeQueue, dict[str, object], str, str]:
+    manager = queue.repository if queue is not None else AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="source-run",
+        attempt_id="source-candidate",
+        base=base,
+        path="proof.txt",
+        content="formalized theorem\n",
+    )
+    moved = _candidate(
+        manager,
+        run_id="remote-run",
+        attempt_id="remote-target",
+        base=base,
+        path="remote.txt",
+        content="concurrent work\n",
+    )
+    replay = _candidate(
+        manager,
+        run_id="replay-run",
+        attempt_id="replay-candidate",
+        base=moved,
+        path="proof.txt",
+        content="formalized theorem\n",
+    )
+    _git("push", "--quiet", str(remote), f"{moved}:refs/autoform/test-target", cwd=coordinator)
+    if queue is None:
+        queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    arguments: dict[str, object] = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+    moved_once = False
+
+    def move_target(name: str) -> None:
+        nonlocal moved_once
+        if name == "target-push-attempted" and not moved_once:
+            _git("update-ref", "refs/heads/main", moved, base, cwd=remote)
+            moved_once = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", move_target)
+    with pytest.raises(RemoteDrift, match="drift| is "):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
+    assert _git("rev-parse", str(arguments["queue_ref"]), cwd=remote) == candidate
+    assert _git("rev-parse", claim_handoff_ref(article_claim.key), cwd=remote) == candidate
+    assert _git("for-each-ref", "--format=%(refname)", article_claim.ref, cwd=remote) == ""
+    return manager, queue, arguments, moved, replay
 
 
 def test_scp_style_remote_without_user_is_not_treated_as_local() -> None:
@@ -4723,3 +4792,768 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
         )
     assert board.released
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+
+
+def test_stale_queued_candidate_is_replayed_without_releasing_its_author_barrier(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+
+    receipt = queue.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+    repeated = queue.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+
+    assert receipt.status == "integrated"
+    assert repeated == receipt
+    assert receipt.observed_target_oid == replay
+    assert len(receipt.replay_intents) == 1
+    intent = receipt.replay_intents[0]
+    assert intent["original_expected_oid"] == base
+    assert intent["original_candidate_oid"] == arguments["candidate_oid"]
+    assert intent["replay_target_oid"] == moved
+    assert intent["replay_candidate_oid"] == replay
+    assert len(str(intent["source_delta_sha256"])) == 64
+    assert [event["status"] for event in receipt.replay_events] == [
+        "prepared",
+        "publishing",
+        "integrated",
+    ]
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == replay
+    assert _git("for-each-ref", "--format=%(refname)", str(arguments["queue_ref"]), cwd=remote) == ""
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        claim_handoff_ref(arguments["article_claim"].key),  # type: ignore[union-attr]
+        cwd=remote,
+    ) == ""
+
+
+def test_stale_replay_rejects_non_exact_tree_delta_before_remote_mutation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager, queue, arguments, moved, _ = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    receipt = manager.prepare("bad-replay-run", "bad-replay", base_oid=moved)
+    tree = Path(receipt.path)
+    (tree / "proof.txt").write_text("formalized theorem\n", encoding="utf-8")
+    (tree / "extra.txt").write_text("unreviewed extra\n", encoding="utf-8")
+    _git("add", "proof.txt", "extra.txt", cwd=tree)
+    _git("commit", "--quiet", "-m", "bad replay", cwd=tree)
+    bad_replay = manager.candidate_oid("bad-replay-run", "bad-replay")
+
+    with pytest.raises(MergeQueueError, match="outside the exact original tree delta"):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=bad_replay,
+        )
+
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
+    assert _git("rev-parse", str(arguments["queue_ref"]), cwd=remote) == arguments["candidate_oid"]
+
+
+def test_stale_replay_cas_rejection_is_durable_and_retryable(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    original_push = queue._atomic_replay_push
+    monkeypatch.setattr(queue, "_atomic_replay_push", lambda _intent: False)
+
+    with pytest.raises(MergeQueueBusy, match="rejected without remote drift"):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    assert _git("rev-parse", str(arguments["queue_ref"]), cwd=remote) == arguments["candidate_oid"]
+
+    monkeypatch.setattr(queue, "_atomic_replay_push", original_push)
+    receipt = queue.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+    assert receipt.status == "integrated"
+    assert len(receipt.replay_intents) == 2
+    assert [event["status"] for event in receipt.replay_events].count("retry") == 1
+
+
+def test_stale_replay_apply_then_disconnect_recovers_as_integrated(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    original_remote_git = queue._remote_git
+
+    def apply_then_disconnect(
+        git_arguments: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        result = original_remote_git(git_arguments, check=check)
+        if (
+            git_arguments[0] == "push"
+            and "--atomic" in git_arguments
+            and f"{replay}:refs/heads/main" in git_arguments
+        ):
+            return subprocess.CompletedProcess(
+                result.args,
+                1,
+                stdout=result.stdout,
+                stderr="connection reset after replay update",
+            )
+        return result
+
+    monkeypatch.setattr(queue, "_remote_git", apply_then_disconnect)
+    with pytest.raises(PublicationUncertain, match="outcome is uncertain"):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+
+    monkeypatch.setattr(queue, "_remote_git", original_remote_git)
+    recovered = queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert recovered.status == "integrated"
+    assert recovered.observed_target_oid == replay
+
+
+def test_stale_replay_restart_retries_exact_prepush_state_without_local_claim_memory(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+
+    def interrupt(name: str) -> None:
+        if name == "replay-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    monkeypatch.setattr(queue, "_release_claim_fence", lambda _ref, _oid: None)
+    with pytest.raises(KeyboardInterrupt):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    queue.close()
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    reopened = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    recovered = reopened.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert recovered.status == "replaying"
+    receipt = reopened.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+    assert receipt.status == "integrated"
+    assert len(receipt.replay_intents) == 1
+
+
+@pytest.mark.parametrize(
+    "changed_ref",
+    ("queue-collision", "handoff-collision", "queue-delete", "handoff-delete"),
+)
+def test_stale_replay_ref_collision_fails_closed(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    changed_ref: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    article_claim = arguments["article_claim"]
+    ref = (
+        str(arguments["queue_ref"])
+        if changed_ref.startswith("queue-")
+        else claim_handoff_ref(article_claim.key)  # type: ignore[union-attr]
+    )
+    changed = False
+
+    def collide(name: str) -> None:
+        nonlocal changed
+        if name == "replay-push-attempted" and not changed:
+            if changed_ref.endswith("-delete"):
+                _git("update-ref", "-d", ref, str(arguments["candidate_oid"]), cwd=remote)
+            else:
+                _git("update-ref", ref, moved, str(arguments["candidate_oid"]), cwd=remote)
+            changed = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", collide)
+    with pytest.raises(PublicationUncertain, match="collision|split"):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
+    assert queue.recover("queue-1", **arguments).status == "uncertain"  # type: ignore[arg-type]
+
+
+def test_stale_replay_merge_claim_steal_cannot_advance_target(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    thief = _FencedTestClaimBoard(remote, "worker-b", tmp_path / "thief-replay-claims")
+    claim_key = repository_module._merge_claim_key("refs/heads/main")
+    original_push = queue._atomic_replay_push
+
+    def steal_then_push(intent: object) -> bool:
+        assert thief.acquire(claim_key, ttl=600, steal=True)
+        return original_push(intent)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(queue, "_atomic_replay_push", steal_then_push)
+    with pytest.raises(PublicationUncertain, match="merge claim .* changed"):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
+    assert thief.holds(claim_key)
+    assert thief.release(claim_key)
+
+
+def test_stale_replay_target_can_drift_repeatedly_without_stranding_barrier(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    moved_again = _candidate(
+        manager,
+        run_id="remote-run-2",
+        attempt_id="remote-target-2",
+        base=moved,
+        path="remote-2.txt",
+        content="more concurrent work\n",
+    )
+    replay_again = _candidate(
+        manager,
+        run_id="replay-run-2",
+        attempt_id="replay-candidate-2",
+        base=moved_again,
+        path="proof.txt",
+        content="formalized theorem\n",
+    )
+    _git("push", "--quiet", str(remote), f"{moved_again}:refs/autoform/test-target-2", cwd=coordinator)
+    moved_once = False
+
+    def drift_again(name: str) -> None:
+        nonlocal moved_once
+        if name == "replay-push-attempted" and not moved_once:
+            _git("update-ref", "refs/heads/main", moved_again, moved, cwd=remote)
+            moved_once = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", drift_again)
+    with pytest.raises(RemoteDrift, match="replay target drifted"):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    assert _git("rev-parse", str(arguments["queue_ref"]), cwd=remote) == arguments["candidate_oid"]
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    receipt = queue.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved_again,
+        replay_candidate_oid=replay_again,
+    )
+    assert receipt.status == "integrated"
+    assert receipt.observed_target_oid == replay_again
+    assert len(receipt.replay_intents) == 2
+    assert any(event["status"] == "stale" for event in receipt.replay_events)
+
+
+def test_stale_replay_preserves_disjoint_concurrent_edits_in_the_same_file(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="source-run",
+        attempt_id="source-candidate",
+        base=base,
+        content="base\nformalized theorem\n",
+    )
+    moved = _candidate(
+        manager,
+        run_id="remote-run",
+        attempt_id="remote-target",
+        base=base,
+        content="concurrent note\nbase\n",
+    )
+    replay = _candidate(
+        manager,
+        run_id="replay-run",
+        attempt_id="replay-candidate",
+        base=moved,
+        content="concurrent note\nbase\nformalized theorem\n",
+    )
+    _git("push", "--quiet", str(remote), f"{moved}:refs/autoform/test-target", cwd=coordinator)
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+
+    def move_target(name: str) -> None:
+        if name == "target-push-attempted":
+            _git("update-ref", "refs/heads/main", moved, base, cwd=remote)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", move_target)
+    with pytest.raises(RemoteDrift):
+        queue.publish("queue-1", **arguments)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    receipt = queue.replay_stale(
+        "queue-1",
+        **arguments,
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+    assert receipt.status == "integrated"
+    assert _git("show", f"{replay}:book.txt", cwd=coordinator) == (
+        "concurrent note\nbase\nformalized theorem"
+    )
+
+
+def test_stale_replay_rejects_overlapping_same_file_conflict(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="source-run",
+        attempt_id="source-candidate",
+        base=base,
+        content="source replacement\n",
+    )
+    moved = _candidate(
+        manager,
+        run_id="remote-run",
+        attempt_id="remote-target",
+        base=base,
+        content="remote replacement\n",
+    )
+    replay = _candidate(
+        manager,
+        run_id="replay-run",
+        attempt_id="resolved-conflict",
+        base=moved,
+        content="source replacement\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    with pytest.raises(MergeQueueError, match="exact original tree delta"):
+        queue._verify_replay_candidate(
+            expected_target_oid=base,
+            candidate_oid=candidate,
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+
+
+def test_stale_replay_verifies_mode_delete_and_add_delta(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+
+    source_receipt = manager.prepare("source-run", "source-candidate", base_oid=base)
+    source = Path(source_receipt.path)
+    (source / "book.txt").unlink()
+    (source / "proof.txt").write_text("formalized theorem\n", encoding="utf-8")
+    (source / ".gitignore").chmod(0o755)
+    _git("add", "--all", cwd=source)
+    _git("update-index", "--chmod=+x", ".gitignore", cwd=source)
+    _git("commit", "--quiet", "-m", "source candidate", cwd=source)
+    candidate = manager.candidate_oid("source-run", "source-candidate")
+
+    moved = _candidate(
+        manager,
+        run_id="remote-run",
+        attempt_id="remote-target",
+        base=base,
+        path="remote.txt",
+        content="concurrent work\n",
+    )
+    replay_receipt = manager.prepare("replay-run", "replay-candidate", base_oid=moved)
+    replay_tree = Path(replay_receipt.path)
+    (replay_tree / "book.txt").unlink()
+    (replay_tree / "proof.txt").write_text("formalized theorem\n", encoding="utf-8")
+    (replay_tree / ".gitignore").chmod(0o755)
+    _git("add", "--all", cwd=replay_tree)
+    _git("update-index", "--chmod=+x", ".gitignore", cwd=replay_tree)
+    _git("commit", "--quiet", "-m", "replay candidate", cwd=replay_tree)
+    replay = manager.candidate_oid("replay-run", "replay-candidate")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    delta_sha256, verified_tree = queue._verify_replay_candidate(
+        expected_target_oid=base,
+        candidate_oid=candidate,
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+    assert len(delta_sha256) == 64
+    assert verified_tree == _git("rev-parse", f"{replay}^{{tree}}", cwd=coordinator)
+    assert _git("ls-tree", replay, ".gitignore", cwd=coordinator).startswith("100755 blob ")
+    assert _git("ls-tree", replay, "book.txt", cwd=coordinator) == ""
+
+
+def test_stale_replay_verifies_binary_delta(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    base_receipt = manager.prepare("binary-base-run", "binary-base", base_oid=base)
+    binary_base_tree = Path(base_receipt.path)
+    (binary_base_tree / "diagram.bin").write_bytes(b"\x00base\xff\n")
+    _git("add", "diagram.bin", cwd=binary_base_tree)
+    _git("commit", "--quiet", "-m", "binary base", cwd=binary_base_tree)
+    binary_base = manager.candidate_oid("binary-base-run", "binary-base")
+
+    candidate_receipt = manager.prepare("source-run", "source-candidate", base_oid=binary_base)
+    candidate_tree = Path(candidate_receipt.path)
+    (candidate_tree / "diagram.bin").write_bytes(b"\x00formalized\xfe\n")
+    _git("add", "diagram.bin", cwd=candidate_tree)
+    _git("commit", "--quiet", "-m", "binary candidate", cwd=candidate_tree)
+    candidate = manager.candidate_oid("source-run", "source-candidate")
+    moved = _candidate(
+        manager,
+        run_id="remote-run",
+        attempt_id="remote-target",
+        base=binary_base,
+        path="remote.txt",
+        content="concurrent work\n",
+    )
+    replay_receipt = manager.prepare("replay-run", "replay-candidate", base_oid=moved)
+    replay_tree = Path(replay_receipt.path)
+    (replay_tree / "diagram.bin").write_bytes(b"\x00formalized\xfe\n")
+    _git("add", "diagram.bin", cwd=replay_tree)
+    _git("commit", "--quiet", "-m", "binary replay", cwd=replay_tree)
+    replay = manager.candidate_oid("replay-run", "replay-candidate")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    _, verified_tree = queue._verify_replay_candidate(
+        expected_target_oid=binary_base,
+        candidate_oid=candidate,
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+    assert verified_tree == _git("rev-parse", f"{replay}^{{tree}}", cwd=coordinator)
+
+
+def test_stale_replay_rejects_ambiguous_context_applied_to_wrong_location(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    repeated = _candidate(
+        manager,
+        run_id="repeated-run",
+        attempt_id="repeated-base",
+        base=base,
+        content="marker\nrepeat\nmarker\nrepeat\n",
+    )
+    candidate = _candidate(
+        manager,
+        run_id="source-run",
+        attempt_id="source-candidate",
+        base=repeated,
+        content="marker\nformalized\nmarker\nrepeat\n",
+    )
+    moved = _candidate(
+        manager,
+        run_id="remote-run",
+        attempt_id="remote-target",
+        base=repeated,
+        content="header\nmarker\nrepeat\nmarker\nrepeat\n",
+    )
+    wrong_replay = _candidate(
+        manager,
+        run_id="replay-run",
+        attempt_id="wrong-location",
+        base=moved,
+        content="header\nmarker\nrepeat\nmarker\nformalized\n",
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    with pytest.raises(MergeQueueError, match="outside the exact original tree delta"):
+        queue._verify_replay_candidate(
+            expected_target_oid=repeated,
+            candidate_oid=candidate,
+            replay_target_oid=moved,
+            replay_candidate_oid=wrong_replay,
+        )
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
+
+
+def test_stale_v4_publication_journal_is_upgraded_before_replay(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    legacy = queue._read_journal(journal)
+    legacy["schema"] = "autoform-merge-publication/v4"
+    legacy.pop("replay_intents")
+    legacy.pop("replay_events")
+    repository_module._write_json_file(journal, legacy)
+
+    receipt = queue.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+
+    assert receipt.status == "integrated"
+    upgraded = queue._read_journal(journal)
+    assert upgraded["schema"] == repository_module._PUBLICATION_SCHEMA
+    assert len(upgraded["replay_intents"]) == 1  # type: ignore[arg-type]
+
+
+def test_stale_replay_intent_is_immutable_and_digest_bound(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+
+    def interrupt(name: str) -> None:
+        if name == "replay-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    record = queue._read_journal(journal)
+    intents = record["replay_intents"]
+    assert isinstance(intents, list) and isinstance(intents[0], dict)
+    intents[0]["source_delta_sha256"] = "0" * 64
+    repository_module._write_json_file(journal, record)
+
+    with pytest.raises(PublicationUncertain, match="digest does not match"):
+        queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert _git("rev-parse", str(arguments["queue_ref"]), cwd=remote) == arguments["candidate_oid"]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "replay-intent-recording",
+        "replay-intent-recorded",
+        "replay-push-attempted",
+        "replay-pushed",
+        "replay-observation-started",
+        "replay-observed",
+        "replay-terminal-recording",
+        "replay-terminal-recorded",
+    ),
+)
+def test_stale_replay_recovers_across_every_durable_checkpoint(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+    )
+
+    def interrupt(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    interrupted = queue._read_journal(journal)
+    original_intents = [dict(item) for item in interrupted["replay_intents"]]  # type: ignore[union-attr]
+    queue.close()
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    reopened = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    recovered = reopened.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    if recovered.status != "integrated":
+        assert recovered.status == "stale"
+        recovered = reopened.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    assert recovered.status == "integrated"
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == replay
+    assert list(recovered.replay_intents[: len(original_intents)]) == original_intents
+
+
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_stale_replay_uses_real_claim_board_for_both_object_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    object_format: str,
+) -> None:
+    # This long integration test covers object formats, not lease expiry under runner suspension.
+    lease_time = repository_module.claims_module.time.time()
+    monkeypatch.setattr(repository_module.claims_module.time, "time", lambda: lease_time)
+    remote, _, coordinator, base = _git_repository_with_format(tmp_path, object_format)
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = RemoteMergeQueue(
+        manager,
+        remote_url=remote,
+        state_root=tmp_path / "queue-state",
+        worker_id="worker-real",
+        claim_ttl=600,
+        heartbeat_interval=300,
+    )
+    _, _, arguments, moved, replay = _stale_replay_case(
+        tmp_path,
+        remote,
+        coordinator,
+        base,
+        monkeypatch,
+        queue=queue,
+    )
+
+    receipt = queue.replay_stale(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        replay_target_oid=moved,
+        replay_candidate_oid=replay,
+    )
+
+    assert receipt.status == "integrated"
+    assert len(replay) == (40 if object_format == "sha1" else 64)
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == replay
