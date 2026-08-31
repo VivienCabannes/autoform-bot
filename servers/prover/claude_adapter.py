@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from ._cli_common import (
+    _cli_launch_record,
     ProverCancelled,
     ProverProcessError,
     ProverTimeout,
@@ -232,6 +233,7 @@ class _ClaudeRun:
     cache_creation_tokens: int = 0      # recorded so totals reconcile with cost
     cost_usd: float = 0.0               # claude's reported figure (notional on Max)
     turns: int = 0
+    launches: list[dict[str, object]] = field(default_factory=list)
 
 
 class ClaudeAdapter(ProverAdapter):
@@ -250,6 +252,11 @@ class ClaudeAdapter(ProverAdapter):
             (``AUTOFORM_MCP_CONFIG`` env, else the plugin's own ``.mcp.json``);
             ``""`` disables the flag entirely.
         extra_args: Extra ``claude`` CLI args the caller wants threaded through.
+        session_isolation_args: Settings/rules isolation flags. ``None`` uses the
+            package defaults; callers with a stricter policy may supply an exact
+            list.
+        wrap_spec_prompt: Wrap the supplied spec in the normal proof-worker
+            instruction. Review-only callers pass ``False``.
         max_wait_seconds: Wall-clock ceiling for the WHOLE run (all turns). On
             expiry the child process group is killed, a terminal error event is
             yielded, and the run reports ``failed`` with meta sub-status
@@ -276,6 +283,8 @@ class ClaudeAdapter(ProverAdapter):
         autonomy_args: list[str] | None = None,
         mcp_config: str | None = None,
         extra_args: list[str] | None = None,
+        session_isolation_args: list[str] | None = None,
+        wrap_spec_prompt: bool = True,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         runner: Any | None = None,
         environment: Mapping[str, str] | None = None,
@@ -287,6 +296,12 @@ class ClaudeAdapter(ProverAdapter):
         )
         self._mcp_config = _default_mcp_config() if mcp_config is None else (mcp_config or None)
         self._extra_args = list(extra_args or [])
+        self._session_isolation_args = list(
+            SESSION_ISOLATION_ARGS
+            if session_isolation_args is None
+            else session_isolation_args
+        )
+        self._wrap_spec_prompt = wrap_spec_prompt
         if not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
         self._max_wait_seconds = max_wait_seconds
@@ -311,7 +326,13 @@ class ClaudeAdapter(ProverAdapter):
             extra_args=self._extra_args,
             deadline=time.monotonic() + self._max_wait_seconds,
         )
-        return Run(backend=self.name, goal=spec, project_dir=str(project_dir), handle=state)
+        return Run(
+            backend=self.name,
+            goal=spec,
+            project_dir=str(project_dir),
+            handle=state,
+            meta={"launches": state.launches},
+        )
 
     def events(self, run: Run) -> Iterator[Event]:
         """Stream events from the first turn, then chain any steered follow-up turns.
@@ -331,7 +352,11 @@ class ClaudeAdapter(ProverAdapter):
             # never replay the first turn.
             if not state.started:
                 state.started = True
-                first_prompt = _build_spec_prompt(state.node, state.spec)
+                first_prompt = (
+                    _build_spec_prompt(state.node, state.spec)
+                    if self._wrap_spec_prompt
+                    else state.spec
+                )
                 yield from self._run_turn(state, first_prompt, resume=False)
 
             # Drain any steers the driver queued during the turn (turn-granular
@@ -429,10 +454,20 @@ class ClaudeAdapter(ProverAdapter):
             args += ["--resume", state.session_id]
         elif not resume:
             args += ["--append-system-prompt", self._system_prompt]
-        args += SESSION_ISOLATION_ARGS + self._autonomy_args
+        args += self._session_isolation_args + self._autonomy_args
         if self._mcp_config:
             args += ["--strict-mcp-config", "--mcp-config", self._mcp_config]
         args += state.extra_args
+        state.launches.append(
+            _cli_launch_record(
+                backend=self.name,
+                model=state.model,
+                args=args,
+                prompt=prompt,
+                prompt_index=2,
+                cwd=state.project_dir,
+            )
+        )
 
         env = dict(self._environment) if self._environment is not None else _scrubbed_env()
         plugin_root = str(Path(__file__).resolve().parents[2])

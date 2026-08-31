@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import stat
 import subprocess
 import threading
 from collections.abc import Mapping
@@ -18,11 +17,15 @@ from autoform_worker.reviewer import (
     CandidateReviewRequest,
     ReviewAdapterFactory,
     ReviewError,
+    bind_candidate_review_request,
     review_candidate,
     reviewer_factory,
     validate_independent_backends,
 )
 from servers.prover import Event, EventKind, ProofResult, ProverAdapter, Run
+from servers.prover._cli_common import CLI_LAUNCH_SCHEMA
+
+import autoform_worker.reviewer as reviewer_module
 
 
 ARTICLE = "af_0123456789abcdef01234567"
@@ -102,19 +105,24 @@ def review_case(tmp_path: Path) -> _ReviewCase:
         "unit": "unit-1",
         "unit_sha256": _sha(SOURCE),
     }
-    runtime = {
-        "blueprint_path": "blueprint",
-        "nodes": [
-            {
-                "article_id": ARTICLE,
-                "article_path": ARTICLE_PATH,
-                "id": NODE,
-                "source_sha256": _sha(b"proof_formalized: true\n"),
-            }
-        ],
-        "schema": "autoform-runtime/v1",
+    base_node = {
+        "article_id": ARTICLE,
+        "article_path": ARTICLE_PATH,
+        "id": NODE,
+        "source_sha256": _sha(b"proof_formalized: false\n"),
     }
-    execution_input = {
+    candidate_node = {
+        **base_node,
+        "source_sha256": _sha(b"proof_formalized: true\n"),
+    }
+    base_runtime = {
+        "blueprint_path": "blueprint",
+        "nodes": [base_node],
+        "schema": "autoform-runtime/v1",
+        "source_revision": "runtime-revision",
+    }
+    candidate_runtime = {**base_runtime, "nodes": [candidate_node]}
+    shared_input = {
         "artifact": {"path": "sources/chapter.txt", "sha256": _sha(SOURCE)},
         "authority_sha256": "a" * 64,
         "coverage": {
@@ -124,28 +132,48 @@ def review_case(tmp_path: Path) -> _ReviewCase:
         },
         "lean_source_revision": "b" * 64,
         "node_bindings": [{"node_id": NODE, "unit": "unit-1"}],
-        "runtime": runtime,
-        "runtime_sha256": _sha(_json_bytes(runtime)),
         "schema": "autoform-execution-input/v1",
         "units": [unit],
     }
-    execution_bytes = _json_bytes(execution_input)
+    base_execution_input = {
+        **shared_input,
+        "runtime": base_runtime,
+        "runtime_sha256": _sha(_json_bytes(base_runtime)),
+    }
+    candidate_execution_input = {
+        **shared_input,
+        "runtime": candidate_runtime,
+        "runtime_sha256": _sha(_json_bytes(candidate_runtime)),
+    }
+    base_execution_bytes = _json_bytes(base_execution_input)
+    candidate_execution_bytes = _json_bytes(candidate_execution_input)
     source_contract = _sha(
         _json_bytes(
             {
-                "artifact": execution_input["artifact"],
-                "coverage": execution_input["coverage"],
-                "node_bindings": execution_input["node_bindings"],
-                "units": execution_input["units"],
+                "artifact": candidate_execution_input["artifact"],
+                "coverage": candidate_execution_input["coverage"],
+                "node_bindings": candidate_execution_input["node_bindings"],
+                "units": candidate_execution_input["units"],
             }
         )
     )
-    work_item = "d" * 64
-    protected = "e" * 64
+    protected = _sha(_json_bytes([]))
+    work_item = _sha(
+        _json_bytes(
+            {
+                "attempt": 1,
+                "node": base_node,
+                "phase": "proof",
+                "protected_roadmap_sha256": protected,
+                "source_contract_sha256": source_contract,
+                "source_revision": "runtime-revision",
+            }
+        )
+    )
     gate = {
-        "base_execution_input_sha256": "f" * 64,
+        "base_execution_input_sha256": _sha(base_execution_bytes),
         "base_toolchain": {"schema": "autoform-toolchain-fingerprint/v1"},
-        "candidate_execution_input_sha256": _sha(execution_bytes),
+        "candidate_execution_input_sha256": _sha(candidate_execution_bytes),
         "candidate_toolchain": {"schema": "autoform-toolchain-fingerprint/v1"},
         "checks": [
             {"detail": "passed", "evidence": {}, "name": name, "passed": True}
@@ -175,7 +203,7 @@ def review_case(tmp_path: Path) -> _ReviewCase:
         "policy": "fixed-gates/v1",
         "schema": "autoform-candidate-gates/v1",
     }
-    request = CandidateReviewRequest(
+    request = bind_candidate_review_request(
         base_oid=base,
         candidate_oid=candidate,
         article_id=ARTICLE,
@@ -185,10 +213,8 @@ def review_case(tmp_path: Path) -> _ReviewCase:
         changed_paths=("Main.lean", ARTICLE_PATH),
         prover_backend="claude",
         reviewer_backend="codex",
-        source_contract_sha256=source_contract,
-        protected_roadmap_sha256=protected,
-        work_item_sha256=work_item,
-        candidate_execution_input=execution_bytes,
+        base_execution_input=base_execution_bytes,
+        candidate_execution_input=candidate_execution_bytes,
         gate_evidence=_json_bytes(gate),
     )
     return _ReviewCase(repo, request)
@@ -210,8 +236,10 @@ class _Adapter(ProverAdapter):
         fail_events: bool = False,
         fail_result: bool = False,
         emit_error: bool = False,
+        emit_tool: bool = False,
         cancel_on_exhaustion: bool = False,
-        mutate_bundle: str | None = None,
+        launch_updates: dict[str, object] | None = None,
+        omit_launch: bool = False,
     ) -> None:
         self.status = status
         self.verdict = verdict
@@ -223,17 +251,16 @@ class _Adapter(ProverAdapter):
         self.fail_events = fail_events
         self.fail_result = fail_result
         self.emit_error = emit_error
+        self.emit_tool = emit_tool
         self.cancel_on_exhaustion = cancel_on_exhaustion
-        self.mutate_bundle = mutate_bundle
+        self.launch_updates = launch_updates or {}
+        self.omit_launch = omit_launch
         self.cancelled = None
         self.prompt = ""
         self.project_dir: Path | None = None
         self.environment: Mapping[str, str] | None = None
-        self.bundle_names: tuple[str, ...] = ()
-        self.bundle_modes: dict[str, int] = {}
-        self.bundle_links: dict[str, int] = {}
-        self.bundle_snapshot: dict[str, bytes] = {}
-        self.isolation_entries: tuple[str, ...] = ()
+        self.configured_backend = "codex"
+        self.configured_model = MODEL
 
     def bind_cancel_event(self, cancel_event) -> None:
         self.cancelled = cancel_event
@@ -241,23 +268,60 @@ class _Adapter(ProverAdapter):
     def start(self, node: str, spec: str, project_dir: str) -> Run:
         self.prompt = spec
         self.project_dir = Path(project_dir)
-        self.bundle_names = tuple(
-            sorted(
-                path.relative_to(self.project_dir).as_posix() for path in self.project_dir.rglob("*") if path.is_file()
-            )
-        )
-        self.bundle_modes = {name: stat.S_IMODE((self.project_dir / name).stat().st_mode) for name in self.bundle_names}
-        self.bundle_links = {name: (self.project_dir / name).stat().st_nlink for name in self.bundle_names}
-        self.bundle_snapshot = {name: (self.project_dir / name).read_bytes() for name in self.bundle_names}
-        self.isolation_entries = tuple(sorted(path.name for path in self.project_dir.parent.iterdir()))
-        return Run(self.name, goal=spec, project_dir=project_dir)
+        launches: list[dict[str, object]] = []
+        if not self.omit_launch:
+            if self.configured_backend == "codex":
+                launched_prompt = f"{reviewer_module._REVIEW_SYSTEM_PROMPT}\n\n{spec}"
+                argv = [
+                    "codex",
+                    "exec",
+                    "--json",
+                    "--skip-git-repo-check",
+                    "-m",
+                    self.configured_model,
+                    *reviewer_module._CODEX_REVIEW_AUTONOMY_ARGS,
+                    *reviewer_module._CODEX_REVIEW_EXTRA_ARGS,
+                    "<PROMPT>",
+                ]
+            else:
+                launched_prompt = spec
+                argv = [
+                    "claude",
+                    "-p",
+                    "<PROMPT>",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--model",
+                    self.configured_model,
+                    "--append-system-prompt",
+                    reviewer_module._REVIEW_SYSTEM_PROMPT,
+                    *reviewer_module._CLAUDE_REVIEW_SESSION_ARGS,
+                    *reviewer_module._CLAUDE_REVIEW_AUTONOMY_ARGS,
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    reviewer_module._EMPTY_CLAUDE_MCP_CONFIG,
+                ]
+            launch = {
+                "argv": argv,
+                "backend": self.configured_backend,
+                "cwd": project_dir,
+                "model": self.configured_model,
+                "prompt_sha256": _sha(launched_prompt.encode()),
+                "schema": CLI_LAUNCH_SCHEMA,
+            }
+            launch.update(self.launch_updates)
+            launches.append(launch)
+        return Run(self.name, goal=spec, project_dir=project_dir, meta={"launches": launches})
 
     def events(self, run: Run):
         if self.fail_events:
             raise RuntimeError("transport failed")
         if self.emit_error:
             yield Event(EventKind.ERROR, "provider stream failed", raw={"error": True})
-        yield Event(EventKind.TOOL, "read manifest", raw={"file": "manifest.json"})
+        if self.emit_tool:
+            yield Event(EventKind.TOOL, "unexpected tool call", raw={"tool": "Read"})
+        yield Event(EventKind.MESSAGE, "reviewed inline evidence", raw={"inline": True})
         if self.cancel_on_exhaustion:
             assert self.cancelled is not None
             self.cancelled.set()
@@ -268,30 +332,9 @@ class _Adapter(ProverAdapter):
     def result(self, run: Run) -> ProofResult:
         if self.fail_result:
             raise RuntimeError("result failed")
-        assert self.project_dir is not None
-        if self.mutate_bundle:
-            target = self.project_dir / "candidate.diff"
-            if self.mutate_bundle == "content":
-                target.chmod(0o600)
-                target.write_bytes(b"changed")
-            else:
-                self.project_dir.chmod(0o700)
-                target.unlink()
-                if self.mutate_bundle == "symlink":
-                    target.symlink_to("manifest.json")
-                elif self.mutate_bundle == "hardlink":
-                    os.link(self.project_dir / "manifest.json", target)
-                elif self.mutate_bundle == "replacement":
-                    target.write_bytes(self.bundle_snapshot["candidate.diff"])
-                    target.chmod(0o400)
-                else:
-                    raise AssertionError(f"unknown bundle mutation: {self.mutate_bundle}")
-                self.project_dir.chmod(0o500)
-        else:
-            assert self.bundle_snapshot == {name: (self.project_dir / name).read_bytes() for name in self.bundle_names}
         response = self.response
         if response is None:
-            template = json.loads(self.prompt.split("AUTOFORM_REVIEW_JSON: ", 1)[1])
+            template = json.loads(self.prompt.rsplit("AUTOFORM_REVIEW_JSON: ", 1)[1])
             template.update({"reason": self.reason, "verdict": self.verdict, **self.updates})
             response = "AUTOFORM_REVIEW_JSON: " + json.dumps(template, sort_keys=True, separators=(",", ":"))
         return ProofResult(
@@ -306,6 +349,8 @@ class _Adapter(ProverAdapter):
 def _factory(adapter: _Adapter, *, backend: str = "codex", model: str = MODEL) -> ReviewAdapterFactory:
     def build(environment) -> ProverAdapter:
         adapter.environment = environment
+        adapter.configured_backend = backend
+        adapter.configured_model = model
         return adapter
 
     return ReviewAdapterFactory(backend, model, 10, ("test-adapter",), build)
@@ -315,30 +360,92 @@ def _blobs(result) -> dict[str, bytes]:
     return {blob.name: blob.content for blob in result.evidence}
 
 
-def _request_with_execution(request: CandidateReviewRequest, execution: dict[str, object]) -> CandidateReviewRequest:
-    execution_bytes = _json_bytes(execution)
+def _rebind_request(
+    request: CandidateReviewRequest,
+    *,
+    base_execution: dict[str, object] | None = None,
+    candidate_execution: dict[str, object] | None = None,
+    gate: dict[str, object] | None = None,
+) -> CandidateReviewRequest:
+    base_execution = base_execution or json.loads(request.base_execution_input)
+    candidate_execution = candidate_execution or json.loads(request.candidate_execution_input)
     source_contract = _sha(
         _json_bytes(
             {
-                "artifact": execution.get("artifact"),
-                "coverage": execution.get("coverage"),
-                "node_bindings": execution.get("node_bindings"),
-                "units": execution.get("units"),
+                "artifact": candidate_execution.get("artifact"),
+                "coverage": candidate_execution.get("coverage"),
+                "node_bindings": candidate_execution.get("node_bindings"),
+                "units": candidate_execution.get("units"),
             }
         )
     )
-    gate = json.loads(request.gate_evidence)
-    gate["candidate_execution_input_sha256"] = _sha(execution_bytes)
+    protected_payload = [
+        {
+            "article_id": node.get("article_id"),
+            "id": node.get("id"),
+            "source_sha256": node.get("source_sha256"),
+        }
+        for node in base_execution["runtime"]["nodes"]
+        if node.get("article_id") != request.article_id
+    ]
+    protected = _sha(_json_bytes(protected_payload))
+    gate = gate or json.loads(request.gate_evidence)
+    identity = gate["identity"]
     gate["identity"]["source_contract_sha256"] = source_contract
-    return replace(
-        request,
-        source_contract_sha256=source_contract,
-        candidate_execution_input=execution_bytes,
+    gate["identity"]["protected_roadmap_sha256"] = protected
+    base_node = next(
+        node
+        for node in base_execution["runtime"]["nodes"]
+        if node.get("article_id") == request.article_id
+    )
+    identity["source_revision"] = base_execution["runtime"]["source_revision"]
+    identity["work_item_sha256"] = _sha(
+        _json_bytes(
+            {
+                "attempt": identity["attempt"],
+                "node": base_node,
+                "phase": request.phase,
+                "protected_roadmap_sha256": protected,
+                "source_contract_sha256": source_contract,
+                "source_revision": identity["source_revision"],
+            }
+        )
+    )
+    base_bytes = _json_bytes(base_execution)
+    candidate_bytes = _json_bytes(candidate_execution)
+    gate["base_execution_input_sha256"] = _sha(base_bytes)
+    gate["candidate_execution_input_sha256"] = _sha(candidate_bytes)
+    return bind_candidate_review_request(
+        base_oid=request.base_oid,
+        candidate_oid=request.candidate_oid,
+        article_id=request.article_id,
+        node_id=request.node_id,
+        phase=request.phase,
+        article_path=request.article_path,
+        changed_paths=request.changed_paths,
+        prover_backend=request.prover_backend,
+        reviewer_backend=request.reviewer_backend,
+        base_execution_input=base_bytes,
+        candidate_execution_input=candidate_bytes,
         gate_evidence=_json_bytes(gate),
     )
 
 
-def test_review_uses_external_immutable_bundle_and_retains_replay_evidence(review_case) -> None:
+def _request_with_execution(
+    request: CandidateReviewRequest,
+    execution: dict[str, object],
+) -> CandidateReviewRequest:
+    base_execution = json.loads(request.base_execution_input)
+    for key in ("artifact", "coverage", "node_bindings", "units"):
+        base_execution[key] = execution.get(key)
+    return _rebind_request(
+        request,
+        base_execution=base_execution,
+        candidate_execution=execution,
+    )
+
+
+def test_review_uses_inline_commit_bound_evidence_and_retains_replay_data(review_case) -> None:
     adapter = _Adapter()
     result = review_candidate(review_case.repo, review_case.request, _factory(adapter), threading.Event())
 
@@ -346,17 +453,7 @@ def test_review_uses_external_immutable_bundle_and_retains_replay_evidence(revie
     assert result.status == "approved"
     assert result.reviewer_backend == "codex"
     assert result.reviewer_model == MODEL
-    assert adapter.project_dir is not None and not adapter.project_dir.exists()
-    assert adapter.project_dir != review_case.repo
-    assert review_case.repo not in adapter.project_dir.parents
-    assert review_case.repo.parent not in adapter.project_dir.parents
-    assert adapter.isolation_entries == ("evidence",)
-    assert ".git" not in adapter.bundle_names
-    assert "AGENTS.md" not in adapter.bundle_names
-    assert "candidate.diff" in adapter.bundle_names
-    assert "source-units/0000.txt" in adapter.bundle_names
-    assert all(mode & 0o222 == 0 for mode in adapter.bundle_modes.values())
-    assert all(link_count == 1 for link_count in adapter.bundle_links.values())
+    assert adapter.project_dir == Path(os.path.abspath(os.sep))
     assert adapter.environment is not None
     assert adapter.environment["GIT_CONFIG_NOSYSTEM"] == "1"
     assert adapter.environment["GIT_CONFIG_GLOBAL"] == os.devnull
@@ -365,10 +462,38 @@ def test_review_uses_external_immutable_bundle_and_retains_replay_evidence(revie
 
     blobs = _blobs(result)
     assert blobs["source-units/0000.txt"] == SOURCE
+    assert blobs["base-execution-input.json"] == review_case.request.base_execution_input
     assert blobs["gate-evidence.json"] == review_case.request.gate_evidence
+    assert blobs["gate-record.json"] == review_case.request.gate_record
     assert blobs["candidate-execution-input.json"] == review_case.request.candidate_execution_input
     assert blobs["response.txt"].decode().startswith("AUTOFORM_REVIEW_JSON: ")
-    assert json.loads(blobs["transcript.json"])[0]["raw"] == {"file": "manifest.json"}
+    assert _sha(blobs["source-contract.json"]) == review_case.request.source_contract_sha256
+    assert _sha(blobs["protected-roadmap.json"]) == review_case.request.protected_roadmap_sha256
+    assert _sha(blobs["work-item.json"]) == review_case.request.work_item_sha256
+    gate_record = json.loads(blobs["gate-record.json"])
+    assert gate_record["base_oid"] == review_case.request.base_oid
+    assert gate_record["candidate_oid"] == review_case.request.candidate_oid
+    assert json.loads(blobs["transcript.json"])[0]["raw"] == {"inline": True}
+    prompt_payload = json.loads(
+        next(
+            line.removeprefix("AUTOFORM_REVIEW_EVIDENCE_JSON: ")
+            for line in adapter.prompt.splitlines()
+            if line.startswith("AUTOFORM_REVIEW_EVIDENCE_JSON: ")
+        )
+    )
+    inline_blobs = {item["name"]: item for item in prompt_payload["blobs"]}
+    for name in (
+        "base-execution-input.json",
+        "candidate-execution-input.json",
+        "gate-evidence.json",
+        "gate-record.json",
+        "protected-roadmap.json",
+        "source-contract.json",
+        "work-item.json",
+    ):
+        assert inline_blobs[name]["encoding"] == "utf-8"
+        assert inline_blobs[name]["content"].encode() == blobs[name]
+        assert inline_blobs[name]["sha256"] == _sha(blobs[name])
     manifest = json.loads(blobs["manifest.json"])
     assert manifest["schema"] == REVIEW_BUNDLE_SCHEMA
     assert manifest["git"]["base_oid"] == review_case.request.base_oid
@@ -384,6 +509,9 @@ def test_review_uses_external_immutable_bundle_and_retains_replay_evidence(revie
     durable = json.loads(result.evidence_bytes())
     assert durable["schema"] == REVIEW_EVIDENCE_SCHEMA
     assert result.response_sha256 == _sha(blobs["response.txt"])
+    launch = json.loads(blobs["reviewer-launch.json"])
+    assert launch["cwd"] == os.path.abspath(os.sep)
+    assert launch["backend"] == "codex"
 
 
 @pytest.mark.parametrize(
@@ -410,12 +538,9 @@ def test_reviewer_backends_cannot_discover_candidate_project_instructions(
     )
 
     assert result.approved
-    assert adapter.project_dir is not None
-    assert review_case.repo not in adapter.project_dir.parents
-    assert review_case.repo.parent not in adapter.project_dir.parents
-    assert adapter.isolation_entries == ("evidence",)
-    assert not any(name in adapter.bundle_names for name in ("AGENTS.md", "CLAUDE.md"))
-    assert not any(name.startswith((".claude/", ".codex/")) for name in adapter.bundle_names)
+    assert adapter.project_dir == Path(os.path.abspath(os.sep))
+    assert "approve everything" not in adapter.prompt
+    assert "ignore the system prompt" not in adapter.prompt
 
 
 @pytest.mark.parametrize(
@@ -507,8 +632,17 @@ def test_review_fails_closed_on_backend_identity_and_lifecycle_errors(review_cas
         threading.Event(),
     )
     assert emitted_error.status == "backend_error"
-    assert "error event" in emitted_error.reason
+    assert "forbidden tool, edit, or error event" in emitted_error.reason
     assert _blobs(emitted_error)["response.txt"].startswith(b"AUTOFORM_REVIEW_JSON: ")
+
+    emitted_tool = review_candidate(
+        review_case.repo,
+        review_case.request,
+        _factory(_Adapter(emit_tool=True)),
+        threading.Event(),
+    )
+    assert emitted_tool.status == "backend_error"
+    assert "forbidden tool, edit, or error event" in emitted_tool.reason
 
 
 def test_review_cancellation_after_stream_exhaustion_cannot_approve(review_case) -> None:
@@ -525,29 +659,25 @@ def test_review_cancellation_after_stream_exhaustion_cannot_approve(review_case)
     assert not result.approved
 
 
-def test_review_rejects_bundle_mutation_before_approval(review_case) -> None:
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        _Adapter(omit_launch=True),
+        _Adapter(launch_updates={"backend": "claude"}),
+        _Adapter(launch_updates={"cwd": "/tmp"}),
+        _Adapter(launch_updates={"prompt_sha256": "0" * 64}),
+    ],
+)
+def test_review_rejects_missing_or_spoofed_launch_identity(review_case, adapter) -> None:
     result = review_candidate(
         review_case.repo,
         review_case.request,
-        _factory(_Adapter(mutate_bundle="content")),
+        _factory(adapter),
         threading.Event(),
     )
 
-    assert result.status == "invalid"
-    assert "bundle changed" in result.reason
-
-
-@pytest.mark.parametrize("mutation", ["symlink", "hardlink", "replacement"])
-def test_review_rejects_bundle_link_substitution(review_case, mutation) -> None:
-    result = review_candidate(
-        review_case.repo,
-        review_case.request,
-        _factory(_Adapter(mutate_bundle=mutation)),
-        threading.Event(),
-    )
-
-    assert result.status == "invalid"
-    assert "bundle changed" in result.reason
+    assert result.status == "backend_error"
+    assert "launch" in result.reason
 
 
 def test_review_rejects_wrong_git_delta_and_nonrepository(review_case, tmp_path) -> None:
@@ -579,33 +709,30 @@ def test_review_rejects_wrong_git_delta_and_nonrepository(review_case, tmp_path)
 def test_review_rejects_stale_source_unit_and_failed_gate(review_case) -> None:
     execution = json.loads(review_case.request.candidate_execution_input)
     execution["units"][0]["unit_sha256"] = "0" * 64
-    execution_bytes = _json_bytes(execution)
-    source_contract = _sha(
-        _json_bytes(
-            {
-                "artifact": execution["artifact"],
-                "coverage": execution["coverage"],
-                "node_bindings": execution["node_bindings"],
-                "units": execution["units"],
-            }
-        )
-    )
-    gate = json.loads(review_case.request.gate_evidence)
-    gate["candidate_execution_input_sha256"] = _sha(execution_bytes)
-    gate["identity"]["source_contract_sha256"] = source_contract
-    stale = replace(
-        review_case.request,
-        source_contract_sha256=source_contract,
-        candidate_execution_input=execution_bytes,
-        gate_evidence=_json_bytes(gate),
-    )
+    stale = _request_with_execution(review_case.request, execution)
     result = review_candidate(review_case.repo, stale, _factory(_Adapter()), threading.Event())
     assert result.status == "invalid"
     assert "source unit" in result.reason and "hash" in result.reason
 
+    gate = json.loads(stale.gate_evidence)
     gate["passed"] = False
     with pytest.raises(ReviewError, match="did not pass"):
         replace(stale, gate_evidence=_json_bytes(gate))
+
+
+def test_request_binds_gate_record_to_commits_and_both_execution_inputs(review_case) -> None:
+    with pytest.raises(ReviewError, match="gate record base_oid"):
+        replace(review_case.request, base_oid="1" * 40)
+
+    record = json.loads(review_case.request.gate_record)
+    record["candidate_oid"] = "2" * 40
+    with pytest.raises(ReviewError, match="gate record candidate_oid"):
+        replace(review_case.request, gate_record=_json_bytes(record))
+
+    gate = json.loads(review_case.request.gate_evidence)
+    gate["base_execution_input_sha256"] = "0" * 64
+    with pytest.raises(ReviewError, match="does not bind the base execution input"):
+        replace(review_case.request, gate_evidence=_json_bytes(gate))
 
 
 def test_review_binds_runtime_article_and_v2_source_contract(review_case) -> None:
@@ -686,14 +813,18 @@ def test_reviewer_factory_has_bound_model_and_no_claude_bash_permission() -> Non
     claude = claude_factory.create({"SAFE": "1"})
 
     assert codex._model == "gpt-test"
-    assert codex._autonomy_args == ["--sandbox", "read-only"]
-    assert codex._extra_args == ["-c", "mcp_servers={}"]
+    assert codex._autonomy_args == list(reviewer_module._CODEX_REVIEW_AUTONOMY_ARGS)
+    assert codex._extra_args == list(reviewer_module._CODEX_REVIEW_EXTRA_ARGS)
+    assert "features.shell_tool=false" in codex._extra_args
+    assert "--ignore-user-config" in codex._extra_args
     assert codex._environment == {"SAFE": "1"}
+    assert codex._wrap_spec_prompt is False
     assert claude._model == "opus"
-    assert claude._autonomy_args[-1] == "Read,Grep,Glob"
-    assert "Bash" not in claude._autonomy_args[-1]
-    assert claude._mcp_config is None
+    assert claude._autonomy_args == list(reviewer_module._CLAUDE_REVIEW_AUTONOMY_ARGS)
+    assert claude._session_isolation_args == list(reviewer_module._CLAUDE_REVIEW_SESSION_ARGS)
+    assert claude._mcp_config == '{"mcpServers":{}}'
     assert claude._environment == {"SAFE": "1"}
+    assert claude._wrap_spec_prompt is False
     assert validate_independent_backends("claude", "codex") == ("claude", "codex")
     with pytest.raises(ReviewError, match="must be different"):
         validate_independent_backends("codex", "codex")
@@ -703,3 +834,33 @@ def test_reviewer_factory_has_bound_model_and_no_claude_bash_permission() -> Non
         validate_independent_backends("claude", "muse")
     with pytest.raises(ReviewError, match="canonical model id"):
         reviewer_factory("codex", model=" gpt-test ", timeout=10)
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+def test_reviewer_factory_launches_with_no_tools_and_records_exact_policy(backend) -> None:
+    captured: list[list[str]] = []
+
+    def runner(args, _environment, _cwd, _deadline):
+        captured.append(args)
+        return iter(())
+
+    factory = reviewer_factory(backend, model="review-model", timeout=10)
+    adapter = factory.create({"SAFE": "1"})
+    adapter._runner = runner
+    adapter._uses_builtin_runner = False
+    run = adapter.start("review:node", "inline evidence", os.path.abspath(os.sep))
+    list(adapter.events(run))
+
+    assert captured
+    argv = captured[0]
+    assert run.meta["launches"][0]["argv"].count("<PROMPT>") == 1
+    if backend == "claude":
+        assert ["--tools", ""] == argv[argv.index("--tools") : argv.index("--tools") + 2]
+        assert "--strict-mcp-config" in argv
+        assert argv[argv.index("--mcp-config") + 1] == '{"mcpServers":{}}'
+        assert argv[argv.index("--setting-sources") + 1] == ""
+    else:
+        assert "features.shell_tool=false" in argv
+        assert "features.unified_exec=false" in argv
+        assert 'web_search="disabled"' in argv
+        assert "mcp_servers={}" in argv

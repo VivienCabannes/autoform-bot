@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import signal
 import threading
 from pathlib import Path
@@ -662,6 +663,32 @@ def test_cli_adapters_copy_explicit_subprocess_environment(adapter_type) -> None
     list(adapter.events(run))
 
     assert captured and captured[0]["SAFE"] == "original"
+
+
+@pytest.mark.parametrize("adapter_type", [ClaudeAdapter, CodexAdapter])
+def test_cli_adapters_expose_the_exact_launch_without_copying_prompt(adapter_type) -> None:
+    captured: list[tuple[list[str], str]] = []
+
+    def runner(args, _environment, cwd, _deadline):
+        captured.append((args, cwd))
+        return iter(())
+
+    kwargs = {"mcp_config": ""} if adapter_type is ClaudeAdapter else {}
+    adapter = adapter_type(model="review-model", runner=runner, **kwargs)
+    run = adapter.start("node", "sensitive evidence", "/neutral")
+    list(adapter.events(run))
+
+    assert len(run.meta["launches"]) == 1
+    launch = run.meta["launches"][0]
+    args, cwd = captured[0]
+    prompt_index = 2 if adapter_type is ClaudeAdapter else -1
+    assert launch["schema"] == _cli_common.CLI_LAUNCH_SCHEMA
+    assert launch["cwd"] == cwd == "/neutral"
+    assert launch["argv"][prompt_index] == "<PROMPT>"
+    assert launch["prompt_sha256"] == hashlib.sha256(
+        args[prompt_index].encode("utf-8")
+    ).hexdigest()
+    assert "sensitive evidence" not in "\n".join(launch["argv"])
 
 
 def test_backend_sandbox_policy_cannot_be_disabled_by_environment(monkeypatch) -> None:

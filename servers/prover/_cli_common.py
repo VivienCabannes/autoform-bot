@@ -12,6 +12,7 @@ worker-discipline text never drift between backends. The parts that genuinely di
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import queue
@@ -24,6 +25,8 @@ from collections.abc import Iterator
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+CLI_LAUNCH_SCHEMA = "autoform-cli-launch/v1"
 
 
 class ProverTimeout(Exception):
@@ -59,6 +62,36 @@ def _build_spec_prompt(node: str, spec: str) -> str:
         "Prove this node now. Write the proof into the project and report the result "
         "(or an honest `FAILED — <reason>` if you cannot)."
     )
+
+
+def _cli_launch_record(
+    *,
+    backend: str,
+    model: str,
+    args: list[str],
+    prompt: str,
+    prompt_index: int,
+    cwd: str,
+) -> dict[str, object]:
+    """Return a safe, exact record of one CLI launch attempt.
+
+    The prompt can contain a large evidence payload, so the argv copy replaces it
+    with a fixed marker and records its digest separately. The record is created
+    from the final argv immediately before the runner is invoked.
+    """
+
+    if args[prompt_index] != prompt:
+        raise ValueError("CLI prompt index does not identify the launched prompt")
+    redacted = list(args)
+    redacted[prompt_index] = "<PROMPT>"
+    return {
+        "argv": redacted,
+        "backend": backend,
+        "cwd": cwd,
+        "model": model,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "schema": CLI_LAUNCH_SCHEMA,
+    }
 
 
 def build_worker_prompt(

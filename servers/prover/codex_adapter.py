@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ._cli_common import (
+    _cli_launch_record,
     ProverCancelled,
     ProverProcessError,
     ProverTimeout,
@@ -168,6 +169,7 @@ class _CodexRun:
     output_tokens: int = 0
     cached_tokens: int = 0
     turns: int = 0
+    launches: list[dict[str, object]] = field(default_factory=list)
 
 
 class CodexAdapter(ProverAdapter):
@@ -178,7 +180,8 @@ class CodexAdapter(ProverAdapter):
     so no live ``codex`` runs). ``autonomy_args`` defaults to a workspace-write
     sandbox, and environment variables cannot disable it. ``environment`` may
     supply an exact subprocess environment; the default preserves existing
-    scrubbed-host behavior.
+    scrubbed-host behavior. ``wrap_spec_prompt=False`` is reserved for callers
+    such as independent review that supply a complete task prompt.
     """
 
     name = "codex"
@@ -194,6 +197,7 @@ class CodexAdapter(ProverAdapter):
         codex_bin: str = DEFAULT_CODEX_BIN,
         autonomy_args: list[str] | None = None,
         extra_args: list[str] | None = None,
+        wrap_spec_prompt: bool = True,
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         runner: Any | None = None,
         environment: Mapping[str, str] | None = None,
@@ -205,6 +209,7 @@ class CodexAdapter(ProverAdapter):
             autonomy_args if autonomy_args is not None else _default_autonomy_args()
         )
         self._extra_args = list(extra_args or [])
+        self._wrap_spec_prompt = wrap_spec_prompt
         if not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
         self._max_wait_seconds = max_wait_seconds
@@ -222,7 +227,13 @@ class CodexAdapter(ProverAdapter):
         state = _CodexRun(node=node, spec=spec, project_dir=str(project_dir),
                           model=self._model, extra_args=self._extra_args,
                           deadline=time.monotonic() + self._max_wait_seconds)
-        return Run(backend=self.name, goal=spec, project_dir=str(project_dir), handle=state)
+        return Run(
+            backend=self.name,
+            goal=spec,
+            project_dir=str(project_dir),
+            handle=state,
+            meta={"launches": state.launches},
+        )
 
     def events(self, run: Run) -> Iterator[Event]:
         """First turn (discipline + spec), then any steered resume turns."""
@@ -235,7 +246,8 @@ class CodexAdapter(ProverAdapter):
             # turn, never replay the first turn.
             if not state.started:
                 state.started = True
-                first = f"{self._system_prompt}\n\n{_build_spec_prompt(state.node, state.spec)}"
+                spec = _build_spec_prompt(state.node, state.spec) if self._wrap_spec_prompt else state.spec
+                first = f"{self._system_prompt}\n\n{spec}"
                 yield from self._run_turn(state, first, resume=False)
 
             while state.pending_steer:
@@ -328,6 +340,16 @@ class CodexAdapter(ProverAdapter):
             else self._autonomy_args
         )
         args += autonomy + state.extra_args + [prompt]
+        state.launches.append(
+            _cli_launch_record(
+                backend=self.name,
+                model=state.model or "codex-default",
+                args=args,
+                prompt=prompt,
+                prompt_index=-1,
+                cwd=state.project_dir,
+            )
+        )
 
         lines = (
             self._runner(
