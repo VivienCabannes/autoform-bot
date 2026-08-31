@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from autoform_cli.execution_input import load_execution_input
 from autoform_cli.runtime import RuntimeGraph, RuntimeNode
 from autoform_cli.status import DEFINITION_DECLARATIONS
 
+from .gates import CandidateGateResult, run_candidate_gates
 from .ledger import (
     AttemptRecord,
+    GateRecord,
     MergeItemRecord,
     RecoverySnapshot,
     RunConfig,
@@ -21,7 +26,15 @@ from .ledger import (
     RunRecord,
     TaskRecord,
 )
-from .scheduler import WorkPhase, _ready_phase
+from .reviewer import (
+    CandidateReviewRequest,
+    CandidateReviewResult,
+    ReviewAdapterFactory,
+    bind_candidate_review_request,
+    load_candidate_review_result,
+    review_candidate,
+)
+from .scheduler import CancellationSignal, WorkItem, WorkPhase, _ready_phase
 
 
 class ControllerError(RuntimeError):
@@ -51,9 +64,40 @@ class RecoveryAction:
     identifier: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateAdmissionContext:
+    """Exact repositories and work item used to resume candidate admission."""
+
+    repository: Path
+    base_worktree: Path
+    candidate_worktree: Path
+    work_item: WorkItem
+    changed_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if tuple(sorted(set(self.changed_paths))) != self.changed_paths:
+            raise ControllerError(
+                "candidate-paths-invalid",
+                "candidate changed paths must be unique and sorted",
+            )
+        if self.work_item.node.article_path not in self.changed_paths:
+            raise ControllerError(
+                "candidate-article-missing",
+                "candidate changed paths must include the selected roadmap article",
+            )
+
+
 EXECUTE_OUTPUT_SCHEMA = "autoform-execute/v1"
 CANDIDATE_GATE_NAME = "fixed-gates/v1"
 REVIEW_GATE_NAME = "independent-review/v1"
+
+GateRunner = Callable[[str | Path, str | Path, WorkItem], CandidateGateResult]
+ReviewRunner = Callable[
+    [str | Path, CandidateReviewRequest, ReviewAdapterFactory, CancellationSignal],
+    CandidateReviewResult,
+]
+ExecutionInputReader = Callable[[Path], bytes]
+ReviewEvidenceLoader = Callable[[bytes], CandidateReviewResult]
 
 
 class RunStopSignal:
@@ -336,6 +380,272 @@ def plan_candidate_admission(
     return RecoveryAction("enqueue-candidate", attempt_id)
 
 
+def advance_candidate_admission(
+    ledger: RunLedger,
+    snapshot: RecoverySnapshot,
+    attempt_id: str,
+    context: CandidateAdmissionContext,
+    reviewer: ReviewAdapterFactory,
+    cancelled: CancellationSignal,
+    *,
+    gate_runner: GateRunner = run_candidate_gates,
+    review_runner: ReviewRunner = review_candidate,
+    execution_input_reader: ExecutionInputReader | None = None,
+    review_evidence_loader: ReviewEvidenceLoader = load_candidate_review_result,
+) -> RecoveryAction:
+    """Perform at most one restart-safe gate, review, or enqueue transition."""
+
+    action = plan_candidate_admission(snapshot, attempt_id)
+    if action.kind in {"reject-candidate", "stop-candidate"}:
+        return action
+    attempt, task = _candidate_records(snapshot, attempt_id)
+    _validate_candidate_context(snapshot, attempt, context, reviewer)
+    read_execution_input = execution_input_reader or _execution_input_bytes
+
+    if action.kind == "run-fixed-gates":
+        _require_active_candidate(cancelled, "before fixed gates")
+        result = gate_runner(context.base_worktree, context.candidate_worktree, context.work_item)
+        if not isinstance(result, CandidateGateResult):
+            raise ControllerError("fixed-gate-result-invalid", "fixed gates returned an invalid result")
+        _validate_gate_identity(result, context.work_item)
+        evidence = result.evidence_bytes()
+        if result.passed:
+            _candidate_review_request(
+                snapshot,
+                attempt,
+                context,
+                evidence,
+                read_execution_input,
+            )
+        _require_active_candidate(cancelled, "after fixed gates")
+        digest = ledger.put_artifact("candidate-gate", evidence)
+        ledger.record_gate(
+            attempt_id,
+            CANDIDATE_GATE_NAME,
+            result.passed,
+            expected_generation=snapshot.run.generation,
+            evidence_sha256=digest,
+            detail=_gate_detail(result),
+        )
+        return RecoveryAction(
+            "run-independent-review" if result.passed else "reject-candidate",
+            attempt_id,
+        )
+
+    fixed = _candidate_gate(snapshot, attempt_id, CANDIDATE_GATE_NAME)
+    fixed_evidence = ledger.read_artifact(fixed.evidence_sha256)
+    request = _candidate_review_request(
+        snapshot,
+        attempt,
+        context,
+        fixed_evidence,
+        read_execution_input,
+    )
+
+    if action.kind == "run-independent-review":
+        _require_active_candidate(cancelled, "before independent review")
+        result = review_runner(context.repository, request, reviewer, cancelled)
+        if not isinstance(result, CandidateReviewResult):
+            raise ControllerError(
+                "review-result-invalid",
+                "independent reviewer returned an invalid result",
+            )
+        evidence = result.evidence_bytes()
+        durable = review_evidence_loader(evidence)
+        if durable != result or durable.request != request:
+            raise ControllerError(
+                "review-evidence-mismatch",
+                "independent review evidence does not match the candidate request",
+            )
+        _require_active_candidate(cancelled, "after independent review")
+        digest = ledger.put_artifact("candidate-review", evidence)
+        ledger.record_gate(
+            attempt_id,
+            REVIEW_GATE_NAME,
+            result.approved,
+            expected_generation=snapshot.run.generation,
+            evidence_sha256=digest,
+            detail=result.reason,
+        )
+        return RecoveryAction(
+            "enqueue-candidate" if result.approved else "reject-candidate",
+            attempt_id,
+        )
+
+    if action.kind == "enqueue-candidate":
+        _require_active_candidate(cancelled, "before candidate enqueue")
+        review_gate = _candidate_gate(snapshot, attempt_id, REVIEW_GATE_NAME)
+        durable = review_evidence_loader(ledger.read_artifact(review_gate.evidence_sha256))
+        if not durable.approved or durable.request != request:
+            raise ControllerError(
+                "review-evidence-mismatch",
+                "stored review approval does not match the candidate request",
+            )
+        if (
+            durable.reviewer_backend != reviewer.backend
+            or durable.reviewer_model != reviewer.model
+        ):
+            raise ControllerError(
+                "reviewer-config-mismatch",
+                "stored review approval does not match the configured reviewer",
+            )
+        queue_item_id, queue_ref = _candidate_queue_identity(snapshot.run.run_id, attempt)
+        queued = ledger.enqueue_candidate(
+            attempt_id,
+            expected_generation=snapshot.run.generation,
+            expected_task_generation=task.generation,
+            candidate_oid=attempt.candidate_oid,
+            required_gates=(CANDIDATE_GATE_NAME, REVIEW_GATE_NAME),
+            queue_ref=queue_ref,
+            expected_target_oid=attempt.base_oid,
+            queue_item_id=queue_item_id,
+        )
+        return RecoveryAction("publish-candidate", queued)
+
+    return action
+
+
+def _candidate_records(
+    snapshot: RecoverySnapshot,
+    attempt_id: str,
+) -> tuple[AttemptRecord, TaskRecord]:
+    attempts = tuple(attempt for attempt in snapshot.attempts if attempt.attempt_id == attempt_id)
+    if len(attempts) != 1:
+        raise ControllerError(
+            "candidate-attempt-missing",
+            f"candidate admission requires one exact attempt: {attempt_id}",
+        )
+    attempt = attempts[0]
+    tasks = tuple(
+        task
+        for task in snapshot.tasks
+        if task.article_id == attempt.article_id and task.phase == attempt.phase
+    )
+    if len(tasks) != 1:
+        raise ControllerError(
+            "candidate-task-missing",
+            f"candidate admission requires one exact task: {attempt_id}",
+        )
+    return attempt, tasks[0]
+
+
+def _validate_candidate_context(
+    snapshot: RecoverySnapshot,
+    attempt: AttemptRecord,
+    context: CandidateAdmissionContext,
+    reviewer: ReviewAdapterFactory,
+) -> None:
+    item = context.work_item
+    if (
+        item.node.article_id != attempt.article_id
+        or item.phase.value != attempt.phase
+        or item.attempt != attempt.number
+        or item.source_revision != snapshot.run.identity.runtime_revision
+        or item.source_contract_sha256 != snapshot.run.config.coverage_contract_sha256
+    ):
+        raise ControllerError(
+            "candidate-context-mismatch",
+            f"candidate admission context does not match attempt {attempt.attempt_id}",
+        )
+    if item.protected_roadmap_sha256 is None:
+        raise ControllerError(
+            "candidate-context-incomplete",
+            "candidate admission requires a protected-roadmap digest",
+        )
+    if reviewer.backend != snapshot.run.config.reviewer_backend:
+        raise ControllerError(
+            "reviewer-config-mismatch",
+            "reviewer backend does not match the durable run configuration",
+        )
+
+
+def _validate_gate_identity(result: CandidateGateResult, item: WorkItem) -> None:
+    if (
+        result.node_id != item.node.id
+        or result.article_id != item.node.article_id
+        or result.phase != item.phase.value
+        or result.attempt != item.attempt
+        or result.source_revision != item.source_revision
+        or result.source_contract_sha256 != item.source_contract_sha256
+        or result.protected_roadmap_sha256 != item.protected_roadmap_sha256
+    ):
+        raise ControllerError(
+            "fixed-gate-identity-mismatch",
+            "fixed-gate evidence does not match the scheduled work item",
+        )
+
+
+def _candidate_gate(
+    snapshot: RecoverySnapshot,
+    attempt_id: str,
+    name: str,
+) -> GateRecord:
+    gates = tuple(
+        gate for gate in snapshot.gates if gate.attempt_id == attempt_id and gate.name == name
+    )
+    if len(gates) != 1 or not gates[0].passed:
+        raise ControllerError(
+            "candidate-gate-missing",
+            f"candidate lacks one passing {name} gate: {attempt_id}",
+        )
+    return gates[0]
+
+
+def _candidate_review_request(
+    snapshot: RecoverySnapshot,
+    attempt: AttemptRecord,
+    context: CandidateAdmissionContext,
+    fixed_evidence: bytes,
+    read_execution_input: ExecutionInputReader,
+) -> CandidateReviewRequest:
+    base_input = read_execution_input(context.base_worktree)
+    candidate_input = read_execution_input(context.candidate_worktree)
+    return bind_candidate_review_request(
+        base_oid=attempt.base_oid,
+        candidate_oid=attempt.candidate_oid or "",
+        article_id=attempt.article_id,
+        node_id=context.work_item.node.id,
+        phase=attempt.phase,
+        article_path=context.work_item.node.article_path,
+        changed_paths=context.changed_paths,
+        prover_backend=snapshot.run.config.backend,
+        reviewer_backend=snapshot.run.config.reviewer_backend,
+        base_execution_input=base_input,
+        candidate_execution_input=candidate_input,
+        gate_evidence=fixed_evidence,
+    )
+
+
+def _execution_input_bytes(project: Path) -> bytes:
+    return load_execution_input(project, lean_root=project).to_json().encode("utf-8")
+
+
+def _gate_detail(result: CandidateGateResult) -> str:
+    if result.passed:
+        return "all fixed candidate gates passed"
+    if result.checks:
+        return result.checks[-1].detail
+    return "fixed candidate gates failed without check evidence"
+
+
+def _require_active_candidate(cancelled: CancellationSignal, stage: str) -> None:
+    if cancelled.is_set():
+        raise ControllerError(
+            "candidate-cancelled",
+            f"candidate admission was cancelled {stage}",
+        )
+
+
+def _candidate_queue_identity(
+    run_id: str,
+    attempt: AttemptRecord,
+) -> tuple[str, str]:
+    digest = hashlib.sha256(
+        f"{run_id}\0{attempt.attempt_id}\0{attempt.candidate_oid}".encode("utf-8")
+    ).hexdigest()
+    return f"candidate-{digest}", f"refs/autoform/queue/{digest}"
+
+
 def create_run(
     ledger: RunLedger,
     identity: RunIdentity,
@@ -491,12 +801,14 @@ def _article_id(node: RuntimeNode) -> str:
 
 __all__ = [
     "CANDIDATE_GATE_NAME",
+    "CandidateAdmissionContext",
     "ControllerError",
     "EXECUTE_OUTPUT_SCHEMA",
     "RecoveryAction",
     "REVIEW_GATE_NAME",
     "RunStopSignal",
     "TaskSpec",
+    "advance_candidate_admission",
     "build_task_specs",
     "classify_no_work",
     "create_run",

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import threading
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from autoform_cli.runtime import RuntimeAssertions, RuntimeGraph, RuntimeNode, RuntimeStatus
 from autoform_worker.controller import (
     CANDIDATE_GATE_NAME,
+    CandidateAdmissionContext,
     ControllerError,
     RecoveryAction,
     REVIEW_GATE_NAME,
     RunStopSignal,
+    advance_candidate_admission,
     build_task_specs,
     classify_no_work,
     create_run,
@@ -20,6 +25,7 @@ from autoform_worker.controller import (
     select_ready_task,
     status_payload,
 )
+from autoform_worker.gates import CandidateGateResult
 from autoform_worker.ledger import (
     AttemptRecord,
     GateRecord,
@@ -33,6 +39,13 @@ from autoform_worker.ledger import (
     TaskRecord,
 )
 from autoform_worker.scheduler import WorkPhase
+from autoform_worker.reviewer import (
+    CandidateReviewResult,
+    ReviewAdapterFactory,
+    ReviewEvidenceBlob,
+)
+
+import autoform_worker.controller as controller_module
 
 
 def _node(
@@ -450,6 +463,89 @@ def _gate(attempt_id: str, name: str, passed: bool) -> GateRecord:
     )
 
 
+class _AdmissionLedger:
+    def __init__(self, artifacts: dict[str, bytes] | None = None) -> None:
+        self.artifacts = dict(artifacts or {})
+        self.recorded: list[tuple[object, ...]] = []
+        self.enqueued: dict[str, object] | None = None
+
+    def put_artifact(self, kind: str, content: bytes) -> str:
+        digest = hashlib.sha256(content).hexdigest()
+        self.artifacts[digest] = content
+        self.recorded.append(("artifact", kind, digest))
+        return digest
+
+    def read_artifact(self, digest: str) -> bytes:
+        return self.artifacts[digest]
+
+    def record_gate(
+        self,
+        attempt_id: str,
+        name: str,
+        passed: bool,
+        *,
+        expected_generation: int,
+        evidence_sha256: str,
+        detail: str,
+    ) -> None:
+        self.recorded.append(
+            ("gate", attempt_id, name, passed, expected_generation, evidence_sha256, detail)
+        )
+
+    def enqueue_candidate(self, attempt_id: str, **values: object) -> str:
+        self.enqueued = {"attempt_id": attempt_id, **values}
+        return str(values["queue_item_id"])
+
+
+class _ReviewRequestStub:
+    reviewer_backend = "codex"
+
+    def as_dict(self) -> dict[str, object]:
+        return {"request": "stub"}
+
+
+def _candidate_admission_case(
+    tmp_path,
+    *,
+    gates: tuple[GateRecord, ...] = (),
+) -> tuple[RecoverySnapshot, CandidateAdmissionContext]:
+    candidate_oid = "2" * 40
+    node = _node(
+        "result",
+        "af_000000000000000000000001",
+        state="can_prove",
+    )
+    task = replace(
+        _task(node.article_id, "proof", "candidate"),
+        attempts=1,
+        candidate_oid=candidate_oid,
+    )
+    attempt = _attempt(task, status="candidate", candidate_oid=candidate_oid)
+    context = CandidateAdmissionContext(
+        repository=tmp_path / "repository",
+        base_worktree=tmp_path / "base",
+        candidate_worktree=tmp_path / "candidate",
+        work_item=controller_module.WorkItem(
+            node=node,
+            phase=WorkPhase.PROOF,
+            attempt=1,
+            source_revision="6" * 64,
+            source_contract_sha256="3" * 64,
+            protected_roadmap_sha256="7" * 64,
+        ),
+        changed_paths=(node.article_path,),
+    )
+    return (
+        _recovery_snapshot(
+            run=_run_record(),
+            tasks=(task,),
+            attempts=(attempt,),
+            gates=gates,
+        ),
+        context,
+    )
+
+
 def test_recovery_plan_prioritizes_replay_over_stale_merge_item() -> None:
     snapshot = _recovery_snapshot(
         run=_run_record(),
@@ -590,6 +686,189 @@ def test_candidate_admission_obeys_stop_before_enqueue() -> None:
     assert plan_candidate_admission(snapshot, "attempt") == RecoveryAction(
         "stop-candidate", "attempt"
     )
+
+
+def test_candidate_admission_records_failed_fixed_gate_before_rejection(tmp_path) -> None:
+    snapshot, context = _candidate_admission_case(tmp_path)
+    ledger = _AdmissionLedger()
+    gate_result = CandidateGateResult(
+        passed=False,
+        node_id=context.work_item.node.id,
+        article_id=context.work_item.node.article_id,
+        phase="proof",
+        attempt=1,
+        source_revision=context.work_item.source_revision,
+        source_contract_sha256=context.work_item.source_contract_sha256,
+        protected_roadmap_sha256=context.work_item.protected_roadmap_sha256,
+        work_item_sha256="8" * 64,
+        base_execution_input_sha256=None,
+        candidate_execution_input_sha256=None,
+        base_toolchain=None,
+        candidate_toolchain=None,
+        checks=(),
+    )
+    reviewer = ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None)
+
+    action = advance_candidate_admission(
+        ledger,  # type: ignore[arg-type]
+        snapshot,
+        "attempt",
+        context,
+        reviewer,
+        threading.Event(),
+        gate_runner=lambda *_: gate_result,
+    )
+
+    assert action == RecoveryAction("reject-candidate", "attempt")
+    assert ledger.recorded[0][0:2] == ("artifact", "candidate-gate")
+    assert ledger.recorded[1][0:5] == (
+        "gate",
+        "attempt",
+        CANDIDATE_GATE_NAME,
+        False,
+        snapshot.run.generation,
+    )
+    assert ledger.enqueued is None
+
+
+def test_candidate_admission_records_review_rejection_once(tmp_path, monkeypatch) -> None:
+    fixed_digest = "9" * 64
+    snapshot, context = _candidate_admission_case(
+        tmp_path,
+        gates=(
+            GateRecord("attempt", CANDIDATE_GATE_NAME, True, fixed_digest, "", 1),
+        ),
+    )
+    ledger = _AdmissionLedger({fixed_digest: b"fixed evidence"})
+    request = _ReviewRequestStub()
+    monkeypatch.setattr(controller_module, "bind_candidate_review_request", lambda **_: request)
+    result = CandidateReviewResult(
+        status="rejected",
+        approved=False,
+        reason="source statement changed",
+        reviewer_backend="codex",
+        reviewer_model="review-model",
+        request=request,  # type: ignore[arg-type]
+        evidence=tuple(
+            ReviewEvidenceBlob(name, b"")
+            for name in sorted(
+                {
+                "base-execution-input.json",
+                "candidate-execution-input.json",
+                "gate-evidence.json",
+                "gate-record.json",
+                "protected-roadmap.json",
+                "request.json",
+                "reviewer-config.json",
+                "response.txt",
+                "source-contract.json",
+                "transcript.json",
+                "work-item.json",
+                }
+            )
+        ),
+    )
+    reviewer = ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None)
+
+    action = advance_candidate_admission(
+        ledger,  # type: ignore[arg-type]
+        snapshot,
+        "attempt",
+        context,
+        reviewer,
+        threading.Event(),
+        review_runner=lambda *_: result,
+        execution_input_reader=lambda _: b"{}",
+        review_evidence_loader=lambda _: result,
+    )
+
+    assert action == RecoveryAction("reject-candidate", "attempt")
+    assert ledger.recorded[0][0:2] == ("artifact", "candidate-review")
+    assert ledger.recorded[1][0:5] == (
+        "gate",
+        "attempt",
+        REVIEW_GATE_NAME,
+        False,
+        snapshot.run.generation,
+    )
+    assert ledger.enqueued is None
+
+
+def test_candidate_admission_revalidates_both_artifacts_before_enqueue(tmp_path, monkeypatch) -> None:
+    fixed_digest = "8" * 64
+    review_digest = "9" * 64
+    snapshot, context = _candidate_admission_case(
+        tmp_path,
+        gates=(
+            GateRecord("attempt", CANDIDATE_GATE_NAME, True, fixed_digest, "", 1),
+            GateRecord("attempt", REVIEW_GATE_NAME, True, review_digest, "", 2),
+        ),
+    )
+    ledger = _AdmissionLedger(
+        {fixed_digest: b"fixed evidence", review_digest: b"review evidence"}
+    )
+    request = _ReviewRequestStub()
+    monkeypatch.setattr(controller_module, "bind_candidate_review_request", lambda **_: request)
+    reviewer = ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None)
+    durable = SimpleNamespace(
+        approved=True,
+        request=request,
+        reviewer_backend="codex",
+        reviewer_model="review-model",
+    )
+
+    action = advance_candidate_admission(
+        ledger,  # type: ignore[arg-type]
+        snapshot,
+        "attempt",
+        context,
+        reviewer,
+        threading.Event(),
+        execution_input_reader=lambda _: b"{}",
+        review_evidence_loader=lambda _: durable,  # type: ignore[arg-type]
+    )
+
+    assert action.kind == "publish-candidate"
+    assert action.identifier is not None
+    assert ledger.enqueued is not None
+    assert ledger.enqueued["candidate_oid"] == "2" * 40
+    assert ledger.enqueued["expected_target_oid"] == "1" * 40
+    assert ledger.enqueued["required_gates"] == (CANDIDATE_GATE_NAME, REVIEW_GATE_NAME)
+    assert ledger.enqueued["queue_ref"] == f"refs/autoform/queue/{action.identifier.removeprefix('candidate-')}"
+
+
+def test_candidate_admission_cancellation_wins_before_enqueue(tmp_path, monkeypatch) -> None:
+    fixed_digest = "8" * 64
+    review_digest = "9" * 64
+    snapshot, context = _candidate_admission_case(
+        tmp_path,
+        gates=(
+            GateRecord("attempt", CANDIDATE_GATE_NAME, True, fixed_digest, "", 1),
+            GateRecord("attempt", REVIEW_GATE_NAME, True, review_digest, "", 2),
+        ),
+    )
+    ledger = _AdmissionLedger(
+        {fixed_digest: b"fixed evidence", review_digest: b"review evidence"}
+    )
+    monkeypatch.setattr(
+        controller_module,
+        "bind_candidate_review_request",
+        lambda **_: _ReviewRequestStub(),
+    )
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with pytest.raises(ControllerError, match="cancelled before candidate enqueue"):
+        advance_candidate_admission(
+            ledger,  # type: ignore[arg-type]
+            snapshot,
+            "attempt",
+            context,
+            ReviewAdapterFactory("codex", "review-model", 10, ("test",), lambda _: None),
+            cancelled,
+            execution_input_reader=lambda _: b"{}",
+        )
+    assert ledger.enqueued is None
 
 
 def test_recovery_plan_keeps_external_recovery_ahead_of_stop() -> None:
