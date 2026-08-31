@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from autoform_cli.runtime import RuntimeGraph, RuntimeNode
@@ -40,6 +43,81 @@ class TaskSpec:
 
 
 EXECUTE_OUTPUT_SCHEMA = "autoform-execute/v1"
+
+
+class RunStopSignal:
+    """Expose a durable stop request as a thread-safe cancellation signal."""
+
+    def __init__(
+        self,
+        ledger_path: str | Path,
+        run_id: str,
+        *,
+        poll_interval: float = 0.25,
+    ) -> None:
+        if not isinstance(poll_interval, (int, float)) or isinstance(poll_interval, bool):
+            raise ValueError("stop poll interval must be a positive finite number")
+        normalized_interval = float(poll_interval)
+        if not math.isfinite(normalized_interval) or normalized_interval <= 0:
+            raise ValueError("stop poll interval must be a positive finite number")
+        self.ledger_path = Path(ledger_path).expanduser().resolve()
+        self.run_id = run_id
+        self.poll_interval = normalized_interval
+        self._cancelled = threading.Event()
+        self._closed = threading.Event()
+        self._failure: str | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def failure(self) -> str | None:
+        """Return a stable fail-closed monitor error, if polling failed."""
+
+        return self._failure
+
+    def is_set(self) -> bool:
+        return self._cancelled.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._cancelled.wait(timeout)
+
+    def start(self) -> RunStopSignal:
+        if self._thread is not None:
+            return self
+        thread = threading.Thread(
+            target=self._poll,
+            name=f"autoform-stop-{self.run_id}",
+            daemon=True,
+        )
+        self._thread = thread
+        thread.start()
+        return self
+
+    def close(self) -> None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._closed.set()
+        thread.join()
+        self._thread = None
+
+    def __enter__(self) -> RunStopSignal:
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _poll(self) -> None:
+        try:
+            with RunLedger(self.ledger_path) as ledger:
+                while not self._closed.is_set():
+                    run = ledger.get_run(self.run_id)
+                    if run.stop_requested or run.status != "running":
+                        self._cancelled.set()
+                        return
+                    self._closed.wait(self.poll_interval)
+        except Exception:
+            self._failure = "durable stop monitor could not read the run ledger"
+            self._cancelled.set()
 
 
 def status_payload(
@@ -244,6 +322,7 @@ def _article_id(node: RuntimeNode) -> str:
 __all__ = [
     "ControllerError",
     "EXECUTE_OUTPUT_SCHEMA",
+    "RunStopSignal",
     "TaskSpec",
     "build_task_specs",
     "classify_no_work",

@@ -7,6 +7,7 @@ import pytest
 from autoform_cli.runtime import RuntimeAssertions, RuntimeGraph, RuntimeNode, RuntimeStatus
 from autoform_worker.controller import (
     ControllerError,
+    RunStopSignal,
     build_task_specs,
     classify_no_work,
     create_run,
@@ -299,6 +300,33 @@ def test_create_run_allows_an_already_complete_task_plan(tmp_path) -> None:
         assert run.status == "running"
         assert ledger.tasks("run") == ()
         assert classify_no_work(ledger.tasks("run")) == "complete"
+
+
+def test_stop_signal_observes_request_from_an_independent_connection(tmp_path) -> None:
+    runtime = _runtime(_node("result", "af_000000000000000000000001"))
+    config, identity = _run_inputs()
+    ledger_path = tmp_path / "run.sqlite3"
+    with RunLedger(ledger_path) as ledger:
+        create_run(ledger, identity, config, runtime, run_id="run")
+
+    with RunStopSignal(ledger_path, "run", poll_interval=0.01) as signal:
+        assert not signal.is_set()
+        with RunLedger(ledger_path) as ledger:
+            run = ledger.get_run("run")
+            ledger.request_stop("run", expected_generation=run.generation)
+        assert signal.wait(2.0)
+        assert signal.failure is None
+
+
+def test_stop_signal_fails_closed_when_run_cannot_be_read(tmp_path) -> None:
+    config, identity = _run_inputs()
+    ledger_path = tmp_path / "run.sqlite3"
+    with RunLedger(ledger_path) as ledger:
+        ledger.create_run(identity, config, tasks=(), run_id="known")
+
+    with RunStopSignal(ledger_path, "unknown", poll_interval=0.01) as signal:
+        assert signal.wait(2.0)
+        assert signal.failure == "durable stop monitor could not read the run ledger"
 
 
 def test_status_payload_is_stable_and_redacts_private_controller_data() -> None:
