@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
+
+import psutil
 
 from autoform_cli.artifact_audit import (
     RootPackageAudit,
@@ -52,6 +58,7 @@ CANDIDATE_GATE_POLICY = "fixed-gates/v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_VERSION_OUTPUT = 16 * 1024
 _MAX_EVIDENCE_TAIL = 4096
+_MAX_CAPTURED_OUTPUT = 64 * 1024
 _COMMAND_TIMEOUT_SECONDS = 2 * 60 * 60
 _ENV_ALLOWLIST = frozenset(
     {
@@ -146,6 +153,10 @@ class CommandEvidence:
     returncode: int
     stdout_sha256: str
     stderr_sha256: str
+    stdout_bytes: int
+    stderr_bytes: int
+    stdout_truncated: bool
+    stderr_truncated: bool
     stdout_tail: str
     stderr_tail: str
 
@@ -154,10 +165,14 @@ class CommandEvidence:
             "argv": list(self.argv),
             "name": self.name,
             "returncode": self.returncode,
+            "stderr_bytes": self.stderr_bytes,
             "stderr_sha256": self.stderr_sha256,
             "stderr_tail": self.stderr_tail,
+            "stderr_truncated": self.stderr_truncated,
+            "stdout_bytes": self.stdout_bytes,
             "stdout_sha256": self.stdout_sha256,
             "stdout_tail": self.stdout_tail,
+            "stdout_truncated": self.stdout_truncated,
         }
 
 
@@ -725,7 +740,7 @@ def _run_root_package_audit(
                 blueprint,
                 candidate,
                 probe,
-                runner=runner,
+                runner=_artifact_runner(runner),
                 environment=environment,
             )
         except Exception as error:
@@ -782,6 +797,7 @@ def _run_checked(
             env=environment,
             runner=runner,
             timeout=_COMMAND_TIMEOUT_SECONDS,
+            replacements=replacements,
         )
     except Exception as error:
         detail = _scrub_text(str(error), replacements)
@@ -796,6 +812,300 @@ def _run_checked(
         )
 
 
+class _StreamCapture:
+    """Bounded text retention plus complete, scrubbed stream evidence."""
+
+    def __init__(self, replacements: tuple[tuple[Path, str], ...]) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        self._pending_carriage_return = False
+        self._captured = ""
+        self._captured_characters = 0
+        self._scrub_pending = ""
+        configured = [(str(path), label) for path, label in replacements]
+        home = os.environ.get("HOME")
+        if home:
+            configured.append((home, "<home>"))
+        ordered = sorted(
+            ((source, label) for source, label in configured if source),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+        self._replacements: dict[str, str] = {}
+        for source, label in ordered:
+            self._replacements.setdefault(source, label)
+        self._max_pattern = max(map(len, self._replacements), default=0)
+        self._replacement_pattern = (
+            re.compile("|".join(re.escape(source) for source in self._replacements))
+            if self._replacements
+            else None
+        )
+        self._digest = hashlib.sha256()
+        self._scrubbed_bytes = 0
+        self._scrubbed_tail = ""
+
+    def feed(self, chunk: bytes) -> None:
+        self._accept_decoded(self._decoder.decode(chunk), final=False)
+
+    def finish(self) -> None:
+        self._accept_decoded(self._decoder.decode(b"", final=True), final=True)
+        self._flush_scrubbed(final=True)
+
+    def _accept_decoded(self, value: str, *, final: bool) -> None:
+        if self._pending_carriage_return:
+            value = "\r" + value
+            self._pending_carriage_return = False
+        if not final and value.endswith("\r"):
+            value = value[:-1]
+            self._pending_carriage_return = True
+        elif final and self._pending_carriage_return:
+            value += "\r"
+            self._pending_carriage_return = False
+        normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+        self._captured_characters += len(normalized)
+        self._captured = (self._captured + normalized)[-_MAX_CAPTURED_OUTPUT:]
+        self._scrub_pending += normalized
+        self._flush_scrubbed(final=False)
+
+    def _flush_scrubbed(self, *, final: bool) -> None:
+        if not self._scrub_pending:
+            return
+        if self._replacement_pattern is None:
+            self._emit(self._scrub_pending)
+            self._scrub_pending = ""
+            return
+        limit = len(self._scrub_pending)
+        if not final:
+            limit = max(0, limit - self._max_pattern + 1)
+        consumed = 0
+        emitted: list[str] = []
+        for match in self._replacement_pattern.finditer(self._scrub_pending):
+            if match.start() >= limit:
+                break
+            emitted.append(self._scrub_pending[consumed : match.start()])
+            emitted.append(self._replacements[match.group(0)])
+            consumed = match.end()
+        if consumed < limit:
+            emitted.append(self._scrub_pending[consumed:limit])
+            consumed = limit
+        self._emit("".join(emitted))
+        self._scrub_pending = self._scrub_pending[consumed:]
+
+    def _emit(self, value: str) -> None:
+        encoded = value.encode("utf-8")
+        self._digest.update(encoded)
+        self._scrubbed_bytes += len(encoded)
+        self._scrubbed_tail = (self._scrubbed_tail + value)[-_MAX_EVIDENCE_TAIL:]
+
+    @property
+    def text(self) -> str:
+        return self._captured
+
+    @property
+    def sha256(self) -> str:
+        return self._digest.hexdigest()
+
+    @property
+    def scrubbed_bytes(self) -> int:
+        return self._scrubbed_bytes
+
+    @property
+    def scrubbed_tail(self) -> str:
+        return self._scrubbed_tail
+
+    @property
+    def truncated(self) -> bool:
+        return self._captured_characters > _MAX_CAPTURED_OUTPUT
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+    earliest_creation_time: float,
+) -> None:
+    """Stop the command and ordinary descendants before returning to the caller."""
+
+    if os.name == "posix" and process.poll() is None:
+        try:
+            process_group = os.getpgid(process.pid)
+        except OSError:
+            process_group = process.pid
+        if process_group == os.getpgrp():  # pragma: no cover - start_new_session enforces this
+            _terminate_process_tree(process, None, earliest_creation_time)
+            process_group = -1
+        if process_group >= 0:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                _terminate_process_tree(process, process_group, earliest_creation_time)
+    elif os.name == "posix":
+        _terminate_process_tree(process, process.pid, earliest_creation_time)
+    else:  # pragma: no cover - exercised on Windows
+        _terminate_process_tree(process, None, earliest_creation_time)
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:  # pragma: no cover - OS failed to reap child
+        process.kill()
+        process.wait(timeout=1)
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    process_group: int | None,
+    earliest_creation_time: float,
+) -> None:
+    """Fallback for platforms that do not permit signalling the process group."""
+
+    by_pid: dict[int, psutil.Process] = {}
+
+    def remember(target: psutil.Process) -> None:
+        try:
+            if target.create_time() >= earliest_creation_time:
+                by_pid[target.pid] = target
+        except psutil.Error:
+            pass
+
+    try:
+        root = psutil.Process(process.pid)
+        for child in root.children(recursive=True):
+            remember(child)
+        remember(root)
+    except psutil.Error:
+        pass
+    if process_group is not None:
+        for target in psutil.process_iter():
+            try:
+                if os.getpgid(target.pid) == process_group:
+                    remember(target)
+            except (OSError, psutil.Error):
+                pass
+    processes = sorted(by_pid.values(), key=lambda target: target.pid != process.pid)
+    for target in processes:
+        try:
+            target.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(processes, timeout=0.5)
+    if process.poll() is None:
+        process.kill()
+
+
+def _bounded_subprocess_run(
+    argv: Sequence[str],
+    *,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    capture_output: bool = True,
+    text: bool = True,
+    check: bool = False,
+    shell: bool = False,
+    timeout: int | float | None = None,
+    replacements: tuple[tuple[Path, str], ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    """Run one fixed command without retaining an unbounded transcript in memory."""
+
+    if not capture_output or not text or check or shell:
+        raise CandidateGateError("bounded gate runner requires captured text and shell=False")
+    command = list(argv)
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=dict(env) if env is not None else None,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        shell=False,
+        start_new_session=True,
+    )
+    try:
+        earliest_creation_time = psutil.Process(process.pid).create_time()
+    except psutil.Error:  # pragma: no cover - process disappeared before inspection
+        earliest_creation_time = time.time() - 1
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = _StreamCapture(replacements)
+    stderr = _StreamCapture(replacements)
+    reader_errors: list[BaseException] = []
+
+    def read_stream(stream: Any, capture: _StreamCapture) -> None:
+        failed = False
+        try:
+            while chunk := stream.read(64 * 1024):
+                capture.feed(chunk)
+        except BaseException as error:  # pragma: no cover - pipe failure is platform-specific
+            failed = True
+            reader_errors.append(error)
+            try:
+                while stream.read(64 * 1024):
+                    pass
+            except BaseException:
+                pass
+        finally:
+            if not failed:
+                try:
+                    capture.finish()
+                except BaseException as error:  # pragma: no cover - malformed final UTF-8 sequence
+                    reader_errors.append(error)
+
+    readers = (
+        threading.Thread(target=read_stream, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=read_stream, args=(process.stderr, stderr), daemon=True),
+    )
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        returncode = -1
+    finally:
+        _terminate_process_group(process, earliest_creation_time)
+        for reader in readers:
+            reader.join(timeout=1)
+        process.stdout.close()
+        process.stderr.close()
+        for reader in readers:
+            reader.join(timeout=0.5)
+    if any(reader.is_alive() for reader in readers):
+        raise CandidateGateError("command output pipes remained open after process-group shutdown")
+    if reader_errors:
+        raise CandidateGateError(f"could not read command output: {reader_errors[0]}")
+    if timed_out:
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout,
+            output=stdout.text,
+            stderr=stderr.text,
+        )
+    completed = subprocess.CompletedProcess(command, returncode, stdout.text, stderr.text)
+    completed._autoform_stdout_sha256 = stdout.sha256  # type: ignore[attr-defined]
+    completed._autoform_stderr_sha256 = stderr.sha256  # type: ignore[attr-defined]
+    completed._autoform_stdout_bytes = stdout.scrubbed_bytes  # type: ignore[attr-defined]
+    completed._autoform_stderr_bytes = stderr.scrubbed_bytes  # type: ignore[attr-defined]
+    completed._autoform_stdout_tail = stdout.scrubbed_tail  # type: ignore[attr-defined]
+    completed._autoform_stderr_tail = stderr.scrubbed_tail  # type: ignore[attr-defined]
+    completed._autoform_stdout_truncated = stdout.truncated  # type: ignore[attr-defined]
+    completed._autoform_stderr_truncated = stderr.truncated  # type: ignore[attr-defined]
+    return completed
+
+
+def _artifact_runner(runner: CommandRunner) -> CommandRunner:
+    if runner is not subprocess.run:
+        return runner
+
+    def bounded(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        completed = _bounded_subprocess_run(argv, **kwargs)
+        if getattr(completed, "_autoform_stdout_truncated", False) or getattr(
+            completed, "_autoform_stderr_truncated", False
+        ):
+            raise CandidateGateError("artifact-inspection command output exceeded the safe limit")
+        return completed
+
+    return bounded
+
+
 def _invoke(
     argv: Sequence[str],
     *,
@@ -803,17 +1113,27 @@ def _invoke(
     env: Mapping[str, str],
     runner: CommandRunner,
     timeout: int,
+    replacements: tuple[tuple[Path, str], ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    completed = runner(
-        list(argv),
-        cwd=cwd,
-        env=dict(env),
-        capture_output=True,
-        text=True,
-        check=False,
-        shell=False,
-        timeout=timeout,
-    )
+    if runner is subprocess.run:
+        completed = _bounded_subprocess_run(
+            argv,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            replacements=replacements,
+        )
+    else:
+        completed = runner(
+            list(argv),
+            cwd=cwd,
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=timeout,
+        )
     if not isinstance(completed.returncode, int):
         raise CandidateGateError("command runner returned an invalid exit code")
     if not isinstance(completed.stdout, str) or not isinstance(completed.stderr, str):
@@ -829,14 +1149,36 @@ def _command_evidence(
 ) -> CommandEvidence:
     stdout = _scrub_text(completed.stdout, replacements)
     stderr = _scrub_text(completed.stderr, replacements)
+    stdout_encoded = stdout.encode("utf-8")
+    stderr_encoded = stderr.encode("utf-8")
     return CommandEvidence(
         name=name,
         argv=tuple(_scrub_text(argument, replacements) for argument in argv),
         returncode=completed.returncode,
-        stdout_sha256=hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
-        stderr_sha256=hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
-        stdout_tail=stdout[-_MAX_EVIDENCE_TAIL:],
-        stderr_tail=stderr[-_MAX_EVIDENCE_TAIL:],
+        stdout_sha256=getattr(
+            completed,
+            "_autoform_stdout_sha256",
+            hashlib.sha256(stdout_encoded).hexdigest(),
+        ),
+        stderr_sha256=getattr(
+            completed,
+            "_autoform_stderr_sha256",
+            hashlib.sha256(stderr_encoded).hexdigest(),
+        ),
+        stdout_bytes=getattr(completed, "_autoform_stdout_bytes", len(stdout_encoded)),
+        stderr_bytes=getattr(completed, "_autoform_stderr_bytes", len(stderr_encoded)),
+        stdout_truncated=getattr(completed, "_autoform_stdout_truncated", False),
+        stderr_truncated=getattr(completed, "_autoform_stderr_truncated", False),
+        stdout_tail=getattr(
+            completed,
+            "_autoform_stdout_tail",
+            stdout[-_MAX_EVIDENCE_TAIL:],
+        ),
+        stderr_tail=getattr(
+            completed,
+            "_autoform_stderr_tail",
+            stderr[-_MAX_EVIDENCE_TAIL:],
+        ),
     )
 
 

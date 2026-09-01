@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,8 +27,12 @@ from autoform_worker.executor import _protected_roadmap_sha256
 from autoform_worker.gates import (
     CANDIDATE_GATE_EVIDENCE_SCHEMA,
     CandidateGateError,
+    _StreamCapture,
+    _command_evidence,
+    _invoke,
     fingerprint_toolchain,
     run_candidate_gates,
+    scrubbed_subprocess_environment,
 )
 from autoform_worker.scheduler import WorkItem, WorkPhase
 from servers.prover.verify import Baseline, VerifyResult, verify_candidate_trust
@@ -558,3 +565,146 @@ def test_package_artifact_probe_refuses_existing_symlink(
 
     assert outside.read_text(encoding="utf-8") == "preserve\n"
     assert probe.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_default_gate_runner_bounds_retained_output_and_hashes_full_stream(
+    tmp_path: Path,
+) -> None:
+    script = (
+        "import os, sys; "
+        "os.write(1, b'x' * 70000 + sys.argv[1].encode() + b'tail'); "
+        "os.write(2, b'y' * 70001)"
+    )
+    completed = _invoke(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=tmp_path,
+        env=scrubbed_subprocess_environment(),
+        runner=subprocess.run,
+        timeout=10,
+        replacements=((tmp_path, "<project>"),),
+    )
+    evidence = _command_evidence(
+        "large-output",
+        [sys.executable, "-c", script, str(tmp_path)],
+        completed,
+        ((tmp_path, "<project>"),),
+    )
+    expected_stdout = "x" * 70000 + "<project>tail"
+    expected_stderr = "y" * 70001
+
+    assert completed.returncode == 0
+    assert len(completed.stdout) == 64 * 1024
+    assert len(completed.stderr) == 64 * 1024
+    assert evidence.stdout_truncated
+    assert evidence.stderr_truncated
+    assert evidence.stdout_bytes == len(expected_stdout.encode("utf-8"))
+    assert evidence.stderr_bytes == len(expected_stderr.encode("utf-8"))
+    assert evidence.stdout_sha256 == hashlib.sha256(expected_stdout.encode("utf-8")).hexdigest()
+    assert evidence.stderr_sha256 == hashlib.sha256(expected_stderr.encode("utf-8")).hexdigest()
+    assert evidence.stdout_tail == expected_stdout[-4096:]
+    assert evidence.stderr_tail == expected_stderr[-4096:]
+
+
+def test_stream_capture_scrubs_paths_and_newlines_across_chunks(tmp_path: Path) -> None:
+    source = str(tmp_path / "nested")
+    payload = f"prefix\r\n{source} suffix\rend".encode("utf-8")
+    split = payload.index(source.encode("utf-8")) + len(source.encode("utf-8")) // 2
+    capture = _StreamCapture(((Path(source), "<project>"),))
+
+    capture.feed(payload[:split])
+    capture.feed(payload[split:])
+    capture.finish()
+
+    expected_text = f"prefix\n{source} suffix\nend"
+    expected_evidence = "prefix\n<project> suffix\nend"
+    assert capture.text == expected_text
+    assert capture.scrubbed_tail == expected_evidence
+    assert capture.scrubbed_bytes == len(expected_evidence.encode("utf-8"))
+    assert capture.sha256 == hashlib.sha256(expected_evidence.encode("utf-8")).hexdigest()
+
+
+def test_default_gate_runner_rejects_non_utf8_output(tmp_path: Path) -> None:
+    with pytest.raises(CandidateGateError, match="could not read command output"):
+        _invoke(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'\\xff' + b'x' * (1024 * 1024))",
+            ],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group behavior is POSIX-specific")
+def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    delayed = tmp_path / "delayed"
+    child_script = (
+        "import pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(3); pathlib.Path(sys.argv[1]).write_text('late')"
+    )
+    parent_script = (
+        "import pathlib, subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+        "pathlib.Path(sys.argv[3]).write_text('ready'); time.sleep(10)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _invoke(
+            [
+                sys.executable,
+                "-c",
+                parent_script,
+                child_script,
+                str(delayed),
+                str(ready),
+            ],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+    assert ready.read_text(encoding="utf-8") == "ready"
+    time.sleep(3.1)
+    assert not delayed.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group behavior is POSIX-specific")
+def test_default_gate_runner_normal_exit_stops_residual_descendant(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    delayed = tmp_path / "delayed"
+    child_script = (
+        "import pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('late')"
+    )
+    parent_script = (
+        "import pathlib, subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
+        "pathlib.Path(sys.argv[3]).write_text('ready')"
+    )
+
+    completed = _invoke(
+        [
+            sys.executable,
+            "-c",
+            parent_script,
+            child_script,
+            str(delayed),
+            str(ready),
+        ],
+        cwd=tmp_path,
+        env=scrubbed_subprocess_environment(),
+        runner=subprocess.run,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert ready.read_text(encoding="utf-8") == "ready"
+    time.sleep(0.7)
+    assert not delayed.exists()
