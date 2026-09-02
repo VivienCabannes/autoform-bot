@@ -702,6 +702,43 @@ def test_default_gate_runner_reaps_command_when_tracker_start_fails(
     assert not psutil.pid_exists(launched_pids[0])
 
 
+def test_default_gate_runner_reports_cleanup_failure_over_setup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launched_pids: list[int] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched_pids.append(process.pid)
+        return process
+
+    def fail_start(_tracker: _InvocationTracker) -> None:
+        raise RuntimeError("injected setup failure")
+
+    def fail_stop(_tracker: _InvocationTracker) -> None:
+        raise CandidateGateError("injected cleanup failure")
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(_InvocationTracker, "start", fail_start)
+    monkeypatch.setattr(_InvocationTracker, "stop", fail_stop)
+
+    with pytest.raises(CandidateGateError, match="injected cleanup failure") as caught:
+        _invoke(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "injected setup failure"
+    assert len(launched_pids) == 1
+    assert not psutil.pid_exists(launched_pids[0])
+
+
 def test_invocation_tracker_stop_fails_closed_if_thread_remains_alive() -> None:
     class StuckThread:
         ident = 1

@@ -1184,6 +1184,8 @@ def _bounded_subprocess_run(
     started_readers: list[threading.Thread] = []
     timed_out = False
     returncode = -1
+    primary_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
         tracker = _InvocationTracker(process.pid)
         tracker.start()
@@ -1211,26 +1213,50 @@ def _bounded_subprocess_run(
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
+    except BaseException as error:
+        primary_error = error
     finally:
-        cleanup_error: Exception | None = None
         try:
             _terminate_invocation(process, marker, tracker)
-        except Exception as error:
-            cleanup_error = error
+        except BaseException as error:
+            cleanup_errors.append(error)
         for reader in started_readers:
-            reader.join(timeout=1)
+            try:
+                reader.join(timeout=1)
+            except BaseException as error:
+                cleanup_errors.append(error)
         if process.stdout is not None:
-            process.stdout.close()
+            try:
+                process.stdout.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         if process.stderr is not None:
-            process.stderr.close()
+            try:
+                process.stderr.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         for reader in started_readers:
-            reader.join(timeout=0.5)
+            try:
+                reader.join(timeout=0.5)
+            except BaseException as error:
+                cleanup_errors.append(error)
+    cleanup_failure: CandidateGateError | None = None
     if any(reader.is_alive() for reader in started_readers):
-        raise CandidateGateError("command output pipes remained open after process-group shutdown")
-    if reader_errors:
-        raise CandidateGateError(f"could not read command output: {reader_errors[0]}")
-    if cleanup_error is not None:
-        raise CandidateGateError(f"could not clean up command processes: {cleanup_error}")
+        cleanup_failure = CandidateGateError(
+            "command output pipes remained open after invocation cleanup"
+        )
+    elif cleanup_errors:
+        detail = str(cleanup_errors[0]).replace(marker, "<gate-invocation>")
+        cleanup_failure = CandidateGateError(f"could not clean up command processes: {detail}")
+    elif reader_errors:
+        detail = str(reader_errors[0]).replace(marker, "<gate-invocation>")
+        cleanup_failure = CandidateGateError(f"could not read command output: {detail}")
+    if cleanup_failure is not None:
+        if primary_error is not None:
+            raise cleanup_failure from primary_error
+        raise cleanup_failure
+    if primary_error is not None:
+        raise primary_error
     captured_stdout = returned_stdout.text
     captured_stderr = returned_stderr.text
     if timed_out:
