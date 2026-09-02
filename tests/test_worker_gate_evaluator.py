@@ -32,6 +32,9 @@ class _FakePackPipe:
     def write(self, content: bytes) -> int:
         return len(content)
 
+    def fileno(self) -> int:
+        return 10
+
     def close(self) -> None:
         self.close_attempts += 1
         if self._fail_close:
@@ -63,6 +66,46 @@ class _FakePackProcess:
 
     def wait(self, *, timeout: float) -> int:
         return 0
+
+
+class _FakeSelectorKey:
+    def __init__(self, fileobj: _FakePackPipe, data: str) -> None:
+        self.fileobj = fileobj
+        self.data = data
+
+
+class _FakePackSelector:
+    def __init__(
+        self,
+        *,
+        failed_registration: int | None = None,
+        fail_close: bool = False,
+    ) -> None:
+        self._failed_registration = failed_registration
+        self._fail_close = fail_close
+        self._keys: list[_FakeSelectorKey] = []
+        self.registration_attempts = 0
+        self.close_attempts = 0
+
+    def register(self, fileobj: _FakePackPipe, _events: int, data: str) -> None:
+        self.registration_attempts += 1
+        if self.registration_attempts == self._failed_registration:
+            raise OSError("injected selector registration failure")
+        self._keys.append(_FakeSelectorKey(fileobj, data))
+
+    def get_map(self) -> dict[int, _FakeSelectorKey]:
+        return {index: key for index, key in enumerate(self._keys)}
+
+    def select(self, _timeout: float) -> list[tuple[_FakeSelectorKey, int]]:
+        return [(self._keys[0], 1)]
+
+    def unregister(self, fileobj: _FakePackPipe) -> None:
+        self._keys = [key for key in self._keys if key.fileobj is not fileobj]
+
+    def close(self) -> None:
+        self.close_attempts += 1
+        if self._fail_close:
+            raise OSError("injected selector close failure")
 
 
 def _git(repository: Path, *arguments: str, input_bytes: bytes | None = None) -> bytes:
@@ -517,6 +560,232 @@ def test_repository_pack_stream_preserves_gate_failure_when_cleanup_also_fails(
     assert process.stdin.close_attempts >= 1
     assert process.stdout.close_attempts == 1
     assert process.stderr.close_attempts == 1
+
+
+def test_repository_pack_stream_closes_selector_after_second_registration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakePackProcess()
+    selector = _FakePackSelector(failed_registration=2)
+    monkeypatch.setattr(gate_pack_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(gate_pack_module.selectors, "DefaultSelector", lambda: selector)
+
+    with pytest.raises(GateProviderError, match="process failed"):
+        gate_pack_module._stream_pack(
+            tmp_path,
+            -1,
+            hashlib.sha256(),
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1024,
+            timeout=1,
+        )
+
+    assert selector.registration_attempts == 2
+    assert selector.close_attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("primary_failure", "message"),
+    [
+        ("copy", "primary copy failure"),
+        ("limit", "byte limit"),
+        ("timeout", "timed out"),
+    ],
+)
+def test_repository_pack_selector_close_does_not_mask_primary_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_failure: str,
+    message: str,
+) -> None:
+    process = _FakePackProcess()
+    selector = _FakePackSelector(fail_close=True)
+    monkeypatch.setattr(gate_pack_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(gate_pack_module.selectors, "DefaultSelector", lambda: selector)
+    if primary_failure != "timeout":
+        monkeypatch.setattr(gate_pack_module.os, "read", lambda *args, **kwargs: b"pack")
+    if primary_failure == "copy":
+        monkeypatch.setattr(
+            gate_pack_module,
+            "_write_all",
+            lambda *args, **kwargs: (_ for _ in ()).throw(GateProviderError("primary copy failure")),
+        )
+
+    with pytest.raises(GateProviderError, match=message):
+        gate_pack_module._stream_pack(
+            tmp_path,
+            -1,
+            hashlib.sha256(),
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1 if primary_failure == "limit" else 1024,
+            timeout=-1 if primary_failure == "timeout" else 1,
+        )
+
+    assert selector.close_attempts == 1
+
+
+@pytest.mark.parametrize("primary_failure", ["preparation", "publication", "none"])
+def test_host_pack_cleanup_attempts_both_descriptors_with_stable_error_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_failure: str,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    original_close_descriptor = gate_pack_module._close_descriptor
+    close_attempts: list[str] = []
+
+    def fail_close(descriptor: int, *, label: str) -> None:
+        close_attempts.append(label)
+        original_close_descriptor(descriptor, label=label)
+        raise GateProviderError(f"injected {label} close failure")
+
+    monkeypatch.setattr(gate_pack_module, "_close_descriptor", fail_close)
+    if primary_failure == "preparation":
+        monkeypatch.setattr(
+            gate_pack_module,
+            "_stream_pack",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                GateProviderError("primary preparation failure")
+            ),
+        )
+    elif primary_failure == "publication":
+        monkeypatch.setattr(
+            gate_pack_module,
+            "_publish_repository_pack",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                GateProviderError("primary publication failure")
+            ),
+        )
+
+    expected = (
+        f"primary {primary_failure} failure"
+        if primary_failure != "none"
+        else "injected repository pack close failure"
+    )
+    with pytest.raises(GateProviderError, match=expected):
+        prepare_repository_pack(
+            repository,
+            state / "invocation.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    assert close_attempts == ["repository pack", "repository pack directory"]
+
+
+def test_host_pack_staging_open_failure_precedes_parent_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    original_open = gate_pack_module.os.open
+    original_close_descriptor = gate_pack_module._close_descriptor
+    close_attempts: list[str] = []
+
+    def fail_staging_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if isinstance(path, str) and path.startswith(".autoform-gate-pack-"):
+            raise OSError("primary staging open failure")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def fail_parent_close(descriptor: int, *, label: str) -> None:
+        close_attempts.append(label)
+        original_close_descriptor(descriptor, label=label)
+        raise GateProviderError("secondary parent close failure")
+
+    monkeypatch.setattr(gate_pack_module.os, "open", fail_staging_open)
+    monkeypatch.setattr(gate_pack_module, "_close_descriptor", fail_parent_close)
+
+    with pytest.raises(GateProviderError, match="destination cannot be created exclusively") as captured:
+        prepare_repository_pack(
+            repository,
+            state / "invocation.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    assert "primary staging open failure" in str(captured.value.__cause__)
+    assert close_attempts == ["repository pack directory"]
+
+
+@pytest.mark.parametrize("primary_failure", ["fstat", "identity"])
+def test_host_pack_bound_parent_failure_precedes_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_failure: str,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    original_open = gate_pack_module.os.open
+    original_fstat = gate_pack_module.os.fstat
+    original_close_descriptor = gate_pack_module._close_descriptor
+    parent_descriptor: int | None = None
+    close_attempts = 0
+
+    def capture_parent_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal parent_descriptor
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(path) == state and dir_fd is None:
+            parent_descriptor = descriptor
+        return descriptor
+
+    def fail_parent_validation(descriptor: int) -> os.stat_result:
+        info = original_fstat(descriptor)
+        if descriptor != parent_descriptor:
+            return info
+        if primary_failure == "fstat":
+            raise OSError("primary bound-parent fstat failure")
+        changed = list(info)
+        changed[1] += 1
+        return os.stat_result(changed)
+
+    def fail_parent_close(descriptor: int, *, label: str) -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        original_close_descriptor(descriptor, label=label)
+        raise GateProviderError("secondary bound-parent close failure")
+
+    monkeypatch.setattr(gate_pack_module.os, "open", capture_parent_open)
+    monkeypatch.setattr(gate_pack_module.os, "fstat", fail_parent_validation)
+    monkeypatch.setattr(gate_pack_module, "_close_descriptor", fail_parent_close)
+
+    expected = "directory cannot be opened safely" if primary_failure == "fstat" else "changed while it was opened"
+    with pytest.raises(GateProviderError, match=expected) as captured:
+        prepare_repository_pack(
+            repository,
+            state / "invocation.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    if primary_failure == "fstat":
+        assert "primary bound-parent fstat failure" in str(captured.value.__cause__)
+    assert close_attempts == 1
 
 
 def test_host_pack_publication_preserves_a_replaced_staging_entry(

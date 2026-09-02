@@ -143,10 +143,14 @@ def prepare_repository_pack(
     try:
         descriptor = os.open(staging_name, flags, 0o600, dir_fd=parent_descriptor)
     except OSError as error:
-        _close_descriptor(parent_descriptor, label="repository pack directory")
+        _close_descriptors(
+            ((parent_descriptor, "repository pack directory"),),
+            preserve_error=True,
+        )
         raise GateProviderError("repository pack destination cannot be created exclusively") from error
     digest = hashlib.sha256()
     size = 0
+    preparation_failed = False
     try:
         completed, size = _stream_pack(
             root,
@@ -197,11 +201,17 @@ def prepare_repository_pack(
             stat.S_IMODE(opened_parent.st_mode),
         ) != parent_identity or _private_directory_identity(parent) != parent_identity:
             raise GateProviderError("repository pack directory changed during publication")
+    except BaseException:
+        preparation_failed = True
+        raise
     finally:
-        try:
-            _close_descriptor(descriptor, label="repository pack")
-        finally:
-            _close_descriptor(parent_descriptor, label="repository pack directory")
+        _close_descriptors(
+            (
+                (descriptor, "repository pack"),
+                (parent_descriptor, "repository pack directory"),
+            ),
+            preserve_error=preparation_failed,
+        )
     pack = RepositoryPack(
         path=os.fspath(target),
         sha256=digest.hexdigest(),
@@ -353,38 +363,47 @@ def _copy_process_output(
 ) -> tuple[int, bytes]:
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-    deadline = time.monotonic() + timeout
-    size = 0
-    diagnostic = bytearray()
+    copy_failed = False
     try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise GateProviderError("repository pack creation timed out")
-            events = selector.select(min(remaining, 0.1))
-            if not events:
-                continue
-            for key, _mask in events:
-                chunk = os.read(key.fileobj.fileno(), 1024 * 1024)
-                if not chunk:
-                    selector.unregister(key.fileobj)
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+            deadline = time.monotonic() + timeout
+            size = 0
+            diagnostic = bytearray()
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GateProviderError("repository pack creation timed out")
+                events = selector.select(min(remaining, 0.1))
+                if not events:
                     continue
-                if key.data == "stderr":
-                    diagnostic.extend(chunk)
-                    if len(diagnostic) > _MAX_GIT_DIAGNOSTIC:
-                        raise GateProviderError(
-                            "repository pack process produced excessive diagnostics"
-                        )
-                    continue
-                size += len(chunk)
-                if size > maximum_bytes:
-                    raise GateProviderError("repository pack exceeds its configured byte limit")
-                digest.update(chunk)
-                _write_all(descriptor, chunk)
+                for key, _mask in events:
+                    chunk = os.read(key.fileobj.fileno(), 1024 * 1024)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    if key.data == "stderr":
+                        diagnostic.extend(chunk)
+                        if len(diagnostic) > _MAX_GIT_DIAGNOSTIC:
+                            raise GateProviderError(
+                                "repository pack process produced excessive diagnostics"
+                            )
+                        continue
+                    size += len(chunk)
+                    if size > maximum_bytes:
+                        raise GateProviderError("repository pack exceeds its configured byte limit")
+                    digest.update(chunk)
+                    _write_all(descriptor, chunk)
+        except BaseException:
+            copy_failed = True
+            raise
     finally:
-        selector.close()
+        try:
+            selector.close()
+        except OSError as error:
+            if not copy_failed:
+                raise GateProviderError("repository pack selector could not be closed") from error
     return size, bytes(diagnostic)
 
 
@@ -535,17 +554,19 @@ def _open_bound_private_directory(path: Path, expected: tuple[int, int, int]) ->
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
-    except OSError:
-        _close_descriptor(descriptor, label="repository pack directory")
+        observed = (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode))
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or observed != expected
+            or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
+        ):
+            raise GateProviderError("repository pack directory changed while it was opened")
+    except BaseException:
+        _close_descriptors(
+            ((descriptor, "repository pack directory"),),
+            preserve_error=True,
+        )
         raise
-    observed = (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode))
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or observed != expected
-        or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
-    ):
-        _close_descriptor(descriptor, label="repository pack directory")
-        raise GateProviderError("repository pack directory changed while it was opened")
     return descriptor
 
 
@@ -731,6 +752,22 @@ def _close_descriptor(descriptor: int, *, label: str) -> None:
         os.close(descriptor)
     except OSError as error:
         raise GateProviderError(f"{label} descriptor could not be closed") from error
+
+
+def _close_descriptors(
+    descriptors: tuple[tuple[int, str], ...],
+    *,
+    preserve_error: bool,
+) -> None:
+    first_error: GateProviderError | None = None
+    for descriptor, label in descriptors:
+        try:
+            _close_descriptor(descriptor, label=label)
+        except GateProviderError as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None and not preserve_error:
+        raise first_error
 
 
 def _diagnostic(value: bytes) -> str:
