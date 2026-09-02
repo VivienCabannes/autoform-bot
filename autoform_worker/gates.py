@@ -60,6 +60,7 @@ _MAX_VERSION_OUTPUT = 16 * 1024
 _MAX_EVIDENCE_TAIL = 4096
 _MAX_CAPTURED_OUTPUT = 64 * 1024
 _COMMAND_TIMEOUT_SECONDS = 2 * 60 * 60
+_PROCESS_GROUP_ISOLATION_SUPPORTED = os.name == "posix"
 _ENV_ALLOWLIST = frozenset(
     {
         "ALL_PROXY",
@@ -1006,6 +1007,10 @@ def _bounded_subprocess_run(
 
     if not capture_output or not text or check or shell:
         raise CandidateGateError("bounded gate runner requires captured text and shell=False")
+    if not _PROCESS_GROUP_ISOLATION_SUPPORTED:
+        raise CandidateGateError(
+            "bounded gate runner requires POSIX process-group isolation"
+        )
     command = list(argv)
     process = subprocess.Popen(
         command,

@@ -5,10 +5,10 @@ import json
 import os
 import subprocess
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
 
+import psutil
 import pytest
 
 from autoform_cli.artifact_audit import RootPackageAudit, prepare_root_package_audit
@@ -638,19 +638,53 @@ def test_default_gate_runner_rejects_non_utf8_output(tmp_path: Path) -> None:
         )
 
 
+def test_default_gate_runner_fails_closed_without_process_group_isolation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launched = False
+
+    def unexpected_launch(*_args: object, **_kwargs: object) -> None:
+        nonlocal launched
+        launched = True
+        raise AssertionError("command launched without process-group isolation")
+
+    monkeypatch.setattr(
+        "autoform_worker.gates._PROCESS_GROUP_ISOLATION_SUPPORTED",
+        False,
+    )
+    monkeypatch.setattr(subprocess, "Popen", unexpected_launch)
+
+    with pytest.raises(CandidateGateError, match="POSIX process-group isolation"):
+        _invoke(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+    assert not launched
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group behavior is POSIX-specific")
 def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Path) -> None:
     ready = tmp_path / "ready"
-    delayed = tmp_path / "delayed"
     child_script = (
-        "import pathlib, signal, sys, time; "
+        "import os, pathlib, signal, sys, time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(3); pathlib.Path(sys.argv[1]).write_text('late')"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(10)"
     )
     parent_script = (
-        "import pathlib, subprocess, sys, time; "
-        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
-        "pathlib.Path(sys.argv[3]).write_text('ready'); time.sleep(10)"
+        "import pathlib, subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+        "ready = pathlib.Path(sys.argv[2])\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not ready.exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise RuntimeError('child did not become ready')\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(10)\n"
     )
 
     with pytest.raises(subprocess.TimeoutExpired):
@@ -660,7 +694,6 @@ def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Pa
                 "-c",
                 parent_script,
                 child_script,
-                str(delayed),
                 str(ready),
             ],
             cwd=tmp_path,
@@ -669,24 +702,27 @@ def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Pa
             timeout=2,
         )
 
-    assert ready.read_text(encoding="utf-8") == "ready"
-    time.sleep(3.1)
-    assert not delayed.exists()
+    child_pid = int(ready.read_text(encoding="utf-8"))
+    assert not psutil.pid_exists(child_pid)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group behavior is POSIX-specific")
 def test_default_gate_runner_normal_exit_stops_residual_descendant(tmp_path: Path) -> None:
     ready = tmp_path / "ready"
-    delayed = tmp_path / "delayed"
     child_script = (
-        "import pathlib, signal, sys, time; "
+        "import os, pathlib, signal, sys, time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('late')"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(10)"
     )
     parent_script = (
-        "import pathlib, subprocess, sys; "
-        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); "
-        "pathlib.Path(sys.argv[3]).write_text('ready')"
+        "import pathlib, subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+        "ready = pathlib.Path(sys.argv[2])\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not ready.exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise RuntimeError('child did not become ready')\n"
+        "    time.sleep(0.01)\n"
     )
 
     completed = _invoke(
@@ -695,7 +731,6 @@ def test_default_gate_runner_normal_exit_stops_residual_descendant(tmp_path: Pat
             "-c",
             parent_script,
             child_script,
-            str(delayed),
             str(ready),
         ],
         cwd=tmp_path,
@@ -705,6 +740,5 @@ def test_default_gate_runner_normal_exit_stops_residual_descendant(tmp_path: Pat
     )
 
     assert completed.returncode == 0
-    assert ready.read_text(encoding="utf-8") == "ready"
-    time.sleep(0.7)
-    assert not delayed.exists()
+    child_pid = int(ready.read_text(encoding="utf-8"))
+    assert not psutil.pid_exists(child_pid)
