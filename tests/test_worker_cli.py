@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from autoform_worker import cli
 from autoform_worker.scheduler import LifecycleRecord, LifecycleStatus
 
@@ -42,8 +44,12 @@ def test_default_worker_ids_are_unique_per_parser_invocation(monkeypatch) -> Non
     monkeypatch.setattr(cli.getpass, "getuser", lambda: "worker")
     monkeypatch.setattr(cli.socket, "gethostname", lambda: "host")
 
-    first = cli._parser().parse_args(["--claim-repo", "claims"]).worker_id
-    second = cli._parser().parse_args(["--claim-repo", "claims"]).worker_id
+    first = cli._parser().parse_args(
+        ["--claim-repo", "claims", "--model", "pinned-model"]
+    ).worker_id
+    second = cli._parser().parse_args(
+        ["--claim-repo", "claims", "--model", "pinned-model"]
+    ).worker_id
 
     assert first.startswith("worker-host-")
     assert second.startswith("worker-host-")
@@ -53,9 +59,48 @@ def test_default_worker_ids_are_unique_per_parser_invocation(monkeypatch) -> Non
 def test_worker_id_environment_override_is_preserved(monkeypatch) -> None:
     monkeypatch.setenv("AUTOFORM_WORKER_ID", "stable-worker")
 
-    args = cli._parser().parse_args(["--claim-repo", "claims"])
+    args = cli._parser().parse_args(["--claim-repo", "claims", "--model", "pinned-model"])
 
     assert args.worker_id == "stable-worker"
+
+
+def test_worker_cli_requires_an_explicit_model() -> None:
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["--claim-repo", "claims"])
+
+
+def test_main_passes_the_exact_model_to_the_backend_factory(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    scheduler = _FakeScheduler([_result(None, detail="no ready work")])
+    captured: list[tuple[str, str, float]] = []
+
+    def capture_factory(name: str, *, model: str, timeout: float):
+        captured.append((name, model, timeout))
+        return object()
+
+    monkeypatch.setattr(cli, "backend_factory", capture_factory)
+    monkeypatch.setattr(cli, "ProverExecutor", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli.Scheduler, "for_project", lambda *args, **kwargs: scheduler)
+
+    exit_code = cli.main(
+        [
+            "--project",
+            str(tmp_path),
+            "--claim-repo",
+            "claims",
+            "--backend",
+            "codex",
+            "--model",
+            "gpt-5.6-codex",
+            "--timeout",
+            "42",
+        ]
+    )
+
+    assert exit_code == 75
+    assert captured == [("codex", "gpt-5.6-codex", 42.0)]
+    assert capsys.readouterr().out.strip() == "no ready work"
 
 
 def test_main_retries_retryable_result_until_success(monkeypatch, tmp_path, capsys) -> None:
@@ -73,6 +118,8 @@ def test_main_retries_retryable_result_until_success(monkeypatch, tmp_path, caps
             str(tmp_path),
             "--claim-repo",
             "claims",
+            "--model",
+            "pinned-model",
             "--max-attempts",
             "2",
             "--json",
@@ -101,6 +148,8 @@ def test_main_stops_after_retry_exhaustion(monkeypatch, tmp_path, capsys) -> Non
             str(tmp_path),
             "--claim-repo",
             "claims",
+            "--model",
+            "pinned-model",
             "--max-attempts",
             "3",
         ]
@@ -115,7 +164,16 @@ def test_main_preserves_single_no_work_round(monkeypatch, tmp_path, capsys) -> N
     scheduler = _FakeScheduler([_result(None, detail="no ready work")])
     _patch_worker_construction(monkeypatch, scheduler)
 
-    exit_code = cli.main(["--project", str(tmp_path), "--claim-repo", "claims"])
+    exit_code = cli.main(
+        [
+            "--project",
+            str(tmp_path),
+            "--claim-repo",
+            "claims",
+            "--model",
+            "pinned-model",
+        ]
+    )
 
     assert exit_code == 75
     assert scheduler.calls == [None]

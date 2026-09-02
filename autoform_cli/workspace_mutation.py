@@ -631,7 +631,15 @@ def _append_project(
             if binding is not None:
                 _verify_blueprint_binding(binding, require_roadmap=True)
         except WorkspaceError:
-            _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
+            _rollback_manifest_exchange(
+                parent_descriptor,
+                manifest_path.name,
+                staged,
+                prior_descriptor=descriptor,
+                prior_identity=(metadata.st_dev, metadata.st_ino),
+                prior_content=original,
+                prior_mode=stat.S_IMODE(metadata.st_mode),
+            )
             exchanged = False
             raise
         _fsync_directory_descriptor(parent_descriptor)
@@ -645,6 +653,7 @@ def _append_project(
             descriptor,
             (metadata.st_dev, metadata.st_ino),
         )
+        _workspace_mutation_checkpoint("registry-backup-published")
         _fsync_directory_descriptor(parent_descriptor)
         _verify_staged_file(parent_descriptor, manifest_path.name, staged)
         if binding is not None:
@@ -674,7 +683,15 @@ def _append_project(
                 ) from None
         if exchanged and staged is not None:
             try:
-                _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
+                _rollback_manifest_exchange(
+                    parent_descriptor,
+                    manifest_path.name,
+                    staged,
+                    prior_descriptor=descriptor,
+                    prior_identity=(metadata.st_dev, metadata.st_ino),
+                    prior_content=original,
+                    prior_mode=stat.S_IMODE(metadata.st_mode),
+                )
             except WorkspaceError:
                 pass
         raise
@@ -701,7 +718,15 @@ def _append_project(
                 ) from None
         if exchanged and staged is not None:
             try:
-                _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
+                _rollback_manifest_exchange(
+                    parent_descriptor,
+                    manifest_path.name,
+                    staged,
+                    prior_descriptor=descriptor,
+                    prior_identity=(metadata.st_dev, metadata.st_ino),
+                    prior_content=original,
+                    prior_mode=stat.S_IMODE(metadata.st_mode),
+                )
             except WorkspaceError:
                 pass
         raise WorkspaceError([f"cannot update {WORKSPACE_FILE}"]) from None
@@ -1087,24 +1112,44 @@ def _rollback_manifest_exchange(
     parent_descriptor: int,
     manifest_name: str,
     staged: _StagedFile,
+    *,
+    prior_descriptor: int,
+    prior_identity: tuple[int, int],
+    prior_content: bytes,
+    prior_mode: int,
 ) -> None:
     try:
-        current = os.stat(manifest_name, dir_fd=parent_descriptor, follow_symlinks=False)
-        displaced = os.stat(staged.path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened_prior = os.fstat(prior_descriptor)
     except OSError:
         raise WorkspaceError(["manifest exchange could not be rolled back safely"]) from None
-    if _identity(current) != staged.identity or not stat.S_ISREG(displaced.st_mode):
+    if (
+        not stat.S_ISREG(opened_prior.st_mode)
+        or _identity(opened_prior) != prior_identity
+        or stat.S_IMODE(opened_prior.st_mode) != prior_mode
+    ):
         raise WorkspaceError(["manifest exchange could not be rolled back safely"])
-    displaced_identity = _identity(displaced)
-    displaced_size = displaced.st_size
-    displaced_bytes = _read_named_bytes(parent_descriptor, staged.path.name, displaced_size)
+    _verify_descriptor_content(
+        prior_descriptor,
+        prior_content,
+        "manifest exchange could not be rolled back safely",
+    )
+    _verify_staged_file(parent_descriptor, manifest_name, staged, published=True)
+    _verify_named_content(
+        parent_descriptor,
+        staged.path.name,
+        identity=prior_identity,
+        content=prior_content,
+        issue="manifest exchange could not be rolled back safely",
+        expected_mode=prior_mode,
+    )
     _rename_exchange(parent_descriptor, staged.path.name, parent_descriptor, manifest_name)
     _verify_named_content(
         parent_descriptor,
         manifest_name,
-        identity=displaced_identity,
-        content=displaced_bytes,
+        identity=prior_identity,
+        content=prior_content,
         issue="displaced manifest could not be restored safely",
+        expected_mode=prior_mode,
     )
     _verify_staged_file(parent_descriptor, staged.path.name, staged)
 
@@ -1173,7 +1218,6 @@ def _retain_displaced_manifest(
         content=content,
         issue="displaced manifest recovery changed during publication",
     )
-    _workspace_mutation_checkpoint("registry-backup-published")
     return backup_name
 
 
@@ -1193,38 +1237,25 @@ def _recover_committed_manifest_update(
     _verify_staged_file(parent_descriptor, manifest_name, staged)
     if binding is not None:
         _verify_blueprint_binding(binding, require_roadmap=True)
-    candidates = {staged.path.name}
-    if backup_name is not None:
-        candidates.add(backup_name)
+    recovery_name = staged.path.name if backup_name is None else backup_name
     try:
-        with os.scandir(parent_descriptor) as entries:
-            candidates.update(
-                entry.name
-                for entry in entries
-                if entry.name.startswith(f"{WORKSPACE_FILE}.backup-")
-            )
+        metadata = os.stat(
+            recovery_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
     except OSError:
-        raise WorkspaceError(["prior manifest recovery paths cannot be inspected"]) from None
-    matches: list[str] = []
-    for name in sorted(candidates):
-        try:
-            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            raise WorkspaceError(["prior manifest recovery path cannot be inspected"]) from None
-        if _identity(metadata) == prior_identity:
-            _verify_named_content(
-                parent_descriptor,
-                name,
-                identity=prior_identity,
-                content=prior_content,
-                issue="prior manifest recovery path changed",
-                expected_mode=prior_mode,
-            )
-            matches.append(name)
-    if not matches:
         raise WorkspaceError(["prior manifest recovery path is missing"])
+    if _identity(metadata) != prior_identity:
+        raise WorkspaceError(["prior manifest recovery path changed"])
+    _verify_named_content(
+        parent_descriptor,
+        recovery_name,
+        identity=prior_identity,
+        content=prior_content,
+        issue="prior manifest recovery path changed",
+        expected_mode=prior_mode,
+    )
     opened = os.fstat(prior_descriptor)
     if _identity(opened) != prior_identity:
         raise WorkspaceError(["prior manifest recovery descriptor changed"])
@@ -1237,7 +1268,7 @@ def _recover_committed_manifest_update(
     _verify_staged_file(parent_descriptor, manifest_name, staged)
     if binding is not None:
         _verify_blueprint_binding(binding, require_roadmap=True)
-    return matches[0]
+    return recovery_name
 
 
 def _fsync_directory_descriptor(descriptor: int) -> None:
@@ -1376,10 +1407,7 @@ def _publish_staged_file(
             expected_mode=mode,
         )
         final_validator()
-        try:
-            _fsync_directory_descriptor(parent_descriptor)
-        except OSError:
-            pass
+        _fsync_directory_descriptor(parent_descriptor)
         _verify_staged_file(
             parent_descriptor,
             path.name,

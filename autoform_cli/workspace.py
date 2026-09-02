@@ -191,6 +191,13 @@ def _read_workspace_manifest(root: Path, manifest_path: Path) -> bytes:
             after
         ) != _file_signature(named):
             raise OSError("workspace manifest changed")
+        named_root = root.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(named_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (named_root.st_dev, named_root.st_ino)
+        ):
+            raise OSError("workspace root changed")
         return b"".join(chunks)
     except OSError:
         raise WorkspaceError([f"cannot read {manifest_path.name} safely"]) from None

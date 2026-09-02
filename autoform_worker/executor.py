@@ -28,14 +28,22 @@ AdapterFactory = Callable[[], ProverAdapter]
 _DIAGNOSTIC_SUMMARY = re.compile(r"^Diagnostics: (\d+) error\(s\), (\d+) warning\(s\)(?:\n|$)")
 
 
-def backend_factory(name: str, *, timeout: float = 30 * 60.0) -> AdapterFactory:
-    """Return a fresh dependency-free CLI adapter for ``name``."""
+def backend_factory(
+    name: str,
+    *,
+    model: str,
+    timeout: float = 30 * 60.0,
+) -> AdapterFactory:
+    """Return a fresh dependency-free CLI adapter pinned to ``model``."""
+
+    if not isinstance(model, str) or not model or model != model.strip() or "\x00" in model:
+        raise ValueError("model must be a nonempty canonical string")
 
     normalized = name.strip().casefold()
     factories: dict[str, AdapterFactory] = {
-        "claude": lambda: ClaudeAdapter(max_wait_seconds=timeout),
-        "codex": lambda: CodexAdapter(max_wait_seconds=timeout),
-        "muse": lambda: MuseAdapter(max_wait_seconds=timeout),
+        "claude": lambda: ClaudeAdapter(model=model, max_wait_seconds=timeout),
+        "codex": lambda: CodexAdapter(model=model, max_wait_seconds=timeout),
+        "muse": lambda: MuseAdapter(model=model, max_wait_seconds=timeout),
     }
     try:
         return factories[normalized]

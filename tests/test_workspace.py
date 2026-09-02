@@ -14,6 +14,7 @@ from autoform_cli.doctor import diagnose_project
 from autoform_cli.runtime import RuntimeProjectionError, resolve_runtime_paths
 from autoform_cli.visualize import main as visualize_main
 from autoform_cli import scaffold as scaffold_module
+from autoform_cli import workspace as workspace_reader_module
 from autoform_cli import workspace_mutation as workspace_module
 from autoform_cli.workspace import (
     discover_workspace,
@@ -450,6 +451,24 @@ def test_workspace_init_treats_complete_manifest_publication_as_commit(
     assert (root / "Plans").is_dir()
 
 
+def test_workspace_init_reports_directory_sync_failure_after_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("injected directory sync failure")
+
+    monkeypatch.setattr(workspace_module, "_fsync_directory_descriptor", fail_fsync)
+
+    with pytest.raises(WorkspaceError, match="published .autoform.toml"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert load_workspace(root).manifest.locations[0].path == "Plans"
+    assert (root / "Plans").is_dir()
+
+
 def test_workspace_init_retains_paths_instead_of_racing_directory_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -679,7 +698,7 @@ def test_workspace_init_rejects_replaced_directory_before_descending(
     assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
 
 
-def test_registry_exchange_restores_a_concurrent_editor_replacement(
+def test_registry_exchange_rejects_an_unbound_concurrent_editor_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _workspace(tmp_path)
@@ -707,7 +726,7 @@ def test_registry_exchange_restores_a_concurrent_editor_replacement(
 
     monkeypatch.setattr(workspace_module, "_rename_exchange", replace_before_exchange)
 
-    with pytest.raises(WorkspaceError, match="changed during update"):
+    with pytest.raises(WorkspaceError, match="rolled back safely"):
         register_blueprint_project(
             root,
             project_id="existing",
@@ -716,8 +735,10 @@ def test_registry_exchange_restores_a_concurrent_editor_replacement(
         )
 
     assert raced
-    assert manifest.read_bytes() == foreign
+    assert manifest.read_bytes() != foreign
     assert displaced.read_bytes() == original_manifest
+    retained, = root.glob("..autoform.toml.*.tmp")
+    assert retained.read_bytes() == foreign
 
 
 def test_registry_exchange_retains_displaced_inode_if_an_editor_mutates_it(
@@ -776,6 +797,76 @@ def test_registry_recovers_success_after_backup_publication_error(
     assert load_workspace(root).manifest.project("existing").blueprint_path == "Existing"
     assert result.manifest_backup_path.startswith(".autoform.toml.backup-")
     assert (root / result.manifest_backup_path).read_bytes() == original_manifest
+
+
+def test_registry_recovery_does_not_report_a_foreign_hardlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    manifest = root / ".autoform.toml"
+    original_manifest = manifest.read_bytes()
+    foreign = root / ".autoform.toml.backup-0000"
+    foreign.hardlink_to(manifest)
+
+    def fail_after_backup(name: str) -> None:
+        if name == "registry-backup-published":
+            raise WorkspaceError(["injected after backup publication"])
+
+    monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", fail_after_backup)
+
+    result = register_blueprint_project(
+        root,
+        project_id="existing",
+        title="Existing",
+        path="Existing",
+    )
+
+    assert result.manifest_backup_path != foreign.name
+    assert (root / result.manifest_backup_path).read_bytes() == original_manifest
+    assert foreign.read_bytes() == original_manifest
+
+
+def test_registry_rollback_rejects_a_replaced_displaced_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    manifest = root / ".autoform.toml"
+    original_manifest = manifest.read_bytes()
+    held_prior = root / "held-prior-manifest"
+    foreign = b"foreign replacement\n"
+    original_exchange = workspace_module._rename_exchange
+    exchanged = False
+
+    def replace_displaced_after_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        nonlocal exchanged
+        original_exchange(source_parent, source, target_parent, target)
+        if not exchanged:
+            exchanged = True
+            displaced = root / source
+            displaced.rename(held_prior)
+            displaced.write_bytes(foreign)
+
+    monkeypatch.setattr(workspace_module, "_rename_exchange", replace_displaced_after_exchange)
+
+    with pytest.raises(WorkspaceError, match="rolled back safely"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
+
+    assert manifest.read_bytes() != foreign
+    assert held_prior.read_bytes() == original_manifest
 
 
 def test_project_registration_rejects_location_replaced_at_commit_boundary(
@@ -1347,3 +1438,32 @@ def test_workspace_manifest_read_is_size_bounded(tmp_path: Path) -> None:
 
     with pytest.raises(WorkspaceError, match="byte limit"):
         load_workspace(root)
+
+
+def test_workspace_manifest_read_rejects_same_name_root_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    held_root = tmp_path / "held-repository"
+    replacement_manifest = b'repository = "replacement"\n'
+    original_read = workspace_reader_module.os.read
+    replaced = False
+
+    def replace_root_after_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        content = original_read(descriptor, size)
+        if content and not replaced:
+            replaced = True
+            root.rename(held_root)
+            root.mkdir()
+            (root / ".autoform.toml").write_bytes(replacement_manifest)
+        return content
+
+    monkeypatch.setattr(workspace_reader_module.os, "read", replace_root_after_read)
+
+    with pytest.raises(WorkspaceError, match="cannot read .autoform.toml safely"):
+        load_workspace(root)
+
+    assert replaced
+    assert (root / ".autoform.toml").read_bytes() == replacement_manifest
+    assert load_workspace(held_root).manifest.locations[0].path == "Plans"

@@ -110,12 +110,20 @@ class FakeAdapter(ProverAdapter):
 
 @pytest.mark.parametrize("name", ["claude", "codex", "muse"])
 def test_backend_factory_supports_only_safe_cli_backends(name: str) -> None:
-    assert isinstance(backend_factory(name)(), ProverAdapter)
+    adapter = backend_factory(name, model="pinned-model")()
+
+    assert isinstance(adapter, ProverAdapter)
+    assert adapter.start("node", "spec", "/project").handle.model == "pinned-model"
+
+
+def test_backend_factory_requires_an_explicit_model() -> None:
+    with pytest.raises(TypeError, match="model"):
+        backend_factory("codex")  # type: ignore[call-arg]
 
 
 def test_backend_factory_rejects_unknown_backend() -> None:
     with pytest.raises(ValueError, match="unknown backend"):
-        backend_factory("other")
+        backend_factory("other", model="pinned-model")
 
 
 def test_proof_prompt_requires_verified_roadmap_transition() -> None:

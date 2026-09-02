@@ -26,6 +26,7 @@ def _parser() -> argparse.ArgumentParser:
         or f"{getpass.getuser()}-{socket.gethostname()}-{uuid.uuid4().hex}",
     )
     parser.add_argument("--backend", choices=("claude", "codex", "muse"), default="claude")
+    parser.add_argument("--model", required=True, help="exact prover model id")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--max-steers", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=30 * 60.0)
@@ -40,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     project = args.project.expanduser().resolve()
     executor = ProverExecutor(
         project,
-        backend_factory(args.backend, timeout=args.timeout),
+        backend_factory(args.backend, model=args.model, timeout=args.timeout),
         max_steers=args.max_steers,
         project_id=args.workspace_project,
     )
