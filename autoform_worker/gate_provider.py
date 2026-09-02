@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -20,6 +21,7 @@ DOCKER_SANDBOX_POLICY = "autoform-docker-gate-sandbox/v1"
 GATE_EVALUATOR_SCHEMA = "autoform-gate-evaluator/v1"
 GATE_INVOCATION_SCHEMA = "autoform-gate-invocation/v1"
 DOCKER_CREATE_ATTESTATION_SCHEMA = "autoform-docker-create-attestation/v1"
+GATE_RESULT_FRAME_SCHEMA = "AUTOFORM-GATE-RESULT/1"
 
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_INSPECT_BYTES = 2 * 1024 * 1024
@@ -54,10 +56,47 @@ _FORBIDDEN_CONTAINER_ENVIRONMENT = frozenset(
 _CREDENTIAL_ENVIRONMENT_FRAGMENT = re.compile(
     r"(?:^|_)(?:API_KEY|CREDENTIALS?|PASSWORD|SECRET|TOKEN)(?:_|$)"
 )
+_RESULT_FRAME_HEADER = re.compile(
+    rb"AUTOFORM-GATE-RESULT/1 (?P<size>[1-9][0-9]*) (?P<sha256>[0-9a-f]{64})\n"
+)
 
 
 class GateProviderError(RuntimeError):
     """A hard gate provider configuration or lifecycle is unsafe."""
+
+
+def encode_gate_result_frame(evidence: bytes) -> bytes:
+    """Frame one canonical result so injected stdout can only force rejection."""
+
+    if not isinstance(evidence, bytes) or not evidence:
+        raise GateProviderError("gate result evidence must be nonempty bytes")
+    digest = hashlib.sha256(evidence).hexdigest()
+    header = f"{GATE_RESULT_FRAME_SCHEMA} {len(evidence)} {digest}\n".encode("ascii")
+    return header + evidence
+
+
+def parse_gate_result_frame(frame: bytes, *, maximum: int) -> bytes:
+    """Return the sole framed payload, rejecting prefixes, suffixes, and truncation."""
+
+    _positive_integer("gate result byte limit", maximum)
+    if not isinstance(frame, bytes) or not frame or len(frame) > maximum + 128:
+        raise GateProviderError("gate result frame has an invalid size")
+    newline = frame.find(b"\n")
+    if newline < 0 or newline > 127:
+        raise GateProviderError("gate result frame has an invalid header")
+    match = _RESULT_FRAME_HEADER.fullmatch(frame[: newline + 1])
+    if match is None:
+        raise GateProviderError("gate result frame has an invalid header")
+    size = int(match.group("size"))
+    if size > maximum:
+        raise GateProviderError("gate result evidence exceeds its configured limit")
+    evidence = frame[newline + 1 :]
+    if len(evidence) != size:
+        raise GateProviderError("gate result frame length does not match its evidence")
+    expected = match.group("sha256").decode("ascii")
+    if not hmac.compare_digest(hashlib.sha256(evidence).hexdigest(), expected):
+        raise GateProviderError("gate result frame digest does not match its evidence")
+    return evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -1061,6 +1100,7 @@ __all__ = [
     "DOCKER_SANDBOX_POLICY",
     "GATE_EVALUATOR_SCHEMA",
     "GATE_INVOCATION_SCHEMA",
+    "GATE_RESULT_FRAME_SCHEMA",
     "DockerCreateAttestation",
     "DockerGateProviderConfig",
     "DockerSandboxLimits",
@@ -1068,4 +1108,6 @@ __all__ = [
     "GateProviderError",
     "attest_docker_create",
     "docker_create_argv",
+    "encode_gate_result_frame",
+    "parse_gate_result_frame",
 ]

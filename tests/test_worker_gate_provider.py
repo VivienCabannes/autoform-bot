@@ -10,6 +10,7 @@ import pytest
 
 from autoform_worker.gate_provider import (
     DOCKER_CREATE_ATTESTATION_SCHEMA,
+    GATE_RESULT_FRAME_SCHEMA,
     DockerCreateAttestation,
     DockerGateProviderConfig,
     DockerSandboxLimits,
@@ -17,6 +18,8 @@ from autoform_worker.gate_provider import (
     GateProviderError,
     attest_docker_create,
     docker_create_argv,
+    encode_gate_result_frame,
+    parse_gate_result_frame,
 )
 
 
@@ -640,3 +643,51 @@ def test_docker_create_inspection_rejects_invalid_evidence(inspect_bytes: bytes)
 def test_docker_create_attestation_loader_rejects_invalid_evidence(content: bytes) -> None:
     with pytest.raises(GateProviderError):
         DockerCreateAttestation.from_bytes(content)
+
+
+def test_gate_result_frame_round_trips_exact_evidence() -> None:
+    evidence = b'{"passed":true,"schema":"autoform-candidate-gates/v1"}'
+
+    frame = encode_gate_result_frame(evidence)
+
+    assert frame.startswith(f"{GATE_RESULT_FRAME_SCHEMA} {len(evidence)} ".encode())
+    assert parse_gate_result_frame(frame, maximum=len(evidence)) == evidence
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "prefix",
+        "suffix",
+        "truncated",
+        "bad-digest",
+        "bad-size",
+        "leading-zero-size",
+        "oversized",
+    ],
+)
+def test_gate_result_frame_rejects_ambiguous_or_injected_output(mutation: str) -> None:
+    evidence = b'{"passed":false}'
+    frame = encode_gate_result_frame(evidence)
+    if mutation == "prefix":
+        frame = b"candidate-output\n" + frame
+    elif mutation == "suffix":
+        frame += b"candidate-output"
+    elif mutation == "truncated":
+        frame = frame[:-1]
+    elif mutation == "bad-digest":
+        frame = frame.replace(hashlib.sha256(evidence).hexdigest().encode(), b"0" * 64)
+    elif mutation == "bad-size":
+        frame = frame.replace(f" {len(evidence)} ".encode(), b" 1 ", 1)
+    elif mutation == "leading-zero-size":
+        frame = frame.replace(f" {len(evidence)} ".encode(), f" 0{len(evidence)} ".encode(), 1)
+
+    maximum = len(evidence) - 1 if mutation == "oversized" else len(evidence)
+    with pytest.raises(GateProviderError):
+        parse_gate_result_frame(frame, maximum=maximum)
+
+
+@pytest.mark.parametrize("evidence", [b"", "not-bytes"])
+def test_gate_result_frame_rejects_empty_or_nonbyte_evidence(evidence: object) -> None:
+    with pytest.raises(GateProviderError):
+        encode_gate_result_frame(evidence)  # type: ignore[arg-type]
