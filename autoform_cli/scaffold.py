@@ -38,6 +38,7 @@ _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}")
 _WORKSPACE_MANIFEST = ".autoform.toml"
 _DIRECTORY_STAGE_ATTEMPTS = 32
+_DIRECTORY_STAGE_PREFIX = ".afd-"
 
 
 class _DirectoryPublicationError(OSError):
@@ -285,14 +286,21 @@ def _publish_new_directory(
     fsync_directory: Callable[[int], None],
     checkpoint: Callable[[str, int, str, str], None],
 ) -> tuple[int, tuple[int, int]]:
-    """Bind a private staged directory, then publish it without replacement."""
+    """Bind a private staged directory, then publish it without replacement.
+
+    Portable ``mkdirat`` does not return a descriptor or inode. The immediate
+    no-follow stat below is therefore the first observable identity boundary;
+    substitution before it cannot be distinguished portably. A short,
+    target-independent 128-bit name minimizes that unavoidable interval and
+    leaves enough ``NAME_MAX`` room for every valid public component.
+    """
 
     staging_name: str | None = None
     descriptor: int | None = None
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
         for _ in range(_DIRECTORY_STAGE_ATTEMPTS):
-            candidate = f".{name}.autoform-stage-{secrets.token_hex(16)}"
+            candidate = f"{_DIRECTORY_STAGE_PREFIX}{secrets.token_hex(16)}"
             try:
                 os.mkdir(candidate, mode=0o700, dir_fd=parent_descriptor)
             except FileExistsError:
@@ -315,7 +323,7 @@ def _publish_new_directory(
         if not stat.S_ISDIR(created.st_mode):
             raise _DirectoryPublicationError("changed", staging_name)
         created_identity = _stat_identity(created)
-        checkpoint("staged-before-bind", parent_descriptor, staging_name, name)
+        checkpoint("identity-captured-before-bind", parent_descriptor, staging_name, name)
         try:
             descriptor = os.open(staging_name, flags, dir_fd=parent_descriptor)
         except OSError:

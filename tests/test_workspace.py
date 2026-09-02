@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -131,6 +132,35 @@ def test_workspace_init_creates_only_root_manifest_and_collection(tmp_path: Path
     assert {path.name for path in root.iterdir()} == {".autoform.toml", "Blueprint"}
 
 
+def test_workspace_init_supports_a_220_byte_nested_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    component = "N" * 220
+    staged_names: list[str] = []
+
+    def record_stage(
+        event: str,
+        _parent_descriptor: int,
+        staging_name: str,
+        target_name: str,
+    ) -> None:
+        if event == "identity-captured-before-bind" and target_name == component:
+            staged_names.append(staging_name)
+
+    monkeypatch.setattr(workspace_module, "_workspace_directory_checkpoint", record_stage)
+
+    initialize_workspace(root, blueprint_root=f"Plans/{component}")
+
+    assert len(component.encode()) == 220
+    assert (root / "Plans" / component).is_dir()
+    assert load_workspace(root).manifest.locations[0].path == f"Plans/{component}"
+    assert len(staged_names) == 1
+    assert component not in staged_names[0]
+    assert len(os.fsencode(staged_names[0])) < 64
+
+
 def test_workspace_init_fsyncs_each_created_directory_parent_before_manifest_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -249,6 +279,40 @@ def test_multiple_blueprints_are_registered_without_nested_markers(tmp_path: Pat
     assert not (root / "Plans/SyntheticHomotopy/autoform.toml").exists()
     assert not (root / "Plans/OpenProblem/autoform.toml").exists()
     assert (unregistered / "README.md").read_text(encoding="utf-8") == "# Existing\n"
+
+
+def test_creation_supports_a_220_byte_project_member(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    member = "P" * 220
+    staged_names: list[str] = []
+
+    def record_stage(
+        event: str,
+        _parent_descriptor: int,
+        staging_name: str,
+        target_name: str,
+    ) -> None:
+        if event == "identity-captured-before-bind" and target_name == member:
+            staged_names.append(staging_name)
+
+    monkeypatch.setattr(workspace_module, "_workspace_directory_checkpoint", record_stage)
+
+    result = create_blueprint_project(
+        root,
+        project_id="long-project",
+        title="Long Project",
+        path=member,
+    )
+
+    assert len(member.encode()) == 220
+    assert result.blueprint_path == f"Plans/{member}"
+    assert (root / "Plans" / member / "roadmap/README.md").is_file()
+    assert load_workspace(root).manifest.project("long-project").blueprint_path == member
+    assert len(staged_names) == 1
+    assert member not in staged_names[0]
+    assert len(os.fsencode(staged_names[0])) < 64
 
 
 def test_concurrent_blueprint_registrations_preserve_both_projects(tmp_path: Path) -> None:
@@ -388,7 +452,7 @@ def test_creation_keeps_its_destination_binding_while_scaffolding(
 
 @pytest.mark.parametrize(
     "event",
-    ["staged-before-bind", "bound-before-publication"],
+    ["identity-captured-before-bind", "bound-before-publication"],
 )
 def test_creation_rejects_staged_destination_replacement(
     tmp_path: Path,
@@ -422,7 +486,7 @@ def test_creation_rejects_staged_destination_replacement(
         create_blueprint_project(root, project_id="example", title="Example", path="Example")
 
     assert (held / "owned").read_text(encoding="utf-8") == "original\n"
-    if event == "staged-before-bind":
+    if event == "identity-captured-before-bind":
         assert not (location / "Example").exists()
         foreign = location / staged_name
     else:
@@ -650,7 +714,7 @@ def test_workspace_init_retains_paths_instead_of_racing_directory_cleanup(
         staging_name: str,
         target_name: str,
     ) -> None:
-        if event == "staged-before-bind" and target_name == "Nested":
+        if event == "identity-captured-before-bind" and target_name == "Nested":
             opened_components.append(parent_descriptor)
             staged_names.append(staging_name)
             raise workspace_module._DirectoryPublicationError("changed", staging_name)
@@ -828,7 +892,7 @@ def test_workspace_init_rejects_bound_directory_replaced_by_file_after_publish(
 
 @pytest.mark.parametrize(
     "event",
-    ["staged-before-bind", "bound-before-publication"],
+    ["identity-captured-before-bind", "bound-before-publication"],
 )
 def test_workspace_init_rejects_replaced_staged_nested_directory(
     tmp_path: Path,
@@ -863,7 +927,7 @@ def test_workspace_init_rejects_replaced_staged_nested_directory(
 
     assert not (root / ".autoform.toml").exists()
     assert (held / "owned").read_text(encoding="utf-8") == "original\n"
-    if event == "staged-before-bind":
+    if event == "identity-captured-before-bind":
         assert not (root / "Plans/Nested").exists()
         foreign = root / "Plans" / staged_name
     else:
@@ -910,6 +974,46 @@ def test_workspace_init_rejects_created_directory_replaced_after_parent_fsync(
     assert raced
     assert not (root / ".autoform.toml").exists()
     assert list(replacement.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+    staged, = root.glob("..autoform.toml.*.tmp")
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+
+
+def test_workspace_init_rejects_nested_child_replaced_after_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    plans = root / "Plans"
+    nested = plans / "Nested"
+    displaced = plans / "held-nested"
+    original_sync = workspace_module._fsync_directory_descriptor
+    raced = False
+
+    def replace_nested_after_parent_fsync(descriptor: int) -> None:
+        nonlocal raced
+        original_sync(descriptor)
+        if raced or not plans.is_dir() or not nested.is_dir():
+            return
+        opened = workspace_module.os.fstat(descriptor)
+        current_plans = plans.stat()
+        if (opened.st_dev, opened.st_ino) == (current_plans.st_dev, current_plans.st_ino):
+            nested.rename(displaced)
+            nested.mkdir()
+            raced = True
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_fsync_directory_descriptor",
+        replace_nested_after_parent_fsync,
+    )
+
+    with pytest.raises(WorkspaceError, match="blueprint root changed"):
+        initialize_workspace(root, blueprint_root="Plans/Nested")
+
+    assert raced
+    assert not (root / ".autoform.toml").exists()
+    assert list(nested.iterdir()) == []
     assert list(displaced.iterdir()) == []
     staged, = root.glob("..autoform.toml.*.tmp")
     assert stat.S_IMODE(staged.stat().st_mode) == 0o600

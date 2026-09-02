@@ -641,7 +641,7 @@ def test_blueprint_scaffold_rejects_a_racing_directory_symlink(
 
 @pytest.mark.parametrize(
     "event",
-    ["staged-before-bind", "bound-before-publication"],
+    ["identity-captured-before-bind", "bound-before-publication"],
 )
 def test_blueprint_scaffold_rejects_staged_child_replacement(
     tmp_path: Path,
@@ -675,7 +675,7 @@ def test_blueprint_scaffold_rejects_staged_child_replacement(
         scaffold_module.scaffold_blueprint(target, title="Probe")
 
     assert (held / "owned").read_text(encoding="utf-8") == "original\n"
-    if event == "staged-before-bind":
+    if event == "identity-captured-before-bind":
         assert not (target / "coverage").exists()
         foreign = target / staged_name
     else:
@@ -711,6 +711,46 @@ def test_blueprint_scaffold_preserves_a_directory_publication_collision(
     assert (target / "coverage/foreign").read_text(encoding="utf-8") == "winner\n"
     assert (target / staged_name).is_dir()
     assert list((target / staged_name).iterdir()) == []
+
+
+def test_directory_stage_captures_identity_at_first_portable_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(target, flags)
+    original_mkdir = scaffold_module.os.mkdir
+    original_stat = scaffold_module.os.stat
+    staging_name = ""
+    events: list[str] = []
+
+    def record_mkdir(name, *args, **kwargs) -> None:
+        nonlocal staging_name
+        original_mkdir(name, *args, **kwargs)
+        if isinstance(name, str) and name.startswith(scaffold_module._DIRECTORY_STAGE_PREFIX):
+            staging_name = name
+            events.append("mkdir")
+
+    def record_stat(name, *args, **kwargs):
+        if name == staging_name and "stat" not in events:
+            events.append("stat")
+        return original_stat(name, *args, **kwargs)
+
+    def record_checkpoint(event: str, *_args) -> None:
+        events.append(event)
+
+    monkeypatch.setattr(scaffold_module.os, "mkdir", record_mkdir)
+    monkeypatch.setattr(scaffold_module.os, "stat", record_stat)
+    monkeypatch.setattr(scaffold_module, "_scaffold_directory_checkpoint", record_checkpoint)
+    try:
+        descriptor = scaffold_module._open_or_create_directory(parent_descriptor, "coverage")
+        os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+    assert events[:3] == ["mkdir", "stat", "identity-captured-before-bind"]
+    assert len(os.fsencode(staging_name)) == len(os.fsencode(scaffold_module._DIRECTORY_STAGE_PREFIX)) + 32
 
 
 def test_created_scaffold_directory_is_bound_before_parent_fsync(
