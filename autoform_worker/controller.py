@@ -90,6 +90,7 @@ class CandidateAdmissionContext:
 EXECUTE_OUTPUT_SCHEMA = "autoform-execute/v1"
 CANDIDATE_GATE_NAME = "fixed-gates/v1"
 REVIEW_GATE_NAME = "independent-review/v1"
+_STOP_MONITOR_JOIN_SECONDS = 1.0
 
 GateRunner = Callable[[str | Path, str | Path, WorkItem], CandidateGateResult]
 ReviewRunner = Callable[
@@ -152,7 +153,14 @@ class RunStopSignal:
         if thread is None:
             return
         self._closed.set()
-        thread.join()
+        thread.join(timeout=_STOP_MONITOR_JOIN_SECONDS)
+        if thread.is_alive():
+            self._failure = "durable stop monitor did not stop"
+            self._cancelled.set()
+            raise ControllerError(
+                "stop-monitor-stuck",
+                self._failure,
+            )
         self._thread = None
 
     def __enter__(self) -> RunStopSignal:

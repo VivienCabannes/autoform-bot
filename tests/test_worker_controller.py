@@ -350,6 +350,30 @@ def test_stop_signal_fails_closed_when_run_cannot_be_read(tmp_path) -> None:
         assert signal.failure == "durable stop monitor could not read the run ledger"
 
 
+def test_stop_signal_close_is_bounded_and_fails_closed_on_a_stuck_monitor(tmp_path) -> None:
+    class StuckThread:
+        def __init__(self) -> None:
+            self.timeouts: list[float | None] = []
+
+        def join(self, timeout: float | None = None) -> None:
+            self.timeouts.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    signal = RunStopSignal(tmp_path / "run.sqlite3", "run")
+    stuck = StuckThread()
+    signal._thread = stuck  # type: ignore[assignment]
+
+    with pytest.raises(ControllerError, match="durable stop monitor did not stop"):
+        signal.close()
+
+    assert stuck.timeouts == [controller_module._STOP_MONITOR_JOIN_SECONDS]
+    assert signal.failure == "durable stop monitor did not stop"
+    assert signal.is_set()
+    assert signal._thread is stuck
+
+
 def _recovery_snapshot(
     *,
     run: RunRecord,
