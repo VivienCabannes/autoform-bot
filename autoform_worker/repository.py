@@ -25,20 +25,28 @@ from urllib.parse import unquote, urlsplit
 import autoform_cli.claims as claims_module
 from autoform_cli.claims import CLAIM_HEARTBEAT_S, CLAIM_REF_PREFIX, CLAIM_TTL_S, ClaimBoard
 
+from ._paths import GENERATED_DIRECTORY_NAMES
 from .ledger import CoordinatorLock
 
 
 _OID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CANDIDATE_INDEX_STAGE_NAME = re.compile(r"^\.autoform-candidate-index-[0-9a-f]{32}\.stage$")
+_CANDIDATE_INDEX_BACKUP_NAME = re.compile(r"^\.autoform-candidate-index-[0-9a-f]{32}\.base$")
 _CANDIDATE_BLOB_CHUNK_BYTES = 1024 * 1024
 _CANDIDATE_BATCH_HEADER_BYTES = 256
 _CANDIDATE_BATCH_STDERR_BYTES = 500
 _CANDIDATE_BATCH_TIMEOUT_S = 120
+_PRIMARY_PACK_VERIFY_MAX_BYTES = 256 * 1024 * 1024
+_PRIMARY_PACK_VERIFY_MAX_LINE_BYTES = 4096
+_PRIMARY_PACK_VERIFY_MAX_OBJECTS = 2_000_000
+_PRIMARY_PACK_TRACE_MAX_BYTES = 64 * 1024
 _MAX_CANDIDATE_BLOB_BYTES = 16 * 1024 * 1024
 _MAX_CANDIDATE_TOTAL_BLOB_BYTES = 64 * 1024 * 1024
+_MAX_CANDIDATE_ABANDONED_INDEX_STAGES = 8
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
-_CANDIDATE_SCHEMA = "autoform-candidate/v3"
+_CANDIDATE_SCHEMA = "autoform-candidate/v5"
+_READY_CANDIDATE_INDEX_TOPOLOGY = frozenset({"stage", "index", "displaced-backup"})
 _PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
@@ -262,6 +270,10 @@ class AttemptWorktrees:
         common = self._run_git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).stdout.strip()
         self.common_git_dir = _existing_real_directory(common, label="common Git directory")
         self._common_git_identity = _directory_identity(self.common_git_dir)
+        self.object_dir = _existing_real_directory(
+            self.common_git_dir / "objects", label="primary Git object directory"
+        )
+        self._object_dir_identity = _directory_identity(self.object_dir)
         self.object_format = self._run_git(["rev-parse", "--show-object-format"]).stdout.strip()
         if self.object_format not in {"sha1", "sha256"}:
             raise RepositoryError(f"unsupported Git object format: {self.object_format}")
@@ -471,19 +483,18 @@ class AttemptWorktrees:
                 message_bytes,
             )
             candidate_oid = _git_object_oid("commit", commit_content, self.object_format)
-            for object_type, expected_oid, content in (*objects, ("commit", candidate_oid, commit_content)):
-                self._write_candidate_object(object_type, expected_oid, content)
+            self._write_candidate_objects((*objects, ("commit", candidate_oid, commit_content)))
             candidate_index = self._candidate_index_image(
                 tree,
                 candidate_oid,
                 dict(snapshot.entries),
             )
-            self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
             self._assert_candidate_config_snapshot(admin, config_sha256)
             if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != base_index:
                 raise CandidateUncertain("attempt Git index changed before candidate intent was recorded")
             self._assert_candidate_index_lock_absent(admin)
             stage_name = self._new_candidate_index_stage_name(admin)
+            backup_name = stage_name.removesuffix(".stage") + ".base"
             root_device, root_inode = _directory_identity(attempt_root)
             record: dict[str, object] = {
                 "schema": _CANDIDATE_SCHEMA,
@@ -504,8 +515,10 @@ class AttemptWorktrees:
                 "candidate_index_sha256": candidate_index.sha256,
                 "candidate_index_identity": None,
                 "candidate_index_stage_name": stage_name,
+                "candidate_index_backup_name": backup_name,
                 "candidate_index_stage_device": None,
                 "candidate_index_stage_inode": None,
+                "candidate_index_abandoned_stages": [],
                 "config_snapshot_sha256": config_sha256,
                 "root_device": root_device,
                 "root_inode": root_inode,
@@ -514,7 +527,6 @@ class AttemptWorktrees:
             }
             self._write_candidate_journal(journal, record)
             _checkpoint("candidate-intent-recorded")
-            self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
             self._assert_candidate_config_snapshot(admin, config_sha256)
             return self._finish_candidate(
                 record,
@@ -570,7 +582,7 @@ class AttemptWorktrees:
         candidate_entries = dict(snapshot.entries)
         candidate_index = self._candidate_index_image(tree, str(record["candidate_oid"]), candidate_entries)
         self._assert_recorded_candidate_index(record, candidate_index)
-        observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        observed_index = self._candidate_index_snapshot(admin, record, label="attempt Git index")
         topology = self._candidate_index_stage_topology(admin, record, candidate_index)
 
         candidate_oid = str(record["candidate_oid"])
@@ -586,7 +598,7 @@ class AttemptWorktrees:
         if candidate_head_identity is not None and list(admin.head_snapshot.identity) != candidate_head_identity:
             raise CandidateUncertain("candidate Git HEAD identity changed")
         if record["state"] == "ready":
-            if topology != frozenset({"index"}):  # pragma: no cover - checked by topology validator
+            if topology != _READY_CANDIDATE_INDEX_TOPOLOGY:  # pragma: no cover - checked by topology validator
                 raise CandidateUncertain("ready candidate has unresolved Git index staging")
             if self._candidate_index_state(record, observed_index) != "candidate":
                 raise CandidateUncertain("ready candidate Git index does not match its tree")
@@ -651,14 +663,25 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate inputs do not reproduce the journaled commit")
         if objects is None:
             objects = rebuilt_objects
+        self._write_candidate_objects((*objects, ("commit", candidate_oid, commit_content)))
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(record, expected_content=commit_content)
         self._assert_candidate_tree_closure(snapshot.entries, admin, config_sha256)
+        _, base_tree_objects = _candidate_tree_objects(
+            tuple(sorted(base_entries.items())),
+            (),
+            self.object_format,
+        )
+        durable_objects = {(base_oid, "commit"), (candidate_oid, "commit")}
+        durable_objects.update((oid, "blob") for _, oid in base_entries.values())
+        durable_objects.update((oid, "blob") for _, (_, oid) in snapshot.entries)
+        durable_objects.update((oid, object_type) for object_type, oid, _ in base_tree_objects)
+        durable_objects.update((oid, object_type) for object_type, oid, _ in objects)
         candidate_entries = dict(snapshot.entries)
         if candidate_index is None:
             candidate_index = self._candidate_index_image(tree, candidate_oid, candidate_entries)
         self._assert_recorded_candidate_index(record, candidate_index)
-        observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        observed_index = self._candidate_index_snapshot(admin, record, label="attempt Git index")
         topology = self._candidate_index_stage_topology(admin, record, candidate_index)
 
         head_oid = self._tree_head(tree)
@@ -670,7 +693,7 @@ class AttemptWorktrees:
                 raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
             if list(admin.head_snapshot.identity) != record.get("candidate_head_identity"):
                 raise CandidateUncertain("ready candidate Git HEAD identity changed")
-            if topology != frozenset({"index"}):  # pragma: no cover - checked by topology validator
+            if topology != _READY_CANDIDATE_INDEX_TOPOLOGY:  # pragma: no cover - checked by topology validator
                 raise CandidateUncertain("ready candidate has unresolved Git index staging")
             if self._candidate_index_state(record, observed_index) != "candidate":
                 raise CandidateUncertain("ready candidate Git index does not match its tree")
@@ -716,16 +739,15 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate Git index advanced before its HEAD")
         if head_oid == base_oid and topology:
             raise CandidateUncertain("candidate Git index staging advanced before its HEAD")
-        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
 
-        for object_type, expected_oid, content in (*objects, ("commit", candidate_oid, commit_content)):
-            self._write_candidate_object(object_type, expected_oid, content)
         _checkpoint("candidate-objects-written")
-        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
+        self._import_candidate_closure(tuple(sorted(durable_objects)))
+        _checkpoint("candidate-closure-imported")
+        self._assert_candidate_snapshot_identity(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
         self._verify_candidate_object(record, expected_content=commit_content)
-        if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != observed_index:
+        if self._candidate_index_snapshot(admin, record, label="attempt Git index") != observed_index:
             raise CandidateUncertain("attempt Git index changed before candidate HEAD update")
         if self._candidate_index_stage_topology(admin, record, candidate_index) != topology:
             raise CandidateUncertain("attempt Git index staging changed before candidate HEAD update")
@@ -769,12 +791,11 @@ class AttemptWorktrees:
             _checkpoint("candidate-head-recorded")
         elif list(admin.head_snapshot.identity) != record.get("candidate_head_identity"):
             raise CandidateUncertain("candidate Git HEAD identity changed after installation")
-        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
 
-        observed_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        observed_index = self._candidate_index_snapshot(admin, record, label="attempt Git index")
         index_state = self._candidate_index_state(record, observed_index)
-        if index_state == "base":
+        if index_state == "base" or topology != _READY_CANDIDATE_INDEX_TOPOLOGY:
             observed_index = self._replace_candidate_index(record, journal, admin, observed_index, candidate_index)
         _checkpoint("candidate-index-updated")
         admin = self._assert_candidate_admin_binding(tree, record)
@@ -791,7 +812,6 @@ class AttemptWorktrees:
             index_path=admin.index_path,
             index_snapshot=observed_index,
         )
-        self._assert_candidate_snapshot(tree, base_entries, paths, snapshot)
         self._assert_candidate_config_snapshot(admin, config_sha256)
         self._assert_candidate_tree_closure(snapshot.entries, admin, config_sha256)
 
@@ -812,8 +832,8 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate Git HEAD identity changed after its result was recorded")
         self._verify_candidate_objects(objects)
         self._verify_candidate_object(ready, expected_content=commit_content)
-        final_index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
-        if self._candidate_index_stage_topology(admin, ready, candidate_index) != frozenset({"index"}):
+        final_index = self._candidate_index_snapshot(admin, record, label="attempt Git index")
+        if self._candidate_index_stage_topology(admin, ready, candidate_index) != _READY_CANDIDATE_INDEX_TOPOLOGY:
             raise CandidateUncertain("ready candidate has unresolved Git index staging")
         if self._candidate_index_state(ready, final_index) != "candidate":
             raise CandidateUncertain("ready candidate Git index identity could not be verified")
@@ -830,9 +850,7 @@ class AttemptWorktrees:
 
     def _candidate_base_entries(self, base_oid: str) -> dict[str, tuple[str, str]]:
         tree_oid = self._verified_candidate_commit_tree_oid(base_oid)
-        proc = self._run_git_bytes(
-            ["--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", tree_oid]
-        )
+        proc = self._run_git_bytes(["--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", tree_oid])
         entries: dict[str, tuple[str, str]] = {}
         for entry in proc.stdout.split(b"\0"):
             if not entry:
@@ -873,6 +891,7 @@ class AttemptWorktrees:
             tree,
             self.object_format,
             retained_paths=allowed,
+            required_paths=frozenset(base_entries) | allowed,
         )
         if _git_entry_identity(tree) != git_identity:
             raise CandidateUncertain("attempt worktree .git entry changed during candidate inspection")
@@ -936,6 +955,32 @@ class AttemptWorktrees:
         self._verify_tree_binding(tree, require_head=True)
         observed = self._candidate_snapshot(tree, base_entries, allowed_paths)
         if observed != expected:
+            raise CandidateUncertain("candidate path was replaced or changed during commit creation")
+
+    def _assert_candidate_snapshot_identity(
+        self,
+        tree: Path,
+        base_entries: Mapping[str, tuple[str, str]],
+        allowed_paths: tuple[str, ...],
+        expected: _CandidateSnapshot,
+    ) -> None:
+        """Reject a changed checkout without rereading every file before installation."""
+        self._verify_tree_binding(tree, require_head=True)
+        git_identity = _git_entry_identity(tree)
+        _, _, identities, directories = _snapshot_regular_tree(
+            tree,
+            self.object_format,
+            retained_paths=frozenset(),
+            required_paths=frozenset(base_entries) | frozenset(allowed_paths),
+            hash_files=False,
+        )
+        observed = (
+            git_identity,
+            tuple(sorted(identities.items())),
+            tuple(sorted(directories.items())),
+        )
+        wanted = (expected.git_identity, expected.file_identities, expected.directory_identities)
+        if observed != wanted:
             raise CandidateUncertain("candidate path was replaced or changed during commit creation")
 
     def _candidate_admin_binding(self, tree: Path) -> _CandidateAdminBinding:
@@ -1056,7 +1101,14 @@ class AttemptWorktrees:
         index_path: Path,
         index_snapshot: _CandidateFileSnapshot,
     ) -> dict[str, tuple[str, str]]:
-        if _candidate_private_file_snapshot(index_path, label="attempt Git index") != index_snapshot:
+        if (
+            _candidate_bound_file_snapshot(
+                index_path,
+                expected=(int(index_snapshot.identity[0]), int(index_snapshot.identity[1])),
+                label="attempt Git index",
+            )
+            != index_snapshot
+        ):
             raise CandidateUncertain("attempt Git index changed before inspection")
         flags = self._run_tree_git_with_index(tree, index_path, ["ls-files", "-v", "-z", "--cached"])
         flagged_paths: set[str] = set()
@@ -1089,7 +1141,14 @@ class AttemptWorktrees:
             entries[path] = (mode, oid)
         if flagged_paths != set(entries):
             raise CandidateUncertain("candidate index flag and stage inventories differ")
-        if _candidate_private_file_snapshot(index_path, label="attempt Git index") != index_snapshot:
+        if (
+            _candidate_bound_file_snapshot(
+                index_path,
+                expected=(int(index_snapshot.identity[0]), int(index_snapshot.identity[1])),
+                label="attempt Git index",
+            )
+            != index_snapshot
+        ):
             raise CandidateUncertain("attempt Git index changed during inspection")
         return entries
 
@@ -1156,12 +1215,18 @@ class AttemptWorktrees:
     ) -> _CandidateFileSnapshot:
         if _directory_identity(admin.path) != admin.identity:
             raise CandidateUncertain("attempt Git directory changed before index update")
-        observed = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
-        if observed != expected_base:
+        observed = self._candidate_index_snapshot(admin, record, label="attempt Git index")
+        topology = self._candidate_index_stage_topology(admin, record, candidate)
+        transitioning = topology in {
+            frozenset({"stage", "index", "displaced-lock"}),
+            frozenset({"stage", "index", "displaced-backup"}),
+        }
+        if not transitioning and observed != expected_base:
             raise CandidateUncertain("attempt Git index does not match its recorded base before update")
         self._ensure_candidate_index_stage(record, journal, admin, candidate)
         topology = self._candidate_index_stage_topology(admin, record, candidate)
         stage = self._candidate_index_stage_path(admin, record)
+        backup = self._candidate_index_backup_path(admin, record)
         lock = admin.index_path.with_name("index.lock")
         if topology == frozenset({"stage"}):
             try:
@@ -1172,22 +1237,48 @@ class AttemptWorktrees:
             _checkpoint("candidate-index-locked")
             topology = self._candidate_index_stage_topology(admin, record, candidate)
         if topology == frozenset({"stage", "lock"}):
-            stage.unlink()
-            _fsync_directory(admin.path)
-            _checkpoint("candidate-index-stage-unlinked")
+            _checkpoint("candidate-index-stage-retained")
             topology = self._candidate_index_stage_topology(admin, record, candidate)
-        if topology != frozenset({"lock"}):
+        if topology == frozenset({"stage", "lock"}):
+            if _directory_identity(admin.path) != admin.identity:
+                raise CandidateUncertain("attempt Git directory changed during index staging")
+            current = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+            if current != expected_base or not _candidate_snapshot_matches_recorded_base(record, current):
+                raise CandidateUncertain("attempt Git index changed during index staging")
+            _checkpoint("candidate-index-before-exchange")
+            try:
+                _exchange_paths(lock, admin.index_path)
+                _fsync_directory(admin.path)
+            except OSError as error:
+                raise CandidateUncertain("candidate Git index could not be exchanged atomically") from error
+            _checkpoint("candidate-index-exchanged")
+            try:
+                topology = self._candidate_index_stage_topology(admin, record, candidate)
+            except CandidateUncertain:
+                self._restore_displaced_candidate_index(admin, record, candidate, lock)
+                raise
+        if topology == frozenset({"stage", "index", "displaced-lock"}):
+            _checkpoint("candidate-index-before-displace")
+            try:
+                topology = self._candidate_index_stage_topology(admin, record, candidate)
+            except CandidateUncertain:
+                self._restore_displaced_candidate_index(admin, record, candidate, lock)
+                raise
+            try:
+                _rename_noreplace(lock, backup)
+                _fsync_directory(admin.path)
+            except OSError as error:
+                self._restore_displaced_candidate_index(admin, record, candidate, lock)
+                raise CandidateUncertain("displaced Git index could not be preserved") from error
+            _checkpoint("candidate-index-displaced")
+            try:
+                topology = self._candidate_index_stage_topology(admin, record, candidate)
+            except CandidateUncertain:
+                self._restore_displaced_candidate_index(admin, record, candidate, backup)
+                raise
+        if topology != _READY_CANDIDATE_INDEX_TOPOLOGY:
             raise CandidateUncertain("candidate Git index staging has an invalid durable state")
-        if _directory_identity(admin.path) != admin.identity:
-            raise CandidateUncertain("attempt Git directory changed during index staging")
-        if _candidate_private_file_snapshot(admin.index_path, label="attempt Git index") != expected_base:
-            raise CandidateUncertain("attempt Git index changed during index staging")
-        try:
-            os.replace(lock, admin.index_path)
-            _fsync_directory(admin.path)
-        except OSError as error:
-            raise CandidateUncertain("candidate Git index could not be replaced atomically") from error
-        installed = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        installed = self._candidate_index_snapshot(admin, record, label="attempt Git index")
         if (
             installed.identity[:2]
             != (record.get("candidate_index_stage_device"), record.get("candidate_index_stage_inode"))
@@ -1197,11 +1288,41 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate Git index replacement could not be verified")
         return installed
 
+    def _restore_displaced_candidate_index(
+        self,
+        admin: _CandidateAdminBinding,
+        record: Mapping[str, object],
+        candidate: _CandidateFileSnapshot,
+        displaced: Path,
+    ) -> None:
+        """Restore a displaced index after a failed post-exchange validation."""
+        expected = (int(record["candidate_index_stage_device"]), int(record["candidate_index_stage_inode"]))
+        installed = _candidate_bound_file_snapshot(
+            admin.index_path,
+            expected=expected,
+            label="installed candidate Git index",
+        )
+        if installed.sha256 != candidate.sha256 or installed.content != candidate.content:
+            raise CandidateUncertain("candidate Git index changed before rollback")
+        try:
+            _exchange_paths(admin.index_path, displaced)
+            _fsync_directory(admin.path)
+        except OSError as error:
+            raise CandidateUncertain("displaced Git index could not be restored") from error
+        if displaced != admin.index_path.with_name("index.lock"):
+            lock = admin.index_path.with_name("index.lock")
+            try:
+                _rename_noreplace(displaced, lock)
+                _fsync_directory(admin.path)
+            except OSError as error:
+                raise CandidateUncertain("candidate Git index lock could not be restored") from error
+
     def _new_candidate_index_stage_name(self, admin: _CandidateAdminBinding) -> str:
         for _ in range(128):
             name = f".autoform-candidate-index-{secrets.token_hex(16)}.stage"
             path = admin.path / name
-            if not path.exists() and not path.is_symlink():
+            backup = path.with_suffix(".base")
+            if not path.exists() and not path.is_symlink() and not backup.exists() and not backup.is_symlink():
                 return name
         raise CandidateUncertain("candidate Git index stage name could not be allocated")
 
@@ -1216,17 +1337,25 @@ class AttemptWorktrees:
         stage_device = record.get("candidate_index_stage_device")
         stage_inode = record.get("candidate_index_stage_inode")
         if _is_integer(stage_device) and _is_integer(stage_inode):
-            self._candidate_index_stage_topology(admin, record, candidate)
+            topology = self._candidate_index_stage_topology(admin, record, candidate)
+            if topology == frozenset({"stage"}):
+                staged = _candidate_bound_file_snapshot(
+                    stage,
+                    expected=(int(stage_device), int(stage_inode)),
+                    label="candidate Git index stage",
+                )
+                if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
+                    self._write_candidate_index_stage(stage, (int(stage_device), int(stage_inode)), candidate)
+                    _fsync_directory(admin.path)
+                    _checkpoint("candidate-index-stage-written")
+                _checkpoint("candidate-index-staged")
             return
         if stage_device is not None or stage_inode is not None:
             raise CandidateUncertain("candidate journal has incomplete index staging identity")
         self._assert_candidate_index_lock_absent(admin)
         if stage.exists() or stage.is_symlink():
-            try:
-                stage.unlink()
-                _fsync_directory(admin.path)
-            except OSError as error:
-                raise CandidateUncertain("incomplete candidate Git index stage cannot be discarded") from error
+            self._abandon_unbound_candidate_index_stage(record, journal, admin, stage)
+            stage = self._candidate_index_stage_path(admin, record)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -1236,6 +1365,22 @@ class AttemptWorktrees:
             raise CandidateUncertain("candidate Git index stage could not be created safely") from error
         open_descriptor = descriptor
         try:
+            created = os.fstat(descriptor)
+            if not stat.S_ISREG(created.st_mode) or created.st_nlink != 1:
+                raise CandidateUncertain("candidate Git index stage was not created as a private regular file")
+            os.fsync(descriptor)
+            _fsync_directory(admin.path)
+            _checkpoint("candidate-index-stage-created-before-journal")
+            updated = dict(record)
+            updated.update(
+                {
+                    "candidate_index_stage_device": created.st_dev,
+                    "candidate_index_stage_inode": created.st_ino,
+                }
+            )
+            self._write_candidate_journal(journal, updated)
+            record.clear()
+            record.update(updated)
             _checkpoint("candidate-index-stage-created")
             with os.fdopen(descriptor, "wb", closefd=True) as stream:
                 open_descriptor = -1
@@ -1247,26 +1392,111 @@ class AttemptWorktrees:
                 raise CandidateUncertain("candidate Git index stage differs from its durable intent")
             _fsync_directory(admin.path)
             _checkpoint("candidate-index-stage-written")
-            updated = dict(record)
-            updated.update(
-                {
-                    "candidate_index_stage_device": staged.identity[0],
-                    "candidate_index_stage_inode": staged.identity[1],
-                }
-            )
-            self._write_candidate_journal(journal, updated)
-            record.clear()
-            record.update(updated)
             _checkpoint("candidate-index-staged")
         except BaseException:
             if open_descriptor >= 0:
                 os.close(open_descriptor)
             raise
 
+    def _abandon_unbound_candidate_index_stage(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        admin: _CandidateAdminBinding,
+        stage: Path,
+    ) -> None:
+        """Preserve an unbound pre-journal stage and durably choose a fresh name."""
+        abandoned = record.get("candidate_index_abandoned_stages")
+        if not isinstance(abandoned, list) or len(abandoned) >= _MAX_CANDIDATE_ABANDONED_INDEX_STAGES:
+            raise CandidateUncertain("candidate Git index abandoned stage limit was reached")
+        try:
+            info = stage.stat(follow_symlinks=False)
+        except OSError as error:
+            raise CandidateUncertain("unbound candidate Git index stage cannot be inspected") from error
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_nlink != 1:
+            raise CandidateUncertain("unbound candidate Git index stage is preserved as foreign state")
+        name = self._new_candidate_index_stage_name(admin)
+        updated = dict(record)
+        updated.update(
+            {
+                "candidate_index_stage_name": name,
+                "candidate_index_backup_name": name.removesuffix(".stage") + ".base",
+                "candidate_index_abandoned_stages": [
+                    *abandoned,
+                    {"name": stage.name, "device": info.st_dev, "inode": info.st_ino},
+                ],
+            }
+        )
+        self._write_candidate_journal(journal, updated)
+        record.clear()
+        record.update(updated)
+        _checkpoint("candidate-index-stage-abandoned")
+
+    @staticmethod
+    def _write_candidate_index_stage(
+        stage: Path,
+        expected: tuple[int, int],
+        candidate: _CandidateFileSnapshot,
+    ) -> None:
+        flags = os.O_WRONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(stage, flags)
+        except OSError as error:
+            raise CandidateUncertain("candidate Git index stage cannot be resumed safely") from error
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or (opened.st_dev, opened.st_ino) != expected:
+                raise CandidateUncertain("candidate Git index stage changed before recovery")
+            os.ftruncate(descriptor, 0)
+            remaining = memoryview(candidate.content)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:  # pragma: no cover - operating-system write invariant
+                    raise CandidateUncertain("candidate Git index stage could not be completed")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        except OSError as error:
+            raise CandidateUncertain("candidate Git index stage could not be completed") from error
+        finally:
+            os.close(descriptor)
+        staged = _candidate_bound_file_snapshot(stage, expected=expected, label="candidate Git index stage")
+        if staged.sha256 != candidate.sha256 or staged.content != candidate.content:
+            raise CandidateUncertain("candidate Git index stage differs from its durable intent")
+
     def _candidate_index_stage_path(self, admin: _CandidateAdminBinding, record: Mapping[str, object]) -> Path:
         name = record.get("candidate_index_stage_name")
         if not isinstance(name, str) or not _CANDIDATE_INDEX_STAGE_NAME.fullmatch(name):
             raise CandidateUncertain("candidate journal has an invalid index stage name")
+        return admin.path / name
+
+    @staticmethod
+    def _candidate_index_snapshot(
+        admin: _CandidateAdminBinding,
+        record: Mapping[str, object],
+        *,
+        label: str,
+    ) -> _CandidateFileSnapshot:
+        device = record.get("candidate_index_stage_device")
+        inode = record.get("candidate_index_stage_inode")
+        if _is_integer(device) and _is_integer(inode):
+            try:
+                info = admin.index_path.stat(follow_symlinks=False)
+            except OSError as error:
+                raise CandidateUncertain(f"{label} cannot be inspected safely") from error
+            if (info.st_dev, info.st_ino) == (int(device), int(inode)):
+                return _candidate_bound_file_snapshot(
+                    admin.index_path,
+                    expected=(int(device), int(inode)),
+                    label=label,
+                )
+        return _candidate_private_file_snapshot(admin.index_path, label=label)
+
+    def _candidate_index_backup_path(self, admin: _CandidateAdminBinding, record: Mapping[str, object]) -> Path:
+        name = record.get("candidate_index_backup_name")
+        if not isinstance(name, str) or not _CANDIDATE_INDEX_BACKUP_NAME.fullmatch(name):
+            raise CandidateUncertain("candidate journal has an invalid index backup name")
         return admin.path / name
 
     def _candidate_index_stage_topology(
@@ -1279,6 +1509,9 @@ class AttemptWorktrees:
         inode = record.get("candidate_index_stage_inode")
         lock = admin.index_path.with_name("index.lock")
         stage = self._candidate_index_stage_path(admin, record)
+        backup = self._candidate_index_backup_path(admin, record)
+        abandoned = _candidate_abandoned_index_stages(record)
+        reserved_names = {stage.name, backup.name, *(name for name, _ in abandoned)}
         try:
             before = admin.path.stat(follow_symlinks=False)
             with os.scandir(admin.path) as iterator:
@@ -1286,8 +1519,8 @@ class AttemptWorktrees:
                     entry.name
                     for entry in iterator
                     if entry.name.startswith(".autoform-candidate-index-")
-                    and entry.name.endswith(".stage")
-                    and entry.name != stage.name
+                    and (entry.name.endswith(".stage") or entry.name.endswith(".base"))
+                    and entry.name not in reserved_names
                 )
             after = admin.path.stat(follow_symlinks=False)
         except OSError as error:
@@ -1301,11 +1534,26 @@ class AttemptWorktrees:
             raise CandidateUncertain("attempt Git directory changed during index stage inspection")
         if foreign_stages:
             raise CandidateUncertain("attempt Git directory contains a foreign candidate index stage")
+        for name, expected in abandoned:
+            path = admin.path / name
+            try:
+                info = path.stat(follow_symlinks=False)
+            except OSError as error:
+                raise CandidateUncertain("abandoned candidate Git index stage cannot be inspected") from error
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != expected
+            ):
+                raise CandidateUncertain("abandoned candidate Git index stage changed and is preserved")
         if device is None and inode is None:
             if record.get("state") == "ready":
                 raise CandidateUncertain("ready candidate has no durable index staging identity")
             if lock.exists() or lock.is_symlink():
                 raise CandidateUncertain("attempt Git index lock contains foreign state")
+            if backup.exists() or backup.is_symlink():
+                raise CandidateUncertain("attempt Git index backup contains foreign state")
             if stage.exists() or stage.is_symlink():
                 try:
                     info = stage.stat(follow_symlinks=False)
@@ -1322,9 +1570,14 @@ class AttemptWorktrees:
             "stage": stage,
             "lock": lock,
             "index": admin.index_path,
+            "backup": backup,
         }
         present: dict[str, _CandidateFileSnapshot] = {}
         expected = (int(device), int(inode))
+        base_identity = record.get("base_index_identity")
+        if not isinstance(base_identity, list) or len(base_identity) != 7:
+            raise CandidateUncertain("candidate journal has an invalid base index identity")
+        expected_base = (int(base_identity[0]), int(base_identity[1]))
         for label, path in locations.items():
             try:
                 info = path.stat(follow_symlinks=False)
@@ -1337,6 +1590,16 @@ class AttemptWorktrees:
             if (info.st_dev, info.st_ino) != expected:
                 if label == "index":
                     continue
+                if label in {"lock", "backup"} and (info.st_dev, info.st_ino) == expected_base:
+                    displaced = _candidate_bound_file_snapshot(
+                        path,
+                        expected=expected_base,
+                        label=f"displaced candidate Git index {label}",
+                    )
+                    if not _candidate_snapshot_matches_recorded_base(record, displaced):
+                        raise CandidateUncertain("displaced candidate Git index differs from its recorded base")
+                    present[f"displaced-{label}"] = displaced
+                    continue
                 raise CandidateUncertain(f"candidate Git index {label} is foreign state")
             present[label] = _candidate_bound_file_snapshot(
                 path, expected=expected, label=f"candidate Git index {label}"
@@ -1345,16 +1608,20 @@ class AttemptWorktrees:
         if topology not in {
             frozenset({"stage"}),
             frozenset({"stage", "lock"}),
-            frozenset({"lock"}),
-            frozenset({"index"}),
+            frozenset({"stage", "index", "displaced-lock"}),
+            frozenset({"stage", "index", "displaced-backup"}),
         }:
             raise CandidateUncertain("candidate Git index stage has an invalid link topology")
-        for snapshot in present.values():
-            if snapshot.identity[3] != len(topology):
+        candidate_locations = {label for label in topology if not label.startswith("displaced-")}
+        for label, snapshot in present.items():
+            if label.startswith("displaced-"):
+                continue
+            if snapshot.identity[3] != len(candidate_locations):
                 raise CandidateUncertain("candidate Git index stage has an external hard link")
             if snapshot.sha256 != candidate.sha256 or snapshot.content != candidate.content:
-                raise CandidateUncertain("candidate Git index stage differs from its durable intent")
-        if record.get("state") == "ready" and topology != frozenset({"index"}):
+                if record.get("state") != "prepared" or topology != frozenset({"stage"}):
+                    raise CandidateUncertain("candidate Git index stage differs from its durable intent")
+        if record.get("state") == "ready" and topology != _READY_CANDIDATE_INDEX_TOPOLOGY:
             raise CandidateUncertain("ready candidate has unresolved Git index staging")
         return topology
 
@@ -1476,8 +1743,12 @@ class AttemptWorktrees:
         objects: tuple[tuple[str, str], ...],
         *,
         label: str,
+        expected_contents: tuple[bytes, ...] | None = None,
+        object_directory: Path | None = None,
     ) -> tuple[str | None, ...]:
         """Stream and independently hash exact objects through one hardened Git process."""
+        if expected_contents is not None and len(expected_contents) != len(objects):
+            raise CandidateUncertain(f"{label} has an invalid expected object inventory")
         self._verify_repository()
         process: subprocess.Popen[bytes] | None = None
         stderr_thread: threading.Thread | None = None
@@ -1508,6 +1779,9 @@ class AttemptWorktrees:
                 for oid, _ in objects:
                     requests.write(f"{oid}\n".encode("ascii"))
                 requests.seek(0)
+                environment = _git_environment()
+                if object_directory is not None:
+                    environment["GIT_OBJECT_DIRECTORY"] = str(object_directory)
                 try:
                     process = subprocess.Popen(
                         _git_command(
@@ -1518,7 +1792,7 @@ class AttemptWorktrees:
                             ]
                         ),
                         cwd=self.repository_root,
-                        env=_git_environment(),
+                        env=environment,
                         stdin=requests,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -1569,6 +1843,7 @@ class AttemptWorktrees:
                         self.object_format,
                         label=label,
                         progress=note_progress,
+                        expected_contents=expected_contents,
                     )
                 except CandidateUncertain as error:
                     if timed_out.is_set():
@@ -1627,26 +1902,43 @@ class AttemptWorktrees:
             if cleanup_error is not None:
                 raise CandidateUncertain(f"{label} Git process could not be reaped") from cleanup_error
 
-    def _write_candidate_object(self, object_type: str, expected_oid: str, content: bytes) -> None:
-        proc = self._run_git_bytes(
-            ["hash-object", "-t", object_type, "-w", "--stdin", "--no-filters"],
-            input_bytes=content,
-        )
-        try:
-            observed = proc.stdout.decode("ascii").strip()
-        except UnicodeDecodeError as error:  # pragma: no cover - Git object IDs are ASCII
-            raise CandidateUncertain("git hash-object returned a malformed object id") from error
-        if observed != expected_oid:
-            raise CandidateUncertain(f"git wrote an unexpected {object_type} object")
-        stored = self._run_git_bytes(["cat-file", object_type, expected_oid]).stdout
-        if stored != content:
-            raise CandidateUncertain(f"stored {object_type} object does not match its expected bytes")
+    def _write_candidate_objects(self, objects: tuple[tuple[str, str, bytes], ...]) -> None:
+        """Write candidate objects in a constant number of Git invocations."""
+        grouped: dict[str, list[tuple[str, bytes]]] = {"blob": [], "tree": [], "commit": []}
+        for object_type, expected_oid, content in objects:
+            if object_type not in grouped or _git_object_oid(object_type, content, self.object_format) != expected_oid:
+                raise CandidateUncertain("candidate object inventory has an invalid identity")
+            grouped[object_type].append((expected_oid, content))
+
+        with tempfile.TemporaryDirectory(prefix="autoform-candidate-objects-") as scratch:
+            scratch_path = Path(scratch)
+            for object_type, values in grouped.items():
+                if not values:
+                    continue
+                paths: list[Path] = []
+                for index, (_, content) in enumerate(values):
+                    path = scratch_path / f"{object_type}-{index}"
+                    path.write_bytes(content)
+                    paths.append(path)
+                payload = b"".join(os.fsencode(path) + b"\n" for path in paths)
+                proc = self._run_git_bytes(
+                    ["hash-object", "-t", object_type, "-w", "--stdin-paths", "--no-filters"],
+                    input_bytes=payload,
+                )
+                try:
+                    observed = proc.stdout.decode("ascii").splitlines()
+                except UnicodeDecodeError as error:  # pragma: no cover - Git object IDs are ASCII
+                    raise CandidateUncertain("git hash-object returned malformed object ids") from error
+                if observed != [oid for oid, _ in values]:
+                    raise CandidateUncertain(f"git wrote unexpected {object_type} objects")
+        self._verify_candidate_objects(objects)
 
     def _verify_candidate_objects(self, objects: tuple[tuple[str, str, bytes], ...]) -> None:
-        for object_type, expected_oid, content in objects:
-            stored = self._run_git_bytes(["cat-file", object_type, expected_oid], check=False)
-            if stored.returncode != 0 or stored.stdout != content:
-                raise CandidateUncertain(f"candidate {object_type} object is missing or invalid")
+        self._verify_candidate_object_batch(
+            tuple((expected_oid, object_type) for object_type, expected_oid, _ in objects),
+            label="candidate object set",
+            expected_contents=tuple(content for _, _, content in objects),
+        )
 
     def _verify_candidate_object(
         self,
@@ -1676,6 +1968,344 @@ class AttemptWorktrees:
             if hashlib.sha256(content[len(prefix) :]).hexdigest() != record["message_sha256"]:
                 raise CandidateUncertain("candidate commit message differs from the durable intent")
 
+    def _import_candidate_closure(self, closure_objects: tuple[tuple[str, str], ...]) -> None:
+        """Copy the exact candidate/base tree closure into owned primary storage."""
+        closure: dict[str, str] = {}
+        for oid, object_type in closure_objects:
+            try:
+                _validate_oid(oid)
+            except RepositoryError as error:
+                raise CandidateUncertain("candidate closure inventory is malformed") from error
+            if len(oid) != hashlib.new(self.object_format).digest_size * 2:
+                raise CandidateUncertain("candidate closure object id has the wrong format")
+            if object_type not in {"blob", "tree", "commit"}:
+                raise CandidateUncertain("candidate closure inventory has an invalid object type")
+            previous = closure.setdefault(oid, object_type)
+            if previous != object_type:
+                raise CandidateUncertain("candidate closure inventory has conflicting object types")
+        if not closure:
+            raise CandidateUncertain("candidate closure inventory is empty")
+        loose = {oid for oid in closure if self._primary_loose_object_exists(oid)}
+        packed = self._primary_packed_object_oids(tuple((oid, closure[oid]) for oid in sorted(set(closure) - loose)))
+        missing = tuple(oid for oid in closure if oid not in loose and oid not in packed)
+        if not missing:
+            return
+
+        self._verify_repository()
+        with tempfile.TemporaryFile() as pack:
+            try:
+                packed = subprocess.run(
+                    _git_command(
+                        [
+                            "--no-replace-objects",
+                            "pack-objects",
+                            "--stdout",
+                            "--no-reuse-delta",
+                            "--no-reuse-object",
+                            "--no-thin",
+                            "--no-include-tag",
+                            "--window=0",
+                        ]
+                    ),
+                    cwd=self.repository_root,
+                    env=_git_environment(),
+                    input=b"".join(f"{oid}\n".encode("ascii") for oid in missing),
+                    stdout=pack,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise CandidateUncertain(f"candidate closure pack failed: {error}") from error
+            self._verify_repository()
+            if packed.returncode != 0:
+                detail = packed.stderr.decode("utf-8", errors="replace").strip()[:500]
+                raise CandidateUncertain(f"candidate closure pack failed: {detail}")
+            pack.flush()
+            os.fsync(pack.fileno())
+            pack.seek(0)
+            try:
+                installed = subprocess.run(
+                    _git_command(["--no-replace-objects", "index-pack", "--stdin", "--strict"]),
+                    cwd=self.repository_root,
+                    env=_git_environment(),
+                    stdin=pack,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise CandidateUncertain(f"candidate closure installation failed: {error}") from error
+        self._verify_repository()
+        if installed.returncode != 0:
+            detail = installed.stderr.decode("utf-8", errors="replace").strip()[:500]
+            raise CandidateUncertain(f"candidate closure installation failed: {detail}")
+        match = re.fullmatch(rb"pack\t([0-9a-f]+)\n", installed.stdout)
+        if match is None or len(match.group(1)) != hashlib.new(self.object_format).digest_size * 2:
+            raise CandidateUncertain("candidate closure installation returned a malformed pack id")
+        pack_oid = match.group(1).decode("ascii")
+        pack_dir = _existing_real_directory(self.object_dir / "pack", label="primary Git pack directory")
+        installed_pack = pack_dir / f"pack-{pack_oid}.pack"
+        installed_index = pack_dir / f"pack-{pack_oid}.idx"
+        _fsync_primary_pack_file(installed_pack, label="installed candidate closure pack")
+        _fsync_primary_pack_file(installed_index, label="installed candidate closure pack index")
+        try:
+            _fsync_directory(pack_dir)
+        except OSError as error:
+            raise CandidateUncertain("candidate closure pack directory could not be synchronized") from error
+        verified = self._verified_primary_pack_objects(installed_pack, installed_index)
+        expected = {(oid, closure[oid]) for oid in missing}
+        if verified != expected:
+            raise CandidateUncertain("installed candidate closure pack does not match its exact inventory")
+        self._verify_repository()
+
+    def _primary_loose_object_exists(self, oid: str) -> bool:
+        path = self.object_dir / oid[:2] / oid[2:]
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            if path.is_symlink():
+                raise CandidateUncertain("primary Git object is a dangling symbolic link")
+            return False
+        except OSError as error:
+            raise CandidateUncertain("primary Git object cannot be inspected") from error
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise CandidateUncertain("primary Git object is not a regular file")
+        return True
+
+    def _primary_packed_object_oids(self, wanted: tuple[tuple[str, str], ...]) -> frozenset[str]:
+        if not wanted:
+            return frozenset()
+        pack_dir = _existing_real_directory(self.object_dir / "pack", label="primary Git pack directory")
+        try:
+            packs = sorted(pack_dir.glob("pack-*.pack"))
+        except OSError as error:
+            raise CandidateUncertain("primary Git pack inventory cannot be inspected") from error
+        if not packs:
+            return frozenset()
+
+        self._verify_repository()
+        bindings = {
+            pack: (
+                _primary_pack_file_identity(pack, label="primary Git pack"),
+                _primary_pack_file_identity(pack.with_suffix(".idx"), label="primary Git pack index"),
+            )
+            for pack in packs
+        }
+        process: subprocess.Popen[bytes] | None = None
+        timer: threading.Timer | None = None
+        timed_out = threading.Event()
+        found: set[str] = set()
+        trace_offset = 0
+        with tempfile.TemporaryFile() as trace, tempfile.TemporaryFile() as stderr:
+            environment = _git_environment()
+            environment["GIT_TRACE_PACK_ACCESS"] = _inherited_descriptor_path(trace.fileno())
+            try:
+                process = subprocess.Popen(
+                    _git_command(
+                        ["--no-replace-objects", "cat-file", "--batch=%(objectname) %(objecttype) %(objectsize)"]
+                    ),
+                    cwd=self.repository_root,
+                    env=environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    pass_fds=(trace.fileno(),),
+                )
+            except OSError as error:
+                raise CandidateUncertain(f"primary Git packed object inspection failed: {error}") from error
+
+            def expire() -> None:
+                timed_out.set()
+                if process is not None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+
+            timer = threading.Timer(_CANDIDATE_BATCH_TIMEOUT_S, expire)
+            timer.daemon = True
+            timer.start()
+            try:
+                if process.stdin is None or process.stdout is None:  # pragma: no cover - PIPE invariant
+                    raise CandidateUncertain("primary Git packed object inspection has no data pipes")
+                for oid, object_type in wanted:
+                    try:
+                        process.stdin.write(f"{oid}\n".encode("ascii"))
+                        process.stdin.flush()
+                    except OSError as error:
+                        raise CandidateUncertain("primary Git packed object request failed") from error
+                    _verify_candidate_object_batch_output(
+                        process.stdout,
+                        ((oid, object_type),),
+                        self.object_format,
+                        label="primary Git packed object",
+                        require_eof=False,
+                    )
+                    trace_size = os.fstat(trace.fileno()).st_size
+                    if trace_size < trace_offset:
+                        raise CandidateUncertain("primary Git pack trace changed during inspection")
+                    if trace_size - trace_offset > _PRIMARY_PACK_TRACE_MAX_BYTES:
+                        raise CandidateUncertain("primary Git pack trace exceeded its per-object limit")
+                    try:
+                        trace_bytes = os.pread(trace.fileno(), trace_size - trace_offset, trace_offset)
+                    except OSError as error:
+                        raise CandidateUncertain("primary Git pack trace could not be read") from error
+                    trace_offset = trace_size
+                    accesses = _primary_pack_trace_paths(trace_bytes, repository_root=self.repository_root)
+                    primary_accesses = {path for path in accesses if path in bindings}
+                    if primary_accesses and primary_accesses != set(accesses):
+                        raise CandidateUncertain("primary Git pack lookup fell back to alternate storage")
+                    if primary_accesses:
+                        found.add(oid)
+                process.stdin.close()
+                if process.stdout.read(1):
+                    raise CandidateUncertain("primary Git packed object inspection returned trailing output")
+                returncode = process.wait()
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+            stderr.seek(0)
+            detail_bytes = stderr.read(_CANDIDATE_BATCH_STDERR_BYTES + 1)
+        if timed_out.is_set():
+            raise CandidateUncertain("primary Git packed object inspection timed out")
+        if returncode != 0 or detail_bytes:
+            detail = detail_bytes.decode("utf-8", errors="replace").strip()[:_CANDIDATE_BATCH_STDERR_BYTES]
+            raise CandidateUncertain(f"primary Git packed object inspection failed: {detail}")
+        for pack, (pack_identity, index_identity) in bindings.items():
+            if _primary_pack_file_identity(pack, label="primary Git pack") != pack_identity or (
+                _primary_pack_file_identity(pack.with_suffix(".idx"), label="primary Git pack index") != index_identity
+            ):
+                raise CandidateUncertain("primary Git pack storage changed during inspection")
+        self._verify_repository()
+        return frozenset(found)
+
+    def _verified_primary_pack_objects(
+        self,
+        pack: Path,
+        index: Path,
+    ) -> frozenset[tuple[str, str]]:
+        """Verify one exact primary pack and cache its object inventory."""
+        self._verify_repository()
+        pack_stat = _primary_pack_file_identity(pack, label="primary Git pack")
+        index_stat = _primary_pack_file_identity(index, label="primary Git pack index")
+        pack_identity, pack_sha256 = _primary_pack_file_digest(pack, label="primary Git pack")
+        index_identity, index_sha256 = _primary_pack_file_digest(index, label="primary Git pack index")
+        if pack_identity != pack_stat or index_identity != index_stat:
+            raise CandidateUncertain("primary Git pack storage changed before verification")
+        objects = self._verify_primary_pack_output(pack, index)
+        if _primary_pack_file_digest(pack, label="primary Git pack") != (pack_identity, pack_sha256) or (
+            _primary_pack_file_digest(index, label="primary Git pack index") != (index_identity, index_sha256)
+        ):
+            raise CandidateUncertain("primary Git pack storage changed during verification")
+        self._verify_repository()
+        return objects
+
+    def _verify_primary_pack_output(self, pack: Path, index: Path) -> frozenset[tuple[str, str]]:
+        """Run Git's pack verifier with bounded, streamed output."""
+        process: subprocess.Popen[bytes] | None = None
+        timed_out = threading.Event()
+        timer: threading.Timer | None = None
+        objects: set[tuple[str, str]] = set()
+        total_bytes = 0
+        ok_line = os.fsencode(pack) + b": ok"
+        saw_ok = False
+        failure: str | None = None
+        with tempfile.TemporaryFile() as stderr:
+            try:
+                process = subprocess.Popen(
+                    _git_command(["--no-replace-objects", "verify-pack", "-v", "--", str(index)]),
+                    cwd=self.repository_root,
+                    env=_git_environment(),
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                )
+            except OSError as error:
+                raise CandidateUncertain(f"primary Git pack verification failed: {error}") from error
+
+            def expire() -> None:
+                timed_out.set()
+                if process is not None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+
+            timer = threading.Timer(_CANDIDATE_BATCH_TIMEOUT_S, expire)
+            timer.daemon = True
+            timer.start()
+            try:
+                if process.stdout is None:  # pragma: no cover - subprocess invariant
+                    raise CandidateUncertain("primary Git pack verifier has no output stream")
+                while True:
+                    line = process.stdout.readline(_PRIMARY_PACK_VERIFY_MAX_LINE_BYTES + 1)
+                    if not line:
+                        break
+                    total_bytes += len(line)
+                    if total_bytes > _PRIMARY_PACK_VERIFY_MAX_BYTES:
+                        failure = "primary Git pack verification exceeded its output limit"
+                        process.kill()
+                        break
+                    if len(line) > _PRIMARY_PACK_VERIFY_MAX_LINE_BYTES or not line.endswith(b"\n"):
+                        failure = "primary Git pack verification returned a malformed line"
+                        process.kill()
+                        break
+                    value = line[:-1]
+                    match = re.fullmatch(
+                        rb"([0-9a-f]{40}|[0-9a-f]{64}) +(commit|tree|blob|tag) +"
+                        rb"[0-9]+ +[0-9]+ +[0-9]+(?: +[0-9]+ +[0-9a-f]{40,64})?",
+                        value,
+                    )
+                    if match is not None:
+                        oid = match.group(1).decode("ascii")
+                        object_type = match.group(2).decode("ascii")
+                        if len(oid) != hashlib.new(self.object_format).digest_size * 2:
+                            failure = "primary Git pack verification returned an invalid object id"
+                            process.kill()
+                            break
+                        objects.add((oid, object_type))
+                        if len(objects) > _PRIMARY_PACK_VERIFY_MAX_OBJECTS:
+                            failure = "primary Git pack verification exceeded its object limit"
+                            process.kill()
+                            break
+                    elif re.fullmatch(rb"non delta: [0-9]+ objects?", value) or re.fullmatch(
+                        rb"chain length = [0-9]+: [0-9]+ objects?", value
+                    ):
+                        continue
+                    elif value == ok_line:
+                        saw_ok = True
+                    else:
+                        failure = "primary Git pack verification returned malformed output"
+                        process.kill()
+                        break
+                returncode = process.wait()
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+            stderr.seek(0)
+            detail_bytes = stderr.read(_CANDIDATE_BATCH_STDERR_BYTES + 1)
+        if timed_out.is_set():
+            raise CandidateUncertain("primary Git pack verification timed out")
+        if failure is not None:
+            raise CandidateUncertain(failure)
+        if returncode != 0 or detail_bytes:
+            detail = detail_bytes.decode("utf-8", errors="replace").strip()[:_CANDIDATE_BATCH_STDERR_BYTES]
+            raise CandidateUncertain(f"primary Git pack verification failed: {detail}")
+        if not saw_ok:
+            raise CandidateUncertain("primary Git pack verification returned no success marker")
+        return frozenset(objects)
+
     def _assert_ready_candidate_tree(self, record: Mapping[str, object], tree: Path) -> None:
         if record["state"] != "ready":
             raise CandidateUncertain("candidate recovery must finish before cleanup")
@@ -1696,10 +2326,10 @@ class AttemptWorktrees:
             or list(admin.head_snapshot.identity) != record.get("candidate_head_identity")
         ):
             raise CandidateUncertain("ready candidate HEAD no longer matches its journal")
-        index = _candidate_private_file_snapshot(admin.index_path, label="attempt Git index")
+        index = self._candidate_index_snapshot(admin, record, label="attempt Git index")
         candidate_index = self._candidate_index_image(tree, str(record["candidate_oid"]), dict(snapshot.entries))
         self._assert_recorded_candidate_index(record, candidate_index)
-        if self._candidate_index_stage_topology(admin, record, candidate_index) != frozenset({"index"}):
+        if self._candidate_index_stage_topology(admin, record, candidate_index) != _READY_CANDIDATE_INDEX_TOPOLOGY:
             raise CandidateUncertain("ready candidate has unresolved Git index staging")
         if self._candidate_index_state(record, index) != "candidate":
             raise CandidateUncertain("ready candidate Git index identity changed")
@@ -1742,8 +2372,10 @@ class AttemptWorktrees:
                 "candidate_index_sha256",
                 "candidate_index_identity",
                 "candidate_index_stage_name",
+                "candidate_index_backup_name",
                 "candidate_index_stage_device",
                 "candidate_index_stage_inode",
+                "candidate_index_abandoned_stages",
                 "config_snapshot_sha256",
             )
         }
@@ -1856,10 +2488,16 @@ class AttemptWorktrees:
         elif candidate_index_identity is not None:
             raise CandidateUncertain("prepared candidate journal has a premature candidate index identity")
         stage_name = record.get("candidate_index_stage_name")
+        backup_name = record.get("candidate_index_backup_name")
         stage_device = record.get("candidate_index_stage_device")
         stage_inode = record.get("candidate_index_stage_inode")
         if not isinstance(stage_name, str) or not _CANDIDATE_INDEX_STAGE_NAME.fullmatch(stage_name):
             raise CandidateUncertain("candidate journal has an invalid index staging identity")
+        if not isinstance(backup_name, str) or not _CANDIDATE_INDEX_BACKUP_NAME.fullmatch(backup_name):
+            raise CandidateUncertain("candidate journal has an invalid index backup name")
+        if backup_name.removesuffix(".base") != stage_name.removesuffix(".stage"):
+            raise CandidateUncertain("candidate journal has mismatched index transition names")
+        _candidate_abandoned_index_stages(record)
         if stage_device is None and stage_inode is None:
             if record.get("state") == "ready":
                 raise CandidateUncertain("ready candidate journal has no index staging identity")
@@ -1901,6 +2539,7 @@ class AttemptWorktrees:
         with self._attempt_lock(run_id, attempt_id):
             self._verify_state()
             if not attempt_root.exists() and not attempt_root.is_symlink():
+                self._remove_empty_run_root(attempt_root.parent)
                 return
             if not marker.exists() and not marker.is_symlink():
                 self._remove_empty_attempt_scaffold(attempt_root, tree)
@@ -1943,12 +2582,12 @@ class AttemptWorktrees:
             if record["state"] != "cleaning":
                 if tree not in self._registered_worktrees():
                     if tree.exists() or tree.is_symlink():
-                        try:
-                            tree.rmdir()
-                        except OSError as error:
-                            raise WorktreeConflict(
-                                "unregistered attempt path is not an empty owned directory"
-                            ) from error
+                        _remove_bound_empty_directory(
+                            tree,
+                            (int(record["tree_device"]), int(record["tree_inode"])),
+                            label="unregistered attempt path",
+                            checkpoint="worktree-cleanup-before-empty-tree-quarantine",
+                        )
                     else:
                         raise WorktreeConflict("registered attempt worktree disappeared before cleanup")
                 else:
@@ -1965,9 +2604,7 @@ class AttemptWorktrees:
                             )
                         foreign = self._foreign_tree_entry(tree)
                         if foreign is not None:
-                            raise WorktreeConflict(
-                                f"attempt worktree contains unowned path {foreign}; cleanup stopped"
-                            )
+                            raise WorktreeConflict(f"attempt worktree contains unowned path {foreign}; cleanup stopped")
                     else:
                         self._assert_ready_candidate_tree(candidate_record, tree)
                     if cleanup_tree.exists() or cleanup_tree.is_symlink():
@@ -1992,10 +2629,12 @@ class AttemptWorktrees:
                 self._continue_cleanup(record, marker, tree, cleanup_tree, candidate_record=candidate_record)
             elif tree.exists() or tree.is_symlink():
                 self._verify_tree_binding(tree, require_head=False)
-                try:
-                    tree.rmdir()
-                except OSError as error:
-                    raise WorktreeConflict("unregistered attempt path is not an empty owned directory") from error
+                _remove_bound_empty_directory(
+                    tree,
+                    (int(record["tree_device"]), int(record["tree_inode"])),
+                    label="unregistered attempt path",
+                    checkpoint="worktree-cleanup-before-empty-tree-quarantine",
+                )
             if candidate_record is not None:
                 if not candidate_journal.exists() and not candidate_journal.is_symlink():
                     raise CandidateUncertain("candidate journal disappeared during cleanup")
@@ -2005,17 +2644,36 @@ class AttemptWorktrees:
                     "cleanup_head_oid"
                 ):
                     raise CandidateUncertain("candidate journal changed during cleanup")
-                candidate_journal.unlink()
-                _fsync_directory(attempt_root)
+                candidate_snapshot = _candidate_private_file_snapshot(
+                    candidate_journal,
+                    label="candidate journal",
+                )
+                if candidate_snapshot.content != _json_bytes(final_candidate_record) + b"\n":
+                    raise CandidateUncertain("candidate journal changed during cleanup")
+                _remove_bound_private_file(
+                    candidate_journal,
+                    candidate_snapshot,
+                    label="candidate journal",
+                    checkpoint="candidate-cleanup-before-journal-quarantine",
+                )
                 _checkpoint("candidate-journal-removed")
             if marker.exists() or marker.is_symlink():
-                marker.unlink()
-                _fsync_directory(attempt_root)
+                marker_snapshot = _candidate_private_file_snapshot(marker, label="attempt marker")
+                if marker_snapshot.content != _json_bytes(record) + b"\n":
+                    raise WorktreeConflict("attempt marker changed during cleanup")
+                _remove_bound_private_file(
+                    marker,
+                    marker_snapshot,
+                    label="attempt marker",
+                    checkpoint="worktree-cleanup-before-marker-quarantine",
+                )
                 _checkpoint("worktree-marker-removed")
-            try:
-                attempt_root.rmdir()
-            except OSError as error:
-                raise WorktreeConflict("attempt directory contains foreign state; cleanup stopped") from error
+            _remove_bound_empty_directory(
+                attempt_root,
+                (int(record["root_device"]), int(record["root_inode"])),
+                label="attempt directory",
+                checkpoint="worktree-cleanup-before-attempt-quarantine",
+            )
             self._remove_empty_run_root(attempt_root.parent)
 
     def _continue_cleanup(
@@ -2048,8 +2706,17 @@ class AttemptWorktrees:
                     raise WorktreeConflict("attempt worktree changed after cleanup intent was recorded")
             else:
                 self._assert_ready_candidate_tree(candidate_record, tree)
-            os.rename(tree, cleanup_tree)
-            _fsync_directory(cleanup_tree.parent)
+            _checkpoint("worktree-cleanup-before-quarantine")
+            try:
+                _rename_noreplace(tree, cleanup_tree)
+                _fsync_directory(cleanup_tree.parent)
+            except OSError as error:
+                raise WorktreeConflict("attempt worktree could not be quarantined safely") from error
+            if cleanup_tree.is_symlink() or _directory_identity(cleanup_tree) != (
+                record["cleanup_device"],
+                record["cleanup_inode"],
+            ):
+                raise WorktreeConflict("attempt worktree was replaced; its quarantine is preserved")
             _checkpoint("worktree-quarantined")
 
         if cleanup_tree.exists() or cleanup_tree.is_symlink():
@@ -2078,10 +2745,12 @@ class AttemptWorktrees:
     def _remove_quarantined_worktree(self, record: Mapping[str, object], cleanup_tree: Path) -> None:
         dot_git = cleanup_tree / ".git"
         if not dot_git.exists() and not dot_git.is_symlink():
-            try:
-                cleanup_tree.rmdir()
-            except OSError as error:
-                raise WorktreeConflict("cleanup quarantine contains foreign state") from error
+            _remove_bound_empty_directory(
+                cleanup_tree,
+                (int(record["cleanup_device"]), int(record["cleanup_inode"])),
+                label="attempt cleanup quarantine",
+                checkpoint="worktree-cleanup-before-final-quarantine",
+            )
             return
         if _git_entry_identity(cleanup_tree) != (
             record["git_entry_device"],
@@ -2125,46 +2794,85 @@ class AttemptWorktrees:
                     raise WorktreeConflict(f"tracked cleanup path changed: {relative}") from error
                 hashed = _git_blob_oid(content, self.object_format)
             after = path.lstat()
-            before_snapshot = (
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            after_snapshot = (
-                after.st_dev,
-                after.st_ino,
-                after.st_mode,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
+            before_snapshot = _candidate_stat_identity(before)
+            after_snapshot = _candidate_stat_identity(after)
             if before_snapshot != after_snapshot or hashed != oid:
                 raise WorktreeConflict(f"tracked cleanup path changed or no longer matches HEAD: {relative}")
-            path.unlink()
+            quarantine = _quarantine_bound_path(
+                path,
+                (before.st_dev, before.st_ino),
+                label=f"tracked cleanup path {relative}",
+                checkpoint=f"worktree-cleanup-before-path-quarantine:{relative}",
+                kind="symlink" if mode == "120000" else "regular",
+            )
+
+            def verify_quarantined_path(candidate: Path) -> None:
+                try:
+                    moved = candidate.lstat()
+                    moved_snapshot = _candidate_stat_identity(moved)
+                    if moved_snapshot[:6] != before_snapshot[:6]:
+                        raise WorktreeConflict(f"tracked cleanup path changed while being quarantined: {relative}")
+                    if mode == "120000":
+                        moved_content = os.fsencode(os.readlink(candidate))
+                    else:
+                        moved_content, _ = _read_candidate_regular_file(candidate, moved, relative)
+                    if _git_blob_oid(moved_content, self.object_format) != oid:
+                        raise WorktreeConflict(f"tracked cleanup path changed while being quarantined: {relative}")
+                except OSError as error:
+                    raise WorktreeConflict(f"tracked cleanup path could not be verified safely: {relative}") from error
+
+            verify_quarantined_path(quarantine)
+            quarantine = _final_removal_quarantine(
+                quarantine,
+                (before.st_dev, before.st_ino),
+                label=f"tracked cleanup path {relative}",
+                checkpoint=f"worktree-cleanup-before-path-final-isolation:{relative}",
+                kind="symlink" if mode == "120000" else "regular",
+            )
+            try:
+                verify_quarantined_path(quarantine)
+                quarantine.unlink()
+                _fsync_directory(path.parent)
+            except OSError as error:
+                raise WorktreeConflict(f"tracked cleanup path could not be removed safely: {relative}") from error
         for directory in sorted(tracked_directories, key=lambda path: len(path.parts), reverse=True):
             try:
-                directory.rmdir()
+                identity = _directory_identity(directory)
             except FileNotFoundError:
                 continue
-            except OSError as error:
+            except RepositoryError as error:
                 raise WorktreeConflict(f"cleanup quarantine preserves foreign state at {directory}") from error
+            _remove_bound_empty_directory(
+                directory,
+                identity,
+                label=f"tracked cleanup directory {directory}",
+                checkpoint="worktree-cleanup-before-directory-quarantine",
+            )
         remaining = [entry.name for entry in os.scandir(cleanup_tree) if entry.name != ".git"]
         if remaining:
             raise WorktreeConflict(f"cleanup quarantine preserves foreign state at {remaining[0]}")
-        if _git_entry_identity(cleanup_tree) != (
+        expected_git_identity = (
             record["git_entry_device"],
             record["git_entry_inode"],
             record["git_entry_sha256"],
-        ):
+        )
+        if _git_entry_identity(cleanup_tree) != expected_git_identity:
             raise WorktreeConflict("attempt cleanup Git identity changed")
-        dot_git.unlink()
-        try:
-            cleanup_tree.rmdir()
-        except OSError as error:
-            raise WorktreeConflict("cleanup quarantine changed before removal") from error
+        git_snapshot = _candidate_private_file_snapshot(dot_git, label="attempt cleanup Git file")
+        if (git_snapshot.identity[0], git_snapshot.identity[1], git_snapshot.sha256) != expected_git_identity:
+            raise WorktreeConflict("attempt cleanup Git identity changed")
+        _remove_bound_private_file(
+            dot_git,
+            git_snapshot,
+            label="attempt cleanup Git file",
+            checkpoint="worktree-cleanup-before-git-quarantine",
+        )
+        _remove_bound_empty_directory(
+            cleanup_tree,
+            (int(record["cleanup_device"]), int(record["cleanup_inode"])),
+            label="attempt cleanup quarantine",
+            checkpoint="worktree-cleanup-before-final-quarantine",
+        )
 
     def _cleanup_head_entries(self, head_oid: str) -> dict[str, tuple[str, str]]:
         _validate_oid(head_oid)
@@ -2194,22 +2902,43 @@ class AttemptWorktrees:
         _remove_atomic_write_orphans(attempt_root / "attempt.json")
         entries = list(attempt_root.iterdir())
         if entries == [tree] and not tree.is_symlink() and _canonical_existing_directory(tree) == tree:
-            try:
-                tree.rmdir()
-            except OSError as error:
-                raise WorktreeConflict("attempt path exists without a durable ownership marker") from error
-            entries = []
+            tree_identity = _directory_identity(tree)
+            _remove_bound_empty_directory(
+                tree,
+                tree_identity,
+                label="unowned empty attempt tree",
+                checkpoint="worktree-scaffold-before-tree-quarantine",
+            )
+            entries = list(attempt_root.iterdir())
         if entries:
             raise WorktreeConflict("attempt path exists without a durable ownership marker")
-        attempt_root.rmdir()
+        _remove_bound_empty_directory(
+            attempt_root,
+            _directory_identity(attempt_root),
+            label="unowned empty attempt scaffold",
+            checkpoint="worktree-scaffold-before-attempt-quarantine",
+        )
 
     @staticmethod
     def _remove_empty_run_root(run_root: Path) -> None:
         try:
-            run_root.rmdir()
+            info = run_root.stat(follow_symlinks=False)
         except OSError:
             return
-        _fsync_directory(run_root.parent)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return
+        try:
+            with os.scandir(run_root) as iterator:
+                if next(iterator, None) is not None:
+                    return
+        except OSError:
+            return
+        _remove_bound_empty_directory(
+            run_root,
+            (info.st_dev, info.st_ino),
+            label="empty run directory",
+            checkpoint="worktree-cleanup-before-run-quarantine",
+        )
 
     def _resume_preparation(
         self,
@@ -2715,6 +3444,8 @@ class AttemptWorktrees:
             _directory_identity(self.common_git_dir) != self._common_git_identity
         ):
             raise RepositoryError("common Git directory was replaced")
+        if hasattr(self, "_object_dir_identity") and _directory_identity(self.object_dir) != self._object_dir_identity:
+            raise RepositoryError("primary Git object directory was replaced")
 
     def _verify_state(self) -> None:
         for path, expected, label in (
@@ -4109,10 +4840,14 @@ def _validate_candidate_identity(author_name: str, author_email: str) -> None:
         character in "<>" or ord(character) < 32 or ord(character) == 127 for character in author_name
     ):
         raise RepositoryError("candidate author name contains a forbidden commit-header character")
-    if len(author_email.encode("utf-8", errors="ignore")) > 256 or any(
-        character in "<>" or character.isspace() or ord(character) < 32 or ord(character) == 127
-        for character in author_email
-    ) or "@" not in author_email:
+    if (
+        len(author_email.encode("utf-8", errors="ignore")) > 256
+        or any(
+            character in "<>" or character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in author_email
+        )
+        or "@" not in author_email
+    ):
         raise RepositoryError("candidate author email is not safe for a commit header")
     try:
         author_name.encode("utf-8")
@@ -4148,10 +4883,14 @@ def _verify_candidate_object_batch_output(
     *,
     label: str,
     progress: Callable[[], None] | None = None,
+    expected_contents: tuple[bytes, ...] | None = None,
+    require_eof: bool = True,
 ) -> tuple[str | None, ...]:
+    if expected_contents is not None and len(expected_contents) != len(objects):
+        raise CandidateUncertain(f"{label} has an invalid expected object inventory")
     tree_oids: list[str | None] = []
-    for oid, object_type in objects:
-        if object_type not in {"blob", "commit"}:
+    for object_index, (oid, object_type) in enumerate(objects):
+        if object_type not in {"blob", "tree", "commit"}:
             raise CandidateUncertain(f"{label} requested an unsupported object type")
         header = stream.readline(_CANDIDATE_BATCH_HEADER_BYTES + 1)
         if header and progress is not None:
@@ -4159,11 +4898,7 @@ def _verify_candidate_object_batch_output(
         if len(header) > _CANDIDATE_BATCH_HEADER_BYTES or not header.endswith(b"\n"):
             raise CandidateUncertain(f"{label} is incomplete: truncated batch header")
         fields = header[:-1].split(b" ")
-        if (
-            len(fields) != 3
-            or fields[0] != oid.encode("ascii")
-            or fields[1] != object_type.encode("ascii")
-        ):
+        if len(fields) != 3 or fields[0] != oid.encode("ascii") or fields[1] != object_type.encode("ascii"):
             raise CandidateUncertain(f"{label} is incomplete: invalid batch header")
         try:
             size = int(fields[2])
@@ -4174,6 +4909,10 @@ def _verify_candidate_object_batch_output(
 
         digest = hashlib.new(object_format)
         digest.update(f"{object_type} {size}\0".encode("ascii"))
+        expected_content = None if expected_contents is None else expected_contents[object_index]
+        if expected_content is not None and len(expected_content) != size:
+            raise CandidateUncertain(f"{label} has unexpected {object_type} content")
+        expected_offset = 0
         first_line = bytearray() if object_type == "commit" else None
         first_line_complete = False
         remaining = size
@@ -4184,6 +4923,10 @@ def _verify_candidate_object_batch_output(
             if progress is not None:
                 progress()
             digest.update(chunk)
+            if expected_content is not None:
+                if chunk != expected_content[expected_offset : expected_offset + len(chunk)]:
+                    raise CandidateUncertain(f"{label} has unexpected {object_type} content")
+                expected_offset += len(chunk)
             if first_line is not None and not first_line_complete:
                 prefix, separator, _ = chunk.partition(b"\n")
                 first_line.extend(prefix)
@@ -4216,7 +4959,7 @@ def _verify_candidate_object_batch_output(
             if len(tree_oid) != hashlib.new(object_format).digest_size * 2:
                 raise CandidateUncertain(f"{label} has an invalid commit tree header")
         tree_oids.append(tree_oid)
-    if stream.read(1):
+    if require_eof and stream.read(1):
         raise CandidateUncertain(f"{label} is incomplete: trailing batch output")
     return tuple(tree_oids)
 
@@ -4255,6 +4998,8 @@ def _snapshot_regular_tree(
     object_format: str,
     *,
     retained_paths: frozenset[str],
+    required_paths: frozenset[str],
+    hash_files: bool = True,
 ) -> tuple[
     dict[str, tuple[str, str]],
     dict[str, bytes],
@@ -4266,6 +5011,12 @@ def _snapshot_regular_tree(
     identities: dict[str, tuple[int, ...]] = {}
     directories: dict[str, tuple[int, ...]] = {}
     retained_bytes = 0
+    required_directories = {
+        "/".join(parts[:index])
+        for path in required_paths
+        for parts in (path.split("/"),)
+        for index in range(1, len(parts))
+    }
     directory_flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_DIRECTORY"):
         directory_flags |= os.O_DIRECTORY
@@ -4287,7 +5038,7 @@ def _snapshot_regular_tree(
             label = relative_directory or "."
             raise CandidateUncertain(f"candidate directory changed while being inspected: {label}")
         if relative_directory:
-            directories[relative_directory] = before_identity
+            directories[relative_directory] = before_identity[:3]
         _checkpoint(f"candidate-directory-listed:{relative_directory or '.'}")
         for entry in sorted(entries, key=lambda item: item.name.encode("utf-8", errors="surrogateescape")):
             relative = f"{relative_directory}/{entry.name}" if relative_directory else entry.name
@@ -4299,6 +5050,15 @@ def _snapshot_regular_tree(
                 info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as error:
                 raise CandidateUncertain(f"candidate path cannot be inspected safely: {relative}") from error
+            generated = bool(GENERATED_DIRECTORY_NAMES.intersection(relative.split("/")))
+            required = relative in required_paths or relative in required_directories
+            if generated and not required:
+                ordinary_directory = stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                ordinary_file = stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_nlink == 1
+                if not ordinary_directory and not ordinary_file:
+                    kind = "symbolic link" if stat.S_ISLNK(info.st_mode) else "special or shared file"
+                    raise CandidateUncertain(f"candidate generated output is not ordinary: {relative} ({kind})")
+                continue
             if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
                 try:
                     child_fd = os.open(entry.name, directory_flags, dir_fd=directory_fd)
@@ -4324,14 +5084,27 @@ def _snapshot_regular_tree(
             if retain and retained_bytes + info.st_size > _MAX_CANDIDATE_TOTAL_BLOB_BYTES:
                 limit_mib = _MAX_CANDIDATE_TOTAL_BLOB_BYTES // (1024 * 1024)
                 raise CandidateUncertain(f"candidate allowed files exceed the {limit_mib} MiB aggregate safety limit")
-            oid, content, identity = _hash_candidate_regular_file_at(
-                directory_fd,
-                entry.name,
-                info,
-                relative,
-                object_format=object_format,
-                retain=retain,
-            )
+            if hash_files:
+                oid, content, identity = _hash_candidate_regular_file_at(
+                    directory_fd,
+                    entry.name,
+                    info,
+                    relative,
+                    object_format=object_format,
+                    retain=retain,
+                )
+            else:
+                if info.st_nlink != 1:
+                    raise CandidateUncertain(f"candidate path is not a private regular file: {relative}")
+                identity = _candidate_stat_identity(info)
+                try:
+                    current = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as error:
+                    raise CandidateUncertain(f"candidate path cannot be rechecked safely: {relative}") from error
+                if _candidate_stat_identity(current) != identity:
+                    raise CandidateUncertain(f"candidate regular file changed while being inspected: {relative}")
+                oid = ""
+                content = None
             mode = "100755" if info.st_mode & 0o111 else "100644"
             files[relative] = (mode, oid)
             if content is not None:
@@ -4553,6 +5326,216 @@ def _candidate_private_file_snapshot(path: Path, *, label: str) -> _CandidateFil
         sha256=hashlib.sha256(content).hexdigest(),
         content=content,
     )
+
+
+def _candidate_snapshot_matches_recorded_base(
+    record: Mapping[str, object],
+    snapshot: _CandidateFileSnapshot,
+) -> bool:
+    identity = record.get("base_index_identity")
+    return (
+        isinstance(identity, list)
+        and len(identity) == 7
+        and list(snapshot.identity[:5]) == identity[:5]
+        and snapshot.sha256 == record.get("base_index_sha256")
+    )
+
+
+def _exchange_paths(left: Path, right: Path) -> None:
+    """Atomically exchange two directory entries without discarding either one."""
+    import ctypes
+
+    library = ctypes.CDLL(None, use_errno=True)
+    left_bytes = os.fsencode(left)
+    right_bytes = os.fsencode(right)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(left_bytes, right_bytes, 0x00000002)
+    elif sys.platform.startswith("linux"):
+        rename = library.renameat2
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(-100, left_bytes, -100, right_bytes, 0x00000002)
+    else:  # pragma: no cover - no portable atomic exchange primitive
+        raise OSError("atomic path exchange is unsupported on this platform")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(left), str(right))
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename one entry only when the destination is absent."""
+    import ctypes
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        rename = library.renameat2
+        rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, destination_bytes, 0x00000001)
+    else:  # pragma: no cover - no portable no-replace rename primitive
+        raise OSError("atomic no-replace rename is unsupported on this platform")
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(source), str(destination))
+
+
+def _quarantine_bound_path(
+    path: Path,
+    expected: tuple[int, int],
+    *,
+    label: str,
+    checkpoint: str,
+    kind: str,
+) -> Path:
+    name_digest = hashlib.sha256(os.fsencode(path.name)).hexdigest()[:16]
+    quarantine = path.with_name(
+        f".autoform-removing-{name_digest}-{expected[0]:x}-{expected[1]:x}-{secrets.token_hex(16)}"
+    )
+    if quarantine.exists() or quarantine.is_symlink():  # pragma: no cover - random collision
+        raise WorktreeConflict(f"{label} quarantine already exists")
+    _checkpoint(checkpoint)
+    try:
+        _rename_noreplace(path, quarantine)
+        _fsync_directory(path.parent)
+        moved = quarantine.stat(follow_symlinks=False)
+    except OSError as error:
+        raise WorktreeConflict(f"{label} could not be quarantined safely") from error
+    expected_type = {
+        "directory": stat.S_ISDIR,
+        "regular": stat.S_ISREG,
+        "symlink": stat.S_ISLNK,
+    }.get(kind)
+    if expected_type is None:  # pragma: no cover - internal invariant
+        raise WorktreeConflict(f"{label} has an unsupported quarantine type")
+    if (
+        not expected_type(moved.st_mode)
+        or (kind != "symlink" and stat.S_ISLNK(moved.st_mode))
+        or (moved.st_dev, moved.st_ino) != expected
+    ):
+        raise WorktreeConflict(f"{label} was replaced; its quarantine is preserved")
+    return quarantine
+
+
+def _final_removal_quarantine(
+    path: Path,
+    expected: tuple[int, int],
+    *,
+    label: str,
+    checkpoint: str,
+    kind: str,
+) -> Path:
+    """Re-isolate a verified entry immediately before its final removal.
+
+    The second unpredictable no-replace rename preserves a bounded concurrent
+    replacement made after the first validation. A continuously hostile
+    same-UID process that discovers and races every random name is outside the
+    repository lifecycle-containment contract.
+    """
+    return _quarantine_bound_path(
+        path,
+        expected,
+        label=label,
+        checkpoint=checkpoint,
+        kind=kind,
+    )
+
+
+def _remove_bound_private_file(
+    path: Path,
+    expected: _CandidateFileSnapshot,
+    *,
+    label: str,
+    checkpoint: str,
+) -> None:
+    quarantine = _quarantine_bound_path(
+        path,
+        (int(expected.identity[0]), int(expected.identity[1])),
+        label=label,
+        checkpoint=checkpoint,
+        kind="regular",
+    )
+    moved = _candidate_bound_file_snapshot(
+        quarantine,
+        expected=(int(expected.identity[0]), int(expected.identity[1])),
+        label=f"quarantined {label}",
+    )
+    if (
+        moved.identity[:6] != expected.identity[:6]
+        or moved.sha256 != expected.sha256
+        or moved.content != expected.content
+    ):
+        raise WorktreeConflict(f"{label} changed while being quarantined; its quarantine is preserved")
+    quarantine = _final_removal_quarantine(
+        quarantine,
+        (int(expected.identity[0]), int(expected.identity[1])),
+        label=label,
+        checkpoint=f"{checkpoint}-final-isolation",
+        kind="regular",
+    )
+    moved = _candidate_bound_file_snapshot(
+        quarantine,
+        expected=(int(expected.identity[0]), int(expected.identity[1])),
+        label=f"final quarantined {label}",
+    )
+    if (
+        moved.identity[:6] != expected.identity[:6]
+        or moved.sha256 != expected.sha256
+        or moved.content != expected.content
+    ):
+        raise WorktreeConflict(f"{label} changed during final isolation; its quarantine is preserved")
+    try:
+        quarantine.unlink()
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise WorktreeConflict(f"quarantined {label} could not be removed") from error
+
+
+def _remove_bound_empty_directory(
+    path: Path,
+    expected: tuple[int, int],
+    *,
+    label: str,
+    checkpoint: str,
+) -> None:
+    quarantine = _quarantine_bound_path(
+        path,
+        expected,
+        label=label,
+        checkpoint=checkpoint,
+        kind="directory",
+    )
+    try:
+        with os.scandir(quarantine) as iterator:
+            if next(iterator, None) is not None:
+                raise WorktreeConflict(f"{label} quarantine contains foreign state")
+        if _directory_identity(quarantine) != expected:
+            raise WorktreeConflict(f"{label} quarantine was replaced")
+        quarantine = _final_removal_quarantine(
+            quarantine,
+            expected,
+            label=label,
+            checkpoint=f"{checkpoint}-final-isolation",
+            kind="directory",
+        )
+        with os.scandir(quarantine) as iterator:
+            if next(iterator, None) is not None:
+                raise WorktreeConflict(f"{label} final quarantine contains foreign state")
+        if _directory_identity(quarantine) != expected:
+            raise WorktreeConflict(f"{label} final quarantine was replaced")
+        quarantine.rmdir()
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise WorktreeConflict(f"{label} quarantine could not be removed") from error
 
 
 def _candidate_bound_file_snapshot(
@@ -4804,19 +5787,39 @@ def _write_bytes_file(path: Path, content: bytes) -> None:
         dir=path.parent,
     )
     temporary = Path(temporary_name)
+    created_identity: tuple[int, int] | None = None
+    written: _CandidateFileSnapshot | None = None
     try:
+        created = os.fstat(descriptor)
+        created_identity = (created.st_dev, created.st_ino)
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+        stream = os.fdopen(descriptor, "wb", closefd=True)
+        descriptor = -1
+        with stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        written = _atomic_state_file_snapshot(
+            temporary,
+            expected=created_identity,
+            label="atomic state temporary file",
+        )
+        if written.content != content:
+            raise RepositoryError(f"atomic state temporary file changed before installation: {temporary}")
         os.replace(temporary, path)
         _fsync_directory(path.parent)
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created_identity is not None:
+            _remove_exact_atomic_state_file(
+                temporary,
+                expected_identity=created_identity,
+                expected_snapshot=written,
+                prefix=_atomic_write_prefix(path),
+                label="atomic state temporary file",
+                missing_ok=True,
+            )
 
 
 def _atomic_write_prefix(path: Path) -> str:
@@ -4824,11 +5827,150 @@ def _atomic_write_prefix(path: Path) -> str:
     return f".autoform-state-{target}-"
 
 
+def _atomic_state_stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (*_candidate_stat_identity(info), info.st_uid)
+
+
+def _atomic_state_file_snapshot(
+    path: Path,
+    *,
+    expected: tuple[int, int] | None,
+    label: str,
+) -> _CandidateFileSnapshot:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise RepositoryError(f"{label} cannot be inspected: {path}") from error
+    owner_matches = not hasattr(os, "geteuid") or info.st_uid == os.geteuid()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or not owner_matches
+        or info.st_size > 1024 * 1024
+    ):
+        raise RepositoryError(f"{label} is not a safe orphan: {path}")
+    identity = _atomic_state_stat_identity(info)
+    if expected is not None and identity[:2] != expected:
+        raise RepositoryError(f"{label} contains a replacement: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RepositoryError(f"{label} cannot be opened safely: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if _atomic_state_stat_identity(opened) != identity:
+            raise RepositoryError(f"{label} changed while being opened: {path}")
+        content = bytearray()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            content.extend(chunk)
+            remaining -= len(chunk)
+        extra = os.read(descriptor, 1) if not remaining else b""
+        if remaining or extra or _atomic_state_stat_identity(os.fstat(descriptor)) != identity:
+            raise RepositoryError(f"{label} changed while being read: {path}")
+    finally:
+        os.close(descriptor)
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise RepositoryError(f"{label} disappeared after being read: {path}") from error
+    if _atomic_state_stat_identity(current) != identity:
+        raise RepositoryError(f"{label} changed after being read: {path}")
+    data = bytes(content)
+    return _CandidateFileSnapshot(identity=identity, sha256=hashlib.sha256(data).hexdigest(), content=data)
+
+
+def _atomic_state_snapshots_match(left: _CandidateFileSnapshot, right: _CandidateFileSnapshot) -> bool:
+    return (
+        left.identity[:6] == right.identity[:6]
+        and left.identity[7:] == right.identity[7:]
+        and left.sha256 == right.sha256
+        and left.content == right.content
+    )
+
+
+def _quarantine_atomic_state_file(
+    path: Path,
+    expected: _CandidateFileSnapshot,
+    *,
+    prefix: str,
+    label: str,
+) -> tuple[Path, _CandidateFileSnapshot]:
+    quarantine = path.with_name(
+        f"{prefix}quarantine-{expected.identity[0]:x}-{expected.identity[1]:x}-{os.urandom(16).hex()}.tmp"
+    )
+    try:
+        _rename_noreplace(path, quarantine)
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise RepositoryError(f"{label} cannot be quarantined: {path}") from error
+    moved = _atomic_state_file_snapshot(
+        quarantine,
+        expected=None,
+        label=label,
+    )
+    if not _atomic_state_snapshots_match(moved, expected):
+        raise RepositoryError(f"{label} changed while being quarantined: {quarantine}")
+    return quarantine, moved
+
+
+def _remove_exact_atomic_state_file(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_snapshot: _CandidateFileSnapshot | None,
+    prefix: str,
+    label: str,
+    missing_ok: bool,
+) -> None:
+    """Remove one bound temp file after two verified no-replace isolations.
+
+    The second unpredictable rename preserves a bounded replacement made after
+    the first validation. A continuously hostile same-UID process that races
+    every random name is outside the repository lifecycle-containment contract.
+    """
+    try:
+        path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok and not path.is_symlink():
+            return
+        raise RepositoryError(f"{label} disappeared before cleanup: {path}") from None
+    except OSError as error:
+        raise RepositoryError(f"{label} cannot be inspected before cleanup: {path}") from error
+    current = _atomic_state_file_snapshot(path, expected=expected_identity, label=label)
+    if expected_snapshot is not None and not _atomic_state_snapshots_match(current, expected_snapshot):
+        raise RepositoryError(f"{label} changed before cleanup: {path}")
+    quarantine, current = _quarantine_atomic_state_file(
+        path,
+        current,
+        prefix=prefix,
+        label=label,
+    )
+    quarantine, current = _quarantine_atomic_state_file(
+        quarantine,
+        current,
+        prefix=prefix,
+        label=f"final quarantined {label}",
+    )
+    try:
+        quarantine.unlink()
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise RepositoryError(f"{label} cannot be removed safely: {quarantine}") from error
+
+
 def _remove_atomic_write_orphans(path: Path) -> None:
     """Remove only private regular files reserved for atomic writes to ``path``."""
     prefix = _atomic_write_prefix(path)
     quarantine_pattern = re.compile(rf"^{re.escape(prefix)}quarantine-([0-9a-f]+)-([0-9a-f]+)-[0-9a-f]{{32}}\.tmp$")
-    removed = False
     try:
         entries = list(os.scandir(path.parent))
     except OSError as error:
@@ -4837,75 +5979,20 @@ def _remove_atomic_write_orphans(path: Path) -> None:
         if not entry.name.startswith(prefix) or not entry.name.endswith(".tmp"):
             continue
         candidate = Path(entry.path)
-        try:
-            info = candidate.lstat()
-        except OSError as error:
-            raise RepositoryError(f"atomic state temporary file cannot be inspected: {candidate}") from error
-        owner_matches = not hasattr(os, "geteuid") or info.st_uid == os.geteuid()
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or not owner_matches
-            or info.st_size > 1024 * 1024
-        ):
-            raise RepositoryError(f"reserved atomic state path is not a safe orphan: {candidate}")
-        flags = os.O_RDONLY | os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        try:
-            descriptor = os.open(candidate, flags)
-        except OSError as error:
-            raise RepositoryError(f"atomic state temporary file cannot be opened safely: {candidate}") from error
-        try:
-            opened = os.fstat(descriptor)
-            identity = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_uid)
-            opened_identity = (
-                opened.st_dev,
-                opened.st_ino,
-                opened.st_mode,
-                opened.st_nlink,
-                opened.st_size,
-                opened.st_uid,
-            )
-            if opened_identity != identity:
-                raise RepositoryError(f"atomic state temporary file changed: {candidate}")
-        finally:
-            os.close(descriptor)
-
+        snapshot = _atomic_state_file_snapshot(candidate, expected=None, label="reserved atomic state path")
         quarantined = quarantine_pattern.fullmatch(candidate.name)
         if quarantined is not None:
             expected_identity = (int(quarantined.group(1), 16), int(quarantined.group(2), 16))
-            if expected_identity != identity[:2]:
+            if expected_identity != snapshot.identity[:2]:
                 raise RepositoryError(f"atomic state quarantine contains a replacement: {candidate}")
-            quarantine = candidate
-        else:
-            quarantine = candidate.with_name(
-                f"{prefix}quarantine-{info.st_dev:x}-{info.st_ino:x}-{os.urandom(16).hex()}.tmp"
-            )
-            if quarantine.exists() or quarantine.is_symlink():  # pragma: no cover - random collision
-                raise RepositoryError(f"atomic state quarantine path already exists: {quarantine}")
-            try:
-                os.rename(candidate, quarantine)
-                _fsync_directory(path.parent)
-                moved = quarantine.lstat()
-            except OSError as error:
-                raise RepositoryError(f"atomic state temporary file cannot be quarantined: {candidate}") from error
-            moved_identity = (
-                moved.st_dev,
-                moved.st_ino,
-                moved.st_mode,
-                moved.st_nlink,
-                moved.st_size,
-                moved.st_uid,
-            )
-            if moved_identity != identity:
-                raise RepositoryError(f"atomic state temporary file changed while being quarantined: {quarantine}")
-        quarantine.unlink()
-        removed = True
-    if removed:
-        _fsync_directory(path.parent)
+        _remove_exact_atomic_state_file(
+            candidate,
+            expected_identity=(int(snapshot.identity[0]), int(snapshot.identity[1])),
+            expected_snapshot=snapshot,
+            prefix=prefix,
+            label="atomic state temporary file",
+            missing_ok=False,
+        )
 
 
 def _transport_config(object_format: str) -> bytes:
@@ -4995,6 +6082,126 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _primary_pack_file_identity(path: Path, *, label: str) -> tuple[int, ...]:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be inspected safely") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_nlink < 1:
+        raise CandidateUncertain(f"{label} is not regular primary storage")
+    return _candidate_stat_identity(info)
+
+
+def _primary_pack_trace_paths(content: bytes, *, repository_root: Path) -> tuple[Path, ...]:
+    if not content:
+        return ()
+    if not content.endswith(b"\n"):
+        raise CandidateUncertain("primary Git pack trace returned a truncated record")
+    result: list[Path] = []
+    for line in content.splitlines():
+        match = re.fullmatch(rb".*packfile\.c:[0-9]+ +(.+) +[0-9]+", line)
+        if match is None or b"\0" in match.group(1):
+            raise CandidateUncertain("primary Git pack trace returned a malformed record")
+        value = Path(os.fsdecode(match.group(1)))
+        if not value.is_absolute():
+            value = repository_root / value
+        result.append(Path(os.path.abspath(value)))
+    return tuple(result)
+
+
+def _inherited_descriptor_path(descriptor: int) -> str:
+    if sys.platform == "darwin" and os.path.isdir("/dev/fd"):
+        return f"/dev/fd/{descriptor}"
+    if sys.platform.startswith("linux") and os.path.isdir("/proc/self/fd"):
+        return f"/proc/self/fd/{descriptor}"
+    raise CandidateUncertain("primary Git pack tracing requires Darwin or Linux descriptor paths")
+
+
+def _primary_pack_file_digest(path: Path, *, label: str) -> tuple[tuple[int, ...], str]:
+    before_identity = _primary_pack_file_identity(path, label=label)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be opened safely") from error
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if _candidate_stat_identity(opened) != before_identity:
+            raise CandidateUncertain(f"{label} changed while being opened")
+        while True:
+            chunk = os.read(descriptor, _CANDIDATE_BLOB_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+        finished = os.fstat(descriptor)
+        if _candidate_stat_identity(finished) != before_identity:
+            raise CandidateUncertain(f"{label} changed while being read")
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be read safely") from error
+    finally:
+        os.close(descriptor)
+    if _primary_pack_file_identity(path, label=label) != before_identity:
+        raise CandidateUncertain(f"{label} was replaced after being read")
+    return before_identity, digest.hexdigest()
+
+
+def _fsync_primary_pack_file(path: Path, *, label: str) -> None:
+    before_identity = _primary_pack_file_identity(path, label=label)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be opened safely") from error
+    try:
+        if _candidate_stat_identity(os.fstat(descriptor)) != before_identity:
+            raise CandidateUncertain(f"{label} changed while being opened")
+        os.fsync(descriptor)
+        if _candidate_stat_identity(os.fstat(descriptor)) != before_identity:
+            raise CandidateUncertain(f"{label} changed while being synchronized")
+    except OSError as error:
+        raise CandidateUncertain(f"{label} cannot be synchronized") from error
+    finally:
+        os.close(descriptor)
+    if _primary_pack_file_identity(path, label=label) != before_identity:
+        raise CandidateUncertain(f"{label} was replaced after being synchronized")
+
+
+def _candidate_abandoned_index_stages(
+    record: Mapping[str, object],
+) -> tuple[tuple[str, tuple[int, int]], ...]:
+    value = record.get("candidate_index_abandoned_stages")
+    if not isinstance(value, list) or len(value) > _MAX_CANDIDATE_ABANDONED_INDEX_STAGES:
+        raise CandidateUncertain("candidate journal has an invalid abandoned index stage inventory")
+    active = record.get("candidate_index_stage_name")
+    seen: set[str] = set()
+    result: list[tuple[str, tuple[int, int]]] = []
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"name", "device", "inode"}:
+            raise CandidateUncertain("candidate journal has an invalid abandoned index stage")
+        name = entry.get("name")
+        device = entry.get("device")
+        inode = entry.get("inode")
+        if (
+            not isinstance(name, str)
+            or not _CANDIDATE_INDEX_STAGE_NAME.fullmatch(name)
+            or name == active
+            or name in seen
+            or not _is_integer(device)
+            or not _is_integer(inode)
+            or int(device) < 0
+            or int(inode) < 0
+        ):
+            raise CandidateUncertain("candidate journal has an invalid abandoned index stage")
+        seen.add(name)
+        result.append((name, (int(device), int(inode))))
+    return tuple(result)
 
 
 def _checkpoint(_name: str) -> None:

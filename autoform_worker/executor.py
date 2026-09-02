@@ -20,13 +20,11 @@ from servers.prover.muse_adapter import MuseAdapter
 from servers.prover.verify import Baseline, _declaration_bounds, restore_baseline
 from servers.lean_client import LeanRuntimeClient, LeanRuntimeError
 
+from ._paths import GENERATED_DIRECTORY_NAMES
 from .scheduler import AttemptResult, CancellationSignal, WorkItem, WorkPhase
 
 AdapterFactory = Callable[[], ProverAdapter]
 
-_IGNORED_PARTS = frozenset(
-    {".git", ".hg", ".lake", ".sl", ".venv", "__pycache__", "build", "lake-packages"}
-)
 _DIAGNOSTIC_SUMMARY = re.compile(r"^Diagnostics: (\d+) error\(s\), (\d+) warning\(s\)(?:\n|$)")
 
 
@@ -347,7 +345,7 @@ def _capture_statement_baseline(project_dir: Path) -> Baseline:
     files: dict[str, bytes] = {}
     for path in sorted(project_dir.rglob("*")):
         relative = path.relative_to(project_dir)
-        if _IGNORED_PARTS.intersection(relative.parts) or not path.is_file() or path.is_symlink():
+        if GENERATED_DIRECTORY_NAMES.intersection(relative.parts) or not path.is_file() or path.is_symlink():
             continue
         files[relative.as_posix()] = path.read_bytes()
     return Baseline(root=project_dir, files=files)

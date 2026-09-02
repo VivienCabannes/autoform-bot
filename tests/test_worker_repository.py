@@ -5,6 +5,7 @@ import io
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -587,15 +588,15 @@ def test_atomic_write_orphan_swap_is_quarantined_and_preserved(
     replacement = tmp_path / "replacement"
     replacement.write_text("foreign replacement\n", encoding="utf-8")
     replacement.chmod(0o600)
-    original_rename = os.rename
+    original_rename_noreplace = repository_module._rename_noreplace
 
     def swap_before_quarantine(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
         if Path(source) == orphan:
-            original_rename(orphan, original)
-            original_rename(replacement, orphan)
-        original_rename(source, destination)
+            os.rename(orphan, original)
+            os.rename(replacement, orphan)
+        original_rename_noreplace(Path(source), Path(destination))
 
-    monkeypatch.setattr(repository_module.os, "rename", swap_before_quarantine)
+    monkeypatch.setattr(repository_module, "_rename_noreplace", swap_before_quarantine)
     monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
     with pytest.raises(RepositoryError, match="changed while being quarantined"):
         manager.prepare("run-1", "attempt-1", base_oid=base)
@@ -627,24 +628,98 @@ def test_atomic_write_orphan_quarantine_is_resumable(
     orphan = marker.parent / f"{prefix}deadbeef.tmp"
     orphan.write_bytes(b'{"partial":')
     orphan.chmod(0o600)
-    original_rename = os.rename
+    original_rename_noreplace = repository_module._rename_noreplace
 
     def interrupt_after_quarantine(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
-        original_rename(source, destination)
+        original_rename_noreplace(Path(source), Path(destination))
         if Path(source) == orphan:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(repository_module.os, "rename", interrupt_after_quarantine)
+    monkeypatch.setattr(repository_module, "_rename_noreplace", interrupt_after_quarantine)
     monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
     with pytest.raises(KeyboardInterrupt):
         manager.prepare("run-1", "attempt-1", base_oid=base)
     quarantined = list(marker.parent.glob(f"{prefix}quarantine-*.tmp"))
     assert len(quarantined) == 1
 
-    monkeypatch.setattr(repository_module.os, "rename", original_rename)
+    monkeypatch.setattr(repository_module, "_rename_noreplace", original_rename_noreplace)
     recovered = manager.prepare("run-1", "attempt-1", base_oid=base)
     assert recovered.state == "ready"
     assert not quarantined[0].exists()
+
+
+def test_atomic_write_orphan_swap_after_validation_preserves_both_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    target = state / "attempt.json"
+    prefix = repository_module._atomic_write_prefix(target)
+    orphan = state / f"{prefix}deadbeef.tmp"
+    orphan.write_bytes(b'{"partial":')
+    orphan.chmod(0o600)
+    original = tmp_path / "original-orphan"
+    replacement = tmp_path / "replacement"
+    replacement.write_text("foreign replacement\n", encoding="utf-8")
+    replacement.chmod(0o600)
+    original_snapshot = repository_module._atomic_state_file_snapshot
+    swapped = False
+
+    def swap_after_validation(
+        path: Path,
+        *,
+        expected: tuple[int, int] | None,
+        label: str,
+    ) -> repository_module._CandidateFileSnapshot:
+        nonlocal swapped
+        snapshot = original_snapshot(path, expected=expected, label=label)
+        if not swapped and "quarantine-" in path.name:
+            os.rename(path, original)
+            os.rename(replacement, path)
+            swapped = True
+        return snapshot
+
+    monkeypatch.setattr(repository_module, "_atomic_state_file_snapshot", swap_after_validation)
+    with pytest.raises(RepositoryError, match="changed while being quarantined"):
+        repository_module._remove_atomic_write_orphans(target)
+
+    quarantined = list(state.glob(f"{prefix}quarantine-*.tmp"))
+    assert swapped
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "foreign replacement\n"
+    assert original.read_bytes() == b'{"partial":'
+
+
+def test_atomic_write_final_cleanup_preserves_replacement_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "state.json"
+    original = tmp_path / "original-temporary"
+    replacement = tmp_path / "replacement"
+    replacement.write_text("foreign replacement\n", encoding="utf-8")
+    replacement.chmod(0o600)
+    original_replace = os.replace
+    temporary: Path | None = None
+
+    def replace_after_validation(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        nonlocal temporary
+        if Path(destination) == target:
+            temporary = Path(source)
+            os.rename(source, original)
+            os.rename(replacement, source)
+            raise OSError("injected replacement")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(repository_module.os, "replace", replace_after_validation)
+    with pytest.raises(RepositoryError, match="contains a replacement"):
+        repository_module._write_bytes_file(target, b"owned state\n")
+
+    assert temporary is not None
+    assert temporary.read_text(encoding="utf-8") == "foreign replacement\n"
+    assert original.read_bytes() == b"owned state\n"
+    assert not target.exists()
 
 
 @pytest.mark.parametrize(
@@ -790,6 +865,288 @@ def test_cleanup_preserves_late_tracked_mode_change(
     assert not quarantine.exists()
 
 
+def test_cleanup_preserves_worktree_path_replacement_before_quarantine(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    tree = Path(receipt.path)
+    owned_tree = tmp_path / "owned-tree"
+    cleanup_tree = tree.with_name("tree-cleaning")
+
+    def replace_tree(name: str) -> None:
+        if name == "worktree-cleanup-before-quarantine":
+            tree.rename(owned_tree)
+            tree.mkdir(mode=0o700)
+            tree.joinpath("foreign.txt").write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_tree)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    assert owned_tree.joinpath("book.txt").read_text(encoding="utf-8") == "base\n"
+    assert cleanup_tree.joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign\n"
+
+
+def test_cleanup_preserves_tracked_path_replacement_before_removal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    cleanup_tree = Path(receipt.path).with_name("tree-cleaning")
+    owned_book = tmp_path / "owned-book.txt"
+
+    def replace_book(name: str) -> None:
+        if name == "worktree-cleanup-before-path-quarantine:book.txt":
+            book = cleanup_tree / "book.txt"
+            book.rename(owned_book)
+            book.write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_book)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    preserved = list(cleanup_tree.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "foreign\n"
+    assert owned_book.read_text(encoding="utf-8") == "base\n"
+
+
+def test_cleanup_preserves_git_file_replacement_before_removal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    cleanup_tree = Path(receipt.path).with_name("tree-cleaning")
+    owned_git = tmp_path / "owned-dot-git"
+
+    def replace_git(name: str) -> None:
+        if name == "worktree-cleanup-before-git-quarantine":
+            dot_git = cleanup_tree / ".git"
+            dot_git.rename(owned_git)
+            dot_git.write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_git)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    preserved = list(cleanup_tree.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "foreign\n"
+    assert owned_git.read_text(encoding="utf-8").startswith("gitdir: ")
+
+
+def test_cleanup_preserves_final_tree_replacement_before_removal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    tree = Path(receipt.path)
+    cleanup_tree = tree.with_name("tree-cleaning")
+    owned_tree = tmp_path / "owned-empty-tree"
+
+    def replace_tree(name: str) -> None:
+        if name == "worktree-cleanup-before-final-quarantine":
+            cleanup_tree.rename(owned_tree)
+            cleanup_tree.mkdir(mode=0o700)
+            cleanup_tree.joinpath("foreign.txt").write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_tree)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    preserved = list(cleanup_tree.parent.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign\n"
+    assert owned_tree.is_dir()
+
+
+def test_cleanup_preserves_marker_replacement_before_removal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    attempt_root = Path(receipt.path).parent
+    marker = attempt_root / "attempt.json"
+    owned_marker = tmp_path / "owned-attempt.json"
+
+    def replace_marker(name: str) -> None:
+        if name == "worktree-cleanup-before-marker-quarantine":
+            marker.rename(owned_marker)
+            marker.write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_marker)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    preserved = list(attempt_root.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "foreign\n"
+    assert json.loads(owned_marker.read_bytes())["state"] == "cleaning"
+
+
+def test_cleanup_preserves_candidate_journal_replacement_before_removal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+    journal = tree.parent / "candidate.json"
+    owned_journal = tmp_path / "owned-candidate.json"
+
+    def replace_journal(name: str) -> None:
+        if name == "candidate-cleanup-before-journal-quarantine":
+            journal.rename(owned_journal)
+            journal.write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_journal)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    preserved = list(journal.parent.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "foreign\n"
+    assert json.loads(owned_journal.read_bytes())["state"] == "ready"
+
+
+def test_private_file_removal_preserves_replacement_after_quarantine_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "owned.json"
+    target.write_bytes(b"owned\n")
+    expected = repository_module._candidate_private_file_snapshot(target, label="test file")
+    owned = tmp_path / "saved-owned.json"
+    original_snapshot = repository_module._candidate_bound_file_snapshot
+    swapped = False
+
+    def swap_after_snapshot(
+        path: Path,
+        *,
+        expected: tuple[int, int],
+        label: str,
+    ) -> object:
+        nonlocal swapped
+        snapshot = original_snapshot(path, expected=expected, label=label)
+        if not swapped and path.name.startswith(".autoform-removing-"):
+            path.rename(owned)
+            path.write_bytes(b"foreign\n")
+            swapped = True
+        return snapshot
+
+    monkeypatch.setattr(repository_module, "_candidate_bound_file_snapshot", swap_after_snapshot)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        repository_module._remove_bound_private_file(
+            target,
+            expected,
+            label="test file",
+            checkpoint="test-file-quarantine",
+        )
+
+    preserved = list(tmp_path.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == b"foreign\n"
+    assert owned.read_bytes() == b"owned\n"
+
+
+def test_empty_directory_removal_preserves_replacement_after_quarantine_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "owned-directory"
+    target.mkdir()
+    expected = repository_module._directory_identity(target)
+    owned = tmp_path / "saved-owned-directory"
+    original_identity = repository_module._directory_identity
+    swapped = False
+
+    def swap_after_identity(path: Path) -> tuple[int, int]:
+        nonlocal swapped
+        identity = original_identity(path)
+        if not swapped and path.name.startswith(".autoform-removing-"):
+            path.rename(owned)
+            path.mkdir()
+            path.joinpath("foreign.txt").write_text("foreign\n", encoding="utf-8")
+            swapped = True
+        return identity
+
+    monkeypatch.setattr(repository_module, "_directory_identity", swap_after_identity)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        repository_module._remove_bound_empty_directory(
+            target,
+            expected,
+            label="test directory",
+            checkpoint="test-directory-quarantine",
+        )
+
+    preserved = list(tmp_path.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].joinpath("foreign.txt").read_text(encoding="utf-8") == "foreign\n"
+    assert owned.is_dir()
+
+
+def test_cleanup_preserves_tracked_replacement_after_quarantine_validation(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    cleanup_tree = Path(receipt.path).with_name("tree-cleaning")
+    owned_book = tmp_path / "saved-owned-book.txt"
+    original_read = repository_module._read_candidate_regular_file
+    swapped = False
+
+    def swap_after_read(
+        path: Path,
+        expected: os.stat_result,
+        relative: str,
+    ) -> tuple[bytes, tuple[int, ...]]:
+        nonlocal swapped
+        result = original_read(path, expected, relative)
+        if not swapped and relative == "book.txt" and path.name.startswith(".autoform-removing-"):
+            path.rename(owned_book)
+            path.write_text("foreign\n", encoding="utf-8")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(repository_module, "_read_candidate_regular_file", swap_after_read)
+    with pytest.raises(WorktreeConflict, match="replaced; its quarantine is preserved"):
+        manager.cleanup("run-1", "attempt-1")
+
+    preserved = list(cleanup_tree.glob(".autoform-removing-*"))
+    assert len(preserved) == 1
+    assert preserved[0].read_text(encoding="utf-8") == "foreign\n"
+    assert owned_book.read_text(encoding="utf-8") == "base\n"
+
+
 def test_cleanup_accepts_canonical_executable_and_symlink_modes(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
@@ -809,14 +1166,39 @@ def test_cleanup_accepts_canonical_executable_and_symlink_modes(
     assert not Path(receipt.path).exists()
 
 
+def test_cleanup_quarantine_name_does_not_expand_long_tracked_filename(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, _ = git_repository
+    long_name = "x" * 240
+    coordinator.joinpath(long_name).write_text("long path\n", encoding="utf-8")
+    _git("add", long_name, cwd=coordinator)
+    _git("commit", "--quiet", "-m", "long path fixture", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+
+    receipt = manager.prepare("run-1", "attempt-1", base_oid=base)
+    manager.cleanup("run-1", "attempt-1")
+
+    assert not Path(receipt.path).exists()
+
+
 @pytest.mark.parametrize(
     "boundary",
     (
         "worktree-cleanup-intent-recorded",
+        "worktree-cleanup-before-quarantine",
         "worktree-quarantined",
+        "worktree-cleanup-before-path-quarantine:.gitignore",
+        "worktree-cleanup-before-git-quarantine",
+        "worktree-cleanup-before-final-quarantine",
         "worktree-quarantine-removed",
         "worktree-removed",
+        "worktree-cleanup-before-marker-quarantine",
         "worktree-marker-removed",
+        "worktree-cleanup-before-attempt-quarantine",
+        "worktree-cleanup-before-run-quarantine",
     ),
 )
 def test_cleanup_resumes_at_every_durable_boundary(
@@ -1002,6 +1384,136 @@ def test_candidate_commit_is_deterministic_idempotent_and_preserves_allowed_chan
         manager.inspect_candidate("run-1", "attempt-1")
 
 
+def test_candidate_creation_batches_object_requests_and_limits_full_snapshots(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    for index in range(99):
+        coordinator.joinpath(f"tracked-{index:03}.txt").write_text(f"base {index}\n", encoding="utf-8")
+    _git("add", ".", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "scale fixture", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    allowed = {f"tracked-{index:03}.txt" for index in range(20)}
+    for relative in allowed:
+        tree.joinpath(relative).write_text(f"candidate {relative}\n", encoding="utf-8")
+
+    snapshot_count = 0
+    object_batch_count = 0
+    largest_batch = 0
+    original_snapshot = manager._candidate_snapshot
+    original_batch = manager._verify_candidate_object_batch
+
+    def counted_snapshot(*args: object, **kwargs: object) -> object:
+        nonlocal snapshot_count
+        snapshot_count += 1
+        return original_snapshot(*args, **kwargs)  # type: ignore[arg-type]
+
+    def counted_batch(
+        objects: tuple[tuple[str, str], ...],
+        *,
+        label: str,
+        expected_contents: tuple[bytes, ...] | None = None,
+        object_directory: Path | None = None,
+    ) -> tuple[str | None, ...]:
+        nonlocal object_batch_count, largest_batch
+        object_batch_count += 1
+        largest_batch = max(largest_batch, len(objects))
+        return original_batch(
+            objects,
+            label=label,
+            expected_contents=expected_contents,
+            object_directory=object_directory,
+        )
+
+    monkeypatch.setattr(manager, "_candidate_snapshot", counted_snapshot)
+    monkeypatch.setattr(manager, "_verify_candidate_object_batch", counted_batch)
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths=allowed,
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert candidate.state == "ready"
+    assert snapshot_count == 2
+    assert object_batch_count <= 12
+    assert largest_batch >= len(allowed)
+
+
+def test_candidate_durable_closure_does_not_scale_with_repository_history(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    history = coordinator / "history.txt"
+    for index in range(25):
+        history.write_text(f"history {index}\n", encoding="utf-8")
+        _git("add", "history.txt", cwd=coordinator)
+        _git("commit", "--quiet", "-m", f"history {index}", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    historical_oids = set(_git("rev-list", "--all", cwd=coordinator).splitlines())
+    _git("gc", "--quiet", "--prune=now", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    imported: list[tuple[tuple[str, str], ...]] = []
+    verified_packs = 0
+    digested_pack_bytes = 0
+    original_import = manager._import_candidate_closure
+    original_verify_pack = manager._verify_primary_pack_output
+    original_pack_digest = repository_module._primary_pack_file_digest
+
+    def capture_import(objects: tuple[tuple[str, str], ...]) -> None:
+        imported.append(objects)
+        original_import(objects)
+
+    def capture_verify_pack(pack: Path, index: Path) -> frozenset[tuple[str, str]]:
+        nonlocal verified_packs
+        verified_packs += 1
+        return original_verify_pack(pack, index)
+
+    def capture_pack_digest(path: Path, *, label: str) -> tuple[tuple[int, ...], str]:
+        nonlocal digested_pack_bytes
+        digested_pack_bytes += path.stat().st_size
+        return original_pack_digest(path, label=label)
+
+    monkeypatch.setattr(manager, "_import_candidate_closure", capture_import)
+    monkeypatch.setattr(manager, "_verify_primary_pack_output", capture_verify_pack)
+    monkeypatch.setattr(repository_module, "_primary_pack_file_digest", capture_pack_digest)
+    first = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+    second_tree = Path(manager.prepare("run-2", "attempt-1", base_oid=base).path)
+    second_tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    second = manager.commit_candidate(
+        "run-2",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert first.candidate_oid == second.candidate_oid
+    assert len(imported) == 2
+    assert all(len(objects) <= 8 for objects in imported)
+    assert all(historical_oids.difference(oid for oid, _ in objects) for objects in imported)
+    assert verified_packs == 0
+    assert digested_pack_bytes == 0
+
+
 def test_candidate_types_are_exported_from_worker_package() -> None:
     assert autoform_worker.CandidateError is repository_module.CandidateError
     assert autoform_worker.CandidateNotFound is repository_module.CandidateNotFound
@@ -1055,6 +1567,109 @@ def test_candidate_commit_rejects_unallowed_ignored_symlink_special_and_reserved
         manager.commit_candidate("run-1", "special", allowed_paths={".git/config"}, **arguments)
     with pytest.raises(RepositoryError, match="explicit finite set"):
         manager.commit_candidate("run-1", "special", allowed_paths=["pipe"], **arguments)  # type: ignore[arg-type]
+
+
+def test_candidate_commit_ignores_ordinary_generated_lake_output_before_and_after_snapshot(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    coordinator.joinpath(".gitignore").write_text("ignored/\n.lake/\n", encoding="utf-8")
+    _git("add", ".gitignore", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "ignore Lake output", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    before = tree / ".lake/build/lib/lean/Before.olean"
+    before.parent.mkdir(parents=True)
+    before.write_bytes(b"generated before snapshot")
+    after = tree / ".lake/build/lib/lean/After.olean"
+
+    def generate_after_snapshot(name: str) -> None:
+        if name == "candidate-objects-written":
+            after.write_bytes(b"generated after snapshot")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", generate_after_snapshot)
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert candidate.state == "ready"
+    assert manager.inspect_candidate("run-1", "attempt-1") == candidate
+    assert before.read_bytes() == b"generated before snapshot"
+    assert after.read_bytes() == b"generated after snapshot"
+    assert _git("ls-tree", candidate.candidate_oid, ".lake", cwd=tree) == ""
+
+
+def test_candidate_commit_rejects_changed_tracked_file_under_generated_directory(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, _ = git_repository
+    tracked = coordinator / ".lake/tracked.txt"
+    tracked.parent.mkdir()
+    tracked.write_text("tracked base\n", encoding="utf-8")
+    _git("add", "-f", ".lake/tracked.txt", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "tracked lake fixture", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    tree.joinpath(".lake/tracked.txt").write_text("changed outside allowlist\n", encoding="utf-8")
+
+    with pytest.raises(CandidateUncertain, match="outside the allowed set"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+
+def test_candidate_commit_ignores_new_generated_output_beside_tracked_generated_path(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, _ = git_repository
+    tracked = coordinator / ".lake/tracked.txt"
+    tracked.parent.mkdir()
+    tracked.write_text("tracked base\n", encoding="utf-8")
+    _git("add", "-f", ".lake/tracked.txt", cwd=coordinator)
+    _git("commit", "--quiet", "-m", "tracked lake fixture", cwd=coordinator)
+    base = _git("rev-parse", "HEAD", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    generated = tree / ".lake/build/lib/lean/Generated.olean"
+
+    def generate_after_snapshot(name: str) -> None:
+        if name == "candidate-objects-written":
+            generated.parent.mkdir(parents=True)
+            generated.write_bytes(b"generated after snapshot")
+
+    monkeypatch.setattr(repository_module, "_checkpoint", generate_after_snapshot)
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert candidate.state == "ready"
+    assert generated.read_bytes() == b"generated after snapshot"
+    assert _git("show", f"{candidate.candidate_oid}:.lake/tracked.txt", cwd=tree) == "tracked base"
 
 
 def test_candidate_commit_rejects_hardlinked_allowed_file_and_preserves_evidence(
@@ -1305,6 +1920,213 @@ def test_candidate_recovery_rejects_same_byte_foreign_index_lock(
 
     with pytest.raises(CandidateUncertain, match="foreign state"):
         manager.commit_candidate("run-1", "attempt-1", **arguments)
+
+
+def test_candidate_recovery_preserves_replaced_unfinished_index_stage(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"book.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "candidate-index-stage-created":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
+
+    journal = manager.worktree_root / "run-1" / "attempt-1" / "candidate.json"
+    record = json.loads(journal.read_text(encoding="utf-8"))
+    stage = Path(record["git_dir"]) / record["candidate_index_stage_name"]
+    owned = stage.with_name(stage.name + ".owned")
+    stage.rename(owned)
+    foreign = b"foreign stage bytes that must survive recovery"
+    stage.write_bytes(foreign)
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    with pytest.raises(CandidateUncertain, match="foreign state"):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
+
+    assert stage.read_bytes() == foreign
+    assert owned.read_bytes() == b""
+
+
+def test_candidate_recovery_preserves_prejournal_index_stage_and_uses_a_new_name(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    arguments = {
+        "allowed_paths": {"book.txt"},
+        "message": "candidate",
+        "author_name": "Autoform Bot",
+        "author_email": "autoform@example.invalid",
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "candidate-index-stage-created-before-journal":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        manager.commit_candidate("run-1", "attempt-1", **arguments)
+
+    journal = manager.worktree_root / "run-1" / "attempt-1" / "candidate.json"
+    interrupted = json.loads(journal.read_text(encoding="utf-8"))
+    old_stage = Path(interrupted["git_dir"]) / interrupted["candidate_index_stage_name"]
+    old_identity = (old_stage.stat().st_dev, old_stage.stat().st_ino)
+    assert interrupted["candidate_index_stage_device"] is None
+    assert old_stage.read_bytes() == b""
+
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    candidate = manager.commit_candidate("run-1", "attempt-1", **arguments)
+    recovered = json.loads(journal.read_text(encoding="utf-8"))
+
+    assert candidate.state == "ready"
+    assert recovered["candidate_index_stage_name"] != interrupted["candidate_index_stage_name"]
+    assert recovered["candidate_index_abandoned_stages"] == [
+        {
+            "name": interrupted["candidate_index_stage_name"],
+            "device": old_identity[0],
+            "inode": old_identity[1],
+        }
+    ]
+    assert old_stage.read_bytes() == b""
+    assert manager.inspect_candidate("run-1", "attempt-1") == candidate
+
+
+def test_candidate_index_staging_preserves_a_racing_stage_replacement(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    foreign = b"foreign stage bytes that must survive installation"
+    replaced: tuple[Path, Path] | None = None
+
+    def replace_stage(name: str) -> None:
+        nonlocal replaced
+        if name != "candidate-index-stage-retained":
+            return
+        journal = manager.worktree_root / "run-1" / "attempt-1" / "candidate.json"
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        stage = Path(record["git_dir"]) / record["candidate_index_stage_name"]
+        owned = stage.with_name(stage.name + ".owned")
+        stage.rename(owned)
+        stage.write_bytes(foreign)
+        replaced = stage, owned
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_stage)
+    with pytest.raises(CandidateUncertain, match="foreign state"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert replaced is not None
+    stage, owned = replaced
+    assert stage.read_bytes() == foreign
+    assert owned.read_bytes() != foreign
+
+
+def test_candidate_index_exchange_restores_a_racing_replacement(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    index = git_dir / "index"
+    foreign = b"foreign index bytes that must survive installation"
+    raced = False
+
+    def replace_after_check(name: str) -> None:
+        nonlocal raced
+        if name == "candidate-index-before-exchange" and not raced:
+            replacement = git_dir / "foreign-index"
+            replacement.write_bytes(foreign)
+            os.replace(replacement, index)
+            raced = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_after_check)
+    with pytest.raises(CandidateUncertain, match="foreign state|recorded base"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert raced
+    assert index.read_bytes() == foreign
+    assert not (git_dir / "foreign-index").exists()
+
+
+def test_candidate_index_displace_preserves_a_racing_lock_replacement(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
+    index = git_dir / "index"
+    lock = git_dir / "index.lock"
+    preserved_base = git_dir / "preserved-base-index"
+    foreign = b"foreign displaced-index bytes"
+    raced = False
+
+    def replace_before_displace(name: str) -> None:
+        nonlocal raced
+        if name == "candidate-index-before-displace" and not raced:
+            lock.rename(preserved_base)
+            lock.write_bytes(foreign)
+            raced = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_before_displace)
+    with pytest.raises(CandidateUncertain, match="foreign state"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert raced
+    assert index.read_bytes() == foreign
+    assert preserved_base.read_bytes()
+    assert lock.read_bytes() != foreign
 
 
 def test_candidate_commit_rejects_explicitly_allowed_ignored_output(
@@ -1572,11 +2394,16 @@ def test_candidate_commit_does_not_execute_filters_hooks_signing_or_external_dif
         ("candidate-objects-written", None),
         ("candidate-head-updated", "recoverable"),
         ("candidate-head-recorded", "recoverable"),
+        ("candidate-index-stage-created-before-journal", "recoverable"),
         ("candidate-index-stage-created", "recoverable"),
         ("candidate-index-stage-written", "recoverable"),
         ("candidate-index-staged", "recoverable"),
         ("candidate-index-locked", "recoverable"),
-        ("candidate-index-stage-unlinked", "recoverable"),
+        ("candidate-index-stage-retained", "recoverable"),
+        ("candidate-index-before-exchange", "recoverable"),
+        ("candidate-index-exchanged", "recoverable"),
+        ("candidate-index-before-displace", "recoverable"),
+        ("candidate-index-displaced", "recoverable"),
         ("candidate-index-updated", "recoverable"),
         ("candidate-result-recorded", "ready"),
     ),
@@ -1618,7 +2445,8 @@ def test_candidate_commit_recovers_every_durable_crash_boundary(
     assert recovered.state == "ready"
     assert manager.commit_candidate("run-1", "attempt-1", **arguments) == recovered
     git_dir = Path(_git("rev-parse", "--path-format=absolute", "--absolute-git-dir", cwd=tree))
-    assert not list(git_dir.glob(".autoform-candidate-index-*.stage"))
+    record = json.loads((manager.worktree_root / "run-1" / "attempt-1" / "candidate.json").read_text(encoding="utf-8"))
+    assert git_dir.joinpath(record["candidate_index_stage_name"]).is_file()
     assert not (git_dir / "index.lock").exists()
 
 
@@ -2067,8 +2895,10 @@ def test_candidate_tree_closure_streams_large_unallowed_blob_without_retaining_i
     def guarded_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
         process = original_popen(*args, **kwargs)
         command = args[0] if args else kwargs.get("args")
-        if isinstance(command, list) and "cat-file" in command and any(
-            isinstance(argument, str) and argument.startswith("--batch=") for argument in command
+        if (
+            isinstance(command, list)
+            and "cat-file" in command
+            and any(isinstance(argument, str) and argument.startswith("--batch=") for argument in command)
         ):
             assert "--no-replace-objects" in command
             environment = kwargs.get("env")
@@ -2360,9 +3190,10 @@ def test_candidate_tree_closure_ignores_replacement_refs(
     assert _git("rev-parse", "HEAD", cwd=tree) == base
 
 
-def test_candidate_tree_closure_accepts_available_alternate_objects(
+def test_ready_candidate_survives_removal_of_alternate_object_storage(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, coordinator, base = git_repository
     manager = AttemptWorktrees(coordinator, tmp_path / "state")
@@ -2376,6 +3207,15 @@ def test_candidate_tree_closure_accepts_available_alternate_objects(
     object_path.replace(alternate_path)
     alternates = manager.common_git_dir / "objects" / "info" / "alternates"
     alternates.write_text(f"{alternate_objects}\n", encoding="utf-8")
+    verified_inventories: list[frozenset[tuple[str, str]]] = []
+    original_verify_pack = manager._verify_primary_pack_output
+
+    def capture_verify_pack(pack: Path, index: Path) -> frozenset[tuple[str, str]]:
+        inventory = original_verify_pack(pack, index)
+        verified_inventories.append(inventory)
+        return inventory
+
+    monkeypatch.setattr(manager, "_verify_primary_pack_output", capture_verify_pack)
 
     candidate = manager.commit_candidate(
         "run-1",
@@ -2387,6 +3227,126 @@ def test_candidate_tree_closure_accepts_available_alternate_objects(
     )
 
     assert manager.inspect_candidate("run-1", "attempt-1") == candidate
+    assert verified_inventories == [frozenset({(blob_oid, "blob")})]
+    packs_after_first_import = {
+        path.name: path.stat().st_size for path in (manager.object_dir / "pack").glob("pack-*.pack")
+    }
+    second_tree = Path(manager.prepare("run-2", "attempt-1", base_oid=base).path)
+    second_tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    second = manager.commit_candidate(
+        "run-2",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+    assert second.candidate_oid == candidate.candidate_oid
+    assert {
+        path.name: path.stat().st_size for path in (manager.object_dir / "pack").glob("pack-*.pack")
+    } == packs_after_first_import
+    alternates.unlink()
+    alternate_path.unlink()
+    alternate_path.parent.rmdir()
+    alternate_objects.rmdir()
+
+    assert manager.inspect_candidate("run-1", "attempt-1") == candidate
+    assert manager.inspect_candidate("run-2", "attempt-1") == second
+    manager.cleanup("run-1", "attempt-1")
+    manager.cleanup("run-2", "attempt-1")
+    with pytest.raises(CandidateNotFound):
+        manager.inspect_candidate("run-1", "attempt-1")
+
+
+def test_candidate_primary_pack_probe_does_not_change_hardlink_counts(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, coordinator, base = git_repository
+    _git("gc", "--quiet", "--prune=now", cwd=coordinator)
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    pack_dir = manager.object_dir / "pack"
+    original_links = {path: path.stat().st_nlink for path in pack_dir.iterdir() if path.suffix in {".idx", ".pack"}}
+    assert original_links
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+
+    candidate = manager.commit_candidate(
+        "run-1",
+        "attempt-1",
+        allowed_paths={"book.txt"},
+        message="candidate",
+        author_name="Autoform Bot",
+        author_email="autoform@example.invalid",
+    )
+
+    assert candidate.state == "ready"
+    assert {path: path.stat().st_nlink for path in original_links} == original_links
+    assert not list(manager.object_dir.glob(".autoform-pack-view-*"))
+
+
+def test_candidate_primary_pack_probe_rejects_forged_index_and_alternate_fallback(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "state")
+    tree = Path(manager.prepare("run-1", "attempt-1", base_oid=base).path)
+    tree.joinpath("book.txt").write_text("candidate\n", encoding="utf-8")
+    blob_oid = _git("rev-parse", f"{base}:.gitignore", cwd=coordinator)
+    object_path = manager.object_dir / blob_oid[:2] / blob_oid[2:]
+    alternate_objects = tmp_path / "alternate-objects"
+    alternate_path = alternate_objects / blob_oid[:2] / blob_oid[2:]
+    alternate_path.parent.mkdir(parents=True)
+    object_path.replace(alternate_path)
+    manager.object_dir.joinpath("info/alternates").write_text(f"{alternate_objects}\n", encoding="utf-8")
+    forged = False
+
+    def forge_primary_index(name: str) -> None:
+        nonlocal forged
+        if name != "candidate-objects-written" or forged:
+            return
+        forged = True
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"decoy object")
+        decoy_oid = _git("hash-object", "-w", str(decoy), cwd=coordinator)
+        prefix = manager.object_dir / "pack" / "pack-autoform-forged"
+        packed = subprocess.run(
+            ["git", "pack-objects", str(prefix)],
+            cwd=coordinator,
+            input=f"{decoy_oid}\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        pack_hash = packed.stdout.strip()
+        index = Path(f"{prefix}-{pack_hash}.idx")
+        content = bytearray(index.read_bytes())
+        assert content[:8] == b"\xfftOc\x00\x00\x00\x02"
+        assert struct.unpack(">I", content[8 + 255 * 4 : 8 + 256 * 4])[0] == 1
+        raw_oid = bytes.fromhex(blob_oid)
+        content[8 : 8 + 256 * 4] = b"".join(struct.pack(">I", int(byte >= raw_oid[0])) for byte in range(256))
+        oid_offset = 8 + 256 * 4
+        content[oid_offset : oid_offset + len(raw_oid)] = raw_oid
+        content[-len(raw_oid) :] = hashlib.sha1(content[: -len(raw_oid)]).digest()
+        index.chmod(0o600)
+        index.write_bytes(content)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", forge_primary_index)
+    with pytest.raises(CandidateUncertain, match="primary Git pack|candidate closure"):
+        manager.commit_candidate(
+            "run-1",
+            "attempt-1",
+            allowed_paths={"book.txt"},
+            message="candidate",
+            author_name="Autoform Bot",
+            author_email="autoform@example.invalid",
+        )
+
+    assert forged
+    assert alternate_path.read_bytes()
+    assert _git("rev-parse", "HEAD", cwd=tree) == base
 
 
 def test_candidate_tree_closure_rechecks_repository_config(
