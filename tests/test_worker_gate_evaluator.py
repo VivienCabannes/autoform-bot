@@ -16,6 +16,7 @@ from autoform_worker.gate_evaluator import (
     _materialize_worktrees,
     evaluate_gate_request,
 )
+from autoform_worker.gate_pack import prepare_repository_pack, verify_repository_pack
 from autoform_worker.gate_provider import GateInvocationRequest, GateProviderError
 from autoform_worker.gates import CandidateGateResult, _work_item_sha256
 from autoform_worker.scheduler import WorkItem, WorkPhase
@@ -33,7 +34,7 @@ def _git(repository: Path, *arguments: str, input_bytes: bytes | None = None) ->
     return completed.stdout
 
 
-def _repository_pack(tmp_path: Path) -> tuple[Path, str, str]:
+def _repository(tmp_path: Path) -> tuple[Path, str, str]:
     repository = tmp_path / "source"
     repository.mkdir()
     _git(repository, "init", "--quiet", "--object-format=sha1")
@@ -65,6 +66,11 @@ def _repository_pack(tmp_path: Path) -> tuple[Path, str, str]:
         "candidate",
     )
     candidate_oid = _git(repository, "rev-parse", "HEAD").decode().strip()
+    return repository, base_oid, candidate_oid
+
+
+def _repository_pack(tmp_path: Path) -> tuple[Path, str, str]:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
     content = _git(
         repository,
         "--no-replace-objects",
@@ -82,6 +88,107 @@ def _repository_pack(tmp_path: Path) -> tuple[Path, str, str]:
     pack.write_bytes(content)
     pack.chmod(0o400)
     return pack, base_oid, candidate_oid
+
+
+def test_host_prepares_and_revalidates_bounded_repository_pack(tmp_path: Path) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+
+    assert pack.path == str(state / "invocation.pack")
+    assert pack.base_oid == base_oid
+    assert pack.candidate_oid == candidate_oid
+    assert pack.object_format == "sha1"
+    assert pack.size > 0
+    assert Path(pack.path).stat().st_mode & 0o777 == 0o400
+    assert hashlib.sha256(Path(pack.path).read_bytes()).hexdigest() == pack.sha256
+    verify_repository_pack(pack)
+
+    request = _request(Path(pack.path), base_oid, candidate_oid)
+    work_root = (tmp_path / "work").resolve()
+    work_root.mkdir()
+    copied, _identity = _copy_verified_pack(request, Path(pack.path), work_root)
+    base, candidate = _materialize_worktrees(request, copied, work_root)
+    assert (base / "tracked.txt").read_text() == "base\n"
+    assert (candidate / "tracked.txt").read_text() == "candidate\n"
+
+
+def test_host_pack_revalidation_rejects_content_or_path_replacement(tmp_path: Path) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+    path = Path(pack.path)
+    displaced = state / "displaced.pack"
+    path.rename(displaced)
+    path.write_bytes(displaced.read_bytes())
+    path.chmod(0o400)
+
+    with pytest.raises(GateProviderError, match="identity"):
+        verify_repository_pack(pack)
+
+
+def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Path) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    with pytest.raises(GateProviderError, match="byte limit"):
+        prepare_repository_pack(
+            repository,
+            state / "too-small.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1,
+            timeout_seconds=30,
+        )
+    occupied = state / "occupied.pack"
+    occupied.write_bytes(b"foreign")
+    with pytest.raises(GateProviderError, match="created exclusively"):
+        prepare_repository_pack(
+            repository,
+            occupied,
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+    state.chmod(0o755)
+    with pytest.raises(GateProviderError, match="group or other"):
+        prepare_repository_pack(
+            repository,
+            state / "unsafe.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+    inside = repository / "private-state"
+    inside.mkdir(mode=0o700)
+    with pytest.raises(GateProviderError, match="outside"):
+        prepare_repository_pack(
+            repository,
+            inside / "unsafe.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
 
 
 def _request(pack: Path, base_oid: str, candidate_oid: str, *, work_item_sha256: str = "c" * 64) -> GateInvocationRequest:
