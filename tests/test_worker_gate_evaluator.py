@@ -498,6 +498,116 @@ def test_host_pack_public_entry_points_wrap_lstat_failures(
             verify_repository_pack(pack)
 
 
+@pytest.mark.parametrize(
+    "repository_path",
+    [
+        Path("~autoform-user-that-does-not-exist-9e8844d8/source"),
+        Path("/tmp/\ud800"),
+    ],
+    ids=["unknown-user", "unencodable"],
+)
+def test_host_pack_preparation_wraps_non_os_path_failures(
+    tmp_path: Path,
+    repository_path: Path,
+) -> None:
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+
+    with pytest.raises(GateProviderError, match="repository root cannot be inspected"):
+        prepare_repository_pack(
+            repository_path,
+            state / "invocation.pack",
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1024,
+            timeout_seconds=1,
+        )
+
+
+def test_host_pack_preparation_wraps_ancestor_symlink_loop(tmp_path: Path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop.name, target_is_directory=True)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+
+    with pytest.raises(GateProviderError, match="repository root cannot be inspected"):
+        prepare_repository_pack(
+            loop / "source",
+            state / "invocation.pack",
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1024,
+            timeout_seconds=1,
+        )
+
+
+@pytest.mark.parametrize("path_failure", ["resolve-runtime", "unencodable"])
+def test_host_pack_revalidation_wraps_non_os_path_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path_failure: str,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+    if path_failure == "unencodable":
+        pack = replace(pack, path=str(state / "\ud800"))
+    else:
+        pack_path = Path(pack.path)
+        original_resolve = Path.resolve
+
+        def fail_pack_resolve(path: Path, *, strict: bool = False) -> Path:
+            if path == pack_path:
+                raise RuntimeError("injected path resolution failure")
+            return original_resolve(path, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", fail_pack_resolve)
+
+    with pytest.raises(GateProviderError, match="pathname cannot be inspected"):
+        verify_repository_pack(pack)
+
+
+def test_host_pack_path_policy_errors_keep_their_specific_diagnostic(tmp_path: Path) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    repository_link = tmp_path / "repository-link"
+    repository_link.symlink_to(repository, target_is_directory=True)
+
+    with pytest.raises(GateProviderError, match="repository root must not be a symbolic link"):
+        prepare_repository_pack(
+            repository_link,
+            state / "linked.pack",
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+    path = Path(pack.path)
+    displaced = state / "displaced.pack"
+    path.rename(displaced)
+    path.symlink_to(displaced)
+    with pytest.raises(GateProviderError, match="pathname became a symbolic link"):
+        verify_repository_pack(pack)
+
+
 @pytest.mark.parametrize("failed_pipe", ["stdin", "stdout", "stderr"])
 def test_repository_pack_stream_wraps_each_pipe_close_and_closes_the_rest(
     tmp_path: Path,

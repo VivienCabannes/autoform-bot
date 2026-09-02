@@ -510,7 +510,9 @@ def _real_directory(path: Path, *, label: str) -> Path:
             raise GateProviderError(f"{label} must not be a symbolic link")
         resolved = path.expanduser().resolve(strict=True)
         info = resolved.stat(follow_symlinks=False)
-    except OSError as error:
+    except GateProviderError:
+        raise
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
         raise GateProviderError(f"{label} cannot be inspected") from error
     if not stat.S_ISDIR(info.st_mode):
         raise GateProviderError(f"{label} must be a real directory")
@@ -611,7 +613,9 @@ def _regular_file_identity(path: Path) -> tuple[int, int, int, int, int]:
             raise GateProviderError("repository pack pathname became a symbolic link")
         resolved = path.resolve(strict=True)
         info = path.stat(follow_symlinks=False)
-    except OSError as error:
+    except GateProviderError:
+        raise
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
         raise GateProviderError("repository pack pathname cannot be inspected") from error
     if (
         resolved != path
