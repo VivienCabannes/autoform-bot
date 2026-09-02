@@ -7,6 +7,7 @@ import pytest
 from autoform_worker.gate_provider import (
     DockerGateProviderConfig,
     DockerSandboxLimits,
+    GateInvocationRequest,
     GateProviderError,
 )
 
@@ -37,6 +38,25 @@ def _config() -> DockerGateProviderConfig:
         seccomp_profile_sha256="6" * 64,
         user="65532:65532",
         limits=_limits(),
+    )
+
+
+def _request() -> GateInvocationRequest:
+    return GateInvocationRequest(
+        invocation_id="7" * 64,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base_oid="8" * 40,
+        candidate_oid="9" * 40,
+        node_id="chapter/result",
+        article_id="af_0123456789abcdef01234567",
+        phase="proof",
+        attempt=1,
+        source_revision="d" * 64,
+        source_contract_sha256="a" * 64,
+        protected_roadmap_sha256="b" * 64,
+        work_item_sha256="c" * 64,
+        provider_config_sha256=_config().sha256,
     )
 
 
@@ -117,3 +137,61 @@ def test_provider_limits_require_output_to_fit_in_scratch() -> None:
 def test_provider_config_loader_rejects_noncanonical_or_wrong_shape(content: bytes) -> None:
     with pytest.raises(GateProviderError):
         DockerGateProviderConfig.from_bytes(content)
+
+
+def test_gate_invocation_round_trips_with_deterministic_ownership() -> None:
+    request = _request()
+
+    loaded = GateInvocationRequest.from_bytes(request.evidence_bytes())
+
+    assert loaded == request
+    assert loaded.container_name == f"autoform-gate-{'7' * 64}"
+    assert loaded.ownership_labels() == (
+        "org.autoform.gate=1",
+        f"org.autoform.invocation={'7' * 64}",
+        f"org.autoform.request-sha256={request.sha256}",
+        f"org.autoform.provider-sha256={_config().sha256}",
+    )
+    assert "run_id" not in loaded.evaluator_dict()
+    assert "attempt_id" not in loaded.evaluator_dict()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("invocation_id", "7" * 63, "256-bit"),
+        ("run_id", "run\nother", "canonical text"),
+        ("run_id", "bad\udcff", "canonical text"),
+        ("base_oid", "8" * 39, "object ID"),
+        ("candidate_oid", "9" * 64, "same object format"),
+        ("candidate_oid", "8" * 40, "must differ"),
+        ("article_id", "result", "durable Autoform format"),
+        ("source_revision", "source-revision", "lowercase hexadecimal"),
+        ("phase", "review", "statement or proof"),
+        ("attempt", 0, "positive integer"),
+        ("provider_config_sha256", "A" * 64, "lowercase hexadecimal"),
+    ],
+)
+def test_gate_invocation_rejects_ambiguous_identity(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(GateProviderError, match=message):
+        replace(_request(), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"{}",
+        b'{"schema":"autoform-gate-invocation/v1","schema":"duplicate"}',
+        b'{"schema":Infinity}',
+        b"[]",
+        b"\xff",
+        b"x" * (64 * 1024 + 1),
+    ],
+)
+def test_gate_invocation_loader_rejects_noncanonical_or_wrong_shape(content: bytes) -> None:
+    with pytest.raises(GateProviderError):
+        GateInvocationRequest.from_bytes(content)

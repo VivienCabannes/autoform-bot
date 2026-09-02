@@ -11,16 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from autoform_cli.graph import ARTICLE_ID_PATTERN
+
 
 DOCKER_GATE_PROVIDER_SCHEMA = "autoform-docker-gate-provider/v1"
 DOCKER_SANDBOX_POLICY = "autoform-docker-gate-sandbox/v1"
 GATE_EVALUATOR_SCHEMA = "autoform-gate-evaluator/v1"
+GATE_INVOCATION_SCHEMA = "autoform-gate-invocation/v1"
 
 _MAX_CONFIG_BYTES = 64 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IMAGE = re.compile(r"[^\s@]+@sha256:(?P<digest>[0-9a-f]{64})")
 _PLATFORM = re.compile(r"linux/[a-z0-9][a-z0-9_.-]*(?:/[a-z0-9][a-z0-9_.-]*)?")
 _USER = re.compile(r"(?P<uid>[1-9][0-9]*):(?P<gid>[1-9][0-9]*)")
+_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_INVOCATION_ID = re.compile(r"[0-9a-f]{64}")
 
 
 class GateProviderError(RuntimeError):
@@ -145,18 +150,11 @@ class DockerGateProviderConfig:
 
     @classmethod
     def from_bytes(cls, content: bytes) -> DockerGateProviderConfig:
-        if not isinstance(content, bytes) or not content or len(content) > _MAX_CONFIG_BYTES:
-            raise GateProviderError("Docker gate provider config has an invalid size")
-        try:
-            value = json.loads(
-                content.decode("utf-8"),
-                object_pairs_hook=_strict_json_object,
-                parse_constant=lambda constant: (_raise_json_constant(constant)),
-            )
-        except (UnicodeError, ValueError, TypeError) as error:
-            raise GateProviderError("Docker gate provider config is not strict JSON") from error
-        if not isinstance(value, dict):
-            raise GateProviderError("Docker gate provider config must contain one object")
+        value = _strict_json_bytes(
+            content,
+            label="Docker gate provider config",
+            maximum=_MAX_CONFIG_BYTES,
+        )
         expected = {
             "evaluator_schema",
             "image_id",
@@ -199,6 +197,133 @@ class DockerGateProviderConfig:
             raise GateProviderError("Docker gate provider config contains invalid values") from error
 
 
+@dataclass(frozen=True, slots=True)
+class GateInvocationRequest:
+    """Immutable evaluator request persisted before a container is created."""
+
+    invocation_id: str
+    run_id: str
+    attempt_id: str
+    base_oid: str
+    candidate_oid: str
+    node_id: str
+    article_id: str
+    phase: str
+    attempt: int
+    source_revision: str
+    source_contract_sha256: str
+    protected_roadmap_sha256: str
+    work_item_sha256: str
+    provider_config_sha256: str
+    schema: str = GATE_INVOCATION_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != GATE_INVOCATION_SCHEMA:
+            raise GateProviderError("unsupported gate invocation schema")
+        if _INVOCATION_ID.fullmatch(self.invocation_id) is None:
+            raise GateProviderError("gate invocation ID must be 256-bit lowercase hexadecimal")
+        for label, value in (
+            ("run ID", self.run_id),
+            ("attempt ID", self.attempt_id),
+            ("node ID", self.node_id),
+        ):
+            _canonical_text(label, value)
+        if not isinstance(self.article_id, str) or ARTICLE_ID_PATTERN.fullmatch(self.article_id) is None:
+            raise GateProviderError("article ID must use the durable Autoform format")
+        _sha256("source revision", self.source_revision)
+        for label, value in (("base OID", self.base_oid), ("candidate OID", self.candidate_oid)):
+            if not isinstance(value, str) or _OID.fullmatch(value) is None:
+                raise GateProviderError(f"{label} must be a lowercase SHA-1 or SHA-256 object ID")
+        if len(self.base_oid) != len(self.candidate_oid):
+            raise GateProviderError("base and candidate OIDs must use the same object format")
+        if self.base_oid == self.candidate_oid:
+            raise GateProviderError("candidate OID must differ from base OID")
+        if self.phase not in {"statement", "proof"}:
+            raise GateProviderError("gate invocation phase must be statement or proof")
+        _positive_integer("attempt number", self.attempt)
+        for label, value in (
+            ("source contract SHA-256", self.source_contract_sha256),
+            ("protected roadmap SHA-256", self.protected_roadmap_sha256),
+            ("work item SHA-256", self.work_item_sha256),
+            ("provider config SHA-256", self.provider_config_sha256),
+        ):
+            _sha256(label, value)
+
+    @property
+    def container_name(self) -> str:
+        return f"autoform-gate-{self.invocation_id}"
+
+    def ownership_labels(self) -> tuple[str, ...]:
+        return (
+            "org.autoform.gate=1",
+            f"org.autoform.invocation={self.invocation_id}",
+            f"org.autoform.request-sha256={self.sha256}",
+            f"org.autoform.provider-sha256={self.provider_config_sha256}",
+        )
+
+    def evaluator_dict(self) -> dict[str, object]:
+        """Return only the fields the in-container evaluator must trust."""
+
+        return {
+            "article_id": self.article_id,
+            "attempt": self.attempt,
+            "base_oid": self.base_oid,
+            "candidate_oid": self.candidate_oid,
+            "node_id": self.node_id,
+            "phase": self.phase,
+            "protected_roadmap_sha256": self.protected_roadmap_sha256,
+            "source_contract_sha256": self.source_contract_sha256,
+            "source_revision": self.source_revision,
+            "work_item_sha256": self.work_item_sha256,
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            **self.evaluator_dict(),
+            "attempt_id": self.attempt_id,
+            "invocation_id": self.invocation_id,
+            "provider_config_sha256": self.provider_config_sha256,
+            "run_id": self.run_id,
+            "schema": self.schema,
+        }
+
+    def evidence_bytes(self) -> bytes:
+        return _json_bytes(self.as_dict())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.evidence_bytes()).hexdigest()
+
+    @classmethod
+    def from_bytes(cls, content: bytes) -> GateInvocationRequest:
+        value = _strict_json_bytes(content, label="gate invocation", maximum=_MAX_CONFIG_BYTES)
+        expected = {
+            "article_id",
+            "attempt",
+            "attempt_id",
+            "base_oid",
+            "candidate_oid",
+            "invocation_id",
+            "node_id",
+            "phase",
+            "protected_roadmap_sha256",
+            "provider_config_sha256",
+            "run_id",
+            "schema",
+            "source_contract_sha256",
+            "source_revision",
+            "work_item_sha256",
+        }
+        if set(value) != expected:
+            raise GateProviderError("gate invocation fields do not match the schema")
+        try:
+            return cls(**value)
+        except (TypeError, ValueError, GateProviderError) as error:
+            if isinstance(error, GateProviderError):
+                raise
+            raise GateProviderError("gate invocation contains invalid values") from error
+
+
 def _canonical_absolute_path(label: str, value: object) -> None:
     if (
         not isinstance(value, str)
@@ -210,6 +335,22 @@ def _canonical_absolute_path(label: str, value: object) -> None:
     path = Path(value)
     if not path.is_absolute() or os.path.normpath(value) != value:
         raise GateProviderError(f"{label} must be a nonempty canonical absolute path")
+
+
+def _canonical_text(label: str, value: object) -> None:
+    if not isinstance(value, str):
+        raise GateProviderError(f"{label} must be nonempty canonical text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError as error:
+        raise GateProviderError(f"{label} must be nonempty canonical text") from error
+    if (
+        not value
+        or len(encoded) > 4096
+        or value != value.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise GateProviderError(f"{label} must be nonempty canonical text")
 
 
 def _sha256(label: str, value: object) -> None:
@@ -243,6 +384,22 @@ def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _strict_json_bytes(content: bytes, *, label: str, maximum: int) -> dict[str, Any]:
+    if not isinstance(content, bytes) or not content or len(content) > maximum:
+        raise GateProviderError(f"{label} has an invalid size")
+    try:
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=lambda constant: (_raise_json_constant(constant)),
+        )
+    except (UnicodeError, ValueError, TypeError) as error:
+        raise GateProviderError(f"{label} is not strict JSON") from error
+    if not isinstance(value, dict):
+        raise GateProviderError(f"{label} must contain one object")
+    return value
+
+
 def _raise_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
@@ -263,7 +420,9 @@ __all__ = [
     "DOCKER_GATE_PROVIDER_SCHEMA",
     "DOCKER_SANDBOX_POLICY",
     "GATE_EVALUATOR_SCHEMA",
+    "GATE_INVOCATION_SCHEMA",
     "DockerGateProviderConfig",
     "DockerSandboxLimits",
+    "GateInvocationRequest",
     "GateProviderError",
 ]
