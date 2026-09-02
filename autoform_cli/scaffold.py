@@ -292,7 +292,8 @@ def _publish_new_directory(
     no-follow stat below is therefore the first observable identity boundary;
     substitution before it cannot be distinguished portably. A short,
     target-independent 128-bit name minimizes that unavoidable interval and
-    leaves enough ``NAME_MAX`` room for every valid public component.
+    uses a fixed 37-byte staging budget independent of the public component's
+    own filesystem name limit.
     """
 
     staging_name: str | None = None
@@ -301,6 +302,11 @@ def _publish_new_directory(
     try:
         for _ in range(_DIRECTORY_STAGE_ATTEMPTS):
             candidate = f"{_DIRECTORY_STAGE_PREFIX}{secrets.token_hex(16)}"
+            # The source and destination must never name the same directory
+            # entry. The stage alphabet is ASCII, so casefold covers the
+            # additional alias relevant to case-insensitive Darwin volumes.
+            if candidate == name or candidate.casefold() == name.casefold():
+                continue
             try:
                 os.mkdir(candidate, mode=0o700, dir_fd=parent_descriptor)
             except FileExistsError:

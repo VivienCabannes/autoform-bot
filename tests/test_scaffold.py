@@ -753,6 +753,70 @@ def test_directory_stage_captures_identity_at_first_portable_observation(
     assert len(os.fsencode(staging_name)) == len(os.fsencode(scaffold_module._DIRECTORY_STAGE_PREFIX)) + 32
 
 
+def test_directory_stage_rejects_an_exact_public_name_alias_before_mkdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    first_token = "a" * 32
+    second_token = "b" * 32
+    public_name = f"{scaffold_module._DIRECTORY_STAGE_PREFIX}{first_token}"
+    expected_stage = f"{scaffold_module._DIRECTORY_STAGE_PREFIX}{second_token}"
+    tokens = iter((first_token, second_token))
+    mkdir_names: list[str] = []
+    original_mkdir = scaffold_module.os.mkdir
+
+    def record_mkdir(name, *args, **kwargs) -> None:
+        mkdir_names.append(name)
+        original_mkdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(scaffold_module.secrets, "token_hex", lambda _size: next(tokens))
+    monkeypatch.setattr(scaffold_module.os, "mkdir", record_mkdir)
+    parent_descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        descriptor = scaffold_module._open_or_create_directory(parent_descriptor, public_name)
+        os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+    assert mkdir_names == [expected_stage]
+    assert (target / public_name).is_dir()
+    assert not (target / expected_stage).exists()
+
+
+def test_directory_stage_rejects_a_darwin_casefold_public_alias_before_mkdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    first_token = "a1" * 16
+    second_token = "b2" * 16
+    candidate = f"{scaffold_module._DIRECTORY_STAGE_PREFIX}{first_token}"
+    public_name = candidate.upper()
+    expected_stage = f"{scaffold_module._DIRECTORY_STAGE_PREFIX}{second_token}"
+    tokens = iter((first_token, second_token))
+    mkdir_names: list[str] = []
+    original_mkdir = scaffold_module.os.mkdir
+
+    def record_mkdir(name, *args, **kwargs) -> None:
+        mkdir_names.append(name)
+        original_mkdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(scaffold_module.secrets, "token_hex", lambda _size: next(tokens))
+    monkeypatch.setattr(scaffold_module.os, "mkdir", record_mkdir)
+    parent_descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        descriptor = scaffold_module._open_or_create_directory(parent_descriptor, public_name)
+        os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+    assert candidate.casefold() == public_name.casefold()
+    assert mkdir_names == [expected_stage]
+    assert (target / public_name).is_dir()
+    assert not (target / expected_stage).exists()
+
+
 def test_created_scaffold_directory_is_bound_before_parent_fsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
