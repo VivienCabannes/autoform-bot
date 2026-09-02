@@ -11,11 +11,14 @@ workspace scaffolds write it.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +37,16 @@ _DOTTED = {
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}")
 _WORKSPACE_MANIFEST = ".autoform.toml"
+_DIRECTORY_STAGE_ATTEMPTS = 32
+
+
+class _DirectoryPublicationError(OSError):
+    """A staged directory could not be bound and published safely."""
+
+    def __init__(self, reason: str, staging_name: str | None = None) -> None:
+        self.reason = reason
+        self.staging_name = staging_name
+        super().__init__(reason)
 
 
 def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -> str | None:
@@ -154,6 +167,7 @@ def _require_exclusive_scaffold_support() -> None:
     required = (
         hasattr(os, "O_DIRECTORY"),
         hasattr(os, "O_NOFOLLOW"),
+        _atomic_directory_publication_available(),
         os.open in os.supports_dir_fd,
         os.mkdir in os.supports_dir_fd,
         os.listdir in os.supports_fd,
@@ -162,6 +176,14 @@ def _require_exclusive_scaffold_support() -> None:
         raise ScaffoldError(
             ["this platform cannot scaffold a blueprint with the required path safety"]
         )
+
+
+def _atomic_directory_publication_available() -> bool:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return False
+    return hasattr(libc, "renameatx_np") or hasattr(libc, "renameat2")
 
 
 def _open_directory_chain(path: Path) -> int:
@@ -187,44 +209,243 @@ def _open_directory_chain(path: Path) -> int:
         raise ScaffoldError([f"cannot open blueprint directory safely: {path}"]) from None
 
 
-def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    created = False
-    try:
-        os.mkdir(name, mode=0o755, dir_fd=parent_descriptor)
-    except FileExistsError:
-        pass
-    except OSError:
-        raise ScaffoldError([f"cannot create blueprint directory: {name}"]) from None
-    else:
-        created = True
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
-    except OSError:
-        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
-    if not created:
-        return descriptor
-    try:
-        os.fsync(parent_descriptor)
-    except OSError:
-        os.close(descriptor)
-        raise ScaffoldError(
-            [f"cannot commit blueprint directory durably: {name}"]
-        ) from None
+def _scaffold_directory_checkpoint(
+    _event: str,
+    _parent_descriptor: int,
+    _staging_name: str,
+    _target_name: str,
+) -> None:
+    """Deterministic race boundary used by adversarial tests."""
+
+
+def _rename_directory_noreplace(
+    source_parent: int,
+    source: str,
+    target_parent: int,
+    target: str,
+) -> None:
+    # Import at call time because project.create imports this module.
+    from .project.create import _rename_noreplace
+
+    _rename_noreplace(source_parent, source, target_parent, target)
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _verify_directory_binding(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    mode: int | None = None,
+    require_empty: bool = False,
+) -> None:
     try:
         opened = os.fstat(descriptor)
         named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except OSError:
-        os.close(descriptor)
-        raise ScaffoldError([f"blueprint directory changed after creation: {name}"]) from None
+        raise _DirectoryPublicationError("changed") from None
     if (
         not stat.S_ISDIR(opened.st_mode)
         or not stat.S_ISDIR(named.st_mode)
-        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        or _stat_identity(opened) != identity
+        or _stat_identity(named) != identity
+        or (mode is not None and stat.S_IMODE(opened.st_mode) != mode)
+        or (mode is not None and stat.S_IMODE(named.st_mode) != mode)
+    ):
+        raise _DirectoryPublicationError("changed")
+    if require_empty:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        scan_descriptor: int | None = None
+        try:
+            scan_descriptor = os.open(".", flags, dir_fd=descriptor)
+            if os.listdir(scan_descriptor):
+                raise _DirectoryPublicationError("changed")
+        except _DirectoryPublicationError:
+            raise
+        except OSError:
+            raise _DirectoryPublicationError("changed") from None
+        finally:
+            if scan_descriptor is not None:
+                try:
+                    os.close(scan_descriptor)
+                except OSError:
+                    pass
+
+
+def _publish_new_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    mode: int,
+    rename_noreplace: Callable[[int, str, int, str], None],
+    fsync_directory: Callable[[int], None],
+    checkpoint: Callable[[str, int, str, str], None],
+) -> tuple[int, tuple[int, int]]:
+    """Bind a private staged directory, then publish it without replacement."""
+
+    staging_name: str | None = None
+    descriptor: int | None = None
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        for _ in range(_DIRECTORY_STAGE_ATTEMPTS):
+            candidate = f".{name}.autoform-stage-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            except OSError:
+                raise _DirectoryPublicationError("create", candidate) from None
+            staging_name = candidate
+            break
+        else:
+            raise _DirectoryPublicationError("create")
+
+        try:
+            created = os.stat(
+                staging_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise _DirectoryPublicationError("changed", staging_name) from None
+        if not stat.S_ISDIR(created.st_mode):
+            raise _DirectoryPublicationError("changed", staging_name)
+        created_identity = _stat_identity(created)
+        checkpoint("staged-before-bind", parent_descriptor, staging_name, name)
+        try:
+            descriptor = os.open(staging_name, flags, dir_fd=parent_descriptor)
+        except OSError:
+            raise _DirectoryPublicationError("changed", staging_name) from None
+        try:
+            _verify_directory_binding(
+                parent_descriptor,
+                staging_name,
+                descriptor,
+                created_identity,
+                require_empty=True,
+            )
+            os.fchmod(descriptor, mode)
+            _verify_directory_binding(
+                parent_descriptor,
+                staging_name,
+                descriptor,
+                created_identity,
+                mode=mode,
+                require_empty=True,
+            )
+        except _DirectoryPublicationError:
+            raise
+        except OSError:
+            raise _DirectoryPublicationError("changed", staging_name) from None
+
+        checkpoint("bound-before-publication", parent_descriptor, staging_name, name)
+        try:
+            rename_noreplace(parent_descriptor, staging_name, parent_descriptor, name)
+        except FileExistsError:
+            raise _DirectoryPublicationError("collision", staging_name) from None
+        except Exception:
+            raise _DirectoryPublicationError("publish", staging_name) from None
+        try:
+            _verify_directory_binding(
+                parent_descriptor,
+                name,
+                descriptor,
+                created_identity,
+                mode=mode,
+                require_empty=True,
+            )
+            fsync_directory(parent_descriptor)
+        except _DirectoryPublicationError:
+            raise
+        except OSError:
+            raise _DirectoryPublicationError("durability", staging_name) from None
+        checkpoint("published-after-parent-fsync", parent_descriptor, staging_name, name)
+        _verify_directory_binding(
+            parent_descriptor,
+            name,
+            descriptor,
+            created_identity,
+            mode=mode,
+            require_empty=True,
+        )
+        return descriptor, created_identity
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        expected = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            descriptor, _ = _publish_new_directory(
+                parent_descriptor,
+                name,
+                mode=0o755,
+                rename_noreplace=_rename_directory_noreplace,
+                fsync_directory=os.fsync,
+                checkpoint=_scaffold_directory_checkpoint,
+            )
+            return descriptor
+        except _DirectoryPublicationError as error:
+            stage_detail = (
+                f"; staged name was {error.staging_name}"
+                if error.staging_name is not None
+                else ""
+            )
+            if error.reason == "durability":
+                issue = f"cannot commit blueprint directory durably: {name}{stage_detail}"
+            elif error.reason in {"changed", "collision"}:
+                issue = f"blueprint directory changed during creation: {name}{stage_detail}"
+            else:
+                issue = f"cannot create blueprint directory: {name}{stage_detail}"
+            raise ScaffoldError([issue]) from None
+    except OSError:
+        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
+    if not stat.S_ISDIR(expected.st_mode):
+        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"])
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
+    try:
+        opened = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or _stat_identity(opened) != _stat_identity(expected)
     ):
         os.close(descriptor)
-        raise ScaffoldError([f"blueprint directory changed after creation: {name}"])
+        raise ScaffoldError([f"blueprint directory changed while it was being opened: {name}"])
     return descriptor
+
+
+def _verify_scaffold_directories(
+    root_descriptor: int,
+    bindings: dict[tuple[str, ...], tuple[int, tuple[int, int]]],
+) -> None:
+    for parts, (descriptor, identity) in bindings.items():
+        parent_descriptor = (
+            root_descriptor if len(parts) == 1 else bindings[parts[:-1]][0]
+        )
+        try:
+            _verify_directory_binding(parent_descriptor, parts[-1], descriptor, identity)
+        except _DirectoryPublicationError:
+            raise ScaffoldError(
+                [f"blueprint directory changed during scaffold: {'/'.join(parts)}"]
+            ) from None
 
 
 def _exclusive_write_at(parent_descriptor: int, name: str, content: bytes, *, mode: int) -> None:
@@ -424,39 +645,59 @@ def scaffold_blueprint(
         substitutions = {"PROJECT_TITLE": title.strip()}
         source_root = _TEMPLATES / "blueprint"
         written: list[str] = []
-        for template in sorted(source_root.rglob("*")):
-            relative_path = template.relative_to(source_root)
-            if (
-                not template.is_file()
-                or "__pycache__" in relative_path.parts
-                or template.suffix == ".pyc"
-            ):
-                continue
-            relative = relative_path.as_posix()
-            destination_relative = ".gitignore" if relative == "gitignore" else relative
-            if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
-                content = template.read_bytes()
-            else:
-                content = _render(template.read_text(encoding="utf-8"), substitutions).encode(
-                    "utf-8"
-                )
+        bindings: dict[tuple[str, ...], tuple[int, tuple[int, int]]] = {}
+        try:
+            for template in sorted(source_root.rglob("*")):
+                relative_path = template.relative_to(source_root)
+                if (
+                    not template.is_file()
+                    or "__pycache__" in relative_path.parts
+                    or template.suffix == ".pyc"
+                ):
+                    continue
+                relative = relative_path.as_posix()
+                destination_relative = ".gitignore" if relative == "gitignore" else relative
+                if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
+                    content = template.read_bytes()
+                else:
+                    content = _render(template.read_text(encoding="utf-8"), substitutions).encode(
+                        "utf-8"
+                    )
 
-            parent_descriptor = os.dup(root_descriptor)
-            try:
+                parent_descriptor = root_descriptor
+                parts: tuple[str, ...] = ()
                 for part in Path(destination_relative).parts[:-1]:
-                    next_descriptor = _open_or_create_directory(parent_descriptor, part)
-                    os.close(parent_descriptor)
-                    parent_descriptor = next_descriptor
+                    parts = (*parts, part)
+                    binding = bindings.get(parts)
+                    if binding is None:
+                        descriptor = _open_or_create_directory(parent_descriptor, part)
+                        try:
+                            opened = os.fstat(descriptor)
+                        except OSError:
+                            os.close(descriptor)
+                            raise ScaffoldError(
+                                [f"cannot retain blueprint directory safely: {'/'.join(parts)}"]
+                            ) from None
+                        binding = (descriptor, _stat_identity(opened))
+                        bindings[parts] = binding
+                    parent_descriptor = binding[0]
+                _verify_scaffold_directories(root_descriptor, bindings)
                 _exclusive_write_at(
                     parent_descriptor,
                     Path(destination_relative).name,
                     content,
                     mode=stat.S_IMODE(template.stat().st_mode),
                 )
-            finally:
-                os.close(parent_descriptor)
-            written.append(destination_relative)
-        return tuple(written)
+                _verify_scaffold_directories(root_descriptor, bindings)
+                written.append(destination_relative)
+            _verify_scaffold_directories(root_descriptor, bindings)
+            return tuple(written)
+        finally:
+            for descriptor, _ in reversed(tuple(bindings.values())):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
     finally:
         os.close(root_descriptor)
 

@@ -600,6 +600,19 @@ def test_blueprint_scaffold_closes_a_nonempty_target(
         os.fstat(opened[0])
 
 
+def test_blueprint_scaffold_requires_atomic_directory_publication_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    monkeypatch.setattr(scaffold_module, "_atomic_directory_publication_available", lambda: False)
+
+    with pytest.raises(ScaffoldError, match="platform"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert list(target.iterdir()) == []
+
+
 def test_blueprint_scaffold_rejects_a_racing_directory_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -624,6 +637,80 @@ def test_blueprint_scaffold_rejects_a_racing_directory_symlink(
 
     assert injected
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "event",
+    ["staged-before-bind", "bound-before-publication"],
+)
+def test_blueprint_scaffold_rejects_staged_child_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    held = target / "held-coverage-stage"
+    staged_name = ""
+
+    def replace_stage(
+        current_event: str,
+        _parent_descriptor: int,
+        current_staging_name: str,
+        target_name: str,
+    ) -> None:
+        nonlocal staged_name
+        if current_event != event or target_name != "coverage" or staged_name:
+            return
+        staged_name = current_staging_name
+        staged = target / staged_name
+        staged.rename(held)
+        (held / "owned").write_text("original\n", encoding="utf-8")
+        staged.mkdir()
+        (staged / "foreign").write_text("replacement\n", encoding="utf-8")
+
+    monkeypatch.setattr(scaffold_module, "_scaffold_directory_checkpoint", replace_stage)
+
+    with pytest.raises(ScaffoldError, match="blueprint directory changed"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert (held / "owned").read_text(encoding="utf-8") == "original\n"
+    if event == "staged-before-bind":
+        assert not (target / "coverage").exists()
+        foreign = target / staged_name
+    else:
+        foreign = target / "coverage"
+    assert (foreign / "foreign").read_text(encoding="utf-8") == "replacement\n"
+
+
+def test_blueprint_scaffold_preserves_a_directory_publication_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    staged_name = ""
+
+    def claim_target(
+        event: str,
+        _parent_descriptor: int,
+        current_staging_name: str,
+        target_name: str,
+    ) -> None:
+        nonlocal staged_name
+        if event != "bound-before-publication" or target_name != "coverage" or staged_name:
+            return
+        staged_name = current_staging_name
+        (target / "coverage").mkdir()
+        (target / "coverage/foreign").write_text("winner\n", encoding="utf-8")
+
+    monkeypatch.setattr(scaffold_module, "_scaffold_directory_checkpoint", claim_target)
+
+    with pytest.raises(ScaffoldError, match="blueprint directory changed"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert (target / "coverage/foreign").read_text(encoding="utf-8") == "winner\n"
+    assert (target / staged_name).is_dir()
+    assert list((target / staged_name).iterdir()) == []
 
 
 def test_created_scaffold_directory_is_bound_before_parent_fsync(
@@ -656,6 +743,39 @@ def test_created_scaffold_directory_is_bound_before_parent_fsync(
     assert raced
     assert list(replacement.iterdir()) == []
     assert list(displaced.iterdir()) == []
+
+
+def test_blueprint_scaffold_retains_child_bindings_until_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    held = target / "held-coverage"
+    original_write = scaffold_module._exclusive_write_at
+    raced = False
+
+    def replace_earlier_child(
+        parent_descriptor: int,
+        name: str,
+        content: bytes,
+        *,
+        mode: int,
+    ) -> None:
+        nonlocal raced
+        if name == ".gitignore" and not raced:
+            (target / "coverage").rename(held)
+            (target / "coverage").mkdir()
+            raced = True
+        original_write(parent_descriptor, name, content, mode=mode)
+
+    monkeypatch.setattr(scaffold_module, "_exclusive_write_at", replace_earlier_child)
+
+    with pytest.raises(ScaffoldError, match="coverage"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert raced
+    assert (held / "README.md").is_file()
+    assert list((target / "coverage").iterdir()) == []
 
 
 def test_a_title_with_a_colon_stays_one_yaml_key(tmp_path: Path) -> None:

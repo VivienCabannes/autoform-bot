@@ -13,7 +13,12 @@ from pathlib import Path, PurePosixPath
 import tomlkit
 from tomlkit.items import InlineTable, KeyType, SingleKey, Table
 
-from .scaffold import ScaffoldError, scaffold_blueprint
+from .scaffold import (
+    ScaffoldError,
+    _DirectoryPublicationError,
+    _publish_new_directory,
+    scaffold_blueprint,
+)
 from .project.create import ProjectCreateError, _rename_noreplace
 from .workspace import (
     Workspace,
@@ -47,6 +52,7 @@ except ImportError:  # pragma: no cover - unsupported mutation platform
     fcntl = None  # type: ignore[assignment]
 
 _ORIGINAL_SCAFFOLD_BLUEPRINT = scaffold_blueprint
+_DIRECTORY_RENAME_NOREPLACE = _rename_noreplace
 
 
 @dataclass(slots=True)
@@ -258,28 +264,40 @@ def create_blueprint_project(
         )
         location_descriptor = binding.location_descriptors[-1]
         try:
-            os.mkdir(member, mode=0o755, dir_fd=location_descriptor)
-        except FileExistsError:
-            raise WorkspaceError(
-                [f"blueprint destination already exists: {binding.combined}"]
-            ) from None
-        except OSError:
-            raise WorkspaceError(
-                [f"blueprint destination could not be created: {binding.combined}"]
-            ) from None
-        destination_descriptor, destination_identity = _open_child_directory(
-            location_descriptor,
-            member,
-            "blueprint destination",
-        )
+            destination_descriptor, destination_identity = _publish_new_directory(
+                location_descriptor,
+                member,
+                mode=0o755,
+                rename_noreplace=_DIRECTORY_RENAME_NOREPLACE,
+                fsync_directory=_fsync_directory_descriptor,
+                checkpoint=_workspace_directory_checkpoint,
+            )
+        except _DirectoryPublicationError as error:
+            stage_detail = (
+                f"; staged name was {error.staging_name}"
+                if error.staging_name is not None
+                else ""
+            )
+            if error.reason == "collision":
+                issue = f"blueprint destination already exists: {binding.combined}{stage_detail}"
+            elif error.reason == "durability":
+                issue = (
+                    "blueprint destination could not be committed durably: "
+                    f"{binding.combined}{stage_detail}"
+                )
+            elif error.reason == "changed":
+                issue = (
+                    f"blueprint destination changed during creation: "
+                    f"{binding.combined}{stage_detail}"
+                )
+            else:
+                issue = (
+                    f"blueprint destination could not be created: "
+                    f"{binding.combined}{stage_detail}"
+                )
+            raise WorkspaceError([issue]) from None
         binding.destination_descriptor = destination_descriptor
         binding.destination_identity = destination_identity
-        try:
-            _fsync_directory_descriptor(location_descriptor)
-        except OSError:
-            raise WorkspaceError(
-                [f"blueprint destination could not be committed durably: {binding.combined}"]
-            ) from None
         _verify_blueprint_binding(binding, require_roadmap=False)
         if scaffold_blueprint is _ORIGINAL_SCAFFOLD_BLUEPRINT:
             written = scaffold_blueprint(
@@ -1338,6 +1356,15 @@ def _workspace_mutation_checkpoint(_name: str) -> None:
     """Deterministic race boundary used by adversarial tests."""
 
 
+def _workspace_directory_checkpoint(
+    _event: str,
+    _parent_descriptor: int,
+    _staging_name: str,
+    _target_name: str,
+) -> None:
+    """Deterministic staged-directory race boundary used by tests."""
+
+
 def _require_workspace_mutation_support() -> None:
     required = (
         fcntl is not None,
@@ -1348,6 +1375,7 @@ def _require_workspace_mutation_support() -> None:
         os.mkdir in os.supports_dir_fd,
         os.open in os.supports_dir_fd,
         os.stat in os.supports_dir_fd,
+        os.listdir in os.supports_fd,
     )
     if not all(required):
         raise WorkspaceError(
@@ -1535,37 +1563,55 @@ def _create_directory_chain(
         _verify_root_binding(root, root_descriptor, root_identity)
         for part in relative.parts:
             next_path = current / part
-            created_now = False
             try:
-                os.mkdir(part, mode=0o755, dir_fd=parent_descriptor)
-            except FileExistsError:
-                pass
-            except OSError:
-                raise WorkspaceError(["blueprint root could not be created"]) from None
-            else:
-                created_now = True
+                expected = os.stat(
+                    part,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                try:
+                    next_descriptor, next_identity = _publish_new_directory(
+                        parent_descriptor,
+                        part,
+                        mode=0o755,
+                        rename_noreplace=_DIRECTORY_RENAME_NOREPLACE,
+                        fsync_directory=_fsync_directory_descriptor,
+                        checkpoint=_workspace_directory_checkpoint,
+                    )
+                except _DirectoryPublicationError as error:
+                    stage_detail = (
+                        f"; staged name was {error.staging_name}"
+                        if error.staging_name is not None
+                        else ""
+                    )
+                    if error.reason == "durability":
+                        issue = f"blueprint root could not be committed durably{stage_detail}"
+                    elif error.reason in {"changed", "collision"}:
+                        issue = f"blueprint root changed during creation{stage_detail}"
+                    else:
+                        issue = f"blueprint root could not be created{stage_detail}"
+                    raise WorkspaceError([issue]) from None
                 created.append(next_path)
-            next_descriptor, next_identity = _open_child_directory(
-                parent_descriptor,
-                part,
-                "blueprint root",
-            )
+            except OSError:
+                raise WorkspaceError(["blueprint root could not be inspected safely"]) from None
+            else:
+                if not stat.S_ISDIR(expected.st_mode):
+                    raise WorkspaceError(["blueprint root exists and is not a directory"])
+                next_descriptor, next_identity = _open_child_directory(
+                    parent_descriptor,
+                    part,
+                    "blueprint root",
+                )
             descriptors.append(next_descriptor)
             identities.append(next_identity)
-            if created_now:
-                try:
-                    _fsync_directory_descriptor(parent_descriptor)
-                except OSError:
-                    raise WorkspaceError(
-                        ["blueprint root could not be committed durably"]
-                    ) from None
-                _verify_relative_directories(
-                    root_descriptor,
-                    PurePosixPath(*relative.parts[: len(descriptors)]),
-                    tuple(descriptors),
-                    tuple(identities),
-                    label="blueprint root",
-                )
+            _verify_relative_directories(
+                root_descriptor,
+                PurePosixPath(*relative.parts[: len(descriptors)]),
+                tuple(descriptors),
+                tuple(identities),
+                label="blueprint root",
+            )
             parent_descriptor = next_descriptor
             current = next_path
     except WorkspaceError as error:

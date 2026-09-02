@@ -152,7 +152,8 @@ def test_workspace_init_fsyncs_each_created_directory_parent_before_manifest_pub
         target_parent: int,
         target: str,
     ) -> None:
-        events.append(("manifest-publish", None))
+        if target == ".autoform.toml":
+            events.append(("manifest-publish", None))
         original_publish(source_parent, source, target_parent, target)
 
     monkeypatch.setattr(workspace_module.os, "fsync", record_sync)
@@ -385,6 +386,51 @@ def test_creation_keeps_its_destination_binding_while_scaffolding(
     assert load_workspace(root).manifest.projects == ()
 
 
+@pytest.mark.parametrize(
+    "event",
+    ["staged-before-bind", "bound-before-publication"],
+)
+def test_creation_rejects_staged_destination_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+) -> None:
+    root = _workspace(tmp_path)
+    location = root / "Plans"
+    held = location / "held-example-stage"
+    staged_name = ""
+
+    def replace_stage(
+        current_event: str,
+        _parent_descriptor: int,
+        current_staging_name: str,
+        target_name: str,
+    ) -> None:
+        nonlocal staged_name
+        if current_event != event or target_name != "Example" or staged_name:
+            return
+        staged_name = current_staging_name
+        staged = location / staged_name
+        staged.rename(held)
+        (held / "owned").write_text("original\n", encoding="utf-8")
+        staged.mkdir()
+        (staged / "foreign").write_text("replacement\n", encoding="utf-8")
+
+    monkeypatch.setattr(workspace_module, "_workspace_directory_checkpoint", replace_stage)
+
+    with pytest.raises(WorkspaceError, match="blueprint destination changed"):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert (held / "owned").read_text(encoding="utf-8") == "original\n"
+    if event == "staged-before-bind":
+        assert not (location / "Example").exists()
+        foreign = location / staged_name
+    else:
+        foreign = location / "Example"
+    assert (foreign / "foreign").read_text(encoding="utf-8") == "replacement\n"
+    assert load_workspace(root).manifest.projects == ()
+
+
 def test_creation_rejects_destination_replaced_after_parent_fsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -595,42 +641,35 @@ def test_workspace_init_retains_paths_instead_of_racing_directory_cleanup(
 ) -> None:
     root = tmp_path / "repository"
     root.mkdir()
-    nested = root / "Plans/Nested"
-    raced = False
-    workspace_module._require_workspace_mutation_support()
-    original_open = workspace_module.os.open
-    original_rmdir = Path.rmdir
     opened_components: list[int] = []
+    staged_names: list[str] = []
 
-    def fail_after_creating_nested(path, *args, **kwargs):
-        if path == "Nested":
-            raise OSError("injected open failure")
-        descriptor = original_open(path, *args, **kwargs)
-        if path == "Plans":
-            opened_components.append(descriptor)
-        return descriptor
+    def fail_before_binding_nested(
+        event: str,
+        parent_descriptor: int,
+        staging_name: str,
+        target_name: str,
+    ) -> None:
+        if event == "staged-before-bind" and target_name == "Nested":
+            opened_components.append(parent_descriptor)
+            staged_names.append(staging_name)
+            raise workspace_module._DirectoryPublicationError("changed", staging_name)
 
-    def replace_before_rmdir(path: Path) -> None:
-        nonlocal raced
-        if path == nested:
-            raced = True
-            path.rename(root / "retained-owned-directory")
-            path.mkdir()
-        original_rmdir(path)
-
-    monkeypatch.setattr(workspace_module, "_require_workspace_mutation_support", lambda: None)
-    monkeypatch.setattr(workspace_module.os, "open", fail_after_creating_nested)
-    monkeypatch.setattr(Path, "rmdir", replace_before_rmdir)
+    monkeypatch.setattr(
+        workspace_module,
+        "_workspace_directory_checkpoint",
+        fail_before_binding_nested,
+    )
 
     with pytest.raises(WorkspaceError, match="retained complete staged manifest"):
         initialize_workspace(root, blueprint_root="Plans/Nested")
 
-    assert not raced
-    assert opened_components
+    assert len(opened_components) == 1
     with pytest.raises(OSError):
-        workspace_module.os.fstat(opened_components[-1])
+        workspace_module.os.fstat(opened_components[0])
     assert not (root / ".autoform.toml").exists()
-    assert nested.is_dir()
+    assert not (root / "Plans/Nested").exists()
+    assert (root / "Plans" / staged_names[0]).is_dir()
     staged, = root.glob("..autoform.toml.*.tmp")
     assert stat.S_IMODE(staged.stat().st_mode) == 0o600
     assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
@@ -787,33 +826,49 @@ def test_workspace_init_rejects_bound_directory_replaced_by_file_after_publish(
     assert (root / "held-plans").is_dir()
 
 
-def test_workspace_init_rejects_replaced_directory_before_descending(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "event",
+    ["staged-before-bind", "bound-before-publication"],
+)
+def test_workspace_init_rejects_replaced_staged_nested_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
 ) -> None:
     root = tmp_path / "repository"
     root.mkdir()
-    workspace_module._require_workspace_mutation_support()
-    original_open = workspace_module.os.open
-    replaced = False
+    held = root / "Plans/held-nested-stage"
+    staged_name = ""
 
-    def replace_after_mkdir(path, *args, **kwargs):
-        nonlocal replaced
-        if path == "Plans" and not replaced:
-            replaced = True
-            (root / "Plans").rename(root / "created-plans")
-            (root / "Plans").mkdir()
-        return original_open(path, *args, **kwargs)
+    def replace_stage(
+        current_event: str,
+        _parent_descriptor: int,
+        current_staging_name: str,
+        target_name: str,
+    ) -> None:
+        nonlocal staged_name
+        if current_event != event or target_name != "Nested" or staged_name:
+            return
+        staged_name = current_staging_name
+        staged = root / "Plans" / staged_name
+        staged.rename(held)
+        (held / "owned").write_text("original\n", encoding="utf-8")
+        staged.mkdir()
+        (staged / "foreign").write_text("replacement\n", encoding="utf-8")
 
-    monkeypatch.setattr(workspace_module, "_require_workspace_mutation_support", lambda: None)
-    monkeypatch.setattr(workspace_module.os, "open", replace_after_mkdir)
+    monkeypatch.setattr(workspace_module, "_workspace_directory_checkpoint", replace_stage)
 
-    with pytest.raises(WorkspaceError, match="changed while it was being opened"):
+    with pytest.raises(WorkspaceError, match="blueprint root changed"):
         initialize_workspace(root, blueprint_root="Plans/Nested")
 
-    assert replaced
     assert not (root / ".autoform.toml").exists()
-    assert list((root / "Plans").iterdir()) == []
-    assert list((root / "created-plans").iterdir()) == []
+    assert (held / "owned").read_text(encoding="utf-8") == "original\n"
+    if event == "staged-before-bind":
+        assert not (root / "Plans/Nested").exists()
+        foreign = root / "Plans" / staged_name
+    else:
+        foreign = root / "Plans/Nested"
+    assert (foreign / "foreign").read_text(encoding="utf-8") == "replacement\n"
     staged, = root.glob("..autoform.toml.*.tmp")
     assert stat.S_IMODE(staged.stat().st_mode) == 0o600
     assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
