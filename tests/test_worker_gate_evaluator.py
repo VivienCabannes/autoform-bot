@@ -17,7 +17,7 @@ from autoform_worker.gate_evaluator import (
     _materialize_worktrees,
     evaluate_gate_request,
 )
-from autoform_worker.gate_pack import prepare_repository_pack, verify_repository_pack
+from autoform_worker.gate_pack import RepositoryPack, prepare_repository_pack, verify_repository_pack
 from autoform_worker.gate_provider import GateInvocationRequest, GateProviderError
 from autoform_worker.gates import CandidateGateResult, _work_item_sha256
 from autoform_worker.scheduler import WorkItem, WorkPhase
@@ -541,11 +541,49 @@ def test_host_pack_preparation_wraps_ancestor_symlink_loop(tmp_path: Path) -> No
         )
 
 
-@pytest.mark.parametrize("path_failure", ["resolve-runtime", "unencodable"])
-def test_host_pack_revalidation_wraps_non_os_path_failures(
+def test_host_pack_preparation_rejects_unencodable_destination_before_staging(
+    tmp_path: Path,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    target = state / "\ud800.pack"
+
+    with pytest.raises(GateProviderError, match="repository pack path must be a canonical absolute path"):
+        prepare_repository_pack(
+            repository,
+            target,
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    assert not target.exists()
+    assert list(state.iterdir()) == []
+
+
+def test_repository_pack_identity_rejects_unencodable_path(tmp_path: Path) -> None:
+    with pytest.raises(GateProviderError, match="repository pack path must be a canonical absolute path"):
+        RepositoryPack(
+            path=str(tmp_path.resolve() / "\ud800.pack"),
+            sha256="0" * 64,
+            size=1,
+            device=1,
+            inode=1,
+            mode=0o444,
+            parent_device=1,
+            parent_inode=1,
+            parent_mode=0o700,
+            object_format="sha1",
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+        )
+
+
+def test_host_pack_revalidation_wraps_path_resolution_runtime_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    path_failure: str,
 ) -> None:
     repository, base_oid, candidate_oid = _repository(tmp_path)
     state = (tmp_path / "state").resolve()
@@ -558,18 +596,15 @@ def test_host_pack_revalidation_wraps_non_os_path_failures(
         maximum_bytes=1024 * 1024,
         timeout_seconds=30,
     )
-    if path_failure == "unencodable":
-        pack = replace(pack, path=str(state / "\ud800"))
-    else:
-        pack_path = Path(pack.path)
-        original_resolve = Path.resolve
+    pack_path = Path(pack.path)
+    original_resolve = Path.resolve
 
-        def fail_pack_resolve(path: Path, *, strict: bool = False) -> Path:
-            if path == pack_path:
-                raise RuntimeError("injected path resolution failure")
-            return original_resolve(path, strict=strict)
+    def fail_pack_resolve(path: Path, *, strict: bool = False) -> Path:
+        if path == pack_path:
+            raise RuntimeError("injected path resolution failure")
+        return original_resolve(path, strict=strict)
 
-        monkeypatch.setattr(Path, "resolve", fail_pack_resolve)
+    monkeypatch.setattr(Path, "resolve", fail_pack_resolve)
 
     with pytest.raises(GateProviderError, match="pathname cannot be inspected"):
         verify_repository_pack(pack)

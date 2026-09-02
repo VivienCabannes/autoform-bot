@@ -573,9 +573,14 @@ def _open_bound_private_directory(path: Path, expected: tuple[int, int, int]) ->
 
 
 def _canonical_absolute_path(value: str, *, label: str) -> None:
+    if not isinstance(value, str):
+        raise GateProviderError(f"{label} must be a canonical absolute path")
+    try:
+        os.fsencode(value)
+    except (UnicodeError, ValueError) as error:
+        raise GateProviderError(f"{label} must be a canonical absolute path") from error
     if (
-        not isinstance(value, str)
-        or not value
+        not value
         or value != value.strip()
         or not Path(value).is_absolute()
         or os.path.normpath(value) != value
