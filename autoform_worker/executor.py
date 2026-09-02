@@ -195,8 +195,8 @@ class ProverExecutor:
         if item.workspace_project_id is not None and (
             getattr(execution_input, "workspace_project_id", None)
             != item.workspace_project_id
-            or getattr(execution_input, "workspace_manifest_sha256", None)
-            != item.workspace_manifest_sha256
+            or getattr(execution_input, "workspace_project_binding_sha256", None)
+            != item.workspace_project_binding_sha256
         ):
             return None, "workspace binding changed during attempt"
         if (

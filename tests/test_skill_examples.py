@@ -628,6 +628,9 @@ def test_workspace_guidance_is_registry_based_and_repository_neutral(repo_root: 
         "--project",
     ):
         assert required in cli
+    assert "project_binding_sha256" in implementation
+    assert "workspace_manifest_sha256" not in implementation
+    assert "_rename_exchange" in implementation
     for repository_specific_name in (
         "formal-math",
         "MathlibExt",

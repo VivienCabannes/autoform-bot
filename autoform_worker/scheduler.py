@@ -67,7 +67,7 @@ class WorkItem:
     source_contract_sha256: str | None = None
     protected_roadmap_sha256: str | None = None
     workspace_project_id: str | None = None
-    workspace_manifest_sha256: str | None = None
+    workspace_project_binding_sha256: str | None = None
     blueprint_path: str | None = None
 
 
@@ -319,7 +319,7 @@ class Scheduler:
                             else None
                         ),
                         workspace_project_id=projection.workspace_project_id,
-                        workspace_manifest_sha256=projection.workspace_manifest_sha256,
+                        workspace_project_binding_sha256=projection.workspace_project_binding_sha256,
                         blueprint_path=runtime.blueprint_path,
                     )
                 )
@@ -401,7 +401,8 @@ class Scheduler:
             return RoundResult(None, None, "claimed work source-coverage contract changed")
         if (
             item.workspace_project_id != projection.workspace_project_id
-            or item.workspace_manifest_sha256 != projection.workspace_manifest_sha256
+            or item.workspace_project_binding_sha256
+            != projection.workspace_project_binding_sha256
             or item.blueprint_path != runtime.blueprint_path
         ):
             return RoundResult(None, None, "claimed work workspace binding changed")
@@ -443,7 +444,7 @@ class Scheduler:
             source_contract_sha256=source_contract_sha256,
             protected_roadmap_sha256=item.protected_roadmap_sha256,
             workspace_project_id=item.workspace_project_id,
-            workspace_manifest_sha256=item.workspace_manifest_sha256,
+            workspace_project_binding_sha256=item.workspace_project_binding_sha256,
             blueprint_path=item.blueprint_path,
         )
 
@@ -566,7 +567,7 @@ class _RuntimeProjection:
     runtime: RuntimeGraph
     source_contract_sha256: str | None
     workspace_project_id: str | None
-    workspace_manifest_sha256: str | None
+    workspace_project_binding_sha256: str | None
 
 
 def _runtime_projection(value: RuntimeGraph | ExecutionInput) -> _RuntimeProjection:
@@ -575,7 +576,7 @@ def _runtime_projection(value: RuntimeGraph | ExecutionInput) -> _RuntimeProject
             value.runtime,
             value.source_contract_sha256,
             value.workspace_project_id,
-            value.workspace_manifest_sha256,
+            value.workspace_project_binding_sha256,
         )
     return _RuntimeProjection(value, None, None, None)
 

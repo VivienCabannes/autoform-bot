@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
+import secrets
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -19,7 +20,6 @@ from .workspace import (
     _path_contains_symlink,
     _reject_case_collisions,
     _reject_existing_symlink_chain,
-    _require_blueprint,
     discover_workspace,
 )
 from .workspace_manifest import (
@@ -46,13 +46,35 @@ try:
 except ImportError:  # pragma: no cover - unsupported mutation platform
     fcntl = None  # type: ignore[assignment]
 
+_ORIGINAL_SCAFFOLD_BLUEPRINT = scaffold_blueprint
 
-@dataclass(frozen=True, slots=True)
+
+@dataclass(slots=True)
 class _BlueprintBinding:
     workspace: Workspace
     location: WorkspaceLocation
     combined: str
     destination: Path
+    root_descriptor: int
+    root_identity: tuple[int, int]
+    location_descriptors: tuple[int, ...]
+    location_identities: tuple[tuple[int, int], ...]
+    destination_descriptor: int | None = None
+    destination_identity: tuple[int, int] | None = None
+    roadmap_descriptor: int | None = None
+    roadmap_identity: tuple[int, int] | None = None
+
+    def close(self) -> None:
+        descriptors = (*self.location_descriptors, self.root_descriptor)
+        if self.destination_descriptor is not None:
+            descriptors = (self.destination_descriptor, *descriptors)
+        if self.roadmap_descriptor is not None:
+            descriptors = (self.roadmap_descriptor, *descriptors)
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +82,26 @@ class _StagedFile:
     path: Path
     descriptor: int
     identity: tuple[int, int]
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectoryChain:
+    root: Path
+    root_descriptor: int
+    root_identity: tuple[int, int]
+    relative: PurePosixPath
+    descriptors: tuple[int, ...]
+    identities: tuple[tuple[int, int], ...]
+    created: tuple[Path, ...]
+
+    def close(self) -> None:
+        for descriptor in reversed(self.descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,11 +126,13 @@ class WorkspaceInitResult:
 class BlueprintCreateResult:
     project_id: str
     blueprint_path: str
+    manifest_backup_path: str
     written: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
             "blueprint_path": self.blueprint_path,
+            "manifest_backup_path": self.manifest_backup_path,
             "ok": True,
             "project": self.project_id,
             "schema": BLUEPRINT_CHANGE_SCHEMA,
@@ -134,14 +178,22 @@ def initialize_workspace(
     _reject_existing_symlink_chain(collection, root)
     _preflight_directory_chain(root, PurePosixPath(blueprint_root))
 
+    root_descriptor, root_identity = _open_bound_directory(root, "workspace root")
     text = _initial_manifest(location_id=location_id, blueprint_root=blueprint_root)
-    staged = _stage_new_file(manifest_path, text.encode("utf-8"))
-    created_directories: tuple[Path, ...] = ()
+    staged: _StagedFile | None = None
+    chain: _DirectoryChain | None = None
     try:
+        staged = _stage_new_file(
+            manifest_path,
+            text.encode("utf-8"),
+            parent_descriptor=root_descriptor,
+        )
         try:
-            created_directories = _create_directory_chain(
+            chain = _create_directory_chain(
                 root,
                 PurePosixPath(blueprint_root),
+                root_descriptor=root_descriptor,
+                root_identity=root_identity,
             )
         except WorkspaceError as error:
             detail = "; ".join(error.issues)
@@ -149,18 +201,31 @@ def initialize_workspace(
                 [f"{detail}; retained complete staged manifest at {staged.path.name}"]
             ) from None
         try:
-            _publish_staged_file(manifest_path, staged, mode=0o644)
+            _publish_staged_file(
+                manifest_path,
+                staged,
+                mode=0o644,
+                parent_descriptor=root_descriptor,
+                final_validator=lambda: _verify_directory_chain(chain),
+            )
         except WorkspaceError as error:
             retained = ", ".join(
-                path.relative_to(root).as_posix() for path in created_directories
+                path.relative_to(root).as_posix() for path in chain.created
             )
             detail = "; ".join(error.issues)
             if retained:
                 detail += f"; retained unregistered directories: {retained}"
             raise WorkspaceError([detail]) from None
     finally:
+        if chain is not None:
+            chain.close()
+        if staged is not None:
+            try:
+                os.close(staged.descriptor)
+            except OSError:
+                pass
         try:
-            os.close(staged.descriptor)
+            os.close(root_descriptor)
         except OSError:
             pass
     return WorkspaceInitResult(root, WORKSPACE_FILE, location_id, blueprint_root)
@@ -185,32 +250,48 @@ def create_blueprint_project(
         member=member,
         location_id=location_id,
     )
-    _reject_case_collisions(
-        binding.workspace.root,
-        PurePosixPath(binding.combined),
-    )
-    if binding.destination.exists() or binding.destination.is_symlink():
-        raise WorkspaceError([f"blueprint destination already exists: {binding.combined}"])
-
     try:
-        binding.destination.mkdir(mode=0o755)
-    except FileExistsError:
-        raise WorkspaceError(
-            [f"blueprint destination already exists: {binding.combined}"]
-        ) from None
-    except OSError:
-        raise WorkspaceError(
-            [f"blueprint destination could not be created: {binding.combined}"]
-        ) from None
-    try:
-        written = scaffold_blueprint(binding.destination, title=title)
-        _append_project(
+        _reject_case_collisions(
+            binding.workspace.root,
+            PurePosixPath(binding.combined),
+        )
+        location_descriptor = binding.location_descriptors[-1]
+        try:
+            os.mkdir(member, mode=0o755, dir_fd=location_descriptor)
+        except FileExistsError:
+            raise WorkspaceError(
+                [f"blueprint destination already exists: {binding.combined}"]
+            ) from None
+        except OSError:
+            raise WorkspaceError(
+                [f"blueprint destination could not be created: {binding.combined}"]
+            ) from None
+        destination_descriptor, destination_identity = _open_child_directory(
+            location_descriptor,
+            member,
+            "blueprint destination",
+        )
+        binding.destination_descriptor = destination_descriptor
+        binding.destination_identity = destination_identity
+        _verify_blueprint_binding(binding, require_roadmap=False)
+        if scaffold_blueprint is _ORIGINAL_SCAFFOLD_BLUEPRINT:
+            written = scaffold_blueprint(
+                binding.destination,
+                title=title,
+                _directory_descriptor=destination_descriptor,
+                _directory_identity=destination_identity,
+            )
+        else:  # Preserve the small monkeypatch seam used by callers and tests.
+            written = scaffold_blueprint(binding.destination, title=title)
+        _verify_blueprint_binding(binding, require_roadmap=True)
+        manifest_backup_path = _append_project(
             binding.workspace.path,
             project_id=project_id,
             title=title.strip(),
             location_id=binding.location.id,
             path=member,
             expected_blueprint_path=binding.combined,
+            binding=binding,
         )
     except (OSError, ScaffoldError, WorkspaceError) as error:
         detail = (
@@ -224,6 +305,8 @@ def create_blueprint_project(
                 "inspect the unregistered directory before retrying"
             ]
         ) from None
+    finally:
+        binding.close()
 
     relative_written = tuple(
         sorted(
@@ -234,6 +317,7 @@ def create_blueprint_project(
     return BlueprintCreateResult(
         project_id,
         binding.combined,
+        manifest_backup_path,
         relative_written,
     )
 
@@ -256,23 +340,37 @@ def register_blueprint_project(
         member=path,
         location_id=location_id,
     )
-    _reject_case_collisions(
-        binding.workspace.root,
-        PurePosixPath(binding.combined),
-    )
-    _reject_existing_symlink_chain(binding.destination, binding.workspace.root)
-    if not binding.destination.exists():
-        raise WorkspaceError([f"blueprint directory does not exist: {binding.combined}"])
-    _require_blueprint(binding.destination)
-    _append_project(
-        binding.workspace.path,
-        project_id=project_id,
-        title=title.strip() if title is not None else project_id,
-        location_id=binding.location.id,
-        path=path,
-        expected_blueprint_path=binding.combined,
-    )
-    return BlueprintCreateResult(project_id, binding.combined, ())
+    try:
+        _reject_case_collisions(
+            binding.workspace.root,
+            PurePosixPath(binding.combined),
+        )
+        _reject_existing_symlink_chain(binding.destination, binding.workspace.root)
+        try:
+            destination_descriptor, destination_identity = _open_child_directory(
+                binding.location_descriptors[-1],
+                path,
+                "blueprint destination",
+            )
+        except WorkspaceError:
+            raise WorkspaceError(
+                [f"blueprint directory does not exist: {binding.combined}"]
+            ) from None
+        binding.destination_descriptor = destination_descriptor
+        binding.destination_identity = destination_identity
+        _verify_blueprint_binding(binding, require_roadmap=True)
+        manifest_backup_path = _append_project(
+            binding.workspace.path,
+            project_id=project_id,
+            title=title.strip() if title is not None else project_id,
+            location_id=binding.location.id,
+            path=path,
+            expected_blueprint_path=binding.combined,
+            binding=binding,
+        )
+    finally:
+        binding.close()
+    return BlueprintCreateResult(project_id, binding.combined, manifest_backup_path, ())
 
 
 def _prepare_blueprint_binding(
@@ -310,8 +408,27 @@ def _prepare_blueprint_binding(
     _reject_existing_symlink_chain(collection, workspace.root)
     if not collection.is_dir():
         raise WorkspaceError([f"blueprint location does not exist: {location.path}"])
+    root_descriptor, root_identity = _open_bound_directory(workspace.root, "workspace root")
+    try:
+        location_descriptors, location_identities = _open_relative_directories(
+            root_descriptor,
+            PurePosixPath(location.path),
+            "blueprint location",
+        )
+    except BaseException:
+        os.close(root_descriptor)
+        raise
     destination = collection / member
-    return _BlueprintBinding(workspace, location, combined, destination)
+    return _BlueprintBinding(
+        workspace,
+        location,
+        combined,
+        destination,
+        root_descriptor,
+        root_identity,
+        location_descriptors,
+        location_identities,
+    )
 
 
 def _validate_project_registration(
@@ -421,10 +538,20 @@ def _append_project(
     location_id: str,
     path: str,
     expected_blueprint_path: str,
-) -> None:
-    descriptor = _open_locked_manifest(manifest_path)
-    temporary: Path | None = None
+    binding: _BlueprintBinding | None = None,
+) -> str:
+    own_parent = binding is None
+    if binding is None:
+        parent_descriptor, _ = _open_bound_directory(manifest_path.parent, "workspace root")
+    else:
+        parent_descriptor = binding.root_descriptor
+    descriptor: int | None = None
+    staged: _StagedFile | None = None
+    exchanged = False
     try:
+        assert fcntl is not None
+        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
+        descriptor = _open_locked_manifest(manifest_path, parent_descriptor=parent_descriptor)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise WorkspaceError([f"{WORKSPACE_FILE} is not a regular file"])
@@ -458,20 +585,21 @@ def _append_project(
             raise WorkspaceError(
                 [f"updated {WORKSPACE_FILE} would exceed the {MAX_MANIFEST_BYTES}-byte limit"]
             )
-        temporary_descriptor, temporary_name = tempfile.mkstemp(
-            dir=manifest_path.parent,
-            prefix=f".{manifest_path.name}.",
-            suffix=".tmp",
+        staged = _stage_new_file(
+            manifest_path,
+            updated,
+            parent_descriptor=parent_descriptor,
+            mode=stat.S_IMODE(metadata.st_mode),
         )
-        temporary = Path(temporary_name)
-        with os.fdopen(temporary_descriptor, "wb") as output:
-            output.write(updated)
-            output.flush()
-            os.fsync(output.fileno())
-        temporary.chmod(stat.S_IMODE(metadata.st_mode))
+        if binding is not None:
+            _verify_blueprint_binding(binding, require_roadmap=True)
         current_metadata = os.fstat(descriptor)
         try:
-            named_metadata = os.stat(manifest_path, follow_symlinks=False)
+            named_metadata = os.stat(
+                manifest_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except OSError:
             raise WorkspaceError([f"{WORKSPACE_FILE} changed during update"]) from None
         if _file_signature(current_metadata) != _file_signature(metadata) or (
@@ -479,37 +607,102 @@ def _append_project(
             current_metadata.st_ino,
         ) != (named_metadata.st_dev, named_metadata.st_ino):
             raise WorkspaceError([f"{WORKSPACE_FILE} changed during update"])
-        os.replace(temporary, manifest_path)
-        temporary = None
-        _fsync_directory(manifest_path.parent)
+        _verify_descriptor_content(descriptor, original, f"{WORKSPACE_FILE} changed during update")
+        _verify_staged_file(parent_descriptor, staged.path.name, staged)
+        _rename_exchange(
+            parent_descriptor,
+            staged.path.name,
+            parent_descriptor,
+            manifest_path.name,
+        )
+        exchanged = True
+        try:
+            _verify_staged_file(parent_descriptor, manifest_path.name, staged)
+            _verify_named_content(
+                parent_descriptor,
+                staged.path.name,
+                identity=(metadata.st_dev, metadata.st_ino),
+                content=original,
+                issue=f"{WORKSPACE_FILE} changed during update",
+            )
+            if binding is not None:
+                _verify_blueprint_binding(binding, require_roadmap=True)
+        except WorkspaceError:
+            _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
+            exchanged = False
+            raise
+        _fsync_directory_descriptor(parent_descriptor)
+        _verify_staged_file(parent_descriptor, manifest_path.name, staged)
+        if binding is not None:
+            _verify_blueprint_binding(binding, require_roadmap=True)
+        backup_name = _retain_displaced_manifest(
+            parent_descriptor,
+            staged.path.name,
+            descriptor,
+            (metadata.st_dev, metadata.st_ino),
+        )
+        _fsync_directory_descriptor(parent_descriptor)
+        _verify_staged_file(parent_descriptor, manifest_path.name, staged)
+        if binding is not None:
+            _verify_blueprint_binding(binding, require_roadmap=True)
+        exchanged = False
+        return backup_name
     except WorkspaceError:
+        if exchanged and staged is not None:
+            try:
+                _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
+            except WorkspaceError:
+                pass
         raise
     except OSError:
+        if exchanged and staged is not None:
+            try:
+                _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
+            except WorkspaceError:
+                pass
         raise WorkspaceError([f"cannot update {WORKSPACE_FILE}"]) from None
     finally:
-        os.close(descriptor)
-        if temporary is not None:
+        if descriptor is not None:
             try:
-                temporary.unlink(missing_ok=True)
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            assert fcntl is not None
+            fcntl.flock(parent_descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        if staged is not None:
+            try:
+                os.close(staged.descriptor)
+            except OSError:
+                pass
+        if own_parent:
+            try:
+                os.close(parent_descriptor)
             except OSError:
                 pass
 
 
-def _open_locked_manifest(manifest_path: Path) -> int:
+def _open_locked_manifest(manifest_path: Path, *, parent_descriptor: int) -> int:
     """Lock the inode currently named by the manifest, retrying across replacement."""
 
     _require_workspace_mutation_support()
     flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     for _ in range(8):
         try:
-            descriptor = os.open(manifest_path, flags)
+            descriptor = os.open(manifest_path.name, flags, dir_fd=parent_descriptor)
         except OSError:
             raise WorkspaceError([f"cannot update {WORKSPACE_FILE}"]) from None
         try:
             assert fcntl is not None
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             opened = os.fstat(descriptor)
-            named = os.stat(manifest_path, follow_symlinks=False)
+            named = os.stat(
+                manifest_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
             if (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino):
                 return descriptor
         except OSError:
@@ -528,12 +721,417 @@ def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
     )
 
 
+def _identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _open_bound_directory(path: Path, label: str) -> tuple[int, tuple[int, int]]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        named = path.stat(follow_symlinks=False)
+    except OSError:
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        except OSError:
+            pass
+        raise WorkspaceError([f"{label} could not be opened safely"]) from None
+    if not stat.S_ISDIR(opened.st_mode) or _identity(opened) != _identity(named):
+        os.close(descriptor)
+        raise WorkspaceError([f"{label} changed while it was being opened"])
+    return descriptor, _identity(opened)
+
+
+def _open_child_directory(
+    parent_descriptor: int,
+    name: str,
+    label: str,
+) -> tuple[int, tuple[int, int]]:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        expected = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise OSError(f"{label} is not a directory")
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+    except OSError:
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        except OSError:
+            pass
+        raise WorkspaceError([f"{label} could not be opened safely"]) from None
+    if _identity(opened) != _identity(expected):
+        os.close(descriptor)
+        raise WorkspaceError([f"{label} changed while it was being opened"])
+    return descriptor, _identity(opened)
+
+
+def _open_relative_directories(
+    root_descriptor: int,
+    relative: PurePosixPath,
+    label: str,
+) -> tuple[tuple[int, ...], tuple[tuple[int, int], ...]]:
+    descriptors: list[int] = []
+    identities: list[tuple[int, int]] = []
+    parent = root_descriptor
+    try:
+        if not relative.parts:
+            descriptor = os.dup(root_descriptor)
+            opened = os.fstat(descriptor)
+            return (descriptor,), (_identity(opened),)
+        for part in relative.parts:
+            descriptor, identity = _open_child_directory(parent, part, label)
+            descriptors.append(descriptor)
+            identities.append(identity)
+            parent = descriptor
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+    return tuple(descriptors), tuple(identities)
+
+
+def _verify_root_binding(path: Path, descriptor: int, identity: tuple[int, int]) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        named = path.stat(follow_symlinks=False)
+    except OSError:
+        raise WorkspaceError(["workspace root changed during publication"]) from None
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or _identity(opened) != identity
+        or _identity(named) != identity
+    ):
+        raise WorkspaceError(["workspace root changed during publication"])
+
+
+def _verify_relative_directories(
+    root_descriptor: int,
+    relative: PurePosixPath,
+    descriptors: tuple[int, ...],
+    identities: tuple[tuple[int, int], ...],
+    *,
+    label: str,
+) -> None:
+    parts = relative.parts
+    if not parts:
+        parts = (".",)
+    if len(parts) != len(descriptors) or len(descriptors) != len(identities):
+        raise WorkspaceError([f"{label} binding is incomplete"])
+    parent = root_descriptor
+    for part, descriptor, identity in zip(parts, descriptors, identities, strict=True):
+        try:
+            opened = os.fstat(descriptor)
+            named = os.fstat(root_descriptor) if part == "." else os.stat(
+                part,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise WorkspaceError([f"{label} changed during publication"]) from None
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or _identity(opened) != identity
+            or _identity(named) != identity
+        ):
+            raise WorkspaceError([f"{label} changed during publication"])
+        parent = descriptor
+
+
+def _verify_blueprint_binding(
+    binding: _BlueprintBinding,
+    *,
+    require_roadmap: bool,
+) -> None:
+    _verify_root_binding(binding.workspace.root, binding.root_descriptor, binding.root_identity)
+    _verify_relative_directories(
+        binding.root_descriptor,
+        PurePosixPath(binding.location.path),
+        binding.location_descriptors,
+        binding.location_identities,
+        label="blueprint location",
+    )
+    if binding.destination_descriptor is None or binding.destination_identity is None:
+        raise WorkspaceError(["blueprint destination binding is incomplete"])
+    try:
+        opened = os.fstat(binding.destination_descriptor)
+        named = os.stat(
+            binding.destination.name,
+            dir_fd=binding.location_descriptors[-1],
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise WorkspaceError(["blueprint destination changed during registration"]) from None
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or _identity(opened) != binding.destination_identity
+        or _identity(named) != binding.destination_identity
+    ):
+        raise WorkspaceError(["blueprint destination changed during registration"])
+    if require_roadmap:
+        if binding.roadmap_descriptor is None or binding.roadmap_identity is None:
+            roadmap_descriptor, roadmap_identity = _open_child_directory(
+                binding.destination_descriptor,
+                "roadmap",
+                "registered blueprint roadmap",
+            )
+            binding.roadmap_descriptor = roadmap_descriptor
+            binding.roadmap_identity = roadmap_identity
+        try:
+            roadmap_opened = os.fstat(binding.roadmap_descriptor)
+            roadmap_named = os.stat(
+                "roadmap",
+                dir_fd=binding.destination_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise WorkspaceError(["registered blueprint roadmap changed during registration"])
+        if (
+            not stat.S_ISDIR(roadmap_opened.st_mode)
+            or not stat.S_ISDIR(roadmap_named.st_mode)
+            or _identity(roadmap_opened) != binding.roadmap_identity
+            or _identity(roadmap_named) != binding.roadmap_identity
+        ):
+            raise WorkspaceError(["registered blueprint roadmap changed during registration"])
+
+
+def _verify_descriptor_content(descriptor: int, content: bytes, issue: str) -> None:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_size != len(content):
+        raise WorkspaceError([issue])
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < len(content):
+        chunk = os.pread(descriptor, min(1024 * 1024, len(content) - offset), offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    after = os.fstat(descriptor)
+    if (
+        offset != len(content)
+        or digest.digest() != hashlib.sha256(content).digest()
+        or _file_signature(before) != _file_signature(after)
+        or _identity(before) != _identity(after)
+    ):
+        raise WorkspaceError([issue])
+
+
+def _verify_named_content(
+    parent_descriptor: int,
+    name: str,
+    *,
+    identity: tuple[int, int],
+    content: bytes,
+    issue: str,
+) -> None:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError:
+        raise WorkspaceError([issue]) from None
+    try:
+        if _identity(named) != identity or _identity(os.fstat(descriptor)) != identity:
+            raise WorkspaceError([issue])
+        _verify_descriptor_content(descriptor, content, issue)
+    finally:
+        os.close(descriptor)
+
+
+def _verify_staged_file(
+    parent_descriptor: int,
+    name: str,
+    staged: _StagedFile,
+    *,
+    published: bool = False,
+) -> None:
+    issue = (
+        f"published {name} changed before initialization could continue"
+        if published
+        else f"staged manifest changed before publication; inspect {staged.path.name}"
+    )
+    metadata = os.fstat(staged.descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or _identity(metadata) != staged.identity
+        or metadata.st_size != staged.size
+    ):
+        raise WorkspaceError([issue])
+    content = _read_descriptor(staged.descriptor, staged.size, issue)
+    if hashlib.sha256(content).hexdigest() != staged.sha256:
+        raise WorkspaceError([issue])
+    _verify_named_content(
+        parent_descriptor,
+        name,
+        identity=staged.identity,
+        content=content,
+        issue=issue,
+    )
+
+
+def _read_descriptor(descriptor: int, size: int, issue: str) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < size:
+        try:
+            chunk = os.pread(descriptor, min(1024 * 1024, size - offset), offset)
+        except OSError:
+            raise WorkspaceError([issue]) from None
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+    if offset != size:
+        raise WorkspaceError([issue])
+    return b"".join(chunks)
+
+
+def _rename_exchange(
+    source_parent: int,
+    source: str,
+    target_parent: int,
+    target: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if hasattr(libc, "renameatx_np"):
+        function = libc.renameatx_np
+        flag = 0x00000002
+    elif hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        flag = 2
+    else:
+        raise OSError("atomic exchange unavailable")
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    if function(source_parent, os.fsencode(source), target_parent, os.fsencode(target), flag) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), target)
+
+
+def _rollback_manifest_exchange(
+    parent_descriptor: int,
+    manifest_name: str,
+    staged: _StagedFile,
+) -> None:
+    try:
+        current = os.stat(manifest_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        displaced = os.stat(staged.path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError:
+        raise WorkspaceError(["manifest exchange could not be rolled back safely"]) from None
+    if _identity(current) != staged.identity or not stat.S_ISREG(displaced.st_mode):
+        raise WorkspaceError(["manifest exchange could not be rolled back safely"])
+    displaced_identity = _identity(displaced)
+    displaced_size = displaced.st_size
+    displaced_bytes = _read_named_bytes(parent_descriptor, staged.path.name, displaced_size)
+    _rename_exchange(parent_descriptor, staged.path.name, parent_descriptor, manifest_name)
+    _verify_named_content(
+        parent_descriptor,
+        manifest_name,
+        identity=displaced_identity,
+        content=displaced_bytes,
+        issue="displaced manifest could not be restored safely",
+    )
+    _verify_staged_file(parent_descriptor, staged.path.name, staged)
+
+
+def _read_named_bytes(parent_descriptor: int, name: str, size: int) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        return _read_descriptor(descriptor, size, f"{WORKSPACE_FILE} changed during update")
+    finally:
+        os.close(descriptor)
+
+
+def _retain_displaced_manifest(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+    identity: tuple[int, int],
+) -> str:
+    """Give displaced bytes an explicit recovery name without deleting them."""
+
+    try:
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+    except OSError:
+        raise WorkspaceError(["displaced manifest could not be retained safely"]) from None
+    if _identity(named) != identity or _identity(opened) != identity:
+        raise WorkspaceError(["displaced manifest changed before recovery publication"])
+    content = _read_descriptor(
+        descriptor,
+        opened.st_size,
+        "displaced manifest changed before recovery publication",
+    )
+    digest = hashlib.sha256(content).hexdigest()
+    base = f"{WORKSPACE_FILE}.backup-{digest}"
+    for attempt in range(32):
+        backup_name = base if attempt == 0 else f"{base}-{secrets.token_hex(4)}"
+        try:
+            _rename_noreplace(parent_descriptor, name, parent_descriptor, backup_name)
+            break
+        except FileExistsError:
+            try:
+                collision = os.stat(
+                    backup_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                collision_bytes = _read_named_bytes(
+                    parent_descriptor,
+                    backup_name,
+                    collision.st_size,
+                )
+            except (OSError, WorkspaceError):
+                raise WorkspaceError(["manifest recovery-name collision could not be inspected"])
+            if hashlib.sha256(collision_bytes).hexdigest() != digest:
+                raise WorkspaceError(["manifest recovery-name collision has unexpected bytes"])
+    else:
+        raise WorkspaceError(["could not allocate a manifest recovery name"])
+    _verify_named_content(
+        parent_descriptor,
+        backup_name,
+        identity=identity,
+        content=content,
+        issue="displaced manifest recovery changed during publication",
+    )
+    _workspace_mutation_checkpoint("registry-backup-published")
+    return backup_name
+
+
+def _fsync_directory_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _workspace_mutation_checkpoint(_name: str) -> None:
+    """Deterministic race boundary used by adversarial tests."""
+
+
 def _require_workspace_mutation_support() -> None:
     required = (
         fcntl is not None,
         hasattr(os, "O_NOFOLLOW"),
         hasattr(os, "O_DIRECTORY"),
         _atomic_noreplace_available(),
+        _atomic_exchange_available(),
         os.mkdir in os.supports_dir_fd,
         os.open in os.supports_dir_fd,
         os.stat in os.supports_dir_fd,
@@ -552,30 +1150,59 @@ def _atomic_noreplace_available() -> bool:
     return hasattr(libc, "renameatx_np") or hasattr(libc, "renameat2")
 
 
-def _stage_new_file(path: Path, content: bytes) -> _StagedFile:
+def _atomic_exchange_available() -> bool:
+    return _atomic_noreplace_available()
+
+
+def _stage_new_file(
+    path: Path,
+    content: bytes,
+    *,
+    parent_descriptor: int,
+    mode: int = 0o600,
+) -> _StagedFile:
     temporary: Path | None = None
     descriptor: int | None = None
     complete = False
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        temporary = Path(temporary_name)
+        for _ in range(32):
+            temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                descriptor = os.open(
+                    temporary.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("could not allocate a unique staged manifest name")
+        os.fchmod(descriptor, mode)
         with os.fdopen(os.dup(descriptor), "wb") as output:
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
         metadata = os.fstat(descriptor)
         identity = (metadata.st_dev, metadata.st_ino)
-        named = temporary.stat(follow_symlinks=False)
+        named = os.stat(temporary.name, dir_fd=parent_descriptor, follow_symlinks=False)
         if (named.st_dev, named.st_ino) != identity or not stat.S_ISREG(named.st_mode):
             raise WorkspaceError(
                 [f"staged manifest changed before publication; inspect {temporary.name}"]
             )
         complete = True
-        return _StagedFile(temporary, descriptor, identity)
+        return _StagedFile(
+            temporary,
+            descriptor,
+            identity,
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+        )
     except WorkspaceError:
         raise
     except Exception:
@@ -592,50 +1219,34 @@ def _stage_new_file(path: Path, content: bytes) -> _StagedFile:
                 pass
 
 
-def _publish_staged_file(path: Path, staged: _StagedFile, *, mode: int) -> None:
+def _publish_staged_file(
+    path: Path,
+    staged: _StagedFile,
+    *,
+    mode: int,
+    parent_descriptor: int,
+    final_validator,
+) -> None:
     published = False
     try:
         os.fchmod(staged.descriptor, mode)
         os.fsync(staged.descriptor)
-        named = staged.path.stat(follow_symlinks=False)
-        if (
-            (named.st_dev, named.st_ino) != staged.identity
-            or not stat.S_ISREG(named.st_mode)
-        ):
-            raise WorkspaceError(
-                [f"staged manifest changed before publication; inspect {staged.path.name}"]
-            )
-        parent_descriptor = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        _verify_staged_file(parent_descriptor, staged.path.name, staged)
+        _rename_noreplace(
+            parent_descriptor,
+            staged.path.name,
+            parent_descriptor,
+            path.name,
         )
+        published = True
+        _verify_staged_file(parent_descriptor, path.name, staged, published=True)
+        final_validator()
         try:
-            _rename_noreplace(
-                parent_descriptor,
-                staged.path.name,
-                parent_descriptor,
-                path.name,
-            )
-            published = True
-        finally:
-            try:
-                os.close(parent_descriptor)
-            except OSError:
-                pass
-        try:
-            named = path.stat(follow_symlinks=False)
-        except OSError:
-            raise WorkspaceError(
-                [f"published {path.name} changed before initialization could continue"]
-            ) from None
-        if (named.st_dev, named.st_ino) != staged.identity or not stat.S_ISREG(named.st_mode):
-            raise WorkspaceError(
-                [f"published {path.name} changed before initialization could continue"]
-            )
-        try:
-            _fsync_directory(path.parent)
+            _fsync_directory_descriptor(parent_descriptor)
         except OSError:
             pass
+        _verify_staged_file(parent_descriptor, path.name, staged, published=True)
+        final_validator()
     except FileExistsError:
         _restrict_staged_file(staged.descriptor)
         raise WorkspaceError(
@@ -678,49 +1289,72 @@ def _restrict_staged_file(descriptor: int) -> None:
         pass
 
 
-def _create_directory_chain(root: Path, relative: PurePosixPath) -> tuple[Path, ...]:
-    """Create a confined directory chain and report only directories created here."""
+def _create_directory_chain(
+    root: Path,
+    relative: PurePosixPath,
+    *,
+    root_descriptor: int,
+    root_identity: tuple[int, int],
+) -> _DirectoryChain:
+    """Create and retain a confined directory chain through publication."""
 
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     created: list[Path] = []
-    descriptor: int | None = None
+    descriptors: list[int] = []
+    identities: list[tuple[int, int]] = []
+    parent_descriptor = root_descriptor
     current = root
     try:
-        descriptor = os.open(root, flags)
+        _verify_root_binding(root, root_descriptor, root_identity)
         for part in relative.parts:
             next_path = current / part
             try:
-                os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                os.mkdir(part, mode=0o755, dir_fd=parent_descriptor)
             except FileExistsError:
                 pass
             except OSError:
                 raise WorkspaceError(["blueprint root could not be created"]) from None
             else:
                 created.append(next_path)
-            try:
-                expected = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
-                if not stat.S_ISDIR(expected.st_mode):
-                    raise OSError("blueprint path component is not a directory")
-                next_descriptor = os.open(part, flags, dir_fd=descriptor)
-            except OSError:
-                raise WorkspaceError(["blueprint root could not be opened safely"]) from None
-            opened = os.fstat(next_descriptor)
-            if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
-                os.close(next_descriptor)
-                raise WorkspaceError(["blueprint root changed while it was being opened"])
-            os.close(descriptor)
-            descriptor = next_descriptor
+            next_descriptor, next_identity = _open_child_directory(
+                parent_descriptor,
+                part,
+                "blueprint root",
+            )
+            descriptors.append(next_descriptor)
+            identities.append(next_identity)
+            parent_descriptor = next_descriptor
             current = next_path
     except WorkspaceError as error:
         retained = ", ".join(path.relative_to(root).as_posix() for path in created)
         detail = "; ".join(error.issues)
         if retained:
             detail += f"; retained created directories: {retained}"
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         raise WorkspaceError([detail]) from None
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    return tuple(created)
+    return _DirectoryChain(
+        root,
+        root_descriptor,
+        root_identity,
+        relative,
+        tuple(descriptors),
+        tuple(identities),
+        tuple(created),
+    )
+
+
+def _verify_directory_chain(chain: _DirectoryChain) -> None:
+    _verify_root_binding(chain.root, chain.root_descriptor, chain.root_identity)
+    _verify_relative_directories(
+        chain.root_descriptor,
+        chain.relative,
+        chain.descriptors,
+        chain.identities,
+        label="blueprint root",
+    )
 
 
 def _fsync_directory(path: Path) -> None:

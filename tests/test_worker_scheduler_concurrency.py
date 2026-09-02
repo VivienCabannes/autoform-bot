@@ -69,7 +69,7 @@ def _runtime(revision: str, *nodes: RuntimeNode) -> RuntimeGraph:
 
 def _input(revision: str, coverage_sha256: str, *nodes: RuntimeNode) -> ExecutionInput:
     return ExecutionInput(
-        schema="autoform-execution-input/v2",
+        schema="autoform-execution-input/v3",
         runtime=_runtime(revision, *nodes),
         authority_sha256="a" * 64,
         runtime_sha256="b" * 64,

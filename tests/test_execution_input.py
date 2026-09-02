@@ -94,7 +94,7 @@ def test_builds_deterministic_deeply_immutable_execution_input(tmp_path: Path) -
         first.units[0].unit = "changed"  # type: ignore[misc]
 
 
-def test_execution_input_binds_registered_workspace_project_and_manifest(
+def test_execution_input_binds_only_the_selected_workspace_project(
     tmp_path: Path,
 ) -> None:
     project = _project(tmp_path)
@@ -104,11 +104,11 @@ def test_execution_input_binds_registered_workspace_project_and_manifest(
 
     first = load_execution_input(project, project_id="one")
     assert first.workspace_project_id == "one"
-    assert first.workspace_manifest_sha256 is not None
+    assert first.workspace_project_binding_sha256 is not None
     assert first.runtime.blueprint_path == "Plans/One"
     assert first.as_dict()["workspace"] == {
         "blueprint_path": "Plans/One",
-        "manifest_sha256": first.workspace_manifest_sha256,
+        "project_binding_sha256": first.workspace_project_binding_sha256,
         "project_id": "one",
     }
 
@@ -118,21 +118,63 @@ def test_execution_input_binds_registered_workspace_project_and_manifest(
         + '\n[locations.notes]\npath = "Notes"\nprovides = ["lean-source"]\n',
         encoding="utf-8",
     )
+    (project / "Plans/Two/roadmap").mkdir(parents=True)
+    register_blueprint_project(project, project_id="two", title="Two", path="Two")
     second = load_execution_input(project, project_id="one")
-    assert second.workspace_manifest_sha256 != first.workspace_manifest_sha256
-    assert second.sha256 != first.sha256
+    assert (
+        second.workspace_project_binding_sha256
+        == first.workspace_project_binding_sha256
+    )
+    assert second.sha256 == first.sha256
 
 
-def test_legacy_project_snapshot_explicitly_uses_workspace_aware_v2(tmp_path: Path) -> None:
+def test_execution_input_retries_a_manifest_runtime_aba_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    initialize_workspace(project, blueprint_root="Plans")
+    (project / "blueprint").rename(project / "Plans/One")
+    register_blueprint_project(project, project_id="one", title="One", path="One")
+    other = project / "Plans/Two"
+    (other / "roadmap").mkdir(parents=True)
+    (other / "roadmap/README.md").write_text("# Other\n", encoding="utf-8")
+    original = execution_module.load_runtime_graph
+    calls = 0
+
+    def wrong_runtime_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original(other)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(execution_module, "load_runtime_graph", wrong_runtime_once)
+
+    result = load_execution_input(project, project_id="one")
+
+    assert calls >= 2
+    assert result.runtime.blueprint_path == "Plans/One"
+
+
+def test_execution_input_rejects_a_symlinked_path_component(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(project.parent, target_is_directory=True)
+
+    with pytest.raises(ExecutionInputError, match="resolved safely"):
+        load_execution_input(linked_parent / project.name)
+
+
+def test_legacy_project_snapshot_explicitly_uses_workspace_aware_v3(tmp_path: Path) -> None:
     snapshot = load_execution_input(_project(tmp_path))
 
     assert snapshot.as_dict()["workspace"] == {
         "blueprint_path": "blueprint",
-        "manifest_sha256": None,
+        "project_binding_sha256": None,
         "project_id": None,
     }
     legacy_payload = snapshot.as_dict()
-    legacy_payload["schema"] = "autoform-execution-input/v1"
+    legacy_payload["schema"] = "autoform-execution-input/v2"
     legacy_payload.pop("workspace")
     legacy_sha256 = _digest(
         json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

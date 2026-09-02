@@ -62,6 +62,8 @@ def _config() -> RunConfig:
         remote="https://example.test/owner/repo.git",
         backend="codex",
         reviewer_backend="claude",
+        prover_model="gpt-5.6-codex",
+        reviewer_model="claude-opus-4.1",
         start_oid="1" * 40,
         plugin_version="0.5.0",
         toolchain_fingerprint="6" * 64,
@@ -92,7 +94,7 @@ def _identity(project: Path, config: RunConfig | None = None) -> RunIdentity:
         execution_input_sha256=config.execution_input_sha256,
         config_sha256=config.sha256,
         workspace_project_id=config.workspace_project_id,
-        workspace_manifest_sha256=config.workspace_manifest_sha256,
+        workspace_project_binding_sha256=config.workspace_project_binding_sha256,
         blueprint_path=config.blueprint_path,
     )
 
@@ -342,8 +344,14 @@ def test_run_config_is_canonical_validated_and_immutable(tmp_path: Path) -> None
         replace(config, target_ref="main")
     with pytest.raises(LedgerError, match="lowercase SHA-256"):
         replace(config, coverage_contract_sha256="not-a-digest")
+    with pytest.raises(LedgerError, match="prover model"):
+        replace(config, prover_model="")
+    with pytest.raises(LedgerError, match="reviewer model"):
+        replace(config, reviewer_model=" reviewer ")
+    assert replace(config, prover_model="gpt-5.7-codex").sha256 != config.sha256
+    assert replace(config, reviewer_model="claude-opus-4.2").sha256 != config.sha256
     with pytest.raises(LedgerError, match="unsupported run config schema"):
-        replace(config, schema_version=2)
+        replace(config, schema_version=1)
     with pytest.raises(LedgerError, match="reviewer backend must differ"):
         replace(config, reviewer_backend=config.backend)
     with pytest.raises(LedgerError, match="reviewer backend must differ"):
@@ -756,7 +764,7 @@ def test_workspace_run_accepts_only_its_project_scoped_claim_token(tmp_path: Pat
     config = replace(
         _config(),
         workspace_project_id="one",
-        workspace_manifest_sha256="a" * 64,
+        workspace_project_binding_sha256="a" * 64,
         blueprint_path="Plans/One",
     )
     ledger, run_id = _running_ledger(tmp_path, config=config)
@@ -799,7 +807,7 @@ def test_workspace_run_accepts_only_its_project_scoped_claim_token(tmp_path: Pat
         attempt = begin(key, token, "workspace-token")
         assert attempt.claim_token == token
         assert ledger.get_run(run_id).identity.workspace_project_id == "one"
-        assert ledger.get_run(run_id).identity.workspace_manifest_sha256 == "a" * 64
+        assert ledger.get_run(run_id).identity.workspace_project_binding_sha256 == "a" * 64
         assert ledger.get_run(run_id).identity.blueprint_path == "Plans/One"
     finally:
         ledger.close()
@@ -832,6 +840,8 @@ def test_legacy_positional_schema_arguments_remain_compatible() -> None:
         config.remote,
         config.backend,
         config.reviewer_backend,
+        config.prover_model,
+        config.reviewer_model,
         config.start_oid,
         config.plugin_version,
         config.toolchain_fingerprint,
@@ -3044,6 +3054,8 @@ def test_v1_ledger_is_migrated_without_permitting_an_unsafe_resume(tmp_path: Pat
         assert "controller settings were not persisted" in migrated.detail
         assert migrated.config.backend == "codex"
         assert migrated.config.reviewer_backend == "claude"
+        assert migrated.config.prover_model == "legacy-unspecified"
+        assert migrated.config.reviewer_model == "legacy-unspecified"
         assert migrated.config.max_attempts == 3
         assert migrated.config.timeout_seconds == 1800.0
         assert migrated.task_count == 1
@@ -3112,6 +3124,9 @@ def test_v2_ledger_migration_seals_even_a_zero_row_task_plan(tmp_path: Path) -> 
     legacy_config = config.as_dict()
     legacy_config["backend"] = "CODEX"
     legacy_config["reviewer_backend"] = "CLAUDE"
+    legacy_config.pop("prover_model")
+    legacy_config.pop("reviewer_model")
+    legacy_config["schema_version"] = 1
     config_json = json.dumps(legacy_config, sort_keys=True, separators=(",", ":"))
     legacy_config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
     legacy_identity = identity.as_dict()
@@ -3142,6 +3157,9 @@ def test_v2_ledger_migration_seals_even_a_zero_row_task_plan(tmp_path: Path) -> 
         assert "complete task plan was not atomically persisted" in migrated.detail
         assert migrated.config.backend == "codex"
         assert migrated.config.reviewer_backend == "claude"
+        assert migrated.config.prover_model == "legacy-unspecified"
+        assert migrated.config.reviewer_model == "legacy-unspecified"
+        assert migrated.config.schema_version == 2
         assert migrated.task_count == 0
         assert migrated.task_plan_sha256 == _task_plan_digest([])
         assert ledger.tasks("run-1") == ()
@@ -3156,6 +3174,68 @@ def test_v2_ledger_migration_seals_even_a_zero_row_task_plan(tmp_path: Path) -> 
                 """,
                 (_ARTICLE_A,),
             )
+
+
+def test_v4_run_config_migration_adds_model_pins_and_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "state/run.sqlite3"
+    config = replace(
+        _config(),
+        workspace_project_id="one",
+        workspace_project_binding_sha256="a" * 64,
+        blueprint_path="Plans/One",
+    )
+    with RunLedger(path) as ledger:
+        ledger.create_run(_identity(tmp_path, config), config, tasks=[], run_id="run-1")
+
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("DROP TRIGGER runs_identity_no_update")
+    row = connection.execute("SELECT * FROM runs WHERE run_id = 'run-1'").fetchone()
+    legacy_config = json.loads(row["config_json"])
+    legacy_config.pop("prover_model")
+    legacy_config.pop("reviewer_model")
+    legacy_config["schema_version"] = 1
+    legacy_config["workspace_manifest_sha256"] = legacy_config.pop(
+        "workspace_project_binding_sha256"
+    )
+    legacy_config_json = json.dumps(legacy_config, sort_keys=True, separators=(",", ":"))
+    legacy_config_sha256 = hashlib.sha256(legacy_config_json.encode()).hexdigest()
+    legacy_identity = json.loads(row["identity_json"])
+    legacy_identity["config_sha256"] = legacy_config_sha256
+    legacy_identity["workspace_manifest_sha256"] = legacy_identity.pop(
+        "workspace_project_binding_sha256"
+    )
+    legacy_identity_json = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    connection.execute(
+        """
+        UPDATE runs SET identity_json = ?, identity_sha256 = ?, config_json = ?,
+            config_sha256 = ? WHERE run_id = 'run-1'
+        """,
+        (
+            legacy_identity_json,
+            hashlib.sha256(legacy_identity_json.encode()).hexdigest(),
+            legacy_config_json,
+            legacy_config_sha256,
+        ),
+    )
+    connection.execute("UPDATE metadata SET value = '4' WHERE key = 'schema_version'")
+    ledger_module._execute_schema(connection, ledger_module._SCHEMA_V4)
+    connection.commit()
+    connection.close()
+
+    with RunLedger(path) as ledger:
+        migrated = ledger.get_run("run-1")
+
+    assert migrated.status == "failed"
+    assert "model pins" in migrated.detail
+    assert migrated.config.prover_model == "legacy-unspecified"
+    assert migrated.config.reviewer_model == "legacy-unspecified"
+    assert migrated.config.schema_version == 2
+    assert migrated.config.workspace_project_binding_sha256 != "a" * 64
+    assert (
+        migrated.identity.workspace_project_binding_sha256
+        == migrated.config.workspace_project_binding_sha256
+    )
 
 
 def test_v2_migration_rejects_complete_run_with_pending_task_and_rolls_back(tmp_path: Path) -> None:

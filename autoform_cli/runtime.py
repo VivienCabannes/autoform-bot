@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlsplit
 from .graph import ARTICLE_ID_PATTERN, Graph, load_graph
 from .lean import declaration_names, index_project
 from .status import derive, is_definition
-from .workspace import discover_workspace, resolve_blueprint
+from .workspace import _path_contains_symlink, discover_workspace, resolve_blueprint
 from .workspace_manifest import WorkspaceError
 
 RUNTIME_SCHEMA = "autoform-runtime/v1"
@@ -41,7 +41,8 @@ class RuntimePaths:
     project_root: Path
     blueprint_dir: Path
     workspace_project_id: str | None = None
-    workspace_manifest_sha256: str | None = None
+    workspace_project_binding_sha256: str | None = None
+    workspace_managed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,9 +223,12 @@ def resolve_runtime_paths(
     """
 
     supplied = Path(project_or_blueprint).expanduser()
-    if supplied.is_symlink():
-        raise RuntimeProjectionError(["project or blueprint path is a symbolic link"])
-    candidate = supplied.resolve()
+    try:
+        if _path_contains_symlink(supplied.absolute()):
+            raise RuntimeProjectionError(["project or blueprint path contains a symbolic link"])
+        candidate = supplied.resolve()
+    except (OSError, RuntimeError, ValueError, WorkspaceError):
+        raise RuntimeProjectionError(["project or blueprint path cannot be resolved safely"]) from None
     if not candidate.is_dir():
         raise RuntimeProjectionError(["project or blueprint directory does not exist"])
 
@@ -236,7 +240,7 @@ def resolve_runtime_paths(
         workspace = None
 
     workspace_project_id: str | None = None
-    workspace_manifest_sha256 = workspace.manifest_sha256 if workspace is not None else None
+    workspace_project_binding_sha256: str | None = None
     is_blueprint = (candidate / "roadmap").is_dir()
     is_project = (candidate / "blueprint" / "roadmap").is_dir()
     if workspace is not None and project_id is not None:
@@ -246,6 +250,7 @@ def resolve_runtime_paths(
             raise RuntimeProjectionError(list(error.issues)) from None
         project_root = workspace.root
         workspace_project_id = project.id
+        workspace_project_binding_sha256 = workspace.project_binding_sha256(project)
     elif workspace is not None and is_blueprint:
         project_root = workspace.root
         blueprint_dir = candidate
@@ -256,6 +261,7 @@ def resolve_runtime_paths(
         )
         if len(matches) == 1:
             workspace_project_id = matches[0].id
+            workspace_project_binding_sha256 = workspace.project_binding_sha256(matches[0])
     elif workspace is not None:
         try:
             _, project, blueprint_dir = resolve_blueprint(candidate)
@@ -263,6 +269,7 @@ def resolve_runtime_paths(
             raise RuntimeProjectionError(list(error.issues)) from None
         project_root = workspace.root
         workspace_project_id = project.id
+        workspace_project_binding_sha256 = workspace.project_binding_sha256(project)
     elif project_id is not None:
         raise RuntimeProjectionError(["--project requires an enclosing .autoform.toml"])
     elif is_blueprint and is_project:
@@ -285,7 +292,8 @@ def resolve_runtime_paths(
         project_root=project_root,
         blueprint_dir=blueprint_dir,
         workspace_project_id=workspace_project_id,
-        workspace_manifest_sha256=workspace_manifest_sha256,
+        workspace_project_binding_sha256=workspace_project_binding_sha256,
+        workspace_managed=workspace is not None,
     )
 
 

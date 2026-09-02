@@ -192,6 +192,7 @@ def run_blueprint_command(args: argparse.Namespace) -> int:
                 print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             else:
                 print(f"Created {result.project_id}: {result.blueprint_path}")
+                print(f"Previous manifest retained at {result.manifest_backup_path}")
                 for path in result.written:
                     print(f"  + {path}")
             return 0
@@ -234,6 +235,7 @@ def run_blueprint_command(args: argparse.Namespace) -> int:
                 print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
             else:
                 print(f"Registered {result.project_id}: {result.blueprint_path}")
+                print(f"Previous manifest retained at {result.manifest_backup_path}")
             return 0
     except WorkspaceError as error:
         _print_workspace_error(error, json_output=getattr(args, "json", False))

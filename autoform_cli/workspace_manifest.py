@@ -19,7 +19,7 @@ WORKSPACE_INSPECTION_SCHEMA = "autoform-workspace-inspection/v1"
 WORKSPACE_INIT_SCHEMA = "autoform-workspace-init/v1"
 WORKSPACE_CHECK_SCHEMA = "autoform-workspace-check/v1"
 WORKSPACE_ERROR_SCHEMA = "autoform-workspace-error/v1"
-BLUEPRINT_CHANGE_SCHEMA = "autoform-blueprint-change/v1"
+BLUEPRINT_CHANGE_SCHEMA = "autoform-blueprint-change/v2"
 BLUEPRINT_LIST_SCHEMA = "autoform-blueprint-list/v1"
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 

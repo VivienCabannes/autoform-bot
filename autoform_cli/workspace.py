@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -33,6 +35,19 @@ class Workspace:
 
     def blueprint_path(self, project: WorkspaceProject) -> Path:
         return self.root / self.manifest.blueprint_relative(project)
+
+    def project_binding_sha256(self, project: WorkspaceProject) -> str:
+        """Digest only the selected project entry and its referenced location."""
+
+        location = self.manifest.location(project.blueprint_location)
+        payload = {
+            "blueprint_path": self.manifest.blueprint_relative(project).as_posix(),
+            "location": location.as_dict(),
+            "project": project.as_dict(),
+            "schema": "autoform-workspace-project-binding/v1",
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,11 +141,7 @@ def load_workspace(root: str | Path) -> Workspace:
         raise WorkspaceError([f"{WORKSPACE_FILE} must not be a symbolic link"])
     if manifest_path.exists() and not manifest_path.is_file():
         raise WorkspaceError([f"{WORKSPACE_FILE} must be a regular file"])
-    try:
-        with manifest_path.open("rb") as stream:
-            content = stream.read(MAX_MANIFEST_BYTES + 1)
-    except OSError:
-        raise WorkspaceError([f"cannot read {WORKSPACE_FILE}"]) from None
+    content = _read_workspace_manifest(resolved, manifest_path)
     if len(content) > MAX_MANIFEST_BYTES:
         raise WorkspaceError([f"{WORKSPACE_FILE} exceeds the {MAX_MANIFEST_BYTES}-byte limit"])
     try:
@@ -141,6 +152,63 @@ def load_workspace(root: str | Path) -> Workspace:
     workspace = Workspace(resolved, manifest, hashlib.sha256(content).hexdigest())
     _validate_workspace_paths(workspace)
     return workspace
+
+
+def _read_workspace_manifest(root: Path, manifest_path: Path) -> bytes:
+    """Read one exact regular manifest generation through a bound root dirfd."""
+
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    root_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        root_descriptor = os.open(root, directory_flags)
+        opened_root = os.fstat(root_descriptor)
+        named_root = root.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (named_root.st_dev, named_root.st_ino)
+        ):
+            raise OSError("workspace root changed")
+        descriptor = os.open(WORKSPACE_FILE, file_flags, dir_fd=root_descriptor)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("workspace manifest is not regular")
+        chunks: list[bytes] = []
+        remaining = MAX_MANIFEST_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        named = os.stat(WORKSPACE_FILE, dir_fd=root_descriptor, follow_symlinks=False)
+        if _file_signature(before) != _file_signature(after) or _file_signature(
+            after
+        ) != _file_signature(named):
+            raise OSError("workspace manifest changed")
+        return b"".join(chunks)
+    except OSError:
+        raise WorkspaceError([f"cannot read {manifest_path.name} safely"]) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def inspect_workspace(start: str | Path = ".") -> WorkspaceInspection:

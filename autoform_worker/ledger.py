@@ -31,8 +31,8 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
     fcntl = None  # type: ignore[assignment]
 
 
-LEDGER_SCHEMA_VERSION = 4
-RUN_CONFIG_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 5
+RUN_CONFIG_SCHEMA_VERSION = 2
 ARTICLE_CLAIM_TOKEN_SCHEMA_VERSION = 1
 _BACKEND_IDS = frozenset({"claude", "codex", "muse"})
 _OBJECT_FORMAT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
@@ -98,6 +98,8 @@ class RunConfig:
     remote: str
     backend: str
     reviewer_backend: str
+    prover_model: str
+    reviewer_model: str
     start_oid: str
     plugin_version: str
     toolchain_fingerprint: str
@@ -112,7 +114,7 @@ class RunConfig:
     heartbeat_interval_seconds: float
     schema_version: int = RUN_CONFIG_SCHEMA_VERSION
     workspace_project_id: str | None = None
-    workspace_manifest_sha256: str | None = None
+    workspace_project_binding_sha256: str | None = None
     blueprint_path: str | None = None
 
     def __post_init__(self) -> None:
@@ -129,6 +131,8 @@ class RunConfig:
             raise LedgerError("reviewer backend must differ from the prover backend")
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "reviewer_backend", reviewer_backend)
+        _validate_nonempty("prover model", self.prover_model)
+        _validate_nonempty("reviewer model", self.reviewer_model)
         _validate_oid(self.start_oid)
         for field in (
             "toolchain_fingerprint",
@@ -151,7 +155,7 @@ class RunConfig:
         object.__setattr__(self, "heartbeat_interval_seconds", heartbeat)
         _validate_workspace_binding(
             self.workspace_project_id,
-            self.workspace_manifest_sha256,
+            self.workspace_project_binding_sha256,
             self.blueprint_path,
         )
 
@@ -159,7 +163,7 @@ class RunConfig:
         payload = asdict(self)
         if self.workspace_project_id is None:
             payload.pop("workspace_project_id")
-            payload.pop("workspace_manifest_sha256")
+            payload.pop("workspace_project_binding_sha256")
             payload.pop("blueprint_path")
         return payload
 
@@ -184,14 +188,14 @@ class RunIdentity:
     execution_input_sha256: str
     config_sha256: str
     workspace_project_id: str | None = None
-    workspace_manifest_sha256: str | None = None
+    workspace_project_binding_sha256: str | None = None
     blueprint_path: str | None = None
 
     def as_dict(self) -> dict[str, str]:
         payload = asdict(self)
         if self.workspace_project_id is None:
             payload.pop("workspace_project_id")
-            payload.pop("workspace_manifest_sha256")
+            payload.pop("workspace_project_binding_sha256")
             payload.pop("blueprint_path")
         return payload
 
@@ -2363,6 +2367,8 @@ class RunLedger:
                         self._migrate_v2()
                     elif row["value"] == "3":
                         self._migrate_v3()
+                    elif row["value"] == "4":
+                        self._migrate_v4()
                     elif row["value"] != str(LEDGER_SCHEMA_VERSION):
                         raise LedgerError(
                             f"unsupported ledger schema {row['value']}; expected {LEDGER_SCHEMA_VERSION}"
@@ -2498,7 +2504,10 @@ class RunLedger:
                 raise LedgerError("ledger schema changed while preparing the v3 migration")
             _verify_schema(self._connection, _SCHEMA_V3, version=3)
             _execute_schema(self._connection, _SCHEMA)
+            self._connection.execute("DROP TRIGGER runs_identity_no_update")
             now = self._clock_ns()
+            self._upgrade_run_config_v1_rows(now=now, from_schema=3)
+            _execute_schema(self._connection, _SCHEMA)
             self._normalize_legacy_stale_merge_items(from_schema=3, now=now)
             self._connection.execute(
                 """
@@ -2529,6 +2538,99 @@ class RunLedger:
             )
             _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
             self._validate_content_rows()
+
+    def _migrate_v4(self) -> None:
+        """Bind persisted runs to explicit models and selected-project identity."""
+
+        with self._transaction():
+            version = self._connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if version is not None and version["value"] == str(LEDGER_SCHEMA_VERSION):
+                return
+            if version is None or version["value"] != "4":
+                raise LedgerError("ledger schema changed while preparing the v4 migration")
+            _verify_schema(self._connection, _SCHEMA_V4, version=4)
+            self._connection.execute("DROP TRIGGER runs_identity_no_update")
+            now = self._clock_ns()
+            self._upgrade_run_config_v1_rows(now=now, from_schema=4)
+            _execute_schema(self._connection, _SCHEMA)
+            for row in self._connection.execute(
+                "SELECT run_id, status, config_sha256 FROM runs ORDER BY run_id"
+            ).fetchall():
+                self._append_event(
+                    row["run_id"],
+                    "ledger.migrated",
+                    {
+                        "config_sha256": row["config_sha256"],
+                        "from_schema": 4,
+                        "status": row["status"],
+                        "to_schema": LEDGER_SCHEMA_VERSION,
+                    },
+                    now,
+                )
+            self._connection.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(LEDGER_SCHEMA_VERSION),),
+            )
+            _verify_schema(self._connection, _SCHEMA, version=LEDGER_SCHEMA_VERSION)
+            self._validate_content_rows()
+
+    def _upgrade_run_config_v1_rows(self, *, now: int, from_schema: int) -> None:
+        """Seal runs whose old config lacked immutable model and project pins."""
+
+        rows = self._connection.execute("SELECT * FROM runs ORDER BY run_id").fetchall()
+        for row in rows:
+            run_id = row["run_id"]
+            identity = _decode_json_object(row["identity_json"], f"v{from_schema} run identity")
+            config = _decode_json_object(row["config_json"], f"v{from_schema} run config")
+            if hashlib.sha256(_json_bytes(identity)).hexdigest() != row["identity_sha256"]:
+                raise LedgerError(f"v{from_schema} run identity is inconsistent: {run_id}")
+            if hashlib.sha256(_json_bytes(config)).hexdigest() != row["config_sha256"]:
+                raise LedgerError(f"v{from_schema} run config is inconsistent: {run_id}")
+            if config.get("schema_version") == RUN_CONFIG_SCHEMA_VERSION:
+                continue
+            if config.get("schema_version") != 1:
+                raise LedgerError(f"v{from_schema} run config schema is invalid: {run_id}")
+            old_config_sha256 = row["config_sha256"]
+            if identity.get("config_sha256") != old_config_sha256:
+                raise LedgerError(f"v{from_schema} run identity does not bind its config: {run_id}")
+            config["prover_model"] = "legacy-unspecified"
+            config["reviewer_model"] = "legacy-unspecified"
+            config["schema_version"] = RUN_CONFIG_SCHEMA_VERSION
+            _upgrade_legacy_workspace_binding(config)
+            new_config_sha256 = hashlib.sha256(_json_bytes(config)).hexdigest()
+            identity["config_sha256"] = new_config_sha256
+            _upgrade_legacy_workspace_binding(identity)
+            new_identity_sha256 = hashlib.sha256(_json_bytes(identity)).hexdigest()
+            status = row["status"]
+            detail = row["detail"]
+            stop_requested = row["stop_requested"]
+            if status not in {"complete", "failed"}:
+                status = "failed"
+                stop_requested = 0
+                detail = (
+                    f"v{from_schema} run cannot resume because model pins and a selected-project "
+                    "binding were not persisted"
+                )
+            self._connection.execute(
+                """
+                UPDATE runs SET identity_json = ?, identity_sha256 = ?, config_json = ?,
+                    config_sha256 = ?, status = ?, stop_requested = ?, detail = ?, updated_ns = ?
+                WHERE run_id = ?
+                """,
+                (
+                    _json_text(identity),
+                    new_identity_sha256,
+                    _json_text(config),
+                    new_config_sha256,
+                    status,
+                    stop_requested,
+                    detail,
+                    now,
+                    run_id,
+                ),
+            )
 
     def _prepare_v1_run_migrations(self) -> tuple[tuple[object, ...], ...]:
         prepared: list[tuple[object, ...]] = []
@@ -2579,6 +2681,8 @@ class RunLedger:
                 remote=values["repository_id"],  # type: ignore[arg-type]
                 backend=backend,
                 reviewer_backend=reviewer_backend,
+                prover_model="legacy-unspecified",
+                reviewer_model="legacy-unspecified",
                 start_oid=base_oid,  # type: ignore[arg-type]
                 plugin_version=values["plugin_revision"],  # type: ignore[arg-type]
                 toolchain_fingerprint=values["toolchain_fingerprint"],  # type: ignore[arg-type]
@@ -2868,12 +2972,17 @@ class RunLedger:
             if identity_values.get("config_sha256") != old_config_sha256:
                 raise LedgerError(f"v2 run identity does not bind its config: {run_id}")
             try:
+                config_values.setdefault("prover_model", "legacy-unspecified")
+                config_values.setdefault("reviewer_model", "legacy-unspecified")
+                config_values["schema_version"] = RUN_CONFIG_SCHEMA_VERSION
+                _upgrade_legacy_workspace_binding(config_values)
                 config_values["backend"] = _canonical_backend("backend", config_values.get("backend"))
                 config_values["reviewer_backend"] = _canonical_backend(
                     "reviewer backend", config_values.get("reviewer_backend")
                 )
                 config = RunConfig(**config_values)
                 identity_values["config_sha256"] = config.sha256
+                _upgrade_legacy_workspace_binding(identity_values)
                 identity = RunIdentity(**identity_values)
             except (TypeError, ValueError, LedgerError) as error:
                 raise LedgerError(f"v2 run identity or config is invalid: {run_id}") from error
@@ -3989,7 +4098,7 @@ def _validate_identity(identity: RunIdentity) -> None:
         _validate_sha256(getattr(identity, field), field)
     _validate_workspace_binding(
         identity.workspace_project_id,
-        identity.workspace_manifest_sha256,
+        identity.workspace_project_binding_sha256,
         identity.blueprint_path,
     )
 
@@ -4007,9 +4116,9 @@ def _validate_config_binding(identity: RunIdentity, config: RunConfig) -> None:
         ("execution_input_sha256", identity.execution_input_sha256, config.execution_input_sha256),
         ("workspace_project_id", identity.workspace_project_id, config.workspace_project_id),
         (
-            "workspace_manifest_sha256",
-            identity.workspace_manifest_sha256,
-            config.workspace_manifest_sha256,
+            "workspace_project_binding_sha256",
+            identity.workspace_project_binding_sha256,
+            config.workspace_project_binding_sha256,
         ),
         ("blueprint_path", identity.blueprint_path, config.blueprint_path),
     )
@@ -4020,20 +4129,44 @@ def _validate_config_binding(identity: RunIdentity, config: RunConfig) -> None:
 
 def _validate_workspace_binding(
     project_id: str | None,
-    manifest_sha256: str | None,
+    project_binding_sha256: str | None,
     blueprint_path: str | None,
 ) -> None:
-    values = (project_id, manifest_sha256, blueprint_path)
+    values = (project_id, project_binding_sha256, blueprint_path)
     if all(value is None for value in values):
         return
     if any(value is None for value in values):
-        raise LedgerError("workspace run binding must include project id, manifest SHA-256, and blueprint path")
-    assert project_id is not None and manifest_sha256 is not None and blueprint_path is not None
+        raise LedgerError(
+            "workspace run binding must include project id, project-binding SHA-256, "
+            "and blueprint path"
+        )
+    assert project_id is not None and project_binding_sha256 is not None and blueprint_path is not None
     if not valid_identifier(project_id):
         raise LedgerError("workspace project id is not portable")
-    _validate_sha256(manifest_sha256, "workspace manifest")
+    _validate_sha256(project_binding_sha256, "workspace project binding")
     if not valid_relative_path(blueprint_path, allow_dot=False):
         raise LedgerError("workspace blueprint path is not a portable repository-relative path")
+
+
+def _upgrade_legacy_workspace_binding(payload: dict[str, object]) -> None:
+    """Rename an old whole-manifest pin without pretending its meaning is new."""
+
+    marker = object()
+    manifest_sha256 = payload.pop("workspace_manifest_sha256", marker)
+    if manifest_sha256 is marker:
+        return
+    if manifest_sha256 is None:
+        payload["workspace_project_binding_sha256"] = None
+        return
+    legacy_binding = {
+        "blueprint_path": payload.get("blueprint_path"),
+        "manifest_sha256": manifest_sha256,
+        "project_id": payload.get("workspace_project_id"),
+        "schema": "autoform-legacy-workspace-binding/v1",
+    }
+    payload["workspace_project_binding_sha256"] = hashlib.sha256(
+        _json_bytes(legacy_binding)
+    ).hexdigest()
 
 
 def _validate_nonempty(label: str, value: object) -> None:
@@ -4729,6 +4862,8 @@ BEFORE UPDATE OF queue_item_id, run_id, attempt_id, queue_ref, expected_target_o
     candidate_oid, created_ns ON merge_items
 BEGIN SELECT RAISE(ABORT, 'merge item identity is immutable'); END;
 """
+
+_SCHEMA_V4 = _SCHEMA
 
 
 __all__ = [

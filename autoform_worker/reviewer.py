@@ -30,9 +30,9 @@ REVIEW_BUNDLE_SCHEMA = "autoform-review-bundle/v2"
 REVIEWER_CONFIG_SCHEMA = "autoform-reviewer-config/v1"
 REVIEW_GATE_RECORD_SCHEMA = "autoform-review-gate-record/v1"
 REVIEW_PROMPT_SCHEMA = "autoform-review-prompt/v1"
-_EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v2"
+_EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v3"
 _RUNTIME_SCHEMA = "autoform-runtime/v1"
-_GATE_SCHEMA = "autoform-candidate-gates/v2"
+_GATE_SCHEMA = "autoform-candidate-gates/v3"
 _GATE_POLICY = "fixed-gates/v1"
 _GATE_CHECKS = (
     "inputs",
@@ -1477,17 +1477,20 @@ def _validate_execution_input(
     if _sha256(_json_bytes(runtime)) != runtime_sha256:
         raise ReviewError(f"{side} execution input does not match its runtime SHA-256")
     workspace = _mapping(payload.get("workspace"), "execution input workspace")
-    if set(workspace) != {"blueprint_path", "manifest_sha256", "project_id"}:
+    if set(workspace) != {"blueprint_path", "project_binding_sha256", "project_id"}:
         raise ReviewError(f"{side} execution input workspace fields do not match the required schema")
     if workspace.get("blueprint_path") != runtime.get("blueprint_path"):
         raise ReviewError(f"{side} execution input workspace blueprint path does not match runtime")
     workspace_project = workspace.get("project_id")
-    workspace_manifest = workspace.get("manifest_sha256")
-    if (workspace_project is None) != (workspace_manifest is None):
+    workspace_project_binding = workspace.get("project_binding_sha256")
+    if (workspace_project is None) != (workspace_project_binding is None):
         raise ReviewError(f"{side} execution input has an incomplete workspace binding")
     if workspace_project is not None:
         _validate_plain_text(workspace_project, f"{side} workspace project id", maximum=256)
-        _validate_sha256(workspace_manifest, f"{side} workspace manifest SHA-256")
+        _validate_sha256(
+            workspace_project_binding,
+            f"{side} workspace project-binding SHA-256",
+        )
     coverage = _mapping(payload.get("coverage"), "execution input coverage")
     if coverage.get("schema") != "autoform-coverage/v2":
         raise ReviewError(f"{side} execution input requires autoform-coverage/v2")
@@ -1540,7 +1543,7 @@ def _validate_gate_evidence(
         "source_contract_sha256",
         "source_revision",
         "work_item_sha256",
-        "workspace_manifest_sha256",
+        "workspace_project_binding_sha256",
         "workspace_project_id",
     }
     if set(identity) != identity_fields:
@@ -1556,10 +1559,10 @@ def _validate_gate_evidence(
         "protected_roadmap_sha256": request.protected_roadmap_sha256,
         "source_contract_sha256": request.source_contract_sha256,
         "work_item_sha256": request.work_item_sha256,
-        "workspace_manifest_sha256": _mapping(
+        "workspace_project_binding_sha256": _mapping(
             base_execution_input.get("workspace"),
             "base execution input workspace",
-        ).get("manifest_sha256"),
+        ).get("project_binding_sha256"),
         "workspace_project_id": _mapping(
             base_execution_input.get("workspace"),
             "base execution input workspace",
@@ -1673,7 +1676,9 @@ def _request_hash_preimages(
             "source_revision": source_revision,
             "workspace": {
                 "blueprint_path": identity.get("blueprint_path"),
-                "manifest_sha256": identity.get("workspace_manifest_sha256"),
+                "project_binding_sha256": identity.get(
+                    "workspace_project_binding_sha256"
+                ),
                 "project_id": identity.get("workspace_project_id"),
             },
         }

@@ -18,11 +18,12 @@ from .coverage import (
 from .graph import GraphValidationError
 from .lean import SourceIndex, project_source_revision, snapshot_project_sources
 from .runtime import RuntimeGraph, RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
+from .workspace import _path_contains_symlink
+from .workspace_manifest import WorkspaceError
 
-# V2 deliberately invalidates V1 snapshots, including snapshots of legacy
-# single-blueprint projects. Workspace identity is part of the trust boundary,
-# so a controller must not resume from bytes that predate that binding.
-EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v2"
+# V3 replaces V2's whole-manifest workspace digest with a selected-project
+# binding. A controller must not reinterpret a V2 digest under the new meaning.
+EXECUTION_INPUT_SCHEMA = "autoform-execution-input/v3"
 _EXECUTION_INPUT_READ_ATTEMPTS = 3
 
 
@@ -102,7 +103,7 @@ class ExecutionInput:
     authority_sha256: str | None = None
     lean_source_revision: str | None = None
     workspace_project_id: str | None = None
-    workspace_manifest_sha256: str | None = None
+    workspace_project_binding_sha256: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -124,7 +125,7 @@ class ExecutionInput:
             "units": [unit.as_dict() for unit in self.units],
             "workspace": {
                 "blueprint_path": self.runtime.blueprint_path,
-                "manifest_sha256": self.workspace_manifest_sha256,
+                "project_binding_sha256": self.workspace_project_binding_sha256,
                 "project_id": self.workspace_project_id,
             },
         }
@@ -163,7 +164,22 @@ def load_execution_input(
 ) -> ExecutionInput:
     """Read a stable runtime and exhaustive coverage snapshot, or fail closed."""
 
-    resolved_lean_root = Path(lean_root).expanduser().resolve() if lean_root is not None else None
+    if lean_root is None:
+        resolved_lean_root = None
+    else:
+        requested_lean_root = Path(lean_root).expanduser()
+        try:
+            if _path_contains_symlink(requested_lean_root.absolute()):
+                raise WorkspaceError(["Lean root path contains a symbolic link"])
+            resolved_lean_root = requested_lean_root.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError, WorkspaceError):
+            raise ExecutionInputError(
+                [ExecutionInputIssue("lean-root-unsafe", "Lean root path cannot be resolved safely")]
+            ) from None
+        if not resolved_lean_root.is_dir():
+            raise ExecutionInputError(
+                [ExecutionInputIssue("lean-root-unsafe", "Lean root path is not a directory")]
+            )
     paths = None
     runtime: RuntimeGraph | None = None
     coverage: CoverageSummary | None = None
@@ -177,7 +193,7 @@ def load_execution_input(
             ) from error
         except OSError:
             continue
-        if paths.workspace_manifest_sha256 is not None and paths.workspace_project_id is None:
+        if paths.workspace_managed and paths.workspace_project_id is None:
             raise ExecutionInputError(
                 [
                     ExecutionInputIssue(
@@ -190,7 +206,7 @@ def load_execution_input(
             paths.project_root,
             paths.blueprint_dir,
             paths.workspace_project_id,
-            paths.workspace_manifest_sha256,
+            paths.workspace_project_binding_sha256,
         )
         before: _ExecutionAuthorityRevision | None = None
         lean_index: SourceIndex | None = None
@@ -204,7 +220,6 @@ def load_execution_input(
             runtime = load_runtime_graph(
                 paths.blueprint_dir,
                 lean_root=lean_root,
-                project_id=paths.workspace_project_id,
             )
         except (GraphValidationError, RuntimeProjectionError) as error:
             if _authority_changed(paths.blueprint_dir, resolved_lean_root, before):
@@ -244,11 +259,13 @@ def load_execution_input(
             final_paths.project_root,
             final_paths.blueprint_dir,
             final_paths.workspace_project_id,
-            final_paths.workspace_manifest_sha256,
+            final_paths.workspace_project_binding_sha256,
         )
+        expected_blueprint_path = paths.blueprint_dir.relative_to(paths.project_root).as_posix()
         if (
             before == between == after
             and binding == final_binding
+            and runtime.blueprint_path == expected_blueprint_path
             and _coverage_matches_authority(coverage, before)
         ):
             authority = after
@@ -299,7 +316,7 @@ def load_execution_input(
             for binding in coverage.node_bindings
         ),
         workspace_project_id=paths.workspace_project_id,
-        workspace_manifest_sha256=paths.workspace_manifest_sha256,
+        workspace_project_binding_sha256=paths.workspace_project_binding_sha256,
     )
 
 

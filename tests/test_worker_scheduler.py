@@ -101,7 +101,7 @@ def _workspace_input(project_id: str, *nodes: RuntimeNode) -> ExecutionInput:
         authority_sha256="4" * 64,
         lean_source_revision=None,
         workspace_project_id=project_id,
-        workspace_manifest_sha256="5" * 64,
+        workspace_project_binding_sha256="5" * 64,
     )
 
 
@@ -189,7 +189,7 @@ def test_scheduler_namespaces_workspace_claims_and_binds_work_items() -> None:
     first_item = first.ready_items()[0]
     second_item = second.ready_items()[0]
     assert first_item.workspace_project_id == "one"
-    assert first_item.workspace_manifest_sha256 == "5" * 64
+    assert first_item.workspace_project_binding_sha256 == "5" * 64
     assert first_item.blueprint_path == "Plans/one"
     assert second_item.workspace_project_id == "two"
     assert first.run_once().progressed
@@ -202,7 +202,7 @@ def test_scheduler_namespaces_workspace_claims_and_binds_work_items() -> None:
 def test_scheduler_fails_closed_when_workspace_manifest_changes_after_claim() -> None:
     node = _node("target")
     first = _workspace_input("one", node)
-    changed = replace(first, workspace_manifest_sha256="6" * 64)
+    changed = replace(first, workspace_project_binding_sha256="6" * 64)
     projections = iter((first, changed))
     board = FakeBoard()
     executed = []

@@ -197,11 +197,11 @@ def review_case(tmp_path: Path) -> _ReviewCase:
         },
         "lean_source_revision": "b" * 64,
         "node_bindings": [{"node_id": NODE, "unit": "unit-1"}],
-        "schema": "autoform-execution-input/v2",
+        "schema": "autoform-execution-input/v3",
         "units": [unit],
         "workspace": {
             "blueprint_path": "blueprint",
-            "manifest_sha256": None,
+            "project_binding_sha256": None,
             "project_id": None,
         },
     }
@@ -239,7 +239,7 @@ def review_case(tmp_path: Path) -> _ReviewCase:
                 "source_revision": "runtime-revision",
                 "workspace": {
                     "blueprint_path": "blueprint",
-                    "manifest_sha256": None,
+                    "project_binding_sha256": None,
                     "project_id": None,
                 },
             }
@@ -274,12 +274,12 @@ def review_case(tmp_path: Path) -> _ReviewCase:
             "source_revision": "runtime-revision",
             "work_item_sha256": work_item,
             "blueprint_path": "blueprint",
-            "workspace_manifest_sha256": None,
+            "workspace_project_binding_sha256": None,
             "workspace_project_id": None,
         },
         "passed": True,
         "policy": "fixed-gates/v1",
-        "schema": "autoform-candidate-gates/v2",
+        "schema": "autoform-candidate-gates/v3",
     }
     request = bind_candidate_review_request(
         base_oid=base,
@@ -499,7 +499,9 @@ def _rebind_request(
                 "source_revision": identity["source_revision"],
                 "workspace": {
                     "blueprint_path": identity["blueprint_path"],
-                    "manifest_sha256": identity["workspace_manifest_sha256"],
+                    "project_binding_sha256": identity[
+                        "workspace_project_binding_sha256"
+                    ],
                     "project_id": identity["workspace_project_id"],
                 },
             }
@@ -922,12 +924,14 @@ def test_review_binds_runtime_article_and_v2_source_contract(review_case) -> Non
         _request_with_execution(review_case.request, execution)
 
 
-def test_review_rejects_legacy_v1_execution_input(review_case) -> None:
+def test_review_rejects_legacy_v2_execution_input(review_case) -> None:
     legacy = json.loads(review_case.request.candidate_execution_input)
-    legacy["schema"] = "autoform-execution-input/v1"
-    legacy.pop("workspace")
+    legacy["schema"] = "autoform-execution-input/v2"
+    legacy["workspace"]["manifest_sha256"] = legacy["workspace"].pop(
+        "project_binding_sha256"
+    )
 
-    with pytest.raises(ReviewError, match="execution input fields do not match"):
+    with pytest.raises(ReviewError, match="unsupported schema"):
         replace(review_case.request, candidate_execution_input=_json_bytes(legacy))
 
 

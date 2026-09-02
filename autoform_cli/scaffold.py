@@ -350,7 +350,13 @@ def scaffold_project(
     return ScaffoldResult(title.strip(), tuple(written), tuple(skipped), unpinned)
 
 
-def scaffold_blueprint(target: str | Path, *, title: str) -> tuple[str, ...]:
+def scaffold_blueprint(
+    target: str | Path,
+    *,
+    title: str,
+    _directory_descriptor: int | None = None,
+    _directory_identity: tuple[int, int] | None = None,
+) -> tuple[str, ...]:
     """Write only the vault files beneath ``templates/blueprint`` into *target*.
 
     This is the workspace counterpart to :func:`scaffold_project`: shared
@@ -372,8 +378,17 @@ def scaffold_blueprint(target: str | Path, *, title: str) -> tuple[str, ...]:
     if issues:
         raise ScaffoldError(issues)
 
-    root_descriptor = _open_directory_chain(requested)
+    root_descriptor = (
+        _open_directory_chain(requested)
+        if _directory_descriptor is None
+        else os.dup(_directory_descriptor)
+    )
     try:
+        opened = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ScaffoldError([f"blueprint directory binding is no longer a directory: {requested}"])
+        if _directory_identity is not None and (opened.st_dev, opened.st_ino) != _directory_identity:
+            raise ScaffoldError([f"blueprint directory binding changed: {requested}"])
         try:
             if os.listdir(root_descriptor):
                 raise ScaffoldError([f"target directory is not empty: {requested}"])

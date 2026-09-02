@@ -54,7 +54,7 @@ from .scheduler import WorkItem, WorkPhase
 
 
 TOOLCHAIN_FINGERPRINT_SCHEMA = "autoform-toolchain-fingerprint/v1"
-CANDIDATE_GATE_EVIDENCE_SCHEMA = "autoform-candidate-gates/v2"
+CANDIDATE_GATE_EVIDENCE_SCHEMA = "autoform-candidate-gates/v3"
 CANDIDATE_GATE_POLICY = "fixed-gates/v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_VERSION_OUTPUT = 16 * 1024
@@ -217,7 +217,7 @@ class CandidateGateResult:
     source_contract_sha256: str | None
     protected_roadmap_sha256: str | None
     workspace_project_id: str | None
-    workspace_manifest_sha256: str | None
+    workspace_project_binding_sha256: str | None
     blueprint_path: str | None
     work_item_sha256: str
     base_execution_input_sha256: str | None
@@ -245,7 +245,7 @@ class CandidateGateResult:
                 "source_revision": self.source_revision,
                 "work_item_sha256": self.work_item_sha256,
                 "workspace_project_id": self.workspace_project_id,
-                "workspace_manifest_sha256": self.workspace_manifest_sha256,
+                "workspace_project_binding_sha256": self.workspace_project_binding_sha256,
                 "blueprint_path": self.blueprint_path,
             },
             "passed": self.passed,
@@ -359,7 +359,7 @@ def run_candidate_gates(
             source_contract_sha256=item.source_contract_sha256,
             protected_roadmap_sha256=item.protected_roadmap_sha256,
             workspace_project_id=item.workspace_project_id,
-            workspace_manifest_sha256=item.workspace_manifest_sha256,
+            workspace_project_binding_sha256=item.workspace_project_binding_sha256,
             blueprint_path=item.blueprint_path,
             work_item_sha256=_work_item_sha256(item),
             base_execution_input_sha256=base_input.sha256 if base_input else None,
@@ -685,14 +685,14 @@ def _validate_work_item(item: WorkItem) -> None:
     if not item.blueprint_path:
         raise CandidateGateError("work item has no blueprint path")
     if item.workspace_project_id is None:
-        if item.workspace_manifest_sha256 is not None:
-            raise CandidateGateError("legacy work item has a workspace manifest binding")
+        if item.workspace_project_binding_sha256 is not None:
+            raise CandidateGateError("legacy work item has a workspace project binding")
     else:
         if (
-            item.workspace_manifest_sha256 is None
-            or _SHA256.fullmatch(item.workspace_manifest_sha256) is None
+            item.workspace_project_binding_sha256 is None
+            or _SHA256.fullmatch(item.workspace_project_binding_sha256) is None
         ):
-            raise CandidateGateError("workspace work item has no manifest SHA-256")
+            raise CandidateGateError("workspace work item has no project-binding SHA-256")
 
 
 def _work_item_sha256(item: WorkItem) -> str:
@@ -705,7 +705,7 @@ def _work_item_sha256(item: WorkItem) -> str:
         "source_revision": item.source_revision,
         "workspace": {
             "blueprint_path": item.blueprint_path,
-            "manifest_sha256": item.workspace_manifest_sha256,
+            "project_binding_sha256": item.workspace_project_binding_sha256,
             "project_id": item.workspace_project_id,
         },
     }
@@ -715,12 +715,12 @@ def _work_item_sha256(item: WorkItem) -> str:
 def _validate_execution_binding(execution_input: ExecutionInput, item: WorkItem) -> None:
     binding = (
         execution_input.workspace_project_id,
-        execution_input.workspace_manifest_sha256,
+        execution_input.workspace_project_binding_sha256,
         execution_input.runtime.blueprint_path,
     )
     expected = (
         item.workspace_project_id,
-        item.workspace_manifest_sha256,
+        item.workspace_project_binding_sha256,
         item.blueprint_path or execution_input.runtime.blueprint_path,
     )
     if binding != expected:

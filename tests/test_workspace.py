@@ -13,6 +13,7 @@ from autoform_cli.__main__ import main
 from autoform_cli.doctor import diagnose_project
 from autoform_cli.runtime import RuntimeProjectionError, resolve_runtime_paths
 from autoform_cli.visualize import main as visualize_main
+from autoform_cli import scaffold as scaffold_module
 from autoform_cli import workspace_mutation as workspace_module
 from autoform_cli.workspace import (
     discover_workspace,
@@ -195,6 +196,10 @@ def test_multiple_blueprints_are_registered_without_nested_markers(tmp_path: Pat
 
     assert first.blueprint_path == "Plans/SyntheticHomotopy"
     assert second.blueprint_path == "Plans/OpenProblem"
+    assert first.manifest_backup_path.startswith(".autoform.toml.backup-")
+    assert second.manifest_backup_path.startswith(".autoform.toml.backup-")
+    assert (root / first.manifest_backup_path).is_file()
+    assert (root / second.manifest_backup_path).is_file()
     workspace = discover_workspace(root / "Plans" / "SyntheticHomotopy" / "roadmap")
     assert [project.id for project in workspace.manifest.projects] == [
         "open-problem",
@@ -291,6 +296,7 @@ def test_existing_blueprint_can_be_registered_without_modification(tmp_path: Pat
     )
 
     assert result.written == ()
+    assert result.manifest_backup_path.startswith(".autoform.toml.backup-")
     assert (existing / "roadmap/README.md").read_bytes() == before
     assert discover_workspace(root).manifest.project("existing").blueprint_path == "Existing"
 
@@ -311,6 +317,32 @@ def test_failed_creation_leaves_recovery_directory_unregistered(
 
     assert (root / "Plans/Example/authored.md").read_text(encoding="utf-8") == "Example"
     assert discover_workspace(root).manifest.projects == ()
+
+
+def test_creation_keeps_its_destination_binding_while_scaffolding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    original_write = scaffold_module._exclusive_write_at
+    replaced = False
+
+    def replace_destination_before_write(*args, **kwargs) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            (root / "Plans/Example").rename(root / "held-example")
+            (root / "Plans/Example").mkdir()
+        original_write(*args, **kwargs)
+
+    monkeypatch.setattr(scaffold_module, "_exclusive_write_at", replace_destination_before_write)
+
+    with pytest.raises(WorkspaceError, match="destination changed"):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert replaced
+    assert list((root / "Plans/Example").iterdir()) == []
+    assert (root / "held-example/roadmap").is_dir()
+    assert load_workspace(root).manifest.projects == ()
 
 
 def test_creation_refuses_to_register_if_the_location_changes(
@@ -428,11 +460,15 @@ def test_workspace_init_retains_paths_instead_of_racing_directory_cleanup(
     workspace_module._require_workspace_mutation_support()
     original_open = workspace_module.os.open
     original_rmdir = Path.rmdir
+    opened_components: list[int] = []
 
     def fail_after_creating_nested(path, *args, **kwargs):
         if path == "Nested":
             raise OSError("injected open failure")
-        return original_open(path, *args, **kwargs)
+        descriptor = original_open(path, *args, **kwargs)
+        if path == "Plans":
+            opened_components.append(descriptor)
+        return descriptor
 
     def replace_before_rmdir(path: Path) -> None:
         nonlocal raced
@@ -450,6 +486,9 @@ def test_workspace_init_retains_paths_instead_of_racing_directory_cleanup(
         initialize_workspace(root, blueprint_root="Plans/Nested")
 
     assert not raced
+    assert opened_components
+    with pytest.raises(OSError):
+        workspace_module.os.fstat(opened_components[-1])
     assert not (root / ".autoform.toml").exists()
     assert nested.is_dir()
     staged, = root.glob("..autoform.toml.*.tmp")
@@ -529,6 +568,61 @@ def test_workspace_init_rejects_changed_final_manifest_after_atomic_publish(
         assert not manifest.exists()
 
 
+def test_workspace_init_rejects_same_inode_stage_mutation_after_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    original = workspace_module._rename_noreplace
+
+    def mutate_after_publish(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        original(source_parent, source, target_parent, target)
+        descriptor = workspace_module.os.open(target, workspace_module.os.O_RDWR, dir_fd=target_parent)
+        try:
+            workspace_module.os.pwrite(descriptor, b"X", 0)
+            workspace_module.os.fsync(descriptor)
+        finally:
+            workspace_module.os.close(descriptor)
+
+    monkeypatch.setattr(workspace_module, "_rename_noreplace", mutate_after_publish)
+
+    with pytest.raises(WorkspaceError, match="published .autoform.toml changed"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert (root / ".autoform.toml").read_bytes().startswith(b"X")
+
+
+def test_workspace_init_rejects_bound_directory_replaced_by_file_after_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    original = workspace_module._rename_noreplace
+
+    def replace_directory_after_publish(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        original(source_parent, source, target_parent, target)
+        (root / "Plans").rename(root / "held-plans")
+        (root / "Plans").write_text("foreign\n", encoding="utf-8")
+
+    monkeypatch.setattr(workspace_module, "_rename_noreplace", replace_directory_after_publish)
+
+    with pytest.raises(WorkspaceError, match="blueprint root changed"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert (root / "Plans").read_text(encoding="utf-8") == "foreign\n"
+    assert (root / "held-plans").is_dir()
+
+
 def test_workspace_init_rejects_replaced_directory_before_descending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -559,6 +653,148 @@ def test_workspace_init_rejects_replaced_directory_before_descending(
     staged, = root.glob("..autoform.toml.*.tmp")
     assert stat.S_IMODE(staged.stat().st_mode) == 0o600
     assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
+
+
+def test_registry_exchange_restores_a_concurrent_editor_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    manifest = root / ".autoform.toml"
+    original_manifest = manifest.read_bytes()
+    displaced = root / "manifest-before-editor"
+    foreign = b"concurrent editor replacement\n"
+    original_exchange = workspace_module._rename_exchange
+    raced = False
+
+    def replace_before_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            manifest.rename(displaced)
+            manifest.write_bytes(foreign)
+        original_exchange(source_parent, source, target_parent, target)
+
+    monkeypatch.setattr(workspace_module, "_rename_exchange", replace_before_exchange)
+
+    with pytest.raises(WorkspaceError, match="changed during update"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
+
+    assert raced
+    assert manifest.read_bytes() == foreign
+    assert displaced.read_bytes() == original_manifest
+
+
+def test_registry_exchange_retains_displaced_inode_if_an_editor_mutates_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    editor_bytes = b"editor wrote through its old open descriptor\n"
+
+    def mutate_displaced(name: str) -> None:
+        if name != "registry-backup-published":
+            return
+        recovery, = root.glob(".autoform.toml.backup-*")
+        with recovery.open("r+b", buffering=0) as stream:
+            stream.seek(0)
+            stream.write(editor_bytes)
+            stream.truncate()
+            workspace_module.os.fsync(stream.fileno())
+
+    monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", mutate_displaced)
+
+    register_blueprint_project(
+        root,
+        project_id="existing",
+        title="Existing",
+        path="Existing",
+    )
+
+    assert load_workspace(root).manifest.project("existing").blueprint_path == "Existing"
+    recovery, = root.glob(".autoform.toml.backup-*")
+    assert recovery.read_bytes() == editor_bytes
+
+
+def test_project_registration_rejects_location_replaced_at_commit_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    original_exchange = workspace_module._rename_exchange
+    replaced = False
+
+    def replace_location_before_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            (root / "Plans").rename(root / "held-plans")
+            (root / "Plans").write_text("foreign\n", encoding="utf-8")
+        original_exchange(source_parent, source, target_parent, target)
+
+    monkeypatch.setattr(workspace_module, "_rename_exchange", replace_location_before_exchange)
+
+    with pytest.raises(WorkspaceError, match="blueprint location changed"):
+        create_blueprint_project(root, project_id="one", title="One", path="One")
+
+    assert replaced
+    assert (root / "Plans").read_text(encoding="utf-8") == "foreign\n"
+    assert (root / "held-plans/One/roadmap").is_dir()
+    assert load_workspace(root).manifest.projects == ()
+
+
+def test_project_registration_rejects_roadmap_replaced_at_commit_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    (root / "Plans/Existing/roadmap").mkdir(parents=True)
+    original_exchange = workspace_module._rename_exchange
+    replaced = False
+
+    def replace_roadmap_before_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            roadmap = root / "Plans/Existing/roadmap"
+            roadmap.rename(root / "held-roadmap")
+            roadmap.write_text("foreign\n", encoding="utf-8")
+        original_exchange(source_parent, source, target_parent, target)
+
+    monkeypatch.setattr(workspace_module, "_rename_exchange", replace_roadmap_before_exchange)
+
+    with pytest.raises(WorkspaceError, match="roadmap changed"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
+
+    assert replaced
+    assert (root / "Plans/Existing/roadmap").read_text(encoding="utf-8") == "foreign\n"
+    assert (root / "held-roadmap").is_dir()
+    assert load_workspace(root).manifest.projects == ()
 
 
 def test_concurrent_workspace_init_never_exposes_partial_manifest(
@@ -676,13 +912,16 @@ def test_workspace_resolution_requires_a_project_at_multi_project_root(tmp_path:
     assert selected.project_root == root.resolve()
     assert selected.blueprint_dir == (root / "Plans/Two").resolve()
     assert selected.workspace_project_id == "two"
-    assert selected.workspace_manifest_sha256 is not None
+    assert selected.workspace_project_binding_sha256 is not None
 
     inferred = resolve_runtime_paths(root / "Plans/One/roadmap")
     assert inferred.project_root == root.resolve()
     assert inferred.blueprint_dir == (root / "Plans/One").resolve()
     assert inferred.workspace_project_id == "one"
-    assert inferred.workspace_manifest_sha256 == selected.workspace_manifest_sha256
+    assert (
+        inferred.workspace_project_binding_sha256
+        != selected.workspace_project_binding_sha256
+    )
 
 
 def test_project_selector_requires_a_workspace_manifest(tmp_path: Path) -> None:
@@ -983,6 +1222,7 @@ def test_workspace_json_results_have_operation_specific_schemas(tmp_path: Path, 
     created = json.loads(capsys.readouterr().out)
     assert created["ok"] is True
     assert created["schema"] == BLUEPRINT_CHANGE_SCHEMA
+    assert created["manifest_backup_path"].startswith(".autoform.toml.backup-")
 
     assert main(["blueprint", "new", "example", "--workspace", str(root), "--json"]) == 1
     failed = json.loads(capsys.readouterr().out)
