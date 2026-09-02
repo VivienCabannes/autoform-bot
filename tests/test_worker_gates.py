@@ -32,9 +32,11 @@ from autoform_worker.gates import (
     _INVOCATION_MARKER_ENV,
     _InvocationTracker,
     _StreamCapture,
+    _active_tracked_invocation_processes,
     _command_evidence,
     _invoke,
     _kill_marked_invocation_processes,
+    _kill_tracked_invocation_processes,
     _terminate_invocation,
     fingerprint_toolchain,
     run_candidate_gates,
@@ -760,6 +762,118 @@ def test_invocation_tracker_stop_fails_closed_if_thread_remains_alive() -> None:
         tracker.stop()
 
 
+@pytest.mark.parametrize(
+    "error",
+    (
+        pytest.param(psutil.AccessDenied(pid=12345), id="access-denied"),
+        pytest.param(OSError("injected tracked-process failure"), id="os-error"),
+        pytest.param(SystemError("injected tracked-process failure"), id="system-error"),
+    ),
+)
+def test_kill_tracked_processes_fails_closed_after_signal_error(
+    error: BaseException,
+) -> None:
+    class UnkillableProcess:
+        @staticmethod
+        def is_running() -> bool:
+            return True
+
+        @staticmethod
+        def kill() -> None:
+            raise error
+
+    class KillableProcess:
+        def __init__(self) -> None:
+            self.killed = False
+
+        @staticmethod
+        def is_running() -> bool:
+            return True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    class Tracker:
+        def __init__(self, processes: tuple[object, ...]) -> None:
+            self.processes = processes
+
+        def snapshot(self) -> tuple[object, ...]:
+            return self.processes
+
+    killable = KillableProcess()
+    tracker = Tracker((UnkillableProcess(), killable))
+
+    with pytest.raises(CandidateGateError, match="could not stop tracked invocation processes"):
+        _kill_tracked_invocation_processes(tracker)  # type: ignore[arg-type]
+
+    assert killable.killed
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        pytest.param(psutil.AccessDenied(pid=12345), id="access-denied"),
+        pytest.param(OSError("injected tracked-process failure"), id="os-error"),
+        pytest.param(SystemError("injected tracked-process failure"), id="system-error"),
+    ),
+)
+def test_active_tracked_processes_fails_closed_after_inspection_error(
+    error: BaseException,
+) -> None:
+    class UninspectableProcess:
+        @staticmethod
+        def is_running() -> bool:
+            raise error
+
+    class InspectableProcess:
+        def __init__(self) -> None:
+            self.inspected = False
+
+        def is_running(self) -> bool:
+            self.inspected = True
+            return False
+
+    class Tracker:
+        def __init__(self, processes: tuple[object, ...]) -> None:
+            self.processes = processes
+
+        def snapshot(self) -> tuple[object, ...]:
+            return self.processes
+
+    inspectable = InspectableProcess()
+    tracker = Tracker((UninspectableProcess(), inspectable))
+
+    with pytest.raises(CandidateGateError, match="could not inspect tracked invocation processes"):
+        _active_tracked_invocation_processes(tracker)  # type: ignore[arg-type]
+
+    assert inspectable.inspected
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        pytest.param(psutil.NoSuchProcess(pid=12345), id="no-such-process"),
+        pytest.param(psutil.ZombieProcess(pid=12345), id="zombie-process"),
+        pytest.param(ProcessLookupError(), id="process-lookup-error"),
+    ),
+)
+def test_tracked_process_disappearance_is_benign(error: BaseException) -> None:
+    class GoneProcess:
+        @staticmethod
+        def is_running() -> bool:
+            raise error
+
+    class Tracker:
+        @staticmethod
+        def snapshot() -> tuple[object, ...]:
+            return (GoneProcess(),)
+
+    tracker = Tracker()
+
+    assert _kill_tracked_invocation_processes(tracker) == ()  # type: ignore[arg-type]
+    assert _active_tracked_invocation_processes(tracker) == ()  # type: ignore[arg-type]
+
+
 def test_terminate_invocation_reports_group_kill_failure_after_reaping_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -842,14 +956,21 @@ def test_default_gate_runner_contains_timeout_after_process_group_kill_failure(
     monkeypatch.setattr(_InvocationTracker, "start", recording_tracker_start)
     monkeypatch.setattr("autoform_worker.gates.os.killpg", fail_group_kill)
 
+    script = (
+        "import os, sys, time; "
+        f"print('stdout ' + os.environ[{_INVOCATION_MARKER_ENV!r}], flush=True); "
+        f"print('stderr ' + os.environ[{_INVOCATION_MARKER_ENV!r}], "
+        "file=sys.stderr, flush=True); "
+        "time.sleep(10)"
+    )
     try:
         with pytest.raises(CandidateGateError) as caught:
             _invoke(
-                [sys.executable, "-c", "import time; time.sleep(10)"],
+                [sys.executable, "-c", script],
                 cwd=tmp_path,
                 env=scrubbed_subprocess_environment(),
                 runner=subprocess.run,
-                timeout=0.05,
+                timeout=0.5,
                 replacements=((tmp_path, "<project>"),),
             )
 
@@ -858,6 +979,8 @@ def test_default_gate_runner_contains_timeout_after_process_group_kill_failure(
             "injected process-group failure at <project>"
         )
         assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
+        assert caught.value.__cause__.output == "stdout <gate-invocation>\n"
+        assert caught.value.__cause__.stderr == "stderr <gate-invocation>\n"
         assert len(processes) == 1
         assert processes[0].poll() is not None
         assert len(trackers) == 1

@@ -975,7 +975,7 @@ class _InvocationTracker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         try:
             self._remember(psutil.Process(root_pid))
-        except (OSError, psutil.Error, SystemError):
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
             pass
 
     def _remember(self, process: psutil.Process) -> None:
@@ -983,19 +983,30 @@ class _InvocationTracker:
             # Creation time is used only as part of psutil's PID-incarnation
             # identity, never as an ownership or ordering heuristic.
             identity = (process.pid, process.create_time())
-        except (OSError, psutil.Error, SystemError):
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
             return
+        except (OSError, psutil.Error, SystemError):
+            raise CandidateGateError("could not identify tracked invocation process") from None
         with self._lock:
             self._known[identity] = process
 
     def _discover(self) -> None:
+        failed = False
         for parent in self.snapshot():
             try:
                 children = parent.children(recursive=True)
+            except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
             except (OSError, psutil.Error, SystemError):
+                failed = True
                 continue
             for child in children:
-                self._remember(child)
+                try:
+                    self._remember(child)
+                except CandidateGateError:
+                    failed = True
+        if failed:
+            raise CandidateGateError("could not discover tracked invocation processes")
 
     def _run(self) -> None:
         try:
@@ -1030,14 +1041,20 @@ def _kill_tracked_invocation_processes(
     tracker: _InvocationTracker,
 ) -> tuple[psutil.Process, ...]:
     killed: list[psutil.Process] = []
+    failed = False
     for process in tracker.snapshot():
         try:
             if not process.is_running():
                 continue
             process.kill()
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
         except (OSError, psutil.Error, SystemError):
+            failed = True
             continue
         killed.append(process)
+    if failed:
+        raise CandidateGateError("could not stop tracked invocation processes")
     return tuple(killed)
 
 
@@ -1045,12 +1062,17 @@ def _active_tracked_invocation_processes(
     tracker: _InvocationTracker,
 ) -> tuple[psutil.Process, ...]:
     active: list[psutil.Process] = []
+    failed = False
     for process in tracker.snapshot():
         try:
             if process.is_running():
                 active.append(process)
-        except (OSError, psutil.Error, SystemError):
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.ZombieProcess):
             continue
+        except (OSError, psutil.Error, SystemError):
+            failed = True
+    if failed:
+        raise CandidateGateError("could not inspect tracked invocation processes")
     return tuple(active)
 
 
@@ -1310,6 +1332,11 @@ def _bounded_subprocess_run(
                 reader.join(timeout=0.5)
             except BaseException as error:
                 cleanup_errors.append(error)
+    captured_stdout = returned_stdout.text
+    captured_stderr = returned_stderr.text
+    if timed_out is not None:
+        timed_out.output = captured_stdout
+        timed_out.stderr = captured_stderr
     cleanup_failure: CandidateGateError | None = None
     if any(reader.is_alive() for reader in started_readers):
         cleanup_failure = CandidateGateError(
@@ -1328,11 +1355,7 @@ def _bounded_subprocess_run(
         raise cleanup_failure
     if primary_error is not None:
         raise primary_error
-    captured_stdout = returned_stdout.text
-    captured_stderr = returned_stderr.text
     if timed_out is not None:
-        timed_out.output = captured_stdout
-        timed_out.stderr = captured_stderr
         raise timed_out
     completed = subprocess.CompletedProcess(command, returncode, captured_stdout, captured_stderr)
     completed._autoform_stdout_sha256 = stdout.sha256  # type: ignore[attr-defined]
