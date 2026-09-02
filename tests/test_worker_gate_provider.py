@@ -73,6 +73,7 @@ def _request(config: DockerGateProviderConfig | None = None) -> GateInvocationRe
         work_item_sha256="c" * 64,
         repository_pack_sha256="f" * 64,
         repository_pack_bytes=1024,
+        result_bytes_limit=config.limits.output_bytes,
         provider_config_sha256=config.sha256,
     )
 
@@ -361,6 +362,7 @@ def test_gate_invocation_round_trips_with_deterministic_ownership() -> None:
         ("attempt", 0, "positive integer"),
         ("repository_pack_sha256", "F" * 64, "lowercase hexadecimal"),
         ("repository_pack_bytes", 0, "positive integer"),
+        ("result_bytes_limit", 0, "positive integer"),
         ("provider_config_sha256", "A" * 64, "lowercase hexadecimal"),
     ],
 )
@@ -461,6 +463,12 @@ def test_docker_create_command_rejects_unbound_config_or_unrepresentable_mount()
         docker_create_argv(
             _config(),
             replace(_request(), repository_pack_bytes=_limits().scratch_bytes + 1),
+            "/srv/autoform/repository.pack",
+        )
+    with pytest.raises(GateProviderError, match="result limit"):
+        docker_create_argv(
+            _config(),
+            replace(_request(), result_bytes_limit=_limits().output_bytes + 1),
             "/srv/autoform/repository.pack",
         )
 

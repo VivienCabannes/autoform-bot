@@ -294,6 +294,7 @@ class GateInvocationRequest:
     work_item_sha256: str
     repository_pack_sha256: str
     repository_pack_bytes: int
+    result_bytes_limit: int
     provider_config_sha256: str
     schema: str = GATE_INVOCATION_SCHEMA
 
@@ -330,6 +331,7 @@ class GateInvocationRequest:
         ):
             _sha256(label, value)
         _positive_integer("repository pack bytes", self.repository_pack_bytes)
+        _positive_integer("gate result byte limit", self.result_bytes_limit)
 
     @property
     def container_name(self) -> str:
@@ -356,6 +358,7 @@ class GateInvocationRequest:
             "protected_roadmap_sha256": self.protected_roadmap_sha256,
             "repository_pack_bytes": self.repository_pack_bytes,
             "repository_pack_sha256": self.repository_pack_sha256,
+            "result_bytes_limit": self.result_bytes_limit,
             "source_contract_sha256": self.source_contract_sha256,
             "source_revision": self.source_revision,
             "work_item_sha256": self.work_item_sha256,
@@ -394,6 +397,7 @@ class GateInvocationRequest:
             "provider_config_sha256",
             "repository_pack_bytes",
             "repository_pack_sha256",
+            "result_bytes_limit",
             "run_id",
             "schema",
             "source_contract_sha256",
@@ -611,6 +615,8 @@ def docker_create_argv(
         raise GateProviderError("repository pack cannot be represented as a Docker bind mount")
     if request.repository_pack_bytes > config.limits.scratch_bytes:
         raise GateProviderError("repository pack does not fit in the Docker scratch limit")
+    if request.result_bytes_limit != config.limits.output_bytes:
+        raise GateProviderError("gate invocation does not bind the configured result limit")
     encoded_request = base64.urlsafe_b64encode(request.evidence_bytes()).decode("ascii")
     limits = config.limits
     mount = (
