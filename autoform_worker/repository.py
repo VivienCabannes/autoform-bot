@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import copy
 import os
 import re
 import secrets
@@ -16,7 +17,7 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Mapping, Set
+from collections.abc import Iterable, Mapping, Set
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Protocol
@@ -27,9 +28,11 @@ from autoform_cli.claims import (
     CLAIM_HEARTBEAT_S,
     CLAIM_REF_PREFIX,
     CLAIM_TTL_S,
+    RECOVERY_BLOCK_SCHEMA,
     ClaimBoard,
     ClaimFence,
     claim_handoff_ref,
+    target_resolution_ref,
 )
 
 from ._paths import GENERATED_DIRECTORY_NAMES
@@ -54,18 +57,40 @@ _MAX_CANDIDATE_ABANDONED_INDEX_STAGES = 8
 _WORKTREE_SCHEMA = "autoform-worktree/v2"
 _CANDIDATE_SCHEMA = "autoform-candidate/v5"
 _READY_CANDIDATE_INDEX_TOPOLOGY = frozenset({"stage", "index", "displaced-backup"})
-_PUBLICATION_SCHEMA = "autoform-merge-publication/v5"
-_LEGACY_PUBLICATION_SCHEMA = "autoform-merge-publication/v4"
+_PUBLICATION_SCHEMA = "autoform-merge-publication/v6"
+_LEGACY_PUBLICATION_SCHEMAS = frozenset(
+    {"autoform-merge-publication/v3", "autoform-merge-publication/v4", "autoform-merge-publication/v5"}
+)
+_UNBOUND_PUBLICATION_SCHEMA = "autoform-merge-publication/v2"
 _REPLAY_INTENT_SCHEMA = "autoform-merge-replay-intent/v1"
+_RESOLUTION_INTENT_SCHEMA = "autoform-publication-resolution-intent/v1"
+_RESOLUTION_SCHEMA = "autoform-target-resolution/v1"
 _TRANSPORT_SCHEMA = "autoform-git-transport/v2"
 _TRANSPORT_INTENT_SCHEMA = "autoform-git-transport-intent/v1"
 _PUBLICATION_STATES = frozenset(
-    {"prepared", "queueing", "queued", "publishing", "replaying", "integrated", "stale", "uncertain"}
+    {
+        "prepared",
+        "queueing",
+        "queued",
+        "publishing",
+        "replaying",
+        "integrated",
+        "aborted",
+        "stale",
+        "uncertain",
+    }
 )
-_REPLAY_EVENT_STATES = frozenset({"prepared", "publishing", "retry", "stale", "integrated", "uncertain"})
-_REPLAY_TERMINAL_STATES = frozenset({"retry", "stale", "integrated", "uncertain"})
+_REPLAY_EVENT_STATES = frozenset(
+    {"prepared", "publishing", "pin-retry", "retry", "stale", "integrated", "uncertain"}
+)
+_REPLAY_TERMINAL_STATES = frozenset({"pin-retry", "retry", "stale", "integrated", "uncertain"})
 _MAX_REPLAY_ATTEMPTS = 128
 _MAX_REPLAY_EVENTS = 512
+_MAX_PUBLICATION_HISTORY = 1024
+_MAX_PUBLICATION_BYTES = 1024 * 1024
+_PUBLICATION_TERMINAL_RESERVE_BYTES = 16 * 1024
+_REPLAY_EXECUTION_RESERVE_BYTES = 32 * 1024
+_MAX_PUBLICATION_DETAIL_BYTES = 2048
 _ZERO_OIDS = frozenset({"0" * 40, "0" * 64})
 _CAS_REJECTIONS = (
     "stale info",
@@ -159,6 +184,8 @@ class _ClaimBoardLike(Protocol):
         ttl: int | float = CLAIM_TTL_S,
         steal: bool = False,
         note: str = "",
+        *,
+        expected_resolution_oid: str | None = None,
     ) -> bool: ...
 
     def holds(self, key: str) -> bool: ...
@@ -166,6 +193,17 @@ class _ClaimBoardLike(Protocol):
     def held_claim_fence(self, key: str) -> ClaimFence | None: ...
 
     def release(self, key: str) -> bool: ...
+
+    def adopt_recovery_block(
+        self,
+        key: str,
+        *,
+        queue_item_id: str,
+        target_resolution_ref: str,
+        resolution_oid: str,
+        ttl: int | float = CLAIM_TTL_S,
+        note: str = "",
+    ) -> bool: ...
 
     def heartbeat(
         self,
@@ -257,6 +295,10 @@ class PublicationReceipt:
     observed_article_claim_oid: str | None
     article_handoff_ref: str
     observed_article_handoff_oid: str | None
+    target_resolution_ref: str
+    initial_resolution_oid: str
+    resolution_oid: str
+    observed_resolution_oid: str | None
     claim_key: str
     claim_ref: str
     claim_oid: str | None
@@ -266,12 +308,14 @@ class PublicationReceipt:
     history: tuple[Mapping[str, object], ...]
     replay_intents: tuple[Mapping[str, object], ...] = ()
     replay_events: tuple[Mapping[str, object], ...] = ()
+    resolution_intents: tuple[Mapping[str, object], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         value = asdict(self)
         value["history"] = [dict(item) for item in self.history]
         value["replay_intents"] = [dict(item) for item in self.replay_intents]
         value["replay_events"] = [dict(item) for item in self.replay_events]
+        value["resolution_intents"] = [dict(item) for item in self.resolution_intents]
         return value
 
     def evidence_bytes(self) -> bytes:
@@ -3622,9 +3666,19 @@ class RemoteMergeQueue:
         article_handoff_ref = claim_handoff_ref(article_claim.key)
         self._verify_state()
         claim_key = _merge_claim_key(target_ref)
+        resolution_ref = target_resolution_ref(claim_key)
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
         with CoordinatorLock(self.lock_root / f"publish-{lock_digest}.lock"):
             self._verify_state()
+            directory, journal_path = self._publication_paths(queue_item_id)
+            staging = self.publication_root / f".{queue_item_id}.preparing"
+            if not (journal_path.exists() or directory.exists() or staging.exists()):
+                self._verify_candidate(expected_target_oid, candidate_oid)
+                if self._held_claim_fence(article_claim.key) != article_claim:
+                    raise PublicationUncertain(
+                        "article claim is not owned by this exact controller session"
+                    )
+                self._import_original_objects(expected_target_oid, candidate_oid, owner=queue_item_id)
             record, journal = self._load_or_create(
                 queue_item_id=queue_item_id,
                 target_ref=target_ref,
@@ -3638,12 +3692,26 @@ class RemoteMergeQueue:
                 article_handoff_ref=article_handoff_ref,
                 claim_key=claim_key,
                 claim_ref=CLAIM_REF_PREFIX + claim_key,
+                target_resolution_ref=resolution_ref,
             )
-            if record["status"] != "integrated":
-                self._verify_candidate(expected_target_oid, candidate_oid)
+            if record["status"] == "integrated":
+                return self._receipt(record)
+            if record["status"] == "aborted":
+                raise MergeQueueError("publication was explicitly aborted")
+            if record.get("resolution_intents"):
+                resolved = self._recover_resolution_intent(record, journal)
+                if resolved is not None and resolved["status"] == "integrated":
+                    return self._receipt(resolved)
+                raise PublicationUncertain("publication has a pending explicit resolution decision")
+            self._ensure_migrated_resolution(record, journal)
+            if record["status"] not in {"integrated", "aborted"}:
+                self._ensure_original_objects(record)
+                self._verify_candidate(expected_target_oid, candidate_oid, use_transport=True)
             recovered = self._recover_current_record(record, journal)
             if recovered["status"] == "integrated":
-                return _publication_receipt(recovered)
+                return self._receipt(recovered)
+            if recovered["status"] == "aborted":
+                raise MergeQueueError("publication was explicitly aborted")
             if recovered["status"] == "stale":
                 raise RemoteDrift(str(recovered["detail"]))
             if recovered["status"] == "uncertain":
@@ -3654,6 +3722,11 @@ class RemoteMergeQueue:
                 claim_key,
                 ttl=self.claim_ttl,
                 note=f"merge queue item {queue_item_id}",
+                expected_resolution_oid=(
+                    str(recovered["resolution_oid"])
+                    if recovered["status"] in {"queued", "publishing"}
+                    else None
+                ),
             )
             if not acquired:
                 raise MergeQueueBusy(f"another publisher owns {target_ref}")
@@ -3672,11 +3745,14 @@ class RemoteMergeQueue:
                     merge_fence = self._held_claim_fence(claim_key)
                     if merge_fence is None:
                         raise PublicationUncertain("publication claim has no coherent ownership fence")
+                    record["claim_oid"] = merge_fence.oid
                     record["claim_lease_id"] = merge_fence.lease_id
                     self._assert_lease(claim_key, heartbeat)
                     record = self._recover_current_record(record, journal)
                     if record["status"] == "integrated":
-                        result = _publication_receipt(record)
+                        result = self._receipt(record)
+                    elif record["status"] == "aborted":
+                        raise MergeQueueError("publication was explicitly aborted")
                     elif record["status"] == "stale":
                         raise RemoteDrift(str(record["detail"]))
                     elif record["status"] == "uncertain":
@@ -3700,7 +3776,7 @@ class RemoteMergeQueue:
                     _checkpoint("claim-fence-recorded")
                     record = self._publish_target(record, journal, merge_fence.oid)
                     if record["status"] == "integrated":
-                        result = _publication_receipt(record)
+                        result = self._receipt(record)
                     elif record["status"] == "stale":
                         raise RemoteDrift(str(record["detail"]))
                     elif record["status"] == "uncertain":
@@ -3712,8 +3788,9 @@ class RemoteMergeQueue:
             finally:
                 try:
                     if merge_fence is not None:
+                        self._secure_claim_cleanup(record, merge_fence)
                         self._release_claim_fence(merge_fence.ref, merge_fence.oid)
-                    else:
+                    elif merge_fence is None:
                         released = self.claim_board.release(claim_key)
                         if not released:
                             release_warning = "publication lease release was refused"
@@ -3724,7 +3801,7 @@ class RemoteMergeQueue:
                 record = self._read_journal(journal)
                 record["detail"] = _append_detail(str(record.get("detail", "")), release_warning)
                 _transition_journal(journal, record, str(record["status"]), record["detail"])
-                result = _publication_receipt(record)
+                result = self._receipt(record)
             if pending_error is not None:
                 raise pending_error
             if result is None:  # pragma: no cover - defensive state invariant
@@ -3740,6 +3817,7 @@ class RemoteMergeQueue:
         expected_target_oid: str,
         candidate_oid: str,
         article_claim: ClaimFence,
+        confirm_legacy_v2_article_binding: bool = False,
     ) -> PublicationReceipt:
         """Classify an interrupted publication from its journal and exact remote refs.
 
@@ -3750,6 +3828,7 @@ class RemoteMergeQueue:
         self._validate_article_claim(article_claim)
         article_handoff_ref = claim_handoff_ref(article_claim.key)
         self._verify_state()
+        claim_key = _merge_claim_key(target_ref)
         _, journal = self._publication_paths(queue_item_id)
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
         with CoordinatorLock(self.lock_root / f"publish-{lock_digest}.lock"):
@@ -3764,25 +3843,54 @@ class RemoteMergeQueue:
                 "article_claim_ref": article_claim.ref,
                 "article_claim_lease_id": article_claim.lease_id,
                 "article_handoff_ref": article_handoff_ref,
-                "claim_key": _merge_claim_key(target_ref),
-                "claim_ref": CLAIM_REF_PREFIX + _merge_claim_key(target_ref),
+                "claim_key": claim_key,
+                "claim_ref": CLAIM_REF_PREFIX + claim_key,
+                "target_resolution_ref": target_resolution_ref(claim_key),
             }
             staging = self.publication_root / f".{queue_item_id}.preparing"
             if not journal.exists() and not journal.is_symlink() and (staging.exists() or staging.is_symlink()):
+                self._import_original_objects(
+                    expected_target_oid,
+                    candidate_oid,
+                    owner=queue_item_id,
+                )
                 record, journal = self._load_or_create(
                     **stable_identity,
                     article_claim_oid=article_claim.oid,
                 )
             else:
                 record = self._read_journal(journal)
+            bound_v2 = record.get("schema") == _UNBOUND_PUBLICATION_SCHEMA
+            if bound_v2:
+                if confirm_legacy_v2_article_binding is not True:
+                    raise PublicationUncertain(
+                        "v2 publication recovery requires explicit confirmation of its article binding"
+                    )
+                record = self._bind_v2_journal(
+                    record,
+                    article_claim=article_claim,
+                    article_handoff_ref=article_handoff_ref,
+                    target_resolution_ref=target_resolution_ref(claim_key),
+                )
             self._validate_journal(
                 record,
                 journal=journal,
                 **stable_identity,
             )
-            if record["status"] != "integrated":
-                self._verify_candidate(expected_target_oid, candidate_oid)
-            return _publication_receipt(self._recover_current_record(record, journal))
+            if bound_v2:
+                _checkpoint("publication-v2-binding-confirmed")
+            if record["status"] in {"integrated", "aborted"}:
+                return self._receipt(record)
+            if record.get("resolution_intents"):
+                resolved = self._recover_resolution_intent(record, journal)
+                if resolved is not None:
+                    return self._receipt(resolved)
+                raise PublicationUncertain("publication has a pending explicit resolution decision")
+            self._ensure_migrated_resolution(record, journal)
+            if record["status"] not in {"integrated", "aborted"}:
+                self._ensure_original_objects(record)
+                self._verify_candidate(expected_target_oid, candidate_oid, use_transport=True)
+            return self._receipt(self._recover_current_record(record, journal))
 
     def replay_stale(
         self,
@@ -3829,6 +3937,7 @@ class RemoteMergeQueue:
             "article_handoff_ref": article_handoff_ref,
             "claim_key": claim_key,
             "claim_ref": CLAIM_REF_PREFIX + claim_key,
+            "target_resolution_ref": target_resolution_ref(claim_key),
         }
         lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
         merge_fence: ClaimFence | None = None
@@ -3837,7 +3946,42 @@ class RemoteMergeQueue:
             _, journal = self._publication_paths(queue_item_id)
             record = self._read_journal(journal)
             self._validate_journal(record, journal=journal, **stable_identity)
-            self._verify_candidate(expected_target_oid, candidate_oid)
+            if record["status"] == "integrated":
+                self._assert_replay_oids_if_present(
+                    record,
+                    replay_target_oid=replay_target_oid,
+                    replay_candidate_oid=replay_candidate_oid,
+                )
+                return self._receipt(record)
+            if record["status"] == "aborted":
+                raise MergeQueueError("publication was explicitly aborted")
+            if record.get("resolution_intents"):
+                resolved = self._recover_resolution_intent(record, journal)
+                if resolved is not None:
+                    return self._receipt(resolved)
+                raise PublicationUncertain("publication has a pending explicit resolution decision")
+            self._ensure_migrated_resolution(record, journal)
+            self._ensure_original_objects(record)
+            self._verify_candidate(expected_target_oid, candidate_oid, use_transport=True)
+            if record["status"] == "replaying":
+                active_before_recovery = self._active_replay_intent(record)
+                if active_before_recovery is None:
+                    raise PublicationUncertain("replaying publication has no durable replay intent")
+                self._import_commits(
+                    (("replay-target", replay_target_oid), ("replay-candidate", replay_candidate_oid)),
+                    owner=queue_item_id,
+                )
+                rebuilt = self._make_resolution_commit(
+                    record,
+                    phase="replay",
+                    replay={
+                        key: value
+                        for key, value in active_before_recovery.items()
+                        if key not in {"replay_id", "prior_resolution_oid", "resolution_oid"}
+                    },
+                )
+                if rebuilt != active_before_recovery["resolution_oid"]:
+                    raise PublicationUncertain("durable replay resolution could not be reconstructed exactly")
             record = self._recover_current_record(record, journal)
             if record["status"] == "integrated":
                 self._assert_replay_oids_if_present(
@@ -3845,7 +3989,7 @@ class RemoteMergeQueue:
                     replay_target_oid=replay_target_oid,
                     replay_candidate_oid=replay_candidate_oid,
                 )
-                return _publication_receipt(record)
+                return self._receipt(record)
             if record["status"] == "uncertain":
                 raise PublicationUncertain(str(record["detail"]))
 
@@ -3858,8 +4002,9 @@ class RemoteMergeQueue:
                     replay_target_oid=replay_target_oid,
                     replay_candidate_oid=replay_candidate_oid,
                 )
-                self.repository._verify_commit(replay_target_oid)
-                self.repository._verify_commit(replay_candidate_oid)
+                self._ensure_resolution_objects(record)
+                self._verify_transport_commit(replay_target_oid)
+                self._verify_transport_commit(replay_candidate_oid)
                 merge_fence = self._replay_claim_fence(active)
             else:
                 if record["status"] != "stale":
@@ -3871,6 +4016,10 @@ class RemoteMergeQueue:
                     detail = "stale replay attempt limit reached; manual reconciliation is required"
                     _transition_journal(journal, record, "uncertain", detail)
                     raise PublicationUncertain(detail)
+                self._import_commits(
+                    (("replay-target", replay_target_oid), ("replay-candidate", replay_candidate_oid)),
+                    owner=queue_item_id,
+                )
                 delta_sha256, replay_tree_oid = self._verify_replay_candidate(
                     expected_target_oid=expected_target_oid,
                     candidate_oid=candidate_oid,
@@ -3881,6 +4030,7 @@ class RemoteMergeQueue:
                     claim_key,
                     ttl=self.claim_ttl,
                     note=f"stale merge queue replay {queue_item_id}",
+                    expected_resolution_oid=str(record["resolution_oid"]),
                 )
                 if not acquired:
                     raise MergeQueueBusy(f"another publisher owns {target_ref}")
@@ -3912,10 +4062,10 @@ class RemoteMergeQueue:
             try:
                 record = self._execute_replay(record, journal, active)
                 if record["status"] == "integrated":
-                    result = _publication_receipt(record)
+                    result = self._receipt(record)
                 elif record["status"] == "stale":
                     event = self._last_replay_event(record)
-                    if event is not None and event.get("status") == "retry":
+                    if event is not None and event.get("status") in {"pin-retry", "retry"}:
                         raise MergeQueueBusy(str(record["detail"]))
                     raise RemoteDrift(str(record["detail"]))
                 elif record["status"] == "uncertain":
@@ -3927,6 +4077,7 @@ class RemoteMergeQueue:
             finally:
                 if merge_fence is not None:
                     try:
+                        self._secure_claim_cleanup(record, merge_fence)
                         self._release_claim_fence(merge_fence.ref, merge_fence.oid)
                     except Exception as error:
                         if pending_error is None:
@@ -3936,6 +4087,359 @@ class RemoteMergeQueue:
             if result is None:  # pragma: no cover - defensive state invariant
                 raise PublicationUncertain("stale replay ended without an outcome")
             return result
+
+    def resolve(
+        self,
+        queue_item_id: str,
+        *,
+        target_ref: str,
+        queue_ref: str,
+        expected_target_oid: str,
+        candidate_oid: str,
+        article_claim: ClaimFence,
+        decision: str,
+    ) -> PublicationReceipt:
+        """Resolve fenced work by exact-CAS abort or descendant adoption."""
+
+        if decision not in {"abort", "adopt"}:
+            raise MergeQueueError("publication resolution decision must be 'abort' or 'adopt'")
+        self._validate_publication_identity(
+            queue_item_id, target_ref, queue_ref, expected_target_oid, candidate_oid
+        )
+        self._validate_article_claim(article_claim)
+        claim_key = _merge_claim_key(target_ref)
+        identity = {
+            "queue_item_id": queue_item_id,
+            "target_ref": target_ref,
+            "queue_ref": queue_ref,
+            "expected_target_oid": expected_target_oid,
+            "candidate_oid": candidate_oid,
+            "article_claim_key": article_claim.key,
+            "article_claim_ref": article_claim.ref,
+            "article_claim_lease_id": article_claim.lease_id,
+            "article_handoff_ref": claim_handoff_ref(article_claim.key),
+            "claim_key": claim_key,
+            "claim_ref": CLAIM_REF_PREFIX + claim_key,
+            "target_resolution_ref": target_resolution_ref(claim_key),
+        }
+        self._verify_state()
+        lock_digest = hashlib.sha256(f"{self.remote_id}\0{target_ref}".encode()).hexdigest()
+        with CoordinatorLock(self.lock_root / f"publish-{lock_digest}.lock"):
+            self._verify_state()
+            _, journal = self._publication_paths(queue_item_id)
+            record = self._read_journal(journal)
+            self._validate_journal(record, journal=journal, **identity)
+            if record["status"] in {"integrated", "aborted"}:
+                return self._receipt(record)
+            resolution_intents = record.get("resolution_intents")
+            if not isinstance(resolution_intents, list):
+                raise PublicationUncertain("publication resolution intent history is malformed")
+            if resolution_intents:
+                if any(
+                    not isinstance(item, dict) or item.get("decision") != decision
+                    for item in resolution_intents
+                ):
+                    raise PublicationUncertain(
+                        "publication already has a durable resolution decision with a different action"
+                    )
+                recovered_resolution = self._recover_resolution_intent(record, journal)
+                if recovered_resolution is not None:
+                    return self._receipt(recovered_resolution)
+            self._ensure_original_objects(record)
+            resolution_oid = str(record["resolution_oid"])
+            acquired = self.claim_board.acquire(
+                claim_key,
+                ttl=self.claim_ttl,
+                note=f"resolve merge queue item {queue_item_id}",
+                expected_resolution_oid=resolution_oid,
+            )
+            if not acquired:
+                fenced = self._ensure_permanent_resolution_fence(record)
+                if fenced == resolution_oid:
+                    acquired = self.claim_board.acquire(
+                        claim_key,
+                        ttl=self.claim_ttl,
+                        note=f"resolve merge queue item {queue_item_id}",
+                        expected_resolution_oid=resolution_oid,
+                    )
+                    if not acquired:
+                        acquired = self.claim_board.adopt_recovery_block(
+                            claim_key,
+                            queue_item_id=queue_item_id,
+                            target_resolution_ref=str(record["target_resolution_ref"]),
+                            resolution_oid=resolution_oid,
+                            ttl=self.claim_ttl,
+                            note=f"resolve merge queue item {queue_item_id}",
+                        )
+            if not acquired:
+                raise MergeQueueBusy("publication resolution is fenced by another publisher")
+            fence = self._held_claim_fence(claim_key)
+            if fence is None:
+                self.claim_board.release(claim_key)
+                raise PublicationUncertain("publication resolution has no coherent merge fence")
+            release = True
+            try:
+                observation = self._observe_replay_refs(record)
+                self._record_replay_observation(record, observation)
+                if (
+                    observation["queue"] not in {None, candidate_oid}
+                    or observation["handoff"] not in {None, candidate_oid}
+                    or observation["resolution"] != resolution_oid
+                    or observation["claim"] != fence.oid
+                    or observation["article"] is not None
+                ):
+                    raise PublicationUncertain(
+                        "publication resolution refused foreign or split queue ownership refs"
+                    )
+                target = observation["target"]
+                latest_replay = self._effective_replay_intent(record)
+                resolution_base = (
+                    str(latest_replay["replay_target_oid"])
+                    if latest_replay is not None
+                    else _expected_oid(expected_target_oid)
+                )
+                resolution_candidate = (
+                    str(latest_replay["replay_candidate_oid"])
+                    if latest_replay is not None
+                    else candidate_oid
+                )
+                if latest_replay is not None:
+                    self._ensure_resolution_objects(record)
+                    self._verify_transport_commit(resolution_base)
+                    self._verify_transport_commit(resolution_candidate)
+                candidate_integrated = False
+                if target is not None:
+                    self._fetch_exact_ref(
+                        target_ref,
+                        target,
+                        owner=str(record["queue_item_id"]),
+                    )
+                    candidate_integrated = self._transport_is_ancestor(resolution_candidate, target)
+                if decision == "abort":
+                    if target != resolution_base:
+                        if candidate_integrated:
+                            raise MergeQueueError(
+                                "candidate is already an ancestor of the target; adopt the integration instead"
+                            )
+                        raise PublicationUncertain(
+                            "publication abort refused target drift from the exact original base"
+                        )
+                if decision == "adopt" and not candidate_integrated:
+                    raise MergeQueueError("candidate is not an ancestor of the target and cannot be adopted")
+                record = self._record_resolution_intent(
+                    record,
+                    journal,
+                    decision=decision,
+                    observation=observation,
+                    resolution_base=resolution_base,
+                    resolution_candidate=resolution_candidate,
+                )
+                _checkpoint("resolution-push-attempted")
+                if not self._atomic_resolve_publication(
+                    record,
+                    observation=observation,
+                    claim_oid=fence.oid,
+                ):
+                    fenced = self._ensure_permanent_resolution_fence(record)
+                    if fenced is None:
+                        blocker = self._install_recovery_block(record, expected_claim=fence.oid)
+                        if blocker is None:
+                            release = False
+                            raise PublicationUncertain(
+                                "resolution CAS failed and no permanent recovery fence could be installed"
+                            )
+                    _transition_journal(
+                        journal,
+                        record,
+                        "uncertain",
+                        "publication resolution exact CAS was rejected; ownership remains fenced",
+                    )
+                    raise PublicationUncertain(str(record["detail"]))
+                _checkpoint("resolution-pushed")
+                status = "aborted" if decision == "abort" else "integrated"
+                detail = (
+                    "operator abort consumed exact queue ownership refs without changing the target"
+                    if decision == "abort"
+                    else "operator adoption verified the candidate in target history and consumed ownership refs"
+                )
+                active_replay = self._active_replay_intent(record)
+                last_replay = self._last_replay_event(record)
+                if (
+                    active_replay is not None
+                    and last_replay is not None
+                    and last_replay.get("status") not in _REPLAY_TERMINAL_STATES
+                ):
+                    record = self._append_replay_event(
+                        record,
+                        journal,
+                        replay_id=str(active_replay["replay_id"]),
+                        status="stale" if decision == "abort" else "integrated",
+                        detail=detail,
+                        top_status=status,
+                    )
+                else:
+                    record = _transition_journal(journal, record, status, detail)
+                return self._receipt(record)
+            finally:
+                if release:
+                    self._secure_claim_cleanup(record, fence)
+                    self._release_claim_fence(fence.ref, fence.oid)
+
+    def _record_resolution_intent(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        *,
+        decision: str,
+        observation: Mapping[str, str | None],
+        resolution_base: str | None,
+        resolution_candidate: str,
+    ) -> dict[str, object]:
+        history = record.get("history")
+        if not isinstance(history, list) or len(history) + 2 > _MAX_PUBLICATION_HISTORY:
+            raise PublicationUncertain("publication has no evidence capacity for explicit resolution")
+        created_ns = time.time_ns()
+        body: dict[str, object] = {
+            "schema": _RESOLUTION_INTENT_SCHEMA,
+            "decision": decision,
+            "queue_item_id": record["queue_item_id"],
+            "target_ref": record["target_ref"],
+            "queue_ref": record["queue_ref"],
+            "article_handoff_ref": record["article_handoff_ref"],
+            "target_resolution_ref": record["target_resolution_ref"],
+            "candidate_oid": record["candidate_oid"],
+            "resolution_oid": record["resolution_oid"],
+            "resolution_base_oid": resolution_base,
+            "resolution_candidate_oid": resolution_candidate,
+            "observed_target_oid": observation["target"],
+            "observed_queue_oid": observation["queue"],
+            "observed_article_handoff_oid": observation["handoff"],
+            "observed_article_claim_oid": observation["article"],
+            "observed_claim_oid": observation["claim"],
+            "observed_resolution_oid": observation["resolution"],
+            "created_ns": created_ns,
+        }
+        intent = {"intent_id": hashlib.sha256(_json_bytes(body)).hexdigest(), **body}
+        proposed = copy.deepcopy(record)
+        proposed_intents = proposed.get("resolution_intents")
+        if not isinstance(proposed_intents, list):
+            raise PublicationUncertain("publication resolution intent history is malformed")
+        proposed_intents.append(intent)
+        proposed_history = proposed.get("history")
+        proposed_replay_events = proposed.get("replay_events")
+        if not isinstance(proposed_history, list):
+            raise PublicationUncertain("publication history is malformed")
+        terminal_detail = (
+            "operator abort consumed exact queue ownership refs without changing the target"
+            if decision == "abort"
+            else "operator adoption verified the candidate in target history and consumed ownership refs"
+        )
+        active_replay = self._active_replay_intent(record)
+        last_replay = self._last_replay_event(record)
+        if (
+            active_replay is not None
+            and last_replay is not None
+            and last_replay.get("status") not in _REPLAY_TERMINAL_STATES
+        ):
+            if not isinstance(proposed_replay_events, list) or len(proposed_replay_events) >= _MAX_REPLAY_EVENTS:
+                raise PublicationUncertain("publication has no replay-event capacity for resolution")
+            proposed_replay_events.append(
+                {
+                    "replay_id": active_replay["replay_id"],
+                    "status": "stale" if decision == "abort" else "integrated",
+                    "detail": terminal_detail,
+                    "created_ns": created_ns,
+                    "observed_target_oid": observation["target"],
+                    "observed_queue_oid": observation["queue"],
+                    "observed_article_claim_oid": observation["article"],
+                    "observed_article_handoff_oid": observation["handoff"],
+                    "observed_claim_oid": observation["claim"],
+                    "observed_resolution_oid": observation["resolution"],
+                }
+            )
+        proposed_history.extend(
+            (
+                {
+                    "status": str(record["status"]),
+                    "detail": "durable explicit resolution decision recorded",
+                    "created_ns": created_ns,
+                },
+                {
+                    "status": "aborted" if decision == "abort" else "integrated",
+                    "detail": terminal_detail,
+                    "created_ns": created_ns,
+                },
+            )
+        )
+        if _publication_journal_size(proposed) > _MAX_PUBLICATION_BYTES:
+            raise PublicationUncertain("publication has no byte capacity for explicit resolution")
+        intents = record.get("resolution_intents")
+        if not isinstance(intents, list):
+            raise PublicationUncertain("publication resolution intent history is malformed")
+        intents.append(intent)
+        return _transition_journal(
+            journal,
+            record,
+            str(record["status"]),
+            "durable explicit resolution decision recorded",
+        )
+
+    def _recover_resolution_intent(
+        self,
+        record: dict[str, object],
+        journal: Path,
+    ) -> dict[str, object] | None:
+        intents = record.get("resolution_intents")
+        if not isinstance(intents, list) or not intents or not isinstance(intents[-1], dict):
+            return None
+        intent = intents[-1]
+        observation = self._observe_replay_refs(record)
+        self._record_replay_observation(record, observation)
+        shared_consumed = all(
+            intent.get(intent_key) is None or observation[current_key] != intent.get(intent_key)
+            for intent_key, current_key in (
+                ("observed_queue_oid", "queue"),
+                ("observed_article_handoff_oid", "handoff"),
+                ("observed_claim_oid", "claim"),
+                ("observed_resolution_oid", "resolution"),
+            )
+        )
+        if shared_consumed:
+            target = observation["target"]
+            candidate = str(intent["resolution_candidate_oid"])
+            integrated = False
+            if target is not None:
+                self._fetch_exact_ref(
+                    str(record["target_ref"]),
+                    target,
+                    owner=str(record["queue_item_id"]),
+                )
+                if not self._transport_has_commit(candidate):
+                    raise PublicationUncertain(
+                        "explicit resolution candidate is unavailable for recovery verification"
+                    )
+                integrated = self._transport_is_ancestor(candidate, target)
+            decision = str(intent["decision"])
+            if (decision == "abort" and not integrated) or (decision == "adopt" and integrated):
+                status = "aborted" if decision == "abort" else "integrated"
+                detail = f"recovery verified completed explicit {decision}"
+                active_replay = self._active_replay_intent(record)
+                last_replay = self._last_replay_event(record)
+                if (
+                    active_replay is not None
+                    and last_replay is not None
+                    and last_replay.get("status") not in _REPLAY_TERMINAL_STATES
+                ):
+                    return self._append_replay_event(
+                        record,
+                        journal,
+                        replay_id=str(active_replay["replay_id"]),
+                        status="stale" if decision == "abort" else "integrated",
+                        detail=detail,
+                        top_status=status,
+                    )
+                return _transition_journal(journal, record, status, detail)
+        return None
 
     def _recover_current_record(
         self,
@@ -3952,6 +4456,11 @@ class RemoteMergeQueue:
                 "uncertain",
                 "replaying publication has no durable replay intent",
             )
+        if self._remote_oid(str(record["target_resolution_ref"])) is None:
+            return self._recover_replay_record(record, journal, active)
+        record = self._ensure_replay_resolution_pinned(record, journal, active)
+        if record["status"] != "replaying":
+            return record
         return self._recover_replay_record(record, journal, active)
 
     def _prepare_replay_intent(
@@ -3970,6 +4479,10 @@ class RemoteMergeQueue:
         original_candidate = str(record["candidate_oid"])
         if observation["queue"] != original_candidate or observation["handoff"] != original_candidate:
             detail = self._replay_barrier_error(record, observation, phase="before replay intent")
+            _transition_journal(journal, record, "uncertain", detail)
+            raise PublicationUncertain(detail)
+        if observation["resolution"] != record.get("resolution_oid"):
+            detail = "target resolution fence changed before stale replay intent"
             _transition_journal(journal, record, "uncertain", detail)
             raise PublicationUncertain(detail)
         if observation["article"] is not None:
@@ -3993,7 +4506,7 @@ class RemoteMergeQueue:
             raise RemoteDrift(detail)
 
         created_ns = time.time_ns()
-        intent_body: dict[str, object] = {
+        replay_payload: dict[str, object] = {
             "schema": _REPLAY_INTENT_SCHEMA,
             "object_format": self.repository.object_format,
             "original_expected_oid": str(record["expected_target_oid"]),
@@ -4013,7 +4526,19 @@ class RemoteMergeQueue:
             "claim_ref": merge_fence.ref,
             "claim_oid": merge_fence.oid,
             "claim_lease_id": merge_fence.lease_id,
+            "target_resolution_ref": str(record["target_resolution_ref"]),
             "created_ns": created_ns,
+        }
+        prior_resolution_oid = str(record["resolution_oid"])
+        replay_resolution_oid = self._make_resolution_commit(
+            record,
+            phase="replay",
+            replay=replay_payload,
+        )
+        intent_body = {
+            **replay_payload,
+            "prior_resolution_oid": prior_resolution_oid,
+            "resolution_oid": replay_resolution_oid,
         }
         replay_id = hashlib.sha256(_json_bytes(intent_body)).hexdigest()
         intent = {"replay_id": replay_id, **intent_body}
@@ -4021,6 +4546,43 @@ class RemoteMergeQueue:
         events = record.get("replay_events")
         if not isinstance(intents, list) or not isinstance(events, list):
             raise PublicationUncertain("publication replay history is malformed")
+        if len(intents) >= _MAX_REPLAY_ATTEMPTS or len(events) + 3 > _MAX_REPLAY_EVENTS:
+            detail = "stale replay evidence limit reached; manual reconciliation is required"
+            _transition_journal(journal, record, "uncertain", detail)
+            raise PublicationUncertain(detail)
+        proposed = copy.deepcopy(record)
+        proposed_intents = proposed.get("replay_intents")
+        proposed_events = proposed.get("replay_events")
+        proposed_history = proposed.get("history")
+        if not all(isinstance(value, list) for value in (proposed_intents, proposed_events, proposed_history)):
+            raise PublicationUncertain("publication replay evidence is malformed")
+        proposed["resolution_oid"] = replay_resolution_oid
+        proposed["observed_resolution_oid"] = prior_resolution_oid
+        proposed_intents.append(intent)
+        proposed_events.append(
+            {
+                "replay_id": replay_id,
+                "status": "prepared",
+                "detail": "durable exact-diff stale replay intent recorded",
+                "created_ns": created_ns,
+            }
+        )
+        proposed_history.append(
+            {
+                "status": "replaying",
+                "detail": "durable exact-diff stale replay intent recorded",
+                "created_ns": created_ns,
+            }
+        )
+        proposed["status"] = "replaying"
+        proposed["detail"] = "durable exact-diff stale replay intent recorded"
+        proposed["updated_ns"] = created_ns
+        if _publication_journal_size(proposed) > _MAX_PUBLICATION_BYTES - _REPLAY_EXECUTION_RESERVE_BYTES:
+            detail = "stale replay evidence byte limit reached; manual reconciliation is required"
+            _transition_journal(journal, record, "uncertain", detail)
+            raise PublicationUncertain(detail)
+        record["resolution_oid"] = replay_resolution_oid
+        record["observed_resolution_oid"] = prior_resolution_oid
         intents.append(intent)
         events.append(
             {
@@ -4038,6 +4600,63 @@ class RemoteMergeQueue:
             "durable exact-diff stale replay intent recorded",
         )
         _checkpoint("replay-intent-recorded")
+        self._pin_replay_resolution(record, intent)
+        record["observed_resolution_oid"] = replay_resolution_oid
+        _write_publication_journal(journal, record)
+        _checkpoint("replay-resolution-pinned")
+        return record
+
+    def _ensure_replay_resolution_pinned(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        intent: Mapping[str, object],
+    ) -> dict[str, object]:
+        for key in ("replay_target_oid", "replay_candidate_oid"):
+            if not self._transport_has_commit(str(intent[key]), use_repository_alternate=False):
+                raise PublicationUncertain(
+                    f"durable replay object {key} is missing before resolution pin recovery"
+                )
+        observed = self._remote_oid(str(record["target_resolution_ref"]))
+        current = str(intent["resolution_oid"])
+        prior = str(intent["prior_resolution_oid"])
+        record["observed_resolution_oid"] = observed
+        if observed == current:
+            self._fetch_exact_ref(
+                str(record["target_resolution_ref"]),
+                current,
+                owner=str(record["queue_item_id"]),
+            )
+            return record
+        if observed != prior:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "stale replay resolution ref changed outside its durable intent",
+            )
+        observed_claim = self._remote_oid(str(intent["claim_ref"]))
+        record["observed_claim_oid"] = observed_claim
+        if observed_claim is None:
+            record["resolution_oid"] = prior
+            return self._append_replay_event(
+                record,
+                journal,
+                replay_id=str(intent["replay_id"]),
+                status="pin-retry",
+                detail="replay resolution pin was interrupted after intent recording; a new fence is required",
+                top_status="stale",
+            )
+        if observed_claim != intent["claim_oid"]:
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "stale replay merge claim changed before its durable resolution could be pinned",
+            )
+        self._pin_replay_resolution(record, intent)
+        record["observed_resolution_oid"] = current
+        _write_publication_journal(journal, record)
         return record
 
     def _execute_replay(
@@ -4052,7 +4671,7 @@ class RemoteMergeQueue:
         events = record.get("replay_events")
         if not isinstance(events, list):  # pragma: no cover - journal validation owns this invariant
             raise PublicationUncertain("publication replay event history is malformed")
-        if len(events) >= _MAX_REPLAY_EVENTS:
+        if len(events) + 2 > _MAX_REPLAY_EVENTS:
             return self._record_replay_classification(
                 record,
                 journal,
@@ -4075,6 +4694,18 @@ class RemoteMergeQueue:
         _checkpoint("replay-observation-started")
         observation = self._observe_replay_refs(record)
         self._record_replay_observation(record, observation)
+        if self._replay_barriers_split(record, observation):
+            record = self._repair_or_fence_split(record, journal, phase="during stale replay")
+            if record["status"] == "uncertain":
+                return self._record_replay_classification(
+                    record,
+                    journal,
+                    intent,
+                    "uncertain",
+                    str(record["detail"]),
+                )
+            observation = self._observe_replay_refs(record)
+            self._record_replay_observation(record, observation)
         _checkpoint("replay-observed")
         status, detail = self._classify_replay_observation(
             record,
@@ -4093,6 +4724,18 @@ class RemoteMergeQueue:
         _checkpoint("replay-recovery-observation-started")
         observation = self._observe_replay_refs(record)
         self._record_replay_observation(record, observation)
+        if self._replay_barriers_split(record, observation):
+            record = self._repair_or_fence_split(record, journal, phase="during stale replay recovery")
+            if record["status"] == "uncertain":
+                return self._record_replay_classification(
+                    record,
+                    journal,
+                    intent,
+                    "uncertain",
+                    str(record["detail"]),
+                )
+            observation = self._observe_replay_refs(record)
+            self._record_replay_observation(record, observation)
         _checkpoint("replay-recovery-observed")
         status, detail = self._classify_replay_observation(
             record,
@@ -4103,7 +4746,7 @@ class RemoteMergeQueue:
         if status == "replaying":
             record["detail"] = detail
             record["updated_ns"] = time.time_ns()
-            _write_json_file(journal, record)
+            _write_publication_journal(journal, record)
             return record
         return self._record_replay_classification(record, journal, intent, status, detail)
 
@@ -4120,12 +4763,14 @@ class RemoteMergeQueue:
         handoff = observation["handoff"]
         article = observation["article"]
         claim = observation["claim"]
+        resolution = observation["resolution"]
         old_candidate = str(intent["original_candidate_oid"])
         replay_target = str(intent["replay_target_oid"])
         replay_candidate = str(intent["replay_candidate_oid"])
         replay_claim = str(intent["claim_oid"])
+        replay_resolution = str(intent["resolution_oid"])
 
-        if target == replay_candidate and queue is None and handoff is None:
+        if target == replay_candidate and queue is None and handoff is None and resolution is None:
             if claim == replay_claim:
                 return "uncertain", "replay target advanced without consuming the exact merge claim"
             return "integrated", "recovery verified atomic stale replay publication"
@@ -4136,6 +4781,8 @@ class RemoteMergeQueue:
             return "uncertain", "an article claim exists while stale replay barriers are active"
         if claim not in {None, replay_claim}:
             return "uncertain", f"merge claim {intent['claim_ref']} changed during stale replay"
+        if resolution != replay_resolution:
+            return "uncertain", "target resolution fence changed during stale replay"
         if target != replay_target:
             if target == replay_candidate:
                 return "uncertain", "replay target advanced without atomically consuming its barriers"
@@ -4185,29 +4832,189 @@ class RemoteMergeQueue:
         events = record.get("replay_events")
         if not isinstance(events, list):
             raise PublicationUncertain("publication replay event history is malformed")
-        events.append(
-            {
-                "replay_id": replay_id,
-                "status": status,
-                "detail": detail,
-                "created_ns": time.time_ns(),
-                "observed_target_oid": record.get("observed_target_oid"),
-                "observed_queue_oid": record.get("observed_queue_oid"),
-                "observed_article_claim_oid": record.get("observed_article_claim_oid"),
-                "observed_article_handoff_oid": record.get("observed_article_handoff_oid"),
-                "observed_claim_oid": record.get("observed_claim_oid"),
-            }
+        terminal = status in _REPLAY_TERMINAL_STATES
+        limit = _MAX_REPLAY_EVENTS if terminal else _MAX_REPLAY_EVENTS - 1
+        if len(events) >= limit:
+            if terminal:
+                raise PublicationUncertain("publication replay history has no reserved terminal event slot")
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "stale replay event limit reached; manual reconciliation is required",
+            )
+        event = {
+            "replay_id": replay_id,
+            "status": status,
+            "detail": _bounded_publication_detail(detail),
+            "created_ns": time.time_ns(),
+            "observed_target_oid": record.get("observed_target_oid"),
+            "observed_queue_oid": record.get("observed_queue_oid"),
+            "observed_article_claim_oid": record.get("observed_article_claim_oid"),
+            "observed_article_handoff_oid": record.get("observed_article_handoff_oid"),
+            "observed_claim_oid": record.get("observed_claim_oid"),
+            "observed_resolution_oid": record.get("observed_resolution_oid"),
+        }
+        proposed = copy.deepcopy(record)
+        proposed_events = proposed.get("replay_events")
+        proposed_history = proposed.get("history")
+        if not isinstance(proposed_events, list) or not isinstance(proposed_history, list):
+            raise PublicationUncertain("publication replay evidence is malformed")
+        proposed_events.append(event)
+        proposed_history.append(
+            {"status": top_status, "detail": event["detail"], "created_ns": event["created_ns"]}
         )
+        proposed["status"] = top_status
+        proposed["detail"] = event["detail"]
+        proposed["updated_ns"] = event["created_ns"]
+        maximum = _MAX_PUBLICATION_BYTES
+        if not terminal:
+            maximum -= _PUBLICATION_TERMINAL_RESERVE_BYTES
+        if _publication_journal_size(proposed) > maximum:
+            if terminal:
+                raise PublicationUncertain("publication replay terminal evidence exceeds its reserved bytes")
+            return _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "stale replay evidence byte limit reached; manual reconciliation is required",
+            )
+        events.append(event)
         return _transition_journal(journal, record, top_status, detail)
 
     def _observe_replay_refs(self, record: Mapping[str, object]) -> dict[str, str | None]:
-        return {
-            "target": self._remote_oid(str(record["target_ref"])),
-            "queue": self._remote_oid(str(record["queue_ref"])),
-            "handoff": self._remote_oid(str(record["article_handoff_ref"])),
-            "article": self._remote_oid(str(record["article_claim_ref"])),
-            "claim": self._remote_oid(str(record["claim_ref"])),
+        refs = {
+            "target": str(record["target_ref"]),
+            "queue": str(record["queue_ref"]),
+            "handoff": str(record["article_handoff_ref"]),
+            "article": str(record["article_claim_ref"]),
+            "claim": str(record["claim_ref"]),
+            "resolution": str(record["target_resolution_ref"]),
         }
+        observation = self._remote_oids(refs.values())
+        return {
+            name: observation[ref]
+            for name, ref in refs.items()
+        }
+
+    @staticmethod
+    def _replay_barriers_split(
+        record: Mapping[str, object], observation: Mapping[str, str | None]
+    ) -> bool:
+        expected = (
+            str(record["candidate_oid"]),
+            str(record["candidate_oid"]),
+            str(record["resolution_oid"]),
+        )
+        observed = (observation["queue"], observation["handoff"], observation["resolution"])
+        if observed == expected:
+            return False
+        active = RemoteMergeQueue._active_replay_intent(record)
+        return not (
+            active is not None
+            and observation["target"] == active.get("replay_candidate_oid")
+            and observed == (None, None, None)
+        )
+
+    def _repair_or_fence_split(
+        self,
+        record: dict[str, object],
+        journal: Path,
+        *,
+        phase: str,
+    ) -> dict[str, object]:
+        observation = self._observe_replay_refs(record)
+        self._record_replay_observation(record, observation)
+        candidate = str(record["candidate_oid"])
+        resolution_oid = str(record["resolution_oid"])
+        claim_oid = observation["claim"]
+        expected_claim = self._active_resolution_claim_oid(record)
+        active_replay = self._effective_replay_intent(record)
+        repair_target = (
+            str(active_replay["replay_target_oid"])
+            if active_replay is not None
+            else _expected_oid(str(record["expected_target_oid"]))
+        )
+        if (
+            observation["target"] == repair_target
+            and observation["queue"] in {None, candidate}
+            and observation["handoff"] in {None, candidate}
+            and observation["resolution"] in {None, resolution_oid}
+            and observation["article"] is None
+            and expected_claim is not None
+            and claim_oid == expected_claim
+        ):
+            repaired = self._atomic_restore_barriers(
+                record,
+                observation=observation,
+                claim_oid=expected_claim,
+            )
+            if repaired:
+                verified = self._observe_replay_refs(record)
+                self._record_replay_observation(record, verified)
+                if (
+                    verified["queue"] == candidate
+                    and verified["handoff"] == candidate
+                    and verified["resolution"] == resolution_oid
+                    and verified["article"] is None
+                    and verified["claim"] == expected_claim
+                ):
+                    prior_status = str(record.get("status"))
+                    restored_status = (
+                        prior_status
+                        if prior_status in {"replaying", "stale", "uncertain"}
+                        else "queued"
+                    )
+                    return _transition_journal(
+                        journal,
+                        record,
+                        restored_status,
+                        f"restored exact queue, handoff, and resolution fences {phase}",
+                    )
+        collisions = []
+        if observation["queue"] not in {None, candidate}:
+            collisions.append("queue")
+        if observation["handoff"] not in {None, candidate}:
+            collisions.append("author-handoff")
+        if observation["resolution"] not in {None, resolution_oid}:
+            collisions.append("target-resolution")
+        if observation["article"] is not None:
+            collisions.append("article-claim")
+        detail = (
+            f"{', '.join(collisions)} ref collision {phase}"
+            if collisions
+            else f"queue, author-handoff, and target-resolution refs split {phase}"
+        )
+        try:
+            fenced = self._ensure_permanent_resolution_fence(record)
+        except (MergeQueueError, PublicationUncertain) as error:
+            fenced = None
+            detail = _append_detail(detail, str(error))
+        if fenced is None:
+            expected_claim = self._active_resolution_claim_oid(record)
+            blocker = (
+                self._install_recovery_block(record, expected_claim=expected_claim)
+                if expected_claim is not None
+                else None
+            )
+            if blocker is None:
+                raise PublicationUncertain(
+                    _append_detail(detail, "no permanent recovery fence could be installed")
+                )
+            record["observed_claim_oid"] = blocker
+            detail = _append_detail(detail, "merge claim converted to a permanent recovery block")
+        else:
+            record["observed_resolution_oid"] = fenced
+        return _transition_journal(journal, record, "uncertain", detail)
+
+    @staticmethod
+    def _active_resolution_claim_oid(record: Mapping[str, object]) -> str | None:
+        if record.get("status") == "replaying":
+            active = RemoteMergeQueue._active_replay_intent(record)
+            if active is not None and isinstance(active.get("claim_oid"), str):
+                return str(active["claim_oid"])
+        value = record.get("claim_oid")
+        return str(value) if isinstance(value, str) else None
 
     @staticmethod
     def _record_replay_observation(
@@ -4219,6 +5026,7 @@ class RemoteMergeQueue:
         record["observed_article_handoff_oid"] = observation["handoff"]
         record["observed_article_claim_oid"] = observation["article"]
         record["observed_claim_oid"] = observation["claim"]
+        record["observed_resolution_oid"] = observation["resolution"]
 
     @staticmethod
     def _replay_barrier_error(
@@ -4243,6 +5051,27 @@ class RemoteMergeQueue:
             return None
         intent = intents[-1]
         return intent if isinstance(intent, dict) else None
+
+    @staticmethod
+    def _effective_replay_intent(record: Mapping[str, object]) -> Mapping[str, object] | None:
+        intents = record.get("replay_intents")
+        events = record.get("replay_events")
+        if not isinstance(intents, list) or not isinstance(events, list):
+            return None
+        abandoned = {
+            str(event.get("replay_id"))
+            for event in events
+            if isinstance(event, dict) and event.get("status") == "pin-retry"
+        }
+        current = record.get("resolution_oid")
+        for intent in reversed(intents):
+            if (
+                isinstance(intent, dict)
+                and intent.get("replay_id") not in abandoned
+                and intent.get("resolution_oid") == current
+            ):
+                return intent
+        return None
 
     @staticmethod
     def _last_replay_event(record: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -4301,20 +5130,22 @@ class RemoteMergeQueue:
         article_claim_ref = str(record["article_claim_ref"])
         article_claim_oid = str(record["article_claim_oid"])
         article_handoff_ref = str(record["article_handoff_ref"])
-        observed_queue = self._remote_oid(queue_ref)
-        observed_article_claim = self._remote_oid(article_claim_ref)
-        observed_article_handoff = self._remote_oid(article_handoff_ref)
+        resolution_ref = str(record["target_resolution_ref"])
+        resolution_oid = str(record["resolution_oid"])
+        observation = self._remote_oids(
+            (queue_ref, article_claim_ref, article_handoff_ref, resolution_ref)
+        )
+        observed_queue = observation[queue_ref]
+        observed_article_claim = observation[article_claim_ref]
+        observed_article_handoff = observation[article_handoff_ref]
+        observed_resolution = observation[resolution_ref]
         record["observed_queue_oid"] = observed_queue
         record["observed_article_claim_oid"] = observed_article_claim
         record["observed_article_handoff_oid"] = observed_article_handoff
+        record["observed_resolution_oid"] = observed_resolution
         if observed_queue == candidate:
-            if observed_article_handoff != candidate:
-                return _transition_journal(
-                    journal,
-                    record,
-                    "uncertain",
-                    "queue ref exists without its exact author handoff barrier",
-                )
+            if observed_article_handoff != candidate or observed_resolution != resolution_oid:
+                return self._repair_or_fence_split(record, journal, phase="queue verification")
             if observed_article_claim is not None:
                 return _transition_journal(
                     journal,
@@ -4336,12 +5167,9 @@ class RemoteMergeQueue:
                 f"queue ref {queue_ref} points to unexpected object {observed_queue}",
             )
         if observed_article_handoff is not None:
-            return _transition_journal(
-                journal,
-                record,
-                "uncertain",
-                f"author handoff ref {article_handoff_ref} has no matching queue ref",
-            )
+            return self._repair_or_fence_split(record, journal, phase="queue verification")
+        if observed_resolution is not None:
+            return self._repair_or_fence_split(record, journal, phase="queue verification")
         if observed_article_claim != article_claim_oid:
             return _transition_journal(
                 journal,
@@ -4376,18 +5204,26 @@ class RemoteMergeQueue:
             article_claim_ref=article_claim_ref,
             article_claim_oid=article_claim_oid,
             article_handoff_ref=article_handoff_ref,
+            resolution_ref=resolution_ref,
+            resolution_oid=resolution_oid,
         )
         _checkpoint("queue-pushed")
-        observed_queue = self._remote_oid(queue_ref)
-        observed_article_claim = self._remote_oid(article_claim_ref)
-        observed_article_handoff = self._remote_oid(article_handoff_ref)
+        observation = self._remote_oids(
+            (queue_ref, article_claim_ref, article_handoff_ref, resolution_ref)
+        )
+        observed_queue = observation[queue_ref]
+        observed_article_claim = observation[article_claim_ref]
+        observed_article_handoff = observation[article_handoff_ref]
+        observed_resolution = observation[resolution_ref]
         record["observed_queue_oid"] = observed_queue
         record["observed_article_claim_oid"] = observed_article_claim
         record["observed_article_handoff_oid"] = observed_article_handoff
+        record["observed_resolution_oid"] = observed_resolution
         if (
             observed_queue == candidate
             and observed_article_handoff == candidate
             and observed_article_claim is None
+            and observed_resolution == resolution_oid
         ):
             return _transition_journal(
                 journal,
@@ -4409,13 +5245,15 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"author handoff ref {article_handoff_ref} changed during queue handoff",
             )
-        if (observed_queue is None) != (observed_article_handoff is None):
+        if observed_resolution not in {None, resolution_oid}:
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
-                "queue and author handoff refs were not changed atomically",
+                f"target resolution ref {resolution_ref} changed during queue handoff",
             )
+        if len({observed_queue is None, observed_article_handoff is None, observed_resolution is None}) != 1:
+            return self._repair_or_fence_split(record, journal, phase="queue handoff")
         if observed_article_claim != article_claim_oid:
             return _transition_journal(
                 journal,
@@ -4426,7 +5264,7 @@ class RemoteMergeQueue:
         detail = (
             "article-claim handoff CAS was rejected without remote drift"
             if not pushed
-            else "article-claim handoff reported success without the exact two-ref result"
+            else "article-claim handoff reported success without the exact four-ref result"
         )
         return _transition_journal(
             journal,
@@ -4445,9 +5283,14 @@ class RemoteMergeQueue:
         queue_ref = str(record["queue_ref"])
         claim_ref = str(record["claim_ref"])
         article_handoff_ref = str(record["article_handoff_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        resolution_oid = str(record["resolution_oid"])
         expected = str(record["expected_target_oid"])
         candidate = str(record["candidate_oid"])
-        observed_claim = self._remote_oid(claim_ref)
+        observation = self._remote_oids(
+            (claim_ref, queue_ref, article_handoff_ref, resolution_ref, target_ref)
+        )
+        observed_claim = observation[claim_ref]
         record["observed_claim_oid"] = observed_claim
         if observed_claim != claim_oid:
             return _transition_journal(
@@ -4456,7 +5299,7 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"claim ref {claim_ref} changed before target publication",
             )
-        observed_queue = self._remote_oid(queue_ref)
+        observed_queue = observation[queue_ref]
         record["observed_queue_oid"] = observed_queue
         if observed_queue != candidate:
             return _transition_journal(
@@ -4465,16 +5308,15 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"queue ref {queue_ref} changed before target publication",
             )
-        observed_article_handoff = self._remote_oid(article_handoff_ref)
+        observed_article_handoff = observation[article_handoff_ref]
         record["observed_article_handoff_oid"] = observed_article_handoff
         if observed_article_handoff != candidate:
-            return _transition_journal(
-                journal,
-                record,
-                "uncertain",
-                f"author handoff ref {article_handoff_ref} changed before target publication",
-            )
-        observed = self._remote_oid(target_ref)
+            return self._repair_or_fence_split(record, journal, phase="before target publication")
+        observed_resolution = observation[resolution_ref]
+        record["observed_resolution_oid"] = observed_resolution
+        if observed_resolution != resolution_oid:
+            return self._repair_or_fence_split(record, journal, phase="before target publication")
+        observed = observation[target_ref]
         record["observed_target_oid"] = observed
         if observed not in {_expected_oid(expected), candidate}:
             return _transition_journal(
@@ -4489,39 +5331,47 @@ class RemoteMergeQueue:
             target_ref=target_ref,
             queue_ref=queue_ref,
             article_handoff_ref=article_handoff_ref,
+            resolution_ref=resolution_ref,
+            resolution_oid=resolution_oid,
             claim_ref=claim_ref,
             claim_oid=claim_oid,
             expected_target=observed,
             candidate=candidate,
         )
         _checkpoint("target-pushed")
-        observed = self._remote_oid(target_ref)
-        observed_queue = self._remote_oid(queue_ref)
-        observed_article_handoff = self._remote_oid(article_handoff_ref)
-        observed_claim = self._remote_oid(claim_ref)
+        observation = self._remote_oids(
+            (target_ref, queue_ref, article_handoff_ref, claim_ref, resolution_ref)
+        )
+        observed = observation[target_ref]
+        observed_queue = observation[queue_ref]
+        observed_article_handoff = observation[article_handoff_ref]
+        observed_claim = observation[claim_ref]
+        observed_resolution = observation[resolution_ref]
         record["observed_target_oid"] = observed
         record["observed_queue_oid"] = observed_queue
         record["observed_article_handoff_oid"] = observed_article_handoff
         record["observed_claim_oid"] = observed_claim
+        record["observed_resolution_oid"] = observed_resolution
         if pushed:
             if (
                 observed == candidate
                 and observed_queue is None
                 and observed_article_handoff is None
                 and observed_claim != claim_oid
+                and observed_resolution is None
             ):
                 _checkpoint("target-verified")
                 return _transition_journal(
                     journal,
                     record,
                     "integrated",
-                    "atomic target advance and queue/handoff/claim consumption verified",
+                    "atomic target advance and queue/handoff/resolution/claim consumption verified",
                 )
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
-                "atomic publication reported success without the exact four-ref result",
+                "atomic publication reported success without the exact five-ref result",
             )
         if observed_claim != claim_oid:
             return _transition_journal(
@@ -4544,14 +5394,21 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"author handoff ref {article_handoff_ref} changed during target publication",
             )
-        if (observed_queue is None) != (observed_article_handoff is None):
+        if observed_resolution not in {None, resolution_oid}:
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
-                "queue and author handoff refs were not consumed atomically",
+                f"target resolution ref {resolution_ref} changed during target publication",
             )
-        if observed == candidate and observed_queue is None and observed_article_handoff is None:
+        if len({observed_queue is None, observed_article_handoff is None, observed_resolution is None}) != 1:
+            return self._repair_or_fence_split(record, journal, phase="target publication")
+        if (
+            observed == candidate
+            and observed_queue is None
+            and observed_article_handoff is None
+            and observed_resolution is None
+        ):
             return _transition_journal(
                 journal,
                 record,
@@ -4562,6 +5419,7 @@ class RemoteMergeQueue:
             observed in {_expected_oid(expected), candidate}
             and observed_queue == candidate
             and observed_article_handoff == candidate
+            and observed_resolution == resolution_oid
         ):
             return _transition_journal(journal, record, "queued", "target CAS was rejected without drift")
         if observed != _expected_oid(expected):
@@ -4575,27 +5433,41 @@ class RemoteMergeQueue:
 
     def _recover_record(self, record: dict[str, object], journal: Path) -> dict[str, object]:
         status = str(record["status"])
-        if status in {"integrated", "stale", "uncertain"}:
+        if status in {"integrated", "aborted", "stale", "uncertain"}:
             return record
         queue_ref = str(record["queue_ref"])
         target_ref = str(record["target_ref"])
         claim_ref = str(record["claim_ref"])
         article_claim_ref = str(record["article_claim_ref"])
         article_handoff_ref = str(record["article_handoff_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        resolution_oid = str(record["resolution_oid"])
         article_claim_oid = str(record["article_claim_oid"])
         recorded_claim_oid = record.get("claim_oid")
         expected = _expected_oid(str(record["expected_target_oid"]))
         candidate = str(record["candidate_oid"])
-        queue_oid = self._remote_oid(queue_ref)
-        target_oid = self._remote_oid(target_ref)
-        claim_oid = self._remote_oid(claim_ref)
-        article_claim_oid_observed = self._remote_oid(article_claim_ref)
-        article_handoff_oid = self._remote_oid(article_handoff_ref)
+        observation = self._remote_oids(
+            (
+                queue_ref,
+                target_ref,
+                claim_ref,
+                article_claim_ref,
+                article_handoff_ref,
+                resolution_ref,
+            )
+        )
+        queue_oid = observation[queue_ref]
+        target_oid = observation[target_ref]
+        claim_oid = observation[claim_ref]
+        article_claim_oid_observed = observation[article_claim_ref]
+        article_handoff_oid = observation[article_handoff_ref]
+        observed_resolution_oid = observation[resolution_ref]
         record["observed_queue_oid"] = queue_oid
         record["observed_target_oid"] = target_oid
         record["observed_claim_oid"] = claim_oid
         record["observed_article_claim_oid"] = article_claim_oid_observed
         record["observed_article_handoff_oid"] = article_handoff_oid
+        record["observed_resolution_oid"] = observed_resolution_oid
         if queue_oid not in {None, candidate}:
             return _transition_journal(
                 journal,
@@ -4610,15 +5482,17 @@ class RemoteMergeQueue:
                 "uncertain",
                 f"recovery found author-handoff collision: {article_handoff_oid}",
             )
-        if (queue_oid is None) != (article_handoff_oid is None):
+        if observed_resolution_oid not in {None, resolution_oid}:
             return _transition_journal(
                 journal,
                 record,
                 "uncertain",
-                "recovery found non-atomic queue and author-handoff state",
+                f"recovery found target-resolution collision: {observed_resolution_oid}",
             )
+        if len({queue_oid is None, article_handoff_oid is None, observed_resolution_oid is None}) != 1:
+            return self._repair_or_fence_split(record, journal, phase="recovery")
         if target_oid == candidate:
-            if queue_oid is None and article_handoff_oid is None:
+            if queue_oid is None and article_handoff_oid is None and observed_resolution_oid is None:
                 if article_claim_oid_observed == article_claim_oid:
                     return _transition_journal(
                         journal,
@@ -4657,7 +5531,11 @@ class RemoteMergeQueue:
                 "stale",
                 f"recovery found target drift: {target_oid or 'absent'}",
             )
-        elif queue_oid == candidate and article_handoff_oid == candidate:
+        elif (
+            queue_oid == candidate
+            and article_handoff_oid == candidate
+            and observed_resolution_oid == resolution_oid
+        ):
             if article_claim_oid_observed is not None:
                 return _transition_journal(
                     journal,
@@ -4669,6 +5547,7 @@ class RemoteMergeQueue:
         elif (
             queue_oid is None
             and article_handoff_oid is None
+            and observed_resolution_oid is None
             and article_claim_oid_observed == article_claim_oid
         ):
             recovered_status = "prepared"
@@ -4680,8 +5559,6 @@ class RemoteMergeQueue:
                 "recovery found neither the queued candidate nor the exact article claim",
             )
         if status == recovered_status:
-            record["detail"] = f"recovery verified {recovered_status} remote state"
-            _write_json_file(journal, record)
             return record
         return _transition_journal(
             journal,
@@ -4715,14 +5592,14 @@ class RemoteMergeQueue:
                     next(staging.iterdir())
                 except StopIteration:
                     record = self._new_publication_record(staging, identity)
-                    _write_json_file(staging_journal, record)
+                    _write_publication_journal(staging_journal, record)
                 else:
                     raise PublicationUncertain("publication staging path has no durable ownership journal")
         else:
             staging.mkdir(mode=0o700)
             _checkpoint("publication-staging-created")
             record = self._new_publication_record(staging, identity)
-            _write_json_file(staging_journal, record)
+            _write_publication_journal(staging_journal, record)
         _checkpoint("publication-staging-recorded")
         if directory.exists() or directory.is_symlink():
             raise PublicationUncertain("publication path appeared before its durable rename")
@@ -4736,6 +5613,7 @@ class RemoteMergeQueue:
         publication_identity = _directory_identity(directory)
         now = time.time_ns()
         detail = "durable publication intent recorded"
+        resolution_oid = self._make_resolution_commit(identity, phase="queued")
         return {
             "schema": _PUBLICATION_SCHEMA,
             "remote_id": self.remote_id,
@@ -4746,6 +5624,9 @@ class RemoteMergeQueue:
             "observed_queue_oid": None,
             "observed_article_claim_oid": None,
             "observed_article_handoff_oid": None,
+            "initial_resolution_oid": resolution_oid,
+            "resolution_oid": resolution_oid,
+            "observed_resolution_oid": None,
             "claim_oid": None,
             "observed_claim_oid": None,
             "claim_lease_id": None,
@@ -4757,6 +5638,7 @@ class RemoteMergeQueue:
             "history": [{"status": "prepared", "detail": detail, "created_ns": now}],
             "replay_intents": [],
             "replay_events": [],
+            "resolution_intents": [],
         }
 
     def _publication_paths(self, queue_item_id: str) -> tuple[Path, Path]:
@@ -4774,7 +5656,8 @@ class RemoteMergeQueue:
         journal: Path,
         **identity: str,
     ) -> None:
-        legacy_schema = record.get("schema") == _LEGACY_PUBLICATION_SCHEMA
+        schema = record.get("schema")
+        legacy_schema = schema in _LEGACY_PUBLICATION_SCHEMAS
         expected = {
             "schema": _PUBLICATION_SCHEMA,
             "remote_id": self.remote_id,
@@ -4784,6 +5667,10 @@ class RemoteMergeQueue:
         for key, value in expected.items():
             if key == "schema" and legacy_schema:
                 continue
+            if legacy_schema and key in {"target_resolution_ref"}:
+                continue
+            if schema == "autoform-merge-publication/v3" and key == "article_handoff_ref":
+                continue
             if key not in record or record[key] != value:
                 raise PublicationUncertain(f"publication journal has a different {key}")
         if record["remote_kind"] == "local" and (
@@ -4792,13 +5679,23 @@ class RemoteMergeQueue:
             raise PublicationUncertain("publication journal has an invalid local remote identity")
         if record.get("status") not in _PUBLICATION_STATES:
             raise PublicationUncertain("publication journal has an unknown status")
+        if not legacy_schema:
+            terminal = record.get("status") in {"integrated", "aborted", "uncertain"}
+            maximum = _MAX_PUBLICATION_BYTES
+            if not terminal:
+                maximum -= _PUBLICATION_TERMINAL_RESERVE_BYTES
+            if _publication_journal_size(record) > maximum:
+                raise PublicationUncertain("publication journal has consumed its reserved terminal bytes")
         if not isinstance(record.get("history"), list):
             raise PublicationUncertain("publication journal history is malformed")
+        if len(record["history"]) > _MAX_PUBLICATION_HISTORY:
+            raise PublicationUncertain("publication journal history exceeds its evidence bound")
         for key in ("publication_device", "publication_inode", "created_ns", "updated_ns"):
             if not _is_integer(record.get(key)):
                 raise PublicationUncertain(f"publication journal has an invalid {key}")
         if not isinstance(record.get("detail"), str):
             raise PublicationUncertain("publication journal detail is malformed")
+        oid_width = 64 if self.repository.object_format == "sha256" else 40
         lease_id = record.get("claim_lease_id")
         if lease_id is not None and (
             not isinstance(lease_id, str) or re.fullmatch(r"[0-9a-f]{64}", lease_id) is None
@@ -4812,9 +5709,17 @@ class RemoteMergeQueue:
             "observed_claim_oid",
             "observed_target_oid",
             "observed_queue_oid",
+            "initial_resolution_oid",
+            "resolution_oid",
+            "observed_resolution_oid",
         ):
             observed = record.get(key)
-            if observed is not None and (not isinstance(observed, str) or not _OID.fullmatch(observed)):
+            if observed is not None and (
+                not isinstance(observed, str)
+                or not _OID.fullmatch(observed)
+                or len(observed) != oid_width
+                or set(observed) == {"0"}
+            ):
                 raise PublicationUncertain(f"publication journal has an invalid {key}")
         if not _journal_directory_matches(journal, record):
             raise PublicationUncertain("publication directory was replaced")
@@ -4827,24 +5732,191 @@ class RemoteMergeQueue:
             ):
                 raise PublicationUncertain("publication journal history is malformed")
         if legacy_schema:
-            if not isinstance(record, dict) or "replay_intents" in record or "replay_events" in record:
+            if not isinstance(record, dict):
+                raise PublicationUncertain("legacy publication journal is malformed")
+            migrated = copy.deepcopy(record)
+            if schema in {"autoform-merge-publication/v3", "autoform-merge-publication/v4"} and (
+                "replay_intents" in migrated or "replay_events" in migrated
+            ):
                 raise PublicationUncertain("legacy publication journal has unexpected replay state")
-            if record.get("status") == "replaying" or any(
-                isinstance(entry, dict) and entry.get("status") == "replaying" for entry in record["history"]
+            if schema in {"autoform-merge-publication/v3", "autoform-merge-publication/v4"} and (
+                migrated.get("status") == "replaying"
+                or any(
+                    isinstance(entry, dict) and entry.get("status") == "replaying"
+                    for entry in migrated["history"]
+                )
             ):
                 raise PublicationUncertain("legacy publication journal has an invalid replaying state")
-            record["schema"] = _PUBLICATION_SCHEMA
-            record["replay_intents"] = []
-            record["replay_events"] = []
-            _write_json_file(journal, record)
+            if schema == "autoform-merge-publication/v3":
+                migrated["article_handoff_ref"] = identity["article_handoff_ref"]
+            migrated["target_resolution_ref"] = identity["target_resolution_ref"]
+            resolution_oid = self._legacy_resolution_oid(migrated)
+            migrated["initial_resolution_oid"] = resolution_oid
+            migrated["resolution_oid"] = resolution_oid
+            migrated["observed_resolution_oid"] = None
+            if schema == "autoform-merge-publication/v5":
+                self._upgrade_v5_replay_history(migrated)
+            migrated["schema"] = _PUBLICATION_SCHEMA
+            migrated.setdefault("replay_intents", [])
+            migrated.setdefault("replay_events", [])
+            migrated.setdefault("resolution_intents", [])
+            self._validate_replay_history(migrated)
+            self._validate_resolution_chain(migrated)
+            self._validate_resolution_intents(migrated)
+            _checkpoint("publication-schema-upgrade-ready")
+            _write_publication_journal(journal, migrated)
+            record.clear()
+            record.update(migrated)
             _checkpoint("publication-schema-upgraded")
         self._validate_replay_history(record)
+        self._validate_resolution_chain(record)
+        self._validate_resolution_intents(record)
+
+    def _validate_resolution_intents(self, record: Mapping[str, object]) -> None:
+        intents = record.get("resolution_intents")
+        if not isinstance(intents, list) or len(intents) > _MAX_REPLAY_ATTEMPTS:
+            raise PublicationUncertain("publication resolution intent history is malformed")
+        keys = {
+            "intent_id",
+            "schema",
+            "decision",
+            "queue_item_id",
+            "target_ref",
+            "queue_ref",
+            "article_handoff_ref",
+            "target_resolution_ref",
+            "candidate_oid",
+            "resolution_oid",
+            "resolution_base_oid",
+            "resolution_candidate_oid",
+            "observed_target_oid",
+            "observed_queue_oid",
+            "observed_article_handoff_oid",
+            "observed_article_claim_oid",
+            "observed_claim_oid",
+            "observed_resolution_oid",
+            "created_ns",
+        }
+        effective = self._effective_replay_intent(record)
+        expected_base = (
+            str(effective["replay_target_oid"])
+            if effective is not None
+            else _expected_oid(str(record["expected_target_oid"]))
+        )
+        expected_candidate = (
+            str(effective["replay_candidate_oid"])
+            if effective is not None
+            else str(record["candidate_oid"])
+        )
+        oid_width = 64 if self.repository.object_format == "sha256" else 40
+        decision: str | None = None
+        for intent in intents:
+            if not isinstance(intent, dict) or set(intent) != keys:
+                raise PublicationUncertain("publication resolution intent is malformed")
+            intent_id = intent.get("intent_id")
+            body = {key: value for key, value in intent.items() if key != "intent_id"}
+            if (
+                not isinstance(intent_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", intent_id) is None
+                or hashlib.sha256(_json_bytes(body)).hexdigest() != intent_id
+            ):
+                raise PublicationUncertain("publication resolution intent digest is invalid")
+            expected = {
+                "schema": _RESOLUTION_INTENT_SCHEMA,
+                "queue_item_id": record.get("queue_item_id"),
+                "target_ref": record.get("target_ref"),
+                "queue_ref": record.get("queue_ref"),
+                "article_handoff_ref": record.get("article_handoff_ref"),
+                "target_resolution_ref": record.get("target_resolution_ref"),
+                "candidate_oid": record.get("candidate_oid"),
+                "resolution_oid": record.get("resolution_oid"),
+                "resolution_base_oid": expected_base,
+                "resolution_candidate_oid": expected_candidate,
+                "observed_article_claim_oid": None,
+                "observed_resolution_oid": record.get("resolution_oid"),
+            }
+            if any(intent.get(key) != value for key, value in expected.items()):
+                raise PublicationUncertain("publication resolution intent does not match its journal")
+            if intent.get("decision") not in {"abort", "adopt"} or not _is_integer(
+                intent.get("created_ns")
+            ):
+                raise PublicationUncertain("publication resolution intent has invalid authorization fields")
+            if decision is not None and intent["decision"] != decision:
+                raise PublicationUncertain("publication resolution decisions conflict")
+            decision = str(intent["decision"])
+            if decision == "abort" and intent.get("observed_target_oid") != expected_base:
+                raise PublicationUncertain("publication abort intent is not bound to its exact base")
+            for key in (
+                "resolution_candidate_oid",
+                "observed_claim_oid",
+                "observed_resolution_oid",
+            ):
+                value = intent.get(key)
+                if (
+                    not isinstance(value, str)
+                    or not _OID.fullmatch(value)
+                    or len(value) != oid_width
+                    or set(value) == {"0"}
+                ):
+                    raise PublicationUncertain(f"publication resolution intent has an invalid {key}")
+            for key in ("resolution_base_oid", "observed_target_oid"):
+                value = intent.get(key)
+                if value is not None and (
+                    not isinstance(value, str)
+                    or not _OID.fullmatch(value)
+                    or len(value) != oid_width
+                    or set(value) == {"0"}
+                ):
+                    raise PublicationUncertain(f"publication resolution intent has an invalid {key}")
+            for key in ("observed_queue_oid", "observed_article_handoff_oid"):
+                if intent.get(key) not in {None, record.get("candidate_oid")}:
+                    raise PublicationUncertain(f"publication resolution intent has a foreign {key}")
+
+    def _validate_resolution_chain(self, record: Mapping[str, object]) -> None:
+        initial = self._resolution_commit_oid(record, phase="queued")
+        if record.get("initial_resolution_oid") != initial:
+            raise PublicationUncertain(
+                "publication initial resolution OID does not match its canonical owner metadata"
+            )
+        current = initial
+        intents = record.get("replay_intents")
+        events = record.get("replay_events")
+        if not isinstance(intents, list) or not isinstance(events, list):
+            raise PublicationUncertain("publication replay history is malformed")
+        unpinned = {
+            str(event["replay_id"])
+            for event in events
+            if isinstance(event, dict) and event.get("status") == "pin-retry"
+        }
+        for intent in intents:
+            if not isinstance(intent, dict):
+                raise PublicationUncertain("publication replay intent is malformed")
+            if intent.get("prior_resolution_oid") != current:
+                raise PublicationUncertain("publication replay resolution chain is discontinuous")
+            replay = {
+                key: value
+                for key, value in intent.items()
+                if key not in {"replay_id", "prior_resolution_oid", "resolution_oid"}
+            }
+            expected = self._resolution_commit_oid(record, phase="replay", replay=replay)
+            if intent.get("resolution_oid") != expected:
+                raise PublicationUncertain(
+                    "publication replay resolution OID does not match its canonical owner metadata"
+                )
+            if intent.get("replay_id") not in unpinned:
+                current = expected
+        if record.get("resolution_oid") != current:
+            raise PublicationUncertain("publication current resolution OID does not match its replay chain")
 
     def _validate_replay_history(self, record: Mapping[str, object]) -> None:
         intents = record.get("replay_intents")
         events = record.get("replay_events")
         if not isinstance(intents, list) or not isinstance(events, list):
             raise PublicationUncertain("publication replay history is malformed")
+        if len(intents) > _MAX_REPLAY_ATTEMPTS:
+            raise PublicationUncertain("publication replay intent history exceeds its evidence bound")
+        if len(events) > _MAX_REPLAY_EVENTS:
+            raise PublicationUncertain("publication replay event history exceeds its evidence bound")
         intent_keys = {
             "replay_id",
             "schema",
@@ -4867,6 +5939,9 @@ class RemoteMergeQueue:
             "claim_oid",
             "claim_lease_id",
             "created_ns",
+            "prior_resolution_oid",
+            "resolution_oid",
+            "target_resolution_ref",
         }
         intent_ids: list[str] = []
         oid_width = 64 if self.repository.object_format == "sha256" else 40
@@ -4897,6 +5972,7 @@ class RemoteMergeQueue:
                 "expected_article_handoff_oid": record.get("candidate_oid"),
                 "claim_key": record.get("claim_key"),
                 "claim_ref": record.get("claim_ref"),
+                "target_resolution_ref": record.get("target_resolution_ref"),
             }
             if any(intent.get(key) != value for key, value in identity.items()):
                 raise PublicationUncertain("publication replay intent does not match its publication")
@@ -4909,6 +5985,8 @@ class RemoteMergeQueue:
                 "expected_queue_oid",
                 "expected_article_handoff_oid",
                 "claim_oid",
+                "prior_resolution_oid",
+                "resolution_oid",
             ):
                 value = intent.get(key)
                 if not isinstance(value, str) or not _OID.fullmatch(value) or len(value) != oid_width:
@@ -4952,6 +6030,7 @@ class RemoteMergeQueue:
                 "observed_article_claim_oid",
                 "observed_article_handoff_oid",
                 "observed_claim_oid",
+                "observed_resolution_oid",
             ):
                 value = event.get(key)
                 if value is not None and (
@@ -4973,9 +6052,172 @@ class RemoteMergeQueue:
                 for event in reversed(events)
                 if isinstance(event, dict) and event.get("replay_id") == intent_ids[-1]
             )
-            expected_status = "stale" if last_status == "retry" else last_status
-            if record.get("status") not in {expected_status, "uncertain"}:
+            expected_status = "stale" if last_status in {"pin-retry", "retry"} else last_status
+            if record.get("status") not in {expected_status, "aborted", "uncertain"}:
                 raise PublicationUncertain("publication status disagrees with its last replay event")
+
+    def _bind_v2_journal(
+        self,
+        record: dict[str, object],
+        *,
+        article_claim: ClaimFence,
+        article_handoff_ref: str,
+        target_resolution_ref: str,
+    ) -> dict[str, object]:
+        bound = copy.deepcopy(record)
+        bound.update(
+            {
+                "schema": "autoform-merge-publication/v3",
+                "article_claim_key": article_claim.key,
+                "article_claim_ref": article_claim.ref,
+                "article_claim_oid": article_claim.oid,
+                "article_claim_lease_id": article_claim.lease_id,
+                "observed_article_claim_oid": None,
+                "article_handoff_ref": article_handoff_ref,
+                "observed_article_handoff_oid": None,
+                "target_resolution_ref": target_resolution_ref,
+            }
+        )
+        return bound
+
+    def _upgrade_v5_replay_history(self, record: dict[str, object]) -> None:
+        intents = record.get("replay_intents")
+        events = record.get("replay_events")
+        if not isinstance(intents, list) or not isinstance(events, list):
+            raise PublicationUncertain("v5 publication replay history is malformed")
+        prior_resolution = str(record["initial_resolution_oid"])
+        id_map: dict[str, str] = {}
+        upgraded: list[dict[str, object]] = []
+        for old in intents:
+            if not isinstance(old, dict) or not isinstance(old.get("replay_id"), str):
+                raise PublicationUncertain("v5 publication replay intent is malformed")
+            old_id = str(old["replay_id"])
+            old_body = {key: value for key, value in old.items() if key != "replay_id"}
+            if hashlib.sha256(_json_bytes(old_body)).hexdigest() != old_id:
+                raise PublicationUncertain("v5 publication replay intent digest does not match its content")
+            payload = dict(old_body)
+            payload["target_resolution_ref"] = record["target_resolution_ref"]
+            resolution_oid = self._make_resolution_commit(record, phase="replay", replay=payload)
+            body = {
+                **payload,
+                "prior_resolution_oid": prior_resolution,
+                "resolution_oid": resolution_oid,
+            }
+            new_id = hashlib.sha256(_json_bytes(body)).hexdigest()
+            upgraded.append({"replay_id": new_id, **body})
+            id_map[old_id] = new_id
+            prior_resolution = resolution_oid
+        for event in events:
+            if isinstance(event, dict) and str(event.get("replay_id")) in id_map:
+                event["replay_id"] = id_map[str(event["replay_id"])]
+        record["replay_intents"] = upgraded
+        record["resolution_oid"] = prior_resolution
+        if record.get("status") == "replaying" and upgraded:
+            active = upgraded[-1]
+            now = time.time_ns()
+            events.append(
+                {
+                    "replay_id": active["replay_id"],
+                    "status": "pin-retry",
+                    "detail": "v5 active replay requires a newly fenced v6 retry",
+                    "created_ns": now,
+                }
+            )
+            record["status"] = "stale"
+            record["resolution_oid"] = active["prior_resolution_oid"]
+            record["detail"] = "v5 active replay requires a newly fenced v6 retry"
+            record["updated_ns"] = now
+            record["claim_oid"] = active["claim_oid"]
+            record["claim_lease_id"] = active["claim_lease_id"]
+            history = record.get("history")
+            if not isinstance(history, list) or len(history) >= _MAX_PUBLICATION_HISTORY:
+                raise PublicationUncertain("v5 publication has no migration history capacity")
+            history.append(
+                {"status": "stale", "detail": record["detail"], "created_ns": now}
+            )
+
+    def _legacy_resolution_oid(self, record: dict[str, object]) -> str:
+        if record.get("status") != "integrated":
+            self._ensure_original_objects(record)
+            self._verify_candidate(
+                str(record["expected_target_oid"]),
+                str(record["candidate_oid"]),
+                use_transport=True,
+            )
+        return self._make_resolution_commit(record, phase="queued")
+
+    def _ensure_migrated_resolution(self, record: dict[str, object], journal: Path) -> None:
+        status = str(record["status"])
+        if status in {"integrated", "aborted"}:
+            return
+        queue_ref = str(record["queue_ref"])
+        handoff_ref = str(record["article_handoff_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        target_ref = str(record["target_ref"])
+        claim_ref = str(record["claim_ref"])
+        observation = self._remote_oids(
+            (queue_ref, handoff_ref, resolution_ref, target_ref, claim_ref)
+        )
+        queue = observation[queue_ref]
+        handoff = observation[handoff_ref]
+        resolution = observation[resolution_ref]
+        candidate = str(record["candidate_oid"])
+        expected_resolution = str(record["resolution_oid"])
+        target = observation[target_ref]
+        claim = observation[claim_ref]
+        record["observed_queue_oid"] = queue
+        record["observed_article_handoff_oid"] = handoff
+        record["observed_resolution_oid"] = resolution
+        record["observed_target_oid"] = target
+        record["observed_claim_oid"] = claim
+        if target == candidate and claim is not None:
+            _transition_journal(
+                journal,
+                record,
+                "uncertain",
+                "target advanced without consuming the exact merge claim",
+            )
+            return
+        if queue is None and handoff is None and resolution is None:
+            return
+        active_replay = self._active_replay_intent(record) if status == "replaying" else None
+        if (
+            active_replay is not None
+            and queue == candidate
+            and handoff == candidate
+            and resolution
+            in {
+                active_replay.get("prior_resolution_oid"),
+                active_replay.get("resolution_oid"),
+            }
+        ):
+            return
+        if queue == candidate and handoff == candidate and resolution == expected_resolution:
+            return
+        claim_key = str(record["claim_key"])
+        recorded_claim = record.get("claim_oid")
+        if isinstance(recorded_claim, str) and claim == recorded_claim:
+            self._repair_or_fence_split(record, journal, phase="during schema migration")
+            return
+        acquired = self.claim_board.acquire(
+            claim_key,
+            ttl=self.claim_ttl,
+            note=f"migrate merge queue item {record['queue_item_id']}",
+            expected_resolution_oid=resolution,
+        )
+        if not acquired:
+            raise MergeQueueBusy("target resolution migration is fenced by another publisher")
+        fence = self._held_claim_fence(claim_key)
+        if fence is None:
+            self.claim_board.release(claim_key)
+            raise PublicationUncertain("resolution migration has no coherent merge fence")
+        try:
+            record["claim_oid"] = fence.oid
+            record["claim_lease_id"] = fence.lease_id
+            self._repair_or_fence_split(record, journal, phase="during schema migration")
+        finally:
+            self._secure_claim_cleanup(record, fence)
+            self._release_claim_fence(fence.ref, fence.oid)
 
     def _validate_publication_identity(
         self,
@@ -5002,12 +6244,219 @@ class RemoteMergeQueue:
         if len(article_claim.oid) != expected_oid_length:
             raise MergeQueueError("article claim object id does not match the repository object format")
 
-    def _verify_candidate(self, expected: str, candidate: str) -> None:
-        self.repository._verify_commit(candidate)
+    def _verify_candidate(self, expected: str, candidate: str, *, use_transport: bool = False) -> None:
+        verify = self._verify_transport_commit if use_transport else self.repository._verify_commit
+        verify(candidate)
         if expected not in _ZERO_OIDS:
-            self.repository._verify_commit(expected)
-            if not self.repository._is_ancestor(expected, candidate):
+            verify(expected)
+            ancestor = (
+                self._transport_is_ancestor(expected, candidate)
+                if use_transport
+                else self.repository._is_ancestor(expected, candidate)
+            )
+            if not ancestor:
                 raise MergeQueueError("candidate is not descended from the expected target object")
+
+    def _ensure_original_objects(self, record: Mapping[str, object]) -> None:
+        expected = str(record["expected_target_oid"])
+        candidate = str(record["candidate_oid"])
+        if self._transport_has_commit(candidate) and (
+            expected in _ZERO_OIDS or self._transport_has_commit(expected)
+        ):
+            return
+        queue_ref = str(record["queue_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        if self._remote_oid(queue_ref) == candidate:
+            self._fetch_exact_ref(
+                queue_ref,
+                candidate,
+                owner=str(record["queue_item_id"]),
+            )
+        elif self._remote_oid(resolution_ref) == record.get("resolution_oid"):
+            self._fetch_exact_ref(
+                resolution_ref,
+                str(record["resolution_oid"]),
+                owner=str(record["queue_item_id"]),
+            )
+        self._verify_candidate(expected, candidate, use_transport=True)
+
+    def _import_original_objects(self, expected: str, candidate: str, *, owner: str) -> None:
+        """Copy the exact publication commits into the owned transport store."""
+
+        commits: list[tuple[str, str]] = [("candidate", candidate)]
+        if expected not in _ZERO_OIDS:
+            commits.append(("expected", expected))
+        self._import_commits(commits, owner=owner)
+        self._verify_candidate(expected, candidate, use_transport=True)
+
+    def _import_commits(self, commits: Iterable[tuple[str, str]], *, owner: str) -> None:
+        self.repository._verify_repository()
+        self._verify_state()
+        self._verify_transport()
+        source = os.fspath(self.repository.common_git_dir)
+        for role, oid in commits:
+            _validate_oid(oid)
+            if self._transport_has_commit(oid, use_repository_alternate=False):
+                continue
+            cache_ref = self._cache_ref(owner, "source-" + hashlib.sha256(
+                f"{role}\0{oid}".encode()
+            ).hexdigest())
+            self._run_local_git_bytes(
+                ["fetch", "--quiet", "--no-tags", "--force", source, f"{oid}:{cache_ref}"],
+                use_repository_alternate=False,
+            )
+            if not self._transport_has_commit(oid, use_repository_alternate=False):
+                raise RepositoryError(f"failed to durably import exact {role} commit {oid}")
+        self.repository._verify_repository()
+        self._verify_state()
+        self._verify_transport()
+
+    def _ensure_resolution_objects(self, record: Mapping[str, object]) -> None:
+        self._fetch_exact_ref(
+            str(record["target_resolution_ref"]),
+            str(record["resolution_oid"]),
+            owner=str(record["queue_item_id"]),
+        )
+
+    def _cache_ref(self, owner: str, token: str) -> str:
+        _validate_name("cache owner", owner)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}", token):
+            raise RepositoryError("transport cache token is invalid")
+        scope = hashlib.sha256(f"{self.remote_id}\0{owner}".encode()).hexdigest()
+        return f"refs/autoform-cache/{scope}/{token}"
+
+    def _fetch_exact_ref(self, remote_ref: str, expected_oid: str, *, owner: str) -> None:
+        observed = self._remote_oid(remote_ref)
+        if observed != expected_oid:
+            raise PublicationUncertain(
+                f"remote ref {remote_ref} changed before its objects could be recovered"
+            )
+        cache_ref = self._cache_ref(
+            owner,
+            "remote-" + hashlib.sha256(f"{remote_ref}\0{expected_oid}".encode()).hexdigest(),
+        )
+        self._remote_git(
+            [
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--force",
+                self.remote_url,
+                f"{remote_ref}:{cache_ref}",
+            ]
+        )
+        fetched = self._local_git_text(["rev-parse", "--verify", cache_ref]).strip()
+        if fetched != expected_oid:
+            raise PublicationUncertain(f"fetched ref {remote_ref} did not preserve its exact object")
+
+    def _cleanup_transport_cache(self, owner: str) -> None:
+        prefix = self._cache_ref(owner, "scope").rsplit("/", 1)[0] + "/"
+        refs = self._local_git_text(
+            ["for-each-ref", "--format=%(refname)", prefix]
+        ).splitlines()
+        for ref in refs:
+            if not ref.startswith(prefix):  # pragma: no cover - Git output invariant
+                raise RepositoryError("transport cache enumeration escaped its publication scope")
+            self._run_local_git_bytes(["update-ref", "-d", ref])
+
+    def _receipt(self, record: Mapping[str, object]) -> PublicationReceipt:
+        receipt = _publication_receipt(record)
+        if receipt.status in {"integrated", "aborted"}:
+            self._cleanup_transport_cache(receipt.queue_item_id)
+        return receipt
+
+    def _verify_transport_commit(self, oid: str) -> None:
+        proc = self._run_local_git_bytes(["cat-file", "-e", f"{oid}^{{commit}}"], check=False)
+        if proc.returncode != 0:
+            raise RepositoryError(f"base object does not resolve exactly to a commit: {oid}")
+
+    def _transport_has_commit(self, oid: str, *, use_repository_alternate: bool = False) -> bool:
+        proc = self._run_local_git_bytes(
+            ["cat-file", "-e", f"{oid}^{{commit}}"],
+            check=False,
+            use_repository_alternate=use_repository_alternate,
+        )
+        return proc.returncode == 0
+
+    def _transport_is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        proc = self._run_local_git_bytes(
+            ["merge-base", "--is-ancestor", ancestor, descendant], check=False
+        )
+        if proc.returncode not in {0, 1}:
+            raise RepositoryError("Git ancestry verification failed")
+        return proc.returncode == 0
+
+    def _local_git_text(self, args: list[str]) -> str:
+        return self._run_local_git_bytes(args).stdout.decode("utf-8", errors="strict")
+
+    def _make_resolution_commit(
+        self,
+        identity: Mapping[str, object],
+        *,
+        phase: str,
+        replay: Mapping[str, object] | None = None,
+    ) -> str:
+        content = self._resolution_commit_content(identity, phase=phase, replay=replay)
+        expected = _git_object_oid("commit", content, self.repository.object_format)
+        empty_tree = self._run_local_git_bytes(
+            ["hash-object", "-t", "tree", "-w", "--stdin"], input_bytes=b""
+        ).stdout.decode("ascii").strip()
+        if empty_tree != _git_object_oid("tree", b"", self.repository.object_format):
+            raise RepositoryError("Git did not preserve the canonical empty resolution tree")
+        result = self._run_local_git_bytes(
+            ["hash-object", "-t", "commit", "-w", "--stdin"],
+            input_bytes=content,
+        ).stdout.decode("ascii").strip()
+        if result != expected:
+            raise RepositoryError("Git did not preserve the canonical target-resolution object")
+        return result
+
+    def _resolution_commit_oid(
+        self,
+        identity: Mapping[str, object],
+        *,
+        phase: str,
+        replay: Mapping[str, object] | None = None,
+    ) -> str:
+        content = self._resolution_commit_content(identity, phase=phase, replay=replay)
+        return _git_object_oid("commit", content, self.repository.object_format)
+
+    def _resolution_commit_content(
+        self,
+        identity: Mapping[str, object],
+        *,
+        phase: str,
+        replay: Mapping[str, object] | None = None,
+    ) -> bytes:
+        body: dict[str, object] = {
+            "schema": _RESOLUTION_SCHEMA,
+            "phase": phase,
+            "remote_id": self.remote_id,
+            "queue_item_id": identity["queue_item_id"],
+            "target_ref": identity["target_ref"],
+            "queue_ref": identity["queue_ref"],
+            "expected_target_oid": identity["expected_target_oid"],
+            "candidate_oid": identity["candidate_oid"],
+            "article_claim_key": identity["article_claim_key"],
+            "article_claim_ref": identity["article_claim_ref"],
+            "article_handoff_ref": identity["article_handoff_ref"],
+            "claim_key": identity["claim_key"],
+            "claim_ref": identity["claim_ref"],
+            "target_resolution_ref": identity["target_resolution_ref"],
+        }
+        parents = [str(identity["candidate_oid"])]
+        if replay is not None:
+            body["replay"] = dict(replay)
+            parents.append(str(replay["replay_candidate_oid"]))
+        tree = _git_object_oid("tree", b"", self.repository.object_format)
+        headers = [f"tree {tree}", *(f"parent {parent}" for parent in dict.fromkeys(parents))]
+        headers.extend(
+            (
+                "author autoform <autoform@localhost> 0 +0000",
+                "committer autoform <autoform@localhost> 0 +0000",
+            )
+        )
+        return ("\n".join(headers) + "\n\n").encode("ascii") + _json_bytes(body) + b"\n"
 
     def _verify_replay_candidate(
         self,
@@ -5019,27 +6468,27 @@ class RemoteMergeQueue:
     ) -> tuple[str, str]:
         """Verify one direct replay commit by reproducing its tree in a private index."""
 
-        self._verify_candidate(expected_target_oid, candidate_oid)
-        self.repository._verify_commit(replay_target_oid)
-        self.repository._verify_commit(replay_candidate_oid)
-        parents = self.repository._run_git(
+        self._verify_candidate(expected_target_oid, candidate_oid, use_transport=True)
+        self._verify_transport_commit(replay_target_oid)
+        self._verify_transport_commit(replay_candidate_oid)
+        parents = self._local_git_text(
             ["rev-list", "--parents", "--max-count=1", replay_candidate_oid]
-        ).stdout.split()
+        ).split()
         if parents != [replay_candidate_oid, replay_target_oid]:
             raise MergeQueueError("replay candidate must have exactly the replay target as its single parent")
 
         if expected_target_oid in _ZERO_OIDS:
-            source_tree = self.repository._run_git(["mktree"], input_text="").stdout.strip()
+            source_tree = self._run_local_git_bytes(["mktree"], input_bytes=b"").stdout.decode("ascii").strip()
         else:
-            source_tree = self.repository._run_git(
+            source_tree = self._local_git_text(
                 ["rev-parse", "--verify", f"{expected_target_oid}^{{tree}}"]
-            ).stdout.strip()
-        candidate_tree = self.repository._run_git(
+            ).strip()
+        candidate_tree = self._local_git_text(
             ["rev-parse", "--verify", f"{candidate_oid}^{{tree}}"]
-        ).stdout.strip()
-        replay_tree = self.repository._run_git(
+        ).strip()
+        replay_tree = self._local_git_text(
             ["rev-parse", "--verify", f"{replay_candidate_oid}^{{tree}}"]
-        ).stdout.strip()
+        ).strip()
         patch = self._run_local_git_bytes(
             [
                 "-c",
@@ -5122,16 +6571,18 @@ class RemoteMergeQueue:
         input_bytes: bytes | None = None,
         environment: Mapping[str, str] | None = None,
         check: bool = True,
+        use_repository_alternate: bool = False,
     ) -> subprocess.CompletedProcess[bytes]:
-        self.repository._verify_repository()
         self._verify_state()
-        self._verify_transport()
         git_environment = _git_environment()
         if environment is not None:
             git_environment.update(environment)
-        git_environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(
-            self.repository.common_git_dir / "objects"
-        )
+        if use_repository_alternate:
+            git_environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(
+                self.repository.common_git_dir / "objects"
+            )
+        else:
+            git_environment.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
         try:
             proc = subprocess.run(
                 _git_command(args),
@@ -5143,9 +6594,7 @@ class RemoteMergeQueue:
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise RepositoryError(f"Git replay verification failed: {error}") from error
-        self.repository._verify_repository()
         self._verify_state()
-        self._verify_transport()
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()[:500]
             raise RepositoryError(f"Git replay verification failed: {detail}")
@@ -5170,16 +6619,30 @@ class RemoteMergeQueue:
             raise PublicationUncertain("publication lease ownership was lost")
 
     def _remote_oid(self, ref: str) -> str | None:
-        proc = self._remote_git(["ls-remote", self.remote_url, ref])
+        return self._remote_oids((ref,))[ref]
+
+    def _remote_oids(self, refs: Iterable[str]) -> dict[str, str | None]:
+        requested = tuple(refs)
+        if not requested:
+            return {}
+        if len(set(requested)) != len(requested):
+            raise MergeQueueError("remote ref observation contains duplicate requests")
+        observed: dict[str, str | None] = dict.fromkeys(requested)
+        proc = self._remote_git(["ls-remote", self.remote_url, *requested])
         lines = [line for line in proc.stdout.splitlines() if line]
-        if not lines:
-            return None
-        if len(lines) != 1:
-            raise PublicationUncertain(f"remote returned multiple results for exact ref {ref}")
-        oid, separator, observed_ref = lines[0].partition("\t")
-        if not separator or observed_ref != ref or not _OID.fullmatch(oid):
-            raise PublicationUncertain(f"remote returned an invalid result for exact ref {ref}")
-        return oid
+        returned: set[str] = set()
+        for line in lines:
+            oid, separator, observed_ref = line.partition("\t")
+            if (
+                not separator
+                or observed_ref not in observed
+                or observed_ref in returned
+                or not _OID.fullmatch(oid)
+            ):
+                raise PublicationUncertain("remote returned invalid results for exact refs")
+            observed[observed_ref] = oid
+            returned.add(observed_ref)
+        return observed
 
     def _atomic_queue_handoff(
         self,
@@ -5189,6 +6652,8 @@ class RemoteMergeQueue:
         article_claim_ref: str,
         article_claim_oid: str,
         article_handoff_ref: str,
+        resolution_ref: str,
+        resolution_oid: str,
     ) -> bool:
         proc = self._remote_git(
             [
@@ -5198,10 +6663,12 @@ class RemoteMergeQueue:
                 "--atomic",
                 f"--force-with-lease={queue_ref}:",
                 f"--force-with-lease={article_handoff_ref}:",
+                f"--force-with-lease={resolution_ref}:",
                 f"--force-with-lease={article_claim_ref}:{article_claim_oid}",
                 self.remote_url,
                 f"{candidate}:{queue_ref}",
                 f"{candidate}:{article_handoff_ref}",
+                f"{resolution_oid}:{resolution_ref}",
                 f":{article_claim_ref}",
             ],
             check=False,
@@ -5241,12 +6708,292 @@ class RemoteMergeQueue:
             return
         raise MergeQueueError(f"exact claim cleanup failed: {_redact_remote(detail[:500], self.remote_url)}")
 
+    def _secure_claim_cleanup(self, record: dict[str, object], fence: ClaimFence) -> None:
+        """Prevent an expiring merge lease from becoming the last ownership barrier."""
+
+        if record.get("status") in {"integrated", "aborted"}:
+            return
+        article = self._remote_oid(str(record["article_claim_ref"]))
+        record["observed_article_claim_oid"] = article
+        resolution = self._remote_oid(str(record["target_resolution_ref"]))
+        record["observed_resolution_oid"] = resolution
+        if resolution is not None:
+            return
+        queue = self._remote_oid(str(record["queue_ref"]))
+        handoff = self._remote_oid(str(record["article_handoff_ref"]))
+        target = self._remote_oid(str(record["target_ref"]))
+        record["observed_queue_oid"] = queue
+        record["observed_article_handoff_oid"] = handoff
+        record["observed_target_oid"] = target
+        intents = record.get("resolution_intents")
+        intent = intents[-1] if isinstance(intents, list) and intents else None
+        if isinstance(intent, dict):
+            claim = self._remote_oid(str(record["claim_ref"]))
+            shared_consumed = all(
+                old is None or current != old
+                for old, current in (
+                    (intent.get("observed_queue_oid"), queue),
+                    (intent.get("observed_article_handoff_oid"), handoff),
+                    (intent.get("observed_claim_oid"), claim),
+                    (intent.get("observed_resolution_oid"), resolution),
+                )
+            )
+            integrated = False
+            if target is not None:
+                self._fetch_exact_ref(
+                    str(record["target_ref"]),
+                    target,
+                    owner=str(record["queue_item_id"]),
+                )
+                candidate = str(intent["resolution_candidate_oid"])
+                integrated = self._transport_has_commit(candidate) and self._transport_is_ancestor(
+                    candidate, target
+                )
+            decision = intent.get("decision")
+            if shared_consumed and (
+                (decision == "abort" and not integrated) or (decision == "adopt" and integrated)
+            ):
+                return
+        if (
+            article == record.get("article_claim_oid")
+            and queue is None
+            and handoff is None
+            and target == _expected_oid(str(record["expected_target_oid"]))
+        ):
+            return
+        blocker = self._install_recovery_block(record, expected_claim=fence.oid)
+        if blocker is not None:
+            record["observed_claim_oid"] = blocker
+            return
+        resolution = self._remote_oid(str(record["target_resolution_ref"]))
+        record["observed_resolution_oid"] = resolution
+        if resolution is None:
+            raise PublicationUncertain(
+                "merge claim cleanup refused because no permanent ownership fence could be proven"
+            )
+
+    def _install_recovery_block(
+        self,
+        record: Mapping[str, object],
+        *,
+        expected_claim: str,
+    ) -> str | None:
+        resolution_oid = str(record["resolution_oid"])
+        body = {
+            "blocked_at": time.time(),
+            "queue_item_id": str(record["queue_item_id"]),
+            "resolution_oid": resolution_oid,
+            "resource": str(record["claim_key"]),
+            "schema": RECOVERY_BLOCK_SCHEMA,
+            "target_resolution_ref": str(record["target_resolution_ref"]),
+        }
+        tree = _git_object_oid("tree", b"", self.repository.object_format)
+        content = (
+            f"tree {tree}\n"
+            f"parent {resolution_oid}\n"
+            "author autoform <autoform@localhost> 0 +0000\n"
+            "committer autoform <autoform@localhost> 0 +0000\n\n"
+        ).encode("ascii") + _json_bytes(body) + b"\n"
+        block_oid = self._run_local_git_bytes(
+            ["hash-object", "-t", "commit", "-w", "--stdin"], input_bytes=content
+        ).stdout.decode("ascii").strip()
+        claim_ref = str(record["claim_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        proc = self._remote_git(
+            [
+                "push",
+                "--quiet",
+                "--porcelain",
+                "--atomic",
+                f"--force-with-lease={claim_ref}:{expected_claim}",
+                f"--force-with-lease={resolution_ref}:",
+                self.remote_url,
+                f"{block_oid}:{claim_ref}",
+                f"{resolution_oid}:{resolution_ref}",
+            ],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return block_oid
+        detail = f"{proc.stdout}\n{proc.stderr}".strip()
+        if any(marker in detail.casefold() for marker in _CAS_REJECTIONS):
+            return None
+        raise PublicationUncertain(
+            f"remote recovery-block outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
+        )
+
+    def _atomic_restore_barriers(
+        self,
+        record: Mapping[str, object],
+        *,
+        observation: Mapping[str, str | None],
+        claim_oid: str,
+    ) -> bool:
+        queue_ref = str(record["queue_ref"])
+        handoff_ref = str(record["article_handoff_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        article_ref = str(record["article_claim_ref"])
+        claim_ref = str(record["claim_ref"])
+        target_ref = str(record["target_ref"])
+        candidate = str(record["candidate_oid"])
+        resolution_oid = str(record["resolution_oid"])
+        target = observation["target"]
+        owner = str(record["queue_item_id"])
+        self._fetch_exact_ref(claim_ref, claim_oid, owner=owner)
+        if target is not None:
+            self._fetch_exact_ref(target_ref, target, owner=owner)
+        updates = [
+            f"{candidate}:{queue_ref}",
+            f"{candidate}:{handoff_ref}",
+            f"{resolution_oid}:{resolution_ref}",
+            f":{article_ref}",
+            f"{claim_oid}:{claim_ref}",
+        ]
+        leases = [
+            f"--force-with-lease={queue_ref}:{observation['queue'] or ''}",
+            f"--force-with-lease={handoff_ref}:{observation['handoff'] or ''}",
+            f"--force-with-lease={resolution_ref}:{observation['resolution'] or ''}",
+            f"--force-with-lease={article_ref}:",
+            f"--force-with-lease={claim_ref}:{claim_oid}",
+            f"--force-with-lease={target_ref}:{target or ''}",
+        ]
+        updates.append(f"{target}:{target_ref}" if target is not None else f":{target_ref}")
+        proc = self._remote_git(
+            ["push", "--quiet", "--porcelain", "--atomic", *leases, self.remote_url, *updates],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        detail = f"{proc.stdout}\n{proc.stderr}".strip()
+        folded = detail.casefold()
+        if "does not support --atomic" in folded:
+            raise MergeQueueError("publication remote does not support atomic pushes")
+        if any(marker in folded for marker in _CAS_REJECTIONS):
+            return False
+        raise PublicationUncertain(
+            f"remote barrier repair outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
+        )
+
+    def _ensure_permanent_resolution_fence(self, record: Mapping[str, object]) -> str | None:
+        """Install or observe a non-expiring owner marker before a merge claim is released."""
+
+        resolution_ref = str(record["target_resolution_ref"])
+        expected = str(record["resolution_oid"])
+        for _ in range(4):
+            observation = self._observe_replay_refs(record)
+            observed = observation["resolution"]
+            if observed is not None:
+                return observed
+            if self._atomic_install_resolution_fence(record, observation=observation):
+                verified = self._remote_oid(resolution_ref)
+                if verified == expected:
+                    return verified
+        return self._remote_oid(resolution_ref)
+
+    def _atomic_install_resolution_fence(
+        self,
+        record: Mapping[str, object],
+        *,
+        observation: Mapping[str, str | None],
+    ) -> bool:
+        resolution_ref = str(record["target_resolution_ref"])
+        resolution_oid = str(record["resolution_oid"])
+        refs = (
+            (str(record["queue_ref"]), observation["queue"]),
+            (str(record["article_handoff_ref"]), observation["handoff"]),
+            (str(record["article_claim_ref"]), observation["article"]),
+            (str(record["claim_ref"]), observation["claim"]),
+            (str(record["target_ref"]), observation["target"]),
+        )
+        for ref, oid in refs:
+            if oid is not None:
+                self._fetch_exact_ref(
+                    ref,
+                    oid,
+                    owner=str(record["queue_item_id"]),
+                )
+        leases = [f"--force-with-lease={resolution_ref}:"]
+        updates = [f"{resolution_oid}:{resolution_ref}"]
+        for ref, oid in refs:
+            leases.append(f"--force-with-lease={ref}:{oid or ''}")
+            updates.append(f"{oid}:{ref}" if oid is not None else f":{ref}")
+        proc = self._remote_git(
+            ["push", "--quiet", "--porcelain", "--atomic", *leases, self.remote_url, *updates],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        detail = f"{proc.stdout}\n{proc.stderr}".strip()
+        folded = detail.casefold()
+        if "does not support --atomic" in folded:
+            raise MergeQueueError("publication remote does not support atomic pushes")
+        if any(marker in folded for marker in _CAS_REJECTIONS):
+            return False
+        raise PublicationUncertain(
+            f"remote resolution fencing outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
+        )
+
+    def _atomic_resolve_publication(
+        self,
+        record: Mapping[str, object],
+        *,
+        observation: Mapping[str, str | None],
+        claim_oid: str,
+    ) -> bool:
+        queue_ref = str(record["queue_ref"])
+        handoff_ref = str(record["article_handoff_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        article_ref = str(record["article_claim_ref"])
+        claim_ref = str(record["claim_ref"])
+        target_ref = str(record["target_ref"])
+        resolution_oid = str(record["resolution_oid"])
+        target = observation["target"]
+        article = observation["article"]
+        self._fetch_exact_ref(
+            claim_ref,
+            claim_oid,
+            owner=str(record["queue_item_id"]),
+        )
+        updates = [
+            f":{queue_ref}",
+            f":{handoff_ref}",
+            f":{resolution_ref}",
+            f":{claim_ref}",
+            f"{target}:{target_ref}" if target is not None else f":{target_ref}",
+            f"{article}:{article_ref}" if article is not None else f":{article_ref}",
+        ]
+        leases = [
+            f"--force-with-lease={queue_ref}:{observation['queue'] or ''}",
+            f"--force-with-lease={handoff_ref}:{observation['handoff'] or ''}",
+            f"--force-with-lease={resolution_ref}:{resolution_oid}",
+            f"--force-with-lease={claim_ref}:{claim_oid}",
+            f"--force-with-lease={target_ref}:{target or ''}",
+            f"--force-with-lease={article_ref}:{article or ''}",
+        ]
+        proc = self._remote_git(
+            ["push", "--quiet", "--porcelain", "--atomic", *leases, self.remote_url, *updates],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        detail = f"{proc.stdout}\n{proc.stderr}".strip()
+        folded = detail.casefold()
+        if "does not support --atomic" in folded:
+            raise MergeQueueError("publication remote does not support atomic pushes")
+        if any(marker in folded for marker in _CAS_REJECTIONS):
+            return False
+        raise PublicationUncertain(
+            f"remote explicit resolution outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
+        )
+
     def _atomic_target_push(
         self,
         *,
         target_ref: str,
         queue_ref: str,
         article_handoff_ref: str,
+        resolution_ref: str,
+        resolution_oid: str,
         claim_ref: str,
         claim_oid: str,
         expected_target: str | None,
@@ -5260,11 +7007,13 @@ class RemoteMergeQueue:
                 "--atomic",
                 f"--force-with-lease={queue_ref}:{candidate}",
                 f"--force-with-lease={article_handoff_ref}:{candidate}",
+                f"--force-with-lease={resolution_ref}:{resolution_oid}",
                 f"--force-with-lease={target_ref}:{expected_target or ''}",
                 f"--force-with-lease={claim_ref}:{claim_oid}",
                 self.remote_url,
                 f":{queue_ref}",
                 f":{article_handoff_ref}",
+                f":{resolution_ref}",
                 f"{candidate}:{target_ref}",
                 f":{claim_ref}",
             ],
@@ -5282,6 +7031,61 @@ class RemoteMergeQueue:
             f"remote atomic CAS push outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
         )
 
+    def _pin_replay_resolution(
+        self,
+        record: Mapping[str, object],
+        intent: Mapping[str, object],
+    ) -> None:
+        target_ref = str(record["target_ref"])
+        queue_ref = str(record["queue_ref"])
+        handoff_ref = str(record["article_handoff_ref"])
+        article_ref = str(record["article_claim_ref"])
+        claim_ref = str(intent["claim_ref"])
+        resolution_ref = str(record["target_resolution_ref"])
+        candidate = str(record["candidate_oid"])
+        replay_target = str(intent["replay_target_oid"])
+        claim_oid = str(intent["claim_oid"])
+        prior_resolution = str(intent["prior_resolution_oid"])
+        replay_resolution = str(intent["resolution_oid"])
+        self._fetch_exact_ref(
+            claim_ref,
+            claim_oid,
+            owner=str(record["queue_item_id"]),
+        )
+        proc = self._remote_git(
+            [
+                "push",
+                "--quiet",
+                "--porcelain",
+                "--atomic",
+                f"--force-with-lease={queue_ref}:{candidate}",
+                f"--force-with-lease={handoff_ref}:{candidate}",
+                f"--force-with-lease={article_ref}:",
+                f"--force-with-lease={claim_ref}:{claim_oid}",
+                f"--force-with-lease={target_ref}:{replay_target}",
+                f"--force-with-lease={resolution_ref}:{prior_resolution}",
+                self.remote_url,
+                f"{candidate}:{queue_ref}",
+                f"{candidate}:{handoff_ref}",
+                f":{article_ref}",
+                f"{claim_oid}:{claim_ref}",
+                f"{replay_target}:{target_ref}",
+                f"{replay_resolution}:{resolution_ref}",
+            ],
+            check=False,
+        )
+        if proc.returncode == 0:
+            return
+        detail = f"{proc.stdout}\n{proc.stderr}".strip()
+        folded = detail.casefold()
+        if "does not support --atomic" in folded:
+            raise MergeQueueError("publication remote does not support atomic pushes")
+        if any(marker in folded for marker in _CAS_REJECTIONS):
+            raise MergeQueueBusy("stale replay resolution fence changed before it could be pinned")
+        raise PublicationUncertain(
+            f"remote replay pin outcome is uncertain: {_redact_remote(detail[:500], self.remote_url)}"
+        )
+
     def _atomic_replay_push(self, intent: Mapping[str, object]) -> bool:
         target_ref = str(intent["target_ref"])
         queue_ref = str(intent["queue_ref"])
@@ -5291,6 +7095,8 @@ class RemoteMergeQueue:
         replay_target = str(intent["replay_target_oid"])
         replay_candidate = str(intent["replay_candidate_oid"])
         claim_oid = str(intent["claim_oid"])
+        resolution_ref = str(intent["target_resolution_ref"])
+        resolution_oid = str(intent["resolution_oid"])
         proc = self._remote_git(
             [
                 "push",
@@ -5301,11 +7107,13 @@ class RemoteMergeQueue:
                 f"--force-with-lease={handoff_ref}:{old_candidate}",
                 f"--force-with-lease={target_ref}:{replay_target}",
                 f"--force-with-lease={claim_ref}:{claim_oid}",
+                f"--force-with-lease={resolution_ref}:{resolution_oid}",
                 self.remote_url,
                 f":{queue_ref}",
                 f":{handoff_ref}",
                 f"{replay_candidate}:{target_ref}",
                 f":{claim_ref}",
+                f":{resolution_ref}",
             ],
             check=False,
         )
@@ -5327,16 +7135,13 @@ class RemoteMergeQueue:
         *,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        self.repository._verify_repository()
         self._verify_state()
-        self._verify_remote()
-        self._verify_transport()
         command_args = args
         pass_fds: tuple[int, ...] = ()
         if self._remote_descriptor is not None:
-            if not args or args[0] not in {"ls-remote", "push"}:
+            if not args or args[0] not in {"fetch", "ls-remote", "push"}:
                 raise MergeQueueError("unsupported local publication transport operation")
-            mode = "upload" if args[0] == "ls-remote" else "receive"
+            mode = "upload" if args[0] in {"fetch", "ls-remote"} else "receive"
             option = "--upload-pack" if mode == "upload" else "--receive-pack"
             helper = shlex.join(
                 (
@@ -5352,7 +7157,7 @@ class RemoteMergeQueue:
             command_args.insert(1, f"{option}={helper}")
             pass_fds = (self._remote_descriptor,)
         environment = _git_environment()
-        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(self.repository.common_git_dir / "objects")
+        environment.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
         try:
             proc = subprocess.run(
                 _git_command(command_args),
@@ -5368,10 +7173,7 @@ class RemoteMergeQueue:
                 raise PublicationUncertain(f"remote Git push outcome is uncertain: {error}") from error
             raise MergeQueueError(f"remote Git operation failed: {error}") from error
         try:
-            self.repository._verify_repository()
             self._verify_state()
-            self._verify_remote()
-            self._verify_transport()
         except RepositoryError as error:
             if args and args[0] == "push":
                 raise PublicationUncertain(
@@ -5646,13 +7448,22 @@ class RemoteMergeQueue:
         ):
             if _canonical_existing_directory(path) != path or _directory_identity(path) != expected:
                 raise PublicationUncertain(f"{label} was replaced")
+        self.repository._verify_repository()
+        self._verify_remote()
+        self._verify_transport()
 
 
 def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
     history = record.get("history")
     replay_intents = record.get("replay_intents")
     replay_events = record.get("replay_events")
-    if not isinstance(history, list) or not isinstance(replay_intents, list) or not isinstance(replay_events, list):
+    resolution_intents = record.get("resolution_intents")
+    if (
+        not isinstance(history, list)
+        or not isinstance(replay_intents, list)
+        or not isinstance(replay_events, list)
+        or not isinstance(resolution_intents, list)
+    ):
         raise PublicationUncertain("publication journal history is malformed")
     return PublicationReceipt(
         queue_item_id=str(record["queue_item_id"]),
@@ -5686,6 +7497,14 @@ def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
             if record.get("observed_article_handoff_oid") is not None
             else None
         ),
+        target_resolution_ref=str(record["target_resolution_ref"]),
+        initial_resolution_oid=str(record["initial_resolution_oid"]),
+        resolution_oid=str(record["resolution_oid"]),
+        observed_resolution_oid=(
+            str(record["observed_resolution_oid"])
+            if record.get("observed_resolution_oid") is not None
+            else None
+        ),
         claim_key=str(record["claim_key"]),
         claim_ref=str(record["claim_ref"]),
         claim_oid=(str(record["claim_oid"]) if record.get("claim_oid") is not None else None),
@@ -5697,6 +7516,9 @@ def _publication_receipt(record: Mapping[str, object]) -> PublicationReceipt:
         history=tuple(dict(item) for item in history if isinstance(item, dict)),
         replay_intents=tuple(dict(item) for item in replay_intents if isinstance(item, dict)),
         replay_events=tuple(dict(item) for item in replay_events if isinstance(item, dict)),
+        resolution_intents=tuple(
+            dict(item) for item in resolution_intents if isinstance(item, dict)
+        ),
     )
 
 
@@ -5712,15 +7534,65 @@ def _transition_journal(
     history = record.setdefault("history", [])
     if not isinstance(history, list):
         raise PublicationUncertain("publication journal history is malformed")
-    entry = {"status": status, "detail": str(detail), "created_ns": now}
+    detail_text = _bounded_publication_detail(detail)
+    entry = {"status": status, "detail": detail_text, "created_ns": now}
+    terminal = status in {"integrated", "aborted", "uncertain"}
+    if not terminal and len(history) >= _MAX_PUBLICATION_HISTORY - 1:
+        status = "uncertain"
+        detail_text = "publication history limit reached; manual reconciliation is required"
+        entry = {"status": status, "detail": detail_text, "created_ns": now}
+        terminal = True
+    if len(history) >= _MAX_PUBLICATION_HISTORY:
+        raise PublicationUncertain("publication journal has no reserved terminal history slot")
     if not history or history[-1] != entry:
         history.append(entry)
     record["status"] = status
-    record["detail"] = str(detail)
+    record["detail"] = detail_text
     record["updated_ns"] = now
-    _write_json_file(journal, record)
+    if not terminal and _publication_journal_size(record) > (
+        _MAX_PUBLICATION_BYTES - _PUBLICATION_TERMINAL_RESERVE_BYTES
+    ):
+        history.pop()
+        status = "uncertain"
+        detail_text = "publication evidence byte limit reached; manual reconciliation is required"
+        history.append({"status": status, "detail": detail_text, "created_ns": now})
+        record["status"] = status
+        record["detail"] = detail_text
+        terminal = True
+    _write_publication_journal(journal, record, reserve_terminal=not terminal)
     _checkpoint(f"publication-recorded:{status}")
     return record
+
+
+def _bounded_publication_detail(detail: object) -> str:
+    value = str(detail)
+    encoded = value.encode("utf-8")
+    if len(encoded) <= _MAX_PUBLICATION_DETAIL_BYTES:
+        return value
+    suffix = " [truncated]"
+    budget = _MAX_PUBLICATION_DETAIL_BYTES - len(suffix.encode())
+    return encoded[:budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _publication_journal_size(value: Mapping[str, object]) -> int:
+    return len(_json_bytes(value)) + 1
+
+
+def _write_publication_journal(
+    path: Path,
+    value: Mapping[str, object],
+    *,
+    reserve_terminal: bool | None = None,
+) -> None:
+    if reserve_terminal is None:
+        reserve_terminal = value.get("status") not in {"integrated", "aborted", "uncertain"}
+    maximum = _MAX_PUBLICATION_BYTES
+    if reserve_terminal:
+        maximum -= _PUBLICATION_TERMINAL_RESERVE_BYTES
+    content = _json_bytes(value) + b"\n"
+    if len(content) > maximum:
+        raise PublicationUncertain("publication journal exceeds its serialized evidence bound")
+    _write_bytes_file(path, content)
 
 
 def _merge_claim_key(target_ref: str) -> str:

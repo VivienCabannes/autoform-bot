@@ -17,7 +17,7 @@ import pytest
 
 import autoform_worker
 import autoform_worker.repository as repository_module
-from autoform_cli.claims import ClaimFence, claim_handoff_ref
+from autoform_cli.claims import ClaimFence, claim_handoff_ref, target_resolution_ref
 from autoform_worker.ledger import RunLedger
 from autoform_worker.repository import (
     AttemptWorktrees,
@@ -51,11 +51,24 @@ class _FencedTestClaimBoard:
     def _remote_oid(self, key: str) -> str | None:
         return _git("for-each-ref", "--format=%(objectname)", self._ref(key), cwd=self.remote) or None
 
-    def acquire(self, key: str, ttl: int | float = 60, steal: bool = False, note: str = "") -> bool:
+    def acquire(
+        self,
+        key: str,
+        ttl: int | float = 60,
+        steal: bool = False,
+        note: str = "",
+        *,
+        expected_resolution_oid: str | None = None,
+    ) -> bool:
         handoff_ref = claim_handoff_ref(key) if key.startswith("author/") else None
+        resolution_ref = target_resolution_ref(key) if key.startswith("merge/") else None
         if handoff_ref is not None and _git(
             "for-each-ref", "--format=%(objectname)", handoff_ref, cwd=self.remote
         ):
+            return False
+        if resolution_ref is not None and (
+            _git("for-each-ref", "--format=%(objectname)", resolution_ref, cwd=self.remote) or None
+        ) != expected_resolution_oid:
             return False
         old = self._remote_oid(key)
         if old is not None and old != self._owned_oids.get(key) and not steal:
@@ -71,6 +84,14 @@ class _FencedTestClaimBoard:
         if handoff_ref is not None and _git(
             "for-each-ref", "--format=%(objectname)", handoff_ref, cwd=self.remote
         ):
+            if old is None:
+                _git("update-ref", "-d", self._ref(key), new, cwd=self.remote)
+            else:
+                _git("update-ref", self._ref(key), old, new, cwd=self.remote)
+            return False
+        if resolution_ref is not None and (
+            _git("for-each-ref", "--format=%(objectname)", resolution_ref, cwd=self.remote) or None
+        ) != expected_resolution_oid:
             if old is None:
                 _git("update-ref", "-d", self._ref(key), new, cwd=self.remote)
             else:
@@ -127,6 +148,80 @@ class _FencedTestClaimBoard:
             return False
         self._owned_oids.pop(key, None)
         self._lease_ids.pop(key, None)
+        return True
+
+    def install_recovery_block(
+        self,
+        key: str,
+        *,
+        expected_oid: str,
+        queue_item_id: str,
+        target_resolution_ref: str,
+        resolution_oid: str,
+    ) -> str | None:
+        if self._remote_oid(key) != expected_oid or self._owned_oids.get(key) != expected_oid:
+            return None
+        token = self.scratch / "recovery-block"
+        token.write_text(
+            json.dumps(
+                {
+                    "key": key,
+                    "queue_item_id": queue_item_id,
+                    "target_resolution_ref": target_resolution_ref,
+                    "resolution_oid": resolution_oid,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        blocked = _git("hash-object", "-w", str(token), cwd=self.remote)
+        try:
+            _git("update-ref", self._ref(key), blocked, expected_oid, cwd=self.remote)
+        except subprocess.CalledProcessError:
+            return None
+        self._owned_oids.pop(key, None)
+        self._lease_ids.pop(key, None)
+        return blocked
+
+    def adopt_recovery_block(
+        self,
+        key: str,
+        *,
+        queue_item_id: str,
+        target_resolution_ref: str,
+        resolution_oid: str,
+        ttl: int | float = 60,
+        note: str = "",
+    ) -> bool:
+        old = self._remote_oid(key)
+        if old is None:
+            return False
+        try:
+            raw = _git("cat-file", "-p", old, cwd=self.remote)
+            message = raw.partition("\n\n")[2] if raw.startswith("tree ") else raw
+            block = json.loads(message)
+        except (json.JSONDecodeError, subprocess.CalledProcessError):
+            return False
+        expected = {
+            "resource": key,
+            "queue_item_id": queue_item_id,
+            "target_resolution_ref": target_resolution_ref,
+            "resolution_oid": resolution_oid,
+        }
+        if any(block.get(field) != value for field, value in expected.items()):
+            return False
+        if (_git("for-each-ref", "--format=%(objectname)", target_resolution_ref, cwd=self.remote) or None) != resolution_oid:
+            return False
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        token = self.scratch / "claim-token"
+        token.write_bytes(os.urandom(32))
+        new = _git("hash-object", "-w", str(token), cwd=self.remote)
+        try:
+            _git("update-ref", self._ref(key), new, old, cwd=self.remote)
+        except subprocess.CalledProcessError:
+            return False
+        self._owned_oids[key] = new
+        self._lease_ids[key] = os.urandom(32).hex()
         return True
 
     def heartbeat(self, key: str, *, interval: float = 300, ttl: int | float = 600) -> _StaticHeartbeat:
@@ -4470,7 +4565,14 @@ def test_recovery_without_recorded_merge_fence_rejects_live_merge_claim(
 
     merge_key = repository_module._merge_claim_key("refs/heads/main")
     other_publisher = _FencedTestClaimBoard(remote, "worker-b", tmp_path / "other-claims")
-    assert other_publisher.acquire(merge_key, ttl=600)
+    record = queue._read_journal(
+        tmp_path / "queue-state/publications/queue-1/publication.json"
+    )
+    assert other_publisher.acquire(
+        merge_key,
+        ttl=600,
+        expected_resolution_oid=str(record["resolution_oid"]),
+    )
     _git("update-ref", "refs/heads/main", candidate, base, cwd=remote)
     _git("update-ref", "-d", arguments["queue_ref"], candidate, cwd=remote)
     _git(
@@ -4506,7 +4608,12 @@ def test_claim_steal_before_atomic_publication_cannot_advance_target(
     original_push = queue._atomic_target_push
 
     def steal_then_push(**arguments: object) -> bool:
-        assert thief.acquire(claim_key, ttl=600, steal=True)
+        assert thief.acquire(
+            claim_key,
+            ttl=600,
+            steal=True,
+            expected_resolution_oid=str(arguments["resolution_oid"]),
+        )
         return original_push(**arguments)  # type: ignore[arg-type]
 
     monkeypatch.setattr(queue, "_atomic_target_push", steal_then_push)
@@ -4620,6 +4727,83 @@ def test_local_remote_replacement_is_rejected_before_any_ref_mutation(
     assert _git("for-each-ref", "--format=%(refname)", cwd=remote) == ""
 
 
+def test_remote_git_verifies_bound_state_once_before_and_after(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    original = queue._verify_state
+    calls = 0
+
+    def counted_verify_state() -> None:
+        nonlocal calls
+        calls += 1
+        original()
+
+    monkeypatch.setattr(queue, "_verify_state", counted_verify_state)
+    queue._remote_git(["ls-remote", queue.remote_url, "refs/heads/main"])
+    assert calls == 2
+
+
+def test_local_git_verifies_bound_state_once_before_and_after(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, _ = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    original = queue._verify_state
+    calls = 0
+
+    def counted_verify_state() -> None:
+        nonlocal calls
+        calls += 1
+        original()
+
+    monkeypatch.setattr(queue, "_verify_state", counted_verify_state)
+    queue._run_local_git_bytes(["hash-object", "-t", "blob", "--stdin"], input_bytes=b"bound")
+    assert calls == 2
+
+
+def test_batched_remote_ref_observation_rejects_invalid_results(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    requested = ("refs/heads/main", "refs/autoform/queue/missing")
+
+    def set_response(stdout: str) -> None:
+        monkeypatch.setattr(
+            queue,
+            "_remote_git",
+            lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout, ""),
+        )
+
+    for stdout in (
+        "malformed\n",
+        f"{base}\trefs/heads/main\n{base}\trefs/heads/main\n",
+        f"{base}\trefs/heads/unrequested\n",
+    ):
+        set_response(stdout)
+        with pytest.raises(PublicationUncertain, match="invalid results"):
+            queue._remote_oids(requested)
+
+    set_response(f"{base}\trefs/heads/main\n")
+    assert queue._remote_oids(requested) == {
+        "refs/heads/main": base,
+        "refs/autoform/queue/missing": None,
+    }
+    with pytest.raises(MergeQueueError, match="duplicate requests"):
+        queue._remote_oids((requested[0], requested[0]))
+
+
 def test_local_remote_replacement_across_restart_is_rejected(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
@@ -4720,7 +4904,7 @@ def test_publication_does_not_adopt_a_foreign_empty_directory(
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
 
 
-def test_claim_is_released_when_fencing_receipt_lookup_fails(
+def test_article_fence_receipt_lookup_fails_before_merge_claim_acquisition(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
 ) -> None:
@@ -4736,9 +4920,11 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
 
     class FailingReceiptBoard:
         repo_url = str(remote)
+        acquired = False
         released = False
 
         def acquire(self, *_args: object, **_kwargs: object) -> bool:
+            self.acquired = True
             return True
 
         def holds(self, _key: str) -> bool:
@@ -4790,7 +4976,8 @@ def test_claim_is_released_when_fencing_receipt_lookup_fails(
             candidate_oid=candidate,
             article_claim=article_claim,
         )
-    assert board.released
+    assert not board.acquired
+    assert not board.released
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == base
 
 
@@ -5010,7 +5197,7 @@ def test_stale_replay_restart_retries_exact_prepush_state_without_local_claim_me
     "changed_ref",
     ("queue-collision", "handoff-collision", "queue-delete", "handoff-delete"),
 )
-def test_stale_replay_ref_collision_fails_closed(
+def test_stale_replay_ref_collision_fails_closed_or_deleted_barrier_is_repaired(
     tmp_path: Path,
     git_repository: tuple[Path, Path, Path, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -5042,7 +5229,9 @@ def test_stale_replay_ref_collision_fails_closed(
             changed = True
 
     monkeypatch.setattr(repository_module, "_checkpoint", collide)
-    with pytest.raises(PublicationUncertain, match="collision|split"):
+    expected_error = MergeQueueBusy if changed_ref.endswith("-delete") else PublicationUncertain
+    expected_detail = "retry" if changed_ref.endswith("-delete") else "collision|split"
+    with pytest.raises(expected_error, match=expected_detail):
         queue.replay_stale(
             "queue-1",
             **arguments,  # type: ignore[arg-type]
@@ -5050,7 +5239,10 @@ def test_stale_replay_ref_collision_fails_closed(
             replay_candidate_oid=replay,
         )
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == moved
-    assert queue.recover("queue-1", **arguments).status == "uncertain"  # type: ignore[arg-type]
+    expected_status = "stale" if changed_ref.endswith("-delete") else "uncertain"
+    assert queue.recover("queue-1", **arguments).status == expected_status  # type: ignore[arg-type]
+    if changed_ref.endswith("-delete"):
+        assert _git("rev-parse", ref, cwd=remote) == arguments["candidate_oid"]
 
 
 def test_stale_replay_merge_claim_steal_cannot_advance_target(
@@ -5071,7 +5263,13 @@ def test_stale_replay_merge_claim_steal_cannot_advance_target(
     original_push = queue._atomic_replay_push
 
     def steal_then_push(intent: object) -> bool:
-        assert thief.acquire(claim_key, ttl=600, steal=True)
+        assert isinstance(intent, dict)
+        assert thief.acquire(
+            claim_key,
+            ttl=600,
+            steal=True,
+            expected_resolution_oid=str(intent["resolution_oid"]),
+        )
         return original_push(intent)  # type: ignore[arg-type]
 
     monkeypatch.setattr(queue, "_atomic_replay_push", steal_then_push)
@@ -5236,6 +5434,10 @@ def test_stale_replay_rejects_overlapping_same_file_conflict(
         content="source replacement\n",
     )
     queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    queue._import_commits(
+        (("expected", base), ("candidate", candidate), ("replay-target", moved), ("replay", replay)),
+        owner="verify-replay",
+    )
 
     with pytest.raises(MergeQueueError, match="exact original tree delta"):
         queue._verify_replay_candidate(
@@ -5282,6 +5484,10 @@ def test_stale_replay_verifies_mode_delete_and_add_delta(
     _git("commit", "--quiet", "-m", "replay candidate", cwd=replay_tree)
     replay = manager.candidate_oid("replay-run", "replay-candidate")
     queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    queue._import_commits(
+        (("expected", base), ("candidate", candidate), ("replay-target", moved), ("replay", replay)),
+        owner="verify-replay",
+    )
 
     delta_sha256, verified_tree = queue._verify_replay_candidate(
         expected_target_oid=base,
@@ -5329,6 +5535,15 @@ def test_stale_replay_verifies_binary_delta(
     _git("commit", "--quiet", "-m", "binary replay", cwd=replay_tree)
     replay = manager.candidate_oid("replay-run", "replay-candidate")
     queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    queue._import_commits(
+        (
+            ("expected", binary_base),
+            ("candidate", candidate),
+            ("replay-target", moved),
+            ("replay", replay),
+        ),
+        owner="verify-replay",
+    )
 
     _, verified_tree = queue._verify_replay_candidate(
         expected_target_oid=binary_base,
@@ -5374,6 +5589,15 @@ def test_stale_replay_rejects_ambiguous_context_applied_to_wrong_location(
         content="header\nmarker\nrepeat\nmarker\nformalized\n",
     )
     queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    queue._import_commits(
+        (
+            ("expected", repeated),
+            ("candidate", candidate),
+            ("replay-target", moved),
+            ("replay", wrong_replay),
+        ),
+        owner="verify-replay",
+    )
 
     with pytest.raises(MergeQueueError, match="outside the exact original tree delta"):
         queue._verify_replay_candidate(
@@ -5463,6 +5687,7 @@ def test_stale_replay_intent_is_immutable_and_digest_bound(
     (
         "replay-intent-recording",
         "replay-intent-recorded",
+        "replay-resolution-pinned",
         "replay-push-attempted",
         "replay-pushed",
         "replay-observation-started",
@@ -5557,3 +5782,453 @@ def test_stale_replay_uses_real_claim_board_for_both_object_formats(
     assert receipt.status == "integrated"
     assert len(replay) == (40 if object_format == "sha1" else 64)
     assert _git("rev-parse", "refs/heads/main", cwd=remote) == replay
+
+
+def test_all_missing_queue_barriers_install_recoverable_permanent_fence(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+
+    def remove_all_barriers(name: str) -> None:
+        if name == "target-push-attempted":
+            claim_key = repository_module._merge_claim_key("refs/heads/main")
+            for ref in (
+                str(arguments["queue_ref"]),
+                claim_handoff_ref(article_claim.key),
+                target_resolution_ref(claim_key),
+            ):
+                _git("update-ref", "-d", ref, cwd=remote)
+
+    monkeypatch.setattr(repository_module, "_checkpoint", remove_all_barriers)
+    with pytest.raises(PublicationUncertain):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    claim_key = repository_module._merge_claim_key("refs/heads/main")
+    resolution_ref = target_resolution_ref(claim_key)
+    resolution_oid = _git("rev-parse", resolution_ref, cwd=remote)
+    competitor = _FencedTestClaimBoard(remote, "worker-b", tmp_path / "competitor")
+    assert not competitor.acquire(claim_key, expected_resolution_oid=resolution_oid)
+    receipt = queue.resolve("queue-1", **arguments, decision="abort")  # type: ignore[arg-type]
+    assert receipt.status == "aborted"
+    queue.close()
+    reopened = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    assert reopened.recover("queue-1", **arguments).status == "aborted"  # type: ignore[arg-type]
+
+
+def test_one_sided_handoff_split_is_restored_before_claim_cleanup(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+    removed = False
+
+    def split_handoff(name: str) -> None:
+        nonlocal removed
+        if name == "target-push-attempted" and not removed:
+            _git("update-ref", "-d", claim_handoff_ref(article_claim.key), cwd=remote)
+            removed = True
+
+    monkeypatch.setattr(repository_module, "_checkpoint", split_handoff)
+    with pytest.raises(MergeQueueError, match="restored exact"):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    assert _git("rev-parse", claim_handoff_ref(article_claim.key), cwd=remote) == candidate
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    assert queue.publish("queue-1", **arguments).status == "integrated"  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("decision", ("abort", "adopt"))
+def test_explicit_resolution_handles_durable_replay_intent(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path, remote, coordinator, base, monkeypatch
+    )
+
+    def interrupt_after_pin(name: str) -> None:
+        if name == "replay-resolution-pinned":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt_after_pin)
+    with pytest.raises(KeyboardInterrupt):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    if decision == "adopt":
+        _git("update-ref", "refs/heads/main", replay, moved, cwd=remote)
+
+    receipt = queue.resolve("queue-1", **arguments, decision=decision)  # type: ignore[arg-type]
+    assert receipt.status == ("aborted" if decision == "abort" else "integrated")
+    expected_target = moved if decision == "abort" else replay
+    assert _git("rev-parse", "refs/heads/main", cwd=remote) == expected_target
+
+
+@pytest.mark.parametrize("object_format", ("sha1", "sha256"))
+def test_prejournal_import_survives_source_cleanup_and_gc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    object_format: str,
+) -> None:
+    remote, _, coordinator, base = _git_repository_with_format(tmp_path, object_format)
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "publication-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    manager.cleanup("run-1", "candidate")
+    _git("reflog", "expire", "--expire=now", "--all", cwd=coordinator)
+    _git("gc", "--prune=now", cwd=coordinator)
+    assert subprocess.run(
+        ["git", "--git-dir", str(queue.transport_root), "fsck", "--full"],
+        capture_output=True,
+        check=False,
+    ).returncode == 0
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    receipt = queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    assert receipt.status == "integrated"
+    assert _git(
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/autoform-cache/",
+        cwd=queue.transport_root,
+    ) == ""
+
+
+@pytest.mark.parametrize("version", (2, 3, 4, 5))
+def test_integrated_legacy_journal_migrates_transactionally(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    version: int,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
+    }
+    assert queue.publish("queue-1", **arguments).status == "integrated"  # type: ignore[arg-type]
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    legacy = queue._read_journal(journal)
+    legacy["schema"] = f"autoform-merge-publication/v{version}"
+    for key in (
+        "initial_resolution_oid",
+        "resolution_oid",
+        "observed_resolution_oid",
+        "target_resolution_ref",
+        "resolution_intents",
+    ):
+        legacy.pop(key, None)
+    if version < 5:
+        legacy.pop("replay_intents", None)
+        legacy.pop("replay_events", None)
+    if version == 3:
+        legacy.pop("article_handoff_ref", None)
+    if version == 2:
+        for key in (
+            "article_claim_key",
+            "article_claim_ref",
+            "article_claim_oid",
+            "article_claim_lease_id",
+            "observed_article_claim_oid",
+            "article_handoff_ref",
+            "observed_article_handoff_oid",
+        ):
+            legacy.pop(key, None)
+    repository_module._write_json_file(journal, legacy)
+
+    if version == 2:
+        original = journal.read_bytes()
+        with pytest.raises(PublicationUncertain, match="explicit confirmation"):
+            queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+        assert journal.read_bytes() == original
+    receipt = queue.recover(
+        "queue-1",
+        **arguments,  # type: ignore[arg-type]
+        confirm_legacy_v2_article_binding=version == 2,
+    )
+    assert receipt.status == "integrated"
+    assert queue._read_journal(journal)["schema"] == repository_module._PUBLICATION_SCHEMA
+
+
+def test_nonterminal_journal_enforces_exact_terminal_byte_reserve(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "publication-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    record = queue._read_journal(journal)
+    record["padding"] = ""
+    maximum = (
+        repository_module._MAX_PUBLICATION_BYTES
+        - repository_module._PUBLICATION_TERMINAL_RESERVE_BYTES
+    )
+    padding = maximum - repository_module._publication_journal_size(record)
+    assert padding > 0
+    record["padding"] = "x" * padding
+    assert repository_module._publication_journal_size(record) == maximum
+    repository_module._write_json_file(journal, record)
+    assert queue.recover("queue-1", **arguments).status == "prepared"  # type: ignore[arg-type]
+
+    record = queue._read_journal(journal)
+    record["padding"] = str(record["padding"]) + "x"
+    repository_module._write_json_file(journal, record)
+    before_refs = _git("show-ref", cwd=remote)
+    with pytest.raises(PublicationUncertain, match="reserved terminal bytes"):
+        queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert _git("show-ref", cwd=remote) == before_refs
+
+
+@pytest.mark.parametrize("boundary", ("resolution-push-attempted", "resolution-pushed"))
+def test_explicit_abort_recovers_its_durable_decision_across_push_crash(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": _article_claim(queue),
+    }
+
+    def stop_before_publish(name: str) -> None:
+        if name == "claim-fence-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", stop_before_publish)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+
+    def interrupt_resolution(name: str) -> None:
+        if name == boundary:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt_resolution)
+    with pytest.raises(KeyboardInterrupt):
+        queue.resolve("queue-1", **arguments, decision="abort")  # type: ignore[arg-type]
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    if boundary == "resolution-push-attempted":
+        with pytest.raises(PublicationUncertain, match="pending explicit"):
+            queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+        with pytest.raises(PublicationUncertain, match="different action"):
+            queue.resolve("queue-1", **arguments, decision="adopt")  # type: ignore[arg-type]
+        receipt = queue.resolve("queue-1", **arguments, decision="abort")  # type: ignore[arg-type]
+    else:
+        receipt = queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert receipt.status == "aborted"
+
+
+@pytest.mark.parametrize("decision", ("abort", "adopt"))
+def test_explicit_resolution_recovers_without_touching_successor_refs(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager, run_id="run-1", attempt_id="candidate", base=base, content="candidate\n"
+    )
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+    article_claim = _article_claim(queue)
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+
+    def stop_before_publish(name: str) -> None:
+        if name == "claim-fence-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", stop_before_publish)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    if decision == "adopt":
+        _git("update-ref", "refs/heads/main", candidate, base, cwd=remote)
+    successor = _candidate(
+        manager,
+        run_id="run-2",
+        attempt_id="candidate",
+        base=candidate if decision == "adopt" else base,
+        content="successor\n",
+    )
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    record = queue._read_journal(journal)
+    successor_refs = (
+        str(record["queue_ref"]),
+        str(record["article_handoff_ref"]),
+        str(record["claim_ref"]),
+        str(record["target_resolution_ref"]),
+        str(record["article_claim_ref"]),
+    )
+
+    def replace_with_successor(name: str) -> None:
+        if name != "resolution-pushed":
+            return
+        _git(
+            "push",
+            "--force",
+            str(remote),
+            *(f"{successor}:{ref}" for ref in successor_refs),
+            cwd=coordinator,
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", replace_with_successor)
+    with pytest.raises(KeyboardInterrupt):
+        queue.resolve("queue-1", **arguments, decision=decision)  # type: ignore[arg-type]
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    receipt = queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert receipt.status == ("aborted" if decision == "abort" else "integrated")
+    for ref in successor_refs:
+        assert _git("rev-parse", ref, cwd=remote) == successor
+
+
+def test_malformed_v5_replay_migration_does_not_mutate_journal(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    _, queue, arguments, moved, replay = _stale_replay_case(
+        tmp_path, remote, coordinator, base, monkeypatch
+    )
+
+    def interrupt(name: str) -> None:
+        if name == "replay-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.replay_stale(
+            "queue-1",
+            **arguments,  # type: ignore[arg-type]
+            replay_target_oid=moved,
+            replay_candidate_oid=replay,
+        )
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+    journal = tmp_path / "queue-state/publications/queue-1/publication.json"
+    legacy = queue._read_journal(journal)
+    legacy["schema"] = "autoform-merge-publication/v5"
+    legacy.pop("initial_resolution_oid")
+    legacy.pop("resolution_oid")
+    legacy.pop("observed_resolution_oid")
+    legacy.pop("target_resolution_ref")
+    legacy.pop("resolution_intents")
+    intents = legacy["replay_intents"]
+    events = legacy["replay_events"]
+    assert isinstance(intents, list) and isinstance(intents[0], dict)
+    old = intents[0]
+    for key in ("prior_resolution_oid", "resolution_oid", "target_resolution_ref"):
+        old.pop(key)
+    old_body = {key: value for key, value in old.items() if key != "replay_id"}
+    old_id = hashlib.sha256(repository_module._json_bytes(old_body)).hexdigest()
+    prior_id = str(old["replay_id"])
+    old["replay_id"] = old_id
+    assert isinstance(events, list)
+    for event in events:
+        if isinstance(event, dict) and event.get("replay_id") == prior_id:
+            event["replay_id"] = old_id
+    old["source_delta_sha256"] = "0" * 64
+    repository_module._write_json_file(journal, legacy)
+    original = journal.read_bytes()
+
+    with pytest.raises(PublicationUncertain, match="v5.*digest"):
+        queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert journal.read_bytes() == original

@@ -31,9 +31,12 @@ from urllib.request import url2pathname
 CLAIM_REF_PREFIX = "refs/autoform-claims/"
 CLAIM_RECEIPT_REF_PREFIX = "refs/autoform-claim-receipts/"
 CLAIM_HANDOFF_REF_PREFIX = "refs/autoform-claim-handoffs/"
+TARGET_RESOLUTION_REF_PREFIX = "refs/autoform-target-resolutions/"
 CLAIM_SCHEMA = "autoform-claim/v2"
 LEGACY_CLAIM_SCHEMA = "autoform-claim/v1"
 LEGACY_BLOCK_SCHEMA = "autoform-claim/legacy-block/v1"
+RECOVERY_BLOCK_SCHEMA = "autoform-claim/recovery-block/v1"
+_PERMANENT_BLOCK_SCHEMAS = frozenset({LEGACY_BLOCK_SCHEMA, RECOVERY_BLOCK_SCHEMA})
 CLAIM_TTL_S = 1500
 CLAIM_HEARTBEAT_S = 300
 CLAIM_MAX_TTL_S = 3600
@@ -129,6 +132,8 @@ class ClaimFence:
             raise ValueError("claim fence ref does not match its key")
         if not isinstance(self.oid, str) or OBJECT_ID_RE.fullmatch(self.oid) is None:
             raise ValueError("claim fence OID must be a full Git object ID")
+        if set(self.oid) == {"0"}:
+            raise ValueError("claim fence OID must identify an object")
         if not isinstance(self.lease_id, str) or LEASE_ID_RE.fullmatch(self.lease_id) is None:
             raise ValueError("claim fence lease_id must be 64 lowercase hexadecimal characters")
 
@@ -331,6 +336,14 @@ def claim_handoff_ref(key: str) -> str:
     if not key.startswith("author/"):
         raise ValueError("only author claims have queue handoff refs")
     return CLAIM_HANDOFF_REF_PREFIX + hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def target_resolution_ref(key: str) -> str:
+    """Return the permanent resolution fence paired with one merge claim."""
+    key = _validate_key(key)
+    if not key.startswith("merge/"):
+        raise ValueError("only merge claims have target resolution refs")
+    return TARGET_RESOLUTION_REF_PREFIX + key.removeprefix("merge/")
 
 
 def resource_claim_key(resource: str) -> str:
@@ -969,6 +982,8 @@ class ClaimBoard:
             raise MalformedLeaseError(f"claim {key!r} has invalid lease JSON") from exc
         if not isinstance(lease, dict) or not self._lease_is_valid(lease, key):
             raise MalformedLeaseError(f"claim {key!r} has an invalid lease schema")
+        if lease.get("schema") == RECOVERY_BLOCK_SCHEMA:
+            self._verify_object_id_format(str(lease["resolution_oid"]))
         return lease
 
     @staticmethod
@@ -978,6 +993,19 @@ class ClaimBoard:
                 isinstance(lease.get("resource"), str)
                 and _is_finite_number(lease.get("blocked_at"))
                 and isinstance(lease.get("canonical_resource"), str)
+                and (key is None or lease.get("resource") == key)
+            )
+        if lease.get("schema") == RECOVERY_BLOCK_SCHEMA:
+            return bool(
+                isinstance(lease.get("resource"), str)
+                and _is_finite_number(lease.get("blocked_at"))
+                and isinstance(lease.get("queue_item_id"), str)
+                and bool(lease.get("queue_item_id"))
+                and isinstance(lease.get("target_resolution_ref"), str)
+                and str(lease.get("target_resolution_ref")).startswith("refs/autoform-target-resolutions/")
+                and isinstance(lease.get("resolution_oid"), str)
+                and OBJECT_ID_RE.fullmatch(str(lease.get("resolution_oid"))) is not None
+                and set(str(lease.get("resolution_oid"))) != {"0"}
                 and (key is None or lease.get("resource") == key)
             )
         acquired_at = lease.get("acquired_at")
@@ -1116,7 +1144,7 @@ class ClaimBoard:
         comparison_time = time.time() if now is None else now
         if not _is_finite_number(comparison_time):
             raise ValueError("claim expiry comparison clock must be finite")
-        if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+        if lease.get("schema") in _PERMANENT_BLOCK_SCHEMAS:
             return False
         expires_at = lease.get("expires_at")
         if not _is_finite_number(expires_at):
@@ -1129,7 +1157,7 @@ class ClaimBoard:
         comparison_time = time.time() if now is None else now
         if not _is_finite_number(comparison_time):
             raise ValueError("claim expiry comparison clock must be finite")
-        if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+        if lease.get("schema") in _PERMANENT_BLOCK_SCHEMAS:
             return False
         expires_at = lease.get("expires_at")
         if not _is_finite_number(expires_at):
@@ -1142,7 +1170,7 @@ class ClaimBoard:
         comparison_time = time.time() if now is None else now
         if not _is_finite_number(comparison_time):
             raise ValueError("claim recovery comparison clock must be finite")
-        if lease.get("schema") == LEGACY_BLOCK_SCHEMA:
+        if lease.get("schema") in _PERMANENT_BLOCK_SCHEMAS:
             return False
         acquired_at = lease.get("acquired_at")
         renewed_at = lease.get("renewed_at", acquired_at)
@@ -1179,6 +1207,55 @@ class ClaimBoard:
                 return False
         new = self._make_legacy_block_commit(key, canonical_key)
         return self._cas_push(key, old, new)
+
+    def adopt_recovery_block(
+        self,
+        key: str,
+        *,
+        queue_item_id: str,
+        target_resolution_ref: str,
+        resolution_oid: str,
+        ttl: int | float = CLAIM_TTL_S,
+        note: str = "",
+    ) -> bool:
+        """Exact-CAS a matching permanent recovery block back into an owned lease."""
+
+        key = _validate_key(key)
+        _validate_ttl(ttl)
+        if not key.startswith("merge/") or target_resolution_ref != (
+            TARGET_RESOLUTION_REF_PREFIX + key.removeprefix("merge/")
+        ):
+            raise ValueError("recovery block target resolution ref does not match its merge key")
+        if OBJECT_ID_RE.fullmatch(resolution_oid) is None or set(resolution_oid) == {"0"}:
+            raise ValueError("recovery block resolution OID must identify an object")
+        self._verify_object_id_format(resolution_oid)
+        self._ensure_scratch()
+        old = self._remote_oid(key)
+        if old is None:
+            return False
+        block = self._read_lease(key, old)
+        expected = {
+            "schema": RECOVERY_BLOCK_SCHEMA,
+            "resource": key,
+            "queue_item_id": queue_item_id,
+            "target_resolution_ref": target_resolution_ref,
+            "resolution_oid": resolution_oid,
+        }
+        if any(block.get(field) != value for field, value in expected.items()):
+            return False
+        if self._remote_ref_oid(target_resolution_ref) != resolution_oid:
+            return False
+        new = self._make_lease_commit(key, ttl, note)
+        if not self._cas_push(key, old, new):
+            return False
+        if self._remote_ref_oid(target_resolution_ref) != resolution_oid:
+            if not self._cas_push(key, new, old):
+                raise ClaimTransportError(
+                    "target resolution changed while a recovery block was adopted, and rollback failed"
+                )
+            return False
+        self._record_receipt(key, new, expected=None)
+        return True
 
     def prepare_v2_claim(
         self,
@@ -1256,13 +1333,30 @@ class ClaimBoard:
                 return True
         return False
 
-    def acquire(self, key: str, ttl: int | float = CLAIM_TTL_S, steal: bool = False, note: str = "") -> bool:
+    def acquire(
+        self,
+        key: str,
+        ttl: int | float = CLAIM_TTL_S,
+        steal: bool = False,
+        note: str = "",
+        *,
+        expected_resolution_oid: str | None = None,
+    ) -> bool:
         """CAS-acquire a free or expired lease, or refresh this exact session's lease."""
         key = _validate_key(key)
         _validate_ttl(ttl)
         self._ensure_scratch()
         handoff_ref = claim_handoff_ref(key) if key.startswith("author/") else None
+        resolution_ref = target_resolution_ref(key) if key.startswith("merge/") else None
+        if expected_resolution_oid is not None and resolution_ref is None:
+            raise ValueError("expected resolution OID is only valid for merge claims")
+        if expected_resolution_oid is not None:
+            if OBJECT_ID_RE.fullmatch(expected_resolution_oid) is None or set(expected_resolution_oid) == {"0"}:
+                raise ValueError("expected resolution OID must identify a Git object")
+            self._verify_object_id_format(expected_resolution_oid)
         if handoff_ref is not None and self._remote_ref_oid(handoff_ref) is not None:
+            return False
+        if resolution_ref is not None and self._remote_ref_oid(resolution_ref) != expected_resolution_oid:
             return False
         if self._legacy_author_claim_blocks_v2(key):
             return False
@@ -1273,7 +1367,7 @@ class ClaimBoard:
         previous_expires_at: int | float | None = None
         if old is not None:
             lease = self._read_lease(key, old)
-            if lease.get("schema") == LEGACY_BLOCK_SCHEMA or self.recovery_required(lease):
+            if lease.get("schema") in _PERMANENT_BLOCK_SCHEMAS or self.recovery_required(lease):
                 return False
             if not self.expired(lease):
                 if lease.get("schema") == LEGACY_CLAIM_SCHEMA:
@@ -1302,6 +1396,13 @@ class ClaimBoard:
             if not self._cas_push(key, new, old or ""):
                 raise ClaimTransportError(
                     "an author queue handoff appeared while its claim was acquired, and "
+                    "the claim could not be rolled back"
+                )
+            return False
+        if resolution_ref is not None and self._remote_ref_oid(resolution_ref) != expected_resolution_oid:
+            if not self._cas_push(key, new, old or ""):
+                raise ClaimTransportError(
+                    "a target resolution fence changed while its merge claim was acquired, and "
                     "the claim could not be rolled back"
                 )
             return False
@@ -1615,18 +1716,23 @@ __all__ = [
     "CLAIM_REF_PREFIX",
     "CLAIM_SCHEMA",
     "CLAIM_TTL_S",
+    "CLAIM_HANDOFF_REF_PREFIX",
     "ClaimBoard",
     "ClaimFence",
     "ClaimTransportError",
     "Heartbeat",
     "LEGACY_CLAIM_SCHEMA",
     "LEGACY_BLOCK_SCHEMA",
+    "RECOVERY_BLOCK_SCHEMA",
     "LEASE_ID_RE",
     "MalformedLeaseError",
     "author_claim_key",
+    "claim_handoff_ref",
     "claim_repository_is_remote",
     "normalize_claim_repository",
     "pin_claim_repository",
     "pin_claim_scratch",
     "resource_claim_key",
+    "target_resolution_ref",
+    "TARGET_RESOLUTION_REF_PREFIX",
 ]

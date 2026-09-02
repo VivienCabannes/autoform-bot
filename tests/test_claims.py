@@ -136,6 +136,68 @@ def test_claim_fence_rejects_mismatched_or_malformed_fields() -> None:
         claims.ClaimFence("author/node", claims.CLAIM_REF_PREFIX + "author/node", "bad", "2" * 64)
     with pytest.raises(ValueError, match="lease_id"):
         claims.ClaimFence("author/node", claims.CLAIM_REF_PREFIX + "author/node", "1" * 40, "bad")
+    with pytest.raises(ValueError, match="identify an object"):
+        claims.ClaimFence(
+            "author/node",
+            claims.CLAIM_REF_PREFIX + "author/node",
+            "0" * 40,
+            "2" * 64,
+        )
+
+
+def test_resolution_expectation_is_rejected_for_non_merge_claim(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    with pytest.raises(ValueError, match="only valid for merge claims"):
+        board.acquire("author/node", expected_resolution_oid="1" * 40)
+
+
+def test_matching_recovery_block_can_be_adopted_but_foreign_queue_cannot(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    key = "merge/target"
+    resolution_ref = claims.target_resolution_ref(key)
+    tree = _git("mktree", cwd=board_repo, input_text="")
+    resolution = _git("commit-tree", tree, "-m", "resolution", cwd=board_repo)
+    block = {
+        "blocked_at": 1.0,
+        "queue_item_id": "queue-1",
+        "resolution_oid": resolution,
+        "resource": key,
+        "schema": claims.RECOVERY_BLOCK_SCHEMA,
+        "target_resolution_ref": resolution_ref,
+    }
+    blocked = _git(
+        "commit-tree",
+        tree,
+        "-p",
+        resolution,
+        "-m",
+        json.dumps(block, sort_keys=True, separators=(",", ":")),
+        cwd=board_repo,
+    )
+    _git("update-ref", resolution_ref, resolution, cwd=board_repo)
+    _git("update-ref", claims.CLAIM_REF_PREFIX + key, blocked, cwd=board_repo)
+    board = _board(tmp_path, board_repo, "worker-a")
+
+    assert not board.acquire(key, expected_resolution_oid=resolution)
+    assert not board.adopt_recovery_block(
+        key,
+        queue_item_id="queue-2",
+        target_resolution_ref=resolution_ref,
+        resolution_oid=resolution,
+    )
+    assert board.adopt_recovery_block(
+        key,
+        queue_item_id="queue-1",
+        target_resolution_ref=resolution_ref,
+        resolution_oid=resolution,
+    )
+    assert board.held_claim_fence(key) is not None
 
 
 def test_author_claim_handoff_ref_is_deterministic_and_namespaced() -> None:
