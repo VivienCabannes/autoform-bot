@@ -6629,15 +6629,32 @@ class RemoteMergeQueue:
             raise MergeQueueError("remote ref observation contains duplicate requests")
         observed: dict[str, str | None] = dict.fromkeys(requested)
         proc = self._remote_git(["ls-remote", self.remote_url, *requested])
-        lines = [line for line in proc.stdout.splitlines() if line]
+        if self.repository.object_format == "sha1":
+            oid_width = 40
+        elif self.repository.object_format == "sha256":
+            oid_width = 64
+        else:  # pragma: no cover - repository initialization owns this invariant
+            raise RepositoryError(f"unsupported Git object format: {self.repository.object_format}")
+        if proc.stdout == "":
+            lines: list[str] = []
+        elif "\r" in proc.stdout or not proc.stdout.endswith("\n"):
+            raise PublicationUncertain("remote returned invalid results for exact refs")
+        else:
+            lines = proc.stdout[:-1].split("\n")
+            if any(not line for line in lines):
+                raise PublicationUncertain("remote returned invalid results for exact refs")
         returned: set[str] = set()
         for line in lines:
-            oid, separator, observed_ref = line.partition("\t")
+            fields = line.split("\t")
+            if len(fields) != 2:
+                raise PublicationUncertain("remote returned invalid results for exact refs")
+            oid, observed_ref = fields
             if (
-                not separator
+                len(oid) != oid_width
+                or not _OID.fullmatch(oid)
+                or oid == "0" * oid_width
                 or observed_ref not in observed
                 or observed_ref in returned
-                or not _OID.fullmatch(oid)
             ):
                 raise PublicationUncertain("remote returned invalid results for exact refs")
             observed[observed_ref] = oid
@@ -7158,16 +7175,26 @@ class RemoteMergeQueue:
             pass_fds = (self._remote_descriptor,)
         environment = _git_environment()
         environment.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+        preserve_output_framing = bool(args and args[0] == "ls-remote")
         try:
-            proc = subprocess.run(
+            raw_proc = subprocess.run(
                 _git_command(command_args),
                 cwd=self.transport_root,
                 capture_output=True,
-                text=True,
+                text=not preserve_output_framing,
                 timeout=120,
                 env=environment,
                 pass_fds=pass_fds,
             )
+            if preserve_output_framing:
+                proc = subprocess.CompletedProcess(
+                    raw_proc.args,
+                    raw_proc.returncode,
+                    raw_proc.stdout.decode("utf-8", errors="replace"),
+                    raw_proc.stderr.decode("utf-8", errors="replace"),
+                )
+            else:
+                proc = raw_proc
         except (OSError, subprocess.TimeoutExpired) as error:
             if args and args[0] == "push":
                 raise PublicationUncertain(f"remote Git push outcome is uncertain: {error}") from error

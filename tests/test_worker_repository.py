@@ -4769,15 +4769,22 @@ def test_local_git_verifies_bound_state_once_before_and_after(
     assert calls == 2
 
 
-def test_batched_remote_ref_observation_rejects_invalid_results(
+@pytest.mark.parametrize(
+    ("object_format", "oid_width", "wrong_width"),
+    (("sha1", 40, 64), ("sha256", 64, 40)),
+)
+def test_batched_remote_ref_observation_requires_canonical_object_format_results(
     tmp_path: Path,
-    git_repository: tuple[Path, Path, Path, str],
     monkeypatch: pytest.MonkeyPatch,
+    object_format: str,
+    oid_width: int,
+    wrong_width: int,
 ) -> None:
-    remote, _, coordinator, base = git_repository
+    remote, _, coordinator, base = _git_repository_with_format(tmp_path, object_format)
     manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
     queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
     requested = ("refs/heads/main", "refs/autoform/queue/missing")
+    missing_oid = "1" * oid_width
 
     def set_response(stdout: str) -> None:
         monkeypatch.setattr(
@@ -4787,7 +4794,17 @@ def test_batched_remote_ref_observation_rejects_invalid_results(
         )
 
     for stdout in (
+        f"{'1' * wrong_width}\trefs/heads/main\n",
+        f"{'0' * oid_width}\trefs/heads/main\n",
+        "\n",
         "malformed\n",
+        f"\n{base}\trefs/heads/main\n",
+        f"{base}\trefs/heads/main\n\n{missing_oid}\t{requested[1]}\n",
+        f"{base}\trefs/heads/main\n\n",
+        f"{base}\trefs/heads/main\r\n",
+        f"{base}\trefs/heads/main",
+        f"{base}\trefs/heads/main\textra\n",
+        f"{base}\trefs/heads/main\nmalformed\n",
         f"{base}\trefs/heads/main\n{base}\trefs/heads/main\n",
         f"{base}\trefs/heads/unrequested\n",
     ):
@@ -4800,8 +4817,102 @@ def test_batched_remote_ref_observation_rejects_invalid_results(
         "refs/heads/main": base,
         "refs/autoform/queue/missing": None,
     }
+    set_response(
+        f"{missing_oid}\t{requested[1]}\n"
+        f"{base}\t{requested[0]}\n"
+    )
+    assert queue._remote_oids(requested) == {
+        "refs/heads/main": base,
+        "refs/autoform/queue/missing": missing_oid,
+    }
+    set_response("")
+    assert queue._remote_oids(requested) == dict.fromkeys(requested)
     with pytest.raises(MergeQueueError, match="duplicate requests"):
         queue._remote_oids((requested[0], requested[0]))
+
+
+def test_remote_ref_observation_preserves_crlf_for_rejection(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    queue = _queue(manager, remote, tmp_path / "queue-state", "worker-a")
+
+    def run(
+        command: list[str], **options: object
+    ) -> subprocess.CompletedProcess[bytes | str]:
+        raw_stdout = f"{base}\trefs/heads/main\r\n".encode()
+        if options.get("text"):
+            return subprocess.CompletedProcess(command, 0, raw_stdout.decode().replace("\r\n", "\n"), "")
+        return subprocess.CompletedProcess(command, 0, raw_stdout, b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(PublicationUncertain, match="invalid results"):
+        queue._remote_oid("refs/heads/main")
+
+
+def test_invalid_remote_oid_observation_does_not_poison_the_next_recovery(
+    tmp_path: Path,
+    git_repository: tuple[Path, Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, _, coordinator, base = git_repository
+    manager = AttemptWorktrees(coordinator, tmp_path / "attempt-state")
+    candidate = _candidate(
+        manager,
+        run_id="run-1",
+        attempt_id="attempt-1",
+        base=base,
+        content="candidate\n",
+    )
+    state = tmp_path / "queue-state"
+    queue = _queue(manager, remote, state, "worker-a")
+    article_claim = _article_claim(queue)
+    arguments = {
+        "target_ref": "refs/heads/main",
+        "queue_ref": "refs/autoform/queue/queue-1",
+        "expected_target_oid": base,
+        "candidate_oid": candidate,
+        "article_claim": article_claim,
+    }
+
+    def interrupt(name: str) -> None:
+        if name == "publication-intent-recorded":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(repository_module, "_checkpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        queue.publish("queue-1", **arguments)  # type: ignore[arg-type]
+    monkeypatch.setattr(repository_module, "_checkpoint", lambda _name: None)
+
+    journal = state / "publications/queue-1/publication.json"
+    original_journal = journal.read_bytes()
+    original_remote_git = queue._remote_git
+
+    def inject_wrong_width_queue_oid(
+        git_arguments: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        if git_arguments[0] == "ls-remote" and article_claim.ref in git_arguments:
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                f"{'f' * 64}\t{arguments['queue_ref']}\n",
+                "",
+            )
+        return original_remote_git(git_arguments, check=check)
+
+    monkeypatch.setattr(queue, "_remote_git", inject_wrong_width_queue_oid)
+    with pytest.raises(PublicationUncertain, match="invalid results"):
+        queue.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert journal.read_bytes() == original_journal
+    queue.close()
+
+    reopened = _queue(manager, remote, state, "worker-b")
+    recovered = reopened.recover("queue-1", **arguments)  # type: ignore[arg-type]
+    assert recovered.status == "prepared"
+    assert recovered.observed_queue_oid is None
 
 
 def test_local_remote_replacement_across_restart_is_rejected(
