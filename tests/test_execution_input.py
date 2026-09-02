@@ -121,6 +121,62 @@ def test_v1_coverage_is_explicitly_refused_for_execution(tmp_path: Path) -> None
     assert [issue.code for issue in raised.value.issues] == ["coverage-v2-required"]
 
 
+def test_mapped_v2_source_unit_is_refused_for_execution(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace("source_units: [result]\n", ""),
+        encoding="utf-8",
+    )
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.write_text(
+        coverage.read_text(encoding="utf-8").replace(
+            "DECOMPOSED | [Result](../roadmap/result.md) |",
+            "MAPPED | Roadmap decomposition pending |",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project)
+
+    assert [issue.code for issue in raised.value.issues] == ["coverage-incomplete"]
+    assert raised.value.issues[0].reason.endswith("1 unit remains MAPPED")
+
+
+@pytest.mark.parametrize(
+    ("disposition", "evidence"),
+    [
+        ("DEFERRED", "Deferred to the second formalization milestone"),
+        ("OUT", "Excluded from the declared formalization scope"),
+    ],
+)
+def test_terminal_nonroadmap_v2_source_unit_is_accepted_for_execution(
+    tmp_path: Path,
+    disposition: str,
+    evidence: str,
+) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace("source_units: [result]\n", ""),
+        encoding="utf-8",
+    )
+    coverage = project / "blueprint/coverage/README.md"
+    coverage.write_text(
+        coverage.read_text(encoding="utf-8").replace(
+            "DECOMPOSED | [Result](../roadmap/result.md) |",
+            f"{disposition} | {evidence} |",
+        ),
+        encoding="utf-8",
+    )
+
+    execution_input = load_execution_input(project)
+
+    assert execution_input.units[0].disposition == disposition
+    assert execution_input.units[0].roadmap_nodes == ()
+
+
 def test_missing_durable_article_id_is_refused_for_execution(tmp_path: Path) -> None:
     project = _project(tmp_path)
     article = project / "blueprint/roadmap/result.md"

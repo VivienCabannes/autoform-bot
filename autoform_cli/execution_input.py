@@ -468,6 +468,18 @@ def _require_v2_coverage(blueprint: Path) -> CoverageSummary:
                 )
             ]
         )
+    if not coverage.complete:
+        mapped_count = coverage.counts["MAPPED"]
+        subject = "unit remains" if mapped_count == 1 else "units remain"
+        raise ExecutionInputError(
+            [
+                ExecutionInputIssue(
+                    "coverage-incomplete",
+                    "autonomous execution requires a terminal coverage disposition for every "
+                    f"v2 source unit; {mapped_count} {subject} MAPPED",
+                )
+            ]
+        )
     return coverage
 
 
