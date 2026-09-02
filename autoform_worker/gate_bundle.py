@@ -33,8 +33,30 @@ _PLATFORM = re.compile(r"linux/[a-z0-9][a-z0-9_.-]*(?:/[a-z0-9][a-z0-9_.-]*)?")
 _RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+:-]{0,127}")
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+!-]{0,127}")
 _TOOLCHAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,255}")
+_PINNED_TOOLCHAIN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._+/-]{0,127}:"
+    r"(?:v?[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?|nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9a-f]{40})"
+)
 _PACKAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
 _TREE_DOMAIN = b"autoform-gate-runtime-tree/v1\0"
+_LAKE_MANIFEST_VERSION = "1.2.0"
+_LAKE_MANIFEST_FIELDS = frozenset(
+    {"fixedToolchain", "lakeDir", "name", "packages", "packagesDir", "version"}
+)
+_LAKE_GIT_PACKAGE_FIELDS = frozenset(
+    {
+        "configFile",
+        "inherited",
+        "inputRev",
+        "manifestFile",
+        "name",
+        "rev",
+        "scope",
+        "subDir",
+        "type",
+        "url",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +161,10 @@ class LakeDependencyLock:
     packages: tuple[LakePackageIdentity, ...]
 
     def __post_init__(self) -> None:
-        _canonical_lock_text("Lake manifest version", self.manifest_version)
+        if self.manifest_version != _LAKE_MANIFEST_VERSION:
+            raise GateProviderError(
+                f"Lake manifest version must be exactly {_LAKE_MANIFEST_VERSION}"
+            )
         if self.packages_dir != ".lake/packages":
             raise GateProviderError("Lake packagesDir must be exactly .lake/packages")
         if type(self.packages) is not tuple or any(
@@ -190,9 +215,17 @@ class LakeDependencyLock:
         )
         if not isinstance(value, dict):
             raise GateProviderError("lake-manifest.json must contain one object")
-        missing = {"packages", "packagesDir", "version"} - set(value)
-        if missing:
-            raise GateProviderError("lake-manifest.json omits dependency lock fields")
+        if set(value) != _LAKE_MANIFEST_FIELDS:
+            raise GateProviderError("lake-manifest.json fields do not match the supported schema")
+        if value["version"] != _LAKE_MANIFEST_VERSION:
+            raise GateProviderError(
+                f"Lake manifest version must be exactly {_LAKE_MANIFEST_VERSION}"
+            )
+        if value["lakeDir"] != ".lake":
+            raise GateProviderError("Lake lakeDir must be exactly .lake")
+        if type(value["fixedToolchain"]) is not bool:
+            raise GateProviderError("Lake fixedToolchain must be a boolean")
+        _canonical_lock_text("Lake project name", value["name"])
         return cls.from_value(
             {
                 "packages": value["packages"],
@@ -782,8 +815,12 @@ def _parse_lean_toolchain(content: bytes) -> str:
 
 
 def _lean_toolchain(value: object) -> None:
-    if not isinstance(value, str) or _TOOLCHAIN.fullmatch(value) is None:
-        raise GateProviderError("Lean toolchain must be one canonical exact identifier")
+    if (
+        not isinstance(value, str)
+        or _TOOLCHAIN.fullmatch(value) is None
+        or _PINNED_TOOLCHAIN.fullmatch(value) is None
+    ):
+        raise GateProviderError("Lean toolchain must be one canonical pinned identifier")
 
 
 def _version_output(label: str, value: object) -> None:
@@ -805,15 +842,16 @@ def _package_name(value: object) -> None:
     _path_component(value, label="Lake dependency package name")
 
 
-def _canonical_lock_text(label: str, value: object) -> None:
-    if not isinstance(value, str) or not value:
-        raise GateProviderError(f"{label} must be nonempty bounded text")
+def _canonical_lock_text(label: str, value: object, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or (not value and not allow_empty):
+        qualifier = "bounded" if allow_empty else "nonempty bounded"
+        raise GateProviderError(f"{label} must be {qualifier} text")
     try:
         encoded = value.encode("utf-8", errors="strict")
     except UnicodeError as error:
         raise GateProviderError(f"{label} is not valid UTF-8") from error
     if len(encoded) > _MAX_PATH_BYTES:
-        raise GateProviderError(f"{label} must be nonempty bounded text")
+        raise GateProviderError(f"{label} must be bounded text")
     if value != unicodedata.normalize("NFC", value) or any(
         _is_forbidden_text_character(character) for character in value
     ):
@@ -822,20 +860,30 @@ def _canonical_lock_text(label: str, value: object) -> None:
 
 def _validate_package_identity(value: dict[str, Any]) -> str:
     _validate_lock_json(value)
-    if not {"name", "type"}.issubset(value):
-        raise GateProviderError("each Lake dependency identity must include name and type")
+    if set(value) != _LAKE_GIT_PACKAGE_FIELDS:
+        raise GateProviderError("Lake Git dependency fields do not match the supported schema")
     name = value["name"]
     package_type = value["type"]
     _package_name(name)
-    _canonical_lock_text("Lake package type", package_type)
-    if package_type == "git":
-        revision = value.get("rev")
-        url = value.get("url")
-        if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
-            raise GateProviderError("each Git Lake dependency must bind one full revision")
-        if revision == "0" * len(revision):
-            raise GateProviderError("Git Lake dependency revisions must not be all-zero")
-        _canonical_lock_text("Git Lake dependency URL", url)
+    if package_type != "git":
+        raise GateProviderError("runtime bundles support only immutable Git Lake dependencies")
+    if type(value["inherited"]) is not bool:
+        raise GateProviderError("Lake dependency inherited must be a boolean")
+    _canonical_lock_text("Lake dependency scope", value["scope"], allow_empty=True)
+    for field in ("configFile", "manifestFile", "subDir"):
+        path = value[field]
+        if path is not None:
+            _relative_path(path, label=f"Lake dependency {field}")
+    input_revision = value["inputRev"]
+    if input_revision is not None:
+        _canonical_lock_text("Lake dependency inputRev", input_revision)
+    revision = value["rev"]
+    url = value["url"]
+    if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
+        raise GateProviderError("each Git Lake dependency must bind one full revision")
+    if revision == "0" * len(revision):
+        raise GateProviderError("Git Lake dependency revisions must not be all-zero")
+    _canonical_lock_text("Git Lake dependency URL", url)
     return name
 
 

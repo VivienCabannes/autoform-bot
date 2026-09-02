@@ -38,7 +38,6 @@ def _packages() -> list[dict[str, object]]:
         },
         {
             "configFile": "lakefile.lean",
-            "identityExtension": {"mirrors": ["primary"], "priority": 1},
             "inherited": False,
             "inputRev": "v4.32.2",
             "manifestFile": "lake-manifest.json",
@@ -352,7 +351,7 @@ def test_project_compatibility_rejects_any_dependency_identity_change(tmp_path: 
     bundle = _bundle(tmp_path)
     manifest = _manifest(bundle)
     changed = _packages()
-    changed[1]["identityExtension"] = {"mirrors": ["different"], "priority": 1}
+    changed[1]["inputRev"] = "v4.32.3"
     project = _project(tmp_path, lake_manifest=_lake_manifest(packages=changed))
 
     with pytest.raises(GateProviderError, match="dependency identities"):
@@ -451,11 +450,104 @@ def test_lake_lock_rejects_unpinned_git_dependency_and_duplicate_names(tmp_path:
     with pytest.raises(GateProviderError, match="unique"):
         _manifest(root, lake_manifest=_lake_manifest(packages=duplicate))
 
-    direct = {"name": "direct", "rev": "main", "type": "git", "url": "https://example.test/repo"}
+    direct = _packages()[0]
+    direct["name"] = "direct"
+    direct["rev"] = "main"
     with pytest.raises(GateProviderError, match="full revision"):
         LakePackageIdentity(
             name="direct",
             canonical_json=json.dumps(direct, sort_keys=True, separators=(",", ":")).encode(),
+        )
+
+
+@pytest.mark.parametrize("package_type", ["path", "registry", "git+ssh"])
+def test_lake_lock_rejects_non_git_dependency_sources(
+    tmp_path: Path,
+    package_type: str,
+) -> None:
+    root = _bundle(tmp_path)
+    packages = _packages()
+    packages[0]["type"] = package_type
+
+    with pytest.raises(GateProviderError, match="only immutable Git"):
+        _manifest(root, lake_manifest=_lake_manifest(packages=packages))
+
+
+@pytest.mark.parametrize("field", ["configFile", "manifestFile", "subDir"])
+@pytest.mark.parametrize("value", ["../outside", "/outside", "nested/../../outside"])
+def test_lake_lock_rejects_dependency_paths_outside_package_root(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    root = _bundle(tmp_path)
+    packages = _packages()
+    packages[0][field] = value
+
+    with pytest.raises(GateProviderError, match=field):
+        _manifest(root, lake_manifest=_lake_manifest(packages=packages))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda value: value.update(version="1.3.0"), "version"),
+        (lambda value: value.update(lakeDir="../lake"), "lakeDir"),
+        (lambda value: value.update(fixedToolchain="false"), "fixedToolchain"),
+        (lambda value: value.update(extra="future"), "fields"),
+    ],
+)
+def test_lake_lock_rejects_unsupported_manifest_semantics(
+    tmp_path: Path,
+    mutation: object,
+    message: str,
+) -> None:
+    root = _bundle(tmp_path)
+    value = json.loads(_lake_manifest())
+    assert callable(mutation)
+    mutation(value)
+
+    with pytest.raises(GateProviderError, match=message):
+        _manifest(root, lake_manifest=json.dumps(value).encode())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda package: package.pop("inherited"),
+        lambda package: package.update(inherited="true"),
+        lambda package: package.update(extra="future"),
+    ],
+)
+def test_lake_lock_rejects_incomplete_or_extended_package_schema(
+    tmp_path: Path,
+    mutation: object,
+) -> None:
+    root = _bundle(tmp_path)
+    packages = _packages()
+    assert callable(mutation)
+    mutation(packages[0])
+
+    with pytest.raises(GateProviderError):
+        _manifest(root, lake_manifest=_lake_manifest(packages=packages))
+
+
+def test_runtime_bundle_rejects_floating_lean_toolchain(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+
+    with pytest.raises(GateProviderError, match="pinned"):
+        build_runtime_bundle_manifest(
+            root,
+            release_id="release-1",
+            platform="linux/amd64",
+            autoform_version="0.5.0",
+            autoform_revision="a" * 40,
+            lean_toolchain="leanprover/lean4:stable",
+            lean_version="Lean 4.32.2\n",
+            lake_version="Lake 5.0.0\n",
+            git_version="git version 2.51.0\n",
+            python_version="Python 3.13.7\n",
+            lake_manifest=_lake_manifest(),
         )
 
 
