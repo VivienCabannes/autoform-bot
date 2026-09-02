@@ -39,13 +39,36 @@ def _limits() -> DockerSandboxLimits:
 def _config(*, seccomp_profile_sha256: str = "6" * 64) -> DockerGateProviderConfig:
     return DockerGateProviderConfig(
         runtime_path="/usr/local/bin/docker",
+        runtime_device=1,
+        runtime_inode=2,
+        runtime_mode=0o555,
+        runtime_size=3,
+        runtime_owner_uid=0,
         runtime_executable_sha256="1" * 64,
         runtime_fingerprint_sha256="2" * 64,
+        docker_host="unix:///var/run/docker.sock",
+        docker_socket_device=4,
+        docker_socket_inode=5,
+        docker_socket_mode=0o660,
+        docker_socket_owner_uid=0,
+        docker_socket_owner_gid=0,
+        state_directory="/var/lib/autoform",
+        state_directory_device=6,
+        state_directory_inode=7,
+        state_directory_owner_uid=0,
+        docker_config_directory="/var/lib/autoform/docker-config",
+        docker_config_device=8,
+        docker_config_inode=9,
+        docker_config_owner_uid=0,
         image_reference=f"autoform-gates@sha256:{'3' * 64}",
         image_id=f"sha256:{'4' * 64}",
         platform="linux/arm64",
         runtime_bundle_sha256="5" * 64,
-        seccomp_profile_path="/etc/autoform/seccomp.json",
+        seccomp_profile_path="/var/lib/autoform/seccomp.json",
+        seccomp_profile_device=10,
+        seccomp_profile_inode=11,
+        seccomp_profile_size=12,
+        seccomp_profile_owner_uid=0,
         seccomp_profile_sha256=seccomp_profile_sha256,
         evaluator_executable="/usr/local/bin/python3",
         container_runtime="runc",
@@ -266,6 +289,15 @@ def test_provider_config_round_trips_as_canonical_evidence() -> None:
         ("runtime_path", "docker", "absolute path"),
         ("runtime_path", "/usr/local/../bin/docker", "absolute path"),
         ("runtime_path", "/usr/local/bin/docker\nignored", "absolute path"),
+        ("runtime_mode", 0o777, "not group/world writable"),
+        ("runtime_mode", 0o4555, "not group/world writable"),
+        ("docker_host", "tcp://127.0.0.1:2375", "local Unix socket"),
+        (
+            "docker_config_directory",
+            "/other/docker-config",
+            "directly under the state directory",
+        ),
+        ("seccomp_profile_path", "/other/seccomp.json", "directly under the state directory"),
         ("runtime_executable_sha256", "A" * 64, "lowercase hexadecimal"),
         ("runtime_fingerprint_sha256", "2" * 63, "lowercase hexadecimal"),
         ("image_reference", "autoform-gates:latest", "immutable sha256 digest"),
@@ -279,7 +311,7 @@ def test_provider_config_round_trips_as_canonical_evidence() -> None:
 )
 def test_provider_config_rejects_unpinned_or_ambiguous_identity(
     field: str,
-    value: str,
+    value: object,
     message: str,
 ) -> None:
     with pytest.raises(GateProviderError, match=message):
@@ -319,7 +351,7 @@ def test_provider_limits_require_output_to_fit_in_scratch() -> None:
     "content",
     [
         b"{}",
-        b'{"schema":"autoform-docker-gate-provider/v1","schema":"duplicate"}',
+        b'{"schema":"autoform-docker-gate-provider/v2","schema":"duplicate"}',
         b'{"schema":NaN}',
         b"[]",
         b"\xff",
@@ -399,8 +431,10 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
 
     command = docker_create_argv(config, request, "/srv/autoform/repository.pack")
 
-    assert command[:4] == (
+    assert command[:6] == (
         "/usr/local/bin/docker",
+        "--config=/var/lib/autoform/docker-config",
+        "--host=unix:///var/run/docker.sock",
         "create",
         "--name",
         request.container_name,
