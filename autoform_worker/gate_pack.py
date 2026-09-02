@@ -89,9 +89,10 @@ def prepare_repository_pack(
     timeout = float(timeout_seconds)
     if not 0 < timeout < float("inf"):
         raise GateProviderError("repository pack timeout must be a positive number")
-    root = _real_directory(Path(repository), label="repository root")
-    target = Path(destination)
+    target = _path_argument(destination, label="repository pack path")
     _canonical_absolute_path(os.fspath(target), label="repository pack path")
+    repository_path = _path_argument(repository, label="repository root")
+    root = _real_directory(repository_path, label="repository root")
     parent = _private_directory(target.parent, label="repository pack directory")
     if target.parent != parent:
         raise GateProviderError("repository pack path has a noncanonical parent")
@@ -512,7 +513,7 @@ def _real_directory(path: Path, *, label: str) -> Path:
         info = resolved.stat(follow_symlinks=False)
     except GateProviderError:
         raise
-    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+    except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
         raise GateProviderError(f"{label} cannot be inspected") from error
     if not stat.S_ISDIR(info.st_mode):
         raise GateProviderError(f"{label} must be a real directory")
@@ -570,6 +571,18 @@ def _open_bound_private_directory(path: Path, expected: tuple[int, int, int]) ->
         )
         raise
     return descriptor
+
+
+def _path_argument(value: object, *, label: str) -> Path:
+    try:
+        path = Path(value)  # type: ignore[arg-type]
+        text = os.fspath(path)
+        text.encode("utf-8", errors="strict")
+    except (TypeError, ValueError) as error:
+        raise GateProviderError(f"{label} is invalid") from error
+    if "\0" in text:
+        raise GateProviderError(f"{label} is invalid")
+    return path
 
 
 def _canonical_absolute_path(value: str, *, label: str) -> None:

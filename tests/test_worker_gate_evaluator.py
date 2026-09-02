@@ -643,6 +643,45 @@ def test_host_pack_path_policy_errors_keep_their_specific_diagnostic(tmp_path: P
         verify_repository_pack(pack)
 
 
+@pytest.mark.parametrize("argument", ["repository", "destination"])
+@pytest.mark.parametrize("invalid_kind", ["unicode", "nul", "type"])
+def test_prepare_repository_pack_wraps_invalid_paths_before_filesystem_or_git_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argument: str,
+    invalid_kind: str,
+) -> None:
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    if invalid_kind == "unicode":
+        invalid: object = f"{state}/\ud800.pack" if argument == "destination" else "\ud800"
+    elif invalid_kind == "nul":
+        invalid = f"{state}/embedded\0nul.pack" if argument == "destination" else "embedded\0nul"
+    else:
+        invalid = object()
+    repository: object = invalid if argument == "repository" else tmp_path
+    destination: object = invalid if argument == "destination" else state / "invocation.pack"
+    monkeypatch.setattr(
+        gate_pack_module,
+        "_real_directory",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("filesystem work started")),
+    )
+    monkeypatch.setattr(
+        gate_pack_module,
+        "_git_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Git work started")),
+    )
+
+    with pytest.raises(GateProviderError, match="repository (root|pack path)"):
+        prepare_repository_pack(
+            repository,  # type: ignore[arg-type]
+            destination,  # type: ignore[arg-type]
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1024,
+            timeout_seconds=1,
+        )
+
 @pytest.mark.parametrize("failed_pipe", ["stdin", "stdout", "stderr"])
 def test_repository_pack_stream_wraps_each_pipe_close_and_closes_the_rest(
     tmp_path: Path,
