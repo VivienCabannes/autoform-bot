@@ -445,7 +445,7 @@ def load_and_verify_runtime_bundle(
 ) -> RuntimeBundleManifest:
     """Load exact canonical evidence and rehash the complete package tree."""
 
-    root = _real_directory(Path(bundle_root), label="runtime bundle root")
+    root = _real_directory(bundle_root, label="runtime bundle root")
     content = _read_regular_file(
         root / RUNTIME_BUNDLE_MANIFEST,
         maximum=_MAX_MANIFEST_BYTES,
@@ -483,7 +483,7 @@ def validate_project_bundle_compatibility(
 
     if not isinstance(manifest, RuntimeBundleManifest):
         raise GateProviderError("runtime bundle manifest is invalid")
-    root = _real_directory(Path(project_root), label="project root")
+    root = _real_directory(project_root, label="project root")
     root_identity = _directory_identity(root)
     tracked = _validate_tracked_source_paths(tracked_source_paths)
     required = {"lake-manifest.json", "lean-toolchain"}
@@ -517,7 +517,7 @@ def _bundle_tree_identity(
 ) -> BundleTreeIdentity:
     _positive_limit("runtime bundle entry limit", maximum_entries)
     _positive_limit("runtime bundle byte limit", maximum_file_bytes)
-    root = _real_directory(Path(bundle_root), label="runtime bundle root")
+    root = _real_directory(bundle_root, label="runtime bundle root")
     root_identity = _directory_identity(root)
     entries = _collect_tree_entries(
         root,
@@ -870,7 +870,8 @@ def _validate_package_identity(value: dict[str, Any]) -> str:
     if type(value["inherited"]) is not bool:
         raise GateProviderError("Lake dependency inherited must be a boolean")
     _canonical_lock_text("Lake dependency scope", value["scope"], allow_empty=True)
-    for field in ("configFile", "manifestFile", "subDir"):
+    _relative_path(value["configFile"], label="Lake dependency configFile")
+    for field in ("manifestFile", "subDir"):
         path = value[field]
         if path is not None:
             _relative_path(path, label=f"Lake dependency {field}")
@@ -979,13 +980,14 @@ def _is_forbidden_text_character(character: str, *, allow_newline: bool = False)
     return unicodedata.category(character) in {"Cc", "Cf", "Cs"}
 
 
-def _real_directory(path: Path, *, label: str) -> Path:
+def _real_directory(path_value: str | Path, *, label: str) -> Path:
     try:
+        path = Path(path_value)
         if path.is_symlink():
             raise GateProviderError(f"{label} must not be a symbolic link")
         resolved = path.expanduser().resolve(strict=True)
         info = resolved.stat(follow_symlinks=False)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise GateProviderError(f"{label} cannot be inspected") from error
     if not stat.S_ISDIR(info.st_mode):
         raise GateProviderError(f"{label} must be one real directory")

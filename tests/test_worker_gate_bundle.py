@@ -126,6 +126,48 @@ def test_runtime_bundle_round_trips_canonical_manifest_and_tree(tmp_path: Path) 
     assert [package.name for package in loaded.lake_lock.packages] == ["batteries", "mathlib"]
 
 
+@pytest.mark.parametrize(
+    "invalid_path",
+    [
+        pytest.param("\ud800", id="unicode"),
+        pytest.param("embedded\0nul", id="nul"),
+        pytest.param(object(), id="type"),
+    ],
+)
+@pytest.mark.parametrize("entry_point", ["build", "load", "compatibility"])
+def test_runtime_bundle_public_entry_points_wrap_invalid_paths(
+    tmp_path: Path,
+    invalid_path: object,
+    entry_point: str,
+) -> None:
+    root = _bundle(tmp_path)
+    manifest = _manifest(root)
+
+    with pytest.raises(GateProviderError, match="cannot be inspected"):
+        if entry_point == "build":
+            build_runtime_bundle_manifest(
+                invalid_path,  # type: ignore[arg-type]
+                release_id="gate-runtime-2026.09.02",
+                platform="linux/arm64",
+                autoform_version="0.5.0",
+                autoform_revision="a" * 40,
+                lean_toolchain="leanprover/lean4:v4.32.2",
+                lean_version="Lean (version 4.32.2, aarch64-unknown-linux-gnu, Release)\n",
+                lake_version="Lake version 5.0.0-src+abc (Lean version 4.32.2)\n",
+                git_version="git version 2.51.0\n",
+                python_version="Python 3.13.7\n",
+                lake_manifest=_lake_manifest(),
+            )
+        elif entry_point == "load":
+            load_and_verify_runtime_bundle(invalid_path)  # type: ignore[arg-type]
+        else:
+            validate_project_bundle_compatibility(
+                manifest,
+                invalid_path,  # type: ignore[arg-type]
+                tracked_source_paths=("lake-manifest.json", "lean-toolchain"),
+            )
+
+
 def test_tree_identity_is_deterministic_and_excludes_only_root_manifest(tmp_path: Path) -> None:
     root = _bundle(tmp_path)
     first = _manifest(root)
@@ -485,6 +527,15 @@ def test_lake_lock_rejects_dependency_paths_outside_package_root(
     packages[0][field] = value
 
     with pytest.raises(GateProviderError, match=field):
+        _manifest(root, lake_manifest=_lake_manifest(packages=packages))
+
+
+def test_lake_lock_requires_a_nonnull_relative_config_file(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+    packages = _packages()
+    packages[0]["configFile"] = None
+
+    with pytest.raises(GateProviderError, match="configFile"):
         _manifest(root, lake_manifest=_lake_manifest(packages=packages))
 
 
