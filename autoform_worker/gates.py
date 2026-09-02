@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import tempfile
@@ -61,6 +62,11 @@ _MAX_EVIDENCE_TAIL = 4096
 _MAX_CAPTURED_OUTPUT = 64 * 1024
 _COMMAND_TIMEOUT_SECONDS = 2 * 60 * 60
 _PROCESS_GROUP_ISOLATION_SUPPORTED = os.name == "posix"
+_INVOCATION_MARKER_ENV = "_AUTOFORM_GATE_INVOCATION"
+_INVOCATION_CLEANUP_SECONDS = 2.0
+_INVOCATION_CLEANUP_INTERVAL_SECONDS = 0.02
+_INVOCATION_CLEANUP_EMPTY_SCANS = 3
+_INVOCATION_TRACK_INTERVAL_SECONDS = 0.01
 _ENV_ALLOWLIST = frozenset(
     {
         "ALL_PROXY",
@@ -816,15 +822,20 @@ def _run_checked(
 class _StreamCapture:
     """Bounded text retention plus complete, scrubbed stream evidence."""
 
-    def __init__(self, replacements: tuple[tuple[Path, str], ...]) -> None:
+    def __init__(
+        self,
+        replacements: tuple[tuple[Path, str], ...],
+        *,
+        scrub_home: bool = True,
+    ) -> None:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         self._pending_carriage_return = False
         self._captured = ""
         self._captured_characters = 0
         self._scrub_pending = ""
         configured = [(str(path), label) for path, label in replacements]
-        home = os.environ.get("HOME")
-        if home:
+        home = os.environ.get("HOME") if scrub_home else None
+        if home is not None:
             configured.append((home, "<home>"))
         ordered = sorted(
             ((source, label) for source, label in configured if source),
@@ -863,7 +874,6 @@ class _StreamCapture:
             self._pending_carriage_return = False
         normalized = value.replace("\r\n", "\n").replace("\r", "\n")
         self._captured_characters += len(normalized)
-        self._captured = (self._captured + normalized)[-_MAX_CAPTURED_OUTPUT:]
         self._scrub_pending += normalized
         self._flush_scrubbed(final=False)
 
@@ -895,6 +905,7 @@ class _StreamCapture:
         encoded = value.encode("utf-8")
         self._digest.update(encoded)
         self._scrubbed_bytes += len(encoded)
+        self._captured = (self._captured + value)[-_MAX_CAPTURED_OUTPUT:]
         self._scrubbed_tail = (self._scrubbed_tail + value)[-_MAX_EVIDENCE_TAIL:]
 
     @property
@@ -918,77 +929,184 @@ class _StreamCapture:
         return self._captured_characters > _MAX_CAPTURED_OUTPUT
 
 
-def _terminate_process_group(
-    process: subprocess.Popen[bytes],
-    earliest_creation_time: float,
-) -> None:
-    """Stop the command and ordinary descendants before returning to the caller."""
+def _has_invocation_marker(process: psutil.Process, marker: str) -> bool:
+    """Revalidate one process identity and its inherited invocation marker."""
 
-    if os.name == "posix" and process.poll() is None:
+    try:
+        return (
+            process.environ().get(_INVOCATION_MARKER_ENV) == marker
+            and process.is_running()
+        )
+    except (OSError, psutil.Error, SystemError):
+        return False
+
+
+def _marked_invocation_processes(marker: str) -> tuple[psutil.Process, ...]:
+    matches: list[psutil.Process] = []
+    for process in psutil.process_iter():
+        if _has_invocation_marker(process, marker):
+            matches.append(process)
+    return tuple(matches)
+
+
+def _kill_marked_invocation_processes(marker: str) -> tuple[psutil.Process, ...]:
+    """Kill only processes whose identity and marker still match at signal time."""
+
+    killed: list[psutil.Process] = []
+    for process in _marked_invocation_processes(marker):
+        if not _has_invocation_marker(process, marker):
+            continue
         try:
-            process_group = os.getpgid(process.pid)
-        except OSError:
-            process_group = process.pid
-        if process_group == os.getpgrp():  # pragma: no cover - start_new_session enforces this
-            _terminate_process_tree(process, None, earliest_creation_time)
-            process_group = -1
-        if process_group >= 0:
+            process.kill()
+        except (OSError, psutil.Error, SystemError):
+            continue
+        killed.append(process)
+    return tuple(killed)
+
+
+class _InvocationTracker:
+    """Continuously retain exact process identities while the command runs."""
+
+    def __init__(self, root_pid: int) -> None:
+        self._known: dict[tuple[int, float], psutil.Process] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        try:
+            self._remember(psutil.Process(root_pid))
+        except (OSError, psutil.Error, SystemError):
+            pass
+
+    def _remember(self, process: psutil.Process) -> None:
+        try:
+            # Creation time is used only as part of psutil's PID-incarnation
+            # identity, never as an ownership or ordering heuristic.
+            identity = (process.pid, process.create_time())
+        except (OSError, psutil.Error, SystemError):
+            return
+        with self._lock:
+            self._known[identity] = process
+
+    def _discover(self) -> None:
+        for parent in self.snapshot():
             try:
-                os.killpg(process_group, signal.SIGKILL)
+                children = parent.children(recursive=True)
+            except (OSError, psutil.Error, SystemError):
+                continue
+            for child in children:
+                self._remember(child)
+
+    def _run(self) -> None:
+        while not self._stop.wait(_INVOCATION_TRACK_INTERVAL_SECONDS):
+            self._discover()
+
+    def start(self) -> None:
+        self._discover()
+        self._thread.start()
+
+    def snapshot(self) -> tuple[psutil.Process, ...]:
+        with self._lock:
+            return tuple(self._known.values())
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=1)
+        if self._thread.is_alive():
+            raise CandidateGateError("invocation process tracker did not stop")
+
+
+def _kill_tracked_invocation_processes(
+    tracker: _InvocationTracker,
+) -> tuple[psutil.Process, ...]:
+    killed: list[psutil.Process] = []
+    for process in tracker.snapshot():
+        try:
+            if not process.is_running():
+                continue
+            process.kill()
+        except (OSError, psutil.Error, SystemError):
+            continue
+        killed.append(process)
+    return tuple(killed)
+
+
+def _active_tracked_invocation_processes(
+    tracker: _InvocationTracker,
+) -> tuple[psutil.Process, ...]:
+    active: list[psutil.Process] = []
+    for process in tracker.snapshot():
+        try:
+            if process.is_running():
+                active.append(process)
+        except (OSError, psutil.Error, SystemError):
+            continue
+    return tuple(active)
+
+
+def _terminate_invocation(
+    process: subprocess.Popen[bytes],
+    marker: str,
+    tracker: _InvocationTracker | None,
+) -> None:
+    """Stop one command and every tracked or marked descendant before returning."""
+
+    if process.poll() is None:
+        # The direct child owns this group until it is reaped, so the numeric
+        # group ID cannot yet have been recycled. Detached descendants are
+        # handled by the marker sweep below.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            try:
+                process.kill()
             except ProcessLookupError:
                 pass
-            except PermissionError:
-                _terminate_process_tree(process, process_group, earliest_creation_time)
-    elif os.name == "posix":
-        _terminate_process_tree(process, process.pid, earliest_creation_time)
-    else:  # pragma: no cover - exercised on Windows
-        _terminate_process_tree(process, None, earliest_creation_time)
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:  # pragma: no cover - OS failed to reap child
-        process.kill()
-        process.wait(timeout=1)
-
-
-def _terminate_process_tree(
-    process: subprocess.Popen[bytes],
-    process_group: int | None,
-    earliest_creation_time: float,
-) -> None:
-    """Fallback for platforms that do not permit signalling the process group."""
-
-    by_pid: dict[int, psutil.Process] = {}
-
-    def remember(target: psutil.Process) -> None:
         try:
-            if target.create_time() >= earliest_creation_time:
-                by_pid[target.pid] = target
-        except psutil.Error:
-            pass
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:  # pragma: no cover - OS failed to reap child
+            process.kill()
+            process.wait(timeout=1)
 
+    deadline = time.monotonic() + _INVOCATION_CLEANUP_SECONDS
+    empty_scans = 0
     try:
-        root = psutil.Process(process.pid)
-        for child in root.children(recursive=True):
-            remember(child)
-        remember(root)
-    except psutil.Error:
-        pass
-    if process_group is not None:
-        for target in psutil.process_iter():
-            try:
-                if os.getpgid(target.pid) == process_group:
-                    remember(target)
-            except (OSError, psutil.Error):
-                pass
-    processes = sorted(by_pid.values(), key=lambda target: target.pid != process.pid)
-    for target in processes:
-        try:
-            target.kill()
-        except psutil.Error:
-            pass
-    psutil.wait_procs(processes, timeout=0.5)
-    if process.poll() is None:
-        process.kill()
+        while time.monotonic() < deadline:
+            if tracker is not None:
+                tracker._discover()
+            killed = (
+                *(_kill_tracked_invocation_processes(tracker) if tracker is not None else ()),
+                *_kill_marked_invocation_processes(marker),
+            )
+            if tracker is not None:
+                tracker._discover()
+            remaining = (
+                *(
+                    _active_tracked_invocation_processes(tracker)
+                    if tracker is not None
+                    else ()
+                ),
+                *_marked_invocation_processes(marker),
+            )
+            if killed or remaining:
+                empty_scans = 0
+            else:
+                empty_scans += 1
+                if empty_scans >= _INVOCATION_CLEANUP_EMPTY_SCANS:
+                    return
+            time.sleep(_INVOCATION_CLEANUP_INTERVAL_SECONDS)
+        tracked = (
+            _active_tracked_invocation_processes(tracker)
+            if tracker is not None
+            else ()
+        )
+        if tracked or _marked_invocation_processes(marker):
+            raise CandidateGateError("command processes remained alive after invocation cleanup")
+    finally:
+        if tracker is not None:
+            tracker.stop()
 
 
 def _bounded_subprocess_run(
@@ -1012,10 +1130,24 @@ def _bounded_subprocess_run(
             "bounded gate runner requires POSIX process-group isolation"
         )
     command = list(argv)
+    marker = secrets.token_hex(32)
+    child_environment = dict(os.environ if env is None else env)
+    child_environment[_INVOCATION_MARKER_ENV] = marker
+    capture_replacements = (*replacements, (Path(marker), "<gate-invocation>"))
+    stdout = _StreamCapture(capture_replacements)
+    stderr = _StreamCapture(capture_replacements)
+    returned_stdout = _StreamCapture(
+        ((Path(marker), "<gate-invocation>"),),
+        scrub_home=False,
+    )
+    returned_stderr = _StreamCapture(
+        ((Path(marker), "<gate-invocation>"),),
+        scrub_home=False,
+    )
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=dict(env) if env is not None else None,
+        env=child_environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1023,21 +1155,15 @@ def _bounded_subprocess_run(
         shell=False,
         start_new_session=True,
     )
-    try:
-        earliest_creation_time = psutil.Process(process.pid).create_time()
-    except psutil.Error:  # pragma: no cover - process disappeared before inspection
-        earliest_creation_time = time.time() - 1
-    assert process.stdout is not None
-    assert process.stderr is not None
-    stdout = _StreamCapture(replacements)
-    stderr = _StreamCapture(replacements)
+    tracker: _InvocationTracker | None = None
     reader_errors: list[BaseException] = []
 
-    def read_stream(stream: Any, capture: _StreamCapture) -> None:
+    def read_stream(stream: Any, captures: tuple[_StreamCapture, ...]) -> None:
         failed = False
         try:
             while chunk := stream.read(64 * 1024):
-                capture.feed(chunk)
+                for capture in captures:
+                    capture.feed(chunk)
         except BaseException as error:  # pragma: no cover - pipe failure is platform-specific
             failed = True
             reader_errors.append(error)
@@ -1048,43 +1174,73 @@ def _bounded_subprocess_run(
                 pass
         finally:
             if not failed:
-                try:
-                    capture.finish()
-                except BaseException as error:  # pragma: no cover - malformed final UTF-8 sequence
-                    reader_errors.append(error)
+                for capture in captures:
+                    try:
+                        capture.finish()
+                    except BaseException as error:  # pragma: no cover - malformed final UTF-8 sequence
+                        reader_errors.append(error)
 
-    readers = (
-        threading.Thread(target=read_stream, args=(process.stdout, stdout), daemon=True),
-        threading.Thread(target=read_stream, args=(process.stderr, stderr), daemon=True),
-    )
-    for reader in readers:
-        reader.start()
+    readers: tuple[threading.Thread, ...] = ()
+    started_readers: list[threading.Thread] = []
     timed_out = False
+    returncode = -1
     try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        returncode = -1
+        tracker = _InvocationTracker(process.pid)
+        tracker.start()
+        assert process.stdout is not None
+        assert process.stderr is not None
+        readers = (
+            threading.Thread(
+                target=read_stream,
+                args=(process.stdout, (stdout, returned_stdout)),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=(process.stderr, (stderr, returned_stderr)),
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            try:
+                reader.start()
+            finally:
+                if reader.ident is not None:
+                    started_readers.append(reader)
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
     finally:
-        _terminate_process_group(process, earliest_creation_time)
-        for reader in readers:
+        cleanup_error: Exception | None = None
+        try:
+            _terminate_invocation(process, marker, tracker)
+        except Exception as error:
+            cleanup_error = error
+        for reader in started_readers:
             reader.join(timeout=1)
-        process.stdout.close()
-        process.stderr.close()
-        for reader in readers:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+        for reader in started_readers:
             reader.join(timeout=0.5)
-    if any(reader.is_alive() for reader in readers):
+    if any(reader.is_alive() for reader in started_readers):
         raise CandidateGateError("command output pipes remained open after process-group shutdown")
     if reader_errors:
         raise CandidateGateError(f"could not read command output: {reader_errors[0]}")
+    if cleanup_error is not None:
+        raise CandidateGateError(f"could not clean up command processes: {cleanup_error}")
+    captured_stdout = returned_stdout.text
+    captured_stderr = returned_stderr.text
     if timed_out:
         raise subprocess.TimeoutExpired(
             command,
             timeout,
-            output=stdout.text,
-            stderr=stderr.text,
+            output=captured_stdout,
+            stderr=captured_stderr,
         )
-    completed = subprocess.CompletedProcess(command, returncode, stdout.text, stderr.text)
+    completed = subprocess.CompletedProcess(command, returncode, captured_stdout, captured_stderr)
     completed._autoform_stdout_sha256 = stdout.sha256  # type: ignore[attr-defined]
     completed._autoform_stderr_sha256 = stderr.sha256  # type: ignore[attr-defined]
     completed._autoform_stdout_bytes = stdout.scrubbed_bytes  # type: ignore[attr-defined]

@@ -27,9 +27,13 @@ from autoform_worker.executor import _protected_roadmap_sha256
 from autoform_worker.gates import (
     CANDIDATE_GATE_EVIDENCE_SCHEMA,
     CandidateGateError,
+    _INVOCATION_MARKER_ENV,
+    _InvocationTracker,
     _StreamCapture,
     _command_evidence,
     _invoke,
+    _kill_marked_invocation_processes,
+    _terminate_invocation,
     fingerprint_toolchain,
     run_candidate_gates,
     scrubbed_subprocess_environment,
@@ -595,6 +599,7 @@ def test_default_gate_runner_bounds_retained_output_and_hashes_full_stream(
     assert completed.returncode == 0
     assert len(completed.stdout) == 64 * 1024
     assert len(completed.stderr) == 64 * 1024
+    assert completed.stdout.endswith(f"{tmp_path}tail")
     assert evidence.stdout_truncated
     assert evidence.stderr_truncated
     assert evidence.stdout_bytes == len(expected_stdout.encode("utf-8"))
@@ -615,9 +620,8 @@ def test_stream_capture_scrubs_paths_and_newlines_across_chunks(tmp_path: Path) 
     capture.feed(payload[split:])
     capture.finish()
 
-    expected_text = f"prefix\n{source} suffix\nend"
     expected_evidence = "prefix\n<project> suffix\nend"
-    assert capture.text == expected_text
+    assert capture.text == expected_evidence
     assert capture.scrubbed_tail == expected_evidence
     assert capture.scrubbed_bytes == len(expected_evidence.encode("utf-8"))
     assert capture.sha256 == hashlib.sha256(expected_evidence.encode("utf-8")).hexdigest()
@@ -667,6 +671,290 @@ def test_default_gate_runner_fails_closed_without_process_group_isolation(
     assert not launched
 
 
+def test_default_gate_runner_reaps_command_when_tracker_start_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launched_pids: list[int] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched_pids.append(process.pid)
+        return process
+
+    def fail_start(_tracker: _InvocationTracker) -> None:
+        raise RuntimeError("injected tracker start failure")
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(_InvocationTracker, "start", fail_start)
+
+    with pytest.raises(RuntimeError, match="injected tracker start failure"):
+        _invoke(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+    assert len(launched_pids) == 1
+    assert not psutil.pid_exists(launched_pids[0])
+
+
+def test_invocation_tracker_stop_fails_closed_if_thread_remains_alive() -> None:
+    class StuckThread:
+        ident = 1
+
+        @staticmethod
+        def join(*, timeout: int) -> None:
+            assert timeout == 1
+
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    tracker = _InvocationTracker(999_999_999)
+    tracker._thread = StuckThread()  # type: ignore[assignment]
+
+    with pytest.raises(CandidateGateError, match="tracker did not stop"):
+        tracker.stop()
+
+
+def test_default_gate_runner_scrubs_internal_invocation_marker(tmp_path: Path) -> None:
+    script = (
+        "import os; "
+        f"print(os.environ[{_INVOCATION_MARKER_ENV!r}]); "
+        f"print(os.environ[{_INVOCATION_MARKER_ENV!r}], file=__import__('sys').stderr)"
+    )
+
+    completed = _invoke(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=scrubbed_subprocess_environment(),
+        runner=subprocess.run,
+        timeout=2,
+    )
+    evidence = _command_evidence("marker", [sys.executable, "-c", script], completed, ())
+
+    assert completed.stdout == "<gate-invocation>\n"
+    assert completed.stderr == "<gate-invocation>\n"
+    assert evidence.stdout_tail == "<gate-invocation>\n"
+    assert evidence.stderr_tail == "<gate-invocation>\n"
+
+
+def test_default_gate_runner_scrubs_marker_split_by_capture_boundary(tmp_path: Path) -> None:
+    retained_suffix = 64 * 1024 - 32
+    script = (
+        "import os, sys; "
+        f"sys.stdout.write(os.environ[{_INVOCATION_MARKER_ENV!r}] + "
+        f"'x' * {retained_suffix})"
+    )
+
+    completed = _invoke(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=scrubbed_subprocess_environment(),
+        runner=subprocess.run,
+        timeout=2,
+    )
+
+    assert completed.stdout == "<gate-invocation>" + "x" * retained_suffix
+
+
+def test_default_gate_runner_scrubs_internal_marker_from_timeout(tmp_path: Path) -> None:
+    script = (
+        "import os, time; "
+        f"print(os.environ[{_INVOCATION_MARKER_ENV!r}], flush=True); "
+        "time.sleep(10)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        _invoke(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=0.5,
+        )
+
+    assert caught.value.output == "<gate-invocation>\n"
+    assert caught.value.stderr == ""
+
+
+def test_marker_sweep_preserves_reused_pid_with_nonmatching_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "a" * 64
+
+    class ReusedProcess:
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.environment_reads = 0
+            self.killed = False
+
+        def environ(self) -> dict[str, str]:
+            self.environment_reads += 1
+            return {
+                _INVOCATION_MARKER_ENV: marker if self.environment_reads == 1 else "replacement"
+            }
+
+        def is_running(self) -> bool:
+            return True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = ReusedProcess()
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter((process,)))
+
+    assert _kill_marked_invocation_processes(marker) == ()
+    assert not process.killed
+
+
+def test_marker_cleanup_repeats_when_process_forks_after_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "b" * 64
+    processes: list[MarkedProcess] = []
+
+    class MarkedProcess:
+        def __init__(
+            self,
+            pid: int,
+            *,
+            fork_on_kill: bool = False,
+            marked: bool = True,
+        ) -> None:
+            self.pid = pid
+            self.alive = True
+            self.fork_on_kill = fork_on_kill
+            self.marked = marked
+
+        def environ(self) -> dict[str, str]:
+            return {_INVOCATION_MARKER_ENV: marker} if self.alive and self.marked else {}
+
+        def is_running(self) -> bool:
+            return self.alive
+
+        def kill(self) -> None:
+            if self.fork_on_kill:
+                processes.append(MarkedProcess(self.pid + 1, marked=False))
+                self.fork_on_kill = False
+            self.alive = False
+
+    class FinishedCommand:
+        pid = 54321
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    class Tracker:
+        stopped = False
+
+        @staticmethod
+        def _discover() -> None:
+            pass
+
+        @staticmethod
+        def snapshot() -> tuple[MarkedProcess, ...]:
+            return tuple(processes)
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    parent = MarkedProcess(54322, fork_on_kill=True)
+    processes.append(parent)
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter(tuple(processes)))
+    monkeypatch.setattr("autoform_worker.gates.time.sleep", lambda _seconds: None)
+    tracker = Tracker()
+
+    _terminate_invocation(FinishedCommand(), marker, tracker)  # type: ignore[arg-type]
+
+    assert len(processes) == 2
+    assert not any(process.alive for process in processes)
+    assert tracker.stopped
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group behavior is POSIX-specific")
+def test_default_gate_runner_preserves_process_with_other_marker(tmp_path: Path) -> None:
+    environment = scrubbed_subprocess_environment()
+    sentinel_environment = dict(environment)
+    sentinel_environment[_INVOCATION_MARKER_ENV] = "sentinel"
+    sentinel = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        env=sentinel_environment,
+        start_new_session=True,
+    )
+    try:
+        completed = _invoke(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            env=environment,
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+        assert completed.returncode == 0
+        assert sentinel.poll() is None
+    finally:
+        sentinel.kill()
+        sentinel.wait(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process tracking is POSIX-specific")
+def test_default_gate_runner_tracks_descendant_that_clears_marker(tmp_path: Path) -> None:
+    ready = tmp_path / "ready"
+    cleared = tmp_path / "cleared"
+    replacement_script = (
+        "import os, pathlib, sys, time; "
+        "assert sys.argv[2] not in os.environ; "
+        "pathlib.Path(sys.argv[1]).write_text('cleared'); time.sleep(10)"
+    )
+    child_script = (
+        "import os, pathlib, sys; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "environment = dict(os.environ); environment.pop(sys.argv[3], None); "
+        "os.execve(sys.executable, "
+        "[sys.executable, '-c', sys.argv[4], sys.argv[2], sys.argv[3]], environment)"
+    )
+    parent_script = (
+        "import pathlib, subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', *sys.argv[1:]], start_new_session=True)\n"
+        "cleared = pathlib.Path(sys.argv[3])\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not cleared.exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise RuntimeError('child did not clear marker')\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(0.2)\n"
+    )
+
+    completed = _invoke(
+        [
+            sys.executable,
+            "-c",
+            parent_script,
+            child_script,
+            str(ready),
+            str(cleared),
+            _INVOCATION_MARKER_ENV,
+            replacement_script,
+        ],
+        cwd=tmp_path,
+        env=scrubbed_subprocess_environment(),
+        runner=subprocess.run,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert cleared.read_text(encoding="utf-8") == "cleared"
+    child_pid = int(ready.read_text(encoding="utf-8"))
+    assert not psutil.pid_exists(child_pid)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group behavior is POSIX-specific")
 def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Path) -> None:
     ready = tmp_path / "ready"
@@ -677,14 +965,15 @@ def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Pa
     )
     parent_script = (
         "import pathlib, subprocess, sys, time\n"
-        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+        "start_new_session=True)\n"
         "ready = pathlib.Path(sys.argv[2])\n"
         "deadline = time.monotonic() + 5\n"
         "while not ready.exists():\n"
         "    if time.monotonic() >= deadline:\n"
         "        raise RuntimeError('child did not become ready')\n"
         "    time.sleep(0.01)\n"
-        "time.sleep(10)\n"
+        "time.sleep(30)\n"
     )
 
     with pytest.raises(subprocess.TimeoutExpired):
@@ -699,7 +988,7 @@ def test_default_gate_runner_timeout_stops_descendant_before_return(tmp_path: Pa
             cwd=tmp_path,
             env=scrubbed_subprocess_environment(),
             runner=subprocess.run,
-            timeout=2,
+            timeout=5,
         )
 
     child_pid = int(ready.read_text(encoding="utf-8"))
@@ -712,11 +1001,14 @@ def test_default_gate_runner_normal_exit_stops_residual_descendant(tmp_path: Pat
     child_script = (
         "import os, pathlib, signal, sys, time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('detached stdout', flush=True); "
+        "print('detached stderr', file=sys.stderr, flush=True); "
         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(10)"
     )
     parent_script = (
         "import pathlib, subprocess, sys, time\n"
-        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]])\n"
+        "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+        "start_new_session=True)\n"
         "ready = pathlib.Path(sys.argv[2])\n"
         "deadline = time.monotonic() + 5\n"
         "while not ready.exists():\n"
@@ -740,5 +1032,7 @@ def test_default_gate_runner_normal_exit_stops_residual_descendant(tmp_path: Pat
     )
 
     assert completed.returncode == 0
+    assert completed.stdout == "detached stdout\n"
+    assert completed.stderr == "detached stderr\n"
     child_pid = int(ready.read_text(encoding="utf-8"))
     assert not psutil.pid_exists(child_pid)
