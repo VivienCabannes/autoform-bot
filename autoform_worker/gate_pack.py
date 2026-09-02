@@ -243,23 +243,34 @@ def verify_repository_pack(pack: RepositoryPack) -> None:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise GateProviderError("repository pack cannot be reopened safely") from error
+    verification_failed = False
     try:
-        opened = os.fstat(descriptor)
-        if (opened.st_dev, opened.st_ino, opened.st_size, stat.S_IMODE(opened.st_mode)) != expected:
-            raise GateProviderError("repository pack identity changed while it was opened")
-        while True:
-            chunk = os.read(descriptor, min(1024 * 1024, pack.size + 1 - size))
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > pack.size:
-                raise GateProviderError("repository pack grew after it was prepared")
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-        if (after.st_dev, after.st_ino, after.st_size, stat.S_IMODE(after.st_mode)) != expected:
-            raise GateProviderError("repository pack changed while it was hashed")
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_size, stat.S_IMODE(opened.st_mode)) != expected:
+                raise GateProviderError("repository pack identity changed while it was opened")
+            while True:
+                chunk = os.read(descriptor, min(1024 * 1024, pack.size + 1 - size))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > pack.size:
+                    raise GateProviderError("repository pack grew after it was prepared")
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size, stat.S_IMODE(after.st_mode)) != expected:
+                raise GateProviderError("repository pack changed while it was hashed")
+        except OSError as error:
+            raise GateProviderError("repository pack cannot be verified safely") from error
+    except BaseException:
+        verification_failed = True
+        raise
     finally:
-        os.close(descriptor)
+        try:
+            _close_descriptor(descriptor, label="repository pack")
+        except GateProviderError:
+            if not verification_failed:
+                raise
     if size != pack.size or digest.hexdigest() != pack.sha256:
         raise GateProviderError("repository pack content changed")
     if _regular_file_identity(path)[:4] != expected:
@@ -305,28 +316,30 @@ def _stream_pack(
     except OSError as error:
         raise GateProviderError("repository pack process could not start") from error
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    operation_failed = False
     try:
-        process.stdin.write(f"{base_oid}\n{candidate_oid}\n".encode("ascii"))
-        process.stdin.close()
-        size, stderr = _copy_process_output(
-            process,
-            descriptor,
-            digest,
-            maximum_bytes=maximum_bytes,
-            timeout=timeout,
-        )
-        returncode = process.wait(timeout=1)
-    except GateProviderError:
-        _terminate_process(process)
-        raise
-    except (OSError, subprocess.SubprocessError) as error:
-        _terminate_process(process)
-        raise GateProviderError("repository pack process failed") from error
-    finally:
-        process.stdout.close()
-        process.stderr.close()
-        if process.stdin is not None and not process.stdin.closed:
+        try:
+            process.stdin.write(f"{base_oid}\n{candidate_oid}\n".encode("ascii"))
             process.stdin.close()
+            size, stderr = _copy_process_output(
+                process,
+                descriptor,
+                digest,
+                maximum_bytes=maximum_bytes,
+                timeout=timeout,
+            )
+            returncode = process.wait(timeout=1)
+        except GateProviderError:
+            _terminate_process(process)
+            raise
+        except (OSError, subprocess.SubprocessError) as error:
+            _terminate_process(process)
+            raise GateProviderError("repository pack process failed") from error
+    except BaseException:
+        operation_failed = True
+        raise
+    finally:
+        _close_process_pipes(process, preserve_error=operation_failed)
     return subprocess.CompletedProcess(command, returncode, b"", stderr), size
 
 
@@ -376,19 +389,40 @@ def _copy_process_output(
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+    try:
+        if process.poll() is not None:
+            return
+    except Exception:
+        pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
+    except Exception:
         try:
             process.kill()
-        except OSError:
+        except Exception:
             pass
     try:
         process.wait(timeout=1)
-    except (OSError, subprocess.TimeoutExpired):
+    except Exception:
         pass
+
+
+def _close_process_pipes(
+    process: subprocess.Popen[bytes],
+    *,
+    preserve_error: bool,
+) -> None:
+    first_error: OSError | None = None
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None and not preserve_error:
+        raise GateProviderError("repository pack process pipes could not be closed") from first_error
 
 
 def _git_text(repository: Path, arguments: list[str], *, timeout: float) -> str:
@@ -452,9 +486,9 @@ def _git_environment() -> dict[str, str]:
 
 
 def _real_directory(path: Path, *, label: str) -> Path:
-    if path.is_symlink():
-        raise GateProviderError(f"{label} must not be a symbolic link")
     try:
+        if path.is_symlink():
+            raise GateProviderError(f"{label} must not be a symbolic link")
         resolved = path.expanduser().resolve(strict=True)
         info = resolved.stat(follow_symlinks=False)
     except OSError as error:
@@ -551,9 +585,9 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 
 
 def _regular_file_identity(path: Path) -> tuple[int, int, int, int, int]:
-    if path.is_symlink():
-        raise GateProviderError("repository pack pathname became a symbolic link")
     try:
+        if path.is_symlink():
+            raise GateProviderError("repository pack pathname became a symbolic link")
         resolved = path.resolve(strict=True)
         info = path.stat(follow_symlinks=False)
     except OSError as error:

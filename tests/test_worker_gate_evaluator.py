@@ -23,6 +23,48 @@ from autoform_worker.gates import CandidateGateResult, _work_item_sha256
 from autoform_worker.scheduler import WorkItem, WorkPhase
 
 
+class _FakePackPipe:
+    def __init__(self, *, fail_close: bool = False) -> None:
+        self.closed = False
+        self.close_attempts = 0
+        self._fail_close = fail_close
+
+    def write(self, content: bytes) -> int:
+        return len(content)
+
+    def close(self) -> None:
+        self.close_attempts += 1
+        if self._fail_close:
+            raise OSError("injected pipe close failure")
+        self.closed = True
+
+
+class _FakePackProcess:
+    def __init__(
+        self,
+        *,
+        failed_pipe: str | None = None,
+        poll_error: Exception | None = None,
+    ) -> None:
+        self.stdin = _FakePackPipe(fail_close=failed_pipe == "stdin")
+        self.stdout = _FakePackPipe(fail_close=failed_pipe == "stdout")
+        self.stderr = _FakePackPipe(fail_close=failed_pipe == "stderr")
+        self.pid = 12345
+        self._poll_error = poll_error
+        self.kill_attempts = 0
+
+    def poll(self) -> int:
+        if self._poll_error is not None:
+            raise self._poll_error
+        return 0
+
+    def kill(self) -> None:
+        self.kill_attempts += 1
+
+    def wait(self, *, timeout: float) -> int:
+        return 0
+
+
 def _git(repository: Path, *arguments: str, input_bytes: bytes | None = None) -> bytes:
     completed = subprocess.run(
         ["git", "-C", str(repository), *arguments],
@@ -258,6 +300,223 @@ def test_host_pack_revalidation_rejects_parent_permission_drift(tmp_path: Path) 
     state.mkdir(mode=0o700)
     with pytest.raises(GateProviderError, match="parent identity"):
         verify_repository_pack(pack)
+
+
+@pytest.mark.parametrize("failure", ["first-fstat", "second-fstat", "read", "close"])
+def test_host_pack_revalidation_wraps_descriptor_failures_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+    original_fstat = gate_pack_module.os.fstat
+    original_read = gate_pack_module.os.read
+    original_close = gate_pack_module.os.close
+    descriptor: int | None = None
+    fstat_calls = 0
+    close_calls = 0
+
+    def injected_fstat(value: int) -> os.stat_result:
+        nonlocal descriptor, fstat_calls
+        if descriptor is None:
+            descriptor = value
+        if value == descriptor:
+            fstat_calls += 1
+            if failure == "first-fstat" and fstat_calls == 1:
+                raise OSError("injected first fstat failure")
+            if failure == "second-fstat" and fstat_calls == 2:
+                raise OSError("injected second fstat failure")
+        return original_fstat(value)
+
+    def injected_read(value: int, length: int) -> bytes:
+        if value == descriptor and failure == "read":
+            raise OSError("injected read failure")
+        return original_read(value, length)
+
+    def injected_close(value: int) -> None:
+        nonlocal close_calls, descriptor
+        if value == descriptor:
+            close_calls += 1
+            descriptor = None
+            original_close(value)
+            if failure == "close":
+                raise OSError("injected close failure")
+            return
+        original_close(value)
+
+    monkeypatch.setattr(gate_pack_module.os, "fstat", injected_fstat)
+    monkeypatch.setattr(gate_pack_module.os, "read", injected_read)
+    monkeypatch.setattr(gate_pack_module.os, "close", injected_close)
+
+    with pytest.raises(GateProviderError):
+        verify_repository_pack(pack)
+
+    assert close_calls == 1
+
+
+def test_host_pack_revalidation_close_failure_does_not_mask_verification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+    original_fstat = gate_pack_module.os.fstat
+    original_close = gate_pack_module.os.close
+    descriptor: int | None = None
+    close_calls = 0
+
+    def capture_fstat(value: int) -> os.stat_result:
+        nonlocal descriptor
+        descriptor = value
+        return original_fstat(value)
+
+    def fail_read(value: int, _length: int) -> bytes:
+        if value == descriptor:
+            raise OSError("injected primary verification failure")
+        raise AssertionError("unexpected descriptor")
+
+    def fail_close(value: int) -> None:
+        nonlocal close_calls, descriptor
+        if value == descriptor:
+            close_calls += 1
+            descriptor = None
+            original_close(value)
+            raise OSError("injected secondary close failure")
+        original_close(value)
+
+    monkeypatch.setattr(gate_pack_module.os, "fstat", capture_fstat)
+    monkeypatch.setattr(gate_pack_module.os, "read", fail_read)
+    monkeypatch.setattr(gate_pack_module.os, "close", fail_close)
+
+    with pytest.raises(GateProviderError, match="verified safely") as captured:
+        verify_repository_pack(pack)
+
+    assert "primary verification failure" in str(captured.value.__cause__)
+    assert close_calls == 1
+
+
+@pytest.mark.parametrize("entry_point", ["prepare", "verify"])
+def test_host_pack_public_entry_points_wrap_lstat_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+    watched = repository if entry_point == "prepare" else Path(pack.path)
+    original_lstat = Path.lstat
+
+    def fail_lstat(path: Path) -> os.stat_result:
+        if path == watched:
+            raise OSError("injected lstat failure")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_lstat)
+
+    with pytest.raises(GateProviderError, match="cannot be inspected"):
+        if entry_point == "prepare":
+            prepare_repository_pack(
+                repository,
+                state / "second.pack",
+                base_oid=base_oid,
+                candidate_oid=candidate_oid,
+                maximum_bytes=1024 * 1024,
+                timeout_seconds=30,
+            )
+        else:
+            verify_repository_pack(pack)
+
+
+@pytest.mark.parametrize("failed_pipe", ["stdin", "stdout", "stderr"])
+def test_repository_pack_stream_wraps_each_pipe_close_and_closes_the_rest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_pipe: str,
+) -> None:
+    process = _FakePackProcess(failed_pipe=failed_pipe)
+    monkeypatch.setattr(gate_pack_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        gate_pack_module,
+        "_copy_process_output",
+        lambda *args, **kwargs: (4, b""),
+    )
+
+    with pytest.raises(GateProviderError):
+        gate_pack_module._stream_pack(
+            tmp_path,
+            -1,
+            hashlib.sha256(),
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1024,
+            timeout=1,
+        )
+
+    assert process.stdin.close_attempts >= 1
+    assert process.stdout.close_attempts == 1
+    assert process.stderr.close_attempts == 1
+
+
+def test_repository_pack_stream_preserves_gate_failure_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakePackProcess(failed_pipe="stdout", poll_error=OSError("injected poll failure"))
+    monkeypatch.setattr(gate_pack_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        gate_pack_module,
+        "_copy_process_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(GateProviderError("primary gate failure")),
+    )
+    monkeypatch.setattr(
+        gate_pack_module.os,
+        "killpg",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    with pytest.raises(GateProviderError, match="primary gate failure"):
+        gate_pack_module._stream_pack(
+            tmp_path,
+            -1,
+            hashlib.sha256(),
+            base_oid="1" * 40,
+            candidate_oid="2" * 40,
+            maximum_bytes=1024,
+            timeout=1,
+        )
+
+    assert process.kill_attempts == 1
+    assert process.stdin.close_attempts >= 1
+    assert process.stdout.close_attempts == 1
+    assert process.stderr.close_attempts == 1
 
 
 def test_host_pack_publication_preserves_a_replaced_staging_entry(
