@@ -882,6 +882,90 @@ def test_blueprint_scaffold_retains_child_bindings_until_completion(
     assert list((target / "coverage").iterdir()) == []
 
 
+def test_blueprint_scaffold_rejects_file_replacement_after_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    displaced = target / "coverage/original-readme"
+    replaced = False
+
+    def replace_file(
+        event: str,
+        relative: str,
+        _binding: scaffold_module._BlueprintScaffoldBinding,
+    ) -> None:
+        nonlocal replaced
+        if event != "after-parent-fsync" or relative != "coverage" or replaced:
+            return
+        readme = target / "coverage/README.md"
+        readme.rename(displaced)
+        readme.write_text("foreign replacement\n", encoding="utf-8")
+        replaced = True
+
+    monkeypatch.setattr(scaffold_module, "_scaffold_binding_checkpoint", replace_file)
+
+    with pytest.raises(ScaffoldError, match="blueprint file changed"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert replaced
+    assert displaced.is_file()
+    assert (target / "coverage/README.md").read_text(encoding="utf-8") == (
+        "foreign replacement\n"
+    )
+
+
+def test_blueprint_scaffold_fsyncs_every_generated_parent_deepest_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    events: list[tuple[str, str]] = []
+
+    def record(
+        event: str,
+        relative: str,
+        _binding: scaffold_module._BlueprintScaffoldBinding,
+    ) -> None:
+        events.append((event, relative))
+
+    monkeypatch.setattr(scaffold_module, "_scaffold_binding_checkpoint", record)
+
+    scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    parents = ["coverage", "javascripts", "roadmap", "sources", "."]
+    assert events == [
+        item
+        for parent in parents
+        for item in (
+            ("before-parent-fsync", parent),
+            ("after-parent-fsync", parent),
+        )
+    ]
+
+
+def test_blueprint_scaffold_fails_closed_on_generated_parent_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+
+    def fail(
+        event: str,
+        relative: str,
+        _binding: scaffold_module._BlueprintScaffoldBinding,
+    ) -> None:
+        if event == "before-parent-fsync" and relative == "roadmap":
+            raise OSError("injected parent fsync failure")
+
+    monkeypatch.setattr(scaffold_module, "_scaffold_binding_checkpoint", fail)
+
+    with pytest.raises(ScaffoldError, match="durably: roadmap"):
+        scaffold_module.scaffold_blueprint(target, title="Probe")
+
+    assert (target / "roadmap/README.md").is_file()
+
+
 def test_a_title_with_a_colon_stays_one_yaml_key(tmp_path: Path) -> None:
     """`site_name: Algebra: Foundations` is a nested mapping, not a title."""
     from autoform_cli import scaffold as scaffold_module

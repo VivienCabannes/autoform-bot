@@ -12,6 +12,7 @@ workspace scaffolds write it.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -90,6 +91,63 @@ class ScaffoldResult:
             "skipped": list(self.skipped),
             "unpinned": self.unpinned,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ScaffoldDirectoryBinding:
+    descriptor: int
+    identity: tuple[int, int]
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ScaffoldFileBinding:
+    descriptor: int
+    identity: tuple[int, int]
+    size: int
+    sha256: str
+    mode: int
+
+
+@dataclass(slots=True)
+class _BlueprintScaffoldBinding:
+    """Descriptors and exact entries retained until project registration."""
+
+    root: Path
+    root_descriptor: int
+    root_identity: tuple[int, int]
+    root_mode: int
+    root_issue: str
+    root_parent_descriptor: int | None
+    root_name: str | None
+    directories: dict[tuple[str, ...], _ScaffoldDirectoryBinding]
+    files: dict[tuple[str, ...], _ScaffoldFileBinding]
+    expected_entries: dict[tuple[str, ...], frozenset[str]]
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for file_binding in self.files.values():
+            if file_binding is None:
+                continue
+            try:
+                os.close(file_binding.descriptor)
+            except OSError:
+                pass
+        for directory_binding in reversed(tuple(self.directories.values())):
+            try:
+                os.close(directory_binding.descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(self.root_descriptor)
+        except OSError:
+            pass
+
+    def __del__(self) -> None:
+        self.close()
 
 
 def _destination(relative: str) -> str:
@@ -397,74 +455,73 @@ def _publish_new_directory(
 
 
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        expected = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        try:
-            descriptor, _ = _publish_new_directory(
-                parent_descriptor,
-                name,
-                mode=0o755,
-                rename_noreplace=_rename_directory_noreplace,
-                fsync_directory=os.fsync,
-                checkpoint=_scaffold_directory_checkpoint,
-            )
-            return descriptor
-        except _DirectoryPublicationError as error:
-            stage_detail = (
-                f"; staged name was {error.staging_name}"
-                if error.staging_name is not None
-                else ""
-            )
-            if error.reason == "durability":
-                issue = f"cannot commit blueprint directory durably: {name}{stage_detail}"
-            elif error.reason in {"changed", "collision"}:
-                issue = f"blueprint directory changed during creation: {name}{stage_detail}"
+        descriptor, _ = _publish_new_directory(
+            parent_descriptor,
+            name,
+            mode=0o755,
+            rename_noreplace=_rename_directory_noreplace,
+            fsync_directory=os.fsync,
+            checkpoint=_scaffold_directory_checkpoint,
+        )
+        return descriptor
+    except _DirectoryPublicationError as error:
+        stage_detail = (
+            f"; staged name was {error.staging_name}"
+            if error.staging_name is not None
+            else ""
+        )
+        if error.reason == "collision":
+            try:
+                collided = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except OSError:
+                collided = None
+            if collided is not None and stat.S_ISLNK(collided.st_mode):
+                issue = f"cannot open blueprint directory safely: {name}{stage_detail}"
             else:
-                issue = f"cannot create blueprint directory: {name}{stage_detail}"
-            raise ScaffoldError([issue]) from None
-    except OSError:
-        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
-    if not stat.S_ISDIR(expected.st_mode):
-        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"])
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
-    except OSError:
-        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
-    try:
-        opened = os.fstat(descriptor)
-    except OSError:
-        os.close(descriptor)
-        raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
-    if (
-        not stat.S_ISDIR(opened.st_mode)
-        or _stat_identity(opened) != _stat_identity(expected)
-    ):
-        os.close(descriptor)
-        raise ScaffoldError([f"blueprint directory changed while it was being opened: {name}"])
-    return descriptor
+                issue = f"blueprint directory changed during creation: {name}{stage_detail}"
+        elif error.reason == "durability":
+            issue = f"cannot commit blueprint directory durably: {name}{stage_detail}"
+        elif error.reason == "changed":
+            issue = f"blueprint directory changed during creation: {name}{stage_detail}"
+        else:
+            issue = f"cannot create blueprint directory: {name}{stage_detail}"
+        raise ScaffoldError([issue]) from None
 
 
 def _verify_scaffold_directories(
     root_descriptor: int,
-    bindings: dict[tuple[str, ...], tuple[int, tuple[int, int]]],
+    bindings: dict[tuple[str, ...], _ScaffoldDirectoryBinding],
 ) -> None:
-    for parts, (descriptor, identity) in bindings.items():
+    for parts, binding in bindings.items():
         parent_descriptor = (
-            root_descriptor if len(parts) == 1 else bindings[parts[:-1]][0]
+            root_descriptor
+            if len(parts) == 1
+            else bindings[parts[:-1]].descriptor
         )
         try:
-            _verify_directory_binding(parent_descriptor, parts[-1], descriptor, identity)
+            _verify_directory_binding(
+                parent_descriptor,
+                parts[-1],
+                binding.descriptor,
+                binding.identity,
+                mode=binding.mode,
+            )
         except _DirectoryPublicationError:
             raise ScaffoldError(
                 [f"blueprint directory changed during scaffold: {'/'.join(parts)}"]
             ) from None
 
 
-def _exclusive_write_at(parent_descriptor: int, name: str, content: bytes, *, mode: int) -> None:
+def _exclusive_write_at(
+    parent_descriptor: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int,
+) -> _ScaffoldFileBinding:
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | os.O_NOFOLLOW
@@ -477,12 +534,215 @@ def _exclusive_write_at(parent_descriptor: int, name: str, content: bytes, *, mo
     except OSError:
         raise ScaffoldError([f"cannot create blueprint file safely: {name}"]) from None
     try:
-        with os.fdopen(descriptor, "wb") as output:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(os.dup(descriptor), "wb") as output:
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        identity = _stat_identity(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or identity != _stat_identity(named)
+            or opened.st_size != len(content)
+            or named.st_size != len(content)
+            or stat.S_IMODE(opened.st_mode) != mode
+            or stat.S_IMODE(named.st_mode) != mode
+        ):
+            raise OSError("created blueprint file changed")
+        return _ScaffoldFileBinding(
+            descriptor,
+            identity,
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            mode,
+        )
     except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
         raise ScaffoldError([f"cannot write blueprint file safely: {name}"]) from None
+
+
+def _verify_scaffold_file(
+    parent_descriptor: int,
+    name: str,
+    binding: _ScaffoldFileBinding,
+) -> None:
+    try:
+        before = os.fstat(binding.descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or _stat_identity(before) != binding.identity
+            or _stat_identity(named) != binding.identity
+            or before.st_size != binding.size
+            or named.st_size != binding.size
+            or stat.S_IMODE(before.st_mode) != binding.mode
+            or stat.S_IMODE(named.st_mode) != binding.mode
+        ):
+            raise OSError("blueprint file binding changed")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < binding.size:
+            chunk = os.pread(
+                binding.descriptor,
+                min(1024 * 1024, binding.size - offset),
+                offset,
+            )
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(binding.descriptor)
+        named_after = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            offset != binding.size
+            or digest.hexdigest() != binding.sha256
+            or _stat_identity(after) != binding.identity
+            or _stat_identity(named_after) != binding.identity
+            or after.st_size != binding.size
+            or named_after.st_size != binding.size
+            or stat.S_IMODE(after.st_mode) != binding.mode
+            or stat.S_IMODE(named_after.st_mode) != binding.mode
+        ):
+            raise OSError("blueprint file content changed")
+    except OSError:
+        raise ScaffoldError([f"blueprint file changed during scaffold: {name}"]) from None
+
+
+def _bind_existing_scaffold_file(
+    parent_descriptor: int,
+    name: str,
+    content: bytes,
+    *,
+    mode: int,
+) -> _ScaffoldFileBinding:
+    """Compatibility path for wrappers around the private write seam."""
+
+    descriptor: int | None = None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        expected = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        binding = _ScaffoldFileBinding(
+            descriptor,
+            _stat_identity(opened),
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            mode,
+        )
+        if _stat_identity(expected) != binding.identity:
+            raise OSError("blueprint file changed while binding")
+        _verify_scaffold_file(parent_descriptor, name, binding)
+        return binding
+    except (OSError, ScaffoldError):
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise ScaffoldError([f"cannot retain blueprint file safely: {name}"]) from None
+
+
+def _scaffold_parent_descriptor(
+    binding: _BlueprintScaffoldBinding,
+    parts: tuple[str, ...],
+) -> int:
+    return (
+        binding.root_descriptor
+        if not parts
+        else binding.directories[parts].descriptor
+    )
+
+
+def _verify_blueprint_scaffold_binding(
+    binding: _BlueprintScaffoldBinding,
+    *,
+    exact: bool,
+) -> None:
+    """Verify descriptor identities, contents, modes, and the generated tree."""
+
+    if binding._closed:
+        raise ScaffoldError(["blueprint scaffold binding is closed"])
+    try:
+        opened_root = os.fstat(binding.root_descriptor)
+        named_root = (
+            binding.root.stat(follow_symlinks=False)
+            if binding.root_parent_descriptor is None or binding.root_name is None
+            else os.stat(
+                binding.root_name,
+                dir_fd=binding.root_parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except OSError:
+        raise ScaffoldError([binding.root_issue]) from None
+    if (
+        not stat.S_ISDIR(opened_root.st_mode)
+        or not stat.S_ISDIR(named_root.st_mode)
+        or _stat_identity(opened_root) != binding.root_identity
+        or _stat_identity(named_root) != binding.root_identity
+        or stat.S_IMODE(opened_root.st_mode) != binding.root_mode
+        or stat.S_IMODE(named_root.st_mode) != binding.root_mode
+    ):
+        raise ScaffoldError([binding.root_issue])
+    _verify_scaffold_directories(binding.root_descriptor, binding.directories)
+    for parts, file_binding in binding.files.items():
+        parent = _scaffold_parent_descriptor(binding, parts[:-1])
+        _verify_scaffold_file(parent, parts[-1], file_binding)
+    for parts, expected in binding.expected_entries.items():
+        if parts and parts not in binding.directories:
+            if exact:
+                raise ScaffoldError(
+                    [f"generated blueprint directory is missing: {'/'.join(parts)}"]
+                )
+            continue
+        descriptor = _scaffold_parent_descriptor(binding, parts)
+        try:
+            actual = frozenset(os.listdir(descriptor))
+        except OSError:
+            raise ScaffoldError(
+                [f"cannot inspect generated blueprint entries: {'/'.join(parts) or '.'}"]
+            ) from None
+        if actual - expected or (exact and actual != expected):
+            raise ScaffoldError(
+                [f"generated blueprint entries changed: {'/'.join(parts) or '.'}"]
+            )
+    _verify_scaffold_directories(binding.root_descriptor, binding.directories)
+    try:
+        opened_root = os.fstat(binding.root_descriptor)
+        named_root = (
+            binding.root.stat(follow_symlinks=False)
+            if binding.root_parent_descriptor is None or binding.root_name is None
+            else os.stat(
+                binding.root_name,
+                dir_fd=binding.root_parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+    except OSError:
+        raise ScaffoldError([binding.root_issue]) from None
+    if (
+        _stat_identity(opened_root) != binding.root_identity
+        or _stat_identity(named_root) != binding.root_identity
+        or stat.S_IMODE(opened_root.st_mode) != binding.root_mode
+        or stat.S_IMODE(named_root.st_mode) != binding.root_mode
+    ):
+        raise ScaffoldError([binding.root_issue])
+
+
+def _scaffold_binding_checkpoint(
+    _event: str,
+    _relative: str,
+    _binding: _BlueprintScaffoldBinding,
+) -> None:
+    """Deterministic file and durability race boundary used by tests."""
 
 
 def scaffold_project(
@@ -617,6 +877,9 @@ def scaffold_blueprint(
     title: str,
     _directory_descriptor: int | None = None,
     _directory_identity: tuple[int, int] | None = None,
+    _directory_parent_descriptor: int | None = None,
+    _directory_name: str | None = None,
+    _retained_bindings: list[_BlueprintScaffoldBinding] | None = None,
 ) -> tuple[str, ...]:
     """Write only the vault files beneath ``templates/blueprint`` into *target*.
 
@@ -630,12 +893,15 @@ def scaffold_blueprint(
     issues: list[str] = []
     if not title.strip():
         issues.append("project title must not be empty")
-    if requested.is_symlink():
-        issues.append(f"refusing to scaffold into a symlink: {requested}")
-    if not requested.exists():
-        issues.append(f"target directory does not exist: {requested}")
-    elif not requested.is_dir():
-        issues.append(f"target exists and is not a directory: {requested}")
+    if _directory_descriptor is None:
+        if requested.is_symlink():
+            issues.append(f"refusing to scaffold into a symlink: {requested}")
+        if not requested.exists():
+            issues.append(f"target directory does not exist: {requested}")
+        elif not requested.is_dir():
+            issues.append(f"target exists and is not a directory: {requested}")
+    elif (_directory_parent_descriptor is None) != (_directory_name is None):
+        issues.append("blueprint directory parent binding is incomplete")
     if issues:
         raise ScaffoldError(issues)
 
@@ -644,6 +910,8 @@ def scaffold_blueprint(
         if _directory_descriptor is None
         else os.dup(_directory_descriptor)
     )
+    retained = False
+    scaffold_binding: _BlueprintScaffoldBinding | None = None
     try:
         opened = os.fstat(root_descriptor)
         if not stat.S_ISDIR(opened.st_mode):
@@ -658,62 +926,122 @@ def scaffold_blueprint(
 
         substitutions = {"PROJECT_TITLE": title.strip()}
         source_root = _TEMPLATES / "blueprint"
-        written: list[str] = []
-        bindings: dict[tuple[str, ...], tuple[int, tuple[int, int]]] = {}
-        try:
-            for template in sorted(source_root.rglob("*")):
-                relative_path = template.relative_to(source_root)
-                if (
-                    not template.is_file()
-                    or "__pycache__" in relative_path.parts
-                    or template.suffix == ".pyc"
-                ):
-                    continue
-                relative = relative_path.as_posix()
-                destination_relative = ".gitignore" if relative == "gitignore" else relative
-                if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
-                    content = template.read_bytes()
-                else:
-                    content = _render(template.read_text(encoding="utf-8"), substitutions).encode(
-                        "utf-8"
-                    )
-
-                parent_descriptor = root_descriptor
-                parts: tuple[str, ...] = ()
-                for part in Path(destination_relative).parts[:-1]:
-                    parts = (*parts, part)
-                    binding = bindings.get(parts)
-                    if binding is None:
-                        descriptor = _open_or_create_directory(parent_descriptor, part)
-                        try:
-                            opened = os.fstat(descriptor)
-                        except OSError:
-                            os.close(descriptor)
-                            raise ScaffoldError(
-                                [f"cannot retain blueprint directory safely: {'/'.join(parts)}"]
-                            ) from None
-                        binding = (descriptor, _stat_identity(opened))
-                        bindings[parts] = binding
-                    parent_descriptor = binding[0]
-                _verify_scaffold_directories(root_descriptor, bindings)
-                _exclusive_write_at(
-                    parent_descriptor,
-                    Path(destination_relative).name,
-                    content,
-                    mode=stat.S_IMODE(template.stat().st_mode),
+        rendered: list[tuple[str, bytes, int]] = []
+        expected_entries: dict[tuple[str, ...], set[str]] = {(): set()}
+        for template in sorted(source_root.rglob("*")):
+            relative_path = template.relative_to(source_root)
+            if (
+                not template.is_file()
+                or "__pycache__" in relative_path.parts
+                or template.suffix == ".pyc"
+            ):
+                continue
+            relative = relative_path.as_posix()
+            destination_relative = ".gitignore" if relative == "gitignore" else relative
+            destination_parts = Path(destination_relative).parts
+            for index, part in enumerate(destination_parts):
+                parent_parts = tuple(destination_parts[:index])
+                expected_entries.setdefault(parent_parts, set()).add(part)
+                if index < len(destination_parts) - 1:
+                    expected_entries.setdefault(tuple(destination_parts[: index + 1]), set())
+            if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
+                content = template.read_bytes()
+            else:
+                content = _render(template.read_text(encoding="utf-8"), substitutions).encode(
+                    "utf-8"
                 )
-                _verify_scaffold_directories(root_descriptor, bindings)
-                written.append(destination_relative)
-            _verify_scaffold_directories(root_descriptor, bindings)
-            return tuple(written)
-        finally:
-            for descriptor, _ in reversed(tuple(bindings.values())):
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+            rendered.append(
+                (destination_relative, content, stat.S_IMODE(template.stat().st_mode))
+            )
+
+        scaffold_binding = _BlueprintScaffoldBinding(
+            requested,
+            root_descriptor,
+            _stat_identity(opened),
+            stat.S_IMODE(opened.st_mode),
+            (
+                "blueprint destination changed during scaffold"
+                if _directory_identity is not None
+                else "blueprint root changed during scaffold"
+            ),
+            _directory_parent_descriptor,
+            _directory_name,
+            {},
+            {},
+            {parts: frozenset(names) for parts, names in expected_entries.items()},
+        )
+        written: list[str] = []
+        for destination_relative, content, mode in rendered:
+            destination_parts = Path(destination_relative).parts
+            parent_descriptor = root_descriptor
+            parts: tuple[str, ...] = ()
+            for part in destination_parts[:-1]:
+                parts = (*parts, part)
+                directory_binding = scaffold_binding.directories.get(parts)
+                if directory_binding is None:
+                    descriptor = _open_or_create_directory(parent_descriptor, part)
+                    try:
+                        opened_directory = os.fstat(descriptor)
+                    except OSError:
+                        os.close(descriptor)
+                        raise ScaffoldError(
+                            [f"cannot retain blueprint directory safely: {'/'.join(parts)}"]
+                        ) from None
+                    directory_binding = _ScaffoldDirectoryBinding(
+                        descriptor,
+                        _stat_identity(opened_directory),
+                        0o755,
+                    )
+                    scaffold_binding.directories[parts] = directory_binding
+                parent_descriptor = directory_binding.descriptor
+            _verify_blueprint_scaffold_binding(scaffold_binding, exact=False)
+            name = destination_parts[-1]
+            file_binding = _exclusive_write_at(
+                parent_descriptor,
+                name,
+                content,
+                mode=mode,
+            )
+            _verify_scaffold_directories(
+                scaffold_binding.root_descriptor,
+                scaffold_binding.directories,
+            )
+            if file_binding is None:
+                file_binding = _bind_existing_scaffold_file(
+                    parent_descriptor,
+                    name,
+                    content,
+                    mode=mode,
+                )
+            scaffold_binding.files[tuple(destination_parts)] = file_binding
+            _verify_blueprint_scaffold_binding(scaffold_binding, exact=False)
+            written.append(destination_relative)
+
+        _verify_blueprint_scaffold_binding(scaffold_binding, exact=True)
+        for parts in sorted(
+            scaffold_binding.expected_entries,
+            key=lambda item: (-len(item), item),
+        ):
+            relative = "/".join(parts) or "."
+            _verify_blueprint_scaffold_binding(scaffold_binding, exact=True)
+            try:
+                _scaffold_binding_checkpoint("before-parent-fsync", relative, scaffold_binding)
+                os.fsync(_scaffold_parent_descriptor(scaffold_binding, parts))
+                _scaffold_binding_checkpoint("after-parent-fsync", relative, scaffold_binding)
+            except OSError:
+                raise ScaffoldError(
+                    [f"cannot commit generated blueprint entries durably: {relative}"]
+                ) from None
+            _verify_blueprint_scaffold_binding(scaffold_binding, exact=True)
+        if _retained_bindings is not None:
+            _retained_bindings.append(scaffold_binding)
+            retained = True
+        return tuple(written)
     finally:
-        os.close(root_descriptor)
+        if scaffold_binding is None:
+            os.close(root_descriptor)
+        elif not retained:
+            scaffold_binding.close()
 
 
 __all__ = [

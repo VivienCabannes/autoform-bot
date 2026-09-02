@@ -201,6 +201,91 @@ def test_workspace_init_fsyncs_each_created_directory_parent_before_manifest_pub
     ]
 
 
+def test_workspace_init_rejects_root_replacement_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    held = tmp_path / "held-repository"
+    replaced = False
+
+    def replace_root(event: str) -> None:
+        nonlocal replaced
+        if event != "workspace-init-root-bound" or replaced:
+            return
+        root.rename(held)
+        root.mkdir()
+        (root / "foreign").write_text("untouched\n", encoding="utf-8")
+        replaced = True
+
+    monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", replace_root)
+
+    with pytest.raises(WorkspaceError, match="workspace root changed"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert replaced
+    assert {path.name for path in root.iterdir()} == {"foreign"}
+    assert list(held.iterdir()) == []
+
+
+@pytest.mark.parametrize("operation", ["initialize", "load"])
+def test_workspace_root_is_opened_one_component_at_a_time_without_following_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    root = tmp_path / "nested" / "repository"
+    root.mkdir(parents=True)
+    if operation == "load":
+        initialize_workspace(root, blueprint_root="Plans")
+    original_open = workspace_reader_module.os.open
+    calls: list[tuple[str, int, int | None]] = []
+    recording = True
+
+    def record_open(path, flags, mode=0o777, *, dir_fd=None):
+        if recording and flags & os.O_DIRECTORY:
+            calls.append((os.fspath(path), flags, dir_fd))
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def stop_mutation_recording(event: str) -> None:
+        nonlocal recording
+        if event == "workspace-init-root-bound":
+            recording = False
+            workspace_reader_module.os.open = original_open
+
+    def stop_read_recording(
+        event: str,
+        _binding: workspace_reader_module._WorkspaceRootBinding,
+    ) -> None:
+        nonlocal recording
+        if event == "before-manifest-open":
+            recording = False
+            workspace_reader_module.os.open = original_open
+
+    monkeypatch.setattr(workspace_reader_module.os, "open", record_open)
+    if operation == "initialize":
+        monkeypatch.setattr(workspace_module, "_require_workspace_mutation_support", lambda: None)
+        monkeypatch.setattr(
+            workspace_module,
+            "_workspace_mutation_checkpoint",
+            stop_mutation_recording,
+        )
+        initialize_workspace(root, blueprint_root="Plans")
+    else:
+        monkeypatch.setattr(
+            workspace_reader_module,
+            "_workspace_read_checkpoint",
+            stop_read_recording,
+        )
+        load_workspace(root)
+
+    expected_names = [root.anchor, *root.absolute().parts[1:]]
+    assert [name for name, _, _ in calls] == expected_names
+    assert calls[0][2] is None
+    assert all(dir_fd is not None for _, _, dir_fd in calls[1:])
+    assert all(flags & os.O_NOFOLLOW for _, flags, _ in calls)
+
+
 def test_workspace_manifest_name_must_have_canonical_case(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     root.mkdir()
@@ -446,7 +531,7 @@ def test_creation_keeps_its_destination_binding_while_scaffolding(
 
     assert replaced
     assert list((root / "Plans/Example").iterdir()) == []
-    assert (root / "held-example/roadmap").is_dir()
+    assert (root / "held-example/README.md").is_file()
     assert load_workspace(root).manifest.projects == ()
 
 
@@ -594,7 +679,197 @@ def test_creation_fsyncs_destination_and_scaffold_topology_before_registry_commi
     location_identity = (location_metadata.st_dev, location_metadata.st_ino)
     destination_identity = (destination_metadata.st_dev, destination_metadata.st_ino)
     assert before_exchange.count(("directory-fsync", location_identity)) == 1
-    assert before_exchange.count(("directory-fsync", destination_identity)) == 4
+    assert before_exchange.count(("directory-fsync", destination_identity)) == 5
+
+
+def test_creation_rejects_generated_file_replacement_before_registry_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    original_stage = workspace_module._stage_new_file
+    replaced = False
+
+    def replace_after_stage(*args, **kwargs):
+        nonlocal replaced
+        staged = original_stage(*args, **kwargs)
+        if not replaced:
+            readme = root / "Plans/Example/coverage/README.md"
+            readme.rename(root / "Plans/Example/coverage/original-readme")
+            readme.write_text("foreign replacement\n", encoding="utf-8")
+            replaced = True
+        return staged
+
+    monkeypatch.setattr(workspace_module, "_stage_new_file", replace_after_stage)
+
+    with pytest.raises(WorkspaceError, match="blueprint file changed"):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert replaced
+    assert (root / "Plans/Example/coverage/README.md").read_text(encoding="utf-8") == (
+        "foreign replacement\n"
+    )
+    assert load_workspace(root).manifest.projects == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("content", "blueprint file changed"),
+        ("file-mode", "blueprint file changed"),
+        ("directory-mode", "blueprint directory changed"),
+    ],
+)
+def test_creation_rejects_same_inode_generated_artifact_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    root = _workspace(tmp_path)
+    original_stage = workspace_module._stage_new_file
+
+    def mutate_after_stage(*args, **kwargs):
+        staged = original_stage(*args, **kwargs)
+        readme = root / "Plans/Example/coverage/README.md"
+        if mutation == "content":
+            descriptor = os.open(readme, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                os.pwrite(descriptor, b"X", 0)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        elif mutation == "file-mode":
+            readme.chmod(0o600)
+        else:
+            readme.parent.chmod(0o700)
+        return staged
+
+    monkeypatch.setattr(workspace_module, "_stage_new_file", mutate_after_stage)
+
+    with pytest.raises(WorkspaceError, match=message):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert load_workspace(root).manifest.projects == ()
+
+
+def test_creation_rejects_extra_generated_entry_before_registry_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    original_stage = workspace_module._stage_new_file
+
+    def add_after_stage(*args, **kwargs):
+        staged = original_stage(*args, **kwargs)
+        (root / "Plans/Example/foreign").write_text("preserve me\n", encoding="utf-8")
+        return staged
+
+    monkeypatch.setattr(workspace_module, "_stage_new_file", add_after_stage)
+
+    with pytest.raises(WorkspaceError, match="generated blueprint entries changed"):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert (root / "Plans/Example/foreign").read_text(encoding="utf-8") == "preserve me\n"
+    assert load_workspace(root).manifest.projects == ()
+
+
+def test_creation_retains_every_generated_file_descriptor_through_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    original_verify = workspace_module._verify_blueprint_scaffold_binding
+    observed: list[frozenset[str]] = []
+
+    def verify(
+        binding: scaffold_module._BlueprintScaffoldBinding,
+        *,
+        exact: bool,
+    ) -> None:
+        for file_binding in binding.files.values():
+            metadata = os.fstat(file_binding.descriptor)
+            assert stat.S_ISREG(metadata.st_mode)
+        observed.append(frozenset("/".join(parts) for parts in binding.files))
+        original_verify(binding, exact=exact)
+
+    monkeypatch.setattr(workspace_module, "_verify_blueprint_scaffold_binding", verify)
+
+    create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    expected = {
+        ".gitignore",
+        "README.md",
+        "coverage/README.md",
+        "javascripts/mathjax.js",
+        "roadmap/README.md",
+        "sources/README.md",
+    }
+    assert observed
+    assert all(paths == expected for paths in observed)
+
+
+def test_creation_leaves_complete_unregistered_blueprint_on_parent_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+
+    def fail(
+        event: str,
+        relative: str,
+        _binding: scaffold_module._BlueprintScaffoldBinding,
+    ) -> None:
+        if event == "after-parent-fsync" and relative == "roadmap":
+            raise OSError("ambiguous parent fsync result")
+
+    monkeypatch.setattr(scaffold_module, "_scaffold_binding_checkpoint", fail)
+
+    with pytest.raises(WorkspaceError, match="inspect the unregistered directory"):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert (root / "Plans/Example/roadmap/README.md").is_file()
+    assert load_workspace(root).manifest.projects == ()
+
+
+@pytest.mark.parametrize("operation", ["create", "register"])
+def test_project_mutation_rejects_workspace_root_replacement_before_manifest_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    root = _workspace(tmp_path)
+    if operation == "register":
+        (root / "Plans/Example/roadmap").mkdir(parents=True)
+    held = tmp_path / "held-repository"
+    replaced = False
+
+    def replace_root(event: str) -> None:
+        nonlocal replaced
+        if event != "registry-before-read" or replaced:
+            return
+        root.rename(held)
+        root.mkdir()
+        (root / "foreign").write_text("untouched\n", encoding="utf-8")
+        replaced = True
+
+    monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", replace_root)
+
+    with pytest.raises(WorkspaceError, match="workspace root changed"):
+        if operation == "create":
+            create_blueprint_project(
+                root,
+                project_id="example",
+                title="Example",
+                path="Example",
+            )
+        else:
+            register_blueprint_project(
+                root,
+                project_id="example",
+                title="Example",
+                path="Example",
+            )
+
+    assert replaced
+    assert {item.name for item in root.iterdir()} == {"foreign"}
+    assert load_workspace(held).manifest.projects == ()
 
 
 def test_workspace_mutation_fails_before_writing_on_an_unsupported_platform(
@@ -1918,3 +2193,52 @@ def test_workspace_manifest_read_rejects_same_name_root_replacement(
     assert replaced
     assert (root / ".autoform.toml").read_bytes() == replacement_manifest
     assert load_workspace(held_root).manifest.locations[0].path == "Plans"
+
+
+def test_workspace_manifest_read_rejects_root_replacement_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    held_root = tmp_path / "held-repository"
+    replacement_manifest = b'repository = "replacement"\n'
+    replaced = False
+
+    def replace_root(
+        event: str,
+        _binding: workspace_reader_module._WorkspaceRootBinding,
+    ) -> None:
+        nonlocal replaced
+        if event != "before-manifest-open" or replaced:
+            return
+        root.rename(held_root)
+        root.mkdir()
+        (root / ".autoform.toml").write_bytes(replacement_manifest)
+        replaced = True
+
+    monkeypatch.setattr(workspace_reader_module, "_workspace_read_checkpoint", replace_root)
+
+    with pytest.raises(WorkspaceError, match="cannot read .autoform.toml safely"):
+        load_workspace(root)
+
+    assert replaced
+    assert (root / ".autoform.toml").read_bytes() == replacement_manifest
+    assert load_workspace(held_root).manifest.locations[0].path == "Plans"
+
+
+def test_loaded_workspace_retains_and_revalidates_its_root_descriptor(tmp_path: Path) -> None:
+    root = _workspace(tmp_path)
+    workspace = load_workspace(root)
+    expected = root.stat()
+    held_root = tmp_path / "held-repository"
+
+    root.rename(held_root)
+    root.mkdir()
+    (root / ".autoform.toml").write_text('repository = "replacement"\n', encoding="utf-8")
+
+    opened = os.fstat(workspace.root_descriptor)
+    assert (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino)
+    with pytest.raises(WorkspaceError, match="workspace root changed"):
+        workspace.verify_root_binding()
+    assert (root / ".autoform.toml").read_text(encoding="utf-8") == (
+        'repository = "replacement"\n'
+    )

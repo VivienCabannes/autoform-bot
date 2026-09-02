@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from .workspace_manifest import (
@@ -21,6 +21,132 @@ from .workspace_manifest import (
 )
 
 
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+@dataclass(slots=True)
+class _WorkspaceRootBinding:
+    """A lexical absolute directory chain retained for a workspace lifetime."""
+
+    path: Path
+    descriptors: tuple[int, ...]
+    identities: tuple[tuple[int, int], ...]
+    _closed: bool = False
+
+    @property
+    def descriptor(self) -> int:
+        if self._closed:
+            raise OSError("workspace root binding is closed")
+        return self.descriptors[-1]
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return self.identities[-1]
+
+    def verify(self) -> None:
+        """Verify every retained component name still names its bound inode."""
+
+        if self._closed or len(self.descriptors) != len(self.identities):
+            raise OSError("workspace root binding is incomplete")
+        anchor = self.path.anchor
+        if not anchor:
+            raise OSError("workspace root is not absolute")
+        opened = os.fstat(self.descriptors[0])
+        named = os.stat(anchor, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != self.identities[0]
+            or (named.st_dev, named.st_ino) != self.identities[0]
+        ):
+            raise OSError("workspace root anchor changed")
+        for index, part in enumerate(self.path.parts[1:], start=1):
+            opened = os.fstat(self.descriptors[index])
+            named = os.stat(
+                part,
+                dir_fd=self.descriptors[index - 1],
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(named.st_mode)
+                or (opened.st_dev, opened.st_ino) != self.identities[index]
+                or (named.st_dev, named.st_ino) != self.identities[index]
+            ):
+                raise OSError("workspace root component changed")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor in reversed(self.descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _open_workspace_root(path: Path) -> _WorkspaceRootBinding:
+    """Bind every component of a lexical absolute root without following links."""
+
+    absolute = Path(os.path.abspath(path))
+    descriptors: list[int] = []
+    identities: list[tuple[int, int]] = []
+    try:
+        anchor = absolute.anchor
+        if not anchor:
+            raise OSError("workspace root is not absolute")
+        descriptor = os.open(anchor, _DIRECTORY_FLAGS)
+        descriptors.append(descriptor)
+        opened = os.fstat(descriptor)
+        named = os.stat(anchor, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise OSError("workspace root anchor changed")
+        identities.append((opened.st_dev, opened.st_ino))
+        for part in absolute.parts[1:]:
+            expected = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(expected.st_mode):
+                raise OSError("workspace root component is not a directory")
+            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            descriptors.append(child)
+            opened = os.fstat(child)
+            named = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or identity != (expected.st_dev, expected.st_ino)
+                or identity != (named.st_dev, named.st_ino)
+            ):
+                raise OSError("workspace root component changed")
+            identities.append(identity)
+            descriptor = child
+        binding = _WorkspaceRootBinding(absolute, tuple(descriptors), tuple(identities))
+        binding.verify()
+        return binding
+    except OSError:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise WorkspaceError(
+            ["workspace root path must not contain a symbolic link or change while opening"]
+        ) from None
+
+
+def _workspace_read_checkpoint(_event: str, _binding: _WorkspaceRootBinding) -> None:
+    """Deterministic root-substitution boundary used by adversarial tests."""
+
+
 @dataclass(frozen=True, slots=True)
 class Workspace:
     """A validated manifest anchored to its repository root."""
@@ -28,6 +154,66 @@ class Workspace:
     root: Path
     manifest: WorkspaceManifest
     manifest_sha256: str
+    _root_binding: _WorkspaceRootBinding | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self._root_binding is not None:
+            return
+        normalized = Path(os.path.abspath(self.root))
+        object.__setattr__(self, "root", normalized)
+        object.__setattr__(self, "_root_binding", _open_workspace_root(normalized))
+
+    @property
+    def root_descriptor(self) -> int:
+        assert self._root_binding is not None
+        return self._root_binding.descriptor
+
+    @property
+    def root_identity(self) -> tuple[int, int]:
+        assert self._root_binding is not None
+        return self._root_binding.identity
+
+    def verify_root_binding(self) -> None:
+        assert self._root_binding is not None
+        try:
+            self._root_binding.verify()
+        except OSError:
+            raise WorkspaceError(["workspace root changed during use"]) from None
+
+    def close(self) -> None:
+        """Release retained root descriptors when the workspace is no longer used."""
+
+        assert self._root_binding is not None
+        self._root_binding.close()
+
+    def duplicate_root_descriptor(self) -> int:
+        """Return a checked duplicate suitable for one bounded mutation."""
+
+        self.verify_root_binding()
+        descriptor: int | None = None
+        try:
+            descriptor = os.dup(self.root_descriptor)
+            opened = os.fstat(descriptor)
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise WorkspaceError(["workspace root changed during use"]) from None
+        if (opened.st_dev, opened.st_ino) != self.root_identity:
+            os.close(descriptor)
+            raise WorkspaceError(["workspace root changed during use"])
+        try:
+            self.verify_root_binding()
+        except WorkspaceError:
+            os.close(descriptor)
+            raise
+        return descriptor
 
     @property
     def path(self) -> Path:
@@ -126,53 +312,53 @@ def load_workspace(root: str | Path) -> Workspace:
     """Load a workspace rooted at *root* without searching its parents."""
 
     try:
-        requested = Path(root).expanduser()
+        requested = Path(os.path.abspath(Path(root).expanduser()))
     except (OSError, RuntimeError, ValueError):
         raise WorkspaceError(["workspace root path cannot be resolved"]) from None
-    if _path_contains_symlink(requested.absolute()):
-        raise WorkspaceError(["workspace root path must not contain a symbolic link"])
+    binding = _open_workspace_root(requested)
     try:
-        resolved = requested.resolve()
-    except (OSError, RuntimeError, ValueError):
-        raise WorkspaceError(["workspace root path cannot be resolved"]) from None
-    _reject_case_collisions(resolved, PurePosixPath(WORKSPACE_FILE))
-    manifest_path = resolved / WORKSPACE_FILE
-    if manifest_path.is_symlink():
-        raise WorkspaceError([f"{WORKSPACE_FILE} must not be a symbolic link"])
-    if manifest_path.exists() and not manifest_path.is_file():
-        raise WorkspaceError([f"{WORKSPACE_FILE} must be a regular file"])
-    content = _read_workspace_manifest(resolved, manifest_path)
-    if len(content) > MAX_MANIFEST_BYTES:
-        raise WorkspaceError([f"{WORKSPACE_FILE} exceeds the {MAX_MANIFEST_BYTES}-byte limit"])
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raise WorkspaceError([f"{WORKSPACE_FILE} is not valid UTF-8 TOML"]) from None
-    manifest = parse_workspace(text)
-    workspace = Workspace(resolved, manifest, hashlib.sha256(content).hexdigest())
-    _validate_workspace_paths(workspace)
-    return workspace
+        binding.verify()
+        _reject_case_collisions(requested, PurePosixPath(WORKSPACE_FILE))
+        binding.verify()
+        manifest_path = requested / WORKSPACE_FILE
+        content = _read_workspace_manifest(binding, manifest_path)
+        if len(content) > MAX_MANIFEST_BYTES:
+            raise WorkspaceError(
+                [f"{WORKSPACE_FILE} exceeds the {MAX_MANIFEST_BYTES}-byte limit"]
+            )
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise WorkspaceError([f"{WORKSPACE_FILE} is not valid UTF-8 TOML"]) from None
+        manifest = parse_workspace(text)
+        workspace = Workspace(
+            requested,
+            manifest,
+            hashlib.sha256(content).hexdigest(),
+            binding,
+        )
+        workspace.verify_root_binding()
+        _validate_workspace_paths(workspace)
+        workspace.verify_root_binding()
+        return workspace
+    except BaseException:
+        binding.close()
+        raise
 
 
-def _read_workspace_manifest(root: Path, manifest_path: Path) -> bytes:
+def _read_workspace_manifest(
+    root_binding: _WorkspaceRootBinding,
+    manifest_path: Path,
+) -> bytes:
     """Read one exact regular manifest generation through a bound root dirfd."""
 
-    directory_flags = (
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    )
     file_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    root_descriptor: int | None = None
     descriptor: int | None = None
     try:
-        root_descriptor = os.open(root, directory_flags)
-        opened_root = os.fstat(root_descriptor)
-        named_root = root.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(opened_root.st_mode)
-            or (opened_root.st_dev, opened_root.st_ino)
-            != (named_root.st_dev, named_root.st_ino)
-        ):
-            raise OSError("workspace root changed")
+        root_binding.verify()
+        _workspace_read_checkpoint("before-manifest-open", root_binding)
+        root_binding.verify()
+        root_descriptor = root_binding.descriptor
         descriptor = os.open(WORKSPACE_FILE, file_flags, dir_fd=root_descriptor)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -191,21 +377,14 @@ def _read_workspace_manifest(root: Path, manifest_path: Path) -> bytes:
             after
         ) != _file_signature(named):
             raise OSError("workspace manifest changed")
-        named_root = root.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(named_root.st_mode)
-            or (opened_root.st_dev, opened_root.st_ino)
-            != (named_root.st_dev, named_root.st_ino)
-        ):
-            raise OSError("workspace root changed")
+        _workspace_read_checkpoint("after-manifest-read", root_binding)
+        root_binding.verify()
         return b"".join(chunks)
     except OSError:
         raise WorkspaceError([f"cannot read {manifest_path.name} safely"]) from None
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        if root_descriptor is not None:
-            os.close(root_descriptor)
 
 
 def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:

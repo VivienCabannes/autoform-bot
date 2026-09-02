@@ -14,15 +14,18 @@ import tomlkit
 from tomlkit.items import InlineTable, KeyType, SingleKey, Table
 
 from .scaffold import (
+    _BlueprintScaffoldBinding,
     ScaffoldError,
     _DirectoryPublicationError,
     _publish_new_directory,
+    _verify_blueprint_scaffold_binding,
     scaffold_blueprint,
 )
 from .project.create import ProjectCreateError, _rename_noreplace
 from .workspace import (
     Workspace,
-    _path_contains_symlink,
+    _WorkspaceRootBinding,
+    _open_workspace_root,
     _reject_case_collisions,
     _reject_existing_symlink_chain,
     discover_workspace,
@@ -69,8 +72,11 @@ class _BlueprintBinding:
     destination_identity: tuple[int, int] | None = None
     roadmap_descriptor: int | None = None
     roadmap_identity: tuple[int, int] | None = None
+    scaffold_binding: _BlueprintScaffoldBinding | None = None
 
     def close(self) -> None:
+        if self.scaffold_binding is not None:
+            self.scaffold_binding.close()
         descriptors = (*self.location_descriptors, self.root_descriptor)
         if self.destination_descriptor is not None:
             descriptors = (self.destination_descriptor, *descriptors)
@@ -96,6 +102,7 @@ class _StagedFile:
 @dataclass(frozen=True, slots=True)
 class _DirectoryChain:
     root: Path
+    root_binding: _WorkspaceRootBinding
     root_descriptor: int
     root_identity: tuple[int, int]
     relative: PurePosixPath
@@ -167,33 +174,53 @@ def initialize_workspace(
             [f"blueprint root uses reserved repository path: {first_component}"]
         )
     try:
-        root = Path(target).expanduser()
+        root = Path(os.path.abspath(Path(target).expanduser()))
     except (OSError, RuntimeError, ValueError):
         raise WorkspaceError(["workspace target cannot be resolved"]) from None
-    if _path_contains_symlink(root.absolute()) or not root.is_dir():
-        raise WorkspaceError(["workspace target must be an existing non-symlink directory"])
-    try:
-        root = root.resolve()
-    except (OSError, RuntimeError, ValueError):
-        raise WorkspaceError(["workspace target cannot be resolved"]) from None
+    root_binding = _open_workspace_root(root)
+    root_descriptor = root_binding.descriptor
+    root_identity = root_binding.identity
     manifest_path = root / WORKSPACE_FILE
-    _reject_case_collisions(root, PurePosixPath(WORKSPACE_FILE))
-    if manifest_path.exists() or manifest_path.is_symlink():
-        raise WorkspaceError([f"{WORKSPACE_FILE} already exists"])
-    collection = root / PurePosixPath(blueprint_root)
-    _reject_case_collisions(root, PurePosixPath(blueprint_root))
-    _reject_existing_symlink_chain(collection, root)
-    _preflight_directory_chain(root, PurePosixPath(blueprint_root))
-
-    root_descriptor, root_identity = _open_bound_directory(root, "workspace root")
     text = _initial_manifest(location_id=location_id, blueprint_root=blueprint_root)
     staged: _StagedFile | None = None
     chain: _DirectoryChain | None = None
     try:
+        _workspace_mutation_checkpoint("workspace-init-root-bound")
+        _verify_root_binding(
+            root,
+            root_descriptor,
+            root_identity,
+            root_binding=root_binding,
+        )
+        _reject_case_collisions(root, PurePosixPath(WORKSPACE_FILE))
+        _reject_case_collisions(root, PurePosixPath(blueprint_root))
+        collection = root / PurePosixPath(blueprint_root)
+        _reject_existing_symlink_chain(collection, root)
+        _preflight_directory_chain(root, PurePosixPath(blueprint_root))
+        _verify_root_binding(
+            root,
+            root_descriptor,
+            root_identity,
+            root_binding=root_binding,
+        )
+        try:
+            os.stat(WORKSPACE_FILE, dir_fd=root_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise WorkspaceError([f"cannot inspect {WORKSPACE_FILE} safely"]) from None
+        else:
+            raise WorkspaceError([f"{WORKSPACE_FILE} already exists"])
         staged = _stage_new_file(
             manifest_path,
             text.encode("utf-8"),
             parent_descriptor=root_descriptor,
+        )
+        _verify_root_binding(
+            root,
+            root_descriptor,
+            root_identity,
+            root_binding=root_binding,
         )
         try:
             chain = _create_directory_chain(
@@ -201,6 +228,7 @@ def initialize_workspace(
                 PurePosixPath(blueprint_root),
                 root_descriptor=root_descriptor,
                 root_identity=root_identity,
+                root_binding=root_binding,
             )
         except WorkspaceError as error:
             detail = "; ".join(error.issues)
@@ -231,10 +259,7 @@ def initialize_workspace(
                 os.close(staged.descriptor)
             except OSError:
                 pass
-        try:
-            os.close(root_descriptor)
-        except OSError:
-            pass
+        root_binding.close()
     return WorkspaceInitResult(root, WORKSPACE_FILE, location_id, blueprint_root)
 
 
@@ -300,12 +325,19 @@ def create_blueprint_project(
         binding.destination_identity = destination_identity
         _verify_blueprint_binding(binding, require_roadmap=False)
         if scaffold_blueprint is _ORIGINAL_SCAFFOLD_BLUEPRINT:
+            retained_bindings: list[_BlueprintScaffoldBinding] = []
             written = scaffold_blueprint(
                 binding.destination,
                 title=title,
                 _directory_descriptor=destination_descriptor,
                 _directory_identity=destination_identity,
+                _directory_parent_descriptor=location_descriptor,
+                _directory_name=member,
+                _retained_bindings=retained_bindings,
             )
+            if len(retained_bindings) != 1:
+                raise WorkspaceError(["blueprint scaffold binding is incomplete"])
+            binding.scaffold_binding = retained_bindings[0]
         else:  # Preserve the small monkeypatch seam used by callers and tests.
             written = scaffold_blueprint(binding.destination, title=title)
         _verify_blueprint_binding(binding, require_roadmap=True)
@@ -433,7 +465,9 @@ def _prepare_blueprint_binding(
     _reject_existing_symlink_chain(collection, workspace.root)
     if not collection.is_dir():
         raise WorkspaceError([f"blueprint location does not exist: {location.path}"])
-    root_descriptor, root_identity = _open_bound_directory(workspace.root, "workspace root")
+    workspace.verify_root_binding()
+    root_descriptor = workspace.duplicate_root_descriptor()
+    root_identity = workspace.root_identity
     try:
         location_descriptors, location_identities = _open_relative_directories(
             root_descriptor,
@@ -565,9 +599,10 @@ def _append_project(
     expected_blueprint_path: str,
     binding: _BlueprintBinding | None = None,
 ) -> str:
-    own_parent = binding is None
+    own_root_binding: _WorkspaceRootBinding | None = None
     if binding is None:
-        parent_descriptor, _ = _open_bound_directory(manifest_path.parent, "workspace root")
+        own_root_binding = _open_workspace_root(manifest_path.parent.absolute())
+        parent_descriptor = own_root_binding.descriptor
     else:
         parent_descriptor = binding.root_descriptor
     descriptor: int | None = None
@@ -576,6 +611,17 @@ def _append_project(
     committed = False
     backup_name: str | None = None
     try:
+        if binding is not None:
+            _verify_blueprint_binding(binding, require_roadmap=True)
+        else:
+            assert own_root_binding is not None
+            own_root_binding.verify()
+        _workspace_mutation_checkpoint("registry-before-read")
+        if binding is not None:
+            _verify_blueprint_binding(binding, require_roadmap=True)
+        else:
+            assert own_root_binding is not None
+            own_root_binding.verify()
         assert fcntl is not None
         fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
         descriptor = _open_locked_manifest(manifest_path, parent_descriptor=parent_descriptor)
@@ -584,6 +630,11 @@ def _append_project(
             raise WorkspaceError([f"{WORKSPACE_FILE} is not a regular file"])
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             original = stream.read(MAX_MANIFEST_BYTES + 1)
+        if binding is not None:
+            _verify_blueprint_binding(binding, require_roadmap=True)
+        else:
+            assert own_root_binding is not None
+            own_root_binding.verify()
         if len(original) > MAX_MANIFEST_BYTES:
             raise WorkspaceError([f"{WORKSPACE_FILE} exceeds the {MAX_MANIFEST_BYTES}-byte limit"])
         try:
@@ -786,11 +837,8 @@ def _append_project(
                 os.close(staged.descriptor)
             except OSError:
                 pass
-        if own_parent:
-            try:
-                os.close(parent_descriptor)
-            except OSError:
-                pass
+        if own_root_binding is not None:
+            own_root_binding.close()
 
 
 def _open_locked_manifest(manifest_path: Path, *, parent_descriptor: int) -> int:
@@ -832,26 +880,6 @@ def _file_signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
 
 def _identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
-
-
-def _open_bound_directory(path: Path, label: str) -> tuple[int, tuple[int, int]]:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        named = path.stat(follow_symlinks=False)
-    except OSError:
-        try:
-            if descriptor is not None:
-                os.close(descriptor)
-        except OSError:
-            pass
-        raise WorkspaceError([f"{label} could not be opened safely"]) from None
-    if not stat.S_ISDIR(opened.st_mode) or _identity(opened) != _identity(named):
-        os.close(descriptor)
-        raise WorkspaceError([f"{label} changed while it was being opened"])
-    return descriptor, _identity(opened)
 
 
 def _open_child_directory(
@@ -905,10 +933,22 @@ def _open_relative_directories(
     return tuple(descriptors), tuple(identities)
 
 
-def _verify_root_binding(path: Path, descriptor: int, identity: tuple[int, int]) -> None:
+def _verify_root_binding(
+    path: Path,
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    root_binding: _WorkspaceRootBinding | None = None,
+) -> None:
     try:
+        if root_binding is not None:
+            if root_binding.path != Path(os.path.abspath(path)):
+                raise OSError("workspace root binding path changed")
+            root_binding.verify()
         opened = os.fstat(descriptor)
-        named = path.stat(follow_symlinks=False)
+        named = os.fstat(descriptor) if root_binding is not None else path.stat(
+            follow_symlinks=False
+        )
     except OSError:
         raise WorkspaceError(["workspace root changed during publication"]) from None
     if (
@@ -959,7 +999,14 @@ def _verify_blueprint_binding(
     *,
     require_roadmap: bool,
 ) -> None:
-    _verify_root_binding(binding.workspace.root, binding.root_descriptor, binding.root_identity)
+    binding.workspace.verify_root_binding()
+    assert binding.workspace._root_binding is not None
+    _verify_root_binding(
+        binding.workspace.root,
+        binding.root_descriptor,
+        binding.root_identity,
+        root_binding=binding.workspace._root_binding,
+    )
     _verify_relative_directories(
         binding.root_descriptor,
         PurePosixPath(binding.location.path),
@@ -1010,6 +1057,11 @@ def _verify_blueprint_binding(
             or _identity(roadmap_named) != binding.roadmap_identity
         ):
             raise WorkspaceError(["registered blueprint roadmap changed during registration"])
+    if binding.scaffold_binding is not None:
+        try:
+            _verify_blueprint_scaffold_binding(binding.scaffold_binding, exact=True)
+        except ScaffoldError as error:
+            raise WorkspaceError(list(error.issues)) from None
 
 
 def _verify_descriptor_content(descriptor: int, content: bytes, issue: str) -> None:
@@ -1551,6 +1603,7 @@ def _create_directory_chain(
     *,
     root_descriptor: int,
     root_identity: tuple[int, int],
+    root_binding: _WorkspaceRootBinding,
 ) -> _DirectoryChain:
     """Create and retain a confined directory chain through publication."""
 
@@ -1560,7 +1613,12 @@ def _create_directory_chain(
     parent_descriptor = root_descriptor
     current = root
     try:
-        _verify_root_binding(root, root_descriptor, root_identity)
+        _verify_root_binding(
+            root,
+            root_descriptor,
+            root_identity,
+            root_binding=root_binding,
+        )
         for part in relative.parts:
             next_path = current / part
             try:
@@ -1605,6 +1663,12 @@ def _create_directory_chain(
                 )
             descriptors.append(next_descriptor)
             identities.append(next_identity)
+            _verify_root_binding(
+                root,
+                root_descriptor,
+                root_identity,
+                root_binding=root_binding,
+            )
             _verify_relative_directories(
                 root_descriptor,
                 PurePosixPath(*relative.parts[: len(descriptors)]),
@@ -1627,6 +1691,7 @@ def _create_directory_chain(
         raise WorkspaceError([detail]) from None
     return _DirectoryChain(
         root,
+        root_binding,
         root_descriptor,
         root_identity,
         relative,
@@ -1637,7 +1702,12 @@ def _create_directory_chain(
 
 
 def _verify_directory_chain(chain: _DirectoryChain) -> None:
-    _verify_root_binding(chain.root, chain.root_descriptor, chain.root_identity)
+    _verify_root_binding(
+        chain.root,
+        chain.root_descriptor,
+        chain.root_identity,
+        root_binding=chain.root_binding,
+    )
     _verify_relative_directories(
         chain.root_descriptor,
         chain.relative,
