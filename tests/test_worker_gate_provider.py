@@ -36,7 +36,7 @@ def _limits() -> DockerSandboxLimits:
     )
 
 
-def _config(*, seccomp_profile_sha256: str = "6" * 64) -> DockerGateProviderConfig:
+def _config(*, seccomp_policy_sha256: str = "6" * 64) -> DockerGateProviderConfig:
     return DockerGateProviderConfig(
         runtime_path="/usr/local/bin/docker",
         runtime_device=1,
@@ -47,6 +47,7 @@ def _config(*, seccomp_profile_sha256: str = "6" * 64) -> DockerGateProviderConf
         runtime_executable_sha256="1" * 64,
         runtime_fingerprint_sha256="2" * 64,
         docker_host="unix:///var/run/docker.sock",
+        docker_daemon_id="ABCDEFGHIJKLMNOPQRSTUVWX",
         docker_socket_device=4,
         docker_socket_inode=5,
         docker_socket_mode=0o660,
@@ -69,7 +70,8 @@ def _config(*, seccomp_profile_sha256: str = "6" * 64) -> DockerGateProviderConf
         seccomp_profile_inode=11,
         seccomp_profile_size=12,
         seccomp_profile_owner_uid=0,
-        seccomp_profile_sha256=seccomp_profile_sha256,
+        seccomp_profile_sha256="7" * 64,
+        seccomp_policy_sha256=seccomp_policy_sha256,
         evaluator_executable="/usr/local/bin/python3",
         container_runtime="runc",
         user="65532:65532",
@@ -187,10 +189,7 @@ def _inspection(
             "ShmSize": 16 * 1024 * 1024,
             "LogConfig": {"Type": "none", "Config": {}},
             "Tmpfs": {
-                "/autoform/work": (
-                    f"rw,nosuid,nodev,size={config.limits.scratch_bytes},"
-                    "uid=65532,gid=65532,mode=0700"
-                ),
+                "/autoform/work": (f"rw,nosuid,nodev,size={config.limits.scratch_bytes},uid=65532,gid=65532,mode=0700"),
             },
             "Binds": None,
             "PortBindings": {},
@@ -283,6 +282,14 @@ def test_provider_config_round_trips_as_canonical_evidence() -> None:
     assert loaded.sha256 == config.sha256
 
 
+def test_provider_config_rejects_unanchored_v2_evidence() -> None:
+    value = _config().as_dict()
+    value["schema"] = "autoform-docker-gate-provider/v2"
+
+    with pytest.raises(GateProviderError, match="unsupported"):
+        DockerGateProviderConfig.from_bytes(_canonical_json(value))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -300,6 +307,8 @@ def test_provider_config_round_trips_as_canonical_evidence() -> None:
         ("seccomp_profile_path", "/other/seccomp.json", "directly under the state directory"),
         ("runtime_executable_sha256", "A" * 64, "lowercase hexadecimal"),
         ("runtime_fingerprint_sha256", "2" * 63, "lowercase hexadecimal"),
+        ("docker_daemon_id", "daemon\nother", "canonical text"),
+        ("seccomp_policy_sha256", "A" * 64, "lowercase hexadecimal"),
         ("image_reference", "autoform-gates:latest", "immutable sha256 digest"),
         ("image_id", "4" * 64, "sha256 algorithm"),
         ("platform", "darwin/arm64", "Linux OCI platform"),
@@ -351,7 +360,7 @@ def test_provider_limits_require_output_to_fit_in_scratch() -> None:
     "content",
     [
         b"{}",
-        b'{"schema":"autoform-docker-gate-provider/v2","schema":"duplicate"}',
+        b'{"schema":"autoform-docker-gate-provider/v3","schema":"duplicate"}',
         b'{"schema":NaN}',
         b"[]",
         b"\xff",
@@ -476,8 +485,7 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
     assert command.count("--security-opt") == 2
     assert command.count("--tmpfs") == 1
     assert command[command.index("--tmpfs") + 1] == (
-        f"/autoform/work:rw,nosuid,nodev,size={config.limits.scratch_bytes},"
-        "uid=65532,gid=65532,mode=0700"
+        f"/autoform/work:rw,nosuid,nodev,size={config.limits.scratch_bytes},uid=65532,gid=65532,mode=0700"
     )
     assert command.count("--ulimit") == 2
     assert all("/autoform/result" not in argument for argument in command)
@@ -515,7 +523,7 @@ def test_docker_create_command_rejects_unbound_config_or_unrepresentable_mount()
 
 def test_docker_create_inspection_produces_bound_canonical_attestation() -> None:
     seccomp_sha256 = hashlib.sha256(_canonical_json(_seccomp_policy())).hexdigest()
-    config = _config(seccomp_profile_sha256=seccomp_sha256)
+    config = _config(seccomp_policy_sha256=seccomp_sha256)
     request = _request(config)
     inspect_bytes = _canonical_json(_inspection(config, request))
 
@@ -571,7 +579,7 @@ def test_docker_create_inspection_rejects_policy_drift(
     value: object,
 ) -> None:
     seccomp_sha256 = hashlib.sha256(_canonical_json(_seccomp_policy())).hexdigest()
-    config = _config(seccomp_profile_sha256=seccomp_sha256)
+    config = _config(seccomp_policy_sha256=seccomp_sha256)
     request = _request(config)
     inspection = copy.deepcopy(_inspection(config, request))
     _set_inspection_path(inspection, path, value)
@@ -597,7 +605,7 @@ def test_docker_create_inspection_rejects_policy_drift(
 )
 def test_docker_create_inspection_rejects_injected_authority(mutation: str) -> None:
     seccomp_sha256 = hashlib.sha256(_canonical_json(_seccomp_policy())).hexdigest()
-    config = _config(seccomp_profile_sha256=seccomp_sha256)
+    config = _config(seccomp_policy_sha256=seccomp_sha256)
     request = _request(config)
     inspection = copy.deepcopy(_inspection(config, request))
     container = inspection["Config"]
@@ -639,7 +647,7 @@ def test_docker_create_inspection_rejects_missing_policy_evidence(
     field: str,
 ) -> None:
     seccomp_sha256 = hashlib.sha256(_canonical_json(_seccomp_policy())).hexdigest()
-    config = _config(seccomp_profile_sha256=seccomp_sha256)
+    config = _config(seccomp_policy_sha256=seccomp_sha256)
     request = _request(config)
     inspection = copy.deepcopy(_inspection(config, request))
     selected = inspection[section]

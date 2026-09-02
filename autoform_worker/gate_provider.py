@@ -10,7 +10,6 @@ import math
 import os
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
@@ -23,7 +22,9 @@ from urllib.parse import urlsplit
 from autoform_cli.graph import ARTICLE_ID_PATTERN
 
 
-DOCKER_GATE_PROVIDER_SCHEMA = "autoform-docker-gate-provider/v2"
+# v3 deliberately rejects v2 evidence: v2 had no external daemon anchor and
+# no separate canonical seccomp policy digest.
+DOCKER_GATE_PROVIDER_SCHEMA = "autoform-docker-gate-provider/v3"
 DOCKER_SANDBOX_POLICY = "autoform-docker-gate-sandbox/v1"
 DOCKER_RUNTIME_BUNDLE_SCHEMA = "autoform-gate-runtime-bundle/v1"
 DOCKER_RUNTIME_FINGERPRINT_SCHEMA = "autoform-docker-runtime-fingerprint/v1"
@@ -65,12 +66,8 @@ _FORBIDDEN_CONTAINER_ENVIRONMENT = frozenset(
         "SSH_AUTH_SOCK",
     }
 )
-_CREDENTIAL_ENVIRONMENT_FRAGMENT = re.compile(
-    r"(?:^|_)(?:API_KEY|CREDENTIALS?|PASSWORD|SECRET|TOKEN)(?:_|$)"
-)
-_RESULT_FRAME_HEADER = re.compile(
-    rb"AUTOFORM-GATE-RESULT/1 (?P<size>[1-9][0-9]*) (?P<sha256>[0-9a-f]{64})\n"
-)
+_CREDENTIAL_ENVIRONMENT_FRAGMENT = re.compile(r"(?:^|_)(?:API_KEY|CREDENTIALS?|PASSWORD|SECRET|TOKEN)(?:_|$)")
+_RESULT_FRAME_HEADER = re.compile(rb"AUTOFORM-GATE-RESULT/1 (?P<size>[1-9][0-9]*) (?P<sha256>[0-9a-f]{64})\n")
 _DOCKER_API_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 _MINIMUM_DOCKER_API_VERSION = (1, 48)
 _RUNTIME_BUNDLE_SCHEMA_LABEL = "org.autoform.runtime-bundle-schema"
@@ -84,6 +81,17 @@ _DOCKER_ARCHITECTURES = {
     "s390x": "s390x",
     "x86_64": "amd64",
 }
+_SECCOMP_DENY_ACTIONS = frozenset(
+    {
+        "SCMP_ACT_ERRNO",
+        "SCMP_ACT_KILL",
+        "SCMP_ACT_KILL_PROCESS",
+        "SCMP_ACT_KILL_THREAD",
+        "SCMP_ACT_TRAP",
+    }
+)
+_SECCOMP_RULE_ACTIONS = _SECCOMP_DENY_ACTIONS | {"SCMP_ACT_ALLOW"}
+_SYSCALL_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 
 class GateProviderError(RuntimeError):
@@ -150,6 +158,7 @@ class _DiscoveryBindings:
     docker_config: _DirectoryIdentity
     seccomp_profile_path: str
     seccomp: _RegularFileIdentity
+    seccomp_policy_sha256: str
     docker_host: str | None = None
     socket: _SocketIdentity | None = None
 
@@ -245,6 +254,7 @@ class DockerGateProviderConfig:
     runtime_executable_sha256: str
     runtime_fingerprint_sha256: str
     docker_host: str
+    docker_daemon_id: str
     docker_socket_device: int
     docker_socket_inode: int
     docker_socket_mode: int
@@ -268,6 +278,7 @@ class DockerGateProviderConfig:
     seccomp_profile_size: int
     seccomp_profile_owner_uid: int
     seccomp_profile_sha256: str
+    seccomp_policy_sha256: str
     evaluator_executable: str
     container_runtime: str
     user: str
@@ -285,6 +296,7 @@ class DockerGateProviderConfig:
             raise GateProviderError("unsupported gate evaluator schema")
         _canonical_absolute_path("runtime path", self.runtime_path)
         _docker_socket_path_text(self.docker_host)
+        _canonical_ascii_text("Docker daemon ID", self.docker_daemon_id)
         _canonical_absolute_path("state directory", self.state_directory)
         _canonical_absolute_path("Docker config directory", self.docker_config_directory)
         _canonical_absolute_path("seccomp profile path", self.seccomp_profile_path)
@@ -320,11 +332,7 @@ class DockerGateProviderConfig:
         ):
             _nonnegative_integer(label, value)
         _permission_mode("runtime mode", self.runtime_mode)
-        if (
-            self.runtime_mode & 0o111 == 0
-            or self.runtime_mode & 0o022
-            or self.runtime_mode & 0o7000
-        ):
+        if self.runtime_mode & 0o111 == 0 or self.runtime_mode & 0o022 or self.runtime_mode & 0o7000:
             raise GateProviderError("runtime mode must be executable and not group/world writable")
         _permission_mode("Docker socket mode", self.docker_socket_mode)
         if self.docker_socket_mode & 0o002:
@@ -334,6 +342,7 @@ class DockerGateProviderConfig:
             ("runtime fingerprint SHA-256", self.runtime_fingerprint_sha256),
             ("runtime bundle SHA-256", self.runtime_bundle_sha256),
             ("seccomp profile SHA-256", self.seccomp_profile_sha256),
+            ("seccomp policy SHA-256", self.seccomp_policy_sha256),
         ):
             _sha256(label, value)
         _canonical_text("image reference", self.image_reference)
@@ -358,6 +367,7 @@ class DockerGateProviderConfig:
             "docker_config_inode": self.docker_config_inode,
             "docker_config_owner_uid": self.docker_config_owner_uid,
             "docker_host": self.docker_host,
+            "docker_daemon_id": self.docker_daemon_id,
             "docker_socket_device": self.docker_socket_device,
             "docker_socket_inode": self.docker_socket_inode,
             "docker_socket_mode": self.docker_socket_mode,
@@ -386,6 +396,7 @@ class DockerGateProviderConfig:
             "seccomp_profile_owner_uid": self.seccomp_profile_owner_uid,
             "seccomp_profile_path": self.seccomp_profile_path,
             "seccomp_profile_sha256": self.seccomp_profile_sha256,
+            "seccomp_policy_sha256": self.seccomp_policy_sha256,
             "seccomp_profile_size": self.seccomp_profile_size,
             "state_directory": self.state_directory,
             "state_directory_device": self.state_directory_device,
@@ -414,6 +425,7 @@ class DockerGateProviderConfig:
             "docker_config_inode",
             "docker_config_owner_uid",
             "docker_host",
+            "docker_daemon_id",
             "docker_socket_device",
             "docker_socket_inode",
             "docker_socket_mode",
@@ -442,6 +454,7 @@ class DockerGateProviderConfig:
             "seccomp_profile_owner_uid",
             "seccomp_profile_path",
             "seccomp_profile_sha256",
+            "seccomp_policy_sha256",
             "seccomp_profile_size",
             "state_directory",
             "state_directory_device",
@@ -478,12 +491,15 @@ class DockerGateProviderConfig:
 def discover_docker_gate_provider(
     *,
     docker_executable: str | Path,
+    expected_runtime_executable_sha256: str,
+    expected_daemon_id: str,
     state_directory: str | Path,
     docker_config_directory: str | Path,
     image_reference: str,
     platform: str,
     runtime_bundle_sha256: str,
     seccomp_profile_path: str | Path,
+    expected_seccomp_profile_sha256: str,
     evaluator_executable: str,
     container_runtime: str,
     user: str,
@@ -492,12 +508,19 @@ def discover_docker_gate_provider(
     command_output_bytes: int = _MAX_INSPECT_BYTES,
     runner: DockerDiscoveryRunner | None = None,
 ) -> DockerGateProviderConfig:
-    """Discover and bind one local Docker daemon suitable for hard gates."""
+    """Discover a provider against caller-supplied, out-of-band trust anchors.
+
+    The expected executable, daemon, and seccomp file identities must not
+    be derived from the local subjects inspected by this function in production.
+    """
 
     timeout = _positive_finite("Docker discovery timeout", command_timeout_seconds)
     _positive_integer("Docker discovery output byte limit", command_output_bytes)
     if command_output_bytes > _MAX_INSPECT_BYTES:
         raise GateProviderError("Docker discovery output byte limit exceeds the hard maximum")
+    _sha256("trusted Docker executable SHA-256", expected_runtime_executable_sha256)
+    _canonical_ascii_text("trusted Docker daemon ID", expected_daemon_id)
+    _sha256("trusted seccomp profile SHA-256", expected_seccomp_profile_sha256)
     _sha256("runtime bundle SHA-256", runtime_bundle_sha256)
     _canonical_text("image reference", image_reference)
     if _IMAGE.fullmatch(image_reference) is None:
@@ -516,6 +539,10 @@ def discover_docker_gate_provider(
         docker_config_directory=docker_config_directory,
         seccomp_profile_path=seccomp_profile_path,
     )
+    if not hmac.compare_digest(bindings.runtime.sha256, expected_runtime_executable_sha256):
+        raise GateProviderError("Docker executable does not match the trusted Docker executable SHA-256")
+    if not hmac.compare_digest(bindings.seccomp.sha256, expected_seccomp_profile_sha256):
+        raise GateProviderError("seccomp profile does not match the trusted seccomp profile SHA-256")
     selected_runner = _bounded_docker_command if runner is None else runner
     common = (
         bindings.runtime_path,
@@ -524,9 +551,10 @@ def discover_docker_gate_provider(
     context = _docker_discovery_json(
         "Docker context inspection",
         (
-            bindings.runtime_path,
+            *common,
             "context",
             "inspect",
+            "default",
             "--format",
             "{{json .Endpoints.docker.Host}}",
         ),
@@ -557,6 +585,16 @@ def discover_docker_gate_provider(
         timeout_seconds=timeout,
         output_bytes_limit=command_output_bytes,
     )
+    version_object = _json_object(version, "Docker version inspection")
+    info_object = _json_object(info, "Docker daemon inspection")
+    runtime_fingerprint = _docker_runtime_fingerprint(
+        docker_host=context,
+        expected_daemon_id=expected_daemon_id,
+        platform=platform,
+        container_runtime=container_runtime,
+        version=version_object,
+        info=info_object,
+    )
     image = _docker_discovery_json(
         "Docker image inspection",
         (
@@ -573,16 +611,7 @@ def discover_docker_gate_provider(
         timeout_seconds=timeout,
         output_bytes_limit=command_output_bytes,
     )
-    version_object = _json_object(version, "Docker version inspection")
-    info_object = _json_object(info, "Docker daemon inspection")
     image_object = _json_object(image, "Docker image inspection")
-    runtime_fingerprint = _docker_runtime_fingerprint(
-        docker_host=context,
-        platform=platform,
-        container_runtime=container_runtime,
-        version=version_object,
-        info=info_object,
-    )
     image_id = _validate_gate_image(
         image_object,
         image_reference=image_reference,
@@ -600,6 +629,7 @@ def discover_docker_gate_provider(
         runtime_executable_sha256=bindings.runtime.sha256,
         runtime_fingerprint_sha256=runtime_fingerprint,
         docker_host=context,
+        docker_daemon_id=expected_daemon_id,
         docker_socket_device=bindings.socket.device,
         docker_socket_inode=bindings.socket.inode,
         docker_socket_mode=bindings.socket.mode,
@@ -623,6 +653,7 @@ def discover_docker_gate_provider(
         seccomp_profile_size=bindings.seccomp.size,
         seccomp_profile_owner_uid=bindings.seccomp.owner_uid,
         seccomp_profile_sha256=bindings.seccomp.sha256,
+        seccomp_policy_sha256=bindings.seccomp_policy_sha256,
         evaluator_executable=evaluator_executable,
         container_runtime=container_runtime,
         user=user,
@@ -645,12 +676,15 @@ def revalidate_docker_gate_provider(
 
     refreshed = discover_docker_gate_provider(
         docker_executable=config.runtime_path,
+        expected_runtime_executable_sha256=config.runtime_executable_sha256,
+        expected_daemon_id=config.docker_daemon_id,
         state_directory=config.state_directory,
         docker_config_directory=config.docker_config_directory,
         image_reference=config.image_reference,
         platform=config.platform,
         runtime_bundle_sha256=config.runtime_bundle_sha256,
         seccomp_profile_path=config.seccomp_profile_path,
+        expected_seccomp_profile_sha256=config.seccomp_profile_sha256,
         evaluator_executable=config.evaluator_executable,
         container_runtime=config.container_runtime,
         user=config.user,
@@ -952,9 +986,7 @@ def attest_docker_create(
     for key, value in expected_labels.items():
         _require_equal(labels, key, value, f"container ownership label {key}")
     extra_autoform_labels = sorted(
-        key
-        for key in labels
-        if key.startswith(_AUTOFORM_LABEL_PREFIX) and key not in expected_labels
+        key for key in labels if key.startswith(_AUTOFORM_LABEL_PREFIX) and key not in expected_labels
     )
     if extra_autoform_labels:
         raise GateProviderError("Docker inspection contains unexpected Autoform ownership labels")
@@ -968,8 +1000,7 @@ def attest_docker_create(
     forbidden_environment = sorted(
         name
         for name in environment
-        if name in _FORBIDDEN_CONTAINER_ENVIRONMENT
-        or _CREDENTIAL_ENVIRONMENT_FRAGMENT.search(name.upper()) is not None
+        if name in _FORBIDDEN_CONTAINER_ENVIRONMENT or _CREDENTIAL_ENVIRONMENT_FRAGMENT.search(name.upper()) is not None
     )
     if forbidden_environment:
         raise GateProviderError("Docker inspection exposed forbidden host environment names")
@@ -1019,10 +1050,7 @@ def docker_create_argv(
         raise GateProviderError("gate invocation does not bind the configured result limit")
     encoded_request = base64.urlsafe_b64encode(request.evidence_bytes()).decode("ascii")
     limits = config.limits
-    mount = (
-        f"type=bind,source={pack},target=/autoform/input/repository.pack,"
-        "readonly,bind-recursive=disabled"
-    )
+    mount = f"type=bind,source={pack},target=/autoform/input/repository.pack,readonly,bind-recursive=disabled"
     arguments = [
         config.runtime_path,
         f"--config={config.docker_config_directory}",
@@ -1132,13 +1160,8 @@ def _bind_discovery_files(
         label="Docker config directory",
         empty=True,
     )
-    seccomp = _inspect_regular_file(
+    seccomp, seccomp_policy_sha256 = _inspect_seccomp_profile(
         seccomp_path,
-        label="seccomp profile",
-        maximum=_MAX_SECCOMP_BYTES,
-        exact_mode=0o444,
-        single_link=True,
-        executable=False,
     )
     runtime = _inspect_regular_file(
         Path(runtime_path),
@@ -1157,6 +1180,7 @@ def _bind_discovery_files(
         docker_config=docker_config,
         seccomp_profile_path=os.fspath(seccomp_path),
         seccomp=seccomp,
+        seccomp_policy_sha256=seccomp_policy_sha256,
     )
 
 
@@ -1164,17 +1188,18 @@ def _resolve_docker_executable(value: str | Path) -> str:
     try:
         requested = os.fspath(value)
     except TypeError as error:
-        raise GateProviderError("Docker executable must be a path or bare command name") from error
+        raise GateProviderError("Docker executable must be an explicit absolute path") from error
     if not isinstance(requested, str) or not requested or requested != requested.strip():
-        raise GateProviderError("Docker executable must be a path or bare command name")
-    if os.sep not in requested:
-        resolved = shutil.which(requested)
-        if resolved is None:
-            raise GateProviderError("Docker executable could not be resolved")
-    else:
-        resolved = requested
-    path = _canonical_real_path(resolved, label="Docker executable")
-    return os.fspath(path)
+        raise GateProviderError("Docker executable must be an explicit absolute path")
+    if not os.path.isabs(requested):
+        raise GateProviderError("Docker executable must be an explicit absolute path")
+    _canonical_absolute_path("Docker executable", requested)
+    try:
+        resolved = os.path.realpath(requested, strict=True)
+    except (OSError, ValueError) as error:
+        raise GateProviderError("Docker executable cannot be resolved safely") from error
+    _canonical_absolute_path("resolved Docker executable", resolved)
+    return resolved
 
 
 def _canonical_real_path(value: str | Path, *, label: str) -> Path:
@@ -1214,9 +1239,7 @@ def _inspect_regular_file(
         raise GateProviderError(f"{label} has an invalid size")
     if exact_mode is not None and permissions != exact_mode:
         raise GateProviderError(f"{label} must have mode {exact_mode:04o}")
-    if executable and (
-        permissions & 0o111 == 0 or permissions & 0o022 or permissions & 0o7000
-    ):
+    if executable and (permissions & 0o111 == 0 or permissions & 0o022 or permissions & 0o7000):
         raise GateProviderError(f"{label} must be executable and not group/world writable")
     if executable and not os.access(path, os.X_OK):
         raise GateProviderError(f"{label} is not executable by the current process")
@@ -1273,6 +1296,123 @@ def _inspect_regular_file(
         links=before.st_nlink,
         sha256=digest.hexdigest(),
     )
+
+
+def _inspect_seccomp_profile(path: Path) -> tuple[_RegularFileIdentity, str]:
+    identity = _inspect_regular_file(
+        path,
+        label="seccomp profile",
+        maximum=_MAX_SECCOMP_BYTES,
+        exact_mode=0o444,
+        single_link=True,
+        executable=False,
+    )
+    content = _read_bound_regular_file(
+        path,
+        expected=identity,
+        maximum=_MAX_SECCOMP_BYTES,
+        label="seccomp profile",
+    )
+    return identity, _canonical_seccomp_policy_sha256(content)
+
+
+def _read_bound_regular_file(
+    path: Path,
+    *,
+    expected: _RegularFileIdentity,
+    maximum: int,
+    label: str,
+) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    content = bytearray()
+    read_failed = False
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not _matches_regular_file_identity(opened, expected):
+            raise GateProviderError(f"{label} changed while it was opened")
+        while chunk := os.read(descriptor, min(1024 * 1024, maximum + 1 - len(content))):
+            content.extend(chunk)
+            if len(content) > maximum:
+                raise GateProviderError(f"{label} exceeds its configured byte limit")
+        if not _matches_regular_file_identity(os.fstat(descriptor), expected):
+            raise GateProviderError(f"{label} changed while it was read")
+    except GateProviderError:
+        read_failed = True
+        raise
+    except OSError as error:
+        read_failed = True
+        raise GateProviderError(f"{label} cannot be read safely") from error
+    except BaseException:
+        read_failed = True
+        raise
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if not read_failed:
+                    raise GateProviderError(f"{label} could not be closed") from error
+    result = bytes(content)
+    if not hmac.compare_digest(hashlib.sha256(result).hexdigest(), expected.sha256):
+        raise GateProviderError(f"{label} changed while it was read")
+    observed = _inspect_regular_file(
+        path,
+        label=label,
+        maximum=maximum,
+        exact_mode=expected.mode,
+        single_link=expected.links == 1,
+        executable=False,
+    )
+    if observed != expected:
+        raise GateProviderError(f"{label} changed while it was read")
+    return result
+
+
+def _matches_regular_file_identity(
+    value: os.stat_result,
+    expected: _RegularFileIdentity,
+) -> bool:
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_dev == expected.device
+        and value.st_ino == expected.inode
+        and stat.S_IMODE(value.st_mode) == expected.mode
+        and value.st_size == expected.size
+        and value.st_uid == expected.owner_uid
+        and value.st_gid == expected.owner_gid
+        and value.st_nlink == expected.links
+    )
+
+
+def _canonical_seccomp_policy_sha256(content: bytes) -> str:
+    policy = _strict_json_bytes(
+        content,
+        label="seccomp profile",
+        maximum=_MAX_SECCOMP_BYTES,
+    )
+    default_action = policy.get("defaultAction")
+    if not isinstance(default_action, str) or default_action not in _SECCOMP_DENY_ACTIONS:
+        raise GateProviderError("seccomp profile must have a deny-by-default action")
+    if "listenerPath" in policy or "listenerMetadata" in policy:
+        raise GateProviderError("seccomp profile must not delegate decisions to a listener")
+    rules = policy.get("syscalls")
+    if not isinstance(rules, list):
+        raise GateProviderError("seccomp profile must contain one syscall rule list")
+    for rule in rules:
+        action = rule.get("action") if isinstance(rule, dict) else None
+        if not isinstance(action, str) or action not in _SECCOMP_RULE_ACTIONS:
+            raise GateProviderError("seccomp profile contains an unsafe syscall action")
+        names = rule.get("names")
+        if (
+            not isinstance(names, list)
+            or not names
+            or any(not isinstance(name, str) or _SYSCALL_NAME.fullmatch(name) is None for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise GateProviderError("seccomp profile contains invalid syscall names")
+    return hashlib.sha256(_json_bytes(policy)).hexdigest()
 
 
 def _stat_file_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -1400,7 +1540,7 @@ def _docker_discovery_json(
     try:
         result = runner(
             argv,
-            env=_docker_discovery_environment(),
+            env=_docker_discovery_environment(bindings.docker_config_directory),
             timeout_seconds=timeout_seconds,
             output_bytes_limit=output_bytes_limit,
         )
@@ -1471,15 +1611,8 @@ def _revalidate_discovery_bindings(bindings: _DiscoveryBindings) -> None:
         ),
         (
             "seccomp profile",
-            lambda: _inspect_regular_file(
-                Path(bindings.seccomp_profile_path),
-                label="seccomp profile",
-                maximum=_MAX_SECCOMP_BYTES,
-                exact_mode=0o444,
-                single_link=True,
-                executable=False,
-            ),
-            bindings.seccomp,
+            lambda: _inspect_seccomp_profile(Path(bindings.seccomp_profile_path)),
+            (bindings.seccomp, bindings.seccomp_policy_sha256),
         ),
     )
     for label, inspect, expected in checks:
@@ -1499,8 +1632,10 @@ def _revalidate_discovery_bindings(bindings: _DiscoveryBindings) -> None:
             raise GateProviderError("Docker socket changed during Docker discovery")
 
 
-def _docker_discovery_environment() -> dict[str, str]:
+def _docker_discovery_environment(docker_config_directory: str) -> dict[str, str]:
     return {
+        "DOCKER_CONFIG": docker_config_directory,
+        "HOME": "/nonexistent",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": "/usr/bin:/bin",
@@ -1536,6 +1671,7 @@ def _json_object(value: object, label: str) -> dict[str, Any]:
 def _docker_runtime_fingerprint(
     *,
     docker_host: str,
+    expected_daemon_id: str,
     platform: str,
     container_runtime: str,
     version: dict[str, Any],
@@ -1562,10 +1698,7 @@ def _docker_runtime_fingerprint(
     expected_os, expected_arch, *_variant = platform.split("/")
     if server_os != expected_os or server_arch != expected_arch:
         raise GateProviderError("Docker server does not match the native platform")
-    if (
-        _required_canonical_string(info, "OSType", "Docker daemon operating system")
-        != server_os
-    ):
+    if _required_canonical_string(info, "OSType", "Docker daemon operating system") != server_os:
         raise GateProviderError("Docker daemon does not match the native platform")
     daemon_arch = _required_canonical_string(
         info,
@@ -1575,10 +1708,7 @@ def _docker_runtime_fingerprint(
     if _DOCKER_ARCHITECTURES.get(daemon_arch, daemon_arch) != server_arch:
         raise GateProviderError("Docker daemon does not match the native platform")
     server_version = _required_canonical_string(server, "Version", "Docker server version")
-    if (
-        _required_canonical_string(info, "ServerVersion", "Docker daemon version")
-        != server_version
-    ):
+    if _required_canonical_string(info, "ServerVersion", "Docker daemon version") != server_version:
         raise GateProviderError("Docker version and daemon evidence disagree")
     runtimes = _required_object(info, "Runtimes", "Docker daemon runtimes")
     if container_runtime not in runtimes or not isinstance(runtimes[container_runtime], dict):
@@ -1595,6 +1725,9 @@ def _docker_runtime_fingerprint(
     for option in security_options:
         _canonical_text("Docker security option", option)
     daemon_id = _required_canonical_string(info, "ID", "Docker daemon ID")
+    _canonical_ascii_text("Docker daemon ID", daemon_id)
+    if not hmac.compare_digest(daemon_id, expected_daemon_id):
+        raise GateProviderError("Docker daemon does not match the trusted Docker daemon ID")
     driver = _required_canonical_string(info, "Driver", "Docker image storage driver")
     docker_root = _required_string(info, "DockerRootDir", "Docker image store root")
     _canonical_absolute_path("Docker image store root", docker_root)
@@ -1672,8 +1805,14 @@ def _validate_gate_image(
         raise GateProviderError("Docker image ID must use sha256")
     _sha256("Docker image ID", image_id.removeprefix("sha256:"))
     digests = image.get("RepoDigests")
-    if digests != [image_reference]:
-        raise GateProviderError("Docker image must have one exact repository digest")
+    if (
+        not isinstance(digests, list)
+        or not digests
+        or any(not isinstance(digest, str) or _IMAGE.fullmatch(digest) is None for digest in digests)
+        or len(set(digests)) != len(digests)
+        or image_reference not in digests
+    ):
+        raise GateProviderError("Docker image must include the requested repository digest")
     image_os = _required_string(image, "Os", "Docker image operating system")
     image_arch = _required_string(image, "Architecture", "Docker image architecture")
     variant = image.get("Variant", "")
@@ -1762,14 +1901,7 @@ def _revalidate_static_provider_files(config: DockerGateProviderConfig) -> None:
 
     try:
         seccomp_path = _canonical_real_path(config.seccomp_profile_path, label="seccomp profile")
-        seccomp = _inspect_regular_file(
-            seccomp_path,
-            label="seccomp profile",
-            maximum=_MAX_SECCOMP_BYTES,
-            exact_mode=0o444,
-            single_link=True,
-            executable=False,
-        )
+        seccomp, seccomp_policy_sha256 = _inspect_seccomp_profile(seccomp_path)
     except GateProviderError as error:
         raise GateProviderError("seccomp profile changed since provider discovery") from error
     if (
@@ -1778,6 +1910,7 @@ def _revalidate_static_provider_files(config: DockerGateProviderConfig) -> None:
         or seccomp.size != config.seccomp_profile_size
         or seccomp.owner_uid != config.seccomp_profile_owner_uid
         or not hmac.compare_digest(seccomp.sha256, config.seccomp_profile_sha256)
+        or not hmac.compare_digest(seccomp_policy_sha256, config.seccomp_policy_sha256)
     ):
         raise GateProviderError("seccomp profile changed since provider discovery")
 
@@ -1845,18 +1978,27 @@ def _bounded_docker_command(
                 running = process.poll() is None
             except BaseException as error:
                 cleanup_errors.append(error)
-            if primary_error is not None and running:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except BaseException as group_error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                if running:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+            except BaseException as group_error:
+                cleanup_errors.append(group_error)
+                if running:
                     try:
                         process.kill()
                     except BaseException as process_error:
-                        cleanup_errors.extend((group_error, process_error))
-                try:
-                    process.wait(timeout=1)
-                except BaseException as error:
-                    cleanup_errors.append(error)
+                        cleanup_errors.append(process_error)
+            try:
+                process.wait(timeout=1)
+            except BaseException as error:
+                cleanup_errors.append(error)
             for stream in (process.stdout, process.stderr):
                 if stream is not None:
                     try:
@@ -2002,9 +2144,7 @@ def _validate_security_options(
     host: dict[str, Any],
 ) -> None:
     value = host.get("SecurityOpt")
-    if not isinstance(value, list) or len(value) != 2 or any(
-        not isinstance(option, str) for option in value
-    ):
+    if not isinstance(value, list) or len(value) != 2 or any(not isinstance(option, str) for option in value):
         raise GateProviderError("Docker inspection contains invalid security options")
     if value.count("no-new-privileges=true") != 1:
         raise GateProviderError("Docker inspection changed no-new-privileges")
@@ -2016,7 +2156,7 @@ def _validate_security_options(
         label="Docker seccomp inspection",
         maximum=_MAX_CONFIG_BYTES,
     )
-    if hashlib.sha256(_json_bytes(policy)).hexdigest() != config.seccomp_profile_sha256:
+    if hashlib.sha256(_json_bytes(policy)).hexdigest() != config.seccomp_policy_sha256:
         raise GateProviderError("Docker inspection changed the seccomp policy")
 
 
@@ -2031,12 +2171,7 @@ def _validate_ulimits(limits: DockerSandboxLimits, host: dict[str, Any]) -> None
         name = entry["Name"]
         soft = entry["Soft"]
         hard = entry["Hard"]
-        if (
-            not isinstance(name, str)
-            or type(soft) is not int
-            or type(hard) is not int
-            or name in observed
-        ):
+        if not isinstance(name, str) or type(soft) is not int or type(hard) is not int or name in observed:
             raise GateProviderError("Docker inspection contains invalid ulimits")
         observed[name] = (soft, hard)
     expected = {
@@ -2173,7 +2308,7 @@ def _normalized_host_policy(
         },
         "no_new_privileges": True,
         "nonroot_user": config.user,
-        "seccomp_profile_sha256": config.seccomp_profile_sha256,
+        "seccomp_policy_sha256": config.seccomp_policy_sha256,
     }
 
 
@@ -2210,6 +2345,15 @@ def _canonical_text(label: str, value: object) -> None:
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise GateProviderError(f"{label} must be nonempty canonical text")
+
+
+def _canonical_ascii_text(label: str, value: object) -> None:
+    _canonical_text(label, value)
+    assert isinstance(value, str)
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise GateProviderError(f"{label} must be nonempty canonical ASCII text") from error
 
 
 def _sha256(label: str, value: object) -> None:
@@ -2251,10 +2395,7 @@ def _docker_cpus(value: int) -> str:
 
 def _work_tmpfs_options(config: DockerGateProviderConfig) -> str:
     uid, gid = config.user.split(":", 1)
-    return (
-        f"rw,nosuid,nodev,size={config.limits.scratch_bytes},"
-        f"uid={uid},gid={gid},mode=0700"
-    )
+    return f"rw,nosuid,nodev,size={config.limits.scratch_bytes},uid={uid},gid={gid},mode=0700"
 
 
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -2273,7 +2414,7 @@ def _strict_json_bytes(content: bytes, *, label: str, maximum: int) -> dict[str,
         value = json.loads(
             content.decode("utf-8"),
             object_pairs_hook=_strict_json_object,
-            parse_constant=lambda constant: (_raise_json_constant(constant)),
+            parse_constant=lambda constant: _raise_json_constant(constant),
         )
     except (RecursionError, UnicodeError, ValueError, TypeError) as error:
         raise GateProviderError(f"{label} is not strict JSON") from error
