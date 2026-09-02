@@ -189,6 +189,7 @@ def _open_directory_chain(path: Path) -> int:
 
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    created = False
     try:
         os.mkdir(name, mode=0o755, dir_fd=parent_descriptor)
     except FileExistsError:
@@ -196,16 +197,34 @@ def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
     except OSError:
         raise ScaffoldError([f"cannot create blueprint directory: {name}"]) from None
     else:
-        try:
-            os.fsync(parent_descriptor)
-        except OSError:
-            raise ScaffoldError(
-                [f"cannot commit blueprint directory durably: {name}"]
-            ) from None
+        created = True
     try:
-        return os.open(name, flags, dir_fd=parent_descriptor)
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     except OSError:
         raise ScaffoldError([f"cannot open blueprint directory safely: {name}"]) from None
+    if not created:
+        return descriptor
+    try:
+        os.fsync(parent_descriptor)
+    except OSError:
+        os.close(descriptor)
+        raise ScaffoldError(
+            [f"cannot commit blueprint directory durably: {name}"]
+        ) from None
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError:
+        os.close(descriptor)
+        raise ScaffoldError([f"blueprint directory changed after creation: {name}"]) from None
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        os.close(descriptor)
+        raise ScaffoldError([f"blueprint directory changed after creation: {name}"])
+    return descriptor
 
 
 def _exclusive_write_at(parent_descriptor: int, name: str, content: bytes, *, mode: int) -> None:

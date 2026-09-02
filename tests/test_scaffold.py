@@ -626,6 +626,38 @@ def test_blueprint_scaffold_rejects_a_racing_directory_symlink(
     assert list(outside.iterdir()) == []
 
 
+def test_created_scaffold_directory_is_bound_before_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "blueprint"
+    target.mkdir()
+    replacement = target / "coverage"
+    displaced = target / "held-coverage"
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(target, flags)
+    original_sync = scaffold_module.os.fsync
+    raced = False
+
+    def replace_after_parent_fsync(descriptor: int) -> None:
+        nonlocal raced
+        original_sync(descriptor)
+        if descriptor == parent_descriptor and not raced and replacement.is_dir():
+            replacement.rename(displaced)
+            replacement.mkdir()
+            raced = True
+
+    monkeypatch.setattr(scaffold_module.os, "fsync", replace_after_parent_fsync)
+    try:
+        with pytest.raises(ScaffoldError, match="blueprint directory changed"):
+            scaffold_module._open_or_create_directory(parent_descriptor, "coverage")
+    finally:
+        os.close(parent_descriptor)
+
+    assert raced
+    assert list(replacement.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+
+
 def test_a_title_with_a_colon_stays_one_yaml_key(tmp_path: Path) -> None:
     """`site_name: Algebra: Foundations` is a nested mapping, not a title."""
     from autoform_cli import scaffold as scaffold_module

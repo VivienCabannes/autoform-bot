@@ -267,12 +267,6 @@ def create_blueprint_project(
             raise WorkspaceError(
                 [f"blueprint destination could not be created: {binding.combined}"]
             ) from None
-        try:
-            _fsync_directory_descriptor(location_descriptor)
-        except OSError:
-            raise WorkspaceError(
-                [f"blueprint destination could not be committed durably: {binding.combined}"]
-            ) from None
         destination_descriptor, destination_identity = _open_child_directory(
             location_descriptor,
             member,
@@ -280,6 +274,12 @@ def create_blueprint_project(
         )
         binding.destination_descriptor = destination_descriptor
         binding.destination_identity = destination_identity
+        try:
+            _fsync_directory_descriptor(location_descriptor)
+        except OSError:
+            raise WorkspaceError(
+                [f"blueprint destination could not be committed durably: {binding.combined}"]
+            ) from None
         _verify_blueprint_binding(binding, require_roadmap=False)
         if scaffold_blueprint is _ORIGINAL_SCAFFOLD_BLUEPRINT:
             written = scaffold_blueprint(
@@ -1535,6 +1535,7 @@ def _create_directory_chain(
         _verify_root_binding(root, root_descriptor, root_identity)
         for part in relative.parts:
             next_path = current / part
+            created_now = False
             try:
                 os.mkdir(part, mode=0o755, dir_fd=parent_descriptor)
             except FileExistsError:
@@ -1542,13 +1543,8 @@ def _create_directory_chain(
             except OSError:
                 raise WorkspaceError(["blueprint root could not be created"]) from None
             else:
+                created_now = True
                 created.append(next_path)
-                try:
-                    _fsync_directory_descriptor(parent_descriptor)
-                except OSError:
-                    raise WorkspaceError(
-                        ["blueprint root could not be committed durably"]
-                    ) from None
             next_descriptor, next_identity = _open_child_directory(
                 parent_descriptor,
                 part,
@@ -1556,6 +1552,20 @@ def _create_directory_chain(
             )
             descriptors.append(next_descriptor)
             identities.append(next_identity)
+            if created_now:
+                try:
+                    _fsync_directory_descriptor(parent_descriptor)
+                except OSError:
+                    raise WorkspaceError(
+                        ["blueprint root could not be committed durably"]
+                    ) from None
+                _verify_relative_directories(
+                    root_descriptor,
+                    PurePosixPath(*relative.parts[: len(descriptors)]),
+                    tuple(descriptors),
+                    tuple(identities),
+                    label="blueprint root",
+                )
             parent_descriptor = next_descriptor
             current = next_path
     except WorkspaceError as error:

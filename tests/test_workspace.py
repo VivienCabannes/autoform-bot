@@ -385,6 +385,46 @@ def test_creation_keeps_its_destination_binding_while_scaffolding(
     assert load_workspace(root).manifest.projects == ()
 
 
+def test_creation_rejects_destination_replaced_after_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    original_sync = workspace_module._fsync_directory_descriptor
+    location = root / "Plans"
+    replacement = location / "Example"
+    displaced = location / "held-example"
+    raced = False
+
+    def replace_after_parent_fsync(descriptor: int) -> None:
+        nonlocal raced
+        original_sync(descriptor)
+        opened = workspace_module.os.fstat(descriptor)
+        current_location = location.stat()
+        if (
+            not raced
+            and (opened.st_dev, opened.st_ino)
+            == (current_location.st_dev, current_location.st_ino)
+            and replacement.is_dir()
+        ):
+            replacement.rename(displaced)
+            replacement.mkdir()
+            raced = True
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_fsync_directory_descriptor",
+        replace_after_parent_fsync,
+    )
+
+    with pytest.raises(WorkspaceError, match="blueprint destination changed"):
+        create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    assert raced
+    assert list(replacement.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+    assert load_workspace(root).manifest.projects == ()
+
+
 def test_creation_refuses_to_register_if_the_location_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -777,6 +817,47 @@ def test_workspace_init_rejects_replaced_directory_before_descending(
     staged, = root.glob("..autoform.toml.*.tmp")
     assert stat.S_IMODE(staged.stat().st_mode) == 0o600
     assert parse_workspace(staged.read_text(encoding="utf-8")).locations[0].path == "Plans/Nested"
+
+
+def test_workspace_init_rejects_created_directory_replaced_after_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    original_sync = workspace_module._fsync_directory_descriptor
+    replacement = root / "Plans"
+    displaced = root / "held-plans"
+    raced = False
+
+    def replace_after_parent_fsync(descriptor: int) -> None:
+        nonlocal raced
+        original_sync(descriptor)
+        opened = workspace_module.os.fstat(descriptor)
+        current_root = root.stat()
+        if (
+            not raced
+            and (opened.st_dev, opened.st_ino) == (current_root.st_dev, current_root.st_ino)
+            and replacement.is_dir()
+        ):
+            replacement.rename(displaced)
+            replacement.mkdir()
+            raced = True
+
+    monkeypatch.setattr(
+        workspace_module,
+        "_fsync_directory_descriptor",
+        replace_after_parent_fsync,
+    )
+
+    with pytest.raises(WorkspaceError, match="blueprint root changed"):
+        initialize_workspace(root, blueprint_root="Plans/Nested")
+
+    assert raced
+    assert not (root / ".autoform.toml").exists()
+    assert list(replacement.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+    staged, = root.glob("..autoform.toml.*.tmp")
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
 
 
 def test_registry_exchange_rejects_an_unbound_concurrent_editor_replacement(
