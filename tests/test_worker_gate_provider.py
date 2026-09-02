@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 
 import pytest
@@ -9,6 +10,7 @@ from autoform_worker.gate_provider import (
     DockerSandboxLimits,
     GateInvocationRequest,
     GateProviderError,
+    docker_create_argv,
 )
 
 
@@ -36,6 +38,8 @@ def _config() -> DockerGateProviderConfig:
         runtime_bundle_sha256="5" * 64,
         seccomp_profile_path="/etc/autoform/seccomp.json",
         seccomp_profile_sha256="6" * 64,
+        evaluator_executable="/usr/local/bin/python3",
+        container_runtime="runc",
         user="65532:65532",
         limits=_limits(),
     )
@@ -81,8 +85,10 @@ def test_provider_config_round_trips_as_canonical_evidence() -> None:
         ("image_reference", "autoform-gates:latest", "immutable sha256 digest"),
         ("image_id", "4" * 64, "sha256 algorithm"),
         ("platform", "darwin/arm64", "Linux OCI platform"),
+        ("container_runtime", "Runc", "runtime name"),
         ("user", "0:0", "non-root numeric"),
         ("user", "worker:worker", "non-root numeric"),
+        ("user", f"{2**31}:65532", "signed 32-bit"),
     ],
 )
 def test_provider_config_rejects_unpinned_or_ambiguous_identity(
@@ -195,3 +201,62 @@ def test_gate_invocation_rejects_ambiguous_identity(
 def test_gate_invocation_loader_rejects_noncanonical_or_wrong_shape(content: bytes) -> None:
     with pytest.raises(GateProviderError):
         GateInvocationRequest.from_bytes(content)
+
+
+def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
+    config = _config()
+    request = _request()
+
+    command = docker_create_argv(config, request, "/srv/autoform/repository")
+
+    assert command[:4] == (
+        "/usr/local/bin/docker",
+        "create",
+        "--name",
+        request.container_name,
+    )
+    assert command.count("--label") == 4
+    assert command.count("--mount") == 1
+    assert command[command.index("--mount") + 1] == (
+        "type=bind,source=/srv/autoform/repository,target=/autoform/input/repository,"
+        "readonly,bind-recursive=readonly"
+    )
+    for pair in (
+        ("--pull", "never"),
+        ("--network", "none"),
+        ("--pid", "private"),
+        ("--ipc", "none"),
+        ("--uts", "private"),
+        ("--cgroupns", "private"),
+        ("--runtime", "runc"),
+        ("--user", "65532:65532"),
+        ("--cap-drop", "ALL"),
+        ("--log-driver", "none"),
+        ("--restart", "no"),
+        ("--stop-signal", "SIGKILL"),
+        ("--stop-timeout", "0"),
+        ("--entrypoint", "/usr/local/bin/python3"),
+    ):
+        position = command.index(pair[0])
+        assert command[position : position + 2] == pair
+    assert "--read-only" in command
+    assert "--init" in command
+    assert "--no-healthcheck" in command
+    assert command[-5:-1] == (
+        "-I",
+        "-m",
+        "autoform_worker.gate_evaluator",
+        "--request-base64",
+    )
+    assert GateInvocationRequest.from_bytes(base64.urlsafe_b64decode(command[-1])) == request
+
+
+def test_docker_create_command_rejects_unbound_config_or_unrepresentable_mount() -> None:
+    with pytest.raises(GateProviderError, match="does not bind"):
+        docker_create_argv(
+            replace(_config(), runtime_bundle_sha256="f" * 64),
+            _request(),
+            "/srv/autoform/repository",
+        )
+    with pytest.raises(GateProviderError, match="bind mount"):
+        docker_create_argv(_config(), _request(), "/srv/autoform/repo,other")

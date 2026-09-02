@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import math
 import os
@@ -24,6 +25,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IMAGE = re.compile(r"[^\s@]+@sha256:(?P<digest>[0-9a-f]{64})")
 _PLATFORM = re.compile(r"linux/[a-z0-9][a-z0-9_.-]*(?:/[a-z0-9][a-z0-9_.-]*)?")
 _USER = re.compile(r"(?P<uid>[1-9][0-9]*):(?P<gid>[1-9][0-9]*)")
+_RUNTIME_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{64}")
 
@@ -89,6 +91,8 @@ class DockerGateProviderConfig:
     runtime_bundle_sha256: str
     seccomp_profile_path: str
     seccomp_profile_sha256: str
+    evaluator_executable: str
+    container_runtime: str
     user: str
     limits: DockerSandboxLimits
     schema: str = DOCKER_GATE_PROVIDER_SCHEMA
@@ -104,6 +108,9 @@ class DockerGateProviderConfig:
             raise GateProviderError("unsupported gate evaluator schema")
         _canonical_absolute_path("runtime path", self.runtime_path)
         _canonical_absolute_path("seccomp profile path", self.seccomp_profile_path)
+        _canonical_absolute_path("evaluator executable", self.evaluator_executable)
+        if _RUNTIME_NAME.fullmatch(self.container_runtime) is None:
+            raise GateProviderError("container runtime must be a canonical Docker runtime name")
         for label, value in (
             ("runtime executable SHA-256", self.runtime_executable_sha256),
             ("runtime fingerprint SHA-256", self.runtime_fingerprint_sha256),
@@ -122,10 +129,14 @@ class DockerGateProviderConfig:
         user = _USER.fullmatch(self.user)
         if user is None:
             raise GateProviderError("container user must be an explicit non-root numeric uid:gid")
+        if any(int(user.group(field)) > 2**31 - 1 for field in ("uid", "gid")):
+            raise GateProviderError("container user uid and gid must fit signed 32-bit values")
 
     def as_dict(self) -> dict[str, object]:
         return {
             "evaluator_schema": self.evaluator_schema,
+            "evaluator_executable": self.evaluator_executable,
+            "container_runtime": self.container_runtime,
             "image_id": self.image_id,
             "image_reference": self.image_reference,
             "limits": self.limits.as_dict(),
@@ -157,6 +168,8 @@ class DockerGateProviderConfig:
         )
         expected = {
             "evaluator_schema",
+            "evaluator_executable",
+            "container_runtime",
             "image_id",
             "image_reference",
             "limits",
@@ -324,6 +337,113 @@ class GateInvocationRequest:
             raise GateProviderError("gate invocation contains invalid values") from error
 
 
+def docker_create_argv(
+    config: DockerGateProviderConfig,
+    request: GateInvocationRequest,
+    repository_root: str | Path,
+) -> tuple[str, ...]:
+    """Return one canonical create command for an inspect-before-start container."""
+
+    if request.provider_config_sha256 != config.sha256:
+        raise GateProviderError("gate invocation does not bind the Docker provider config")
+    root = os.fspath(repository_root)
+    _canonical_absolute_path("repository root", root)
+    if "," in root:
+        raise GateProviderError("repository root cannot be represented as a Docker bind mount")
+    encoded_request = base64.urlsafe_b64encode(request.evidence_bytes()).decode("ascii")
+    limits = config.limits
+    mount = (
+        f"type=bind,source={root},target=/autoform/input/repository,"
+        "readonly,bind-recursive=readonly"
+    )
+    arguments = [
+        config.runtime_path,
+        "create",
+        "--name",
+        request.container_name,
+    ]
+    for label in request.ownership_labels():
+        arguments.extend(("--label", label))
+    arguments.extend(
+        (
+            "--pull",
+            "never",
+            "--platform",
+            config.platform,
+            "--network",
+            "none",
+            "--pid",
+            "private",
+            "--ipc",
+            "none",
+            "--uts",
+            "private",
+            "--cgroupns",
+            "private",
+            "--runtime",
+            config.container_runtime,
+            "--read-only",
+            "--init",
+            "--user",
+            config.user,
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges=true",
+            "--security-opt",
+            f"seccomp={config.seccomp_profile_path}",
+            "--pids-limit",
+            str(limits.pids_limit),
+            "--memory",
+            str(limits.memory_bytes),
+            "--memory-swap",
+            str(limits.memory_swap_bytes),
+            "--memory-swappiness",
+            "0",
+            "--cpus",
+            _docker_cpus(limits.cpu_nanos),
+            "--ulimit",
+            f"nofile={limits.nofile_limit}:{limits.nofile_limit}",
+            "--ulimit",
+            "core=0:0",
+            "--tmpfs",
+            f"/autoform/work:rw,nosuid,nodev,size={limits.scratch_bytes}",
+            "--tmpfs",
+            f"/autoform/result:rw,nosuid,nodev,noexec,size={limits.output_bytes}",
+            "--mount",
+            mount,
+            "--log-driver",
+            "none",
+            "--restart",
+            "no",
+            "--stop-signal",
+            "SIGKILL",
+            "--stop-timeout",
+            "0",
+            "--no-healthcheck",
+            "--hostname",
+            "autoform-gate",
+            "--workdir",
+            "/autoform/work",
+            "--env",
+            "HOME=/nonexistent",
+            "--env",
+            "TMPDIR=/autoform/work/tmp",
+            "--env",
+            "AUTOFORM_GATE_RESULT=/autoform/result/result.json",
+            "--entrypoint",
+            config.evaluator_executable,
+            config.image_reference,
+            "-I",
+            "-m",
+            "autoform_worker.gate_evaluator",
+            "--request-base64",
+            encoded_request,
+        )
+    )
+    return tuple(arguments)
+
+
 def _canonical_absolute_path(label: str, value: object) -> None:
     if (
         not isinstance(value, str)
@@ -373,6 +493,11 @@ def _positive_finite(label: str, value: object) -> float:
     if not math.isfinite(normalized) or normalized <= 0:
         raise GateProviderError(f"{label} must be a finite positive number")
     return normalized
+
+
+def _docker_cpus(value: int) -> str:
+    whole, remainder = divmod(value, 1_000_000_000)
+    return f"{whole}.{remainder:09d}"
 
 
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -425,4 +550,5 @@ __all__ = [
     "DockerSandboxLimits",
     "GateInvocationRequest",
     "GateProviderError",
+    "docker_create_argv",
 ]
