@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import base64
+import hashlib
 import json
 import math
 import os
@@ -19,8 +19,11 @@ DOCKER_GATE_PROVIDER_SCHEMA = "autoform-docker-gate-provider/v1"
 DOCKER_SANDBOX_POLICY = "autoform-docker-gate-sandbox/v1"
 GATE_EVALUATOR_SCHEMA = "autoform-gate-evaluator/v1"
 GATE_INVOCATION_SCHEMA = "autoform-gate-invocation/v1"
+DOCKER_CREATE_ATTESTATION_SCHEMA = "autoform-docker-create-attestation/v1"
 
 _MAX_CONFIG_BYTES = 64 * 1024
+_MAX_INSPECT_BYTES = 2 * 1024 * 1024
+_SHM_BYTES = 16 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IMAGE = re.compile(r"[^\s@]+@sha256:(?P<digest>[0-9a-f]{64})")
 _PLATFORM = re.compile(r"linux/[a-z0-9][a-z0-9_.-]*(?:/[a-z0-9][a-z0-9_.-]*)?")
@@ -28,6 +31,29 @@ _USER = re.compile(r"(?P<uid>[1-9][0-9]*):(?P<gid>[1-9][0-9]*)")
 _RUNTIME_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _INVOCATION_ID = re.compile(r"[0-9a-f]{64}")
+_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_AUTOFORM_LABEL_PREFIX = "org.autoform."
+_FORBIDDEN_CONTAINER_ENVIRONMENT = frozenset(
+    {
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "KUBECONFIG",
+        "SSH_AGENT_PID",
+        "SSH_AUTH_SOCK",
+    }
+)
+_CREDENTIAL_ENVIRONMENT_FRAGMENT = re.compile(
+    r"(?:^|_)(?:API_KEY|CREDENTIALS?|PASSWORD|SECRET|TOKEN)(?:_|$)"
+)
 
 
 class GateProviderError(RuntimeError):
@@ -337,6 +363,193 @@ class GateInvocationRequest:
             raise GateProviderError("gate invocation contains invalid values") from error
 
 
+@dataclass(frozen=True, slots=True)
+class DockerCreateAttestation:
+    """Canonical proof that Docker created, but did not start, the requested policy."""
+
+    container_id: str
+    request_sha256: str
+    provider_config_sha256: str
+    inspect_sha256: str
+    normalized_policy_sha256: str
+    schema: str = DOCKER_CREATE_ATTESTATION_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != DOCKER_CREATE_ATTESTATION_SCHEMA:
+            raise GateProviderError("unsupported Docker create attestation schema")
+        if _INVOCATION_ID.fullmatch(self.container_id) is None:
+            raise GateProviderError("container ID must be 256-bit lowercase hexadecimal")
+        for label, value in (
+            ("request SHA-256", self.request_sha256),
+            ("provider config SHA-256", self.provider_config_sha256),
+            ("inspect SHA-256", self.inspect_sha256),
+            ("normalized policy SHA-256", self.normalized_policy_sha256),
+        ):
+            _sha256(label, value)
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "container_id": self.container_id,
+            "inspect_sha256": self.inspect_sha256,
+            "normalized_policy_sha256": self.normalized_policy_sha256,
+            "provider_config_sha256": self.provider_config_sha256,
+            "request_sha256": self.request_sha256,
+            "schema": self.schema,
+        }
+
+    def evidence_bytes(self) -> bytes:
+        return _json_bytes(self.as_dict())
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.evidence_bytes()).hexdigest()
+
+    @classmethod
+    def from_bytes(cls, content: bytes) -> DockerCreateAttestation:
+        value = _strict_json_bytes(
+            content,
+            label="Docker create attestation",
+            maximum=_MAX_CONFIG_BYTES,
+        )
+        expected = {
+            "container_id",
+            "inspect_sha256",
+            "normalized_policy_sha256",
+            "provider_config_sha256",
+            "request_sha256",
+            "schema",
+        }
+        if set(value) != expected:
+            raise GateProviderError("Docker create attestation fields do not match the schema")
+        try:
+            return cls(**value)
+        except (TypeError, ValueError, GateProviderError) as error:
+            if isinstance(error, GateProviderError):
+                raise
+            raise GateProviderError("Docker create attestation contains invalid values") from error
+
+
+def attest_docker_create(
+    config: DockerGateProviderConfig,
+    request: GateInvocationRequest,
+    repository_root: str | Path,
+    inspect_bytes: bytes,
+) -> DockerCreateAttestation:
+    """Reject a created container unless every admission-relevant field is exact."""
+
+    create = docker_create_argv(config, request, repository_root)
+    root = os.fspath(repository_root)
+    inspect = _strict_json_bytes(
+        inspect_bytes,
+        label="Docker create inspection",
+        maximum=_MAX_INSPECT_BYTES,
+    )
+    container_id = _required_string(inspect, "Id", "Docker container ID")
+    if _INVOCATION_ID.fullmatch(container_id) is None:
+        raise GateProviderError("Docker inspection contains an invalid container ID")
+    _require_equal(inspect, "Name", f"/{request.container_name}", "container name")
+    _require_equal(inspect, "Image", config.image_id, "container image ID")
+    _require_equal(inspect, "Path", config.evaluator_executable, "container executable")
+    image_index = create.index(config.image_reference)
+    evaluator_arguments = list(create[image_index + 1 :])
+    _require_equal(inspect, "Args", evaluator_arguments, "container arguments")
+    _require_equal(inspect, "RestartCount", 0, "container restart count")
+    _require_equal(inspect, "Platform", "linux", "container platform")
+
+    state = _required_object(inspect, "State", "container state")
+    for key, expected in (
+        ("Status", "created"),
+        ("Running", False),
+        ("Paused", False),
+        ("Restarting", False),
+        ("OOMKilled", False),
+        ("Dead", False),
+        ("Pid", 0),
+        ("ExitCode", 0),
+        ("Error", ""),
+    ):
+        _require_equal(state, key, expected, f"container state {key}")
+
+    container_config = _required_object(inspect, "Config", "container config")
+    _require_equal(container_config, "Hostname", "autoform-gate", "container hostname")
+    _require_equal(container_config, "Domainname", "", "container domain")
+    _require_equal(container_config, "User", config.user, "container user")
+    _require_equal(container_config, "Tty", False, "container TTY")
+    _require_equal(container_config, "OpenStdin", False, "container open stdin")
+    _require_equal(container_config, "StdinOnce", False, "container stdin-once")
+    _require_equal(container_config, "Cmd", evaluator_arguments, "container command")
+    _require_equal(container_config, "Image", config.image_reference, "container image reference")
+    _require_equal(container_config, "WorkingDir", "/autoform/work", "container working directory")
+    _require_equal(container_config, "StopSignal", "SIGKILL", "container stop signal")
+    _require_equal(container_config, "StopTimeout", 0, "container stop timeout")
+    _require_equal(
+        container_config,
+        "Entrypoint",
+        [config.evaluator_executable],
+        "container entrypoint",
+    )
+    _require_empty_field(container_config, "ExposedPorts", "container exposed ports")
+    _require_empty_field(container_config, "Volumes", "container image volumes")
+    _require_equal(
+        container_config,
+        "Healthcheck",
+        {"Test": ["NONE"]},
+        "container healthcheck",
+    )
+    labels = _required_object(container_config, "Labels", "container labels")
+    expected_labels = dict(label.split("=", 1) for label in request.ownership_labels())
+    for key, value in expected_labels.items():
+        _require_equal(labels, key, value, f"container ownership label {key}")
+    extra_autoform_labels = sorted(
+        key
+        for key in labels
+        if key.startswith(_AUTOFORM_LABEL_PREFIX) and key not in expected_labels
+    )
+    if extra_autoform_labels:
+        raise GateProviderError("Docker inspection contains unexpected Autoform ownership labels")
+    environment = _environment_map(container_config.get("Env"))
+    for key, value in (
+        ("HOME", "/nonexistent"),
+        ("TMPDIR", "/autoform/work/tmp"),
+        ("AUTOFORM_GATE_RESULT", "/autoform/result/result.json"),
+    ):
+        if environment.get(key) != value:
+            raise GateProviderError(f"Docker inspection changed required environment variable {key}")
+    forbidden_environment = sorted(
+        name
+        for name in environment
+        if name in _FORBIDDEN_CONTAINER_ENVIRONMENT
+        or _CREDENTIAL_ENVIRONMENT_FRAGMENT.search(name.upper()) is not None
+    )
+    if forbidden_environment:
+        raise GateProviderError("Docker inspection exposed forbidden host environment names")
+
+    host = _required_object(inspect, "HostConfig", "Docker host config")
+    _validate_host_config(config, root, host)
+    _validate_mounts(root, inspect.get("Mounts"))
+    _validate_network_settings(inspect.get("NetworkSettings"))
+
+    normalized = {
+        "arguments": evaluator_arguments,
+        "container_id": container_id,
+        "environment": environment,
+        "host": _normalized_host_policy(config, root),
+        "image_id": config.image_id,
+        "image_reference": config.image_reference,
+        "labels": expected_labels,
+        "name": request.container_name,
+        "platform": config.platform,
+        "user": config.user,
+    }
+    return DockerCreateAttestation(
+        container_id=container_id,
+        request_sha256=request.sha256,
+        provider_config_sha256=config.sha256,
+        inspect_sha256=hashlib.sha256(inspect_bytes).hexdigest(),
+        normalized_policy_sha256=hashlib.sha256(_json_bytes(normalized)).hexdigest(),
+    )
+
+
 def docker_create_argv(
     config: DockerGateProviderConfig,
     request: GateInvocationRequest,
@@ -400,6 +613,9 @@ def docker_create_argv(
             str(limits.memory_swap_bytes),
             "--memory-swappiness",
             "0",
+            "--oom-kill-disable=false",
+            "--shm-size",
+            str(_SHM_BYTES),
             "--cpus",
             _docker_cpus(limits.cpu_nanos),
             "--ulimit",
@@ -442,6 +658,299 @@ def docker_create_argv(
         )
     )
     return tuple(arguments)
+
+
+def _required_object(
+    value: dict[str, Any],
+    key: str,
+    label: str,
+) -> dict[str, Any]:
+    if key not in value or not isinstance(value[key], dict):
+        raise GateProviderError(f"{label} must be one object")
+    return value[key]
+
+
+def _required_string(value: dict[str, Any], key: str, label: str) -> str:
+    if key not in value or not isinstance(value[key], str):
+        raise GateProviderError(f"{label} must be text")
+    return value[key]
+
+
+def _require_equal(
+    value: dict[str, Any],
+    key: str,
+    expected: object,
+    label: str,
+) -> None:
+    if key not in value or type(value[key]) is not type(expected) or value[key] != expected:
+        raise GateProviderError(f"Docker inspection changed {label}")
+
+
+def _require_empty(value: object, label: str) -> None:
+    if value is None or value == "":
+        return
+    if isinstance(value, (dict, list)) and not value:
+        return
+    raise GateProviderError(f"Docker inspection populated {label}")
+
+
+def _require_empty_field(value: dict[str, Any], key: str, label: str) -> None:
+    if key not in value:
+        raise GateProviderError(f"Docker inspection omitted {label}")
+    _require_empty(value[key], label)
+
+
+def _environment_map(value: object) -> dict[str, str]:
+    if not isinstance(value, list) or len(value) > 256:
+        raise GateProviderError("Docker inspection contains an invalid environment")
+    environment: dict[str, str] = {}
+    for entry in value:
+        if not isinstance(entry, str) or len(entry.encode("utf-8")) > 16 * 1024:
+            raise GateProviderError("Docker inspection contains an invalid environment entry")
+        name, separator, content = entry.partition("=")
+        if separator != "=" or _ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise GateProviderError("Docker inspection contains an invalid environment entry")
+        if name in environment:
+            raise GateProviderError("Docker inspection contains duplicate environment names")
+        environment[name] = content
+    return environment
+
+
+def _validate_host_config(
+    config: DockerGateProviderConfig,
+    repository_root: str,
+    host: dict[str, Any],
+) -> None:
+    limits = config.limits
+    for key, expected, label in (
+        ("NetworkMode", "none", "network mode"),
+        ("RestartPolicy", {"Name": "no", "MaximumRetryCount": 0}, "restart policy"),
+        ("AutoRemove", False, "automatic removal"),
+        ("CapDrop", ["ALL"], "dropped capabilities"),
+        ("CgroupnsMode", "private", "cgroup namespace"),
+        ("IpcMode", "none", "IPC namespace"),
+        ("PidMode", "private", "PID namespace"),
+        ("UTSMode", "private", "UTS namespace"),
+        ("Privileged", False, "privileged mode"),
+        ("PublishAllPorts", False, "published ports"),
+        ("ReadonlyRootfs", True, "read-only root filesystem"),
+        ("Runtime", config.container_runtime, "OCI runtime"),
+        ("Memory", limits.memory_bytes, "memory limit"),
+        ("MemorySwap", limits.memory_swap_bytes, "memory plus swap limit"),
+        ("MemorySwappiness", 0, "memory swappiness"),
+        ("NanoCpus", limits.cpu_nanos, "CPU limit"),
+        ("PidsLimit", limits.pids_limit, "PID limit"),
+        ("OomKillDisable", False, "OOM killer policy"),
+        ("Init", True, "init policy"),
+        ("ShmSize", _SHM_BYTES, "shared-memory limit"),
+        ("LogConfig", {"Type": "none", "Config": {}}, "logging policy"),
+        (
+            "Tmpfs",
+            {
+                "/autoform/result": (
+                    f"rw,nosuid,nodev,noexec,size={limits.output_bytes}"
+                ),
+                "/autoform/work": f"rw,nosuid,nodev,size={limits.scratch_bytes}",
+            },
+            "tmpfs policy",
+        ),
+    ):
+        _require_equal(host, key, expected, label)
+
+    for key, label in (
+        ("Binds", "legacy bind mounts"),
+        ("PortBindings", "port bindings"),
+        ("Links", "container links"),
+        ("Dns", "custom DNS servers"),
+        ("DnsOptions", "custom DNS options"),
+        ("DnsSearch", "custom DNS search domains"),
+        ("ExtraHosts", "extra host mappings"),
+        ("VolumesFrom", "inherited volumes"),
+        ("CapAdd", "added capabilities"),
+        ("GroupAdd", "supplementary groups"),
+        ("Devices", "host devices"),
+        ("DeviceCgroupRules", "device cgroup rules"),
+        ("DeviceRequests", "device requests"),
+        ("Sysctls", "custom sysctls"),
+        ("StorageOpt", "storage options"),
+    ):
+        _require_empty_field(host, key, label)
+
+    _validate_security_options(config, host)
+    _validate_ulimits(limits, host)
+    _validate_host_mount(repository_root, host)
+
+
+def _validate_security_options(
+    config: DockerGateProviderConfig,
+    host: dict[str, Any],
+) -> None:
+    value = host.get("SecurityOpt")
+    if not isinstance(value, list) or len(value) != 2 or any(
+        not isinstance(option, str) for option in value
+    ):
+        raise GateProviderError("Docker inspection contains invalid security options")
+    if value.count("no-new-privileges=true") != 1:
+        raise GateProviderError("Docker inspection changed no-new-privileges")
+    seccomp = [option.removeprefix("seccomp=") for option in value if option.startswith("seccomp=")]
+    if len(seccomp) != 1:
+        raise GateProviderError("Docker inspection changed the seccomp policy")
+    policy = _strict_json_bytes(
+        seccomp[0].encode("utf-8"),
+        label="Docker seccomp inspection",
+        maximum=_MAX_CONFIG_BYTES,
+    )
+    if hashlib.sha256(_json_bytes(policy)).hexdigest() != config.seccomp_profile_sha256:
+        raise GateProviderError("Docker inspection changed the seccomp policy")
+
+
+def _validate_ulimits(limits: DockerSandboxLimits, host: dict[str, Any]) -> None:
+    value = host.get("Ulimits")
+    if not isinstance(value, list) or len(value) != 2:
+        raise GateProviderError("Docker inspection contains invalid ulimits")
+    observed: dict[str, tuple[int, int]] = {}
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"Name", "Soft", "Hard"}:
+            raise GateProviderError("Docker inspection contains invalid ulimits")
+        name = entry["Name"]
+        soft = entry["Soft"]
+        hard = entry["Hard"]
+        if (
+            not isinstance(name, str)
+            or type(soft) is not int
+            or type(hard) is not int
+            or name in observed
+        ):
+            raise GateProviderError("Docker inspection contains invalid ulimits")
+        observed[name] = (soft, hard)
+    expected = {
+        "core": (0, 0),
+        "nofile": (limits.nofile_limit, limits.nofile_limit),
+    }
+    if observed != expected:
+        raise GateProviderError("Docker inspection changed the ulimits")
+
+
+def _validate_host_mount(repository_root: str, host: dict[str, Any]) -> None:
+    mounts = host.get("Mounts")
+    if not isinstance(mounts, list) or len(mounts) != 1 or not isinstance(mounts[0], dict):
+        raise GateProviderError("Docker inspection contains an invalid host mount policy")
+    mount = mounts[0]
+    for key, expected, label in (
+        ("Type", "bind", "host mount type"),
+        ("Source", repository_root, "host mount source"),
+        ("Target", "/autoform/input/repository", "host mount target"),
+        ("ReadOnly", True, "host mount read-only policy"),
+        ("Consistency", "", "host mount consistency"),
+    ):
+        _require_equal(mount, key, expected, label)
+    bind_options = _required_object(mount, "BindOptions", "host bind options")
+    expected_options = {
+        "CreateMountpoint": False,
+        "NonRecursive": False,
+        "Propagation": "rprivate",
+        "ReadOnlyForceRecursive": True,
+        "ReadOnlyNonRecursive": False,
+    }
+    if bind_options != expected_options:
+        raise GateProviderError("Docker inspection changed recursive read-only bind options")
+    for key in ("VolumeOptions", "TmpfsOptions", "ImageOptions", "ClusterOptions"):
+        if key in mount:
+            _require_empty(mount[key], f"host mount {key}")
+
+
+def _validate_mounts(repository_root: str, value: object) -> None:
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        raise GateProviderError("Docker inspection contains invalid realized mounts")
+    mount = value[0]
+    for key, expected, label in (
+        ("Type", "bind", "realized mount type"),
+        ("Source", repository_root, "realized mount source"),
+        ("Destination", "/autoform/input/repository", "realized mount destination"),
+        ("Mode", "ro", "realized mount mode"),
+        ("RW", False, "realized mount write policy"),
+        ("Propagation", "rprivate", "realized mount propagation"),
+    ):
+        _require_equal(mount, key, expected, label)
+
+
+def _validate_network_settings(value: object) -> None:
+    if not isinstance(value, dict):
+        raise GateProviderError("Docker inspection contains invalid network settings")
+    for key, expected, label in (
+        ("Bridge", "", "network bridge"),
+        ("SandboxID", "", "network sandbox ID"),
+        ("SandboxKey", "", "network sandbox key"),
+        ("HairpinMode", False, "network hairpin mode"),
+        ("LinkLocalIPv6Address", "", "link-local IPv6 address"),
+        ("LinkLocalIPv6PrefixLen", 0, "link-local IPv6 prefix"),
+    ):
+        _require_equal(value, key, expected, label)
+    for key, label in (
+        ("Ports", "network ports"),
+        ("SecondaryIPAddresses", "secondary IP addresses"),
+        ("SecondaryIPv6Addresses", "secondary IPv6 addresses"),
+    ):
+        _require_empty_field(value, key, label)
+    networks = _required_object(value, "Networks", "container networks")
+    if set(networks) != {"none"} or not isinstance(networks["none"], dict):
+        raise GateProviderError("Docker inspection attached an unexpected network")
+    network = networks["none"]
+    for key, expected, label in (
+        ("EndpointID", "", "network endpoint ID"),
+        ("Gateway", "", "network gateway"),
+        ("IPAddress", "", "network IP address"),
+        ("IPPrefixLen", 0, "network IP prefix"),
+        ("IPv6Gateway", "", "network IPv6 gateway"),
+        ("GlobalIPv6Address", "", "global IPv6 address"),
+        ("GlobalIPv6PrefixLen", 0, "global IPv6 prefix"),
+        ("MacAddress", "", "network MAC address"),
+    ):
+        _require_equal(network, key, expected, label)
+    for key, label in (
+        ("IPAMConfig", "network IPAM configuration"),
+        ("Links", "network links"),
+        ("Aliases", "network aliases"),
+        ("DriverOpts", "network driver options"),
+        ("DNSNames", "network DNS names"),
+    ):
+        _require_empty_field(network, key, label)
+
+
+def _normalized_host_policy(
+    config: DockerGateProviderConfig,
+    repository_root: str,
+) -> dict[str, object]:
+    limits = config.limits
+    return {
+        "capabilities": {"add": [], "drop": ["ALL"]},
+        "container_runtime": config.container_runtime,
+        "filesystem": {
+            "input": {
+                "destination": "/autoform/input/repository",
+                "recursive_read_only": True,
+                "source": repository_root,
+            },
+            "root_read_only": True,
+            "shm_bytes": _SHM_BYTES,
+            "tmpfs": {
+                "/autoform/result": limits.output_bytes,
+                "/autoform/work": limits.scratch_bytes,
+            },
+        },
+        "limits": limits.as_dict(),
+        "logging": "none",
+        "namespaces": {
+            "cgroup": "private",
+            "ipc": "none",
+            "network": "none",
+            "pid": "private",
+            "uts": "private",
+        },
+        "no_new_privileges": True,
+        "nonroot_user": config.user,
+        "seccomp_profile_sha256": config.seccomp_profile_sha256,
+    }
 
 
 def _canonical_absolute_path(label: str, value: object) -> None:
@@ -542,13 +1051,16 @@ def _json_bytes(value: object) -> bytes:
 
 
 __all__ = [
+    "DOCKER_CREATE_ATTESTATION_SCHEMA",
     "DOCKER_GATE_PROVIDER_SCHEMA",
     "DOCKER_SANDBOX_POLICY",
     "GATE_EVALUATOR_SCHEMA",
     "GATE_INVOCATION_SCHEMA",
+    "DockerCreateAttestation",
     "DockerGateProviderConfig",
     "DockerSandboxLimits",
     "GateInvocationRequest",
     "GateProviderError",
+    "attest_docker_create",
     "docker_create_argv",
 ]
