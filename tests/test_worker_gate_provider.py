@@ -68,6 +68,8 @@ def _request(config: DockerGateProviderConfig | None = None) -> GateInvocationRe
         source_contract_sha256="a" * 64,
         protected_roadmap_sha256="b" * 64,
         work_item_sha256="c" * 64,
+        repository_pack_sha256="f" * 64,
+        repository_pack_bytes=1024,
         provider_config_sha256=config.sha256,
     )
 
@@ -88,7 +90,7 @@ def _inspection(
     config: DockerGateProviderConfig,
     request: GateInvocationRequest,
 ) -> dict[str, object]:
-    command = docker_create_argv(config, request, "/srv/autoform/repository")
+    command = docker_create_argv(config, request, "/srv/autoform/repository.pack")
     image_index = command.index(config.image_reference)
     evaluator_arguments = list(command[image_index + 1 :])
     labels = dict(label.split("=", 1) for label in request.ownership_labels())
@@ -132,7 +134,6 @@ def _inspection(
             "Env": [
                 "HOME=/nonexistent",
                 "TMPDIR=/autoform/work/tmp",
-                "AUTOFORM_GATE_RESULT=/autoform/result/result.json",
             ],
         },
         "HostConfig": {
@@ -162,9 +163,6 @@ def _inspection(
                 "/autoform/work": (
                     f"rw,nosuid,nodev,size={config.limits.scratch_bytes}"
                 ),
-                "/autoform/result": (
-                    f"rw,nosuid,nodev,noexec,size={config.limits.output_bytes}"
-                ),
             },
             "Binds": None,
             "PortBindings": {},
@@ -191,16 +189,16 @@ def _inspection(
             "Mounts": [
                 {
                     "Type": "bind",
-                    "Source": "/srv/autoform/repository",
-                    "Target": "/autoform/input/repository",
+                    "Source": "/srv/autoform/repository.pack",
+                    "Target": "/autoform/input/repository.pack",
                     "ReadOnly": True,
                     "Consistency": "",
                     "BindOptions": {
                         "Propagation": "rprivate",
-                        "NonRecursive": False,
+                        "NonRecursive": True,
                         "CreateMountpoint": False,
                         "ReadOnlyNonRecursive": False,
-                        "ReadOnlyForceRecursive": True,
+                        "ReadOnlyForceRecursive": False,
                     },
                 }
             ],
@@ -208,8 +206,8 @@ def _inspection(
         "Mounts": [
             {
                 "Type": "bind",
-                "Source": "/srv/autoform/repository",
-                "Destination": "/autoform/input/repository",
+                "Source": "/srv/autoform/repository.pack",
+                "Destination": "/autoform/input/repository.pack",
                 "Mode": "ro",
                 "RW": False,
                 "Propagation": "rprivate",
@@ -358,6 +356,8 @@ def test_gate_invocation_round_trips_with_deterministic_ownership() -> None:
         ("source_revision", "source-revision", "lowercase hexadecimal"),
         ("phase", "review", "statement or proof"),
         ("attempt", 0, "positive integer"),
+        ("repository_pack_sha256", "F" * 64, "lowercase hexadecimal"),
+        ("repository_pack_bytes", 0, "positive integer"),
         ("provider_config_sha256", "A" * 64, "lowercase hexadecimal"),
     ],
 )
@@ -390,7 +390,7 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
     config = _config()
     request = _request()
 
-    command = docker_create_argv(config, request, "/srv/autoform/repository")
+    command = docker_create_argv(config, request, "/srv/autoform/repository.pack")
 
     assert command[:4] == (
         "/usr/local/bin/docker",
@@ -401,8 +401,8 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
     assert command.count("--label") == 4
     assert command.count("--mount") == 1
     assert command[command.index("--mount") + 1] == (
-        "type=bind,source=/srv/autoform/repository,target=/autoform/input/repository,"
-        "readonly,bind-recursive=readonly"
+        "type=bind,source=/srv/autoform/repository.pack,target=/autoform/input/repository.pack,"
+        "readonly,bind-recursive=disabled"
     )
     for pair in (
         ("--pull", "never"),
@@ -433,8 +433,9 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
     assert "--no-healthcheck" in command
     assert "--oom-kill-disable=false" in command
     assert command.count("--security-opt") == 2
-    assert command.count("--tmpfs") == 2
+    assert command.count("--tmpfs") == 1
     assert command.count("--ulimit") == 2
+    assert all("/autoform/result" not in argument for argument in command)
     assert command[-5:-1] == (
         "-I",
         "-m",
@@ -449,10 +450,16 @@ def test_docker_create_command_rejects_unbound_config_or_unrepresentable_mount()
         docker_create_argv(
             replace(_config(), runtime_bundle_sha256="f" * 64),
             _request(),
-            "/srv/autoform/repository",
+            "/srv/autoform/repository.pack",
         )
     with pytest.raises(GateProviderError, match="bind mount"):
         docker_create_argv(_config(), _request(), "/srv/autoform/repo,other")
+    with pytest.raises(GateProviderError, match="scratch limit"):
+        docker_create_argv(
+            _config(),
+            replace(_request(), repository_pack_bytes=_limits().scratch_bytes + 1),
+            "/srv/autoform/repository.pack",
+        )
 
 
 def test_docker_create_inspection_produces_bound_canonical_attestation() -> None:
@@ -464,7 +471,7 @@ def test_docker_create_inspection_produces_bound_canonical_attestation() -> None
     attestation = attest_docker_create(
         config,
         request,
-        "/srv/autoform/repository",
+        "/srv/autoform/repository.pack",
         inspect_bytes,
     )
 
@@ -502,7 +509,8 @@ def _set_inspection_path(
         (("HostConfig", "SecurityOpt", 0), "no-new-privileges=false"),
         (("HostConfig", "SecurityOpt", 1), "seccomp={}"),
         (("HostConfig", "Mounts", 0, "ReadOnly"), False),
-        (("HostConfig", "Mounts", 0, "BindOptions", "ReadOnlyForceRecursive"), False),
+        (("HostConfig", "Mounts", 0, "BindOptions", "NonRecursive"), False),
+        (("HostConfig", "Mounts", 0, "BindOptions", "ReadOnlyForceRecursive"), True),
         (("Mounts", 0, "RW"), True),
         (("NetworkSettings", "Networks"), {"bridge": {}}),
     ],
@@ -521,7 +529,7 @@ def test_docker_create_inspection_rejects_policy_drift(
         attest_docker_create(
             config,
             request,
-            "/srv/autoform/repository",
+            "/srv/autoform/repository.pack",
             _canonical_json(inspection),
         )
 
@@ -560,7 +568,7 @@ def test_docker_create_inspection_rejects_injected_authority(mutation: str) -> N
         attest_docker_create(
             config,
             request,
-            "/srv/autoform/repository",
+            "/srv/autoform/repository.pack",
             _canonical_json(inspection),
         )
 
@@ -591,7 +599,7 @@ def test_docker_create_inspection_rejects_missing_policy_evidence(
         attest_docker_create(
             config,
             request,
-            "/srv/autoform/repository",
+            "/srv/autoform/repository.pack",
             _canonical_json(inspection),
         )
 
@@ -613,7 +621,7 @@ def test_docker_create_inspection_rejects_invalid_evidence(inspect_bytes: bytes)
         attest_docker_create(
             config,
             _request(config),
-            "/srv/autoform/repository",
+            "/srv/autoform/repository.pack",
             inspect_bytes,
         )
 

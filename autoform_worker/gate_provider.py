@@ -253,6 +253,8 @@ class GateInvocationRequest:
     source_contract_sha256: str
     protected_roadmap_sha256: str
     work_item_sha256: str
+    repository_pack_sha256: str
+    repository_pack_bytes: int
     provider_config_sha256: str
     schema: str = GATE_INVOCATION_SCHEMA
 
@@ -284,9 +286,11 @@ class GateInvocationRequest:
             ("source contract SHA-256", self.source_contract_sha256),
             ("protected roadmap SHA-256", self.protected_roadmap_sha256),
             ("work item SHA-256", self.work_item_sha256),
+            ("repository pack SHA-256", self.repository_pack_sha256),
             ("provider config SHA-256", self.provider_config_sha256),
         ):
             _sha256(label, value)
+        _positive_integer("repository pack bytes", self.repository_pack_bytes)
 
     @property
     def container_name(self) -> str:
@@ -311,6 +315,8 @@ class GateInvocationRequest:
             "node_id": self.node_id,
             "phase": self.phase,
             "protected_roadmap_sha256": self.protected_roadmap_sha256,
+            "repository_pack_bytes": self.repository_pack_bytes,
+            "repository_pack_sha256": self.repository_pack_sha256,
             "source_contract_sha256": self.source_contract_sha256,
             "source_revision": self.source_revision,
             "work_item_sha256": self.work_item_sha256,
@@ -347,6 +353,8 @@ class GateInvocationRequest:
             "phase",
             "protected_roadmap_sha256",
             "provider_config_sha256",
+            "repository_pack_bytes",
+            "repository_pack_sha256",
             "run_id",
             "schema",
             "source_contract_sha256",
@@ -432,13 +440,13 @@ class DockerCreateAttestation:
 def attest_docker_create(
     config: DockerGateProviderConfig,
     request: GateInvocationRequest,
-    repository_root: str | Path,
+    repository_pack: str | Path,
     inspect_bytes: bytes,
 ) -> DockerCreateAttestation:
     """Reject a created container unless every admission-relevant field is exact."""
 
-    create = docker_create_argv(config, request, repository_root)
-    root = os.fspath(repository_root)
+    create = docker_create_argv(config, request, repository_pack)
+    pack = os.fspath(repository_pack)
     inspect = _strict_json_bytes(
         inspect_bytes,
         label="Docker create inspection",
@@ -511,7 +519,6 @@ def attest_docker_create(
     for key, value in (
         ("HOME", "/nonexistent"),
         ("TMPDIR", "/autoform/work/tmp"),
-        ("AUTOFORM_GATE_RESULT", "/autoform/result/result.json"),
     ):
         if environment.get(key) != value:
             raise GateProviderError(f"Docker inspection changed required environment variable {key}")
@@ -525,15 +532,15 @@ def attest_docker_create(
         raise GateProviderError("Docker inspection exposed forbidden host environment names")
 
     host = _required_object(inspect, "HostConfig", "Docker host config")
-    _validate_host_config(config, root, host)
-    _validate_mounts(root, inspect.get("Mounts"))
+    _validate_host_config(config, pack, host)
+    _validate_mounts(pack, inspect.get("Mounts"))
     _validate_network_settings(inspect.get("NetworkSettings"))
 
     normalized = {
         "arguments": evaluator_arguments,
         "container_id": container_id,
         "environment": environment,
-        "host": _normalized_host_policy(config, root),
+        "host": _normalized_host_policy(config, request, pack),
         "image_id": config.image_id,
         "image_reference": config.image_reference,
         "labels": expected_labels,
@@ -553,21 +560,23 @@ def attest_docker_create(
 def docker_create_argv(
     config: DockerGateProviderConfig,
     request: GateInvocationRequest,
-    repository_root: str | Path,
+    repository_pack: str | Path,
 ) -> tuple[str, ...]:
     """Return one canonical create command for an inspect-before-start container."""
 
     if request.provider_config_sha256 != config.sha256:
         raise GateProviderError("gate invocation does not bind the Docker provider config")
-    root = os.fspath(repository_root)
-    _canonical_absolute_path("repository root", root)
-    if "," in root:
-        raise GateProviderError("repository root cannot be represented as a Docker bind mount")
+    pack = os.fspath(repository_pack)
+    _canonical_absolute_path("repository pack", pack)
+    if "," in pack:
+        raise GateProviderError("repository pack cannot be represented as a Docker bind mount")
+    if request.repository_pack_bytes > config.limits.scratch_bytes:
+        raise GateProviderError("repository pack does not fit in the Docker scratch limit")
     encoded_request = base64.urlsafe_b64encode(request.evidence_bytes()).decode("ascii")
     limits = config.limits
     mount = (
-        f"type=bind,source={root},target=/autoform/input/repository,"
-        "readonly,bind-recursive=readonly"
+        f"type=bind,source={pack},target=/autoform/input/repository.pack,"
+        "readonly,bind-recursive=disabled"
     )
     arguments = [
         config.runtime_path,
@@ -624,8 +633,6 @@ def docker_create_argv(
             "core=0:0",
             "--tmpfs",
             f"/autoform/work:rw,nosuid,nodev,size={limits.scratch_bytes}",
-            "--tmpfs",
-            f"/autoform/result:rw,nosuid,nodev,noexec,size={limits.output_bytes}",
             "--mount",
             mount,
             "--log-driver",
@@ -645,8 +652,6 @@ def docker_create_argv(
             "HOME=/nonexistent",
             "--env",
             "TMPDIR=/autoform/work/tmp",
-            "--env",
-            "AUTOFORM_GATE_RESULT=/autoform/result/result.json",
             "--entrypoint",
             config.evaluator_executable,
             config.image_reference,
@@ -718,7 +723,7 @@ def _environment_map(value: object) -> dict[str, str]:
 
 def _validate_host_config(
     config: DockerGateProviderConfig,
-    repository_root: str,
+    repository_pack: str,
     host: dict[str, Any],
 ) -> None:
     limits = config.limits
@@ -747,9 +752,6 @@ def _validate_host_config(
         (
             "Tmpfs",
             {
-                "/autoform/result": (
-                    f"rw,nosuid,nodev,noexec,size={limits.output_bytes}"
-                ),
                 "/autoform/work": f"rw,nosuid,nodev,size={limits.scratch_bytes}",
             },
             "tmpfs policy",
@@ -778,7 +780,7 @@ def _validate_host_config(
 
     _validate_security_options(config, host)
     _validate_ulimits(limits, host)
-    _validate_host_mount(repository_root, host)
+    _validate_host_mount(repository_pack, host)
 
 
 def _validate_security_options(
@@ -831,15 +833,15 @@ def _validate_ulimits(limits: DockerSandboxLimits, host: dict[str, Any]) -> None
         raise GateProviderError("Docker inspection changed the ulimits")
 
 
-def _validate_host_mount(repository_root: str, host: dict[str, Any]) -> None:
+def _validate_host_mount(repository_pack: str, host: dict[str, Any]) -> None:
     mounts = host.get("Mounts")
     if not isinstance(mounts, list) or len(mounts) != 1 or not isinstance(mounts[0], dict):
         raise GateProviderError("Docker inspection contains an invalid host mount policy")
     mount = mounts[0]
     for key, expected, label in (
         ("Type", "bind", "host mount type"),
-        ("Source", repository_root, "host mount source"),
-        ("Target", "/autoform/input/repository", "host mount target"),
+        ("Source", repository_pack, "host mount source"),
+        ("Target", "/autoform/input/repository.pack", "host mount target"),
         ("ReadOnly", True, "host mount read-only policy"),
         ("Consistency", "", "host mount consistency"),
     ):
@@ -847,9 +849,9 @@ def _validate_host_mount(repository_root: str, host: dict[str, Any]) -> None:
     bind_options = _required_object(mount, "BindOptions", "host bind options")
     expected_options = {
         "CreateMountpoint": False,
-        "NonRecursive": False,
+        "NonRecursive": True,
         "Propagation": "rprivate",
-        "ReadOnlyForceRecursive": True,
+        "ReadOnlyForceRecursive": False,
         "ReadOnlyNonRecursive": False,
     }
     if bind_options != expected_options:
@@ -859,14 +861,14 @@ def _validate_host_mount(repository_root: str, host: dict[str, Any]) -> None:
             _require_empty(mount[key], f"host mount {key}")
 
 
-def _validate_mounts(repository_root: str, value: object) -> None:
+def _validate_mounts(repository_pack: str, value: object) -> None:
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         raise GateProviderError("Docker inspection contains invalid realized mounts")
     mount = value[0]
     for key, expected, label in (
         ("Type", "bind", "realized mount type"),
-        ("Source", repository_root, "realized mount source"),
-        ("Destination", "/autoform/input/repository", "realized mount destination"),
+        ("Source", repository_pack, "realized mount source"),
+        ("Destination", "/autoform/input/repository.pack", "realized mount destination"),
         ("Mode", "ro", "realized mount mode"),
         ("RW", False, "realized mount write policy"),
         ("Propagation", "rprivate", "realized mount propagation"),
@@ -919,7 +921,8 @@ def _validate_network_settings(value: object) -> None:
 
 def _normalized_host_policy(
     config: DockerGateProviderConfig,
-    repository_root: str,
+    request: GateInvocationRequest,
+    repository_pack: str,
 ) -> dict[str, object]:
     limits = config.limits
     return {
@@ -927,14 +930,16 @@ def _normalized_host_policy(
         "container_runtime": config.container_runtime,
         "filesystem": {
             "input": {
-                "destination": "/autoform/input/repository",
-                "recursive_read_only": True,
-                "source": repository_root,
+                "bytes": request.repository_pack_bytes,
+                "destination": "/autoform/input/repository.pack",
+                "kind": "git-pack",
+                "sha256": request.repository_pack_sha256,
+                "source": repository_pack,
+                "read_only": True,
             },
             "root_read_only": True,
             "shm_bytes": _SHM_BYTES,
             "tmpfs": {
-                "/autoform/result": limits.output_bytes,
                 "/autoform/work": limits.scratch_bytes,
             },
         },
