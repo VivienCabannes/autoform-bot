@@ -195,6 +195,13 @@ def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
         pass
     except OSError:
         raise ScaffoldError([f"cannot create blueprint directory: {name}"]) from None
+    else:
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            raise ScaffoldError(
+                [f"cannot commit blueprint directory durably: {name}"]
+            ) from None
     try:
         return os.open(name, flags, dir_fd=parent_descriptor)
     except OSError:

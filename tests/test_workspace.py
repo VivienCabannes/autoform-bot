@@ -131,6 +131,45 @@ def test_workspace_init_creates_only_root_manifest_and_collection(tmp_path: Path
     assert {path.name for path in root.iterdir()} == {".autoform.toml", "Blueprint"}
 
 
+def test_workspace_init_fsyncs_each_created_directory_parent_before_manifest_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    events: list[tuple[str, tuple[int, int] | None]] = []
+    original_sync = workspace_module.os.fsync
+    original_publish = workspace_module._rename_noreplace
+
+    def record_sync(descriptor: int) -> None:
+        metadata = workspace_module.os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            events.append(("directory-fsync", (metadata.st_dev, metadata.st_ino)))
+        original_sync(descriptor)
+
+    def record_publish(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        events.append(("manifest-publish", None))
+        original_publish(source_parent, source, target_parent, target)
+
+    monkeypatch.setattr(workspace_module.os, "fsync", record_sync)
+    monkeypatch.setattr(workspace_module, "_rename_noreplace", record_publish)
+
+    initialize_workspace(root, blueprint_root="Plans/Nested")
+
+    publish_index = events.index(("manifest-publish", None))
+    before_publish = events[:publish_index]
+    root_metadata = root.stat()
+    plans_metadata = (root / "Plans").stat()
+    assert before_publish == [
+        ("directory-fsync", (root_metadata.st_dev, root_metadata.st_ino)),
+        ("directory-fsync", (plans_metadata.st_dev, plans_metadata.st_ino)),
+    ]
+
+
 def test_workspace_manifest_name_must_have_canonical_case(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     root.mkdir()
@@ -370,6 +409,44 @@ def test_creation_refuses_to_register_if_the_location_changes(
     assert load_workspace(root).manifest.projects == ()
 
 
+def test_creation_fsyncs_destination_and_scaffold_topology_before_registry_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    events: list[tuple[str, tuple[int, int] | None]] = []
+    original_sync = workspace_module.os.fsync
+    original_exchange = workspace_module._rename_exchange
+
+    def record_sync(descriptor: int) -> None:
+        metadata = workspace_module.os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            events.append(("directory-fsync", (metadata.st_dev, metadata.st_ino)))
+        original_sync(descriptor)
+
+    def record_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        events.append(("registry-exchange", None))
+        original_exchange(source_parent, source, target_parent, target)
+
+    monkeypatch.setattr(workspace_module.os, "fsync", record_sync)
+    monkeypatch.setattr(workspace_module, "_rename_exchange", record_exchange)
+
+    create_blueprint_project(root, project_id="example", title="Example", path="Example")
+
+    exchange_index = events.index(("registry-exchange", None))
+    before_exchange = events[:exchange_index]
+    location_metadata = (root / "Plans").stat()
+    destination_metadata = (root / "Plans/Example").stat()
+    location_identity = (location_metadata.st_dev, location_metadata.st_ino)
+    destination_identity = (destination_metadata.st_dev, destination_metadata.st_ino)
+    assert before_exchange.count(("directory-fsync", location_identity)) == 1
+    assert before_exchange.count(("directory-fsync", destination_identity)) == 4
+
+
 def test_workspace_mutation_fails_before_writing_on_an_unsupported_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -456,9 +533,13 @@ def test_workspace_init_reports_directory_sync_failure_after_publication(
 ) -> None:
     root = tmp_path / "repository"
     root.mkdir()
+    calls = 0
 
     def fail_fsync(_descriptor: int) -> None:
-        raise OSError("injected directory sync failure")
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected directory sync failure")
 
     monkeypatch.setattr(workspace_module, "_fsync_directory_descriptor", fail_fsync)
 
@@ -741,8 +822,9 @@ def test_registry_exchange_rejects_an_unbound_concurrent_editor_replacement(
     assert retained.read_bytes() == foreign
 
 
-def test_registry_exchange_retains_displaced_inode_if_an_editor_mutates_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mutation", ["bytes", "mode"])
+def test_registry_exchange_rejects_same_inode_backup_mutation_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
     root = _workspace(tmp_path)
     existing = root / "Plans/Existing"
@@ -753,24 +835,66 @@ def test_registry_exchange_retains_displaced_inode_if_an_editor_mutates_it(
         if name != "registry-backup-published":
             return
         recovery, = root.glob(".autoform.toml.backup-*")
-        with recovery.open("r+b", buffering=0) as stream:
-            stream.seek(0)
-            stream.write(editor_bytes)
-            stream.truncate()
-            workspace_module.os.fsync(stream.fileno())
+        if mutation == "bytes":
+            with recovery.open("r+b", buffering=0) as stream:
+                stream.seek(0)
+                stream.write(editor_bytes)
+                stream.truncate()
+                workspace_module.os.fsync(stream.fileno())
+        else:
+            recovery.chmod(0o600)
 
     monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", mutate_displaced)
 
-    register_blueprint_project(
-        root,
-        project_id="existing",
-        title="Existing",
-        path="Existing",
-    )
+    with pytest.raises(WorkspaceError, match="recovery path could not be confirmed"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
 
     assert load_workspace(root).manifest.project("existing").blueprint_path == "Existing"
     recovery, = root.glob(".autoform.toml.backup-*")
-    assert recovery.read_bytes() == editor_bytes
+    if mutation == "bytes":
+        assert recovery.read_bytes() == editor_bytes
+    else:
+        assert stat.S_IMODE(recovery.stat().st_mode) == 0o600
+
+
+def test_registry_exchange_rejects_replaced_backup_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    original_manifest = (root / ".autoform.toml").read_bytes()
+    held_backup = root / "held-owned-backup"
+    replacement: list[Path] = []
+
+    def replace_backup(name: str) -> None:
+        if name != "registry-backup-published":
+            return
+        recovery, = root.glob(".autoform.toml.backup-*")
+        recovery.rename(held_backup)
+        recovery.write_bytes(original_manifest)
+        recovery.chmod(stat.S_IMODE(held_backup.stat().st_mode))
+        replacement.append(recovery)
+
+    monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", replace_backup)
+
+    with pytest.raises(WorkspaceError, match="recovery path could not be confirmed"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
+
+    assert load_workspace(root).manifest.project("existing").blueprint_path == "Existing"
+    assert held_backup.read_bytes() == original_manifest
+    assert replacement and replacement[0].read_bytes() == original_manifest
+    assert replacement[0].stat().st_ino != held_backup.stat().st_ino
 
 
 def test_registry_recovers_success_after_backup_publication_error(
@@ -867,6 +991,93 @@ def test_registry_rollback_rejects_a_replaced_displaced_manifest(
 
     assert manifest.read_bytes() != foreign
     assert held_prior.read_bytes() == original_manifest
+
+
+def test_registry_rollback_fsyncs_parent_after_restoring_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    original_manifest = (root / ".autoform.toml").read_bytes()
+    original_exchange = workspace_module._rename_exchange
+    original_sync = workspace_module._fsync_directory_descriptor
+    events: list[str] = []
+    exchanged = False
+
+    def replace_roadmap_after_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        nonlocal exchanged
+        original_exchange(source_parent, source, target_parent, target)
+        events.append("exchange")
+        if not exchanged:
+            exchanged = True
+            roadmap = existing / "roadmap"
+            roadmap.rename(root / "held-roadmap")
+            roadmap.write_text("foreign\n", encoding="utf-8")
+
+    def record_sync(descriptor: int) -> None:
+        events.append("fsync")
+        original_sync(descriptor)
+
+    monkeypatch.setattr(workspace_module, "_rename_exchange", replace_roadmap_after_exchange)
+    monkeypatch.setattr(workspace_module, "_fsync_directory_descriptor", record_sync)
+
+    with pytest.raises(WorkspaceError, match="roadmap changed"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
+
+    assert events == ["exchange", "exchange", "fsync"]
+    assert (root / ".autoform.toml").read_bytes() == original_manifest
+
+
+def test_registry_rollback_reports_parent_fsync_failure_after_restoring_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    original_manifest = (root / ".autoform.toml").read_bytes()
+    original_exchange = workspace_module._rename_exchange
+    exchanged = False
+
+    def replace_roadmap_after_exchange(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        nonlocal exchanged
+        original_exchange(source_parent, source, target_parent, target)
+        if not exchanged:
+            exchanged = True
+            roadmap = existing / "roadmap"
+            roadmap.rename(root / "held-roadmap")
+            roadmap.write_text("foreign\n", encoding="utf-8")
+
+    def fail_sync(_descriptor: int) -> None:
+        raise OSError("injected rollback directory sync failure")
+
+    monkeypatch.setattr(workspace_module, "_rename_exchange", replace_roadmap_after_exchange)
+    monkeypatch.setattr(workspace_module, "_fsync_directory_descriptor", fail_sync)
+
+    with pytest.raises(WorkspaceError, match="rollback could not be committed durably"):
+        register_blueprint_project(
+            root,
+            project_id="existing",
+            title="Existing",
+            path="Existing",
+        )
+
+    assert (root / ".autoform.toml").read_bytes() == original_manifest
 
 
 def test_project_registration_rejects_location_replaced_at_commit_boundary(

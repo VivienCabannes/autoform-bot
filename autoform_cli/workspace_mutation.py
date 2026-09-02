@@ -267,6 +267,12 @@ def create_blueprint_project(
             raise WorkspaceError(
                 [f"blueprint destination could not be created: {binding.combined}"]
             ) from None
+        try:
+            _fsync_directory_descriptor(location_descriptor)
+        except OSError:
+            raise WorkspaceError(
+                [f"blueprint destination could not be committed durably: {binding.combined}"]
+            ) from None
         destination_descriptor, destination_identity = _open_child_directory(
             location_descriptor,
             member,
@@ -654,10 +660,26 @@ def _append_project(
             (metadata.st_dev, metadata.st_ino),
         )
         _workspace_mutation_checkpoint("registry-backup-published")
+        _verify_manifest_recovery(
+            parent_descriptor,
+            backup_name,
+            descriptor,
+            (metadata.st_dev, metadata.st_ino),
+            original,
+            stat.S_IMODE(metadata.st_mode),
+        )
         _fsync_directory_descriptor(parent_descriptor)
         _verify_staged_file(parent_descriptor, manifest_path.name, staged)
         if binding is not None:
             _verify_blueprint_binding(binding, require_roadmap=True)
+        _verify_manifest_recovery(
+            parent_descriptor,
+            backup_name,
+            descriptor,
+            (metadata.st_dev, metadata.st_ino),
+            original,
+            stat.S_IMODE(metadata.st_mode),
+        )
         exchanged = False
         return backup_name
     except WorkspaceError as error:
@@ -1152,6 +1174,21 @@ def _rollback_manifest_exchange(
         expected_mode=prior_mode,
     )
     _verify_staged_file(parent_descriptor, staged.path.name, staged)
+    try:
+        _fsync_directory_descriptor(parent_descriptor)
+    except OSError:
+        raise WorkspaceError(
+            ["manifest exchange was restored, but its rollback could not be committed durably"]
+        ) from None
+    _verify_named_content(
+        parent_descriptor,
+        manifest_name,
+        identity=prior_identity,
+        content=prior_content,
+        issue="displaced manifest changed after durable restoration",
+        expected_mode=prior_mode,
+    )
+    _verify_staged_file(parent_descriptor, staged.path.name, staged)
 
 
 def _read_named_bytes(parent_descriptor: int, name: str, size: int) -> bytes:
@@ -1238,37 +1275,59 @@ def _recover_committed_manifest_update(
     if binding is not None:
         _verify_blueprint_binding(binding, require_roadmap=True)
     recovery_name = staged.path.name if backup_name is None else backup_name
-    try:
-        metadata = os.stat(
-            recovery_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-    except OSError:
-        raise WorkspaceError(["prior manifest recovery path is missing"])
-    if _identity(metadata) != prior_identity:
-        raise WorkspaceError(["prior manifest recovery path changed"])
-    _verify_named_content(
+    _verify_manifest_recovery(
         parent_descriptor,
         recovery_name,
-        identity=prior_identity,
-        content=prior_content,
-        issue="prior manifest recovery path changed",
-        expected_mode=prior_mode,
-    )
-    opened = os.fstat(prior_descriptor)
-    if _identity(opened) != prior_identity:
-        raise WorkspaceError(["prior manifest recovery descriptor changed"])
-    _verify_descriptor_content(
         prior_descriptor,
+        prior_identity,
         prior_content,
-        "prior manifest recovery descriptor changed",
+        prior_mode,
     )
     _fsync_directory_descriptor(parent_descriptor)
     _verify_staged_file(parent_descriptor, manifest_name, staged)
     if binding is not None:
         _verify_blueprint_binding(binding, require_roadmap=True)
+    _verify_manifest_recovery(
+        parent_descriptor,
+        recovery_name,
+        prior_descriptor,
+        prior_identity,
+        prior_content,
+        prior_mode,
+    )
     return recovery_name
+
+
+def _verify_manifest_recovery(
+    parent_descriptor: int,
+    recovery_name: str,
+    prior_descriptor: int,
+    prior_identity: tuple[int, int],
+    prior_content: bytes,
+    prior_mode: int,
+) -> None:
+    issue = "prior manifest recovery path changed"
+    try:
+        opened = os.fstat(prior_descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _identity(opened) != prior_identity
+            or stat.S_IMODE(opened.st_mode) != prior_mode
+        ):
+            raise WorkspaceError([issue])
+        _verify_descriptor_content(prior_descriptor, prior_content, issue)
+        _verify_named_content(
+            parent_descriptor,
+            recovery_name,
+            identity=prior_identity,
+            content=prior_content,
+            issue=issue,
+            expected_mode=prior_mode,
+        )
+    except WorkspaceError:
+        raise
+    except OSError:
+        raise WorkspaceError([issue]) from None
 
 
 def _fsync_directory_descriptor(descriptor: int) -> None:
@@ -1484,6 +1543,12 @@ def _create_directory_chain(
                 raise WorkspaceError(["blueprint root could not be created"]) from None
             else:
                 created.append(next_path)
+                try:
+                    _fsync_directory_descriptor(parent_descriptor)
+                except OSError:
+                    raise WorkspaceError(
+                        ["blueprint root could not be committed durably"]
+                    ) from None
             next_descriptor, next_identity = _open_child_directory(
                 parent_descriptor,
                 part,
