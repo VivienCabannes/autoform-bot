@@ -84,6 +84,7 @@ class _StagedFile:
     identity: tuple[int, int]
     size: int
     sha256: str
+    mode: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +549,8 @@ def _append_project(
     descriptor: int | None = None
     staged: _StagedFile | None = None
     exchanged = False
+    committed = False
+    backup_name: str | None = None
     try:
         assert fcntl is not None
         fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
@@ -635,6 +638,7 @@ def _append_project(
         _verify_staged_file(parent_descriptor, manifest_path.name, staged)
         if binding is not None:
             _verify_blueprint_binding(binding, require_roadmap=True)
+        committed = True
         backup_name = _retain_displaced_manifest(
             parent_descriptor,
             staged.path.name,
@@ -647,14 +651,54 @@ def _append_project(
             _verify_blueprint_binding(binding, require_roadmap=True)
         exchanged = False
         return backup_name
-    except WorkspaceError:
+    except WorkspaceError as error:
+        if committed and staged is not None and descriptor is not None:
+            try:
+                return _recover_committed_manifest_update(
+                    parent_descriptor,
+                    manifest_path.name,
+                    staged,
+                    descriptor,
+                    (metadata.st_dev, metadata.st_ino),
+                    original,
+                    stat.S_IMODE(metadata.st_mode),
+                    binding,
+                    backup_name,
+                )
+            except WorkspaceError:
+                raise WorkspaceError(
+                    [
+                        f"updated {WORKSPACE_FILE} is committed, but its prior-manifest "
+                        f"recovery path could not be confirmed after: {error}"
+                    ]
+                ) from None
         if exchanged and staged is not None:
             try:
                 _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
             except WorkspaceError:
                 pass
         raise
-    except OSError:
+    except OSError as error:
+        if committed and staged is not None and descriptor is not None:
+            try:
+                return _recover_committed_manifest_update(
+                    parent_descriptor,
+                    manifest_path.name,
+                    staged,
+                    descriptor,
+                    (metadata.st_dev, metadata.st_ino),
+                    original,
+                    stat.S_IMODE(metadata.st_mode),
+                    binding,
+                    backup_name,
+                )
+            except WorkspaceError:
+                raise WorkspaceError(
+                    [
+                        f"updated {WORKSPACE_FILE} is committed, but its prior-manifest "
+                        f"recovery path could not be confirmed after: {error}"
+                    ]
+                ) from None
         if exchanged and staged is not None:
             try:
                 _rollback_manifest_exchange(parent_descriptor, manifest_path.name, staged)
@@ -932,6 +976,7 @@ def _verify_named_content(
     identity: tuple[int, int],
     content: bytes,
     issue: str,
+    expected_mode: int | None = None,
 ) -> None:
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -940,7 +985,18 @@ def _verify_named_content(
     except OSError:
         raise WorkspaceError([issue]) from None
     try:
-        if _identity(named) != identity or _identity(os.fstat(descriptor)) != identity:
+        opened = os.fstat(descriptor)
+        if (
+            _identity(named) != identity
+            or _identity(opened) != identity
+            or (
+                expected_mode is not None
+                and (
+                    stat.S_IMODE(named.st_mode) != expected_mode
+                    or stat.S_IMODE(opened.st_mode) != expected_mode
+                )
+            )
+        ):
             raise WorkspaceError([issue])
         _verify_descriptor_content(descriptor, content, issue)
     finally:
@@ -953,6 +1009,7 @@ def _verify_staged_file(
     staged: _StagedFile,
     *,
     published: bool = False,
+    expected_mode: int | None = None,
 ) -> None:
     issue = (
         f"published {name} changed before initialization could continue"
@@ -960,10 +1017,12 @@ def _verify_staged_file(
         else f"staged manifest changed before publication; inspect {staged.path.name}"
     )
     metadata = os.fstat(staged.descriptor)
+    required_mode = staged.mode if expected_mode is None else expected_mode
     if (
         not stat.S_ISREG(metadata.st_mode)
         or _identity(metadata) != staged.identity
         or metadata.st_size != staged.size
+        or stat.S_IMODE(metadata.st_mode) != required_mode
     ):
         raise WorkspaceError([issue])
     content = _read_descriptor(staged.descriptor, staged.size, issue)
@@ -975,6 +1034,7 @@ def _verify_staged_file(
         identity=staged.identity,
         content=content,
         issue=issue,
+        expected_mode=required_mode,
     )
 
 
@@ -1117,6 +1177,69 @@ def _retain_displaced_manifest(
     return backup_name
 
 
+def _recover_committed_manifest_update(
+    parent_descriptor: int,
+    manifest_name: str,
+    staged: _StagedFile,
+    prior_descriptor: int,
+    prior_identity: tuple[int, int],
+    prior_content: bytes,
+    prior_mode: int,
+    binding: _BlueprintBinding | None,
+    backup_name: str | None,
+) -> str:
+    """Confirm an already durable exchange and expose its exact recovery path."""
+
+    _verify_staged_file(parent_descriptor, manifest_name, staged)
+    if binding is not None:
+        _verify_blueprint_binding(binding, require_roadmap=True)
+    candidates = {staged.path.name}
+    if backup_name is not None:
+        candidates.add(backup_name)
+    try:
+        with os.scandir(parent_descriptor) as entries:
+            candidates.update(
+                entry.name
+                for entry in entries
+                if entry.name.startswith(f"{WORKSPACE_FILE}.backup-")
+            )
+    except OSError:
+        raise WorkspaceError(["prior manifest recovery paths cannot be inspected"]) from None
+    matches: list[str] = []
+    for name in sorted(candidates):
+        try:
+            metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise WorkspaceError(["prior manifest recovery path cannot be inspected"]) from None
+        if _identity(metadata) == prior_identity:
+            _verify_named_content(
+                parent_descriptor,
+                name,
+                identity=prior_identity,
+                content=prior_content,
+                issue="prior manifest recovery path changed",
+                expected_mode=prior_mode,
+            )
+            matches.append(name)
+    if not matches:
+        raise WorkspaceError(["prior manifest recovery path is missing"])
+    opened = os.fstat(prior_descriptor)
+    if _identity(opened) != prior_identity:
+        raise WorkspaceError(["prior manifest recovery descriptor changed"])
+    _verify_descriptor_content(
+        prior_descriptor,
+        prior_content,
+        "prior manifest recovery descriptor changed",
+    )
+    _fsync_directory_descriptor(parent_descriptor)
+    _verify_staged_file(parent_descriptor, manifest_name, staged)
+    if binding is not None:
+        _verify_blueprint_binding(binding, require_roadmap=True)
+    return matches[0]
+
+
 def _fsync_directory_descriptor(descriptor: int) -> None:
     os.fsync(descriptor)
 
@@ -1202,6 +1325,7 @@ def _stage_new_file(
             identity,
             len(content),
             hashlib.sha256(content).hexdigest(),
+            mode,
         )
     except WorkspaceError:
         raise
@@ -1231,7 +1355,12 @@ def _publish_staged_file(
     try:
         os.fchmod(staged.descriptor, mode)
         os.fsync(staged.descriptor)
-        _verify_staged_file(parent_descriptor, staged.path.name, staged)
+        _verify_staged_file(
+            parent_descriptor,
+            staged.path.name,
+            staged,
+            expected_mode=mode,
+        )
         _rename_noreplace(
             parent_descriptor,
             staged.path.name,
@@ -1239,13 +1368,25 @@ def _publish_staged_file(
             path.name,
         )
         published = True
-        _verify_staged_file(parent_descriptor, path.name, staged, published=True)
+        _verify_staged_file(
+            parent_descriptor,
+            path.name,
+            staged,
+            published=True,
+            expected_mode=mode,
+        )
         final_validator()
         try:
             _fsync_directory_descriptor(parent_descriptor)
         except OSError:
             pass
-        _verify_staged_file(parent_descriptor, path.name, staged, published=True)
+        _verify_staged_file(
+            parent_descriptor,
+            path.name,
+            staged,
+            published=True,
+            expected_mode=mode,
+        )
         final_validator()
     except FileExistsError:
         _restrict_staged_file(staged.descriptor)

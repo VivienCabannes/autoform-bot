@@ -597,6 +597,30 @@ def test_workspace_init_rejects_same_inode_stage_mutation_after_publish(
     assert (root / ".autoform.toml").read_bytes().startswith(b"X")
 
 
+def test_workspace_init_rejects_same_inode_mode_mutation_after_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    original = workspace_module._rename_noreplace
+
+    def chmod_after_publish(
+        source_parent: int,
+        source: str,
+        target_parent: int,
+        target: str,
+    ) -> None:
+        original(source_parent, source, target_parent, target)
+        workspace_module.os.chmod(target, 0o777, dir_fd=target_parent)
+
+    monkeypatch.setattr(workspace_module, "_rename_noreplace", chmod_after_publish)
+
+    with pytest.raises(WorkspaceError, match="published .autoform.toml changed"):
+        initialize_workspace(root, blueprint_root="Plans")
+
+    assert stat.S_IMODE((root / ".autoform.toml").stat().st_mode) == 0o777
+
+
 def test_workspace_init_rejects_bound_directory_replaced_by_file_after_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -726,6 +750,32 @@ def test_registry_exchange_retains_displaced_inode_if_an_editor_mutates_it(
     assert load_workspace(root).manifest.project("existing").blueprint_path == "Existing"
     recovery, = root.glob(".autoform.toml.backup-*")
     assert recovery.read_bytes() == editor_bytes
+
+
+def test_registry_recovers_success_after_backup_publication_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _workspace(tmp_path)
+    existing = root / "Plans/Existing"
+    (existing / "roadmap").mkdir(parents=True)
+    original_manifest = (root / ".autoform.toml").read_bytes()
+
+    def fail_after_backup(name: str) -> None:
+        if name == "registry-backup-published":
+            raise WorkspaceError(["injected after backup publication"])
+
+    monkeypatch.setattr(workspace_module, "_workspace_mutation_checkpoint", fail_after_backup)
+
+    result = register_blueprint_project(
+        root,
+        project_id="existing",
+        title="Existing",
+        path="Existing",
+    )
+
+    assert load_workspace(root).manifest.project("existing").blueprint_path == "Existing"
+    assert result.manifest_backup_path.startswith(".autoform.toml.backup-")
+    assert (root / result.manifest_backup_path).read_bytes() == original_manifest
 
 
 def test_project_registration_rejects_location_replaced_at_commit_boundary(
