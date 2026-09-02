@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
 import re
@@ -33,6 +35,9 @@ class RepositoryPack:
     device: int
     inode: int
     mode: int
+    parent_device: int
+    parent_inode: int
+    parent_mode: int
     object_format: str
     base_oid: str
     candidate_oid: str
@@ -45,11 +50,15 @@ class RepositoryPack:
             ("repository pack size", self.size),
             ("repository pack device", self.device),
             ("repository pack inode", self.inode),
+            ("repository pack parent device", self.parent_device),
+            ("repository pack parent inode", self.parent_inode),
         ):
             if type(value) is not int or value <= 0:
                 raise GateProviderError(f"{label} must be a positive integer")
         if type(self.mode) is not int or self.mode != 0o444:
             raise GateProviderError("repository pack mode must be 0444")
+        if type(self.parent_mode) is not int or self.parent_mode != 0o700:
+            raise GateProviderError("repository pack parent mode must be 0700")
         length = _OBJECT_FORMAT_LENGTHS.get(self.object_format)
         if length is None:
             raise GateProviderError("repository pack object format is unsupported")
@@ -88,6 +97,7 @@ def prepare_repository_pack(
         raise GateProviderError("repository pack path has a noncanonical parent")
     if _paths_overlap(root, parent):
         raise GateProviderError("repository pack directory must be outside the source repository")
+    parent_identity = _private_directory_identity(parent)
     repository_identity = _directory_identity(root)
     top_level = _git_text(root, ["rev-parse", "--show-toplevel"], timeout=timeout).strip()
     if top_level != os.fspath(root):
@@ -122,13 +132,18 @@ def prepare_repository_pack(
     if _directory_identity(root) != repository_identity:
         raise GateProviderError("repository root changed while pack inputs were verified")
 
-    staging = parent / f".{target.name}.preparing-{secrets.token_hex(16)}"
+    staging_name = f".autoform-gate-pack-{secrets.token_hex(16)}.stage"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(staging, flags, 0o600)
+        parent_descriptor = _open_bound_private_directory(parent, parent_identity)
     except OSError as error:
+        raise GateProviderError("repository pack directory cannot be opened safely") from error
+    try:
+        descriptor = os.open(staging_name, flags, 0o600, dir_fd=parent_descriptor)
+    except OSError as error:
+        _close_descriptor(parent_descriptor, label="repository pack directory")
         raise GateProviderError("repository pack destination cannot be created exclusively") from error
     digest = hashlib.sha256()
     size = 0
@@ -149,19 +164,44 @@ def prepare_repository_pack(
             )
         if size <= 0:
             raise GateProviderError("repository pack creation returned no bytes")
-        os.fsync(descriptor)
-        info = os.fstat(descriptor)
+        try:
+            os.fsync(descriptor)
+            info = os.fstat(descriptor)
+        except OSError as error:
+            raise GateProviderError("repository pack destination cannot be synchronized") from error
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != size:
             raise GateProviderError("repository pack destination changed while it was written")
-        os.fchmod(descriptor, 0o444)
-        os.fsync(descriptor)
-        info = os.fstat(descriptor)
+        try:
+            os.fchmod(descriptor, 0o444)
+            os.fsync(descriptor)
+            info = os.fstat(descriptor)
+        except OSError as error:
+            raise GateProviderError("repository pack destination cannot be finalized") from error
+        if _directory_identity(root) != repository_identity:
+            raise GateProviderError("repository root changed while its pack was created")
+        _fsync_descriptor(parent_descriptor, label="repository pack directory")
+        _publish_repository_pack(
+            parent_descriptor,
+            staging_name,
+            target.name,
+            descriptor,
+            info,
+        )
+        try:
+            opened_parent = os.fstat(parent_descriptor)
+        except OSError as error:
+            raise GateProviderError("repository pack directory cannot be revalidated") from error
+        if (
+            opened_parent.st_dev,
+            opened_parent.st_ino,
+            stat.S_IMODE(opened_parent.st_mode),
+        ) != parent_identity or _private_directory_identity(parent) != parent_identity:
+            raise GateProviderError("repository pack directory changed during publication")
     finally:
-        os.close(descriptor)
-    if _directory_identity(root) != repository_identity:
-        raise GateProviderError("repository root changed while its pack was created")
-    _fsync_directory(parent)
-    _publish_repository_pack(staging, target, parent, info)
+        try:
+            _close_descriptor(descriptor, label="repository pack")
+        finally:
+            _close_descriptor(parent_descriptor, label="repository pack directory")
     pack = RepositoryPack(
         path=os.fspath(target),
         sha256=digest.hexdigest(),
@@ -169,6 +209,9 @@ def prepare_repository_pack(
         device=info.st_dev,
         inode=info.st_ino,
         mode=stat.S_IMODE(info.st_mode),
+        parent_device=parent_identity[0],
+        parent_inode=parent_identity[1],
+        parent_mode=parent_identity[2],
         object_format=object_format,
         base_oid=base_oid,
         candidate_oid=candidate_oid,
@@ -181,6 +224,12 @@ def verify_repository_pack(pack: RepositoryPack) -> None:
     """Reopen and hash the exact pack pathname before and after Docker create."""
 
     path = Path(pack.path)
+    parent = _private_directory(path.parent, label="repository pack directory")
+    if parent != path.parent:
+        raise GateProviderError("repository pack parent path changed")
+    expected_parent = (pack.parent_device, pack.parent_inode, pack.parent_mode)
+    if _private_directory_identity(parent) != expected_parent:
+        raise GateProviderError("repository pack parent identity changed")
     identity = _regular_file_identity(path)
     expected = (pack.device, pack.inode, pack.size, pack.mode)
     if identity[:4] != expected:
@@ -215,6 +264,8 @@ def verify_repository_pack(pack: RepositoryPack) -> None:
         raise GateProviderError("repository pack content changed")
     if _regular_file_identity(path)[:4] != expected:
         raise GateProviderError("repository pack pathname changed")
+    if _private_directory_identity(parent) != expected_parent:
+        raise GateProviderError("repository pack parent identity changed")
 
 
 def _stream_pack(
@@ -415,12 +466,53 @@ def _real_directory(path: Path, *, label: str) -> Path:
 
 def _private_directory(path: Path, *, label: str) -> Path:
     resolved = _real_directory(path, label=label)
-    info = resolved.stat(follow_symlinks=False)
+    try:
+        info = resolved.stat(follow_symlinks=False)
+    except OSError as error:
+        raise GateProviderError(f"{label} cannot be inspected") from error
     if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
         raise GateProviderError(f"{label} must be owned by the current user")
-    if stat.S_IMODE(info.st_mode) & 0o077:
-        raise GateProviderError(f"{label} must not grant group or other permissions")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise GateProviderError(f"{label} must have mode 0700")
     return resolved
+
+
+def _private_directory_identity(path: Path) -> tuple[int, int, int]:
+    try:
+        info = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise GateProviderError("repository pack directory cannot be revalidated") from error
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
+    ):
+        raise GateProviderError("repository pack directory identity is unsafe")
+    return info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)
+
+
+def _open_bound_private_directory(path: Path, expected: tuple[int, int, int]) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        _close_descriptor(descriptor, label="repository pack directory")
+        raise
+    observed = (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode))
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or observed != expected
+        or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
+    ):
+        _close_descriptor(descriptor, label="repository pack directory")
+        raise GateProviderError("repository pack directory changed while it was opened")
+    return descriptor
 
 
 def _canonical_absolute_path(value: str, *, label: str) -> None:
@@ -477,9 +569,10 @@ def _regular_file_identity(path: Path) -> tuple[int, int, int, int, int]:
 
 
 def _publish_repository_pack(
-    staging: Path,
-    target: Path,
-    parent: Path,
+    parent_descriptor: int,
+    staging_name: str,
+    target_name: str,
+    descriptor: int,
     prepared: os.stat_result,
 ) -> None:
     expected = (
@@ -488,64 +581,96 @@ def _publish_repository_pack(
         prepared.st_size,
         stat.S_IMODE(prepared.st_mode),
     )
-    if _regular_file_identity(staging)[:4] != expected:
+    try:
+        staged = os.stat(staging_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise GateProviderError("repository pack staging entry cannot be revalidated") from error
+    if (
+        staged.st_dev,
+        staged.st_ino,
+        staged.st_size,
+        stat.S_IMODE(staged.st_mode),
+    ) != expected or staged.st_nlink != 1:
         raise GateProviderError("repository pack staging identity changed")
     try:
-        os.link(staging, target, follow_symlinks=False)
-    except OSError as error:
-        raise GateProviderError("repository pack destination cannot be created exclusively") from error
-    _fsync_directory(parent)
-
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(target, flags)
-    except OSError as error:
-        raise GateProviderError("published repository pack cannot be opened safely") from error
-    try:
         opened = os.fstat(descriptor)
-        if (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-            stat.S_IMODE(opened.st_mode),
-        ) != expected or opened.st_nlink != 2:
-            raise GateProviderError("published repository pack has the wrong identity")
-        try:
-            staging_info = staging.stat(follow_symlinks=False)
-            target_info = target.stat(follow_symlinks=False)
-        except OSError as error:
-            raise GateProviderError("repository pack publication cannot be revalidated") from error
-        if (
-            staging_info.st_dev,
-            staging_info.st_ino,
-            staging_info.st_size,
-            stat.S_IMODE(staging_info.st_mode),
-        ) != expected or (
-            target_info.st_dev,
-            target_info.st_ino,
-            target_info.st_size,
-            stat.S_IMODE(target_info.st_mode),
-        ) != expected:
-            raise GateProviderError("repository pack publication changed identity")
-        try:
-            os.unlink(staging)
-        except OSError as error:
-            raise GateProviderError("repository pack staging link cannot be removed") from error
-        _fsync_directory(parent)
+    except OSError as error:
+        raise GateProviderError("repository pack staging descriptor cannot be revalidated") from error
+    if (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        stat.S_IMODE(opened.st_mode),
+    ) != expected or opened.st_nlink != 1:
+        raise GateProviderError("repository pack staging descriptor changed")
+
+    _rename_noreplace(parent_descriptor, staging_name, target_name)
+    _fsync_descriptor(parent_descriptor, label="repository pack directory")
+    try:
+        published = os.stat(target_name, dir_fd=parent_descriptor, follow_symlinks=False)
         after = os.fstat(descriptor)
+    except OSError as error:
+        raise GateProviderError("published repository pack cannot be revalidated") from error
+    for observed in (published, after):
         if (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            stat.S_IMODE(after.st_mode),
-        ) != expected or after.st_nlink != 1:
-            raise GateProviderError("repository pack publication did not become exclusive")
-        if _regular_file_identity(target)[:4] != expected:
-            raise GateProviderError("repository pack pathname changed after publication")
-    finally:
-        os.close(descriptor)
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            stat.S_IMODE(observed.st_mode),
+        ) != expected or observed.st_nlink != 1:
+            raise GateProviderError("published repository pack has the wrong identity")
+    try:
+        os.stat(staging_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise GateProviderError("repository pack staging absence cannot be verified") from error
+    else:
+        raise GateProviderError("repository pack staging entry remains after publication")
+
+
+def _rename_noreplace(parent_descriptor: int, source: str, target: str) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+    except OSError as error:
+        raise GateProviderError("atomic repository pack publication is unavailable") from error
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if hasattr(library, "renameatx_np"):
+        function = library.renameatx_np
+        flag = 0x00000004
+    elif hasattr(library, "renameat2"):
+        function = library.renameat2
+        flag = 1
+    else:
+        raise GateProviderError("atomic repository pack publication is unavailable")
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    result = function(
+        parent_descriptor,
+        source_bytes,
+        parent_descriptor,
+        target_bytes,
+        flag,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise GateProviderError("repository pack destination cannot be created exclusively")
+    if error in {errno.ENOSYS, errno.ENOTSUP}:
+        raise GateProviderError("atomic repository pack publication is unavailable")
+    raise GateProviderError("repository pack cannot be published atomically") from OSError(
+        error,
+        os.strerror(error),
+        target,
+    )
 
 
 def _write_all(descriptor: int, content: bytes) -> None:
@@ -560,18 +685,18 @@ def _write_all(descriptor: int, content: bytes) -> None:
         offset += written
 
 
-def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
+def _fsync_descriptor(descriptor: int, *, label: str) -> None:
     try:
-        descriptor = os.open(path, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        os.fsync(descriptor)
     except OSError as error:
-        raise GateProviderError("repository pack directory could not be synchronized") from error
+        raise GateProviderError(f"{label} could not be synchronized") from error
+
+
+def _close_descriptor(descriptor: int, *, label: str) -> None:
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        raise GateProviderError(f"{label} descriptor could not be closed") from error
 
 
 def _diagnostic(value: bytes) -> str:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import autoform_worker.gate_evaluator as evaluator_module
+import autoform_worker.gate_pack as gate_pack_module
 from autoform_worker.gate_evaluator import (
     _copy_verified_pack,
     _decode_request,
@@ -148,7 +149,7 @@ def test_host_prepares_and_revalidates_bounded_repository_pack(tmp_path: Path) -
     assert pack.size > 0
     assert Path(pack.path).stat().st_mode & 0o777 == 0o444
     assert Path(pack.path).stat().st_nlink == 1
-    assert not list(state.glob(".*.preparing-*"))
+    assert not list(state.glob(".autoform-gate-pack-*.stage"))
     assert hashlib.sha256(Path(pack.path).read_bytes()).hexdigest() == pack.sha256
     verify_repository_pack(pack)
 
@@ -197,7 +198,7 @@ def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Pa
             timeout_seconds=30,
         )
     assert not (state / "too-small.pack").exists()
-    assert len(list(state.glob(".too-small.pack.preparing-*"))) == 1
+    assert len(list(state.glob(".autoform-gate-pack-*.stage"))) == 1
     occupied = state / "occupied.pack"
     occupied.write_bytes(b"foreign")
     with pytest.raises(GateProviderError, match="created exclusively"):
@@ -211,7 +212,7 @@ def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Pa
         )
     assert occupied.read_bytes() == b"foreign"
     state.chmod(0o755)
-    with pytest.raises(GateProviderError, match="group or other"):
+    with pytest.raises(GateProviderError, match="mode 0700"):
         prepare_repository_pack(
             repository,
             state / "unsafe.pack",
@@ -231,6 +232,141 @@ def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Pa
             maximum_bytes=1024 * 1024,
             timeout_seconds=30,
         )
+
+
+def test_host_pack_revalidation_rejects_parent_permission_drift(tmp_path: Path) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    pack = prepare_repository_pack(
+        repository,
+        state / "invocation.pack",
+        base_oid=base_oid,
+        candidate_oid=candidate_oid,
+        maximum_bytes=1024 * 1024,
+        timeout_seconds=30,
+    )
+
+    state.chmod(0o755)
+    try:
+        with pytest.raises(GateProviderError, match="mode 0700|identity"):
+            verify_repository_pack(pack)
+    finally:
+        state.chmod(0o700)
+    displaced = tmp_path / "displaced-state"
+    state.rename(displaced)
+    state.mkdir(mode=0o700)
+    with pytest.raises(GateProviderError, match="parent identity"):
+        verify_repository_pack(pack)
+
+
+def test_host_pack_publication_preserves_a_replaced_staging_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    target = state / "invocation.pack"
+    displaced = state / "displaced.pack"
+    original_rename = gate_pack_module._rename_noreplace
+
+    def replace_before_rename(parent_descriptor: int, source: str, destination: str) -> None:
+        staging = state / source
+        staging.rename(displaced)
+        staging.write_bytes(b"foreign")
+        staging.chmod(0o444)
+        original_rename(parent_descriptor, source, destination)
+
+    monkeypatch.setattr(
+        gate_pack_module,
+        "_rename_noreplace",
+        replace_before_rename,
+    )
+    with pytest.raises(GateProviderError, match="wrong identity"):
+        prepare_repository_pack(
+            repository,
+            target,
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    assert target.read_bytes() == b"foreign"
+    assert displaced.exists()
+
+
+def test_host_pack_publication_preserves_ambiguous_post_rename_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, base_oid, candidate_oid = _repository(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    target = state / "invocation.pack"
+    original_fsync = gate_pack_module._fsync_descriptor
+    calls = 0
+
+    def fail_second_fsync(descriptor: int, *, label: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise GateProviderError("injected parent fsync failure")
+        original_fsync(descriptor, label=label)
+
+    monkeypatch.setattr(gate_pack_module, "_fsync_descriptor", fail_second_fsync)
+    with pytest.raises(GateProviderError, match="injected parent fsync failure"):
+        prepare_repository_pack(
+            repository,
+            target,
+            base_oid=base_oid,
+            candidate_oid=candidate_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+
+    assert target.is_file()
+    assert target.stat().st_nlink == 1
+    assert not list(state.glob(".autoform-gate-pack-*.stage"))
+
+
+def test_host_pack_publication_wraps_descriptor_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+    staging_name = ".autoform-gate-pack-test.stage"
+    target_name = "invocation.pack"
+    staging = state / staging_name
+    staging.write_bytes(b"pack")
+    staging.chmod(0o444)
+    parent_descriptor = os.open(state, os.O_RDONLY)
+    descriptor = os.open(staging, os.O_RDONLY)
+    prepared = os.fstat(descriptor)
+    original_fstat = gate_pack_module.os.fstat
+
+    def fail_pack_fstat(value: int) -> os.stat_result:
+        if value == descriptor:
+            raise OSError("injected")
+        return original_fstat(value)
+
+    monkeypatch.setattr(gate_pack_module.os, "fstat", fail_pack_fstat)
+    try:
+        with pytest.raises(GateProviderError, match="descriptor cannot be revalidated"):
+            gate_pack_module._publish_repository_pack(
+                parent_descriptor,
+                staging_name,
+                target_name,
+                descriptor,
+                prepared,
+            )
+    finally:
+        os.close(descriptor)
+        os.close(parent_descriptor)
+    assert staging.exists()
+    assert not (state / target_name).exists()
 
 
 def test_host_pack_rejects_zero_or_non_descendant_candidate(tmp_path: Path) -> None:
