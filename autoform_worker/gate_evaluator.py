@@ -115,7 +115,7 @@ def _pack_identity(path: Path) -> tuple[int, int, int, int, int]:
         resolved != path
         or not stat.S_ISREG(info.st_mode)
         or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o022
+        or stat.S_IMODE(info.st_mode) != 0o444
     ):
         raise GateProviderError("repository pack must be one private regular file")
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, stat.S_IMODE(info.st_mode)
@@ -248,6 +248,10 @@ def _materialize_worktrees(
         ).stdout
         if resolved != f"{oid}\n".encode("ascii"):
             raise GateProviderError(f"repository pack does not contain the exact {label} commit")
+    _run_git(
+        ["merge-base", "--is-ancestor", request.base_oid, request.candidate_oid],
+        cwd=repository,
+    )
     _run_git(["worktree", "add", "--detach", str(base), request.base_oid], cwd=repository)
     _run_git(
         ["worktree", "add", "--detach", str(candidate), request.candidate_oid],
@@ -332,6 +336,8 @@ def _decode_request(value: str) -> GateInvocationRequest:
         content = base64.b64decode(value.encode("ascii"), altchars=b"-_", validate=True)
     except (UnicodeError, ValueError, binascii.Error) as error:
         raise GateProviderError("gate invocation argument is not strict URL-safe base64") from error
+    if base64.urlsafe_b64encode(content).decode("ascii") != value:
+        raise GateProviderError("gate invocation argument is not canonical URL-safe base64")
     request = GateInvocationRequest.from_bytes(content)
     if request.evidence_bytes() != content:
         raise GateProviderError("gate invocation argument is not canonical evidence")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import selectors
 import signal
 import stat
@@ -47,14 +48,16 @@ class RepositoryPack:
         ):
             if type(value) is not int or value <= 0:
                 raise GateProviderError(f"{label} must be a positive integer")
-        if type(self.mode) is not int or self.mode != 0o400:
-            raise GateProviderError("repository pack mode must be 0400")
+        if type(self.mode) is not int or self.mode != 0o444:
+            raise GateProviderError("repository pack mode must be 0444")
         length = _OBJECT_FORMAT_LENGTHS.get(self.object_format)
         if length is None:
             raise GateProviderError("repository pack object format is unsupported")
         for label, oid in (("base", self.base_oid), ("candidate", self.candidate_oid)):
             if not isinstance(oid, str) or _OID.fullmatch(oid) is None or len(oid) != length:
                 raise GateProviderError(f"repository pack {label} OID has the wrong format")
+            if oid == "0" * len(oid):
+                raise GateProviderError(f"repository pack {label} OID must not be all-zero")
         if self.base_oid == self.candidate_oid:
             raise GateProviderError("repository pack candidate OID must differ from its base")
 
@@ -100,6 +103,8 @@ def prepare_repository_pack(
     for label, oid in (("base", base_oid), ("candidate", candidate_oid)):
         if not isinstance(oid, str) or _OID.fullmatch(oid) is None or len(oid) != length:
             raise GateProviderError(f"{label} OID does not match the repository object format")
+        if oid == "0" * len(oid):
+            raise GateProviderError(f"{label} OID must not be all-zero")
         resolved = _git_text(
             root,
             ["rev-parse", "--verify", f"{oid}^{{commit}}"],
@@ -109,14 +114,20 @@ def prepare_repository_pack(
             raise GateProviderError(f"{label} OID does not resolve to one exact commit")
     if base_oid == candidate_oid:
         raise GateProviderError("candidate OID must differ from base OID")
+    _git_text(
+        root,
+        ["merge-base", "--is-ancestor", base_oid, candidate_oid],
+        timeout=timeout,
+    )
     if _directory_identity(root) != repository_identity:
         raise GateProviderError("repository root changed while pack inputs were verified")
 
+    staging = parent / f".{target.name}.preparing-{secrets.token_hex(16)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(target, flags, 0o600)
+        descriptor = os.open(staging, flags, 0o600)
     except OSError as error:
         raise GateProviderError("repository pack destination cannot be created exclusively") from error
     digest = hashlib.sha256()
@@ -142,7 +153,7 @@ def prepare_repository_pack(
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != size:
             raise GateProviderError("repository pack destination changed while it was written")
-        os.fchmod(descriptor, 0o400)
+        os.fchmod(descriptor, 0o444)
         os.fsync(descriptor)
         info = os.fstat(descriptor)
     finally:
@@ -150,6 +161,7 @@ def prepare_repository_pack(
     if _directory_identity(root) != repository_identity:
         raise GateProviderError("repository root changed while its pack was created")
     _fsync_directory(parent)
+    _publish_repository_pack(staging, target, parent, info)
     pack = RepositoryPack(
         path=os.fspath(target),
         sha256=digest.hexdigest(),
@@ -458,10 +470,82 @@ def _regular_file_identity(path: Path) -> tuple[int, int, int, int, int]:
         resolved != path
         or not stat.S_ISREG(info.st_mode)
         or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o377 != 0
+        or stat.S_IMODE(info.st_mode) != 0o444
     ):
         raise GateProviderError("repository pack pathname is not one private read-only file")
     return info.st_dev, info.st_ino, info.st_size, stat.S_IMODE(info.st_mode), info.st_mtime_ns
+
+
+def _publish_repository_pack(
+    staging: Path,
+    target: Path,
+    parent: Path,
+    prepared: os.stat_result,
+) -> None:
+    expected = (
+        prepared.st_dev,
+        prepared.st_ino,
+        prepared.st_size,
+        stat.S_IMODE(prepared.st_mode),
+    )
+    if _regular_file_identity(staging)[:4] != expected:
+        raise GateProviderError("repository pack staging identity changed")
+    try:
+        os.link(staging, target, follow_symlinks=False)
+    except OSError as error:
+        raise GateProviderError("repository pack destination cannot be created exclusively") from error
+    _fsync_directory(parent)
+
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as error:
+        raise GateProviderError("published repository pack cannot be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            stat.S_IMODE(opened.st_mode),
+        ) != expected or opened.st_nlink != 2:
+            raise GateProviderError("published repository pack has the wrong identity")
+        try:
+            staging_info = staging.stat(follow_symlinks=False)
+            target_info = target.stat(follow_symlinks=False)
+        except OSError as error:
+            raise GateProviderError("repository pack publication cannot be revalidated") from error
+        if (
+            staging_info.st_dev,
+            staging_info.st_ino,
+            staging_info.st_size,
+            stat.S_IMODE(staging_info.st_mode),
+        ) != expected or (
+            target_info.st_dev,
+            target_info.st_ino,
+            target_info.st_size,
+            stat.S_IMODE(target_info.st_mode),
+        ) != expected:
+            raise GateProviderError("repository pack publication changed identity")
+        try:
+            os.unlink(staging)
+        except OSError as error:
+            raise GateProviderError("repository pack staging link cannot be removed") from error
+        _fsync_directory(parent)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            stat.S_IMODE(after.st_mode),
+        ) != expected or after.st_nlink != 1:
+            raise GateProviderError("repository pack publication did not become exclusive")
+        if _regular_file_identity(target)[:4] != expected:
+            raise GateProviderError("repository pack pathname changed after publication")
+    finally:
+        os.close(descriptor)
 
 
 def _write_all(descriptor: int, content: bytes) -> None:

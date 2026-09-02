@@ -315,6 +315,8 @@ class GateInvocationRequest:
         for label, value in (("base OID", self.base_oid), ("candidate OID", self.candidate_oid)):
             if not isinstance(value, str) or _OID.fullmatch(value) is None:
                 raise GateProviderError(f"{label} must be a lowercase SHA-1 or SHA-256 object ID")
+            if value == "0" * len(value):
+                raise GateProviderError(f"{label} must not be the all-zero object ID")
         if len(self.base_oid) != len(self.candidate_oid):
             raise GateProviderError("base and candidate OIDs must use the same object format")
         if self.base_oid == self.candidate_oid:
@@ -639,12 +641,8 @@ def docker_create_argv(
             config.platform,
             "--network",
             "none",
-            "--pid",
-            "private",
             "--ipc",
             "none",
-            "--uts",
-            "private",
             "--cgroupns",
             "private",
             "--runtime",
@@ -677,7 +675,7 @@ def docker_create_argv(
             "--ulimit",
             "core=0:0",
             "--tmpfs",
-            f"/autoform/work:rw,nosuid,nodev,size={limits.scratch_bytes}",
+            f"/autoform/work:{_work_tmpfs_options(config)}",
             "--mount",
             mount,
             "--log-driver",
@@ -779,8 +777,8 @@ def _validate_host_config(
         ("CapDrop", ["ALL"], "dropped capabilities"),
         ("CgroupnsMode", "private", "cgroup namespace"),
         ("IpcMode", "none", "IPC namespace"),
-        ("PidMode", "private", "PID namespace"),
-        ("UTSMode", "private", "UTS namespace"),
+        ("PidMode", "", "PID namespace"),
+        ("UTSMode", "", "UTS namespace"),
         ("Privileged", False, "privileged mode"),
         ("PublishAllPorts", False, "published ports"),
         ("ReadonlyRootfs", True, "read-only root filesystem"),
@@ -797,7 +795,7 @@ def _validate_host_config(
         (
             "Tmpfs",
             {
-                "/autoform/work": f"rw,nosuid,nodev,size={limits.scratch_bytes}",
+                "/autoform/work": _work_tmpfs_options(config),
             },
             "tmpfs policy",
         ),
@@ -985,7 +983,12 @@ def _normalized_host_policy(
             "root_read_only": True,
             "shm_bytes": _SHM_BYTES,
             "tmpfs": {
-                "/autoform/work": limits.scratch_bytes,
+                "/autoform/work": {
+                    "bytes": limits.scratch_bytes,
+                    "gid": int(config.user.split(":", 1)[1]),
+                    "mode": "0700",
+                    "uid": int(config.user.split(":", 1)[0]),
+                },
             },
         },
         "limits": limits.as_dict(),
@@ -1057,6 +1060,14 @@ def _positive_finite(label: str, value: object) -> float:
 def _docker_cpus(value: int) -> str:
     whole, remainder = divmod(value, 1_000_000_000)
     return f"{whole}.{remainder:09d}"
+
+
+def _work_tmpfs_options(config: DockerGateProviderConfig) -> str:
+    uid, gid = config.user.split(":", 1)
+    return (
+        f"rw,nosuid,nodev,size={config.limits.scratch_bytes},"
+        f"uid={uid},gid={gid},mode=0700"
+    )
 
 
 def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

@@ -86,8 +86,45 @@ def _repository_pack(tmp_path: Path) -> tuple[Path, str, str]:
     )
     pack = (tmp_path / "source.pack").resolve()
     pack.write_bytes(content)
-    pack.chmod(0o400)
+    pack.chmod(0o444)
     return pack, base_oid, candidate_oid
+
+
+def _unrelated_repository_pack(tmp_path: Path) -> tuple[Path, str, str, Path]:
+    repository, base_oid, _candidate_oid = _repository(tmp_path)
+    _git(repository, "checkout", "--quiet", "--orphan", "unrelated")
+    _git(repository, "rm", "--quiet", "-rf", ".")
+    (repository / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+    _git(repository, "add", "unrelated.txt")
+    _git(
+        repository,
+        "-c",
+        "user.name=Autoform",
+        "-c",
+        "user.email=autoform@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "unrelated",
+    )
+    unrelated_oid = _git(repository, "rev-parse", "HEAD").decode().strip()
+    content = _git(
+        repository,
+        "--no-replace-objects",
+        "pack-objects",
+        "--stdout",
+        "--revs",
+        "--no-reuse-delta",
+        "--no-reuse-object",
+        "--no-thin",
+        "--no-include-tag",
+        "--window=0",
+        input_bytes=f"{base_oid}\n{unrelated_oid}\n".encode("ascii"),
+    )
+    pack = (tmp_path / "unrelated.pack").resolve()
+    pack.write_bytes(content)
+    pack.chmod(0o444)
+    return pack, base_oid, unrelated_oid, repository
 
 
 def test_host_prepares_and_revalidates_bounded_repository_pack(tmp_path: Path) -> None:
@@ -109,7 +146,9 @@ def test_host_prepares_and_revalidates_bounded_repository_pack(tmp_path: Path) -
     assert pack.candidate_oid == candidate_oid
     assert pack.object_format == "sha1"
     assert pack.size > 0
-    assert Path(pack.path).stat().st_mode & 0o777 == 0o400
+    assert Path(pack.path).stat().st_mode & 0o777 == 0o444
+    assert Path(pack.path).stat().st_nlink == 1
+    assert not list(state.glob(".*.preparing-*"))
     assert hashlib.sha256(Path(pack.path).read_bytes()).hexdigest() == pack.sha256
     verify_repository_pack(pack)
 
@@ -138,7 +177,7 @@ def test_host_pack_revalidation_rejects_content_or_path_replacement(tmp_path: Pa
     displaced = state / "displaced.pack"
     path.rename(displaced)
     path.write_bytes(displaced.read_bytes())
-    path.chmod(0o400)
+    path.chmod(0o444)
 
     with pytest.raises(GateProviderError, match="identity"):
         verify_repository_pack(pack)
@@ -157,6 +196,8 @@ def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Pa
             maximum_bytes=1,
             timeout_seconds=30,
         )
+    assert not (state / "too-small.pack").exists()
+    assert len(list(state.glob(".too-small.pack.preparing-*"))) == 1
     occupied = state / "occupied.pack"
     occupied.write_bytes(b"foreign")
     with pytest.raises(GateProviderError, match="created exclusively"):
@@ -168,6 +209,7 @@ def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Pa
             maximum_bytes=1024 * 1024,
             timeout_seconds=30,
         )
+    assert occupied.read_bytes() == b"foreign"
     state.chmod(0o755)
     with pytest.raises(GateProviderError, match="group or other"):
         prepare_repository_pack(
@@ -189,6 +231,39 @@ def test_host_pack_creation_fails_closed_on_limits_and_unsafe_state(tmp_path: Pa
             maximum_bytes=1024 * 1024,
             timeout_seconds=30,
         )
+
+
+def test_host_pack_rejects_zero_or_non_descendant_candidate(tmp_path: Path) -> None:
+    pack, base_oid, unrelated_oid, repository = _unrelated_repository_pack(tmp_path)
+    state = (tmp_path / "state").resolve()
+    state.mkdir(mode=0o700)
+
+    with pytest.raises(GateProviderError, match="all-zero"):
+        prepare_repository_pack(
+            repository,
+            state / "zero.pack",
+            base_oid="0" * len(base_oid),
+            candidate_oid=unrelated_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+    with pytest.raises(GateProviderError, match="Git input verification failed"):
+        prepare_repository_pack(
+            repository,
+            state / "unrelated-output.pack",
+            base_oid=base_oid,
+            candidate_oid=unrelated_oid,
+            maximum_bytes=1024 * 1024,
+            timeout_seconds=30,
+        )
+    assert not (state / "zero.pack").exists()
+    assert not (state / "unrelated-output.pack").exists()
+
+    request = _request(pack, base_oid, unrelated_oid)
+    work_root = (tmp_path / "work-unrelated").resolve()
+    work_root.mkdir()
+    with pytest.raises(GateProviderError, match="isolated Git command failed"):
+        _materialize_worktrees(request, pack, work_root)
 
 
 def _request(pack: Path, base_oid: str, candidate_oid: str, *, work_item_sha256: str = "c" * 64) -> GateInvocationRequest:
@@ -232,7 +307,7 @@ def test_repository_pack_is_copied_rehashed_and_materialized(tmp_path: Path) -> 
     assert _git(candidate, "rev-parse", "HEAD") == f"{candidate_oid}\n".encode()
 
 
-@pytest.mark.parametrize("change", ["size", "digest", "hardlink", "symlink"])
+@pytest.mark.parametrize("change", ["size", "digest", "hardlink", "mode", "symlink"])
 def test_repository_pack_copy_rejects_identity_or_content_drift(
     tmp_path: Path,
     change: str,
@@ -245,6 +320,8 @@ def test_repository_pack_copy_rejects_identity_or_content_drift(
         request = replace(request, repository_pack_sha256="0" * 64)
     elif change == "hardlink":
         os.link(pack, tmp_path / "other.pack")
+    elif change == "mode":
+        pack.chmod(0o400)
     else:
         target = tmp_path / "target.pack"
         pack.rename(target)
@@ -274,7 +351,7 @@ def test_repository_pack_copy_detects_a_mid_copy_replacement(
             changed = True
             pack.chmod(0o600)
             pack.write_bytes(b"x" * request.repository_pack_bytes)
-            pack.chmod(0o400)
+            pack.chmod(0o444)
 
     monkeypatch.setattr(evaluator_module, "_write_all", mutate_source)
 
@@ -410,3 +487,8 @@ def test_gate_request_argument_requires_canonical_strict_base64(tmp_path: Path) 
     noncanonical = base64.urlsafe_b64encode(b" " + request.evidence_bytes()).decode("ascii")
     with pytest.raises(GateProviderError):
         _decode_request(noncanonical)
+    assert encoded.endswith("0=")
+    alternative = encoded[:-2] + "1="
+    assert base64.urlsafe_b64decode(alternative) == request.evidence_bytes()
+    with pytest.raises(GateProviderError, match="canonical URL-safe base64"):
+        _decode_request(alternative)

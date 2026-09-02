@@ -148,8 +148,8 @@ def _inspection(
             "CapDrop": ["ALL"],
             "CgroupnsMode": "private",
             "IpcMode": "none",
-            "PidMode": "private",
-            "UTSMode": "private",
+            "PidMode": "",
+            "UTSMode": "",
             "Privileged": False,
             "PublishAllPorts": False,
             "ReadonlyRootfs": True,
@@ -165,7 +165,8 @@ def _inspection(
             "LogConfig": {"Type": "none", "Config": {}},
             "Tmpfs": {
                 "/autoform/work": (
-                    f"rw,nosuid,nodev,size={config.limits.scratch_bytes}"
+                    f"rw,nosuid,nodev,size={config.limits.scratch_bytes},"
+                    "uid=65532,gid=65532,mode=0700"
                 ),
             },
             "Binds": None,
@@ -354,6 +355,7 @@ def test_gate_invocation_round_trips_with_deterministic_ownership() -> None:
         ("run_id", "run\nother", "canonical text"),
         ("run_id", "bad\udcff", "canonical text"),
         ("base_oid", "8" * 39, "object ID"),
+        ("base_oid", "0" * 40, "all-zero"),
         ("candidate_oid", "9" * 64, "same object format"),
         ("candidate_oid", "8" * 40, "must differ"),
         ("article_id", "result", "durable Autoform format"),
@@ -412,9 +414,7 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
     for pair in (
         ("--pull", "never"),
         ("--network", "none"),
-        ("--pid", "private"),
         ("--ipc", "none"),
-        ("--uts", "private"),
         ("--cgroupns", "private"),
         ("--runtime", "runc"),
         ("--user", "65532:65532"),
@@ -435,10 +435,16 @@ def test_docker_create_command_has_one_exact_fail_closed_policy() -> None:
         assert command[position : position + 2] == pair
     assert "--read-only" in command
     assert "--init" in command
+    assert "--pid" not in command
+    assert "--uts" not in command
     assert "--no-healthcheck" in command
     assert "--oom-kill-disable=false" in command
     assert command.count("--security-opt") == 2
     assert command.count("--tmpfs") == 1
+    assert command[command.index("--tmpfs") + 1] == (
+        f"/autoform/work:rw,nosuid,nodev,size={config.limits.scratch_bytes},"
+        "uid=65532,gid=65532,mode=0700"
+    )
     assert command.count("--ulimit") == 2
     assert all("/autoform/result" not in argument for argument in command)
     assert command[-5:-1] == (
