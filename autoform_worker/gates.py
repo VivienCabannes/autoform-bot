@@ -970,6 +970,7 @@ class _InvocationTracker:
     def __init__(self, root_pid: int) -> None:
         self._known: dict[tuple[int, float], psutil.Process] = {}
         self._lock = threading.Lock()
+        self._failure: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         try:
@@ -997,8 +998,13 @@ class _InvocationTracker:
                 self._remember(child)
 
     def _run(self) -> None:
-        while not self._stop.wait(_INVOCATION_TRACK_INTERVAL_SECONDS):
-            self._discover()
+        try:
+            while not self._stop.wait(_INVOCATION_TRACK_INTERVAL_SECONDS):
+                self._discover()
+        except BaseException as error:
+            with self._lock:
+                self._failure = error
+            self._stop.set()
 
     def start(self) -> None:
         self._discover()
@@ -1014,6 +1020,10 @@ class _InvocationTracker:
             self._thread.join(timeout=1)
         if self._thread.is_alive():
             raise CandidateGateError("invocation process tracker did not stop")
+        with self._lock:
+            failed = self._failure is not None
+        if failed:
+            raise CandidateGateError("invocation process tracker failed")
 
 
 def _kill_tracked_invocation_processes(
@@ -1051,62 +1061,122 @@ def _terminate_invocation(
 ) -> None:
     """Stop one command and every tracked or marked descendant before returning."""
 
-    if process.poll() is None:
-        # The direct child owns this group until it is reaped, so the numeric
-        # group ID cannot yet have been recycled. Detached descendants are
-        # handled by the marker sweep below.
+    cleanup_errors: list[BaseException] = []
+
+    def kill_direct_child() -> None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            process.kill()
         except ProcessLookupError:
             pass
-        except PermissionError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
+        except BaseException as error:
+            cleanup_errors.append(error)
+
+    def wait_for_direct_child(*, final: bool) -> bool:
         try:
             process.wait(timeout=1)
-        except subprocess.TimeoutExpired:  # pragma: no cover - OS failed to reap child
-            process.kill()
-            process.wait(timeout=1)
+        except subprocess.TimeoutExpired as error:
+            if final:
+                cleanup_errors.append(error)
+            return False
+        except BaseException as error:
+            cleanup_errors.append(error)
+            return False
+        return True
 
-    deadline = time.monotonic() + _INVOCATION_CLEANUP_SECONDS
-    empty_scans = 0
+    def direct_child_is_running() -> bool:
+        try:
+            return process.poll() is None
+        except BaseException as error:
+            cleanup_errors.append(error)
+            return True
+
     try:
+        if direct_child_is_running():
+            # The direct child owns this group until it is reaped, so the numeric
+            # group ID cannot yet have been recycled. Detached descendants are
+            # handled by the marker sweep below.
+            fallback_to_direct_child = False
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                fallback_to_direct_child = True
+            except BaseException as error:
+                cleanup_errors.append(error)
+                fallback_to_direct_child = True
+            if fallback_to_direct_child:
+                kill_direct_child()
+            if not wait_for_direct_child(final=False):
+                kill_direct_child()
+                wait_for_direct_child(final=True)
+
+        deadline = time.monotonic() + _INVOCATION_CLEANUP_SECONDS
+        empty_scans = 0
         while time.monotonic() < deadline:
             if tracker is not None:
-                tracker._discover()
-            killed = (
-                *(_kill_tracked_invocation_processes(tracker) if tracker is not None else ()),
-                *_kill_marked_invocation_processes(marker),
-            )
+                try:
+                    tracker._discover()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            killed: tuple[psutil.Process, ...] = ()
             if tracker is not None:
-                tracker._discover()
-            remaining = (
-                *(
-                    _active_tracked_invocation_processes(tracker)
-                    if tracker is not None
-                    else ()
-                ),
-                *_marked_invocation_processes(marker),
-            )
+                try:
+                    killed += _kill_tracked_invocation_processes(tracker)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            try:
+                killed += _kill_marked_invocation_processes(marker)
+            except BaseException as error:
+                cleanup_errors.append(error)
+            if tracker is not None:
+                try:
+                    tracker._discover()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            remaining: tuple[psutil.Process, ...] = ()
+            if tracker is not None:
+                try:
+                    remaining += _active_tracked_invocation_processes(tracker)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            try:
+                remaining += _marked_invocation_processes(marker)
+            except BaseException as error:
+                cleanup_errors.append(error)
             if killed or remaining:
                 empty_scans = 0
             else:
                 empty_scans += 1
                 if empty_scans >= _INVOCATION_CLEANUP_EMPTY_SCANS:
-                    return
+                    break
             time.sleep(_INVOCATION_CLEANUP_INTERVAL_SECONDS)
-        tracked = (
-            _active_tracked_invocation_processes(tracker)
-            if tracker is not None
-            else ()
-        )
-        if tracked or _marked_invocation_processes(marker):
-            raise CandidateGateError("command processes remained alive after invocation cleanup")
-    finally:
+        tracked: tuple[psutil.Process, ...] = ()
         if tracker is not None:
-            tracker.stop()
+            try:
+                tracked = _active_tracked_invocation_processes(tracker)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        try:
+            marked = _marked_invocation_processes(marker)
+        except BaseException as error:
+            cleanup_errors.append(error)
+            marked = ()
+        if tracked or marked:
+            raise CandidateGateError("command processes remained alive after invocation cleanup")
+    except BaseException as error:
+        cleanup_errors.append(error)
+    finally:
+        if direct_child_is_running():
+            kill_direct_child()
+            wait_for_direct_child(final=True)
+        if tracker is not None:
+            try:
+                tracker.stop()
+            except BaseException as error:
+                cleanup_errors.append(error)
+    if cleanup_errors:
+        raise cleanup_errors[0]
 
 
 def _bounded_subprocess_run(
@@ -1182,7 +1252,7 @@ def _bounded_subprocess_run(
 
     readers: tuple[threading.Thread, ...] = ()
     started_readers: list[threading.Thread] = []
-    timed_out = False
+    timed_out: subprocess.TimeoutExpired | None = None
     returncode = -1
     primary_error: BaseException | None = None
     cleanup_errors: list[BaseException] = []
@@ -1211,8 +1281,8 @@ def _bounded_subprocess_run(
                     started_readers.append(reader)
         try:
             returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        except subprocess.TimeoutExpired as error:
+            timed_out = error
     except BaseException as error:
         primary_error = error
     finally:
@@ -1246,26 +1316,24 @@ def _bounded_subprocess_run(
             "command output pipes remained open after invocation cleanup"
         )
     elif cleanup_errors:
-        detail = str(cleanup_errors[0]).replace(marker, "<gate-invocation>")
+        detail = _scrub_text(str(cleanup_errors[0]), capture_replacements)
         cleanup_failure = CandidateGateError(f"could not clean up command processes: {detail}")
     elif reader_errors:
-        detail = str(reader_errors[0]).replace(marker, "<gate-invocation>")
+        detail = _scrub_text(str(reader_errors[0]), capture_replacements)
         cleanup_failure = CandidateGateError(f"could not read command output: {detail}")
     if cleanup_failure is not None:
-        if primary_error is not None:
-            raise cleanup_failure from primary_error
+        prior_error = primary_error if primary_error is not None else timed_out
+        if prior_error is not None:
+            raise cleanup_failure from prior_error
         raise cleanup_failure
     if primary_error is not None:
         raise primary_error
     captured_stdout = returned_stdout.text
     captured_stderr = returned_stderr.text
-    if timed_out:
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout,
-            output=captured_stdout,
-            stderr=captured_stderr,
-        )
+    if timed_out is not None:
+        timed_out.output = captured_stdout
+        timed_out.stderr = captured_stderr
+        raise timed_out
     completed = subprocess.CompletedProcess(command, returncode, captured_stdout, captured_stderr)
     completed._autoform_stdout_sha256 = stdout.sha256  # type: ignore[attr-defined]
     completed._autoform_stderr_sha256 = stderr.sha256  # type: ignore[attr-defined]

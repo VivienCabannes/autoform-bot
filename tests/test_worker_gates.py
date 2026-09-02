@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -756,6 +758,151 @@ def test_invocation_tracker_stop_fails_closed_if_thread_remains_alive() -> None:
 
     with pytest.raises(CandidateGateError, match="tracker did not stop"):
         tracker.stop()
+
+
+def test_terminate_invocation_reports_group_kill_failure_after_reaping_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "c" * 64
+
+    class RunningCommand:
+        pid = 54321
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.waited = False
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, *, timeout: int) -> int:
+            assert timeout == 1
+            self.waited = True
+            return -signal.SIGKILL
+
+    class Tracker:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        @staticmethod
+        def _discover() -> None:
+            pass
+
+        @staticmethod
+        def snapshot() -> tuple[object, ...]:
+            return ()
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    def fail_group_kill(_pid: int, _sig: int) -> None:
+        raise OSError("injected process-group failure")
+
+    process = RunningCommand()
+    tracker = Tracker()
+    monkeypatch.setattr("autoform_worker.gates.os.killpg", fail_group_kill)
+    monkeypatch.setattr(psutil, "process_iter", lambda: iter(()))
+    monkeypatch.setattr("autoform_worker.gates.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(OSError, match="injected process-group failure"):
+        _terminate_invocation(process, marker, tracker)  # type: ignore[arg-type]
+
+    assert process.killed
+    assert process.waited
+    assert tracker.stopped
+
+
+def test_default_gate_runner_contains_timeout_after_process_group_kill_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes: list[subprocess.Popen[bytes]] = []
+    trackers: list[_InvocationTracker] = []
+    real_killpg = os.killpg
+    real_popen = subprocess.Popen
+    real_tracker_start = _InvocationTracker.start
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def recording_tracker_start(tracker: _InvocationTracker) -> None:
+        trackers.append(tracker)
+        real_tracker_start(tracker)
+
+    def fail_group_kill(_pid: int, _sig: int) -> None:
+        raise OSError(f"injected process-group failure at {tmp_path}")
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(_InvocationTracker, "start", recording_tracker_start)
+    monkeypatch.setattr("autoform_worker.gates.os.killpg", fail_group_kill)
+
+    try:
+        with pytest.raises(CandidateGateError) as caught:
+            _invoke(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                cwd=tmp_path,
+                env=scrubbed_subprocess_environment(),
+                runner=subprocess.run,
+                timeout=0.05,
+                replacements=((tmp_path, "<project>"),),
+            )
+
+        assert str(caught.value) == (
+            "could not clean up command processes: "
+            "injected process-group failure at <project>"
+        )
+        assert isinstance(caught.value.__cause__, subprocess.TimeoutExpired)
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert len(trackers) == 1
+        assert trackers[0]._stop.is_set()
+        assert not trackers[0]._thread.is_alive()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                real_killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=1)
+        for tracker in trackers:
+            if tracker._thread.is_alive():
+                tracker.stop()
+
+
+def test_default_gate_runner_rejects_background_tracker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_detail = f"tracker detail from {tmp_path}"
+    failure_seen = threading.Event()
+    real_discover = _InvocationTracker._discover
+
+    def fail_in_tracker_thread(tracker: _InvocationTracker) -> None:
+        if threading.current_thread() is tracker._thread:
+            failure_seen.set()
+            raise RuntimeError(sensitive_detail)
+        real_discover(tracker)
+
+    monkeypatch.setattr(_InvocationTracker, "_discover", fail_in_tracker_thread)
+
+    with pytest.raises(CandidateGateError) as caught:
+        _invoke(
+            [sys.executable, "-c", "import time; time.sleep(0.1)"],
+            cwd=tmp_path,
+            env=scrubbed_subprocess_environment(),
+            runner=subprocess.run,
+            timeout=2,
+        )
+
+    assert failure_seen.is_set()
+    assert str(caught.value) == (
+        "could not clean up command processes: invocation process tracker failed"
+    )
+    assert sensitive_detail not in str(caught.value)
 
 
 def test_default_gate_runner_scrubs_internal_invocation_marker(tmp_path: Path) -> None:
