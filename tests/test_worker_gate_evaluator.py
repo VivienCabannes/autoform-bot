@@ -499,21 +499,25 @@ def test_host_pack_public_entry_points_wrap_lstat_failures(
 
 
 @pytest.mark.parametrize(
-    "repository_path",
+    ("repository_path", "message"),
     [
-        Path("~autoform-user-that-does-not-exist-9e8844d8/source"),
-        Path("/tmp/\ud800"),
+        (
+            Path("~autoform-user-that-does-not-exist-9e8844d8/source"),
+            "repository root cannot be inspected",
+        ),
+        (Path("/tmp/\ud800"), "repository root is invalid"),
     ],
     ids=["unknown-user", "unencodable"],
 )
 def test_host_pack_preparation_wraps_non_os_path_failures(
     tmp_path: Path,
     repository_path: Path,
+    message: str,
 ) -> None:
     state = (tmp_path / "state").resolve()
     state.mkdir(mode=0o700)
 
-    with pytest.raises(GateProviderError, match="repository root cannot be inspected"):
+    with pytest.raises(GateProviderError, match=message):
         prepare_repository_pack(
             repository_path,
             state / "invocation.pack",
@@ -549,7 +553,7 @@ def test_host_pack_preparation_rejects_unencodable_destination_before_staging(
     state.mkdir(mode=0o700)
     target = state / "\ud800.pack"
 
-    with pytest.raises(GateProviderError, match="repository pack path must be a canonical absolute path"):
+    with pytest.raises(GateProviderError, match="repository pack path is invalid"):
         prepare_repository_pack(
             repository,
             target,
