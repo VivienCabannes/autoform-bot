@@ -10,6 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Mapping
 
 import pytest
@@ -648,6 +649,7 @@ def test_discovery_accepts_multiple_repository_digest_aliases_and_binds_image_id
 
 def test_discovery_rejects_executable_or_socket_swap_during_command(
     provider_environment: _Environment,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def mutate_executable(operation: str, _call: int) -> None:
         if operation == "version":
@@ -658,14 +660,34 @@ def test_discovery_rejects_executable_or_socket_swap_during_command(
         _discover(provider_environment, runner)
 
     provider_environment.docker.chmod(0o500)
+    original_socket = os.lstat(provider_environment.socket_path)
+    real_lstat = os.lstat
+    socket_replaced = False
+
+    def reused_socket_inode(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]):
+        value = real_lstat(path)
+        if Path(path) != provider_environment.socket_path:
+            return value
+        return SimpleNamespace(
+            st_dev=original_socket.st_dev,
+            st_ino=original_socket.st_ino,
+            st_mode=original_socket.st_mode,
+            st_uid=original_socket.st_uid,
+            st_gid=original_socket.st_gid,
+            st_ctime_ns=original_socket.st_ctime_ns + int(socket_replaced),
+        )
+
+    monkeypatch.setattr(gate_provider_module.os, "lstat", reused_socket_inode)
 
     def mutate_socket(operation: str, _call: int) -> None:
+        nonlocal socket_replaced
         if operation == "version":
             provider_environment.socket_handle.close()
             provider_environment.socket_path.unlink()
             replacement = socket.socket(socket.AF_UNIX)
             replacement.bind(os.fspath(provider_environment.socket_path))
             provider_environment.socket_handle = replacement
+            socket_replaced = True
 
     runner = _Runner(provider_environment, mutate=mutate_socket)
     with pytest.raises(GateProviderError, match="Docker socket changed"):
@@ -676,7 +698,6 @@ def test_revalidation_accepts_socket_replacement_only_after_full_stable_reprobe(
     provider_environment: _Environment,
 ) -> None:
     config = _discover(provider_environment, _Runner(provider_environment))
-    old_inode = config.docker_socket_inode
     provider_environment.socket_handle.close()
     provider_environment.socket_path.unlink()
     provider_environment.socket_handle = socket.socket(socket.AF_UNIX)
@@ -690,7 +711,9 @@ def test_revalidation_accepts_socket_replacement_only_after_full_stable_reprobe(
         runner=runner,
     )
 
-    assert refreshed.docker_socket_inode != old_inode
+    socket_info = provider_environment.socket_path.stat()
+    assert refreshed.docker_socket_device == socket_info.st_dev
+    assert refreshed.docker_socket_inode == socket_info.st_ino
     assert refreshed.runtime_fingerprint_sha256 == config.runtime_fingerprint_sha256
     assert len(runner.calls) == 4
 

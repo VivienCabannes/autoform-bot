@@ -146,6 +146,7 @@ class _SocketIdentity:
     mode: int
     owner_uid: int
     owner_gid: int
+    ctime_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1521,6 +1522,7 @@ def _inspect_docker_socket(path: Path) -> _SocketIdentity:
         mode=stat.S_IMODE(value.st_mode),
         owner_uid=value.st_uid,
         owner_gid=value.st_gid,
+        ctime_ns=value.st_ctime_ns,
     )
 
 
