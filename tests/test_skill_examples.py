@@ -28,9 +28,7 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
         in readme
     )
     assert "git clone https://github.com/facebookresearch/autoform-bot.git" in readme
-    assert (
-        "https://github.com/facebookresearch/autoform-bot/tree/execution" in readme
-    )
+    assert "https://github.com/facebookresearch/autoform-bot/tree/execution" not in readme
     assert "VivienCabannes/autoform-bot" not in readme
 
 
@@ -628,8 +626,8 @@ def test_workspace_guidance_is_registry_based_and_repository_neutral(repo_root: 
         "--project",
     ):
         assert required in cli
-    assert "project_binding_sha256" in implementation
-    assert "workspace_manifest_sha256" not in implementation
+    assert "workspace_project_binding_sha256" in implementation
+    assert "paths.workspace_manifest_sha256 != workspace.manifest_sha256" in implementation
     assert "_rename_exchange" in implementation
     for repository_specific_name in (
         "formal-math",

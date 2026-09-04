@@ -79,7 +79,7 @@ def provider_environment(tmp_path: Path) -> _Environment:
     docker = tmp_path / "docker"
     docker.write_bytes(b"#!/bin/sh\nexit 125\n")
     docker.chmod(0o500)
-    with tempfile.TemporaryDirectory(prefix="afd-", dir="/private/tmp") as socket_directory:
+    with tempfile.TemporaryDirectory(prefix="afd-") as socket_directory:
         socket_path = Path(socket_directory) / "docker.sock"
         socket_handle = socket.socket(socket.AF_UNIX)
         socket_handle.bind(os.fspath(socket_path))
