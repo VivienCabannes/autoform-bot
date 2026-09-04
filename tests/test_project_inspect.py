@@ -224,6 +224,28 @@ def test_inspects_unregistered_workspace_locations_for_path_safety(tmp_path: Pat
     )
 
 
+def test_workspace_manifest_ignores_unregistered_legacy_blueprint_file(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "Plans").mkdir()
+    (root / "blueprint").write_text("unregistered sibling\n", encoding="utf-8")
+    (root / ".autoform.toml").write_text(
+        'schema = "autoform-workspace/v1"\n'
+        '[locations.plans]\npath = "Plans"\nprovides = ["blueprints"]\n'
+        '[projects]\n',
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.autoform.manifest_path == ".autoform.toml"
+    assert result.autoform.blueprint_path is None
+    assert not any(
+        diagnostic.path == "blueprint" and diagnostic.severity == "error"
+        for diagnostic in result.diagnostics
+    )
+
+
 def test_inspects_workspace_location_at_repository_root(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "Example/roadmap").mkdir(parents=True)

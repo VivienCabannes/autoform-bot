@@ -7,11 +7,12 @@ import json
 import sys
 from pathlib import Path
 
-from .graph import GraphValidationError, load_graph
+from .graph import GraphValidationError
 from .lean import build_linker, declaration_names
-from .runtime import RuntimeProjectionError, resolve_runtime_paths
+from .runtime import RuntimeProjectionError, bind_runtime_paths, load_bound_graph
 from .workspace import (
     WorkspaceDiagnostic,
+    WorkspaceInspection,
     discover_workspace,
     inspect_workspace,
 )
@@ -149,27 +150,33 @@ def run_workspace_command(args: argparse.Namespace) -> int:
             return 0
         if args.workspace_command == "inspect":
             result = inspect_workspace(args.target)
-            if args.json:
-                print(result.to_json())
-            else:
-                print(f"Workspace: {result.workspace.root}")
-                print(f"Manifest: {result.workspace.path.name} ({result.workspace.manifest.schema})")
-                for location in result.workspace.manifest.locations:
-                    capabilities = ", ".join(location.provides)
-                    print(f"Location {location.id}: {location.path} [{capabilities}]")
-                for project in result.workspace.manifest.projects:
-                    relative = result.workspace.blueprint_path(project).relative_to(
-                        result.workspace.root
-                    )
-                    print(f"Project {project.id}: {relative.as_posix()}")
-                for diagnostic in result.diagnostics:
-                    location = f" {diagnostic.path}" if diagnostic.path else ""
+            try:
+                if args.json:
+                    print(result.to_json())
+                else:
+                    print(f"Workspace: {result.workspace.root}")
                     print(
-                        f"{diagnostic.severity}[{diagnostic.code}]{location}: "
-                        f"{diagnostic.message}",
-                        file=sys.stderr,
+                        f"Manifest: {result.workspace.path.name} "
+                        f"({result.workspace.manifest.schema})"
                     )
-            return 0 if result.ok else 1
+                    for location in result.workspace.manifest.locations:
+                        capabilities = ", ".join(location.provides)
+                        print(f"Location {location.id}: {location.path} [{capabilities}]")
+                    for project in result.workspace.manifest.projects:
+                        relative = result.workspace.blueprint_path(project).relative_to(
+                            result.workspace.root
+                        )
+                        print(f"Project {project.id}: {relative.as_posix()}")
+                    for diagnostic in result.diagnostics:
+                        location = f" {diagnostic.path}" if diagnostic.path else ""
+                        print(
+                            f"{diagnostic.severity}[{diagnostic.code}]{location}: "
+                            f"{diagnostic.message}",
+                            file=sys.stderr,
+                        )
+                return 0 if result.ok else 1
+            finally:
+                result.workspace.close()
         if args.workspace_command == "check":
             return _check_workspace(args)
     except WorkspaceError as error:
@@ -198,31 +205,36 @@ def run_blueprint_command(args: argparse.Namespace) -> int:
             return 0
         if args.blueprint_command == "list":
             workspace = discover_workspace(args.target)
-            projects = [
-                {
-                    "id": project.id,
-                    "path": workspace.blueprint_path(project).relative_to(workspace.root).as_posix(),
-                    "title": project.title,
-                }
-                for project in workspace.manifest.projects
-            ]
-            if args.json:
-                print(
-                    json.dumps(
-                        {
-                            "ok": True,
-                            "projects": projects,
-                            "schema": BLUEPRINT_LIST_SCHEMA,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
+            try:
+                projects = [
+                    {
+                        "id": project.id,
+                        "path": workspace.blueprint_path(project)
+                        .relative_to(workspace.root)
+                        .as_posix(),
+                        "title": project.title,
+                    }
+                    for project in workspace.manifest.projects
+                ]
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "projects": projects,
+                                "schema": BLUEPRINT_LIST_SCHEMA,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
                     )
-                )
-            else:
-                for project in projects:
-                    title = f" — {project['title']}" if project["title"] else ""
-                    print(f"{project['id']}: {project['path']}{title}")
-            return 0
+                else:
+                    for project in projects:
+                        title = f" — {project['title']}" if project["title"] else ""
+                        print(f"{project['id']}: {project['path']}{title}")
+                return 0
+            finally:
+                workspace.close()
         if args.blueprint_command == "register":
             result = register_blueprint_project(
                 args.workspace,
@@ -245,6 +257,16 @@ def run_blueprint_command(args: argparse.Namespace) -> int:
 
 def _check_workspace(args: argparse.Namespace) -> int:
     inspection = inspect_workspace(args.target)
+    try:
+        return _check_workspace_inspection(args, inspection)
+    finally:
+        inspection.workspace.close()
+
+
+def _check_workspace_inspection(
+    args: argparse.Namespace,
+    inspection: WorkspaceInspection,
+) -> int:
     workspace = inspection.workspace
     diagnostics = list(inspection.diagnostics)
     if not workspace.manifest.projects:
@@ -257,31 +279,57 @@ def _check_workspace(args: argparse.Namespace) -> int:
             )
         )
     results: list[dict[str, object]] = []
+    linker = None
+    if args.lean_root is not None:
+        try:
+            linker = build_linker(args.lean_root)
+        except OSError as error:
+            diagnostics.append(
+                WorkspaceDiagnostic(
+                    "error",
+                    "invalid-lean-root",
+                    str(error),
+                    str(args.lean_root),
+                )
+            )
     failed = any(item.severity == "error" for item in diagnostics)
-    linker = build_linker(args.lean_root) if args.lean_root is not None else None
+    workspace.verify_root_binding()
+    workspace.verify_managed_directory_snapshots()
     for project in workspace.manifest.projects:
         blueprint_dir = workspace.blueprint_path(project)
+        expected_project_binding = workspace.project_binding_sha256(project)
         issues: list[str] = []
         articles = 0
         dependencies = 0
         try:
-            blueprint_dir = resolve_runtime_paths(
-                workspace.root,
-                project_id=project.id,
-            ).blueprint_dir
-            graph = load_graph(blueprint_dir)
-        except (GraphValidationError, RuntimeProjectionError) as error:
+            with bind_runtime_paths(workspace.root, project_id=project.id) as paths:
+                if (
+                    paths.workspace_root_identity != workspace.root_identity
+                    or paths.workspace_manifest_sha256 != workspace.manifest_sha256
+                    or paths.workspace_project_binding_sha256 != expected_project_binding
+                ):
+                    raise RuntimeProjectionError(
+                        ["workspace changed while registered projects were checked"]
+                    )
+                workspace.verify_root_binding()
+                workspace.verify_managed_directory_snapshots()
+                blueprint_dir = paths.blueprint_dir
+                graph = load_bound_graph(paths)
+                if linker is not None:
+                    issues.extend(
+                        f"{node.id}: declaration not found: {name}"
+                        for node in graph.nodes.values()
+                        for name in declaration_names(node.lean or "")
+                        if linker.location(name) is None
+                    )
+                paths.verify()
+                workspace.verify_managed_directory_snapshots()
+                workspace.verify_root_binding()
+        except (GraphValidationError, RuntimeProjectionError, WorkspaceError) as error:
             issues.extend(error.issues)
         else:
             articles = len(graph.nodes)
             dependencies = graph.edge_count
-            if linker is not None:
-                issues.extend(
-                    f"{node.id}: declaration not found: {name}"
-                    for node in graph.nodes.values()
-                    for name in declaration_names(node.lean or "")
-                    if linker.location(name) is None
-                )
         failed = failed or bool(issues)
         results.append(
             {
@@ -293,6 +341,8 @@ def _check_workspace(args: argparse.Namespace) -> int:
                 "project": project.id,
             }
         )
+    workspace.verify_managed_directory_snapshots()
+    workspace.verify_root_binding()
 
     if args.json:
         print(

@@ -22,6 +22,7 @@ from autoform_cli.render import _book_page_order
 from autoform_cli.runtime import (
     RuntimeGraph,
     RuntimeProjectionError,
+    _source_revision,
     _validate_depths,
     _validate_runtime,
     build_runtime_graph,
@@ -202,6 +203,28 @@ def test_dependency_and_rollup_walks_handle_a_1200_node_chain(tmp_path: Path) ->
     assert order[0] == "n1199"
     assert order[-1] == "n0000"
     assert len(derive(graph)) == 1_200
+
+
+def test_graph_loading_uses_depth_bounded_descriptors(tmp_path: Path) -> None:
+    resource = pytest.importorskip("resource")
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    roadmap.mkdir(parents=True)
+    (roadmap / "README.md").write_text("# Roadmap\n", encoding="utf-8")
+    for index in range(80):
+        chapter = roadmap / f"chapter-{index:03d}"
+        chapter.mkdir()
+        (chapter / "README.md").write_text(f"# Chapter {index}\n", encoding="utf-8")
+
+    previous = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if previous[0] < 64:
+        pytest.skip("descriptor limit is already below the regression threshold")
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, previous[1]))
+        graph = load_graph(tmp_path / "blueprint")
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, previous)
+
+    assert len(graph.nodes) == 81
 
 
 def test_rollup_projection_is_subquadratic_on_a_deep_branching_hierarchy(
@@ -426,7 +449,7 @@ def test_runtime_validation_does_not_scan_for_children_per_node(tmp_path: Path) 
     assert nodes.iterations - scans_after_construction < 10
 
 
-def test_runtime_rejects_article_bytes_changed_after_graph_load(tmp_path: Path) -> None:
+def test_runtime_uses_article_bytes_captured_during_graph_load(tmp_path: Path) -> None:
     project = tmp_path / "project"
     roadmap = project / "blueprint" / "roadmap"
     roadmap.mkdir(parents=True)
@@ -435,8 +458,12 @@ def test_runtime_rejects_article_bytes_changed_after_graph_load(tmp_path: Path) 
     graph = load_graph(project / "blueprint")
     article.write_text("# Item\n\nChanged.\n", encoding="utf-8")
 
-    with pytest.raises(RuntimeProjectionError, match="article changed after graph load"):
-        build_runtime_graph(graph, project_root=project)
+    runtime = build_runtime_graph(graph, project_root=project)
+
+    assert runtime.source_revision == _source_revision(
+        {"item": "roadmap/item.md"},
+        {"item": b"# Item\n\nOriginal.\n"},
+    )
 
 
 def test_runtime_rejects_a_graph_node_without_a_source_digest(tmp_path: Path) -> None:

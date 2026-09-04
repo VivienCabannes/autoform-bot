@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
-from autoform_cli.graph import Graph, Node, load_graph
+from autoform_cli import runtime as runtime_module
+from autoform_cli.graph import Graph, GraphValidationError, Node, load_graph
 from autoform_cli.runtime import (
     RUNTIME_AUTHORITY,
     RUNTIME_SCHEMA,
     RuntimeProjectionError,
+    bind_runtime_paths,
     build_runtime_graph,
+    load_bound_graph,
     load_runtime_graph,
     resolve_runtime_paths,
 )
@@ -101,6 +105,32 @@ def test_loads_identical_runtime_from_project_or_blueprint(tmp_path: Path) -> No
     assert from_project.maximum_depth == 3
 
 
+def test_bound_graph_rejects_a_b_a_project_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path / "selected")
+    replacement = _project(tmp_path / "replacement")
+    retained = tmp_path / "retained-project"
+    original_load_graph = runtime_module.load_graph
+
+    def load_replacement(*args, **kwargs):
+        project.rename(retained)
+        replacement.rename(project)
+        try:
+            return original_load_graph(*args, **kwargs)
+        finally:
+            project.rename(replacement)
+            retained.rename(project)
+
+    monkeypatch.setattr(runtime_module, "load_graph", load_replacement)
+
+    with bind_runtime_paths(project) as paths:
+        with pytest.raises(GraphValidationError, match="blueprint changed"):
+            load_bound_graph(paths)
+        paths.verify()
+
+
 def test_preserves_hierarchy_typed_dependencies_and_dispatchability(tmp_path: Path) -> None:
     project = _project(tmp_path)
     runtime = load_runtime_graph(project)
@@ -157,6 +187,104 @@ def test_exposes_provenance_mathlib_and_optional_lean_locations(tmp_path: Path) 
     assert result.mathlib
     assert result.mathlib_declarations == ("Mathlib.Result", "Mathlib.ResultAux")
     assert result.mathlib_file == "Mathlib/Result.lean"
+
+
+def test_translates_unsafe_lean_source_failures(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    lean_root = tmp_path / "lean"
+    lean_root.mkdir()
+    outside = tmp_path / "Outside.lean"
+    outside.write_text("def escaped : Nat := 0\n", encoding="utf-8")
+    try:
+        (lean_root / "Linked.lean").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(RuntimeProjectionError, match="cannot be indexed safely"):
+        load_runtime_graph(project, lean_root=lean_root)
+
+
+def test_rejects_source_target_through_symlink_outside_blueprint(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project / "blueprint/sources").symlink_to(outside, target_is_directory=True)
+    article = project / "blueprint/roadmap/chapter/section/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "https://example.invalid/paper",
+            "../../../sources/paper.md",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="source target escapes"):
+        load_runtime_graph(project)
+
+
+@pytest.mark.parametrize("direct_builder", [False, True])
+def test_rejects_a_source_symlink_component_cancelled_by_parent_navigation(
+    tmp_path: Path,
+    direct_builder: bool,
+) -> None:
+    project = _project(tmp_path)
+    outside = tmp_path / "outside"
+    target_directory = outside / "directory"
+    target_directory.mkdir(parents=True)
+    (outside / "secret.md").write_text("outside\n", encoding="utf-8")
+    sources = project / "blueprint/sources"
+    sources.mkdir()
+    try:
+        (sources / "link").symlink_to(target_directory, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    article = project / "blueprint/roadmap/chapter/section/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "https://example.invalid/paper",
+            "../../../sources/link/../secret.md",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="source target escapes"):
+        if direct_builder:
+            build_runtime_graph(load_graph(project / "blueprint"), project_root=project)
+        else:
+            load_runtime_graph(project)
+
+
+@pytest.mark.parametrize("direct_builder", [False, True])
+def test_malformed_source_url_is_reported_as_runtime_error(
+    tmp_path: Path,
+    direct_builder: bool,
+) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/chapter/section/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "https://example.invalid/paper",
+            "http://[",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="unsupported location"):
+        if direct_builder:
+            build_runtime_graph(load_graph(project / "blueprint"), project_root=project)
+        else:
+            load_runtime_graph(project)
+
+
+def test_direct_builder_translates_invalid_lean_root(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+
+    with pytest.raises(RuntimeProjectionError, match="cannot be indexed safely"):
+        build_runtime_graph(
+            load_graph(project / "blueprint"),
+            project_root=project,
+            lean_root="invalid\x00lean-root",
+        )
 
 
 def test_serialization_is_deterministic_relative_and_deeply_immutable(tmp_path: Path) -> None:
@@ -225,6 +353,50 @@ def test_rejects_symlinked_roadmap_content_and_ambiguous_input(tmp_path: Path) -
         resolve_runtime_paths(ambiguous)
 
 
+def test_runtime_preflight_does_not_traverse_reparse_point_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from autoform_cli import runtime as runtime_module
+
+    project = _project(tmp_path)
+    junction = project / "blueprint/roadmap/junction"
+    junction.mkdir()
+    _article(project, "junction/hidden.md", title="Hidden")
+    original = runtime_module._path_is_reparse_point
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_path_is_reparse_point",
+        lambda path, metadata: path == junction or original(path, metadata),
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="reparse point"):
+        resolve_runtime_paths(project)
+
+
+def test_bound_graph_prefers_generation_change_over_stale_parse_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path / "selected")
+    replacement_project = _project(tmp_path / "replacement")
+    blueprint = project / "blueprint"
+    held = project / "held-blueprint"
+    replacement = replacement_project / "blueprint"
+
+    def replace_then_fail(*_args, **_kwargs):
+        blueprint.rename(held)
+        replacement.rename(blueprint)
+        raise GraphValidationError(["stale generation error"])
+
+    monkeypatch.setattr(runtime_module, "load_graph", replace_then_fail)
+
+    with bind_runtime_paths(project) as paths:
+        with pytest.raises(RuntimeProjectionError, match="blueprint directory changed"):
+            load_bound_graph(paths)
+
+
 def test_allows_confined_parent_relative_sources_and_rejects_escapes(tmp_path: Path) -> None:
     project = _project(tmp_path)
     source = project / "blueprint" / "sources" / "paper.md"
@@ -246,12 +418,66 @@ def test_allows_confined_parent_relative_sources_and_rejects_escapes(tmp_path: P
     assert str(tmp_path) not in str(error.value)
 
 
-def test_rejects_nonportable_authored_file_paths(tmp_path: Path) -> None:
+def test_rejects_percent_encoded_windows_drive_source_target(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    result = project / "blueprint/roadmap/chapter/section/result.md"
+    result.write_text(
+        result.read_text(encoding="utf-8").replace(
+            "https://example.invalid/paper",
+            "C%3Aoutside.md",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="source target escapes"):
+        load_runtime_graph(project)
+
+
+def test_portable_runtime_validates_local_source_targets_without_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from autoform_cli import graph as graph_module
+    from autoform_cli import workspace as workspace_module
+
+    project = _project(tmp_path)
+    source = project / "blueprint/sources/paper.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Paper\n", encoding="utf-8")
+    result = project / "blueprint/roadmap/chapter/section/result.md"
+    text = result.read_text(encoding="utf-8").replace(
+        "https://example.invalid/paper",
+        "../../../sources/paper.md",
+    )
+    result.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(workspace_module, "_DIRECTORY_BINDING_SUPPORTED", False)
+    monkeypatch.setattr(graph_module, "_DIRECTORY_BINDING_SUPPORTED", False)
+
+    runtime = load_runtime_graph(project)
+    assert runtime.get("chapter/section/result").source_targets == (
+        "../../../sources/paper.md",
+    )
+
+    original = runtime_module._path_is_reparse_point
+
+    def mark_sources_as_reparse(path: Path, metadata: os.stat_result) -> bool:
+        return path.name == "sources" or original(path, metadata)
+
+    monkeypatch.setattr(runtime_module, "_path_is_reparse_point", mark_sources_as_reparse)
+    with pytest.raises(RuntimeProjectionError, match="symbolic link or reparse point"):
+        load_runtime_graph(project)
+
+
+@pytest.mark.parametrize("authored_path", [r"..\outside.lean", "C:outside.lean"])
+def test_rejects_nonportable_authored_file_paths(
+    tmp_path: Path,
+    authored_path: str,
+) -> None:
     project = _project(tmp_path)
     result = project / "blueprint" / "roadmap" / "chapter" / "section" / "result.md"
     text = result.read_text(encoding="utf-8").replace(
         "mathlib_file: Mathlib/Result.lean",
-        r"mathlib_file: ..\outside.lean",
+        f"mathlib_file: {authored_path}",
     )
     result.write_text(text, encoding="utf-8")
 
@@ -285,3 +511,24 @@ def test_adapter_rejects_inconsistent_hand_built_graph_without_host_paths(tmp_pa
         "chapter/section/base: dependency union does not match typed dependencies",
     )
     assert str(tmp_path) not in str(error.value)
+
+
+def test_adapter_rejects_hand_built_article_symlink_outside_blueprint(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    roadmap = project / "blueprint/roadmap"
+    roadmap.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    content = b"# Outside\n"
+    outside.write_bytes(content)
+    article = roadmap / "evil.md"
+    article.symlink_to(outside)
+    node = Node(
+        id="evil",
+        title="Evil",
+        path=article,
+        dependencies=(),
+        source_sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="symbolic link"):
+        build_runtime_graph(Graph(project / "blueprint", {node.id: node}), project_root=project)

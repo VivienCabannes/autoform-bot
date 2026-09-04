@@ -1004,16 +1004,16 @@ def test_cleanup_rejects_blueprint_replacement_before_selecting_origin(
         "resource": key,
     }
     _plant_message(intended_repo, key, json.dumps(lease))
-    original_load = cli.load_graph
+    original_load = cli.load_bound_graph
     pinned_project = tmp_path / "pinned-project"
 
-    def load_then_replace(blueprint):
-        graph = original_load(blueprint)
+    def load_then_replace(paths):
+        graph = original_load(paths)
         intended_project.rename(pinned_project)
         intended_project.symlink_to(redirected_project, target_is_directory=True)
         return graph
 
-    monkeypatch.setattr(cli, "load_graph", load_then_replace)
+    monkeypatch.setattr(cli, "load_bound_graph", load_then_replace)
 
     assert main(["claim", "cleanup", "--blueprint", str(intended_project)]) == 1
     assert "was replaced while resolving the claim" in capsys.readouterr().out

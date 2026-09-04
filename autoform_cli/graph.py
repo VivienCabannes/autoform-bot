@@ -10,12 +10,22 @@ a second graph file that could drift from the book.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
+
+from .workspace import (
+    _DIRECTORY_BINDING_SUPPORTED,
+    _WorkspaceRootBinding,
+    _open_workspace_root,
+    _path_is_reparse_point,
+)
+from .workspace_manifest import WorkspaceError
 
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
@@ -44,6 +54,18 @@ _FRONTMATTER_KEYS = frozenset(
 _FORMALIZED = "formalized"
 _TRUE = frozenset({"true", "yes"})
 _FALSE = frozenset({"false", "no"})
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_FILE_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
 
 #: ``## Depends on`` carries the prerequisites needed to *state* a node;
 #: ``## Proof depends on`` carries the extra prerequisites its *proof* needs.
@@ -174,7 +196,7 @@ class _TrackedNodeDict(dict[str, Node]):
 
 
 class _GraphCache:
-    __slots__ = ("_children_by_parent", "_children_revision")
+    __slots__ = ("_children_by_parent", "_children_revision", "_source_bytes")
 
     _children_by_parent: Mapping[str | None, tuple[str, ...]]
     _children_revision: int
@@ -190,6 +212,8 @@ class Graph(_GraphCache):
     def __post_init__(self) -> None:
         if not isinstance(self.nodes, _TrackedNodeDict):
             object.__setattr__(self, "nodes", _TrackedNodeDict(self.nodes))
+        if not hasattr(self, "_source_bytes"):
+            object.__setattr__(self, "_source_bytes", {})
         self._refresh_children()
 
     def _refresh_children(self) -> None:
@@ -213,9 +237,16 @@ class Graph(_GraphCache):
             self._refresh_children()
         return self._children_by_parent.get(node_id, ())
 
+    def source_bytes(self, node_id: str) -> bytes | None:
+        """Return immutable source bytes captured with this graph, when available."""
+
+        return self._source_bytes.get(node_id)
+
 
 def _restore_graph_state(graph: Graph, state: list[object]) -> None:
     """Restore legacy slot pickles through the current cache initializer."""
+    if len(state) != 2:
+        raise ValueError("unsupported Graph pickle state")
     blueprint_dir, nodes = state
     object.__setattr__(graph, "blueprint_dir", blueprint_dir)
     object.__setattr__(graph, "nodes", nodes)
@@ -245,9 +276,38 @@ class _NodeSource:
     path: Path
     text: str
     source_sha256: str
+    content: bytes
 
 
-def load_graph(blueprint_dir: str | Path) -> Graph:
+@dataclass(frozen=True, slots=True)
+class _BoundRoadmapDirectory:
+    relative: str
+    identity: tuple[int, ...]
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundRoadmapEntry:
+    relative: str
+    identity: tuple[int, ...]
+    ignored: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableRoadmapSnapshot:
+    root_identity: tuple[int, ...]
+    entries: tuple[tuple[str, tuple[int, ...]], ...]
+    directories: tuple[str, ...]
+    sources: tuple[_NodeSource, ...]
+    issues: tuple[str, ...]
+
+
+def load_graph(
+    blueprint_dir: str | Path,
+    *,
+    _expected_blueprint_identity: tuple[int, int] | None = None,
+    _expected_roadmap_identity: tuple[int, int] | None = None,
+) -> Graph:
     """Load and validate Markdown nodes beneath *blueprint_dir*."""
 
     blueprint = Path(blueprint_dir).expanduser().resolve()
@@ -258,13 +318,18 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
     parsed: list[_ParsedNode] = []
     canonical_ids: dict[Path, str] = {}
     node_ids: dict[str, Path] = {}
-    sources, discovery_issues = _discover_nodes(blueprint)
+    sources, discovery_issues = _discover_nodes(
+        blueprint,
+        expected_blueprint_identity=_expected_blueprint_identity,
+        expected_roadmap_identity=_expected_roadmap_identity,
+    )
     issues.extend(discovery_issues)
     article_ids: dict[str, str] = {}
     source_hashes = {source.id: source.source_sha256 for source in sources}
+    source_bytes = {source.id: source.content for source in sources}
 
     for source in sources:
-        canonical = source.path.resolve()
+        canonical = source.path
         if canonical in canonical_ids:
             issues.append(f"{source.id}: duplicates node {canonical_ids[canonical]!r}")
             continue
@@ -347,50 +412,474 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
         issues.extend(_find_rollup_cycles(nodes))
     if issues:
         raise GraphValidationError(issues)
-    return Graph(blueprint_dir=blueprint, nodes=nodes)
+    graph = Graph(blueprint_dir=blueprint, nodes=nodes)
+    object.__setattr__(graph, "_source_bytes", source_bytes)
+    return graph
 
 
-def _discover_nodes(blueprint: Path) -> tuple[list[_NodeSource], list[str]]:
+def _discover_nodes(
+    blueprint: Path,
+    *,
+    expected_blueprint_identity: tuple[int, int] | None = None,
+    expected_roadmap_identity: tuple[int, int] | None = None,
+) -> tuple[list[_NodeSource], list[str]]:
     roadmap_root = blueprint / "roadmap"
     if not roadmap_root.is_dir():
         return [], [f"roadmap directory does not exist: {roadmap_root}"]
+    if not _DIRECTORY_BINDING_SUPPORTED or os.listdir not in getattr(os, "supports_fd", ()):
+        return _discover_nodes_portably(
+            blueprint,
+            roadmap_root,
+            expected_blueprint_identity=expected_blueprint_identity,
+            expected_roadmap_identity=expected_roadmap_identity,
+        )
+
+    try:
+        binding = _open_workspace_root(blueprint)
+    except WorkspaceError:
+        return [], ["blueprint directory cannot be inspected safely"]
 
     issues: list[str] = []
     sources: list[_NodeSource] = []
-    roadmap_root = roadmap_root.resolve()
-    entries = sorted(roadmap_root.rglob("*"))
-    for path in entries:
-        if path.is_file() and path.name.casefold() == "readme.md" and path.name != "README.md":
-            relative = path.relative_to(roadmap_root).as_posix()
-            issues.append(
-                f"{relative}: noncanonical README filename; container pages must be named exactly README.md "
-                "for portable behavior on case-sensitive filesystems"
-            )
-
-    for path in entries:
-        if not path.is_file() or path.suffix != ".md":
-            continue
+    directories: list[_BoundRoadmapDirectory] = []
+    entries: list[_BoundRoadmapEntry] = []
+    roadmap_descriptor: int | None = None
+    try:
+        if (
+            expected_blueprint_identity is not None
+            and binding.identity != expected_blueprint_identity
+        ):
+            return [], ["blueprint changed while the graph was loaded"]
         try:
-            content = path.read_bytes()
-            text = content.decode("utf-8")
-        except (OSError, UnicodeError) as exc:
-            relative = path.relative_to(roadmap_root).as_posix()
-            issues.append(f"{relative}: cannot read roadmap page: {exc}")
-            continue
-        node_id = _article_id(path, roadmap_root)
-        canonical = path.resolve()
-        if not _is_within(canonical, roadmap_root):
-            issues.append(f"{node_id}: node file escapes the roadmap directory")
-            continue
-        sources.append(
-            _NodeSource(node_id, canonical, text, hashlib.sha256(content).hexdigest())
+            roadmap_identity = os.stat(
+                "roadmap",
+                dir_fd=binding.descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(roadmap_identity.st_mode):
+                return [], [f"roadmap directory does not exist: {roadmap_root}"]
+            roadmap_descriptor = os.open(
+                "roadmap",
+                _DIRECTORY_FLAGS,
+                dir_fd=binding.descriptor,
+            )
+            opened = os.fstat(roadmap_descriptor)
+        except (OSError, ValueError):
+            return [], [f"roadmap directory does not exist: {roadmap_root}"]
+        if _stat_signature(opened) != _stat_signature(roadmap_identity):
+            return [], ["roadmap changed while the graph was loaded"]
+        if (
+            expected_roadmap_identity is not None
+            and (opened.st_dev, opened.st_ino) != expected_roadmap_identity
+        ):
+            return [], ["roadmap changed while the graph was loaded"]
+        _scan_bound_roadmap_directory(
+            roadmap_descriptor,
+            relative="",
+            identity=_stat_signature(opened),
+            roadmap_root=roadmap_root,
+            directories=directories,
+            entries=entries,
+            sources=sources,
+            issues=issues,
         )
+        _graph_snapshot_checkpoint("before-final-verification", "")
+        _verify_roadmap_snapshot(binding, roadmap_descriptor, directories, entries)
+    except (_RoadmapChanged, WorkspaceError):
+        return [], ["roadmap changed while the graph was loaded"]
+    finally:
+        if roadmap_descriptor is not None:
+            try:
+                os.close(roadmap_descriptor)
+            except OSError:
+                pass
+        binding.close()
 
-    issues.extend(_chapter_issues(roadmap_root))
+    sources.sort(key=lambda source: source.path.as_posix())
+    issues.extend(
+        _chapter_issues(
+            roadmap_root,
+            [directory.relative for directory in directories],
+            sources,
+        )
+    )
     return sources, issues
 
 
-def _chapter_issues(roadmap_root: Path) -> list[str]:
+class _RoadmapChanged(Exception):
+    """The bound roadmap tree did not remain one filesystem generation."""
+
+
+def _graph_snapshot_checkpoint(_event: str, _relative: str) -> None:
+    """Deterministic roadmap-substitution boundary used by adversarial tests."""
+
+
+def _stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _scan_bound_roadmap_directory(
+    descriptor: int,
+    *,
+    relative: str,
+    identity: tuple[int, ...],
+    roadmap_root: Path,
+    directories: list[_BoundRoadmapDirectory],
+    entries: list[_BoundRoadmapEntry],
+    sources: list[_NodeSource],
+    issues: list[str],
+) -> None:
+    """Capture one roadmap subtree while retaining only its ancestor descriptors."""
+
+    try:
+        names = tuple(sorted(os.listdir(descriptor)))
+    except OSError:
+        raise _RoadmapChanged from None
+    if any(
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        for name in names
+    ):
+        raise _RoadmapChanged
+    directories.append(_BoundRoadmapDirectory(relative, identity, names))
+    _graph_snapshot_checkpoint("after-directory-list", relative)
+    for name in names:
+        child_relative = f"{relative}/{name}" if relative else name
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError:
+            raise _RoadmapChanged from None
+        child_identity = _stat_signature(metadata)
+        if name.startswith("."):
+            entries.append(_BoundRoadmapEntry(child_relative, child_identity, ignored=True))
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            child_descriptor: int | None = None
+            try:
+                child_descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                opened = os.fstat(child_descriptor)
+                if _stat_signature(opened) != child_identity:
+                    raise _RoadmapChanged
+                _scan_bound_roadmap_directory(
+                    child_descriptor,
+                    relative=child_relative,
+                    identity=child_identity,
+                    roadmap_root=roadmap_root,
+                    directories=directories,
+                    entries=entries,
+                    sources=sources,
+                    issues=issues,
+                )
+                named = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if _stat_signature(named) != child_identity:
+                    raise _RoadmapChanged
+            except OSError:
+                raise _RoadmapChanged from None
+            finally:
+                if child_descriptor is not None:
+                    try:
+                        os.close(child_descriptor)
+                    except OSError:
+                        pass
+            continue
+        entries.append(_BoundRoadmapEntry(child_relative, child_identity))
+        if stat.S_ISLNK(metadata.st_mode):
+            issues.append(f"{child_relative}: roadmap paths must not be symbolic links")
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        if name.casefold() == "readme.md" and name != "README.md":
+            issues.append(
+                f"{child_relative}: noncanonical README filename; container pages must be named "
+                "exactly README.md for portable behavior on case-sensitive filesystems"
+            )
+        if Path(name).suffix != ".md":
+            continue
+        try:
+            content = _read_bound_roadmap_file(descriptor, name, child_identity)
+            text = content.decode("utf-8")
+        except UnicodeError as error:
+            issues.append(f"{child_relative}: cannot read roadmap page: {error}")
+            continue
+        source_path = roadmap_root.joinpath(*PurePosixPath(child_relative).parts)
+        node_id = _article_id(source_path, roadmap_root)
+        sources.append(
+            _NodeSource(
+                node_id,
+                source_path,
+                text,
+                hashlib.sha256(content).hexdigest(),
+                content,
+            )
+        )
+    try:
+        if _stat_signature(os.fstat(descriptor)) != identity:
+            raise _RoadmapChanged
+        if tuple(sorted(os.listdir(descriptor))) != names:
+            raise _RoadmapChanged
+    except OSError:
+        raise _RoadmapChanged from None
+
+
+def _read_bound_roadmap_file(
+    parent_descriptor: int,
+    name: str,
+    expected: tuple[int, ...],
+) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(name, _FILE_FLAGS, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _stat_signature(opened) != expected:
+            raise _RoadmapChanged
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if _stat_signature(after) != expected or _stat_signature(named) != expected:
+            raise _RoadmapChanged
+        return b"".join(chunks)
+    except (OSError, WorkspaceError):
+        raise _RoadmapChanged from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _discover_nodes_portably(
+    blueprint: Path,
+    roadmap_root: Path,
+    *,
+    expected_blueprint_identity: tuple[int, int] | None = None,
+    expected_roadmap_identity: tuple[int, int] | None = None,
+) -> tuple[list[_NodeSource], list[str]]:
+    """Keep read-only graph commands usable where descriptor traversal is absent."""
+
+    try:
+        blueprint_before = blueprint.stat(follow_symlinks=False)
+        first = _portable_roadmap_snapshot(roadmap_root)
+        _graph_snapshot_checkpoint("between-portable-snapshots", "")
+        second = _portable_roadmap_snapshot(roadmap_root)
+        blueprint_after = blueprint.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError, _RoadmapChanged):
+        return [], ["roadmap changed while the graph was loaded"]
+    if (
+        first != second
+        or _stat_signature(blueprint_before) != _stat_signature(blueprint_after)
+        or (
+            expected_blueprint_identity is not None
+            and (blueprint_after.st_dev, blueprint_after.st_ino) != expected_blueprint_identity
+        )
+        or (
+            expected_roadmap_identity is not None
+            and second.root_identity[:2] != expected_roadmap_identity
+        )
+    ):
+        return [], ["roadmap changed while the graph was loaded"]
+    sources = list(second.sources)
+    issues = list(second.issues)
+    issues.extend(_chapter_issues(roadmap_root, list(second.directories), sources))
+    return sources, issues
+
+
+def _portable_roadmap_snapshot(roadmap_root: Path) -> _PortableRoadmapSnapshot:
+    root_before = roadmap_root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(root_before.st_mode) or _path_is_reparse_point(
+        roadmap_root, root_before
+    ):
+        raise _RoadmapChanged
+    paths = _portable_roadmap_paths(roadmap_root)
+    entries: list[tuple[str, tuple[int, ...]]] = []
+    directories: list[str] = []
+    sources: list[_NodeSource] = []
+    issues: list[str] = []
+    for path in paths:
+        relative = path.relative_to(roadmap_root).as_posix()
+        metadata = path.stat(follow_symlinks=False)
+        identity = _stat_signature(metadata)
+        entries.append((relative, identity))
+        if _path_is_reparse_point(path, metadata):
+            issues.append(
+                f"{relative}: roadmap paths must not be symbolic links or reparse points"
+            )
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            directories.append(relative)
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        if path.name.casefold() == "readme.md" and path.name != "README.md":
+            issues.append(
+                f"{relative}: noncanonical README filename; container pages must be named exactly "
+                "README.md for portable behavior on case-sensitive filesystems"
+            )
+        if path.suffix != ".md":
+            continue
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            content = stream.read()
+            after = os.fstat(stream.fileno())
+        final = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode) or not (
+            _stat_signature(opened)
+            == _stat_signature(after)
+            == _stat_signature(final)
+            == identity
+        ):
+            raise _RoadmapChanged
+        try:
+            text = content.decode("utf-8")
+        except UnicodeError as error:
+            issues.append(f"{relative}: cannot read roadmap page: {error}")
+            continue
+        source_path = roadmap_root.joinpath(*PurePosixPath(relative).parts)
+        sources.append(
+            _NodeSource(
+                _article_id(source_path, roadmap_root),
+                source_path,
+                text,
+                hashlib.sha256(content).hexdigest(),
+                content,
+            )
+        )
+    root_after = roadmap_root.stat(follow_symlinks=False)
+    if _stat_signature(root_before) != _stat_signature(root_after):
+        raise _RoadmapChanged
+    return _PortableRoadmapSnapshot(
+        root_identity=_stat_signature(root_after),
+        entries=tuple(entries),
+        directories=tuple(directories),
+        sources=tuple(sources),
+        issues=tuple(issues),
+    )
+
+
+def _portable_roadmap_paths(roadmap_root: Path) -> tuple[Path, ...]:
+    """Enumerate without traversing links or Windows reparse-point directories."""
+
+    paths: list[Path] = []
+
+    def visit(directory: Path) -> None:
+        before = directory.stat(follow_symlinks=False)
+        names = tuple(sorted(path.name for path in directory.iterdir()))
+        for name in names:
+            path = directory / name
+            metadata = path.stat(follow_symlinks=False)
+            if name.startswith("."):
+                continue
+            paths.append(path)
+            if stat.S_ISDIR(metadata.st_mode) and not _path_is_reparse_point(path, metadata):
+                visit(path)
+        after = directory.stat(follow_symlinks=False)
+        final_names = tuple(sorted(path.name for path in directory.iterdir()))
+        if _stat_signature(before) != _stat_signature(after) or names != final_names:
+            raise _RoadmapChanged
+
+    visit(roadmap_root)
+    return tuple(sorted(paths))
+
+
+def _verify_roadmap_snapshot(
+    binding: _WorkspaceRootBinding,
+    roadmap_descriptor: int,
+    directories: list[_BoundRoadmapDirectory],
+    entries: list[_BoundRoadmapEntry],
+) -> None:
+    expected_directories = {directory.relative: directory for directory in directories}
+    expected_entries = {entry.relative: entry for entry in entries}
+    visited_directories: set[str] = set()
+    visited_entries: set[str] = set()
+
+    def verify_directory(descriptor: int, relative: str) -> None:
+        expected = expected_directories.get(relative)
+        if expected is None:
+            raise _RoadmapChanged
+        visited_directories.add(relative)
+        opened = os.fstat(descriptor)
+        names = tuple(sorted(os.listdir(descriptor)))
+        if _stat_signature(opened) != expected.identity or names != expected.names:
+            raise _RoadmapChanged
+        for name in names:
+            child_relative = f"{relative}/{name}" if relative else name
+            current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            directory = expected_directories.get(child_relative)
+            if directory is not None:
+                if not stat.S_ISDIR(current.st_mode) or _stat_signature(current) != directory.identity:
+                    raise _RoadmapChanged
+                child_descriptor: int | None = None
+                try:
+                    child_descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                    child_opened = os.fstat(child_descriptor)
+                    if _stat_signature(child_opened) != directory.identity:
+                        raise _RoadmapChanged
+                    verify_directory(child_descriptor, child_relative)
+                    named = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                    if _stat_signature(named) != directory.identity:
+                        raise _RoadmapChanged
+                finally:
+                    if child_descriptor is not None:
+                        try:
+                            os.close(child_descriptor)
+                        except OSError:
+                            pass
+                continue
+            entry = expected_entries.get(child_relative)
+            if entry is None or (
+                not entry.ignored and _stat_signature(current) != entry.identity
+            ):
+                raise _RoadmapChanged
+            if entry.ignored and stat.S_IFMT(current.st_mode) != stat.S_IFMT(
+                entry.identity[2]
+            ):
+                raise _RoadmapChanged
+            visited_entries.add(child_relative)
+        after = os.fstat(descriptor)
+        if (
+            _stat_signature(after) != expected.identity
+            or tuple(sorted(os.listdir(descriptor))) != expected.names
+        ):
+            raise _RoadmapChanged
+
+    try:
+        roadmap = expected_directories.get("")
+        if roadmap is None:
+            raise _RoadmapChanged
+        named = os.stat("roadmap", dir_fd=binding.descriptor, follow_symlinks=False)
+        if _stat_signature(named) != roadmap.identity:
+            raise _RoadmapChanged
+        verify_directory(roadmap_descriptor, "")
+        if visited_directories != set(expected_directories) or visited_entries != set(
+            expected_entries
+        ):
+            raise _RoadmapChanged
+        binding.verify()
+    except OSError:
+        raise _RoadmapChanged from None
+
+
+def _chapter_issues(
+    roadmap_root: Path,
+    directories: list[str],
+    sources: list[_NodeSource],
+) -> list[str]:
     """Reject a chapter directory that names no chapter.
 
     Containment is inferred from nested ``README.md`` articles, so a directory
@@ -417,22 +906,32 @@ def _chapter_issues(roadmap_root: Path) -> list[str]:
     generated nav.
     """
 
-    try:
-        chapters = sorted(path for path in roadmap_root.iterdir() if path.is_dir())
-    except OSError:
-        return []
+    chapters = sorted(
+        relative
+        for relative in directories
+        if relative and "/" not in relative
+    )
+    article_counts: dict[str, int] = {}
+    chapter_readmes: set[str] = set()
+    for source in sources:
+        relative = source.path.relative_to(roadmap_root)
+        if len(relative.parts) < 2:
+            continue
+        chapter = relative.parts[0]
+        article_counts[chapter] = article_counts.get(chapter, 0) + 1
+        if relative.parts == (chapter, "README.md"):
+            chapter_readmes.add(chapter)
     issues = []
     for chapter in chapters:
-        articles = [path for path in chapter.rglob("*.md") if path.is_file()]
-        if not articles:
+        article_count = article_counts.get(chapter, 0)
+        if not article_count:
             continue
-        if (chapter / "README.md").is_file():
+        if chapter in chapter_readmes:
             continue
-        names = articles
         issues.append(
-            f"{chapter.name}: chapter directory holds {len(names)} article(s) but no "
-            f"README.md, so they attach to the roadmap root instead of a chapter; "
-            f"add {chapter.name}/README.md with the chapter's H1 title"
+            f"{chapter}: chapter directory holds {article_count} article(s) but no "
+            "README.md, so they attach to the roadmap root instead of a chapter; "
+            f"add {chapter}/README.md with the chapter's H1 title"
         )
     return issues
 
@@ -447,7 +946,7 @@ def _article_id(path: Path, roadmap_root: Path) -> str:
 
 def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
     """Infer strict single-parent containment from nested README articles."""
-    by_path = {node.path.resolve(): node.id for node in parsed}
+    by_path = {node.path: node.id for node in parsed}
     parents: dict[str, str | None] = {}
     for node in parsed:
         candidate = node.path.parent
@@ -455,7 +954,7 @@ def _article_parents(parsed: list[_ParsedNode]) -> dict[str, str | None]:
             candidate = candidate.parent
         parent: str | None = None
         while candidate != candidate.parent:
-            readme = (candidate / "README.md").resolve()
+            readme = candidate / "README.md"
             if readme in by_path:
                 parent = by_path[readme]
                 break
@@ -635,14 +1134,12 @@ def _resolve_target(
     if relative.is_absolute() or relative.suffix != ".md":
         return None, f"{node.id}: dependency target must be a relative .md file: {target!r}"
 
-    resolved = (node.path.parent / relative).resolve()
+    resolved = Path(os.path.abspath(node.path.parent / relative))
     if not _is_within(resolved, blueprint):
         return None, f"{node.id}: dependency target escapes the blueprint directory: {target!r}"
-    if not resolved.is_file():
-        return None, f"{node.id}: dependency target does not exist: {target!r}"
     dependency = canonical_ids.get(resolved)
     if dependency is None:
-        return None, f"{node.id}: dependency target is not a node: {target!r}"
+        return None, f"{node.id}: dependency target does not exist: {target!r}"
     return dependency, None
 
 

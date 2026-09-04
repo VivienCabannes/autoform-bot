@@ -579,12 +579,11 @@ def _read_source_artifact(
                     "coverage-artifact-not-regular",
                     "source artifact is not a regular file",
                 )
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
+            stream = os.fdopen(descriptor, "rb", buffering=0, closefd=False)
+            try:
+                artifact_bytes = stream.read()
+            finally:
+                stream.close()
             after = os.fstat(descriptor)
         finally:
             os.close(descriptor)
@@ -614,7 +613,7 @@ def _read_source_artifact(
                     "coverage-artifact-changed",
                     "source artifact path changed while it was read",
                 )
-        return b"".join(chunks), None
+        return artifact_bytes, None
     except FileNotFoundError:
         return None, ("coverage-artifact-missing", "source artifact does not exist")
     except OSError:
@@ -1022,7 +1021,7 @@ def _roadmap_source_provenance(sources: Iterable[tuple[str, str]]) -> str:
 
     digest = hashlib.sha256(b"autoform-roadmap-provenance/v1\0")
     for relative, source_sha256 in sorted(sources):
-        encoded_path = relative.encode("utf-8")
+        encoded_path = os.fsencode(relative)
         encoded_sha256 = source_sha256.encode("ascii")
         digest.update(len(encoded_path).to_bytes(8, "big"))
         digest.update(encoded_path)

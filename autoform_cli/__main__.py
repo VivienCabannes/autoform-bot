@@ -13,7 +13,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -33,7 +34,7 @@ from .claims import (
     workspace_author_claim_key,
 )
 from .doctor import diagnose_project
-from .graph import ARTICLE_ID_PATTERN, GraphValidationError, load_graph
+from .graph import ARTICLE_ID_PATTERN, GraphValidationError
 from .lean import build_linker, declaration_names
 from .project import (
     ProjectCatalogError,
@@ -46,7 +47,12 @@ from .project import (
 )
 from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
-from .runtime import RuntimeProjectionError, resolve_runtime_paths
+from .runtime import (
+    RuntimePaths,
+    RuntimeProjectionError,
+    bind_runtime_paths,
+    load_bound_graph,
+)
 from .scaffold import ScaffoldError, scaffold_project
 from .workspace_cli import add_workspace_parsers, run_blueprint_command, run_workspace_command
 
@@ -370,29 +376,38 @@ def _init(args: argparse.Namespace) -> int:
 
 def _check(args: argparse.Namespace) -> int:
     try:
-        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
-        graph = load_graph(blueprint_dir)
+        with _resolved_blueprint(args.blueprint_dir, args.project) as paths:
+            graph = load_bound_graph(paths)
+
+            statuses = status.derive(graph)
+            summary = " · ".join(
+                f"{count} {state.label}" for state, count in status.summarize(statuses)
+            )
+            missing: list[str] = []
+            if args.lean_root is None:
+                paths.verify()
+            else:
+                linker = build_linker(args.lean_root)
+                missing = [
+                    f"{node.id}: declaration not found in {args.lean_root}: {name}"
+                    for node in graph.nodes.values()
+                    for name in declaration_names(node.lean or "")
+                    if linker.location(name) is None
+                ]
+                paths.verify()
     except (GraphValidationError, RuntimeProjectionError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1
+    except OSError as exc:
+        print(f"error: {exc}")
+        return 1
 
-    statuses = status.derive(graph)
-    summary = " · ".join(f"{count} {state.label}" for state, count in status.summarize(statuses))
     print(f"OK: {len(graph.nodes)} articles, {graph.edge_count} dependencies")
     if summary:
         print(f"    {summary}")
-
     if args.lean_root is None:
         return 0
-
-    linker = build_linker(args.lean_root)
-    missing = [
-        f"{node.id}: declaration not found in {args.lean_root}: {name}"
-        for node in graph.nodes.values()
-        for name in declaration_names(node.lean or "")
-        if linker.location(name) is None
-    ]
     for issue in missing:
         print(f"error: {issue}")
     if missing:
@@ -404,7 +419,14 @@ def _check(args: argparse.Namespace) -> int:
 
 def _audit(args: argparse.Namespace) -> int:
     try:
-        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
+        with _resolved_blueprint(args.blueprint_dir, args.project) as paths:
+            result = audit_blueprint(
+                paths.blueprint_dir,
+                lean_root=args.lean_root,
+                _expected_blueprint_identity=paths.blueprint_identity,
+                _expected_roadmap_identity=paths.roadmap_identity,
+            )
+            paths.verify()
     except RuntimeProjectionError as error:
         if args.json:
             print(json.dumps({"clean": False, "errors": list(error.issues)}, sort_keys=True, separators=(",", ":")))
@@ -412,7 +434,6 @@ def _audit(args: argparse.Namespace) -> int:
             for issue in error.issues:
                 print(f"error: {issue}")
         return 1
-    result = audit_blueprint(blueprint_dir, lean_root=args.lean_root)
     if args.json:
         print(result.to_json())
     else:
@@ -447,8 +468,13 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if result.clean else 1
 
 
-def _resolved_blueprint(target: str | Path, project_id: str | None) -> Path:
-    return resolve_runtime_paths(target, project_id=project_id).blueprint_dir
+@contextmanager
+def _resolved_blueprint(
+    target: str | Path,
+    project_id: str | None,
+) -> Iterator[RuntimePaths]:
+    with bind_runtime_paths(target, project_id=project_id) as paths:
+        yield paths
 
 
 def _project(args: argparse.Namespace) -> int:
@@ -618,40 +644,42 @@ def _claim(args: argparse.Namespace) -> int:
             board_identity = None
             if args.blueprint is not None:
                 try:
-                    paths = resolve_runtime_paths(args.blueprint, project_id=args.project)
-                    blueprint = paths.blueprint_dir
-                    project_pin = _PinnedDirectory.capture(
-                        paths.project_root,
-                        label="claim project",
-                    )
-                    blueprint_pin = _PinnedDirectory.capture(
-                        blueprint,
-                        label="claim blueprint",
-                    )
-                    graph = load_graph(blueprint)
-                    board_identity = _resolve_claim_board_identity(
-                        args,
-                        context=paths.project_root,
-                        require_identity=False,
-                    )
-                    project_pin.verify(label="claim project")
-                    blueprint_pin.verify(label="claim blueprint")
+                    with bind_runtime_paths(args.blueprint, project_id=args.project) as paths:
+                        paths.require_strong_binding(operation="claim cleanup")
+                        blueprint = paths.blueprint_dir
+                        project_pin = _PinnedDirectory.capture(
+                            paths.project_root,
+                            label="claim project",
+                        )
+                        blueprint_pin = _PinnedDirectory.capture(
+                            blueprint,
+                            label="claim blueprint",
+                        )
+                        graph = load_bound_graph(paths)
+                        board_identity = _resolve_claim_board_identity(
+                            args,
+                            context=paths.project_root,
+                            require_identity=False,
+                        )
+                        project_pin.verify(label="claim project")
+                        blueprint_pin.verify(label="claim blueprint")
+                        key_factory = (
+                            (lambda article_id: workspace_author_claim_key(
+                                paths.workspace_project_id, article_id
+                            ))
+                            if paths.workspace_project_id is not None
+                            else author_claim_key
+                        )
+                        canonical_keys = tuple(
+                            key_factory(node.article_id)
+                            for node in graph.nodes.values()
+                            if node.article_id is not None
+                        )
+                        paths.verify()
                 except RuntimeProjectionError as exc:
                     raise ValueError(str(exc)) from exc
                 except GraphValidationError as exc:
                     raise ValueError("; ".join(exc.issues)) from exc
-                key_factory = (
-                    (lambda article_id: workspace_author_claim_key(
-                        paths.workspace_project_id, article_id
-                    ))
-                    if paths.workspace_project_id is not None
-                    else author_claim_key
-                )
-                canonical_keys = tuple(
-                    key_factory(node.article_id)
-                    for node in graph.nodes.values()
-                    if node.article_id is not None
-                )
             board = _claim_board(
                 args,
                 identity=board_identity,
@@ -697,8 +725,10 @@ def _migrate(args: argparse.Namespace) -> int:
     if args.migrate_command != "article-ids":
         return 2
     try:
-        blueprint_dir = _resolved_blueprint(args.blueprint_dir, args.project)
-        plan = plan_article_ids(blueprint_dir)
+        with _resolved_blueprint(args.blueprint_dir, args.project) as paths:
+            graph = load_bound_graph(paths)
+            plan = plan_article_ids(paths.blueprint_dir, _graph=graph)
+            paths.verify()
     except (GraphValidationError, RuntimeProjectionError) as error:
         for issue in error.issues:
             print(f"error: {issue}", file=sys.stderr)
@@ -796,65 +826,74 @@ def _resolve_claim_target(
         raise ValueError("an article target or --resource is required")
 
     try:
-        paths = resolve_runtime_paths(args.blueprint, project_id=args.project)
-        blueprint = paths.blueprint_dir
-        project_pin = _PinnedDirectory.capture(paths.project_root, label="claim project")
-        blueprint_pin = _PinnedDirectory.capture(blueprint, label="claim blueprint")
-        graph = load_graph(blueprint)
+        with bind_runtime_paths(args.blueprint, project_id=args.project) as paths:
+            paths.require_strong_binding(operation="claim mutation")
+            blueprint = paths.blueprint_dir
+            project_pin = _PinnedDirectory.capture(paths.project_root, label="claim project")
+            blueprint_pin = _PinnedDirectory.capture(blueprint, label="claim blueprint")
+            graph = load_bound_graph(paths)
+            matches = [
+                node
+                for node in graph.nodes.values()
+                if article_target == node.id or article_target == node.article_id
+            ]
+            if not matches:
+                if article_target == "lake-build":
+                    raise ValueError(
+                        f"article target {article_target!r} does not exist in {blueprint}; "
+                        "use --resource lake-build for the shared build lock"
+                    )
+                raise ValueError(
+                    f"article target {article_target!r} does not exist in {blueprint}"
+                )
+            if len(matches) != 1:
+                matching_paths = ", ".join(sorted(node.id for node in matches))
+                raise ValueError(
+                    f"article target {article_target!r} is ambiguous: {matching_paths}"
+                )
+            node = matches[0]
+            if node.article_id is None:
+                raise ValueError(
+                    f"article {node.id!r} has no durable article_id; "
+                    f"run 'autoform migrate article-ids {blueprint}' and add the proposed ID"
+                )
+            if paths.workspace_project_id is None:
+                key = author_claim_key(node.article_id)
+                compatibility_keys = (author_claim_key(node.id),)
+                canonical_keys = tuple(
+                    author_claim_key(candidate.article_id)
+                    for candidate in graph.nodes.values()
+                    if candidate.article_id is not None
+                )
+            else:
+                key = workspace_author_claim_key(paths.workspace_project_id, node.article_id)
+                compatibility_keys = (
+                    author_claim_key(node.article_id),
+                    author_claim_key(node.id),
+                )
+                canonical_keys = tuple(
+                    workspace_author_claim_key(
+                        paths.workspace_project_id,
+                        candidate.article_id,
+                    )
+                    for candidate in graph.nodes.values()
+                    if candidate.article_id is not None
+                )
+            identity = _resolve_claim_board_identity(args, context=paths.project_root)
+            project_pin.verify(label="claim project")
+            blueprint_pin.verify(label="claim blueprint")
+            paths.verify()
+            return _ResolvedClaimTarget(
+                key,
+                node.id,
+                compatibility_keys,
+                canonical_keys,
+                identity,
+            )
     except RuntimeProjectionError as exc:
         raise ValueError(str(exc)) from exc
     except GraphValidationError as exc:
         raise ValueError("; ".join(exc.issues)) from exc
-    matches = [
-        node
-        for node in graph.nodes.values()
-        if article_target == node.id or article_target == node.article_id
-    ]
-    if not matches:
-        if article_target == "lake-build":
-            raise ValueError(
-                f"article target {article_target!r} does not exist in {blueprint}; "
-                "use --resource lake-build for the shared build lock"
-            )
-        raise ValueError(f"article target {article_target!r} does not exist in {blueprint}")
-    if len(matches) != 1:
-        paths = ", ".join(sorted(node.id for node in matches))
-        raise ValueError(f"article target {article_target!r} is ambiguous: {paths}")
-    node = matches[0]
-    if node.article_id is None:
-        raise ValueError(
-            f"article {node.id!r} has no durable article_id; "
-            f"run 'autoform migrate article-ids {blueprint}' and add the proposed ID"
-        )
-    if paths.workspace_project_id is None:
-        key = author_claim_key(node.article_id)
-        compatibility_keys = (author_claim_key(node.id),)
-        canonical_keys = tuple(
-            author_claim_key(candidate.article_id)
-            for candidate in graph.nodes.values()
-            if candidate.article_id is not None
-        )
-    else:
-        key = workspace_author_claim_key(paths.workspace_project_id, node.article_id)
-        compatibility_keys = (
-            author_claim_key(node.article_id),
-            author_claim_key(node.id),
-        )
-        canonical_keys = tuple(
-            workspace_author_claim_key(paths.workspace_project_id, candidate.article_id)
-            for candidate in graph.nodes.values()
-            if candidate.article_id is not None
-        )
-    identity = _resolve_claim_board_identity(args, context=paths.project_root)
-    project_pin.verify(label="claim project")
-    blueprint_pin.verify(label="claim blueprint")
-    return _ResolvedClaimTarget(
-        key,
-        node.id,
-        compatibility_keys,
-        canonical_keys,
-        identity,
-    )
 
 
 def _origin_url(project_or_blueprint: str | Path = ".") -> str:
@@ -1024,22 +1063,25 @@ def _default_claim_scratch(repo: str, session_id: str) -> Path:
 
 def _render(args: argparse.Namespace) -> int:
     try:
-        paths = resolve_runtime_paths(args.blueprint_dir, project_id=args.project)
-        blueprint_dir = paths.blueprint_dir
-        output = args.output
-        if output is None:
-            output = (
-                str(Path("site-src") / paths.workspace_project_id)
-                if paths.workspace_project_id is not None
-                else "site-src"
+        with bind_runtime_paths(args.blueprint_dir, project_id=args.project) as paths:
+            blueprint_dir = paths.blueprint_dir
+            output = args.output
+            if output is None:
+                output = (
+                    str(Path("site-src") / paths.workspace_project_id)
+                    if paths.workspace_project_id is not None
+                    else "site-src"
+                )
+            report = render_site(
+                blueprint_dir,
+                output,
+                lean_root=args.lean_root,
+                repository_url=args.repository_url,
+                ref=args.ref,
+                _expected_blueprint_identity=paths.blueprint_identity,
+                _expected_roadmap_identity=paths.roadmap_identity,
             )
-        report = render_site(
-            blueprint_dir,
-            output,
-            lean_root=args.lean_root,
-            repository_url=args.repository_url,
-            ref=args.ref,
-        )
+            paths.verify()
     except (GraphValidationError, PublicationError, RuntimeProjectionError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")

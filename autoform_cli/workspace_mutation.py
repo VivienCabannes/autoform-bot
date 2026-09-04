@@ -87,6 +87,7 @@ class _BlueprintBinding:
                 os.close(descriptor)
             except OSError:
                 pass
+        self.workspace.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +185,14 @@ def initialize_workspace(
     text = _initial_manifest(location_id=location_id, blueprint_root=blueprint_root)
     staged: _StagedFile | None = None
     chain: _DirectoryChain | None = None
+    locked = False
     try:
+        assert fcntl is not None
+        try:
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX)
+            locked = True
+        except OSError:
+            raise WorkspaceError(["workspace root could not be locked safely"]) from None
         _workspace_mutation_checkpoint("workspace-init-root-bound")
         _verify_root_binding(
             root,
@@ -252,6 +260,12 @@ def initialize_workspace(
                 detail += f"; retained unregistered directories: {retained}"
             raise WorkspaceError([detail]) from None
     finally:
+        if locked:
+            try:
+                assert fcntl is not None
+                fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
         if chain is not None:
             chain.close()
         if staged is not None:
@@ -282,7 +296,15 @@ def create_blueprint_project(
         member=member,
         location_id=location_id,
     )
+    locked = False
     try:
+        assert fcntl is not None
+        try:
+            fcntl.flock(binding.root_descriptor, fcntl.LOCK_EX)
+            locked = True
+        except OSError:
+            raise WorkspaceError(["workspace root could not be locked safely"]) from None
+        _verify_blueprint_parent_binding(binding, verify_manifest=False)
         _reject_case_collisions(
             binding.workspace.root,
             PurePosixPath(binding.combined),
@@ -323,7 +345,11 @@ def create_blueprint_project(
             raise WorkspaceError([issue]) from None
         binding.destination_descriptor = destination_descriptor
         binding.destination_identity = destination_identity
-        _verify_blueprint_binding(binding, require_roadmap=False)
+        _verify_blueprint_binding(
+            binding,
+            require_roadmap=False,
+            verify_manifest=False,
+        )
         if scaffold_blueprint is _ORIGINAL_SCAFFOLD_BLUEPRINT:
             retained_bindings: list[_BlueprintScaffoldBinding] = []
             written = scaffold_blueprint(
@@ -340,7 +366,11 @@ def create_blueprint_project(
             binding.scaffold_binding = retained_bindings[0]
         else:  # Preserve the small monkeypatch seam used by callers and tests.
             written = scaffold_blueprint(binding.destination, title=title)
-        _verify_blueprint_binding(binding, require_roadmap=True)
+        _verify_blueprint_binding(
+            binding,
+            require_roadmap=True,
+            verify_manifest=False,
+        )
         manifest_backup_path = _append_project(
             binding.workspace.path,
             project_id=project_id,
@@ -363,6 +393,12 @@ def create_blueprint_project(
             ]
         ) from None
     finally:
+        if locked:
+            try:
+                assert fcntl is not None
+                fcntl.flock(binding.root_descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
         binding.close()
 
     relative_written = tuple(
@@ -415,7 +451,11 @@ def register_blueprint_project(
             ) from None
         binding.destination_descriptor = destination_descriptor
         binding.destination_identity = destination_identity
-        _verify_blueprint_binding(binding, require_roadmap=True)
+        _verify_blueprint_binding(
+            binding,
+            require_roadmap=True,
+            verify_manifest=False,
+        )
         manifest_backup_path = _append_project(
             binding.workspace.path,
             project_id=project_id,
@@ -444,38 +484,66 @@ def _prepare_blueprint_binding(
         raise WorkspaceError(["blueprint path must name one portable immediate child directory"])
 
     workspace = discover_workspace(start)
-    candidates = tuple(
-        location for location in workspace.manifest.locations if "blueprints" in location.provides
-    )
-    if location_id is None:
-        if len(candidates) != 1:
-            choices = ", ".join(item.id for item in candidates) or "none"
-            raise WorkspaceError([f"choose a blueprint location with --location from: {choices}"])
-        selected_location_id = candidates[0].id
-    else:
-        selected_location_id = location_id
-    location, combined = _validate_project_registration(
-        workspace.manifest,
-        project_id=project_id,
-        location_id=selected_location_id,
-        path=member,
-    )
-
-    collection = workspace.root / PurePosixPath(location.path)
-    _reject_existing_symlink_chain(collection, workspace.root)
-    if not collection.is_dir():
-        raise WorkspaceError([f"blueprint location does not exist: {location.path}"])
-    workspace.verify_root_binding()
-    root_descriptor = workspace.duplicate_root_descriptor()
-    root_identity = workspace.root_identity
+    root_descriptor: int | None = None
     try:
+        root = workspace.root
+        root_identity = workspace.root_identity
+        try:
+            root_descriptor = os.dup(workspace.root_descriptor)
+            opened_root = os.fstat(root_descriptor)
+            if (opened_root.st_dev, opened_root.st_ino) != root_identity:
+                raise OSError("workspace root changed")
+            _workspace_mutation_checkpoint("project-before-root-lock")
+            assert fcntl is not None
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX)
+        except OSError:
+            raise WorkspaceError(["workspace root could not be locked safely"]) from None
+
+        # Discovery precedes the lock only to locate the workspace root. Reload
+        # the manifest while holding the root lock so concurrent registrations
+        # are composed rather than rejected as changes to a stale generation.
+        workspace.close()
+        workspace = discover_workspace(root)
+        if workspace.root_identity != root_identity:
+            raise WorkspaceError(["workspace root changed during use"])
+
+        candidates = tuple(
+            location
+            for location in workspace.manifest.locations
+            if "blueprints" in location.provides
+        )
+        if location_id is None:
+            if len(candidates) != 1:
+                choices = ", ".join(item.id for item in candidates) or "none"
+                raise WorkspaceError(
+                    [f"choose a blueprint location with --location from: {choices}"]
+                )
+            selected_location_id = candidates[0].id
+        else:
+            selected_location_id = location_id
+        location, combined = _validate_project_registration(
+            workspace.manifest,
+            project_id=project_id,
+            location_id=selected_location_id,
+            path=member,
+        )
+
+        location_relative = PurePosixPath(location.path)
+        workspace.bind_managed_directory(location_relative)
+        collection = workspace.root / location_relative
+        _reject_existing_symlink_chain(collection, workspace.root)
+        if not collection.is_dir():
+            raise WorkspaceError([f"blueprint location does not exist: {location.path}"])
+        workspace.verify_root_binding()
         location_descriptors, location_identities = _open_relative_directories(
             root_descriptor,
-            PurePosixPath(location.path),
+            location_relative,
             "blueprint location",
         )
     except BaseException:
-        os.close(root_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        workspace.close()
         raise
     destination = collection / member
     return _BlueprintBinding(
@@ -612,13 +680,21 @@ def _append_project(
     backup_name: str | None = None
     try:
         if binding is not None:
-            _verify_blueprint_binding(binding, require_roadmap=True)
+            _verify_blueprint_binding(
+                binding,
+                require_roadmap=True,
+                verify_manifest=False,
+            )
         else:
             assert own_root_binding is not None
             own_root_binding.verify()
         _workspace_mutation_checkpoint("registry-before-read")
         if binding is not None:
-            _verify_blueprint_binding(binding, require_roadmap=True)
+            _verify_blueprint_binding(
+                binding,
+                require_roadmap=True,
+                verify_manifest=False,
+            )
         else:
             assert own_root_binding is not None
             own_root_binding.verify()
@@ -631,7 +707,11 @@ def _append_project(
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             original = stream.read(MAX_MANIFEST_BYTES + 1)
         if binding is not None:
-            _verify_blueprint_binding(binding, require_roadmap=True)
+            _verify_blueprint_binding(
+                binding,
+                require_roadmap=True,
+                verify_manifest=False,
+            )
         else:
             assert own_root_binding is not None
             own_root_binding.verify()
@@ -670,7 +750,11 @@ def _append_project(
             mode=stat.S_IMODE(metadata.st_mode),
         )
         if binding is not None:
-            _verify_blueprint_binding(binding, require_roadmap=True)
+            _verify_blueprint_binding(
+                binding,
+                require_roadmap=True,
+                verify_manifest=False,
+            )
         current_metadata = os.fstat(descriptor)
         try:
             named_metadata = os.stat(
@@ -704,7 +788,11 @@ def _append_project(
                 issue=f"{WORKSPACE_FILE} changed during update",
             )
             if binding is not None:
-                _verify_blueprint_binding(binding, require_roadmap=True)
+                _verify_blueprint_binding(
+                    binding,
+                    require_roadmap=True,
+                    verify_manifest=False,
+                )
         except WorkspaceError:
             _rollback_manifest_exchange(
                 parent_descriptor,
@@ -720,7 +808,11 @@ def _append_project(
         _fsync_directory_descriptor(parent_descriptor)
         _verify_staged_file(parent_descriptor, manifest_path.name, staged)
         if binding is not None:
-            _verify_blueprint_binding(binding, require_roadmap=True)
+            _verify_blueprint_binding(
+                binding,
+                require_roadmap=True,
+                verify_manifest=False,
+            )
         committed = True
         backup_name = _retain_displaced_manifest(
             parent_descriptor,
@@ -740,7 +832,11 @@ def _append_project(
         _fsync_directory_descriptor(parent_descriptor)
         _verify_staged_file(parent_descriptor, manifest_path.name, staged)
         if binding is not None:
-            _verify_blueprint_binding(binding, require_roadmap=True)
+            _verify_blueprint_binding(
+                binding,
+                require_roadmap=True,
+                verify_manifest=False,
+            )
         _verify_manifest_recovery(
             parent_descriptor,
             backup_name,
@@ -994,12 +1090,13 @@ def _verify_relative_directories(
         parent = descriptor
 
 
-def _verify_blueprint_binding(
+def _verify_blueprint_parent_binding(
     binding: _BlueprintBinding,
     *,
-    require_roadmap: bool,
+    verify_manifest: bool = True,
 ) -> None:
-    binding.workspace.verify_root_binding()
+    """Verify the workspace root and selected blueprint collection."""
+
     assert binding.workspace._root_binding is not None
     _verify_root_binding(
         binding.workspace.root,
@@ -1014,6 +1111,17 @@ def _verify_blueprint_binding(
         binding.location_identities,
         label="blueprint location",
     )
+    if verify_manifest:
+        binding.workspace.verify_root_binding()
+
+
+def _verify_blueprint_binding(
+    binding: _BlueprintBinding,
+    *,
+    require_roadmap: bool,
+    verify_manifest: bool = True,
+) -> None:
+    _verify_blueprint_parent_binding(binding, verify_manifest=verify_manifest)
     if binding.destination_descriptor is None or binding.destination_identity is None:
         raise WorkspaceError(["blueprint destination binding is incomplete"])
     try:
@@ -1343,7 +1451,11 @@ def _recover_committed_manifest_update(
 
     _verify_staged_file(parent_descriptor, manifest_name, staged)
     if binding is not None:
-        _verify_blueprint_binding(binding, require_roadmap=True)
+        _verify_blueprint_binding(
+            binding,
+            require_roadmap=True,
+            verify_manifest=False,
+        )
     recovery_name = staged.path.name if backup_name is None else backup_name
     _verify_manifest_recovery(
         parent_descriptor,
@@ -1356,7 +1468,11 @@ def _recover_committed_manifest_update(
     _fsync_directory_descriptor(parent_descriptor)
     _verify_staged_file(parent_descriptor, manifest_name, staged)
     if binding is not None:
-        _verify_blueprint_binding(binding, require_roadmap=True)
+        _verify_blueprint_binding(
+            binding,
+            require_roadmap=True,
+            verify_manifest=False,
+        )
     _verify_manifest_recovery(
         parent_descriptor,
         recovery_name,

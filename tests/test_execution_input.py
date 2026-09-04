@@ -2,18 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import FrozenInstanceError
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 import autoform_cli.execution_input as execution_module
+from autoform_cli import graph as graph_module
+from autoform_cli import workspace as workspace_module
 from autoform_cli.execution_input import (
     EXECUTION_INPUT_SCHEMA,
     ExecutionInputError,
     load_execution_input,
 )
-from autoform_cli.runtime import RUNTIME_SCHEMA, RuntimeProjectionError, load_runtime_graph
+from autoform_cli.runtime import (
+    RUNTIME_SCHEMA,
+    RuntimeProjectionError,
+    bind_runtime_paths,
+    load_runtime_graph,
+)
 from autoform_cli.workspace_mutation import initialize_workspace, register_blueprint_project
 
 
@@ -94,6 +102,169 @@ def test_builds_deterministic_deeply_immutable_execution_input(tmp_path: Path) -
         first.units[0].unit = "changed"  # type: ignore[misc]
 
 
+def test_unrelated_blueprint_files_do_not_change_execution_authority_generation(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    with bind_runtime_paths(project) as paths:
+        before = execution_module._capture_execution_authority(paths)
+        (project / "blueprint/sources/unrelated.txt").write_text(
+            "ignored\n", encoding="utf-8"
+        )
+        after = execution_module._capture_execution_authority(paths)
+
+    assert after.generation_revision == before.generation_revision
+
+
+def test_many_source_targets_list_each_shared_directory_once_per_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    sources = project / "blueprint/sources"
+    targets = []
+    for index in range(100):
+        name = f"reference-{index:03d}.md"
+        (sources / name).write_text(f"reference {index}\n", encoding="utf-8")
+        targets.append(PurePosixPath("sources", name))
+    list_calls = 0
+    original = execution_module.os.listdir
+
+    def count_lists(path):
+        nonlocal list_calls
+        list_calls += 1
+        return original(path)
+
+    monkeypatch.setattr(execution_module.os, "listdir", count_lists)
+
+    with bind_runtime_paths(project) as paths:
+        selected = execution_module._bind_existing_source_target_paths(
+            paths,
+            tuple(targets),
+        )
+
+    assert len(selected) == 101
+    assert list_calls == 4
+
+
+def test_local_source_target_symlink_is_part_of_execution_authority(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n", encoding="utf-8")
+    (project / "blueprint/sources/other.md").symlink_to(outside)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8")
+        + "\n## Sources\n\n- [Other](../sources/other.md)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExecutionInputError, match="execution-authority-unsafe"):
+        load_execution_input(project)
+
+
+def test_cancelled_source_symlink_is_part_of_execution_authority(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    outside = tmp_path / "outside"
+    target_directory = outside / "directory"
+    target_directory.mkdir(parents=True)
+    (outside / "secret.md").write_text("outside\n", encoding="utf-8")
+    link = project / "blueprint/sources/link"
+    try:
+        link.symlink_to(target_directory, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8")
+        + "\n## Sources\n\n- [Escaped](../sources/link/../secret.md)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExecutionInputError, match="execution-authority-unsafe"):
+        load_execution_input(project)
+
+
+def test_case_alias_of_local_source_target_is_bound_by_filesystem_identity(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    if not (project / "blueprint/SOURCES").exists():
+        pytest.skip("filesystem is case-sensitive")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n", encoding="utf-8")
+    (project / "blueprint/sources/other.md").symlink_to(outside)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8")
+        + "\n## Sources\n\n- [Other](../SOURCES/other.md)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeProjectionError, match="source target escapes"):
+        load_runtime_graph(project)
+    with pytest.raises(ExecutionInputError, match="execution-authority-unsafe"):
+        load_execution_input(project)
+
+
+def test_case_alias_of_coverage_artifact_is_bound_by_filesystem_identity(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    blueprint = project / "blueprint"
+    sources = blueprint / "sources"
+    physical_sources = blueprint / "SOURCES"
+    sources.rename(physical_sources)
+    if not sources.exists():
+        pytest.skip("filesystem is case-sensitive")
+    physical_book = physical_sources / "BOOK.md"
+    (physical_sources / "book.md").rename(physical_book)
+
+    execution_input = load_execution_input(project)
+
+    assert execution_input.artifact_path == "sources/book.md"
+    assert execution_input.artifact_sha256 == _digest(physical_book.read_bytes())
+
+
+@pytest.mark.parametrize("root_name", ["roadmap", "coverage"])
+def test_case_alias_of_contract_root_is_bound_by_filesystem_identity(
+    tmp_path: Path,
+    root_name: str,
+) -> None:
+    project = _project(tmp_path)
+    blueprint = project / "blueprint"
+    authored = blueprint / root_name
+    physical = blueprint / root_name.upper()
+    authored.rename(physical)
+    if not authored.exists():
+        pytest.skip("filesystem is case-sensitive")
+
+    execution_input = load_execution_input(project)
+
+    assert execution_input.runtime.article_count == 2
+    assert execution_input.coverage_schema == "autoform-coverage/v2"
+
+
+@pytest.mark.parametrize("relative", ["roadmap/.notes.md", "roadmap/.hidden/note.md"])
+def test_hidden_roadmap_markdown_does_not_change_execution_authority(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    project = _project(tmp_path)
+    hidden = project / "blueprint" / relative
+    hidden.parent.mkdir(parents=True, exist_ok=True)
+    hidden.write_text("# Private notes\n", encoding="utf-8")
+
+    direct = load_runtime_graph(project)
+    execution = load_execution_input(project)
+
+    assert execution.runtime == direct
+
+
 def test_execution_input_binds_only_the_selected_workspace_project(
     tmp_path: Path,
 ) -> None:
@@ -163,6 +334,27 @@ def test_execution_input_rejects_a_symlinked_path_component(tmp_path: Path) -> N
 
     with pytest.raises(ExecutionInputError, match="resolved safely"):
         load_execution_input(linked_parent / project.name)
+
+
+def test_rejected_unregistered_workspace_vault_closes_all_bindings(tmp_path: Path) -> None:
+    descriptors = Path("/proc/self/fd")
+    if not descriptors.is_dir():
+        descriptors = Path("/dev/fd")
+    if not descriptors.is_dir():
+        pytest.skip("the platform does not expose process file descriptors")
+    project = _project(tmp_path)
+    initialize_workspace(project, blueprint_root="Plans")
+    retained_errors = []
+    before = len(tuple(descriptors.iterdir()))
+
+    for _ in range(20):
+        try:
+            load_execution_input(project / "blueprint")
+        except ExecutionInputError as error:
+            retained_errors.append(error)
+
+    assert len(retained_errors) == 20
+    assert len(tuple(descriptors.iterdir())) == before
 
 
 def test_legacy_project_snapshot_explicitly_uses_workspace_aware_v3(tmp_path: Path) -> None:
@@ -293,6 +485,20 @@ def test_invalid_roadmap_is_reported_through_execution_input_error(tmp_path: Pat
         load_execution_input(project)
 
     assert [issue.code for issue in raised.value.issues] == ["runtime-invalid"]
+
+
+def test_autonomous_input_rejects_portable_read_only_filesystem_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    monkeypatch.setattr(workspace_module, "_DIRECTORY_BINDING_SUPPORTED", False)
+    monkeypatch.setattr(graph_module, "_DIRECTORY_BINDING_SUPPORTED", False)
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project)
+
+    assert [issue.code for issue in raised.value.issues] == ["strong-binding-required"]
 
 
 def test_concurrent_authority_change_is_not_snapshotted(
@@ -440,6 +646,92 @@ def test_lean_source_bytes_are_bound_into_execution_input(tmp_path: Path) -> Non
     assert before.source_contract_sha256 == after.source_contract_sha256
 
 
+def test_execution_input_rejects_symlinked_lean_source(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    article = project / "blueprint/roadmap/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "declaration: theorem\n",
+            "declaration: theorem\nlean: Project.result\n",
+        ),
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside.lean"
+    outside.write_text("theorem Project.result : True := by trivial\n", encoding="utf-8")
+    (project / "Project.lean").symlink_to(outside)
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project, lean_root=project)
+
+    assert [issue.code for issue in raised.value.issues] == ["lean-source-unsafe"]
+    assert "Project.lean" in raised.value.issues[0].reason
+
+
+def test_execution_input_rejects_special_lean_source_without_opening_it(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs are unavailable")
+    project = _project(tmp_path)
+    trap = project / "Trap.lean"
+    os.mkfifo(trap)
+    try:
+        with pytest.raises(ExecutionInputError) as raised:
+            load_execution_input(project, lean_root=project)
+    finally:
+        trap.unlink(missing_ok=True)
+
+    assert [issue.code for issue in raised.value.issues] == ["lean-source-unsafe"]
+    assert "Trap.lean" in raised.value.issues[0].reason
+
+
+def test_execution_input_rejects_lean_root_redirected_before_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    lean_root = tmp_path / "lean"
+    lean_root.mkdir()
+    (lean_root / "Stable.lean").write_text("theorem stable : True := by trivial\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    held = tmp_path / "held-lean"
+    original = execution_module.open_project_sources
+
+    def redirect_before_open(root: str | Path, **kwargs):
+        lean_root.rename(held)
+        lean_root.symlink_to(outside, target_is_directory=True)
+        try:
+            return original(root, **kwargs)
+        finally:
+            lean_root.unlink()
+            held.rename(lean_root)
+
+    monkeypatch.setattr(execution_module, "open_project_sources", redirect_before_open)
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project, lean_root=lean_root)
+
+    assert [issue.code for issue in raised.value.issues] == ["lean-source-unsafe"]
+
+
+def test_execution_input_translates_private_snapshot_materialization_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+
+    def fail_materialization(*_args, **_kwargs) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(execution_module.TreeSnapshot, "materialize", fail_materialization)
+
+    with pytest.raises(ExecutionInputError) as raised:
+        load_execution_input(project)
+
+    assert [issue.code for issue in raised.value.issues] == [
+        "execution-snapshot-unavailable"
+    ]
+
+
 def _mutate_roadmap(project: Path) -> None:
     article = project / "blueprint/roadmap/result.md"
     article.write_text(
@@ -528,6 +820,32 @@ def test_execution_input_fails_closed_after_bounded_continuous_mutation(
 
     assert calls == execution_module._EXECUTION_INPUT_READ_ATTEMPTS
     assert [issue.code for issue in raised.value.issues] == ["execution-input-changed"]
+
+
+def test_execution_input_retries_a_transient_lean_capture_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    (project / "Main.lean").write_text("theorem result : True := trivial\n", encoding="utf-8")
+    original = execution_module.BoundProjectSources.capture
+    calls = 0
+
+    def fail_once(sources):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise execution_module.TreeSnapshotError(
+                "directory tree changed while it was captured"
+            )
+        return original(sources)
+
+    monkeypatch.setattr(execution_module.BoundProjectSources, "capture", fail_once)
+
+    snapshot = load_execution_input(project, lean_root=project)
+
+    assert calls > 1
+    assert snapshot.lean_source_revision is not None
 
 
 @pytest.mark.parametrize(

@@ -9,17 +9,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+import stat
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 
-from .graph import ARTICLE_ID_PATTERN, Graph, load_graph
-from .lean import declaration_names, index_project
+from . import workspace as workspace_module
+from .graph import ARTICLE_ID_PATTERN, Graph, GraphValidationError, load_graph
+from .lean import SourceIndex, declaration_names, index_project
 from .status import derive, is_definition
-from .workspace import _path_contains_symlink, discover_workspace, resolve_blueprint
+from .workspace import (
+    Workspace,
+    _WorkspaceRootBinding,
+    _DIRECTORY_FLAGS,
+    _open_workspace_root,
+    _path_contains_symlink,
+    _path_is_reparse_point,
+    _portable_directory_chain,
+    discover_workspace,
+    resolve_blueprint,
+)
 from .workspace_manifest import WorkspaceError
 
 RUNTIME_SCHEMA = "autoform-runtime/v1"
@@ -43,6 +57,138 @@ class RuntimePaths:
     workspace_project_id: str | None = None
     workspace_project_binding_sha256: str | None = None
     workspace_managed: bool = False
+    _workspace: Workspace | None = field(default=None, repr=False, compare=False)
+    _blueprint_binding: _WorkspaceRootBinding | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _roadmap_identity: tuple[int, int] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _portable_blueprint_identities: tuple[tuple[int, int], ...] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def blueprint_identity(self) -> tuple[int, int] | None:
+        """Return the retained blueprint inode identity, when paths are bound."""
+
+        if self._blueprint_binding is None:
+            if self._portable_blueprint_identities:
+                return self._portable_blueprint_identities[-1]
+            return None
+        return self._blueprint_binding.identity
+
+    @property
+    def roadmap_identity(self) -> tuple[int, int] | None:
+        """Return the retained roadmap inode identity, when paths are bound."""
+
+        return self._roadmap_identity
+
+    @property
+    def workspace_root_identity(self) -> tuple[int, int] | None:
+        """Return the selected workspace root generation, when managed."""
+
+        return self._workspace.root_identity if self._workspace is not None else None
+
+    @property
+    def workspace_manifest_sha256(self) -> str | None:
+        """Return the manifest digest that selected this runtime project."""
+
+        return self._workspace.manifest_sha256 if self._workspace is not None else None
+
+    @property
+    def strongly_bound(self) -> bool:
+        """Whether pathname consumers can be tied to retained directories."""
+
+        return self._blueprint_binding is not None
+
+    def require_strong_binding(self, *, operation: str) -> None:
+        """Reject mutations and control-plane work on the portable read tier."""
+
+        if not self.strongly_bound:
+            raise RuntimeProjectionError(
+                [
+                    f"{operation} requires descriptor-relative filesystem support; "
+                    "this platform supports read-only inspection only"
+                ]
+            )
+        self.verify()
+
+    def verify(self) -> None:
+        try:
+            if self._workspace is not None:
+                self._workspace.verify_root_binding()
+            if self._blueprint_binding is not None:
+                self._blueprint_binding.verify()
+                roadmap = os.stat(
+                    "roadmap",
+                    dir_fd=self._blueprint_binding.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(roadmap.st_mode)
+                    or (roadmap.st_dev, roadmap.st_ino) != self._roadmap_identity
+                ):
+                    raise OSError("roadmap directory changed")
+            elif self._portable_blueprint_identities is not None:
+                if (
+                    _portable_directory_chain(self.blueprint_dir)
+                    != self._portable_blueprint_identities
+                ):
+                    raise OSError("blueprint directory changed")
+                roadmap = (self.blueprint_dir / "roadmap").stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(roadmap.st_mode)
+                    or _path_is_reparse_point(self.blueprint_dir / "roadmap", roadmap)
+                    or (roadmap.st_dev, roadmap.st_ino) != self._roadmap_identity
+                ):
+                    raise OSError("roadmap directory changed")
+        except WorkspaceError as error:
+            raise RuntimeProjectionError(list(error.issues)) from None
+        except OSError:
+            raise RuntimeProjectionError(["blueprint directory changed during use"]) from None
+
+    def duplicate_blueprint_descriptor(self) -> int:
+        """Return a checked descriptor for one blueprint-relative operation."""
+
+        if self._blueprint_binding is None:
+            raise RuntimeProjectionError(["runtime paths are not retained"])
+        self.verify()
+        descriptor: int | None = None
+        try:
+            descriptor = os.dup(self._blueprint_binding.descriptor)
+            opened = os.fstat(descriptor)
+        except OSError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise RuntimeProjectionError(["blueprint directory changed during use"]) from None
+        if (opened.st_dev, opened.st_ino) != self._blueprint_binding.identity:
+            os.close(descriptor)
+            raise RuntimeProjectionError(["blueprint directory changed during use"])
+        try:
+            self.verify()
+        except RuntimeProjectionError:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def close(self) -> None:
+        if self._blueprint_binding is not None:
+            self._blueprint_binding.close()
+        if self._workspace is not None:
+            self._workspace.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +360,7 @@ def resolve_runtime_paths(
     project_or_blueprint: str | Path,
     *,
     project_id: str | None = None,
+    _retain_workspace: bool = False,
 ) -> RuntimePaths:
     """Resolve a workspace project, legacy project, or explicit blueprint.
 
@@ -223,13 +370,16 @@ def resolve_runtime_paths(
     """
 
     supplied = Path(project_or_blueprint).expanduser()
+    retained = False
+    blueprint_binding: _WorkspaceRootBinding | None = None
+    portable_blueprint_identities: tuple[tuple[int, int], ...] | None = None
     try:
         if _path_contains_symlink(supplied.absolute()):
             raise RuntimeProjectionError(["project or blueprint path contains a symbolic link"])
         candidate = supplied.resolve()
     except (OSError, RuntimeError, ValueError, WorkspaceError):
         raise RuntimeProjectionError(["project or blueprint path cannot be resolved safely"]) from None
-    if not candidate.is_dir():
+    if not _is_real_directory(candidate):
         raise RuntimeProjectionError(["project or blueprint directory does not exist"])
 
     try:
@@ -238,63 +388,139 @@ def resolve_runtime_paths(
         if error.issues != ("no enclosing .autoform.toml was found",):
             raise RuntimeProjectionError(list(error.issues)) from None
         workspace = None
-
-    workspace_project_id: str | None = None
-    workspace_project_binding_sha256: str | None = None
-    is_blueprint = (candidate / "roadmap").is_dir()
-    is_project = (candidate / "blueprint" / "roadmap").is_dir()
-    if workspace is not None and project_id is not None:
-        try:
-            _, project, blueprint_dir = resolve_blueprint(candidate, project_id=project_id)
-        except WorkspaceError as error:
-            raise RuntimeProjectionError(list(error.issues)) from None
-        project_root = workspace.root
-        workspace_project_id = project.id
-        workspace_project_binding_sha256 = workspace.project_binding_sha256(project)
-    elif workspace is not None and is_blueprint:
-        project_root = workspace.root
-        blueprint_dir = candidate
-        matches = tuple(
-            project
-            for project in workspace.manifest.projects
-            if workspace.blueprint_path(project).resolve() == candidate
-        )
-        if len(matches) == 1:
-            workspace_project_id = matches[0].id
-            workspace_project_binding_sha256 = workspace.project_binding_sha256(matches[0])
-    elif workspace is not None:
-        try:
-            _, project, blueprint_dir = resolve_blueprint(candidate)
-        except WorkspaceError as error:
-            raise RuntimeProjectionError(list(error.issues)) from None
-        project_root = workspace.root
-        workspace_project_id = project.id
-        workspace_project_binding_sha256 = workspace.project_binding_sha256(project)
-    elif project_id is not None:
-        raise RuntimeProjectionError(["--project requires an enclosing .autoform.toml"])
-    elif is_blueprint and is_project:
-        raise RuntimeProjectionError(["input is ambiguous between a project and blueprint directory"])
-    elif is_project:
-        project_root = candidate
-        blueprint_dir = (candidate / "blueprint").resolve()
-    elif is_blueprint:
-        blueprint_dir = candidate
-        project_root = candidate.parent.resolve()
-    else:
-        raise RuntimeProjectionError(["roadmap directory does not exist"])
-
     try:
-        blueprint_dir.relative_to(project_root)
-    except ValueError as error:
-        raise RuntimeProjectionError(["blueprint directory escapes the project root"]) from error
-    _reject_roadmap_symlinks(blueprint_dir)
-    return RuntimePaths(
-        project_root=project_root,
-        blueprint_dir=blueprint_dir,
-        workspace_project_id=workspace_project_id,
-        workspace_project_binding_sha256=workspace_project_binding_sha256,
-        workspace_managed=workspace is not None,
+        workspace_project_id: str | None = None
+        workspace_project_binding_sha256: str | None = None
+        is_blueprint = _is_real_directory(candidate / "roadmap")
+        is_project = _is_real_directory(candidate / "blueprint") and _is_real_directory(
+            candidate / "blueprint" / "roadmap"
+        )
+        if workspace is not None and project_id is not None:
+            previous_workspace = workspace
+            workspace, project, blueprint_dir = resolve_blueprint(
+                candidate,
+                project_id=project_id,
+            )
+            previous_workspace.close()
+            project_root = workspace.root
+            workspace_project_id = project.id
+            workspace_project_binding_sha256 = workspace.project_binding_sha256(project)
+        elif workspace is not None and is_blueprint:
+            project_root = workspace.root
+            blueprint_dir = candidate
+            matches = tuple(
+                project
+                for project in workspace.manifest.projects
+                if workspace.blueprint_path(project).resolve() == candidate
+            )
+            if len(matches) == 1:
+                relative = workspace.manifest.blueprint_relative(matches[0])
+                workspace.bind_managed_directory(relative)
+                workspace.bind_managed_directory(relative / "roadmap")
+                workspace_project_id = matches[0].id
+                workspace_project_binding_sha256 = workspace.project_binding_sha256(matches[0])
+        elif workspace is not None:
+            previous_workspace = workspace
+            workspace, project, blueprint_dir = resolve_blueprint(candidate)
+            previous_workspace.close()
+            project_root = workspace.root
+            workspace_project_id = project.id
+            workspace_project_binding_sha256 = workspace.project_binding_sha256(project)
+        elif project_id is not None:
+            raise RuntimeProjectionError(["--project requires an enclosing .autoform.toml"])
+        elif is_blueprint and is_project:
+            raise RuntimeProjectionError(["input is ambiguous between a project and blueprint directory"])
+        elif is_project:
+            project_root = candidate
+            blueprint_dir = candidate / "blueprint"
+        elif is_blueprint:
+            blueprint_dir = candidate
+            project_root = candidate.parent.resolve()
+        else:
+            raise RuntimeProjectionError(["roadmap directory does not exist"])
+
+        try:
+            blueprint_dir.relative_to(project_root)
+        except ValueError as error:
+            raise RuntimeProjectionError(["blueprint directory escapes the project root"]) from error
+        if not _retain_workspace:
+            _reject_roadmap_symlinks(blueprint_dir)
+        if workspace is not None:
+            workspace.verify_root_binding()
+        roadmap_identity: tuple[int, int] | None = None
+        if _retain_workspace:
+            if workspace_module._DIRECTORY_BINDING_SUPPORTED:
+                blueprint_binding = _open_workspace_root(blueprint_dir)
+                blueprint_descriptor = blueprint_binding.descriptor
+            else:
+                portable_blueprint_identities = _portable_directory_chain(blueprint_dir)
+                blueprint_descriptor = None
+            try:
+                roadmap = (
+                    os.stat(
+                        "roadmap",
+                        dir_fd=blueprint_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if blueprint_descriptor is not None
+                    else (blueprint_dir / "roadmap").stat(follow_symlinks=False)
+                )
+            except OSError:
+                raise RuntimeProjectionError(["roadmap directory changed during selection"]) from None
+            if not stat.S_ISDIR(roadmap.st_mode) or (
+                blueprint_descriptor is None
+                and _path_is_reparse_point(blueprint_dir / "roadmap", roadmap)
+            ):
+                raise RuntimeProjectionError(["roadmap directory changed during selection"])
+            roadmap_identity = (roadmap.st_dev, roadmap.st_ino)
+            if blueprint_binding is not None:
+                blueprint_binding.verify()
+            elif _portable_directory_chain(blueprint_dir) != portable_blueprint_identities:
+                raise RuntimeProjectionError(["blueprint directory changed during selection"])
+            if workspace is not None:
+                workspace.verify_root_binding()
+        result = RuntimePaths(
+            project_root=project_root,
+            blueprint_dir=blueprint_dir,
+            workspace_project_id=workspace_project_id,
+            workspace_project_binding_sha256=workspace_project_binding_sha256,
+            workspace_managed=workspace is not None,
+            _workspace=workspace if _retain_workspace else None,
+            _blueprint_binding=blueprint_binding,
+            _roadmap_identity=roadmap_identity,
+            _portable_blueprint_identities=portable_blueprint_identities,
+        )
+        retained = _retain_workspace
+        return result
+    except WorkspaceError as error:
+        raise RuntimeProjectionError(list(error.issues)) from None
+    except OSError:
+        raise RuntimeProjectionError(["blueprint directory changed during selection"]) from None
+    finally:
+        if not retained:
+            if blueprint_binding is not None:
+                blueprint_binding.close()
+            if workspace is not None:
+                workspace.close()
+
+
+@contextmanager
+def bind_runtime_paths(
+    project_or_blueprint: str | Path,
+    *,
+    project_id: str | None = None,
+) -> Iterator[RuntimePaths]:
+    """Retain the selected workspace generation while its paths are consumed."""
+
+    paths = resolve_runtime_paths(
+        project_or_blueprint,
+        project_id=project_id,
+        _retain_workspace=True,
     )
+    try:
+        yield paths
+    finally:
+        paths.close()
 
 
 def load_runtime_graph(
@@ -302,12 +528,58 @@ def load_runtime_graph(
     *,
     lean_root: str | Path | None = None,
     project_id: str | None = None,
+    _paths: RuntimePaths | None = None,
 ) -> RuntimeGraph:
     """Load the canonical graph once and return its immutable runtime view."""
 
-    paths = resolve_runtime_paths(project_or_blueprint, project_id=project_id)
-    graph = load_graph(paths.blueprint_dir)
-    return build_runtime_graph(graph, project_root=paths.project_root, lean_root=lean_root)
+    if _paths is not None:
+        try:
+            graph = load_bound_graph(_paths)
+        except GraphValidationError as error:
+            raise RuntimeProjectionError(list(error.issues)) from error
+        _validate_source_target_paths(graph, _paths)
+        runtime = build_runtime_graph(
+            graph,
+            project_root=_paths.project_root,
+            lean_root=lean_root,
+        )
+        _paths.verify()
+        return runtime
+    try:
+        with bind_runtime_paths(project_or_blueprint, project_id=project_id) as paths:
+            try:
+                graph = load_bound_graph(paths)
+            except GraphValidationError as error:
+                raise RuntimeProjectionError(list(error.issues)) from error
+            _validate_source_target_paths(graph, paths)
+            runtime = build_runtime_graph(
+                graph,
+                project_root=paths.project_root,
+                lean_root=lean_root,
+            )
+            paths.verify()
+            return runtime
+    except WorkspaceError as error:
+        raise RuntimeProjectionError(list(error.issues)) from None
+
+
+def load_bound_graph(paths: RuntimePaths) -> Graph:
+    """Load a graph tied to the exact retained RuntimePaths generation."""
+
+    if paths.blueprint_identity is None or paths.roadmap_identity is None:
+        raise RuntimeProjectionError(["runtime paths are not retained"])
+    paths.verify()
+    try:
+        graph = load_graph(
+            paths.blueprint_dir,
+            _expected_blueprint_identity=paths.blueprint_identity,
+            _expected_roadmap_identity=paths.roadmap_identity,
+        )
+    except GraphValidationError:
+        paths.verify()
+        raise
+    paths.verify()
+    return graph
 
 
 def build_runtime_graph(
@@ -315,18 +587,21 @@ def build_runtime_graph(
     *,
     project_root: str | Path,
     lean_root: str | Path | None = None,
+    _lean_index: SourceIndex | None = None,
 ) -> RuntimeGraph:
     """Copy an already validated canonical graph into the runtime contract."""
 
-    project = Path(project_root).expanduser().resolve()
-    blueprint = graph.blueprint_dir.resolve()
+    project = Path(os.path.abspath(Path(project_root).expanduser()))
+    blueprint = Path(os.path.abspath(graph.blueprint_dir))
     issues: list[str] = []
     try:
         blueprint_path = blueprint.relative_to(project).as_posix()
     except ValueError:
         raise RuntimeProjectionError(["blueprint directory escapes the project root"]) from None
 
-    _reject_roadmap_symlinks(blueprint)
+    legacy_source_paths = any(graph.source_bytes(node_id) is None for node_id in graph.nodes)
+    if legacy_source_paths:
+        _reject_roadmap_symlinks(blueprint)
     node_ids = set(graph.nodes)
     article_paths: dict[str, str] = {}
     seen_article_paths: set[str] = set()
@@ -346,9 +621,15 @@ def build_runtime_graph(
             if dependency not in node_ids:
                 issues.append(f"{node.id}: dependency does not name a runtime node: {dependency}")
 
+        captured = graph.source_bytes(node.id)
         try:
-            relative_blueprint = node.path.resolve().relative_to(blueprint)
-            relative_project = node.path.resolve().relative_to(project)
+            article = (
+                Path(os.path.abspath(node.path))
+                if captured is not None
+                else node.path.resolve()
+            )
+            relative_blueprint = article.relative_to(blueprint)
+            relative_project = article.relative_to(project)
         except ValueError:
             issues.append(f"{node.id}: article path escapes the project or blueprint")
             continue
@@ -357,17 +638,26 @@ def build_runtime_graph(
             continue
         if _article_id(relative_blueprint) != node.id:
             issues.append(f"{node.id}: article path does not match its path-derived id")
-        if node.path.is_symlink():
+        if captured is None and node.path.is_symlink():
             issues.append(f"{node.id}: article path is a symbolic link")
-        try:
-            content = node.path.read_bytes()
-        except OSError:
-            issues.append(f"{node.id}: article cannot be read")
-            continue
+        content = captured
+        if content is None and node.source_sha256 is not None:
+            # Graphs deserialized from the pre-snapshot pickle format have no
+            # captured bytes. Retain their compatibility path without making
+            # normal graph loads reopen a pathname after validation.
+            try:
+                content = node.path.read_bytes()
+            except OSError:
+                issues.append(f"{node.id}: article cannot be read")
+                continue
         if node.source_sha256 is None:
             issues.append(f"{node.id}: article source digest is unavailable")
+        elif content is None:
+            issues.append(f"{node.id}: article source bytes are unavailable")
         elif hashlib.sha256(content).hexdigest() != node.source_sha256:
-            issues.append(f"{node.id}: article changed after graph load")
+            issues.append(f"{node.id}: captured article bytes do not match their digest")
+        if content is None:
+            continue
         article_path = relative_project.as_posix()
         if article_path in seen_article_paths:
             issues.append(f"{node.id}: article path is duplicated")
@@ -387,12 +677,21 @@ def build_runtime_graph(
         raise RuntimeProjectionError(issues)
 
     statuses = derive(graph)
-    lean_index = None
-    if lean_root is not None:
-        root = Path(lean_root).expanduser().resolve()
-        if not root.is_dir():
-            raise RuntimeProjectionError(["Lean root does not exist or is not a directory"])
-        lean_index = index_project(root)
+    lean_index = _lean_index
+    if lean_index is None and lean_root is not None:
+        try:
+            root = Path(lean_root).expanduser().resolve()
+            if not root.is_dir():
+                raise RuntimeProjectionError(
+                    ["Lean root does not exist or is not a directory"]
+                )
+            lean_index = index_project(root)
+        except RuntimeProjectionError:
+            raise
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeProjectionError(
+                ["Lean sources cannot be indexed safely"]
+            ) from error
 
     runtime_nodes: list[RuntimeNode] = []
     for node_id in sorted(graph.nodes):
@@ -470,15 +769,42 @@ def build_runtime_graph(
 
 def _reject_roadmap_symlinks(blueprint: Path) -> None:
     roadmap = blueprint / "roadmap"
-    if not roadmap.is_dir():
+    try:
+        roadmap_metadata = roadmap.stat(follow_symlinks=False)
+    except OSError:
         raise RuntimeProjectionError(["roadmap directory does not exist"])
-    for path in (roadmap, *sorted(roadmap.rglob("*"))):
-        if path.is_symlink():
+    if _path_is_reparse_point(roadmap, roadmap_metadata):
+        raise RuntimeProjectionError(["roadmap contains a symbolic link or reparse point: roadmap"])
+    if not stat.S_ISDIR(roadmap_metadata.st_mode):
+        raise RuntimeProjectionError(["roadmap directory does not exist"])
+    pending = [roadmap]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError:
+            raise RuntimeProjectionError(["roadmap directory cannot be inspected safely"]) from None
+        for entry in entries:
+            path = directory / entry.name
             try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError:
+                raise RuntimeProjectionError(["roadmap directory cannot be inspected safely"]) from None
+            if _path_is_reparse_point(path, metadata):
                 label = path.relative_to(blueprint).as_posix()
-            except ValueError:
-                label = "roadmap"
-            raise RuntimeProjectionError([f"roadmap contains a symbolic link: {label}"])
+                raise RuntimeProjectionError(
+                    [f"roadmap contains a symbolic link or reparse point: {label}"]
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+
+
+def _is_real_directory(path: Path) -> bool:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISDIR(metadata.st_mode) and not _path_is_reparse_point(path, metadata)
 
 
 def _ordered_union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
@@ -500,23 +826,208 @@ def _article_id(relative_blueprint: Path) -> str:
 
 
 def _source_target_is_confined(article: Path, target: str, blueprint: Path) -> bool:
-    split = urlsplit(target)
-    if split.scheme.casefold() in {"http", "https"}:
+    relative = _source_target_relative(article, target, blueprint)
+    walk = _source_target_walk(article, target, blueprint)
+    if relative is False or walk is False:
+        return False
+    if relative is None or walk is None:
         return True
+    try:
+        return not _relative_path_traverses_link_portably(blueprint, walk)
+    except OSError:
+        return False
+
+
+def _source_target_relative(
+    article: Path,
+    target: str,
+    blueprint: Path,
+) -> PurePosixPath | None | bool:
+    """Resolve a source link lexically, without consulting mutable pathnames."""
+
+    components = _source_target_walk(article, target, blueprint)
+    if components is None or components is False:
+        return components
+    parts: list[str] = []
+    for part in components.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                return False
+            parts.pop()
+            continue
+        parts.append(part)
+    return PurePosixPath(*parts)
+
+
+def _source_target_walk(
+    article: Path,
+    target: str,
+    blueprint: Path,
+) -> PurePosixPath | None | bool:
+    """Return every lexical component traversed by a local source target."""
+
+    try:
+        split = urlsplit(target)
+    except ValueError:
+        return False
+    if split.scheme.casefold() in {"http", "https"}:
+        return None
     if split.scheme or split.netloc:
         return False
     value = unquote(split.path)
     if not value:
-        return True
+        try:
+            return PurePosixPath(article.relative_to(blueprint).as_posix())
+        except ValueError:
+            return False
     path = Path(value)
     windows = PureWindowsPath(value)
-    if path.is_absolute() or windows.is_absolute():
+    if (
+        path.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or "\\" in value
+        or "\x00" in value
+    ):
         return False
     try:
-        (article.parent / path).resolve().relative_to(blueprint)
-    except (OSError, ValueError):
+        article_relative = PurePosixPath(article.relative_to(blueprint).as_posix())
+    except ValueError:
         return False
-    return True
+    return PurePosixPath(*article_relative.parent.parts, *PurePosixPath(value).parts)
+
+
+def _validate_source_target_paths(graph: Graph, paths: RuntimePaths) -> None:
+    """Reject local source targets whose selected path traverses a link."""
+
+    if not paths.strongly_bound:
+        try:
+            for node in graph.nodes.values():
+                for target in node.sources:
+                    walk = _source_target_walk(node.path, target, graph.blueprint_dir)
+                    if walk is None or walk is False:
+                        continue
+                    if _relative_path_traverses_link_portably(paths.blueprint_dir, walk):
+                        raise RuntimeProjectionError(
+                            [
+                                f"{node.id}: source target escapes the blueprint "
+                                "through a symbolic link or reparse point"
+                            ]
+                        )
+            paths.verify()
+        except OSError:
+            raise RuntimeProjectionError(["source target path changed during use"]) from None
+        return
+
+    root_descriptor = paths.duplicate_blueprint_descriptor()
+    try:
+        try:
+            for node in graph.nodes.values():
+                for target in node.sources:
+                    walk = _source_target_walk(node.path, target, graph.blueprint_dir)
+                    if walk is None or walk is False:
+                        continue
+                    if _relative_path_traverses_link(root_descriptor, walk):
+                        raise RuntimeProjectionError(
+                            [
+                                f"{node.id}: source target escapes the blueprint "
+                                "through a symbolic link"
+                            ]
+                        )
+            paths.verify()
+        except OSError:
+            raise RuntimeProjectionError(["source target path changed during use"]) from None
+    finally:
+        os.close(root_descriptor)
+
+
+def _relative_path_traverses_link_portably(
+    root: Path,
+    relative: PurePosixPath,
+) -> bool:
+    """Best-effort no-follow source validation for read-only portable clients."""
+
+    def inspect() -> tuple[bool, tuple[tuple[str, tuple[int, ...]], ...]]:
+        stack = [root]
+        observed: list[tuple[str, tuple[int, ...]]] = []
+        for index, part in enumerate(relative.parts):
+            if part == "..":
+                if len(stack) == 1:
+                    return True, tuple(observed)
+                stack.pop()
+                continue
+            current = stack[-1] / part
+            try:
+                metadata = current.stat(follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                break
+            signature = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            observed.append((current.relative_to(root).as_posix(), signature))
+            if _path_is_reparse_point(current, metadata):
+                return True, tuple(observed)
+            if index == len(relative.parts) - 1:
+                continue
+            if not stat.S_ISDIR(metadata.st_mode):
+                break
+            stack.append(current)
+        return False, tuple(observed)
+
+    first = inspect()
+    second = inspect()
+    if first != second:
+        raise OSError("source target path changed")
+    return first[0]
+
+
+def _relative_path_traverses_link(
+    root_descriptor: int,
+    relative: PurePosixPath,
+) -> bool:
+    descriptors: list[int] = []
+    observed: list[tuple[int, str, tuple[int, int, int]]] = []
+    stack = [root_descriptor]
+    try:
+        for index, part in enumerate(relative.parts):
+            if part == "..":
+                if len(stack) == 1:
+                    return True
+                stack.pop()
+                continue
+            parent = stack[-1]
+            try:
+                metadata = os.stat(part, dir_fd=parent, follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                break
+            signature = (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+            observed.append((parent, part, signature))
+            if stat.S_ISLNK(metadata.st_mode):
+                return True
+            if index == len(relative.parts) - 1 or not stat.S_ISDIR(metadata.st_mode):
+                break
+            descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent)
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_mode) != signature:
+                os.close(descriptor)
+                raise OSError("source target path changed")
+            descriptors.append(descriptor)
+            stack.append(descriptor)
+        for observed_parent, part, signature in observed:
+            current = os.stat(part, dir_fd=observed_parent, follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_mode) != signature:
+                raise OSError("source target path changed")
+        return False
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _is_portable_relative_path(value: str) -> bool:
@@ -525,6 +1036,7 @@ def _is_portable_relative_path(value: str) -> bool:
     return (
         not path.is_absolute()
         and not windows.is_absolute()
+        and not windows.drive
         and ".." not in path.parts
         and ".." not in windows.parts
     )
@@ -577,7 +1089,7 @@ def _validate_depths(graph: Graph, issues: list[str]) -> None:
 def _source_revision(article_paths: dict[str, str], article_bytes: dict[str, bytes]) -> str:
     digest = hashlib.sha256(b"autoform-runtime-source/v1\0")
     for node_id in sorted(article_paths):
-        path = article_paths[node_id].encode("utf-8")
+        path = os.fsencode(article_paths[node_id])
         content = article_bytes[node_id]
         digest.update(len(path).to_bytes(8, "big"))
         digest.update(path)
@@ -640,7 +1152,9 @@ __all__ = [
     "RuntimePaths",
     "RuntimeProjectionError",
     "RuntimeStatus",
+    "bind_runtime_paths",
     "build_runtime_graph",
+    "load_bound_graph",
     "load_runtime_graph",
     "resolve_runtime_paths",
 ]

@@ -504,12 +504,11 @@ def _inspect_git(root_descriptor: int, diagnostics: list[ProjectDiagnostic]) -> 
 
 def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]) -> AutoformProject:
     paths = {
-        "blueprint_path": ("blueprint", "directory"),
         "mkdocs_path": ("mkdocs.yml", "file"),
         "verification_workflow_path": (".github/workflows/autoform-verify.yml", "file"),
         "pages_workflow_path": (".github/workflows/blueprint-pages.yml", "file"),
     }
-    values: dict[str, str | None] = {}
+    values: dict[str, str | None] = {"blueprint_path": None}
     for field, (relative, expected) in paths.items():
         status = _relative_status(root_descriptor, relative)
         if status == "unsafe":
@@ -637,6 +636,27 @@ def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]
                             relative,
                         )
                 blueprint_paths = tuple(sorted(resolved))
+
+    if manifest_status == "missing":
+        blueprint_status = _relative_status(root_descriptor, "blueprint")
+        if blueprint_status == "unsafe":
+            _issue(
+                diagnostics,
+                "error",
+                "scaffold-path-is-symlink",
+                "An Autoform scaffold path cannot be inspected safely.",
+                "blueprint",
+            )
+        elif blueprint_status == "directory":
+            values["blueprint_path"] = "blueprint"
+        elif blueprint_status != "missing":
+            _issue(
+                diagnostics,
+                "error",
+                "scaffold-path-unexpected-type",
+                "An Autoform scaffold path is not the expected file or directory.",
+                "blueprint",
+            )
 
     workflow_count = sum(
         values[field] is not None
