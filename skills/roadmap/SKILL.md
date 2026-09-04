@@ -115,7 +115,7 @@ mathematics.
    the author's judgement and cannot be checked locally, so state what the rows
    are meant to span rather than implying the tool verified it.
 
-   Before autonomous execution, replace the exploratory v1 table with an
+   Before CLI-backed orchestration, replace the exploratory v1 table with an
    exhaustive v2 contract selected by `schema: autoform-coverage/v2`. Its
    frontmatter must name one canonical UTF-8 source
    artifact below `blueprint/sources/` and its lowercase SHA-256. Use exactly
@@ -193,7 +193,7 @@ already asked you to push.
 Report roadmap and coverage status, node and edge
 counts, the derived state summary, unresolved source questions, and the
 vault/graph paths. Return nodes that are ready to state or prove to the user or
-a separately installed execution workflow; `main` does not ship autonomous
-orchestration. Hand the draft to Agent Review for mathematical-plan judgment or Human Review
+the Orchestrate skill, which discovers work through the public CLI. Hand the
+draft to Agent Review for mathematical-plan judgment or Human Review
 for visual inspection; hand CI, Pages, Lean-project, or vault infrastructure
 changes back to Setup.

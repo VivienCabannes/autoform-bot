@@ -8,7 +8,7 @@ into a Lean 4 formalization and a readable companion site. It provides:
 - exhaustive source-unit coverage checks;
 - shared Lean LSP and REPL tools;
 - human and independent agent review workflows; and
-- claim-backed orchestration for several workers in separate Git worktrees.
+- CLI-backed work discovery and durable claims for concurrent contributors.
 
 The plugin and Python commands use the name `autoform`. The canonical repository
 is [`facebookresearch/autoform-bot`](https://github.com/facebookresearch/autoform-bot).
@@ -135,36 +135,40 @@ GitHub Pages is enabled.
 For the complete blueprint format and command flags, see the
 [CLI reference](autoform_cli/README.md).
 
-## Collaborate safely
+## Formalize ready work
 
-The Orchestrate skill assigns independent roadmap leaves to specialist agents.
-Each writer uses its own Git worktree and a fail-closed Git-ref claim:
+The Orchestrate skill uses the public CLI rather than a separate worker
+runtime. First list the statement or proof phases whose roadmap prerequisites
+are satisfied. This command also requires a complete source-unit coverage
+contract:
+
+```bash
+uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform ready . --lean-root . --json
+```
+
+Before editing an item, acquire its returned `article_id`. Each concurrent
+contributor uses a separate Git worktree and a fail-closed Git-ref claim:
 
 ```bash
 export AUTOFORM_WORKER_ID="worker-name"
-uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform claim acquire <node-id>
-uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform claim renew <node-id>
-uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform claim release <node-id>
+uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform claim acquire <article-id>
+uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform claim renew <article-id>
+uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform claim release <article-id>
 ```
 
-Use the `claim list` subcommand to inspect ownership. Workers also claim shared
-resources such as `lake-build` before using a shared build cache. A result is
-eligible for integration only after the fixed Lean and source-contract gates
-pass and an independent reviewer accepts it.
-
-The `autoform-worker` command runs one claim-backed scheduling round when a
-direct worker process is useful:
-
-```bash
-uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform-worker \
-  --project . --claim-repo <git-repository> \
-  --backend codex --model <exact-model-id>
-```
-
-Use `--workspace-project <id>` for a registered workspace project. Runs pin the
-source coverage contract, roadmap generation, toolchain, model identities, and
-candidate evidence so interrupted work can be inspected and resumed without
-silently changing inputs.
+Use the `claim list` subcommand to inspect ownership. Contributors also claim shared
+resources such as `lake-build` before using a shared build cache. The current
+host agent performs the Lean work with the bundled LSP and REPL, runs the
+focused Lake build, obtains an independent source-faithfulness and proof review,
+records the exact verified metadata, and then runs `autoform check` and
+`autoform audit` against that final state. Release the
+article claim only after the verified commit reaches the authorized shared
+branch. If an attempt is abandoned without a candidate, release it. For an
+integration failure or handoff, report the branch, commit, and claim state
+instead of making unfinished work appear available. Then call `autoform ready`
+again from the updated shared base.
+In a registered workspace, pass the same `--project <id>` to the ready, claim,
+check, and audit commands.
 
 ## Development
 

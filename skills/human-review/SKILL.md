@@ -36,6 +36,6 @@ book, progress summary, cross-chapter graph, chapter graph, then individual node
 and Lean-source links. Record each human decision as `approve`, `revise`, or
 `block`, with the exact page or node and rationale. Separate validator output
 from the person's judgment. Do not silently apply requested revisions: hand
-mathematical-plan changes to Roadmap, Lean implementation changes to the user
-or a separately installed execution workflow, and autonomous rubric scoring to
-Agent Review. `main` does not ship autonomous orchestration.
+mathematical-plan changes to Roadmap, Lean implementation changes to
+Orchestrate, and rubric scoring to Agent Review. Autoform does not ship a
+detached autonomous runner.

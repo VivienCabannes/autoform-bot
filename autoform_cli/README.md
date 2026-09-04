@@ -377,7 +377,24 @@ unit may link only to formalizable roadmap leaves. Those leaves reciprocate in
 their frontmatter with `source_units: [chapter-one]`. The immutable
 `load_execution_input` API binds this contract to the unchanged
 `autoform-runtime/v1` projection; schema-less v1 remains valid for audit and
-render but is refused for execution with `coverage-v2-required`.
+render but is refused for ready-work discovery with `coverage-v2-required`.
+
+List the formalization phases that are ready for the current agent:
+
+```bash
+autoform ready blueprint --lean-root .
+autoform ready . --project finite-flat --lean-root . --json
+```
+
+`ready` is read-only. It loads the same immutable execution input, requires
+durable `article_id` frontmatter, and returns only dispatchable formalizable
+leaves whose statement or proof prerequisites are satisfied. Its deterministic
+JSON includes the roadmap and source-contract revisions, structured blocked
+items with unmet dependency IDs, and counts for ready, blocked, and complete
+work. With local formalized progress, pass `--lean-root`; `ready` rejects
+missing or unresolved Lean targets rather than treating stale metadata as
+complete. It does not acquire a claim or edit files; use the claim commands
+below before beginning the returned item.
 
 A v2 publication excludes the entire `blueprint/sources/` authority tree, so
 renamed artifacts cannot survive an incremental render. With repository
@@ -666,13 +683,13 @@ become fences while expired durable-ID refs remain reusable.
 
 Article claims require a real graph node with materialized `article_id`
 frontmatter. Separate raw-resource keys cover coordination outside the roadmap.
-Parallel agents get one Git worktree each and serialize shared build state with
+Parallel contributors get one Git worktree each and serialize shared build state with
 `autoform claim acquire --resource lake-build`.
 
 Leases are temporary operational state; compatibility fences are persistent
-migration state. Neither belongs in article frontmatter. Future Deicyde workers
-may share this protocol, but their current continue-uncoordinated failure
-behavior must be removed before they use the canonical claim API.
+migration state. Neither belongs in article frontmatter. The Orchestrate skill
+is a thin client of `ready`, `claim`, `check`, and `audit`; there is no second
+worker scheduler or provider-specific execution service.
 
 ## Local runtime doctor
 
@@ -693,10 +710,10 @@ review. The bundled example intentionally exits nonzero while its declared
 coverage still holds `MAPPED` rows.
 
 This command is strictly read-only and local. It does not invoke Git, GitHub,
-subprocesses, network services, claims, queues, reviews, recovery state,
-providers, workers, renderers, or dashboards, and it creates no cache, scratch
+subprocesses, network services, claims, reviews, orchestration state,
+providers, renderers, or dashboards, and it creates no cache, scratch
 repository, service, state directory, or `graph.json`. It is a project/runtime
-doctor, separate from any future Deicyde fleet or machine-capability preflight.
+doctor, separate from ready-work discovery and machine-capability preflight.
 
 ## Runtime contract
 
@@ -717,12 +734,10 @@ and bytes, excluding timestamps, absolute paths, Git state, and operational
 state. Optional Lean locations come from a local lexical scan and do not by
 themselves establish compilation or proof correctness.
 
-Schema v1 retains the graph's path-derived article ID. That is suitable for
-an ephemeral runtime projection and temporary claims, but it is not yet an
-approved durable identity. Queues, reviews, recovery records, PR markers,
-dashboard routes, providers, and logs must not persist against this ID until a
-path-move identity and migration policy is defined. Those records remain private
-and excluded from runtime snapshots and publication.
+Each node retains its path-derived `id` for links and carries optional authored
+`article_id` frontmatter for identity across path moves. `autoform ready` and
+article claims require that durable identity; ordinary check, audit, render,
+and human review continue to support roadmaps while IDs are being migrated.
 
 ## Publication contract
 

@@ -34,6 +34,7 @@ from .claims import (
     workspace_author_claim_key,
 )
 from .doctor import diagnose_project
+from .execution_input import ExecutionInputError
 from .graph import ARTICLE_ID_PATTERN, GraphValidationError
 from .lean import build_linker, declaration_names
 from .project import (
@@ -46,6 +47,7 @@ from .project import (
     repair_project,
 )
 from .provenance import ProvenanceError, verify_plugin_provenance
+from .ready import READY_SCHEMA, list_ready_work
 from .render import PublicationError, render_site
 from .runtime import (
     RuntimePaths,
@@ -157,6 +159,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     doctor.add_argument("--project", help="registered workspace project id")
     doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
+    ready = subparsers.add_parser(
+        "ready", help="list formalization work whose authored prerequisites are satisfied"
+    )
+    ready.add_argument("project_or_blueprint")
+    ready.add_argument("--project", help="registered workspace project id")
+    ready.add_argument("--lean-root", type=Path, help="Lean project to bind into the execution input")
+    ready.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     project = subparsers.add_parser("project", help="inspect local project configuration and releases")
     project_subparsers = project.add_subparsers(dest="project_command", required=True)
@@ -294,6 +304,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _audit(args)
     if args.command == "doctor":
         return _doctor(args)
+    if args.command == "ready":
+        return _ready(args)
     if args.command == "project":
         return _project(args)
     if args.command == "workspace":
@@ -466,6 +478,57 @@ def _doctor(args: argparse.Namespace) -> int:
             marker = "PASS" if check.ok else "FAIL"
             print(f"{marker}: {check.name}: {check.detail}")
     return 0 if result.clean else 1
+
+
+def _ready(args: argparse.Namespace) -> int:
+    try:
+        result = list_ready_work(
+            args.project_or_blueprint,
+            lean_root=args.lean_root,
+            project_id=args.project,
+        )
+    except ExecutionInputError as error:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "blocked_items": [],
+                        "errors": [
+                            {"code": issue.code, "reason": issue.reason}
+                            for issue in error.issues
+                        ],
+                        "items": [],
+                        "schema": READY_SCHEMA,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            for issue in error.issues:
+                print(f"error: {issue.code}: {issue.reason}")
+        return 1
+    if args.json:
+        print(result.to_json())
+        return 0
+    for item in result.items:
+        print(
+            f"READY: {item.phase}: {item.article_id}: "
+            f"{item.node_id} ({item.article_path})"
+        )
+    if not result.items:
+        print("BLOCKED: no ready work" if result.blocked_items else "OK: no ready work")
+    for item in result.blocked_items:
+        dependencies = ", ".join(item.blocked_by) or "none"
+        print(
+            f"BLOCKED: {item.phase}: {item.article_id}: {item.node_id} "
+            f"({item.article_path}): {', '.join(item.reasons)}; blocked by: {dependencies}"
+        )
+    print(
+        f"    {len(result.items)} ready · {result.blocked} blocked · "
+        f"{result.complete} complete"
+    )
+    return 0
 
 
 @contextmanager

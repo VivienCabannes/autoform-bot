@@ -1,4 +1,4 @@
-"""Build the immutable input contract for autonomous Autoform execution."""
+"""Build the immutable input contract for CLI-backed Autoform work."""
 
 from __future__ import annotations
 
@@ -76,14 +76,14 @@ _EXECUTION_CONTRACT_SELECTION = TreeSelection(
 
 @dataclass(frozen=True, order=True, slots=True)
 class ExecutionInputIssue:
-    """One stable reason an execution snapshot could not be built."""
+    """One stable reason a ready-work snapshot could not be built."""
 
     code: str
     reason: str
 
 
 class ExecutionInputError(ValueError):
-    """The authored project cannot supply a safe autonomous input snapshot."""
+    """The authored project cannot supply a safe ready-work snapshot."""
 
     def __init__(self, issues: tuple[ExecutionInputIssue, ...] | list[ExecutionInputIssue]) -> None:
         self.issues = tuple(sorted(set(issues)))
@@ -135,7 +135,7 @@ class ExecutionNodeBinding:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionInput:
-    """A deterministic snapshot suitable for a durable execution ledger."""
+    """A deterministic snapshot for ready-work discovery and validation."""
 
     schema: str
     runtime: RuntimeGraph
@@ -259,7 +259,7 @@ def load_execution_input(
                     [
                         ExecutionInputIssue(
                             "strong-binding-required",
-                            "autonomous execution requires descriptor-relative filesystem support",
+                            "ready-work discovery requires descriptor-relative filesystem support",
                         )
                     ]
                 )
@@ -268,7 +268,7 @@ def load_execution_input(
                     [
                         ExecutionInputIssue(
                             "workspace-project-required",
-                            "autonomous execution requires a registered workspace project",
+                            "ready-work discovery requires a registered workspace project",
                         )
                     ]
                 )
@@ -419,7 +419,7 @@ def load_execution_input(
             [
                 ExecutionInputIssue(
                     "article-id-required",
-                    "autonomous execution requires durable article_id frontmatter on every "
+                    "ready-work discovery requires durable article_id frontmatter on every "
                     f"roadmap article; missing: {', '.join(missing_article_ids)}",
                 )
             ]
@@ -464,7 +464,7 @@ def _changed_execution_input() -> ExecutionInputError:
         [
             ExecutionInputIssue(
                 "execution-input-changed",
-                "runtime or coverage authority kept changing while the execution input was read",
+                "runtime or coverage authority kept changing while ready work was read",
             )
         ]
     )
@@ -974,7 +974,7 @@ def _require_v2_coverage(blueprint: Path) -> CoverageSummary:
             [
                 ExecutionInputIssue(
                     "coverage-v2-required",
-                    "autonomous execution requires an exhaustive autoform-coverage/v2 contract",
+                    "ready-work discovery requires an exhaustive autoform-coverage/v2 contract",
                 )
             ]
         )
@@ -985,7 +985,7 @@ def _require_v2_coverage(blueprint: Path) -> CoverageSummary:
             [
                 ExecutionInputIssue(
                     "coverage-incomplete",
-                    "autonomous execution requires a terminal coverage disposition for every "
+                    "ready-work discovery requires a terminal coverage disposition for every "
                     f"v2 source unit; {mapped_count} {subject} MAPPED",
                 )
             ]

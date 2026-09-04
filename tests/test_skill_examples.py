@@ -32,13 +32,14 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
     assert "VivienCabannes/autoform-bot" not in readme
 
 
-def test_orchestrator_requires_package_owned_candidate_gates(repo_root: Path) -> None:
+def test_orchestrator_uses_the_public_cli(repo_root: Path) -> None:
     skill = (repo_root / "skills/orchestrate/SKILL.md").read_text(encoding="utf-8")
 
-    assert "autoform_worker.gates.run_candidate_gates" in skill
-    assert "exact base" in skill
-    assert "full Lake" in skill
-    assert "Never\nexecute `.github/autoform_audit.py` from the candidate" in skill
+    assert "autoform ready" in skill
+    assert "autoform claim acquire" in skill
+    assert "autoform check" in skill
+    assert "autoform audit" in skill
+    assert "autoform_worker" not in skill
 
 
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:

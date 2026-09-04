@@ -21,7 +21,7 @@
     "defaultPrompt": [
       "Set up this Lean repository with an Autoform vault, verification CI, and GitHub Pages without planning the mathematics.",
       "Build or refine an Autoform roadmap from my mathematical sources.",
-      "Work through the ready nodes in my Autoform blueprint with claim-backed workers.",
+      "Work through ready nodes using the Autoform CLI and durable claims.",
       "Prepare the visual blueprint surfaces so I can review this formalization.",
       "Judge this roadmap or Lean formalization with evidence-based review rubrics.",
       "Develop Autoform itself through its executable formalization example."
