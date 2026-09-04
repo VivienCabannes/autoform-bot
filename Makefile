@@ -22,7 +22,7 @@ test-real-lean:
 	$(PYTEST) -m real_lean
 
 lint:
-	uv run ruff check autoform_cli servers tests
+	uv run ruff check autoform_cli autoform_worker servers tests
 
 check-example:
 	uv run autoform check $(THESIS_EXAMPLE)/blueprint --lean-root $(THESIS_EXAMPLE)
