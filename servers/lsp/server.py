@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -19,7 +20,7 @@ from typing import Any
 
 from fastmcp.server import FastMCP
 
-from servers import resolve_lean_project_dir
+from servers import clean_lake_environment, resolve_lean_project_dir
 from servers.lean_client import LeanRuntimeClient
 
 logger = getLogger(__name__)
@@ -27,6 +28,8 @@ logger = getLogger(__name__)
 DEFAULT_LSP_TIMEOUT = 60
 MAX_LSP_HEADER_BYTES = 16 * 1024
 MAX_LSP_MESSAGE_BYTES = 16 * 1024 * 1024
+LSP_ABORT_TERM_SECONDS = 0.5
+LSP_ABORT_KILL_SECONDS = 1.0
 
 
 class LspProtocolError(RuntimeError):
@@ -52,8 +55,10 @@ class LeanLspSession:
     def __init__(self, config: LspConfig) -> None:
         self.config = config
         self.process: subprocess.Popen | None = None
+        self._process_group_id: int | None = None
         self._request_id = 0
         self._lock = threading.Lock()
+        self._poisoned = False
         # A session has one stdout stream. Serialize the complete document
         # lifecycle so concurrent MCP calls cannot race two readers against
         # that stream or consume one another's diagnostics/responses.
@@ -61,16 +66,19 @@ class LeanLspSession:
 
     def start(self) -> None:
         """Start the language server process."""
-        env = os.environ.copy()
-        env.pop("PYTHONPATH", None)
+        env = clean_lake_environment()
 
         self.process = subprocess.Popen(
             self.config.lake_command,
             cwd=self.config.cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env=env,
+            start_new_session=True,
         )
+        self._process_group_id = self.process.pid
+        self._poisoned = False
 
         try:
             # An initialize response must be an InitializeResult object. A
@@ -95,25 +103,60 @@ class LeanLspSession:
 
     def _abort_process(self) -> None:
         """Force-close the backing process without attempting more JSON-RPC."""
+        self._poisoned = True
         process, self.process = self.process, None
-        if process is None or process.poll() is not None:
+        process_group_id, self._process_group_id = self._process_group_id, None
+        if process is None:
             return
+        process_group_id = process_group_id or process.pid
         try:
-            process.kill()
-            process.wait(timeout=5)
-        except Exception:
+            # Signal before polling or waiting. Reaping an exited group leader
+            # would release its PID while descendants can still own the PGID.
+            os.killpg(process_group_id, signal.SIGTERM)
+        except (AttributeError, OSError):
+            try:
+                process.terminate()
+            except (AttributeError, OSError):
+                try:
+                    process.kill()
+                except OSError:
+                    return
+        parent_reaped = False
+        try:
+            process.wait(timeout=LSP_ABORT_TERM_SECONDS)
+            parent_reaped = True
+        except (OSError, subprocess.TimeoutExpired):
             pass
+        # The wrapper may exit on SIGTERM while a descendant ignores it. Signal
+        # the whole group again before considering the abort complete.
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except (AttributeError, OSError):
+            try:
+                process.kill()
+            except OSError:
+                return
+        if not parent_reaped:
+            try:
+                process.wait(timeout=LSP_ABORT_KILL_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning("timed out reaping an aborted Lean LSP process")
 
     def close(self) -> None:
         """Shut down the language server."""
-        if self.process and self.process.poll() is None:
+        if self.process:
             try:
                 self._send_request("shutdown", {})
                 self._send_notification("exit", {})
                 self.process.wait(timeout=5)
             except Exception:
+                pass
+            finally:
+                # A wrapper can exit while a server descendant remains. Always
+                # finish by clearing the process group, even after graceful RPC.
                 self._abort_process()
-        self.process = None
+        else:
+            self._poisoned = True
 
     def abort(self) -> None:
         """Discard a protocol stream that can no longer be shared safely."""
@@ -121,7 +164,8 @@ class LeanLspSession:
 
     def is_alive(self) -> bool:
         """Return whether the cached language-server child can accept work."""
-        return self.process is not None and self.process.poll() is None
+        process = self.process
+        return process is not None and not self._poisoned and process.poll() is None
 
     def get_diagnostics(self, file_path: str) -> list[dict]:
         """Open a file and collect diagnostics from the language server."""
@@ -136,7 +180,16 @@ class LeanLspSession:
                 raise LspBusyError(
                     f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
                 )
-            return self._get_diagnostics(file_path, timeout=remaining)
+            if self._poisoned:
+                raise LspProtocolError("Lean LSP session is no longer usable")
+            try:
+                return self._get_diagnostics(file_path, timeout=remaining)
+            except (LspProtocolError, TimeoutError, OSError):
+                # Poison the stream before releasing the operation lock. A queued
+                # waiter must not perform protocol I/O after a partial frame or
+                # timed-out request made the shared stream ambiguous.
+                self._abort_process()
+                raise
         finally:
             self._operation_lock.release()
 
@@ -181,7 +234,13 @@ class LeanLspSession:
                         {"textDocument": {"uri": uri}},
                         timeout=remaining,
                     )
+                else:
+                    # Leaving a document open makes the shared server state
+                    # ambiguous for the next caller. Poison it while this
+                    # operation still owns the session lock.
+                    self._abort_process()
             except Exception:
+                self._abort_process()
                 logger.warning("failed to close LSP document %s", uri, exc_info=True)
 
     def hover(self, file_path: str, line: int, character: int) -> str | None:
@@ -197,7 +256,13 @@ class LeanLspSession:
                 raise LspBusyError(
                     f"timed out after {self.config.timeout:g}s waiting for the Lean LSP session"
                 )
-            return self._hover(file_path, line, character, timeout=remaining)
+            if self._poisoned:
+                raise LspProtocolError("Lean LSP session is no longer usable")
+            try:
+                return self._hover(file_path, line, character, timeout=remaining)
+            except (LspProtocolError, TimeoutError, OSError):
+                self._abort_process()
+                raise
         finally:
             self._operation_lock.release()
 
@@ -243,12 +308,26 @@ class LeanLspSession:
                         {"textDocument": {"uri": uri}},
                         timeout=remaining,
                     )
+                else:
+                    self._abort_process()
             except Exception:
+                self._abort_process()
                 logger.warning("failed to close LSP document %s", uri, exc_info=True)
+        if result is not None and not isinstance(result, dict):
+            raise LspProtocolError(
+                f"LSP hover returned a non-object result: {result!r}"
+            )
+        if result is not None and "contents" not in result:
+            raise LspProtocolError("LSP hover result is missing contents")
         if result and "contents" in result:
             contents = result["contents"]
             if isinstance(contents, dict):
-                return contents.get("value", "")
+                value = contents.get("value")
+                if not isinstance(value, str):
+                    raise LspProtocolError(
+                        "LSP hover contents.value must be a string"
+                    )
+                return value
             return str(contents)
         return None
 
@@ -287,7 +366,7 @@ class LeanLspSession:
     def _write_message(self, msg: dict, *, timeout: float = 30) -> None:
         """Write a bounded JSON-RPC message without blocking past timeout."""
         if not self.process or not self.process.stdin:
-            raise RuntimeError("LSP process not running")
+            raise LspProtocolError("LSP process not running")
         body = json.dumps(msg).encode("utf-8")
         if len(body) > MAX_LSP_MESSAGE_BYTES:
             raise LspProtocolError(
@@ -487,6 +566,36 @@ class LeanLspSession:
                     raise LspProtocolError(
                         "publishDiagnostics diagnostics must be a list"
                     )
+                for diagnostic in published:
+                    if not isinstance(diagnostic, dict):
+                        raise LspProtocolError(
+                            "publishDiagnostics entries must be objects"
+                        )
+                    range_value = diagnostic.get("range", {})
+                    if not isinstance(range_value, dict):
+                        raise LspProtocolError(
+                            "publishDiagnostics range must be an object"
+                        )
+                    start = range_value.get("start", {})
+                    if not isinstance(start, dict):
+                        raise LspProtocolError(
+                            "publishDiagnostics range.start must be an object"
+                        )
+                    for name in ("line", "character"):
+                        value = start.get(name, 0)
+                        if isinstance(value, bool) or not isinstance(value, int):
+                            raise LspProtocolError(
+                                f"publishDiagnostics range.start.{name} must be an integer"
+                            )
+                    severity = diagnostic.get("severity", 0)
+                    if isinstance(severity, bool) or not isinstance(severity, int):
+                        raise LspProtocolError(
+                            "publishDiagnostics severity must be an integer"
+                        )
+                    if not isinstance(diagnostic.get("message", ""), str):
+                        raise LspProtocolError(
+                            "publishDiagnostics message must be a string"
+                        )
                 if params.get("uri") == uri:
                     received = True
                     diagnostics = published

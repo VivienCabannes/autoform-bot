@@ -235,6 +235,7 @@ def _run(project: Path, *command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=project, capture_output=True, text=True, timeout=180)
 
 
+@pytest.mark.real_lean
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
 def test_real_toml_build_uses_target_src_dir_globs_and_import_closure(
     helper: ModuleType, tmp_path: Path
@@ -292,6 +293,7 @@ srcDir = "app-src"
     assert audited.returncode == 0, audited.stdout + audited.stderr
 
 
+@pytest.mark.real_lean
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
 def test_root_package_clean_excludes_stale_custom_artifacts(
     helper: ModuleType, tmp_path: Path
@@ -329,6 +331,7 @@ lean_lib «Fresh»
     assert helper.modules_from_archive(archive, "StaleFixture") == ("Fresh",)
 
 
+@pytest.mark.real_lean
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
 def test_real_lean_manifest_supports_custom_build_dir(helper: ModuleType, tmp_path: Path) -> None:
     dependency = tmp_path / "dependency"

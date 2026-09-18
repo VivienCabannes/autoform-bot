@@ -10,18 +10,25 @@ import json
 import os
 import random
 import select
+import signal
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from logging import getLogger
+from pathlib import Path
 from typing import Any, Callable
+
+from servers import ProjectFingerprint, clean_lake_environment, lean_project_fingerprint
 
 logger = getLogger(__name__)
 
 DEFAULT_MAX_DIAGNOSTICS = 10
 DEFAULT_SMOKE_TEST_TIMEOUT = 10
 DEFAULT_REPL_STARTUP_TIMEOUT = 180.0
+REPL_ABORT_TERM_SECONDS = 0.5
+REPL_ABORT_KILL_SECONDS = 1.0
 
 ALLOWED_IMPORTS = frozenset({"Mathlib", "Aesop", "Batteries", "LeanSearchClient"})
 WARMUP_IMPORTS = frozenset({"Mathlib"})
@@ -52,8 +59,42 @@ def _get_process_memory_gb(process: subprocess.Popen | None) -> float:
         return 0.0
 
 
-def _kill_subprocesses(process: subprocess.Popen) -> None:
+def _kill_subprocesses(
+    process: subprocess.Popen,
+    process_group_id: int | None = None,
+) -> None:
     """Kill a process and all its children."""
+    if process_group_id is not None:
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except (AttributeError, OSError):
+            try:
+                process.terminate()
+            except (AttributeError, OSError):
+                try:
+                    process.kill()
+                except (AttributeError, OSError):
+                    return
+        parent_reaped = False
+        try:
+            process.wait(timeout=REPL_ABORT_TERM_SECONDS)
+            parent_reaped = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except (AttributeError, OSError):
+            try:
+                process.kill()
+            except (AttributeError, OSError):
+                return
+        if not parent_reaped:
+            try:
+                process.wait(timeout=REPL_ABORT_KILL_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning("timed out reaping an aborted Lean REPL process")
+        return
+
     try:
         import psutil
 
@@ -75,10 +116,8 @@ def _kill_subprocesses(process: subprocess.Popen) -> None:
 
 
 def _inherit_clean_env() -> dict[str, str]:
-    """Return a copy of the current environment without PYTHONPATH noise."""
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    return env
+    """Return the host environment without ambient Python or Lean paths."""
+    return clean_lake_environment()
 
 
 def _is_natural_number(value: Any) -> bool:
@@ -403,7 +442,9 @@ class LeanRepl:
     def __init__(self, config: LeanReplConfig) -> None:
         self.config = config
         self.cwd = config.cwd
+        self._project_identity = Path(config.cwd).resolve()
         self.process: subprocess.Popen | None = None
+        self._process_group_id: int | None = None
 
         self.request_timeout = config.request_timeout
         self.max_retries = config.max_retries
@@ -414,6 +455,8 @@ class LeanRepl:
         self.mem_limit_gb: int = config.instance_mem_limit_gb
 
         self._process_lock = threading.Lock()
+        self._request_deadline: float | None = None
+        self._project_fingerprint: ProjectFingerprint | None = None
         # stderr has no command boundary. Account for it monotonically across one
         # process generation and retain only a bounded tail for diagnostics.
         self._stderr_bytes = 0
@@ -425,11 +468,14 @@ class LeanRepl:
 
     def start(self, startup_timeout: float | None = None) -> None:
         """Start and warm the Lean REPL within one startup deadline."""
+        self._project_fingerprint = None
         timeout = self.config.startup_timeout if startup_timeout is None else min(
             self.config.startup_timeout,
             startup_timeout,
         )
         deadline = time.monotonic() + timeout
+        if self._request_deadline is not None:
+            deadline = min(deadline, self._request_deadline)
 
         def remaining() -> float:
             value = deadline - time.monotonic()
@@ -439,6 +485,8 @@ class LeanRepl:
 
         env = _inherit_clean_env()
         env.update(self.config.env)
+        startup_fingerprint = lean_project_fingerprint(self._project_identity)
+        remaining()
 
         self.process = subprocess.Popen(
             self.config.repl_command,
@@ -447,7 +495,9 @@ class LeanRepl:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            start_new_session=True,
         )
+        self._process_group_id = self.process.pid
         self._stderr_bytes = 0
         self._stderr_tail.clear()
 
@@ -488,25 +538,36 @@ class LeanRepl:
                     raise RuntimeError(
                         f"REPL smoke test failed — LEAN_PATH may be misconfigured. Errors: {error_details}"
                     )
+            remaining()
+            if lean_project_fingerprint(self._project_identity) != startup_fingerprint:
+                raise RuntimeError("Lean project changed during REPL startup")
+            self._project_fingerprint = startup_fingerprint
         except Exception:
             self.close()
             raise
 
     def close(self) -> None:
         """Close the Lean REPL process."""
+        process, self.process = self.process, None
+        process_group_id, self._process_group_id = self._process_group_id, None
         try:
-            if not self.process or self.process.poll() is not None:
-                return
-            _kill_subprocesses(self.process)
+            if process is not None:
+                _kill_subprocesses(process, process_group_id)
         finally:
-            self.process = None
             self._base_env_id = None
+            self._project_fingerprint = None
             self._stderr_bytes = 0
             self._stderr_tail.clear()
 
     def restart(self, timeout: float | None = None) -> None:
         """Restart the Lean REPL process within an optional total timeout."""
         deadline = time.monotonic() + timeout if timeout is not None else None
+        if self._request_deadline is not None:
+            deadline = (
+                self._request_deadline
+                if deadline is None
+                else min(deadline, self._request_deadline)
+            )
         self.close()
         if deadline is None:
             self.start()
@@ -524,15 +585,31 @@ class LeanRepl:
         """Return memory usage in GB."""
         return _get_process_memory_gb(self.process)
 
-    def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
+    def run(
+        self,
+        code: str,
+        env_id: int | None = None,
+        timeout: float | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Send code to the REPL within one deadline across recovery attempts."""
+        if deadline is not None and timeout is not None:
+            raise TypeError("pass timeout or deadline, not both")
+        absolute_deadline = deadline is not None
         timeout = self.request_timeout if timeout is None else timeout
-        deadline = time.monotonic() + timeout
+        if deadline is None:
+            deadline = time.monotonic() + timeout
+
+        def deadline_error() -> TimeoutError:
+            if absolute_deadline:
+                return TimeoutError("REPL command deadline exceeded")
+            return TimeoutError(f"REPL command timed out after {timeout:g} seconds")
 
         def remaining() -> float:
             value = deadline - time.monotonic()
             if value <= 0:
-                raise TimeoutError(f"REPL command timed out after {timeout:g} seconds")
+                raise deadline_error()
             return value
 
         run_from_env = env_id is not None
@@ -554,7 +631,7 @@ class LeanRepl:
                     }
 
         last_exception: Exception | None = None
-        with self._process_lock:
+        with self._process_lock, self._deadline_scope(deadline):
             if run_from_env and not self.is_alive():
                 self.close()
                 raise ReplProcessRestarted(
@@ -566,6 +643,7 @@ class LeanRepl:
                 if not self.is_alive():
                     self.restart(timeout=remaining())
                 self._check_memory_and_maybe_restart(timeout=remaining())
+                self._assert_project_current(deadline)
             except (TimeoutError, RuntimeError) as error:
                 self.close()
                 if run_from_env:
@@ -579,47 +657,39 @@ class LeanRepl:
 
             for i in range(max_retries + 1):
                 try:
+                    self._assert_project_current(deadline)
+                    dispatch_fingerprint = self._project_fingerprint
+                    if dispatch_fingerprint is None:
+                        raise RuntimeError("Lean project fingerprint is unavailable")
                     dispatch_env_id = env_id if run_from_env else self._base_env_id
-                    resp = self._run(
-                        code=code,
-                        env_id=dispatch_env_id,
-                        timeout=remaining(),
+                    backlog: ReplStderrBacklog | None = None
+                    try:
+                        resp = self._run(
+                            code=code,
+                            env_id=dispatch_env_id,
+                            timeout=remaining(),
+                        )
+                    except ReplStderrBacklog as error:
+                        logger.error("%s", error)
+                        self.close()
+                        backlog = error
+                        resp = error.response
+                    self._assert_project_unchanged_after_dispatch(
+                        deadline,
+                        dispatch_fingerprint,
+                        allow_expired=backlog is not None,
                     )
+                    if backlog is not None and run_from_env:
+                        raise ReplProcessRestarted(str(backlog)) from backlog
                     _validate_command_response(
                         resp,
                         context="the requested command",
                         require_environment=True,
                     )
+                    if backlog is not None:
+                        resp = _without_process_handles(resp)
                     _adjust_line_numbers(resp, header_line_count)
                     return resp
-                except ReplStderrBacklog as e:
-                    # _run() already retired the process, so nothing can inherit the
-                    # undrained stderr; close() here is an idempotent assertion of
-                    # that. The response is valid, so a plain request still receives
-                    # it. An env-scoped request cannot transparently outlive the
-                    # process that held its environment, so it is told loudly.
-                    logger.error("%s", e)
-                    self.close()
-                    if run_from_env:
-                        raise ReplProcessRestarted(str(e)) from e
-                    try:
-                        _validate_command_response(
-                            e.response,
-                            context="the requested command",
-                            require_environment=True,
-                        )
-                    except ReplCommandError as error:
-                        return {"repl_error": str(error)}
-                    except ReplProtocolError as error:
-                        return {
-                            "repl_error": str(error),
-                            "outcome_unknown": True,
-                        }
-                    # The command's diagnostics remain valid, but any environment
-                    # identifier belongs to the process _run() just retired.
-                    response = _without_process_handles(e.response)
-                    _adjust_line_numbers(response, header_line_count)
-                    return response
                 except ReplOutcomeUnknown as e:
                     # The request was fully written, so replay could execute it
                     # twice. Retire the process and report the unknown outcome
@@ -656,9 +726,7 @@ class LeanRepl:
                 backoff = min(2**i, 30) + random.uniform(0, 1)
                 try:
                     if backoff >= remaining():
-                        raise TimeoutError(
-                            f"REPL command timed out after {timeout:g} seconds"
-                        )
+                        raise deadline_error()
                     time.sleep(backoff)
                     self.restart(timeout=remaining())
                 except (TimeoutError, RuntimeError) as error:
@@ -667,6 +735,50 @@ class LeanRepl:
                     break
             logger.error("Exceeded maximum retries for Lean REPL command")
             return {"repl_error": str(last_exception)}
+
+    def _assert_project_current(self, deadline: float) -> None:
+        """Reject a worker whose project changed after process startup."""
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError("REPL command deadline exceeded")
+        try:
+            current = lean_project_fingerprint(self._project_identity)
+        except OSError as error:
+            self.close()
+            raise RuntimeError("Lean project changed after REPL startup") from error
+        if self._project_fingerprint != current:
+            self.close()
+            raise RuntimeError("Lean project changed after REPL startup")
+
+    def _assert_project_unchanged_after_dispatch(
+        self,
+        deadline: float,
+        expected: ProjectFingerprint,
+        *,
+        allow_expired: bool = False,
+    ) -> None:
+        """Reject every response if its project generation changed in flight."""
+
+        try:
+            if not allow_expired and deadline - time.monotonic() <= 0:
+                raise TimeoutError("REPL command deadline exceeded")
+            current = lean_project_fingerprint(self._project_identity)
+            if current != expected:
+                raise RuntimeError("Lean project changed after REPL dispatch")
+        except (OSError, TimeoutError, RuntimeError) as error:
+            self.close()
+            raise ReplOutcomeUnknown(
+                "Lean project freshness changed while the requested command was "
+                "executing; its outcome is unknown"
+            ) from error
+
+    @contextmanager
+    def _deadline_scope(self, deadline: float):
+        previous = self._request_deadline
+        self._request_deadline = deadline
+        try:
+            yield
+        finally:
+            self._request_deadline = previous
 
     def _check_memory_and_maybe_restart(self, timeout: float | None = None) -> None:
         """Proactively restart if memory usage is near the limit."""
@@ -728,6 +840,8 @@ class LeanRepl:
             raise ReplProcessExited("REPL process is not running.")
 
         end_time = time.monotonic() + timeout
+        if self._request_deadline is not None:
+            end_time = min(end_time, self._request_deadline)
         stdin_fd = self.process.stdin.fileno()
         stdout_fd = self.process.stdout.fileno()
         stderr_fd = self.process.stderr.fileno()

@@ -1,4 +1,4 @@
-.PHONY: setup test lint check-example
+.PHONY: setup test test-real-lean lint check-example
 
 THESIS_EXAMPLE := skills/setup/assets/cabannes-thesis-project
 
@@ -6,7 +6,10 @@ setup:
 	uv sync --extra dev --extra repl
 
 test:
-	uv run pytest -q
+	uv run pytest -q -m "not real_lean"
+
+test-real-lean:
+	uv run pytest -q -m real_lean
 
 lint:
 	uv run ruff check autoform_cli servers tests

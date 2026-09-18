@@ -36,5 +36,7 @@ uid-specific directory in `/tmp`; the rotating runtime log is beside it.
 by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
 `AUTOFORM_MAX_LEAN_PROJECTS`, and `AUTOFORM_LEAN_IDLE_SECONDS`. The first
 process to start the runtime supplies those settings until it is stopped.
-`AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` can raise the client/daemon response budget
-when unusually large worker pools need more than the default 15 minutes to warm.
+`AUTOFORM_REPL_REQUEST_TIMEOUT` sets the default end-to-end REPL call budget
+(180 seconds), bounded by `AUTOFORM_MAX_REPL_REQUEST_SECONDS`. The client-side
+`AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` must remain above the node-wide request
+limits.
