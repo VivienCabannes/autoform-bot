@@ -44,16 +44,18 @@ manifest is included, but Muse installation is not covered here.
 
 ## Quick start
 
-Work from an existing Lean repository. First scaffold the blueprint and site
-configuration from an Autoform checkout:
+Work from an existing Lean repository. Verify the Autoform checkout, then
+scaffold the blueprint and site configuration:
 
 ```bash
-uv run autoform init /path/to/lean-project \
-  --autoform-ref <full-commit-sha>
+uv run autoform project provenance --json
+uv run autoform init /path/to/lean-project
 ```
 
 This creates `blueprint/`, `mkdocs.yml`, and `requirements-docs.txt`. GitHub
-workflows are created only when Autoform has an immutable commit pin. The Setup
+workflows are created only when Autoform has a verified immutable source and
+commit. To override discovery, pass both `--autoform-source` and
+`--autoform-ref`; a ref alone is resolved against the canonical repository. The Setup
 skill can inspect and repair this infrastructure, but its new-project Lean
 bootstrap helper is not packaged on `main`; start from an existing Lean project
 and use `autoform init` for the blueprint and publication files.
