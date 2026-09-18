@@ -97,6 +97,7 @@ dependencies = [
     { name = "markdown" },
     { name = "psutil" },
     { name = "pymdown-extensions" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -122,6 +123,7 @@ requires-dist = [
     { name = "pymdown-extensions", marker = "extra == 'dev'", specifier = ">=11.0.1,<12" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
 ]
 provides-extras = ["repl", "dev"]
 
