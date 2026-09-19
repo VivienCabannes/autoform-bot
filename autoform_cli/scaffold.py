@@ -154,6 +154,7 @@ def scaffold_project(
     autoform_source: str = "",
     autoform_ref: str = "",
     force: bool = False,
+    discover_plugin_pin: bool = True,
 ) -> ScaffoldResult:
     """Write the blueprint vault, site config, and CI into *target*.
 
@@ -195,7 +196,9 @@ def scaffold_project(
         raise ScaffoldError(issues)
 
     pinned_source, pinned_ref = (
-        ("", "") if given_source or given_ref else plugin_pin()
+        plugin_pin()
+        if discover_plugin_pin and not (given_source or given_ref)
+        else ("", "")
     )
     safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
     if safe_pinned_source is None or not _FULL_SHA.fullmatch(pinned_ref.lower()):

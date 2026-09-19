@@ -130,14 +130,27 @@ pair, pass both `--autoform-source <https-git-url>` and `--autoform-ref <sha>`.
 A ref supplied alone is resolved against the canonical repository. Use
 `--force` to overwrite and `--json` for machine-readable output.
 
-Inspect a Lean project and list Autoform's bundled known-good release pairs:
+Create or inspect a Lean project and list Autoform's bundled known-good release pairs:
 
 ```bash
+autoform project versions
+autoform project new ./FiniteFlat \
+  --package FiniteFlat \
+  --release lean-v4.32.2-mathlib-v4.32.2
 autoform project inspect .
 autoform project inspect path/inside/project --json
 autoform project versions --json
 autoform project provenance --json
 ```
+
+`project new` requires an absent target and an explicit release ID. It builds a
+complete Lean shell, blueprint, and site in a private sibling directory,
+validates the staged project, then publishes the directory with an atomic
+no-replace rename. It never overwrites an existing path. Failed and concurrent
+creations leave no partial target, and exactly one concurrent creator can win.
+The command does not run Git, Lake, Lean, subprocesses, or network operations.
+Generated workflows are omitted unless creation can use an explicit immutable
+Autoform pin in a future interface; the local project remains complete.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and

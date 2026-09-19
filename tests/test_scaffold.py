@@ -69,6 +69,14 @@ def test_scaffold_writes_the_whole_vault(tmp_path: Path) -> None:
         assert (tmp_path / relative).is_file(), relative
 
 
+def test_init_does_not_create_a_lean_project_shell(tmp_path: Path) -> None:
+    scaffold_project(tmp_path, title="Finite Flat")
+
+    assert not (tmp_path / "lakefile.toml").exists()
+    assert not (tmp_path / "lean-toolchain").exists()
+    assert not (tmp_path / "src/FiniteFlat.lean").exists()
+
+
 def test_scaffolded_vault_validates_immediately(tmp_path: Path) -> None:
     """A fresh project must pass `autoform check` before any mathematics."""
 

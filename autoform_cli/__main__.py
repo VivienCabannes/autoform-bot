@@ -19,7 +19,13 @@ from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_k
 from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
-from .project import ProjectCatalogError, inspect_project, load_release_catalog
+from .project import (
+    ProjectCatalogError,
+    ProjectCreateError,
+    create_project,
+    inspect_project,
+    load_release_catalog,
+)
 from .provenance import ProvenanceError, verify_plugin_provenance
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
@@ -66,6 +72,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     project = subparsers.add_parser("project", help="inspect local project configuration and releases")
     project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_new = project_subparsers.add_parser(
+        "new", help="atomically create a complete Lean and Autoform project"
+    )
+    project_new.add_argument(
+        "target", nargs="?", help="new project directory; it must not exist"
+    )
+    project_new.add_argument("--package", help="UpperCamelCase Lean package name")
+    project_new.add_argument("--release", help="release id from 'project versions'")
+    project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_inspect = project_subparsers.add_parser(
         "inspect", help="inspect a project without running Lake, Git, or network operations"
     )
@@ -269,6 +284,15 @@ def _doctor(args: argparse.Namespace) -> int:
 
 def _project(args: argparse.Namespace) -> int:
     try:
+        if args.project_command == "new":
+            result = create_project(args.target, package=args.package, release_id=args.release)
+            if args.json:
+                print(result.to_json())
+            else:
+                print(f"Created {result.package} at {result.target} ({result.release})")
+                if not result.workflows_pinned:
+                    print("warning: workflows were omitted because no immutable Autoform pin was available")
+            return 0
         if args.project_command == "inspect":
             result = inspect_project(args.target)
             if args.json:
@@ -296,6 +320,12 @@ def _project(args: argparse.Namespace) -> int:
                 print(f"Source: {result.source}")
                 print(f"Revision: {result.revision}")
             return 0
+    except ProjectCreateError as error:
+        if getattr(args, "json", False):
+            print(error.to_json())
+        else:
+            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+        return 1
     except ProjectCatalogError:
         if getattr(args, "json", False):
             print(
