@@ -27,6 +27,7 @@ class LeanReplPoolConfig(LeanReplConfig):
     startup_stagger: float = DEFAULT_STARTUP_STAGGER_SECONDS
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.num_repls is None:
             try:
                 import psutil

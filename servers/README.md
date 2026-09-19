@@ -34,13 +34,16 @@ The private socket lives below `$XDG_RUNTIME_DIR/autoform`, falling back to a
 uid-specific directory in `/tmp`; the rotating runtime log is beside it.
 `AUTOFORM_RUNTIME_DIR` overrides that location. Node-wide limits are controlled
 by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
-`AUTOFORM_MAX_LEAN_PROJECTS`, and `AUTOFORM_LEAN_IDLE_SECONDS`. The first
-process to start the runtime supplies those settings until it is stopped.
+`AUTOFORM_REPL_MAX_CONTEXTS_PER_PROCESS`, `AUTOFORM_MAX_LEAN_PROJECTS`, and
+`AUTOFORM_LEAN_IDLE_SECONDS`. Each worker retains at most one structured-import
+environment and restarts when its context budget, 256 by default, is reached.
+The first process to start the runtime supplies those settings until it is
+stopped.
 `AUTOFORM_REPL_REQUEST_TIMEOUT` sets the default end-to-end REPL call budget
 (180 seconds), bounded by `AUTOFORM_MAX_REPL_REQUEST_SECONDS`. The client-side
 `AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` must remain above the node-wide request
 limits.
 
 `run_lean_code` accepts an optional ordered `imports` list for project modules
-that Lake has already built. Nonempty lists are validated against the project,
-executed in a fresh REPL process, and retired after that request.
+that Lake has already built. Nonempty lists are validated against the project;
+each worker reuses only an exact, still-current import environment.

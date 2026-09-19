@@ -52,7 +52,7 @@ from servers.lsp.server import (
     LspProtocolError,
     format_lsp_diagnostics,
 )
-from servers.repl.core import format_repl_response
+from servers.repl.core import DEFAULT_MAX_CONTEXTS_PER_PROCESS, format_repl_response
 from servers.repl.imports import (
     require_no_source_imports,
     resolve_project_imports,
@@ -143,6 +143,7 @@ class LeanRuntimeConfig:
     total_repl_workers: int
     repl_workers_per_project: int
     repl_project_limit: int
+    repl_max_contexts_per_process: int
     repl_command: tuple[str, ...]
     lsp_command: tuple[str, ...]
     lsp_timeout: float
@@ -182,6 +183,14 @@ class LeanRuntimeConfig:
                 "AUTOFORM_REPL_TOTAL_WORKERS"
             )
         repl_project_limit = min(max_projects, total_workers // workers_per_project)
+        repl_max_contexts = _positive_int(
+            "AUTOFORM_REPL_MAX_CONTEXTS_PER_PROCESS",
+            DEFAULT_MAX_CONTEXTS_PER_PROCESS,
+        )
+        if repl_max_contexts < 3:
+            raise ValueError(
+                "AUTOFORM_REPL_MAX_CONTEXTS_PER_PROCESS must be at least 3"
+            )
         repl_command = tuple(shlex.split(os.environ.get("LEAN_REPL_CMD", "lake exe repl")))
         lsp_command = tuple(shlex.split(os.environ.get("LEAN_LSP_CMD", "lake serve")))
         if not repl_command:
@@ -238,6 +247,7 @@ class LeanRuntimeConfig:
             total_repl_workers=total_workers,
             repl_workers_per_project=workers_per_project,
             repl_project_limit=max(1, repl_project_limit),
+            repl_max_contexts_per_process=repl_max_contexts,
             repl_command=repl_command,
             lsp_command=lsp_command,
             lsp_timeout=lsp_timeout,
@@ -262,6 +272,7 @@ class LeanRuntimeConfig:
             "total_repl_workers": self.total_repl_workers,
             "repl_workers_per_project": self.repl_workers_per_project,
             "repl_project_limit": self.repl_project_limit,
+            "repl_max_contexts_per_process": self.repl_max_contexts_per_process,
             "repl_command": list(self.repl_command),
             "lsp_command": list(self.lsp_command),
             "lsp_timeout": self.lsp_timeout,
@@ -966,6 +977,9 @@ class LeanRuntimeServices:
                     repl_command=list(self.config.repl_command),
                     num_repls=self.config.repl_workers_per_project,
                     max_retries=0,
+                    max_contexts_per_process=(
+                        self.config.repl_max_contexts_per_process
+                    ),
                 )
             )
 

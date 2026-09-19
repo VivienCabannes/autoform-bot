@@ -4,11 +4,115 @@ from __future__ import annotations
 
 import os
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from servers.repl import core as repl_core
 from servers.repl import pool as repl_pool
+
+
+def test_pool_config_runs_base_context_limit_validation():
+    with pytest.raises(ValueError, match="positive integer"):
+        repl_pool.LeanReplPoolConfig(
+            max_contexts_per_process=True,
+            num_repls=1,
+        )
+    with pytest.raises(ValueError, match="too small"):
+        repl_pool.LeanReplPoolConfig(
+            max_contexts_per_process=2,
+            num_repls=1,
+        )
+    config = repl_pool.LeanReplPoolConfig(
+        warmup_imports=frozenset(),
+        max_contexts_per_process=2,
+        num_repls=1,
+    )
+    assert config.max_contexts_per_process == 2
+
+
+def test_counted_run_counts_environments_and_unique_proof_states(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    responses = iter(
+        [
+            {
+                "env": 12,
+                "proofState": 4,
+                "messages": [],
+                "sorries": [
+                    {"proofState": 2},
+                    {"proofState": 3},
+                    {"proofState": 3},
+                    {"proofState": None},
+                ],
+                "tactics": [{"proofState": 5}, {"proofState": 2}],
+            },
+            {"env": True, "messages": []},
+            {"env": -1, "messages": []},
+            {"env": "13", "messages": []},
+            {"messages": []},
+        ]
+    )
+    monkeypatch.setattr(repl, "_run", lambda code, env_id, timeout: next(responses))
+
+    for _ in range(5):
+        repl._run_counted("#check Nat", env_id=None, timeout=1)
+
+    assert repl._contexts_created == 5
+
+
+def test_plain_response_crossing_context_limit_retires_process(
+    tmp_path, monkeypatch
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            warmup_imports=frozenset(),
+            validate_imports=False,
+            max_contexts_per_process=2,
+        )
+    )
+    repl.process = SimpleNamespace(poll=lambda: None)
+    repl._project_fingerprint = repl_core.lean_project_fingerprint(tmp_path)
+    repl._contexts_created = 1
+    closed = []
+
+    def close():
+        closed.append(True)
+        repl.process = None
+        repl._base_env_id = None
+        repl._structured_context = None
+        repl._contexts_created = 0
+        repl._project_fingerprint = None
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda code, env_id, timeout: {
+            "env": 12,
+            "messages": [],
+            "sorries": [
+                {
+                    "goal": "False",
+                    "proofState": 13,
+                    "pos": {"line": 1, "column": 0},
+                }
+            ],
+        },
+    )
+
+    response = repl.run("example : False := by sorry", timeout=1)
+
+    assert response == {"messages": [], "sorries": [{"goal": "False", "pos": {"line": 1, "column": 0}}]}
+    assert closed == [True]
+    assert repl.process is None
 
 
 def test_partial_pool_startup_closes_all_constructed_workers(monkeypatch):
