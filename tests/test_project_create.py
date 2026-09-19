@@ -522,6 +522,51 @@ def test_unsupported_rename_flag_uses_capability_error(
     assert raised.value.code == "project-create-safety-unavailable"
 
 
+def test_missing_native_noreplace_operation_uses_capability_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        create_module.ctypes,
+        "CDLL",
+        lambda *args, **kwargs: object(),
+    )
+
+    assert create_module._noreplace_function() is None
+    with pytest.raises(ProjectCreateError) as raised:
+        create_module._rename_noreplace(3, "stage", 3, "target")
+    assert raised.value.code == "project-create-safety-unavailable"
+
+
+def test_open_parent_close_after_close_does_not_retry_or_leak_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_close = create_module.os.close
+    original_fstat = create_module.os.fstat
+    close_attempts: dict[int, int] = {}
+    failed = False
+
+    def close_after_close(descriptor: int) -> None:
+        nonlocal failed
+        close_attempts[descriptor] = close_attempts.get(descriptor, 0) + 1
+        original_close(descriptor)
+        if not failed:
+            failed = True
+            raise OSError("injected close-after-close failure")
+
+    monkeypatch.setattr(create_module.os, "close", close_after_close)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_module._open_parent(tmp_path)
+
+    assert raised.value.code == "project-path-is-symlink"
+    assert len(close_attempts) == 2
+    assert all(attempts == 1 for attempts in close_attempts.values())
+    for descriptor in close_attempts:
+        with pytest.raises(OSError) as closed:
+            original_fstat(descriptor)
+        assert closed.value.errno == errno.EBADF
+
+
 def test_late_target_race_remains_distinguishable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
 

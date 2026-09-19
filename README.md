@@ -108,6 +108,7 @@ complete frontmatter, hierarchy, status, and validation rules.
 | Command | Purpose |
 | --- | --- |
 | `autoform project new` | Atomically create a compatible Lean and Autoform project. |
+| `autoform project repair` | Add unambiguous missing project files without overwriting existing work. |
 | `autoform project inspect` | Inspect local project configuration without executing it. |
 | `autoform init` | Scaffold the blueprint and site; add CI when immutably pinned. |
 | `autoform check` | Validate Markdown structure and dependencies. |

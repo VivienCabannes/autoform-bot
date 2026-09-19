@@ -11,6 +11,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from ..graph import _parse_node
 from ..provenance import normalize_git_source
@@ -63,6 +64,44 @@ class ProjectCreateError(ValueError):
 
     def to_json(self) -> str:
         return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
+
+
+class _OwnedDescriptor:
+    """Track one descriptor and make ownership transfer explicit."""
+
+    __slots__ = ("_descriptor",)
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor is None:
+            raise RuntimeError("descriptor ownership was already transferred")
+        return self._descriptor
+
+    def detach(self) -> int:
+        descriptor = self.descriptor
+        self._descriptor = None
+        return descriptor
+
+    def close(self) -> None:
+        if self._descriptor is None:
+            return
+        descriptor = self._descriptor
+        self._descriptor = None
+        os.close(descriptor)
+
+    def replace(self, child: _OwnedDescriptor) -> None:
+        try:
+            self.close()
+        except BaseException:
+            try:
+                child.close()
+            except OSError:
+                pass
+            raise
+        self._descriptor = child.detach()
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,19 +360,25 @@ def _open_parent(parent: Path) -> int:
         )
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     absolute = parent.absolute()
+    owner: _OwnedDescriptor | None = None
     try:
-        descriptor = os.open(absolute.anchor, flags)
+        owner = _OwnedDescriptor(os.open(absolute.anchor, flags))
         try:
             for part in absolute.parts[1:]:
-                child = os.open(part, flags, dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
+                child = _OwnedDescriptor(
+                    os.open(part, flags, dir_fd=owner.descriptor)
+                )
+                owner.replace(child)
         except BaseException:
-            os.close(descriptor)
+            try:
+                owner.close()
+            except OSError:
+                pass
             raise
     except OSError:
         raise ProjectCreateError("project-path-is-symlink", "The target path contains a symbolic link.") from None
-    return descriptor
+    assert owner is not None
+    return owner.detach()
 
 
 def _require_absent(parent_descriptor: int, name: str) -> None:
@@ -672,42 +717,54 @@ def _validate_roadmap_plan(plan: tuple[_ScaffoldFile, ...]) -> None:
         )
 
 
+def _noreplace_function() -> tuple[Any, int] | None:
+    """Return the platform's native atomic no-replace rename operation."""
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    if hasattr(libc, "renameatx_np"):
+        function = libc.renameatx_np
+        flag = 0x00000004
+    elif hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        flag = 1
+    else:
+        return None
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    return function, flag
+
+
 def _rename_noreplace(
     source_parent_descriptor: int,
     source: str,
     target_parent_descriptor: int,
     target: str,
 ) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
+    implementation = _noreplace_function()
     source_bytes = os.fsencode(source)
     target_bytes = os.fsencode(target)
-    if hasattr(libc, "renameatx_np"):
-        function = libc.renameatx_np
-        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        function.restype = ctypes.c_int
-        result = function(
-            source_parent_descriptor,
-            source_bytes,
-            target_parent_descriptor,
-            target_bytes,
-            0x00000004,
-        )
-    elif hasattr(libc, "renameat2"):
-        function = libc.renameat2
-        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        function.restype = ctypes.c_int
-        result = function(
-            source_parent_descriptor,
-            source_bytes,
-            target_parent_descriptor,
-            target_bytes,
-            1,
-        )
-    else:
+    if implementation is None:
         raise ProjectCreateError(
             "project-create-safety-unavailable",
             "This platform cannot atomically publish a new project without replacement.",
         )
+    function, flag = implementation
+    result = function(
+        source_parent_descriptor,
+        source_bytes,
+        target_parent_descriptor,
+        target_bytes,
+        flag,
+    )
     if result == 0:
         return
     error = ctypes.get_errno()

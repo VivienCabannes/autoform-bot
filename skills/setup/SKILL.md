@@ -49,17 +49,28 @@ overwrites an existing target. Omit both provenance flags if verification is
 unavailable; the command then omits CI workflows. Do not invent version pairs,
 sources, or revisions, and do not copy the populated example as a project generator.
 
-For an incomplete existing repository, preserve its authored configuration and
-use `autoform init` only for the Autoform vault/site overlay until the dedicated
-repair command is available.
+For an incomplete existing Autoform repository, inspect first, preview the
+repair, and apply only when the plan contains the intended missing files:
+
+```bash
+autoform project inspect <TARGET>
+autoform project repair <TARGET> --dry-run --json
+autoform project repair <TARGET>
+```
+
+Repair preserves existing files and adds only unambiguous missing files whose
+parents already exist. Supply exact title, repository URL, or verified workflow
+source and commit only when requested; never infer them. Inspect every reported
+temporary or possibly published path before retrying with the same inputs.
+Never use `init --force` as repair.
 
 `autoform init` is the whole vault: `blueprint/` with its landing page,
 `roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
 override, both workflows, and ignore rules. Do not hand-build any of it and do
 not copy the bundled example: the layout is fixed, and a chapter written as a
 sibling file instead of `<chapter>/README.md` still validates while publishing
-a book with no chapters. `init` never overwrites an existing file, so it is
-also the repair path; it reports what it left alone. See the
+a book with no chapters. Use `project repair` for an incomplete existing
+Autoform project. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
 Before writing, run `autoform project provenance --json`. This online check

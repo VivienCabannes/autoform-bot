@@ -141,6 +141,9 @@ autoform project new ./FiniteFlat \
   --autoform-ref <full-commit-sha>
 autoform project inspect .
 autoform project inspect path/inside/project --json
+autoform project repair . --dry-run --json
+autoform project repair . --title "Finite Flat Group Schemes" \
+  --repository-url https://github.com/owner/repo
 autoform project versions --json
 autoform project provenance --json
 ```
@@ -153,6 +156,16 @@ creations leave no partial target, and exactly one concurrent creator can win.
 The command does not run Git, Lake, Lean, subprocesses, or network operations.
 Pass both provenance flags to include pinned CI workflows; without them the
 local project is complete but the workflows are omitted.
+
+`project repair` accepts an explicit project root with a supported Lake/Lean
+configuration. It preserves every existing managed file and adds only missing
+canonical files whose parent directories already exist. Preview with
+`--dry-run`; supply `--title`, `--repository-url`, or the verified
+`--autoform-source`/`--autoform-ref` pair only when the reported missing file
+requires them. The command never infers provenance or runs Git, Lake, Lean,
+subprocesses, or network operations. Publication is atomic per file, so an
+interrupted multi-file repair reports files already or possibly published and
+retains any ambiguous temporary for inspection. Retry with the same inputs.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and

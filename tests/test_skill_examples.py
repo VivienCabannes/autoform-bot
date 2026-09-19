@@ -422,6 +422,16 @@ def test_setup_skill_uses_verified_plugin_provenance(repo_root: Path) -> None:
     assert "--autoform-ref <full-commit-sha>" not in readme
 
 
+def test_setup_skill_uses_conservative_project_repair(repo_root: Path) -> None:
+    setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
+
+    assert "autoform project inspect <TARGET>" in setup
+    assert "autoform project repair <TARGET> --dry-run --json" in setup
+    assert "autoform project repair <TARGET>" in setup
+    assert "never infer them" in setup
+    assert "Never use `init --force` as repair" in setup
+
+
 def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
     setup = (repo_root / "skills/setup/SKILL.md").read_text(encoding="utf-8")
     roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
