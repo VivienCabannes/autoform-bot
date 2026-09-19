@@ -53,6 +53,11 @@ from servers.lsp.server import (
     format_lsp_diagnostics,
 )
 from servers.repl.core import format_repl_response
+from servers.repl.imports import (
+    require_no_source_imports,
+    resolve_project_imports,
+    validate_imports,
+)
 from servers.repl.pool import (
     DEFAULT_RAM_FRACTION,
     LeanReplPool,
@@ -999,6 +1004,7 @@ class LeanRuntimeServices:
         if method == "repl.run":
             project_dir = self._string_param(params, "project_dir")
             code = self._string_param(params, "code", allow_empty=True)
+            imports = validate_imports(params.get("imports")) or None
             timeout = params.get("timeout")
             if timeout is None:
                 effective_timeout = self.config.repl_request_timeout
@@ -1018,13 +1024,33 @@ class LeanRuntimeServices:
                 )
             deadline = time.monotonic() + effective_timeout
             root = resolve_lean_project_dir(project_dir)
+            resolved_imports = None
+            if imports is not None:
+                require_no_source_imports(code)
+                resolved_imports = resolve_project_imports(
+                    root,
+                    imports,
+                    deadline=deadline,
+                )
             with self.repl_projects.lease(
                 str(root),
                 deadline=deadline,
                 creation_budget=0,
+                required_fingerprint=(
+                    resolved_imports.project_fingerprint
+                    if resolved_imports is not None
+                    else None
+                ),
             ) as pool:
                 assert pool is not None
-                response = pool.run(code, deadline=deadline)
+                if resolved_imports is None:
+                    response = pool.run(code, deadline=deadline)
+                else:
+                    response = pool.run(
+                        code,
+                        imports=resolved_imports,
+                        deadline=deadline,
+                    )
                 return format_repl_response(response)
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")

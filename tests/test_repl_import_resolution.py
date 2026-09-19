@@ -16,9 +16,11 @@ from servers import lean_project_fingerprint
 from servers.repl import imports as repl_imports
 from servers.repl.imports import (
     LeanImportError,
+    LeanImportHeaderError,
     ResolvedImports,
     clean_lake_environment,
     resolve_project_imports,
+    split_imports_and_body,
     validate_imports,
 )
 
@@ -128,6 +130,91 @@ def test_structured_import_validation_preserves_order_and_duplicates():
 def test_structured_import_validation_rejects_malformed_values(value):
     with pytest.raises(LeanImportError, match="imports"):
         validate_imports(value)
+
+
+@pytest.mark.parametrize(
+    ("code", "imports", "body", "line_count"),
+    [
+        ("import Mathlib\n#check Nat", ["Mathlib"], "#check Nat", 1),
+        (
+            "  /- lead -/ import /- gap -/ Mathlib -- tail\r\n#check Nat",
+            ["Mathlib"],
+            "#check Nat",
+            1,
+        ),
+        (
+            "-- lead\n/- outer\n /- nested -/\n-/\nimport Mathlib\n\n-- body\n#check Nat",
+            ["Mathlib"],
+            "\n-- body\n#check Nat",
+            5,
+        ),
+        (
+            "import Mathlib\n\nimport Aesop\n-- body\n#check Nat",
+            ["Mathlib", "Aesop"],
+            "-- body\n#check Nat",
+            3,
+        ),
+    ],
+)
+def test_source_import_scanner_accepts_only_plain_physical_headers(
+    code, imports, body, line_count
+):
+    assert split_imports_and_body(code) == (imports, body, line_count)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import\nMathlib",
+        "import -- continued\nMathlib",
+        "import /- continued\n-/ Mathlib",
+        "module Fixture",
+        "prelude",
+        "public import Mathlib",
+        "meta import Mathlib",
+        "import all Mathlib",
+        "import mathlib",
+        "\timport Mathlib",
+        "\N{NO-BREAK SPACE}import Mathlib",
+        "import Mathlib Aesop",
+        "import Mathlib #check Nat",
+        "import Math/- gap -/lib",
+        "import Mathlib\r#check Nat",
+        "\rimport Mathlib\n#check Nat",
+        "-- lead\rimport Mathlib\n#check Nat",
+        "/- lead -/\rimport Mathlib\n#check Nat",
+        "/- lead\r-/\nimport Mathlib\n#check Nat",
+    ],
+)
+def test_source_import_scanner_rejects_unsupported_headers(code):
+    with pytest.raises(LeanImportHeaderError, match="pass module names with imports"):
+        split_imports_and_body(code)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "/-- docs -/\nimport Mathlib",
+        "/-! docs -/\nimport Mathlib",
+        "#check Nat\nimport Mathlib",
+        "im/- gap -/port Mathlib",
+        "meta def fixture : Nat := 1",
+        "public def fixture : Nat := 1",
+        "\r#check Nat",
+    ],
+)
+def test_source_import_scanner_preserves_non_header_source(code):
+    assert split_imports_and_body(code) == ([], code, 0)
+
+
+def test_source_import_scanner_preserves_unterminated_trailing_comment():
+    code = "import Mathlib /- unterminated"
+    assert split_imports_and_body(code) == (["Mathlib"], code, 0)
+
+
+def test_source_import_scanner_preserves_bare_cr_after_the_final_import():
+    code = "import Mathlib\n\r#check Nat"
+    assert split_imports_and_body(code) == (["Mathlib"], "\r#check Nat", 1)
 
 
 def test_resolver_rejects_malformed_module_before_running_lake(

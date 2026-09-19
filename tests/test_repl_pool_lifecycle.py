@@ -67,7 +67,8 @@ def test_shutdown_closes_every_worker_and_drains_idle_queue(monkeypatch):
     assert pool._idle.empty()
 
 
-def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch):
+@pytest.mark.parametrize("imports", [None, object()])
+def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch, imports):
     class FakeRepl:
         def __init__(self, config):
             pass
@@ -85,7 +86,7 @@ def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch):
     borrowed = pool._idle.get_nowait()
     try:
         with pytest.raises(TimeoutError, match="waiting for an idle Lean REPL"):
-            pool.run("#check Nat", timeout=0.01)
+            pool.run("#check Nat", imports=imports, timeout=0.01)
     finally:
         pool._idle.put(borrowed)
         pool.shutdown()
@@ -151,6 +152,54 @@ def test_pool_forwards_the_absolute_deadline(monkeypatch):
         pool.shutdown()
 
     assert calls == [("#check Nat", {"deadline": 13.0})]
+
+
+def test_pool_forwards_resolved_imports_and_absolute_deadline(monkeypatch):
+    calls = []
+
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def run(self, code, **kwargs):
+            calls.append((code, kwargs))
+            return {"env": 0}
+
+        def close(self):
+            pass
+
+    descriptor = object()
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    monkeypatch.setattr(repl_pool.time, "monotonic", lambda: 10.0)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+
+    try:
+        assert pool.run(
+            "#check Fixture.value",
+            imports=descriptor,
+            deadline=13.0,
+        ) == {"env": 0}
+    finally:
+        pool.shutdown()
+
+    assert calls == [
+        (
+            "#check Fixture.value",
+            {"imports": descriptor, "deadline": 13.0},
+        )
+    ]
+
+
+def test_pool_rejects_raw_environment_forwarding(monkeypatch):
+    pool = object.__new__(repl_pool.LeanReplPool)
+
+    with pytest.raises(TypeError, match="env_id"):
+        pool.run("#check Nat", env_id=22)
 
 
 def test_pool_rejects_ambiguous_deadlines_before_worker_admission(monkeypatch):

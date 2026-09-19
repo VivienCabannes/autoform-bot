@@ -10,6 +10,7 @@ from logging import getLogger
 from typing import Any
 
 from .core import LeanRepl, LeanReplConfig
+from .imports import ResolvedImports
 
 logger = getLogger(__name__)
 
@@ -98,9 +99,9 @@ class LeanReplPool:
         self,
         code: str,
         *,
+        imports: ResolvedImports | None = None,
         timeout: float | None = None,
         deadline: float | None = None,
-        **kwargs: Any,
     ) -> dict[str, Any]:
         """Run code on an idle REPL within one queue-and-execution timeout."""
         if deadline is None and timeout is not None:
@@ -136,7 +137,9 @@ class LeanReplPool:
                 if deadline - time.monotonic() <= 0:
                     raise TimeoutError("timed out waiting for an idle Lean REPL")
             try:
-                return repl.run(code, deadline=deadline, **kwargs)
+                if imports is None:
+                    return repl.run(code, deadline=deadline)
+                return repl.run(code, imports=imports, deadline=deadline)
             except BaseException:
                 try:
                     repl.close()

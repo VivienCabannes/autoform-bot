@@ -36,6 +36,7 @@ _RUNTIME_FILES = (
     PACKAGE_ROOT / "servers" / "repl" / "__init__.py",
     PACKAGE_ROOT / "servers" / "repl" / "server.py",
     PACKAGE_ROOT / "servers" / "repl" / "core.py",
+    PACKAGE_ROOT / "servers" / "repl" / "imports.py",
     PACKAGE_ROOT / "servers" / "repl" / "pool.py",
 )
 

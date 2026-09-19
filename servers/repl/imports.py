@@ -53,6 +53,12 @@ _DESCRIPTOR_INSPECTION_SUPPORTED = (
     and os.listdir in getattr(os, "supports_fd", ())
 )
 _MODULE_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
+_SOURCE_HEADER_MODULE = re.compile(
+    r"[A-Z][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
+)
+_STRUCTURED_HEADER_PREFIX = re.compile(
+    r"(?:(?:public|meta)\b\s*)*(?:import|module|prelude)\b"
+)
 _RESOLUTION_PROVENANCE = object()
 _DESCRIPTOR_SESSION_LIMIT = 64
 _VALIDATION_CACHE_LIMIT = 64
@@ -67,6 +73,10 @@ _resolved_import_cache: OrderedDict[
 
 class LeanImportError(ValueError):
     """Structured imports cannot be resolved safely for the project."""
+
+
+class LeanImportHeaderError(LeanImportError):
+    """A source import header is unsafe to split from the request body."""
 
 
 class StaleResolvedImportsError(LeanImportError):
@@ -424,6 +434,138 @@ def validate_imports(value: Any) -> tuple[str, ...] | None:
             raise LeanImportError(f"imports[{index}] is not a conservative Lean module name: {module!r}")
         modules.append(module)
     return tuple(modules)
+
+
+def split_imports_and_body(code: str) -> tuple[list[str], str, int]:
+    """Split the conservative source-header subset accepted by Autoform."""
+    lines = code.splitlines(keepends=True)
+    imports: list[str] = []
+    offset = 0
+    body_start = 0
+    header_line_count = 0
+    block_depth = 0
+    bare_carriage_return_in_prefix = False
+    for index, line in enumerate(lines):
+        bare_carriage_return = line.endswith("\r") and not line.endswith("\r\n")
+        content = line[:-1] if line.endswith("\n") else line
+        visible, next_depth = _mask_header_comments(content, block_depth)
+        match = re.fullmatch(
+            rf" *import +({_SOURCE_HEADER_MODULE.pattern}) *\r?",
+            visible,
+        )
+        header_space = _only_header_space(visible)
+        looks_like_header = _looks_like_import_header(visible)
+        if match is not None and (
+            bare_carriage_return or bare_carriage_return_in_prefix
+        ):
+            raise LeanImportHeaderError(
+                "unsupported Lean source import header; pass module names with imports"
+            )
+        if match is not None:
+            imports.append(match.group(1))
+            body_start = offset + len(line)
+            header_line_count = index + 1
+            block_depth = next_depth
+            # Removing only the first line of a multiline trailing comment
+            # would expose its closing token to Lean. Preserve the whole source
+            # and let Lean reject or diagnose it from the established base env.
+            if block_depth:
+                return imports, code, 0
+        elif header_space:
+            bare_carriage_return_in_prefix |= bare_carriage_return
+            block_depth = next_depth
+        elif looks_like_header:
+            raise LeanImportHeaderError(
+                "unsupported Lean source import header; pass module names with imports"
+            )
+        else:
+            break
+        offset += len(line)
+    if block_depth:
+        return imports, code, 0
+    if not imports:
+        return [], code, 0
+    return imports, code[body_start:], header_line_count
+
+
+def require_no_source_imports(code: str) -> None:
+    """Reject source that could introduce imports outside a resolved descriptor."""
+    source_imports, _, _ = split_imports_and_body(code)
+    if source_imports:
+        raise LeanImportHeaderError(
+            "Structured imports cannot be combined with import statements "
+            "at the start of code."
+        )
+
+    visible_lines: list[str] = []
+    block_depth = 0
+    for line in code.splitlines(keepends=True):
+        content = line[:-1] if line.endswith("\n") else line
+        visible, block_depth = _mask_header_comments(
+            content,
+            block_depth,
+            mask_documentation=True,
+        )
+        visible_lines.append(visible)
+        if line.endswith("\n"):
+            visible_lines.append("\n")
+    candidate = "".join(visible_lines).lstrip()
+    candidate = candidate.removeprefix("\N{ZERO WIDTH NO-BREAK SPACE}").lstrip()
+    if _STRUCTURED_HEADER_PREFIX.match(candidate) is not None:
+        raise LeanImportHeaderError(
+            "unsupported Lean source import header; pass module names with imports"
+        )
+
+
+def _only_header_space(value: str) -> bool:
+    return all(character in {" ", "\r"} for character in value)
+
+
+def _looks_like_import_header(value: str) -> bool:
+    candidate = value.lstrip()
+    if not candidate:
+        return False
+    tokens = candidate.split()
+    first = tokens[0]
+    if first in {"import", "module", "prelude"}:
+        return True
+    return first in {"public", "meta"} and "import" in tokens[1:3]
+
+
+def _mask_header_comments(
+    line: str,
+    initial_depth: int,
+    *,
+    mask_documentation: bool = False,
+) -> tuple[str, int]:
+    """Mask ordinary Lean comments without joining surrounding tokens."""
+    visible = list(line)
+    depth = initial_depth
+    index = 0
+    while index < len(line):
+        if depth and line.startswith("/-", index):
+            visible[index : index + 2] = "  "
+            depth += 1
+            index += 2
+        elif depth and line.startswith("-/", index):
+            visible[index : index + 2] = "  "
+            depth -= 1
+            index += 2
+        elif depth:
+            visible[index] = " "
+            index += 1
+        elif line.startswith("--", index):
+            visible[index:] = " " * (len(line) - index)
+            break
+        elif line.startswith("/-", index) and (
+            mask_documentation or not line.startswith(("/--", "/-!"), index)
+        ):
+            visible[index : index + 2] = "  "
+            depth = 1
+            index += 2
+        else:
+            index += 1
+    return "".join(visible), depth
 
 
 @_with_descriptor_session

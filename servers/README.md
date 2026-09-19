@@ -40,3 +40,7 @@ process to start the runtime supplies those settings until it is stopped.
 (180 seconds), bounded by `AUTOFORM_MAX_REPL_REQUEST_SECONDS`. The client-side
 `AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` must remain above the node-wide request
 limits.
+
+`run_lean_code` accepts an optional ordered `imports` list for project modules
+that Lake has already built. Nonempty lists are validated against the project,
+executed in a fresh REPL process, and retired after that request.

@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from servers import ProjectFingerprint, clean_lake_environment, lean_project_fingerprint
+from servers.repl.imports import (
+    LeanImportHeaderError,
+    ResolvedImports,
+    StaleResolvedImportsError,
+    require_no_source_imports,
+)
 
 logger = getLogger(__name__)
 
@@ -466,7 +472,12 @@ class LeanRepl:
         if config.validate_imports and config.allowed_imports:
             self._allowed_import_roots = config.allowed_imports
 
-    def start(self, startup_timeout: float | None = None) -> None:
+    def start(
+        self,
+        startup_timeout: float | None = None,
+        *,
+        warmup_imports: frozenset[str] | tuple[str, ...] | None = None,
+    ) -> None:
         """Start and warm the Lean REPL within one startup deadline."""
         self._project_fingerprint = None
         timeout = self.config.startup_timeout if startup_timeout is None else min(
@@ -502,9 +513,14 @@ class LeanRepl:
         self._stderr_tail.clear()
 
         try:
-            if self.config.warmup_imports:
-                header = "\n".join(f"import {root}" for root in self.config.warmup_imports)
-                logger.info("Loading imports at startup: %s", self.config.warmup_imports)
+            startup_imports = (
+                self.config.warmup_imports
+                if warmup_imports is None
+                else warmup_imports
+            )
+            if startup_imports:
+                header = "\n".join(f"import {root}" for root in startup_imports)
+                logger.info("Loading imports at startup: %s", startup_imports)
                 resp = self._run(code=header, env_id=None, timeout=remaining())
                 environment, messages = _validate_command_response(
                     resp,
@@ -591,6 +607,7 @@ class LeanRepl:
         env_id: int | None = None,
         timeout: float | None = None,
         *,
+        imports: ResolvedImports | None = None,
         deadline: float | None = None,
     ) -> dict[str, Any]:
         """Send code to the REPL within one deadline across recovery attempts."""
@@ -611,6 +628,23 @@ class LeanRepl:
             if value <= 0:
                 raise deadline_error()
             return value
+
+        if imports is not None:
+            if type(imports) is not ResolvedImports:
+                raise TypeError("imports must be a ResolvedImports descriptor or None")
+            if env_id is not None:
+                return {
+                    "repl_error": (
+                        "Structured imports cannot be combined with an explicit "
+                        "environment identifier."
+                    )
+                }
+            return self._run_with_imports_once(
+                code,
+                imports,
+                deadline=deadline,
+                deadline_error=deadline_error,
+            )
 
         run_from_env = env_id is not None
         max_retries = 0 if run_from_env else self.max_retries
@@ -735,6 +769,126 @@ class LeanRepl:
                     break
             logger.error("Exceeded maximum retries for Lean REPL command")
             return {"repl_error": str(last_exception)}
+
+    def _run_with_imports_once(
+        self,
+        code: str,
+        imports: ResolvedImports,
+        *,
+        deadline: float,
+        deadline_error: Callable[[], TimeoutError],
+    ) -> dict[str, Any]:
+        """Execute one resolved-import request in a fresh, disposable process."""
+        if not imports.modules:
+            return {"repl_error": "Structured imports must not be empty."}
+        if imports.project_root != self._project_identity:
+            return {
+                "repl_error": "Resolved imports belong to a different Lean project root."
+            }
+        try:
+            require_no_source_imports(code)
+        except LeanImportHeaderError as error:
+            return {"repl_error": str(error)}
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise deadline_error()
+            return value
+
+        phase = "setup"
+        with self._process_lock, self._deadline_scope(deadline):
+            try:
+                imports.assert_current(deadline)
+                self.close()
+                self.start(startup_timeout=remaining(), warmup_imports=())
+                if self._project_fingerprint != imports.project_fingerprint:
+                    raise StaleResolvedImportsError(
+                        "resolved Lean imports are stale: worker project configuration differs"
+                    )
+                imports.assert_current(deadline)
+
+                header = "\n".join(f"import {module}" for module in imports.modules)
+                imported = self._run(
+                    code=header,
+                    env_id=None,
+                    timeout=remaining(),
+                )
+                imports.assert_current(deadline)
+                request_env_id, messages = _validate_command_response(
+                    imported,
+                    context="the requested imports",
+                    require_environment=True,
+                )
+                if any(message["severity"] == "error" for message in messages):
+                    return _without_process_handles(imported)
+
+                phase = "body"
+                dispatch_fingerprint = self._project_fingerprint
+                backlog: ReplStderrBacklog | None = None
+                try:
+                    response = self._run(
+                        code=code,
+                        env_id=request_env_id,
+                        timeout=remaining(),
+                    )
+                except ReplStderrBacklog as error:
+                    backlog = error
+                    response = error.response
+
+                try:
+                    imports.assert_current(deadline)
+                    if dispatch_fingerprint != imports.project_fingerprint:
+                        raise StaleResolvedImportsError(
+                            "resolved Lean imports are stale: worker project "
+                            "configuration differs"
+                        )
+                except (StaleResolvedImportsError, TimeoutError, RuntimeError) as error:
+                    raise ReplOutcomeUnknown(
+                        "Lean project freshness changed while the requested command "
+                        "was executing; its outcome is unknown"
+                    ) from error
+
+                _validate_command_response(
+                    response,
+                    context="the requested command",
+                    require_environment=True,
+                )
+                if backlog is not None:
+                    logger.error("%s", backlog)
+                return _without_process_handles(response)
+            except ReplStderrBacklog as error:
+                logger.error("%s", error)
+                return {
+                    "repl_error": (
+                        "REPL import setup failed before the requested code ran: "
+                        f"{error}"
+                    )
+                }
+            except ReplOutcomeUnknown as error:
+                logger.error("%s", error)
+                if phase == "setup":
+                    return {
+                        "repl_error": (
+                            "REPL import setup failed before the requested code ran: "
+                            f"{error}"
+                        )
+                    }
+                return {"repl_error": str(error), "outcome_unknown": True}
+            except ReplCommandError as error:
+                logger.error("Lean REPL rejected the command: %s", error)
+                return {"repl_error": str(error)}
+            except ReplProtocolError as error:
+                logger.error("%s", error)
+                response = {"repl_error": str(error)}
+                if phase == "body":
+                    response["outcome_unknown"] = True
+                return response
+            except (ReplProcessExited, StaleResolvedImportsError, TimeoutError, RuntimeError) as error:
+                logger.error("Structured REPL request failed: %s", error)
+                return {"repl_error": str(error)}
+            finally:
+                self.close()
 
     def _assert_project_current(self, deadline: float) -> None:
         """Reject a worker whose project changed after process startup."""

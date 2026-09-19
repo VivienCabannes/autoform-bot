@@ -47,6 +47,7 @@ def test_runtime_identity_tracks_all_behavior_affecting_modules():
         "servers/repl/__init__.py",
         "servers/repl/server.py",
         "servers/repl/core.py",
+        "servers/repl/imports.py",
         "servers/repl/pool.py",
     }
 
@@ -183,6 +184,222 @@ def test_runtime_formats_unknown_repl_outcomes_without_hiding_them(tmp_path):
         "REPL error (execution outcome unknown; request not retried): "
         "response frame was malformed"
     )
+
+
+def test_empty_structured_imports_keep_the_legacy_execution_path(tmp_path, monkeypatch):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "empty-imports")
+    pools = []
+    monkeypatch.setattr(
+        lean_runtime,
+        "resolve_project_imports",
+        lambda *args, **kwargs: pytest.fail("empty imports must not run discovery"),
+    )
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=lambda root: pools.append(FakePool(root)) or pools[-1],
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        result = services.dispatch(
+            "repl.run",
+            {
+                "project_dir": str(project),
+                "code": "import Mathlib\n#check Nat",
+                "timeout": 3,
+                "imports": [],
+            },
+        )
+    finally:
+        services.close()
+
+    assert result == "Compiles successfully"
+    assert len(pools[0].calls) == 1
+    assert pools[0].calls[0][0] == "import Mathlib\n#check Nat"
+    assert set(pools[0].calls[0][1]) == {"deadline"}
+
+
+def test_structured_imports_resolve_once_and_bind_the_pool_lease(
+    tmp_path, monkeypatch
+):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "structured")
+    pools = []
+    resolutions = []
+
+    def resolve(root, modules, *, deadline):
+        descriptor = SimpleNamespace(
+            project_root=root,
+            modules=modules,
+            project_fingerprint=lean_project_fingerprint(root),
+        )
+        resolutions.append((root, modules, deadline, descriptor))
+        return descriptor
+
+    monkeypatch.setattr(lean_runtime, "resolve_project_imports", resolve)
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=lambda root: pools.append(FakePool(root)) or pools[-1],
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    original_lease = services.repl_projects.lease
+    leases = []
+
+    def tracked_lease(project_dir, **kwargs):
+        leases.append((project_dir, kwargs))
+        return original_lease(project_dir, **kwargs)
+
+    monkeypatch.setattr(services.repl_projects, "lease", tracked_lease)
+    try:
+        result = services.dispatch(
+            "repl.run",
+            {
+                "project_dir": str(project),
+                "code": "#check Structured.value",
+                "timeout": 3,
+                "imports": ["Structured.B", "Structured.A", "Structured.B"],
+            },
+        )
+    finally:
+        services.close()
+
+    assert result == "Compiles successfully"
+    root, modules, deadline, descriptor = resolutions[0]
+    assert root == project.resolve()
+    assert modules == ("Structured.B", "Structured.A", "Structured.B")
+    assert pools[0].calls == [
+        (
+            "#check Structured.value",
+            {"imports": descriptor, "deadline": deadline},
+        )
+    ]
+    assert leases == [
+        (
+            str(project.resolve()),
+            {
+                "deadline": deadline,
+                "creation_budget": 0,
+                "required_fingerprint": descriptor.project_fingerprint,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import Mathlib\n#check Nat",
+        "/- lead -/ import Mathlib\n#check Nat",
+        "module Fixture\npublic import Mathlib\n#check Nat",
+        "/-- docs -/\nimport Mathlib\n#check Nat",
+        "meta\nimport Mathlib\n#check Nat",
+    ],
+)
+def test_structured_imports_reject_source_headers_before_discovery(
+    tmp_path, monkeypatch, code
+):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "mixed-imports")
+    pools = []
+    monkeypatch.setattr(
+        lean_runtime,
+        "resolve_project_imports",
+        lambda *args, **kwargs: pytest.fail("mixed imports must not run discovery"),
+    )
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=lambda root: pools.append(FakePool(root)) or pools[-1],
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        with pytest.raises(ValueError, match="imports"):
+            services.dispatch(
+                "repl.run",
+                {
+                    "project_dir": str(project),
+                    "code": code,
+                    "timeout": 3,
+                    "imports": ["Fixture"],
+                },
+            )
+    finally:
+        services.close()
+
+    assert pools == []
+
+
+@pytest.mark.parametrize("imports", ["Fixture", [""], [1], ["Fixture/Bad"]])
+def test_invalid_structured_imports_never_warm_a_pool(tmp_path, imports):
+    project = make_lake_project(tmp_path, "bad-imports")
+    pools = []
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=lambda root: pools.append(FakePool(root)) or pools[-1],
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        with pytest.raises(ValueError, match="imports"):
+            services.dispatch(
+                "repl.run",
+                {
+                    "project_dir": str(project),
+                    "code": "#check Nat",
+                    "timeout": None,
+                    "imports": imports,
+                },
+            )
+    finally:
+        services.close()
+
+    assert pools == []
+
+
+def test_structured_imports_reject_project_change_before_pool_lease(
+    tmp_path, monkeypatch
+):
+    from servers import lean_runtime
+
+    project = make_lake_project(tmp_path, "changed-project")
+    pools = []
+
+    def resolve(root, modules, *, deadline):
+        descriptor = SimpleNamespace(
+            project_root=root,
+            modules=modules,
+            project_fingerprint=lean_project_fingerprint(root),
+        )
+        (root / "lakefile.toml").write_text('name = "Changed"\n', encoding="utf-8")
+        return descriptor
+
+    monkeypatch.setattr(lean_runtime, "resolve_project_imports", resolve)
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=lambda root: pools.append(FakePool(root)) or pools[-1],
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        with pytest.raises(ProjectResourceBusyError, match="changed after validation"):
+            services.dispatch(
+                "repl.run",
+                {
+                    "project_dir": str(project),
+                    "code": "#check Fixture.value",
+                    "timeout": 3,
+                    "imports": ["Fixture"],
+                },
+            )
+    finally:
+        services.close()
+
+    assert pools == []
 
 
 def test_requested_timeout_covers_project_slot_admission(tmp_path):
@@ -1216,11 +1433,31 @@ def test_stdio_mcp_adapters_delegate_without_owning_lean_state():
             },
         )
     )
+    asyncio.run(
+        repl.call_tool(
+            "run_lean_code",
+            {
+                "project_dir": "/lean",
+                "code": "#check Fixture.value",
+                "timeout": 5,
+                "imports": ["Fixture"],
+            },
+        )
+    )
     asyncio.run(repl.call_tool("get_repl_status", {"project_dir": "/lean"}))
     assert repl_runtime.calls == [
         (
             "repl.run",
             {"project_dir": "/lean", "code": "#check Nat", "timeout": None},
+        ),
+        (
+            "repl.run",
+            {
+                "project_dir": "/lean",
+                "code": "#check Fixture.value",
+                "timeout": 5.0,
+                "imports": ["Fixture"],
+            },
         ),
         ("repl.status", {"project_dir": "/lean"}),
     ]
