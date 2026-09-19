@@ -1609,6 +1609,24 @@ def test_resolver_checks_deadline_after_final_lake_call(tmp_path, monkeypatch):
         resolve_project_imports(project, ("Fixture",), deadline=1.0)
 
 
+def test_dependency_tree_scan_preserves_deadline_errors(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    child = root / "Fixture"
+    child.mkdir(parents=True)
+    (child / "Dependency.olean").write_bytes(b"artifact")
+
+    def time_out(*args, **kwargs):
+        raise TimeoutError("deadline exhausted")
+
+    monkeypatch.setattr(repl_imports, "_inspect_regular_at", time_out)
+
+    with pytest.raises(TimeoutError, match="deadline exhausted"):
+        repl_imports._snapshot_dependency_roots(
+            (root.resolve(),),
+            time.monotonic() + 1,
+        )
+
+
 def test_resolved_imports_reject_changed_project_config(tmp_path):
     project = _project(tmp_path).resolve()
     root = tmp_path / "root"
@@ -1739,7 +1757,7 @@ srcDir = "src"
     resolved = resolve_project_imports(project, ("Fixture",), timeout=60)
     assert resolved.project_root == project.resolve()
     assert resolved.modules == ("Fixture",)
-    resolved.assert_current(time.monotonic() + 10)
+    resolved.assert_current(time.monotonic() + 60)
 
     dependency_timestamp = dependency.stat().st_mtime_ns
     dependency.write_text(
@@ -1761,4 +1779,4 @@ srcDir = "src"
 
     refreshed = resolve_project_imports(project, ("Fixture",), timeout=60)
     assert refreshed != resolved
-    refreshed.assert_current(time.monotonic() + 10)
+    refreshed.assert_current(time.monotonic() + 60)

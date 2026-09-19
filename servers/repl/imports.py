@@ -1812,6 +1812,8 @@ def _snapshot_dependency_roots(
                         )
                 except LeanImportError:
                     raise
+                except TimeoutError:
+                    raise
                 except OSError as error:
                     raise LeanImportError(
                         f"cannot inspect Lean dependency root: {root / child_relative}"
