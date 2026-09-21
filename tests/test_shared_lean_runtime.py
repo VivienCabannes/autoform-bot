@@ -92,10 +92,16 @@ class FakePool:
         return {"messages": []}
 
     def get_memory_usage(self):
-        return 0.25
+        return 0.0
 
     def shutdown(self):
         self._shutdown = True
+
+    def shutdown_until_clean(self):
+        self.shutdown()
+
+    def is_usable(self):
+        return not self._shutdown
 
 
 class FakeLsp:
@@ -113,7 +119,9 @@ class FakeLsp:
         return not self.closed
 
 
-def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
+def test_runtime_reuses_project_admission_slots_without_claiming_a_warm_process(
+    tmp_path,
+):
     project = make_lake_project(tmp_path, "shared")
     pools = []
 
@@ -150,7 +158,11 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
         assert pools[0].calls[1][1]["deadline"] > time.monotonic()
         warm = services.dispatch("repl.status", {"project_dir": str(project)})
         assert warm["state"] == "warm"
-        assert warm["memory_usage_gb"] == 0.25
+        assert warm["memory_usage_gb"] == 0.0
+        daemon_status = services.status(include_projects=True)
+        assert [pool["project_dir"] for pool in daemon_status["repl_projects"]["resident"]] == [
+            str(project.resolve())
+        ]
     finally:
         services.close()
     assert pools[0]._shutdown is True
@@ -186,7 +198,67 @@ def test_runtime_formats_unknown_repl_outcomes_without_hiding_them(tmp_path):
     )
 
 
-def test_empty_structured_imports_keep_the_legacy_execution_path(tmp_path, monkeypatch):
+def test_runtime_replaces_a_poisoned_pool_only_after_cleanup(tmp_path):
+    project = make_lake_project(tmp_path, "cleanup-recovery")
+    pools = []
+    events = []
+
+    class RecoveringPool(FakePool):
+        def __init__(self, root):
+            super().__init__(root)
+            self.number = len(pools) + 1
+            pools.append(self)
+            events.append(("create", self.number))
+
+        def run(self, code, **kwargs):
+            events.append(("run", self.number))
+            if self.number == 1:
+                self._shutdown = True
+                raise RuntimeError("cleanup failed")
+            return {"messages": []}
+
+        def shutdown_until_clean(self):
+            events.append(("cleanup", self.number))
+            self._shutdown = True
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=RecoveringPool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        params = {
+            "project_dir": str(project),
+            "code": "#check Nat",
+            "timeout": 3,
+        }
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            services.dispatch("repl.run", params)
+
+        repl_status = services.dispatch(
+            "repl.status",
+            {"project_dir": str(project)},
+        )
+        assert repl_status["state"] == "warm"
+        assert repl_status["shutdown"] is True
+        assert events == [("create", 1), ("run", 1)]
+        daemon_status = services.status(include_projects=True)
+        assert daemon_status["repl_projects"]["resident"][0]["valid"] is False
+
+        assert services.dispatch("repl.run", params) == "Compiles successfully"
+        assert events == [
+            ("create", 1),
+            ("run", 1),
+            ("cleanup", 1),
+            ("create", 2),
+            ("run", 2),
+        ]
+    finally:
+        services.close()
+
+
+def test_empty_structured_imports_keep_the_default_execution_path(tmp_path, monkeypatch):
     from servers import lean_runtime
 
     project = make_lake_project(tmp_path, "empty-imports")
@@ -335,7 +407,7 @@ def test_structured_imports_reject_source_headers_before_discovery(
 
 
 @pytest.mark.parametrize("imports", ["Fixture", [""], [1], ["Fixture/Bad"]])
-def test_invalid_structured_imports_never_warm_a_pool(tmp_path, imports):
+def test_invalid_structured_imports_never_create_a_pool(tmp_path, imports):
     project = make_lake_project(tmp_path, "bad-imports")
     pools = []
     services = LeanRuntimeServices(
@@ -1826,7 +1898,7 @@ def test_repl_response_budget_uses_the_end_to_end_request_limit(monkeypatch):
 
 
 @pytest.mark.parametrize("timeout", [-1, 0, True, float("nan"), float("inf"), 241])
-def test_invalid_repl_timeout_never_warms_a_pool(tmp_path, timeout):
+def test_invalid_repl_timeout_never_creates_a_pool(tmp_path, timeout):
     project = make_lake_project(tmp_path, "timeout")
     pools = []
     services = LeanRuntimeServices(

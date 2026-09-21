@@ -20,7 +20,7 @@ def create_repl_server(runtime: LeanRuntimeClient) -> FastMCP:
         timeout: float | None = None,
         imports: list[str] | None = None,
     ) -> str:
-        """Compile a Lean snippet in a project's bounded REPL runtime.
+        """Compile a Lean snippet in a fresh, bounded REPL process.
 
         Args:
             project_dir: Absolute path to the Lake project root.
@@ -35,7 +35,7 @@ def create_repl_server(runtime: LeanRuntimeClient) -> FastMCP:
 
     @server.tool
     def get_repl_status(project_dir: str) -> str:
-        """Return pool capacity, memory use, and shutdown state.
+        """Return admission capacity, active-child memory, and shutdown state.
 
         Args:
             project_dir: Absolute path to the Lake project root.

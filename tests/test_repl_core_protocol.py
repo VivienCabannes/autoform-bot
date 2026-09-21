@@ -117,6 +117,121 @@ def test_close_kills_descendant_after_repl_wrapper_already_exited(tmp_path):
             pass
 
 
+def test_process_group_cleanup_reports_an_unreaped_parent(monkeypatch):
+    waits = []
+    signals = []
+
+    class Process:
+        def wait(self, timeout):
+            waits.append(timeout)
+            raise subprocess.TimeoutExpired("lean-repl", timeout)
+
+    monkeypatch.setattr(
+        repl_core.os,
+        "killpg",
+        lambda process_group_id, sent_signal: signals.append(
+            (process_group_id, sent_signal)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out reaping"):
+        repl_core._kill_subprocesses(Process(), 1234)
+
+    assert waits == [
+        repl_core.REPL_ABORT_TERM_SECONDS,
+        repl_core.REPL_ABORT_KILL_SECONDS,
+    ]
+    assert signals == [(1234, signal.SIGTERM), (1234, signal.SIGKILL)]
+
+
+def test_process_group_cleanup_waits_for_descendants_after_parent_exit(monkeypatch):
+    signals = []
+    clock = iter((0.0, 2.0))
+
+    class Process:
+        def wait(self, timeout):
+            return 0
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(repl_core.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        repl_core.os,
+        "killpg",
+        lambda process_group_id, sent_signal: signals.append(
+            (process_group_id, sent_signal)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="process group"):
+        repl_core._kill_subprocesses(Process(), 1234)
+
+    assert signals == [
+        (1234, signal.SIGTERM),
+        (1234, signal.SIGKILL),
+        (1234, 0),
+    ]
+
+
+def test_close_retains_process_handle_until_cleanup_succeeds(tmp_path, monkeypatch):
+    (tmp_path / "lakefile.toml").write_text('name = "Fixture"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    process = object()
+    repl.process = process
+    repl._process_group_id = 1234
+    cleanup_calls = []
+
+    def cleanup(candidate, process_group_id):
+        cleanup_calls.append((candidate, process_group_id))
+        if len(cleanup_calls) == 1:
+            raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", cleanup)
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        repl.close()
+
+    assert repl.process is process
+    assert repl._process_group_id == 1234
+
+    repl.close()
+
+    assert cleanup_calls == [(process, 1234), (process, 1234)]
+    assert repl.process is None
+    assert repl._process_group_id is None
+
+
+def test_close_uses_process_pid_when_stored_group_id_is_missing(tmp_path, monkeypatch):
+    (tmp_path / "lakefile.toml").write_text('name = "Fixture"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(tmp_path),
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+    process = type("Process", (), {"pid": 1234})()
+    repl.process = process
+    cleanup_calls = []
+    monkeypatch.setattr(
+        repl_core,
+        "_kill_subprocesses",
+        lambda candidate, process_group_id: cleanup_calls.append(
+            (candidate, process_group_id)
+        ),
+    )
+
+    repl.close()
+
+    assert cleanup_calls == [(process, process.pid)]
+    assert repl.process is None
+
+
 def test_split_imports_preserves_body_offset_after_comments_and_blank_lines():
     code = """-- preface
 import Mathlib.Data.Nat.Basic
@@ -631,6 +746,112 @@ def test_format_repl_response_preserves_unknown_outcome_warning():
         "REPL error (execution outcome unknown; request not retried): "
         "response timed out"
     )
+
+
+def test_run_disposable_starts_clean_and_removes_process_handles(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    stale_process = object()
+    request_process = object()
+    repl.process = stale_process
+    events = []
+
+    def close():
+        events.append(("close", repl.process))
+        repl.process = None
+
+    def run(code, env_id=None, timeout=None, *, imports=None, deadline=None):
+        events.append(("run", repl.process, code, timeout, imports, deadline))
+        assert repl.process is None
+        repl.process = request_process
+        return {
+            "env": 7,
+            "proofState": 8,
+            "messages": [],
+            "sorries": [{"goal": "False", "proofState": 9}],
+            "tactics": [{"proofState": 10, "text": "exact False.elim"}],
+        }
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "run", run)
+
+    response = repl.run_disposable("example : False := by sorry", deadline=23.0)
+
+    assert response == {
+        "messages": [],
+        "sorries": [{"goal": "False"}],
+        "tactics": [{"text": "exact False.elim"}],
+    }
+    assert events == [
+        ("close", stale_process),
+        ("run", None, "example : False := by sorry", None, None, 23.0),
+        ("close", request_process),
+    ]
+    assert repl.process is None
+
+
+def test_run_disposable_closes_after_delegate_error(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    stale_process = object()
+    request_process = object()
+    repl.process = stale_process
+    closed = []
+
+    def close():
+        closed.append(repl.process)
+        repl.process = None
+
+    def fail(*args, **kwargs):
+        assert repl.process is None
+        repl.process = request_process
+        raise RuntimeError("request failed")
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "run", fail)
+
+    with pytest.raises(RuntimeError, match="request failed"):
+        repl.run_disposable("#check Nat", timeout=1)
+
+    assert closed == [stale_process, request_process]
+    assert repl.process is None
+
+
+def test_run_disposable_preserves_structured_import_execution(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    descriptor = object.__new__(repl_core.ResolvedImports)
+    calls = []
+
+    monkeypatch.setattr(repl, "close", lambda: setattr(repl, "process", None))
+
+    def run_with_imports(code, imports, *, deadline, deadline_error):
+        calls.append((code, imports, deadline))
+        repl.process = object()
+        return {
+            "env": 17,
+            "messages": [],
+            "sorries": [{"goal": "False", "proofState": 18}],
+        }
+
+    monkeypatch.setattr(repl, "_run_with_imports_once", run_with_imports)
+
+    response = repl.run_disposable(
+        "example : False := by sorry",
+        imports=descriptor,
+        timeout=2,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("example : False := by sorry", descriptor)
+    assert response == {
+        "messages": [],
+        "sorries": [{"goal": "False"}],
+    }
+    assert repl.process is None
 
 
 class _PipeProcess:

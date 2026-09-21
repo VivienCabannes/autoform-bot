@@ -1,8 +1,9 @@
-"""Persistent, node-local owner of Autoform's Lean REPL and LSP processes.
+"""Node-local owner of Autoform's disposable REPL and persistent LSP processes.
 
 This is an internal runtime rather than a third MCP server.  The public
 ``autoform-repl`` and ``autoform-lsp`` stdio servers proxy their four tools to
-this process through a private Unix-domain socket.
+this process through a private Unix-domain socket.  REPL project pools retain
+only admission slots between calls; each call owns and reaps its Lean child.
 """
 
 from __future__ import annotations
@@ -362,7 +363,11 @@ class ProjectResourceCache(Generic[T]):
                     {
                         "project_dir": str(root),
                         "active": entry.active,
-                        "valid": not entry.invalid,
+                        "valid": not entry.invalid
+                        and (
+                            self._is_valid is None
+                            or self._is_valid(entry.resource)
+                        ),
                         "idle_seconds": round(max(0.0, now - entry.last_used), 3),
                     }
                     for root, entry in sorted(
@@ -371,6 +376,27 @@ class ProjectResourceCache(Generic[T]):
                 ],
                 "creating": sorted(str(root) for root in self._creating),
             }
+
+    @contextmanager
+    def inspect(self, project_dir: str) -> Iterator[T | None]:
+        """Lease an existing resource without replacing invalid state."""
+        root = resolve_lean_project_dir(project_dir)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("project resource cache is closed")
+            entry = self._entries.get(root)
+            if entry is None:
+                resource = None
+            else:
+                entry.active += 1
+                self._active_leases += 1
+                entry.last_used = self._clock()
+                resource = entry.resource
+        try:
+            yield resource
+        finally:
+            if resource is not None:
+                self._release(root, resource)
 
     def state(self, project_dir: str) -> str:
         """Return ``cold``, ``warming``, or ``warm`` without creating state."""
@@ -945,7 +971,7 @@ class ProjectResourceCache(Generic[T]):
 
 
 class LeanRuntimeServices:
-    """Runtime dispatch and ownership for all shared Lean subprocesses."""
+    """Runtime dispatch for disposable REPL children and persistent LSP sessions."""
 
     def __init__(
         self,
@@ -982,9 +1008,10 @@ class LeanRuntimeServices:
 
         self.repl_projects = ProjectResourceCache(
             repl_factory or default_repl_factory,
-            lambda pool: pool.shutdown(),
+            lambda pool: pool.shutdown_until_clean(),
             max_entries=self.config.repl_project_limit,
             idle_seconds=self.config.idle_seconds,
+            is_valid=lambda pool: pool.is_usable(),
             start_sweeper=start_sweepers,
         )
         self.lsp_projects = ProjectResourceCache(
@@ -1054,7 +1081,7 @@ class LeanRuntimeServices:
                 return format_repl_response(response)
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
-            with self.repl_projects.lease(project_dir, create=False) as pool:
+            with self.repl_projects.inspect(project_dir) as pool:
                 state = "warm" if pool is not None else self.repl_projects.state(project_dir)
                 return {
                     "state": state,

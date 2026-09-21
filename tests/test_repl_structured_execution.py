@@ -401,7 +401,7 @@ def test_structured_imports_require_a_resolver_issued_descriptor(tmp_path):
 
 @pytest.mark.real_lean
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
-def test_real_structured_import_execution_is_one_shot(tmp_path):
+def test_real_repl_execution_is_disposable_across_structured_and_plain_calls(tmp_path):
     project = tmp_path / "fixture"
     project.mkdir()
     (project / "lean-toolchain").write_text(
@@ -473,11 +473,25 @@ srcDir = "src"
             timeout=120,
         )
         assert worker.process is None
+        plain_first = pool.run(
+            "def PlainOnly : Nat := 41\n#check PlainOnly",
+            timeout=120,
+        )
+        assert worker.process is None
+        plain_second = pool.run("#check PlainOnly", timeout=120)
+        assert worker.process is None
     finally:
         pool.shutdown()
 
-    assert len(starts) == 2
+    assert len(starts) == 4
+    assert "env" not in first
+    assert "env" not in second
+    assert "env" not in plain_first
+    assert "env" not in plain_second
     assert first["messages"][0]["data"] == "Fixture.localValue : Nat"
     assert second["messages"][0]["data"] == "Fixture.localValue : Nat"
     assert second["messages"][1]["severity"] == "error"
     assert "Unknown identifier `RequestOnly`" in second["messages"][1]["data"]
+    assert plain_first["messages"][0]["data"] == "PlainOnly : Nat"
+    assert plain_second["messages"][0]["severity"] == "error"
+    assert "Unknown identifier `PlainOnly`" in plain_second["messages"][0]["data"]

@@ -6,6 +6,7 @@ memory monitoring, automatic restart, and multi-snippet chaining.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import random
@@ -80,7 +81,7 @@ def _kill_subprocesses(
                 try:
                     process.kill()
                 except (AttributeError, OSError):
-                    return
+                    pass
         parent_reaped = False
         try:
             process.wait(timeout=REPL_ABORT_TERM_SECONDS)
@@ -93,12 +94,35 @@ def _kill_subprocesses(
             try:
                 process.kill()
             except (AttributeError, OSError):
-                return
+                pass
         if not parent_reaped:
             try:
                 process.wait(timeout=REPL_ABORT_KILL_SECONDS)
-            except (OSError, subprocess.TimeoutExpired):
-                logger.warning("timed out reaping an aborted Lean REPL process")
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "timed out reaping an aborted Lean REPL process"
+                ) from error
+            except OSError:
+                pass
+        deadline = time.monotonic() + REPL_ABORT_KILL_SECONDS
+        while True:
+            try:
+                os.killpg(process_group_id, 0)
+            except AttributeError:
+                break
+            except OSError as error:
+                if error.errno == errno.ESRCH:
+                    break
+                if error.errno != errno.EPERM:
+                    raise RuntimeError(
+                        "failed to verify Lean REPL process-group cleanup"
+                    ) from error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "timed out terminating the Lean REPL process group"
+                )
+            time.sleep(min(0.01, remaining))
         return
 
     try:
@@ -564,11 +588,16 @@ class LeanRepl:
 
     def close(self) -> None:
         """Close the Lean REPL process."""
-        process, self.process = self.process, None
-        process_group_id, self._process_group_id = self._process_group_id, None
+        process = self.process
+        process_group_id = self._process_group_id
         try:
             if process is not None:
-                _kill_subprocesses(process, process_group_id)
+                _kill_subprocesses(
+                    process,
+                    process_group_id or getattr(process, "pid", None),
+                )
+            self.process = None
+            self._process_group_id = None
         finally:
             self._base_env_id = None
             self._project_fingerprint = None
@@ -600,6 +629,27 @@ class LeanRepl:
     def get_memory_usage(self) -> float:
         """Return memory usage in GB."""
         return _get_process_memory_gb(self.process)
+
+    def run_disposable(
+        self,
+        code: str,
+        timeout: float | None = None,
+        *,
+        imports: ResolvedImports | None = None,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Run one public call in a fresh process and discard its handles."""
+        try:
+            self.close()
+            response = self.run(
+                code,
+                timeout=timeout,
+                imports=imports,
+                deadline=deadline,
+            )
+            return _without_process_handles(response)
+        finally:
+            self.close()
 
     def run(
         self,
