@@ -78,6 +78,8 @@ RUNTIME_SAFETY_SECONDS = 30.0
 # an inactive project must be replaced first.
 LSP_STARTUP_BUDGET = 60.0
 LSP_CLOSE_BUDGET = 65.0
+RESOURCE_CLEANUP_RETRY_INITIAL_SECONDS = 0.05
+RESOURCE_CLEANUP_RETRY_MAX_SECONDS = 5.0
 
 
 class ProjectResourceBusyError(TimeoutError):
@@ -357,7 +359,11 @@ class ProjectResourceCache(Generic[T]):
                     {
                         "project_dir": str(root),
                         "active": entry.active,
-                        "valid": not entry.invalid,
+                        "valid": not entry.invalid
+                        and (
+                            self._is_valid is None
+                            or self._is_valid(entry.resource)
+                        ),
                         "idle_seconds": round(max(0.0, now - entry.last_used), 3),
                     }
                     for root, entry in sorted(
@@ -933,10 +939,18 @@ class ProjectResourceCache(Generic[T]):
             raise
 
     def _safe_close(self, resource: T) -> None:
-        try:
-            self._close_resource(resource)
-        except Exception:
-            logger.exception("failed to close Lean project resource")
+        delay = RESOURCE_CLEANUP_RETRY_INITIAL_SECONDS
+        while True:
+            try:
+                self._close_resource(resource)
+                return
+            except Exception:
+                # Returning here would drop the only cache-owned reference and
+                # allow a replacement project process to start. Cleanup methods
+                # are required to be idempotent, so retain ownership and retry.
+                logger.exception("failed to close Lean project resource; retrying")
+                time.sleep(delay)
+                delay = min(delay * 2, RESOURCE_CLEANUP_RETRY_MAX_SECONDS)
 
 
 class LeanRuntimeServices:
@@ -980,6 +994,7 @@ class LeanRuntimeServices:
             lambda pool: pool.shutdown(),
             max_entries=self.config.repl_project_limit,
             idle_seconds=self.config.idle_seconds,
+            is_valid=lambda pool: pool.is_usable(),
             start_sweeper=start_sweepers,
         )
         self.lsp_projects = ProjectResourceCache(

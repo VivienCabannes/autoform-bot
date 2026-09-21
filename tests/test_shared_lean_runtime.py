@@ -93,6 +93,9 @@ class FakePool:
     def get_memory_usage(self):
         return 0.25
 
+    def is_usable(self):
+        return not self._shutdown
+
     def shutdown(self):
         self._shutdown = True
 
@@ -1151,6 +1154,63 @@ def test_idle_eviction_reserves_its_slot_until_cleanup_finishes(tmp_path):
     assert not eviction.is_alive()
     assert not acquisition.is_alive()
     assert evicted == [1]
+    assert second_started.is_set()
+    assert errors == []
+    cache.close()
+
+
+def test_failed_victim_cleanup_blocks_replacement_until_retry_succeeds(tmp_path):
+    first = make_lake_project(tmp_path, "retry-cleanup-first")
+    second = make_lake_project(tmp_path, "retry-cleanup-second")
+    cleanup_failed = threading.Event()
+    allow_retry = threading.Event()
+    second_started = threading.Event()
+    errors = []
+    close_attempts = 0
+
+    def factory(root):
+        if root == second.resolve():
+            second_started.set()
+        return root
+
+    def close_resource(resource):
+        nonlocal close_attempts
+        if resource != first.resolve():
+            return
+        close_attempts += 1
+        if close_attempts == 1:
+            cleanup_failed.set()
+            raise RuntimeError("transient cleanup failure")
+        assert allow_retry.wait(timeout=2)
+
+    cache = ProjectResourceCache(
+        factory,
+        close_resource,
+        max_entries=1,
+        idle_seconds=1800,
+        start_sweeper=False,
+    )
+    with cache.lease(str(first)):
+        pass
+
+    def lease_second():
+        try:
+            with cache.lease(str(second)):
+                pass
+        except BaseException as error:
+            errors.append(error)
+
+    acquisition = threading.Thread(target=lease_second)
+    acquisition.start()
+    try:
+        assert cleanup_failed.wait(timeout=1)
+        assert not second_started.wait(timeout=0.1)
+    finally:
+        allow_retry.set()
+        acquisition.join(timeout=2)
+
+    assert not acquisition.is_alive()
+    assert close_attempts == 2
     assert second_started.is_set()
     assert errors == []
     cache.close()
