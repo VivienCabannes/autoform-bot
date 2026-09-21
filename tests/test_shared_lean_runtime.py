@@ -159,6 +159,47 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
     assert pools[0]._shutdown is True
 
 
+def test_repl_status_observes_a_poisoned_pool_without_cleaning_it(tmp_path):
+    project = make_lake_project(tmp_path, "poisoned-status")
+    pools = []
+
+    class PoisonablePool(FakePool):
+        def __init__(self, root):
+            super().__init__(root)
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            super().shutdown()
+
+    def create_pool(root):
+        pool = PoisonablePool(root)
+        pools.append(pool)
+        return pool
+
+    services = LeanRuntimeServices(
+        runtime_config(),
+        repl_factory=create_pool,
+        lsp_factory=FakeLsp,
+        start_sweepers=False,
+    )
+    try:
+        services.dispatch(
+            "repl.run",
+            {"project_dir": str(project), "code": "#check Nat", "timeout": None},
+        )
+        pools[0]._shutdown = True
+
+        status = services.dispatch("repl.status", {"project_dir": str(project)})
+
+        assert status["state"] == "warm"
+        assert status["shutdown"] is True
+        assert pools[0].shutdown_calls == 0
+        assert len(pools) == 1
+    finally:
+        services.close()
+
+
 def test_runtime_formats_unknown_repl_outcomes_without_hiding_them(tmp_path):
     project = make_lake_project(tmp_path, "unknown-outcome")
 

@@ -373,6 +373,27 @@ class ProjectResourceCache(Generic[T]):
                 "creating": sorted(str(root) for root in self._creating),
             }
 
+    @contextmanager
+    def inspect(self, project_dir: str) -> Iterator[T | None]:
+        """Lease existing state without validating, replacing, or creating it."""
+        root = resolve_lean_project_dir(project_dir)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("project resource cache is closed")
+            entry = self._entries.get(root)
+            if entry is None:
+                resource = None
+            else:
+                entry.active += 1
+                self._active_leases += 1
+                entry.last_used = self._clock()
+                resource = entry.resource
+        try:
+            yield resource
+        finally:
+            if resource is not None:
+                self._release(root, resource)
+
     def state(self, project_dir: str) -> str:
         """Return ``cold``, ``warming``, or ``warm`` without creating state."""
         root = resolve_lean_project_dir(project_dir)
@@ -1043,7 +1064,7 @@ class LeanRuntimeServices:
                 return format_repl_response(response)
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
-            with self.repl_projects.lease(project_dir, create=False) as pool:
+            with self.repl_projects.inspect(project_dir) as pool:
                 state = "warm" if pool is not None else self.repl_projects.state(project_dir)
                 return {
                     "state": state,
