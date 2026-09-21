@@ -281,24 +281,35 @@ autoform migrate article-ids blueprint --check
 
 `article_id` accepts opaque values in the form `af_` plus 24 lowercase hex
 digits. The planner validates uniqueness, proposes deterministic IDs for
-missing articles, includes exact source hashes, and is strictly read-only.
-Applying plans, moving runtime consumers and claims to durable IDs, and
-preserving publication routes are intentionally deferred to follow-up changes.
+missing articles, includes exact source hashes, and is strictly read-only. Add
+the proposed IDs to the named article frontmatter before claiming those
+articles.
 
 Coordinate temporary cross-machine ownership without modifying the book:
 
 ```bash
 export AUTOFORM_WORKER_ID="agent-name"
-autoform claim acquire "chapter/main-result"
-autoform claim renew "chapter/main-result"
-autoform claim release "chapter/main-result"
+autoform claim acquire chapter/main-result --blueprint blueprint
+autoform claim renew chapter/main-result --blueprint blueprint
+autoform claim release chapter/main-result --blueprint blueprint
+autoform claim acquire --resource lake-build --blueprint blueprint
+autoform claim list
+autoform claim cleanup --blueprint blueprint
 ```
 
-Claims are fail-closed compare-and-swap leases under
-`refs/autoform-claims/` on the Git `origin`; pass `--repo` for another claim
-board. A failed acquire or renew means the caller cannot prove ownership and
-must stop before committing or pushing protected work. Claims do not prove
-mathematical correctness and do not replace branch-level Git CAS.
+Article targets accept a roadmap path or exact `article_id`, then claim the
+durable `article_id`; articles without one are rejected. Treat an `article_id`
+as immutable after its first claim. `--resource` uses a separate namespace for
+shared locks such as builds; acquiring one requires a project or `--blueprint`
+so it cannot collide with an article path. Claims are expiring,
+fail-closed compare-and-swap leases under `refs/autoform-claims/` on the Git
+`origin`. The session defaults to a durable worktree identity. Use `--repo`,
+`--session-id`, or `--scratch` to override those choices, and `--object-format
+sha1|sha256` when an empty remote does not advertise its object format. `list`
+does not mutate the remote. `cleanup` recovers expired or unsafe leases; `--blueprint`
+supplies exact legacy-path mappings and records unknown legacy paths as generic
+tombstones. Permanent legacy blocks and tombstones remain visible in `list`
+after an active lease is released or cleanup completes.
 
 Write the Mermaid dependency graph into the vault, where Obsidian renders it:
 
@@ -385,25 +396,6 @@ The audit API also accepts an already compiled graph. Future orchestration may
 turn its findings into private work items, but the audit itself never enqueues
 work, stamps articles, or creates another graph artifact.
 
-## Claim contract
-
-Claims use canonical `autoform-claim/v1` JSON in orphan commit messages and
-exact observed object IDs as update preconditions. Absent and verifiably expired
-leases may be acquired; live peer leases are refused. Malformed or unreadable
-refs are unverifiable and may not be acquired, renewed, released, or removed by
-cleanup. A heartbeat verifies ownership on entry and permanently records any
-later refusal or transport uncertainty as lost ownership.
-
-A claim key is a slug and digest of any string, not a validated node id, so a
-shared resource is locked the same way a node is. Parallel agents get one Git
-worktree each and serialize `lake build` behind a `lake-build` claim, because
-builds share the elan toolchain and the Mathlib cache even when the checkouts
-are separate.
-
-Claims are temporary operational state, never article frontmatter. Future
-Deicyde workers may share this protocol, but their current continue-uncoordinated
-failure behavior must be removed before they use the canonical claim API.
-
 ## Local runtime doctor
 
 Use the runtime projection and roadmap audit together without contacting any
@@ -447,12 +439,9 @@ and bytes, excluding timestamps, absolute paths, Git state, and operational
 state. Optional Lean locations come from a local lexical scan and do not by
 themselves establish compilation or proof correctness.
 
-Schema v1 retains the graph's path-derived article ID. That is suitable for
-an ephemeral runtime projection and temporary claims, but it is not yet an
-approved durable identity. Queues, reviews, recovery records, PR markers,
-dashboard routes, providers, and logs must not persist against this ID until a
-path-move identity and migration policy is defined. Those records remain private
-and excluded from runtime snapshots and publication.
+Schema v1 carries both the path-derived node ID and the optional durable
+`article_id`. Paths remain navigation identifiers; cross-machine claims use
+`article_id` so moving an article does not change its claim key.
 
 ## Publication contract
 
