@@ -32,6 +32,7 @@ _RUNTIME_FILES = (
     PACKAGE_ROOT / "servers" / "__init__.py",
     Path(__file__).resolve(),
     PACKAGE_ROOT / "servers" / "lean_runtime.py",
+    PACKAGE_ROOT / "servers" / "lsp" / "launcher.py",
     PACKAGE_ROOT / "servers" / "lsp" / "server.py",
     PACKAGE_ROOT / "servers" / "repl" / "__init__.py",
     PACKAGE_ROOT / "servers" / "repl" / "server.py",

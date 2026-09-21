@@ -30,6 +30,14 @@ uv run autoform-lean-runtime stop
 `stop` is graceful: it waits for admitted tool calls and Lean children to
 finish shutting down before a subsequent `start` can replace the runtime.
 
+The LSP session delegates Lean's evolving JSON-RPC protocol to the pinned
+`leanclient` backend. In particular, diagnostics and hover wait on Lean's
+`textDocument/waitForDiagnostics` barrier instead of guessing completion from
+a quiet stdout interval. Autoform still owns admission deadlines, project-path
+validation, a scrubbed Lake environment, and verified process-group cleanup.
+This backend requires Lean 4.24 or newer; Autoform's bundled project pins a
+supported stable release.
+
 The private socket lives below `$XDG_RUNTIME_DIR/autoform`, falling back to a
 uid-specific directory in `/tmp`; the rotating runtime log is beside it.
 `AUTOFORM_RUNTIME_DIR` overrides that location. Node-wide limits are controlled

@@ -43,6 +43,7 @@ def test_runtime_identity_tracks_all_behavior_affecting_modules():
         "servers/__init__.py",
         "servers/lean_client.py",
         "servers/lean_runtime.py",
+        "servers/lsp/launcher.py",
         "servers/lsp/server.py",
         "servers/repl/__init__.py",
         "servers/repl/server.py",
