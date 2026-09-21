@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath
 from . import _directory_binding as directory_binding
 from ._tree_snapshot import (
     BoundDirectoryTree,
+    TreeCaptureLimits,
     TreeSelection,
     TreeSnapshot,
     TreeSnapshotError,
@@ -104,6 +105,7 @@ class BoundProjectSources:
     root: Path
     tree: BoundDirectoryTree
     exclusion_roots: tuple[Path, ...]
+    limits: TreeCaptureLimits = TreeCaptureLimits()
 
     def capture(self) -> IndexedSourceSnapshot:
         excluded = _project_exclusions(
@@ -123,6 +125,7 @@ class BoundProjectSources:
             selection=_lean_tree_selection(
                 excluded,
                 refresh_exclusions=refresh_exclusions,
+                limits=self.limits,
             )
         )
         return _indexed_source_snapshot(self.root, snapshot, excluded)
@@ -168,10 +171,15 @@ def bind_project_sources(
     root: str | Path,
     *,
     exclude_roots: Iterable[str | Path] = (),
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> Iterator[BoundProjectSources]:
     """Retain a Lean root while one or more source snapshots are consumed."""
 
-    bound = open_project_sources(root, exclude_roots=exclude_roots)
+    bound = open_project_sources(
+        root,
+        exclude_roots=exclude_roots,
+        limits=limits,
+    )
     try:
         yield bound
     finally:
@@ -182,6 +190,7 @@ def open_project_sources(
     root: str | Path,
     *,
     exclude_roots: Iterable[str | Path] = (),
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> BoundProjectSources:
     """Open a retained Lean source root; the caller must close it."""
 
@@ -197,11 +206,11 @@ def open_project_sources(
             exclusion_paths,
             root_identity=tree.identity,
         )
-        tree.selection = _lean_tree_selection(excluded)
+        tree.selection = _lean_tree_selection(excluded, limits=limits)
     except BaseException:
         tree.close()
         raise
-    return BoundProjectSources(root_path, tree, exclusion_paths)
+    return BoundProjectSources(root_path, tree, exclusion_paths, limits)
 
 
 def _project_exclusions(
@@ -228,6 +237,7 @@ def _lean_tree_selection(
     excluded: tuple[PurePosixPath, ...],
     *,
     refresh_exclusions: Callable[[], tuple[PurePosixPath, ...]] | None = None,
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> TreeSelection:
     def is_excluded(path: PurePosixPath) -> bool:
         if _lean_path_is_excluded(path, excluded):
@@ -255,6 +265,7 @@ def _lean_tree_selection(
             else None
         ),
         record_omitted=False,
+        limits=limits,
     )
 
 
