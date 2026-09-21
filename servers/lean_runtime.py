@@ -1049,7 +1049,7 @@ class LeanRuntimeServices:
                 effective_timeout = float(timeout)
             if effective_timeout > self.config.max_repl_request_seconds:
                 raise ValueError(
-                    "timeout exceeds the node-wide limit of "
+                    "timeout exceeds the per-installation limit of "
                     f"{self.config.max_repl_request_seconds:g} seconds"
                 )
             deadline = time.monotonic() + effective_timeout
@@ -1441,22 +1441,35 @@ def serve(paths: RuntimePaths) -> None:
                 os.close(lifetime_fd)
 
 
-def _paths_from_args(socket_path: str | None, log_path: str | None) -> RuntimePaths:
+def _paths_from_args(
+    socket_path: str | None,
+    log_path: str | None,
+    lifetime_lock_path: str | None = None,
+) -> RuntimePaths:
     paths = (
         runtime_paths_for_socket(socket_path)
         if socket_path is not None
         else default_runtime_paths()
     )
-    if log_path is None:
+    if log_path is None and lifetime_lock_path is None:
         return paths
-    log = Path(log_path).expanduser()
-    if not log.is_absolute():
-        raise LeanRuntimeError("Lean runtime log path must be absolute")
+    log = paths.log
+    if log_path is not None:
+        log = Path(log_path).expanduser()
+        if not log.is_absolute():
+            raise LeanRuntimeError("Lean runtime log path must be absolute")
+    lifetime_lock = paths.lifetime_lock
+    if lifetime_lock_path is not None:
+        lifetime_lock = Path(lifetime_lock_path).expanduser()
+        if not lifetime_lock.is_absolute():
+            raise LeanRuntimeError("Lean runtime lifetime lock path must be absolute")
+        if lifetime_lock.parent != paths.directory:
+            raise LeanRuntimeError("Lean runtime lifetime lock must be in the runtime directory")
     return RuntimePaths(
         directory=paths.directory,
         socket=paths.socket,
         lock=paths.lock,
-        lifetime_lock=paths.lifetime_lock,
+        lifetime_lock=lifetime_lock,
         log=log,
     )
 
@@ -1465,6 +1478,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", help="override the Unix socket path")
     parser.add_argument("--log", help="override the rotating log path")
+    parser.add_argument("--lifetime-lock", help=argparse.SUPPRESS)
     parser.add_argument(
         "command",
         choices=("serve", "start", "status", "stop"),
@@ -1472,7 +1486,7 @@ def main(argv: list[str] | None = None) -> None:
         default="status",
     )
     args = parser.parse_args(argv)
-    paths = _paths_from_args(args.socket, args.log)
+    paths = _paths_from_args(args.socket, args.log, args.lifetime_lock)
 
     if args.command == "serve":
         serve(paths)
