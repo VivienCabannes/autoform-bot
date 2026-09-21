@@ -69,9 +69,10 @@ The two workflows it writes are `autoform-verify.yml`, a reusable gate that
 validates the Markdown DAG, rebuilds Lean, binds local declaration claims to the
 checked root-package artifacts, and rejects unfinished or unsafe proofs, and
 `blueprint-pages.yml`, which must pass that gate before rendering, building, and
-deploying GitHub Pages. The local gate fails closed on `mathlib: true` until a
-separate Mathlib verifier is installed. Pass `--autoform-ref` to pin the
-installed policy at an immutable commit.
+deploying GitHub Pages. For `mathlib: true`, the local gate requires exact
+`mathlib_declaration` and canonical `mathlib_file` metadata and binds them to
+the manifest-selected Mathlib revision and artifacts. Pass `--autoform-ref` to
+pin the installed policy at an immutable commit.
 
 The verification workflow preflights blueprint claims before installing elan
 or fetching build caches, so an unsupported claim fails before expensive work.

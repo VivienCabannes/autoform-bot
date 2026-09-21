@@ -147,9 +147,33 @@ def test_audit_requires_mathlib_declaration_and_declaration_intent_on_evidenced_
 
     upstream_codes = {code for code, _reason in findings["roadmap/upstream.md"]}
     local_codes = {code for code, _reason in findings["roadmap/local.md"]}
-    assert upstream_codes == {"mathlib-without-declaration", "missing-declaration-intent"}
+    assert upstream_codes == {
+        "mathlib-without-declaration",
+        "mathlib-without-file",
+        "missing-declaration-intent",
+    }
     assert local_codes == {"missing-declaration-intent"}
     assert "roadmap/exposition.md" not in findings
+
+
+def test_audit_rejects_noncanonical_mathlib_source_path(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(
+        blueprint,
+        "upstream.md",
+        declaration="theorem",
+        mathlib="true",
+        mathlib_declaration="Nat.Prime",
+        mathlib_file="Mathlib/../Counterfeit.lean",
+    )
+
+    assert _finding_map(blueprint)["roadmap/upstream.md"] == [
+        (
+            "invalid-mathlib-file",
+            "mathlib_file must be a canonical Mathlib/**/*.lean source path",
+        )
+    ]
 
 
 def test_audit_validates_local_source_links_without_network_access(tmp_path: Path, monkeypatch) -> None:

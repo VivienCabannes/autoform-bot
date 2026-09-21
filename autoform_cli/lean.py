@@ -759,6 +759,32 @@ def declaration_keywords(intent: str | None) -> frozenset[str] | None:
     return _DECLARATION_KEYWORDS.get(kind) if kind is not None else None
 
 
+def mathlib_module_name(source_file: str) -> str | None:
+    """Map a canonical ``Mathlib/**/*.lean`` source path to its module name."""
+
+    if not source_file or "\\" in source_file:
+        return None
+    path = PurePosixPath(source_file)
+    if path.is_absolute() or path.as_posix() != source_file:
+        return None
+    parts = path.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    if parts[0] != "Mathlib" and parts != ("Mathlib.lean",):
+        return None
+    if not parts[-1].endswith(".lean") or parts[-1] == ".lean":
+        return None
+    module_parts = [*parts[:-1], parts[-1][: -len(".lean")]]
+    if not module_parts or module_parts[0] != "Mathlib":
+        return None
+    for part in module_parts:
+        if not part or not (part[0].isalpha() or part[0] == "_"):
+            return None
+        if any(not (character.isalnum() or character in "_'") for character in part):
+            return None
+    return ".".join(module_parts)
+
+
 @dataclass(frozen=True, slots=True)
 class SourceLinker:
     """Build permalinks into the project's Lean sources."""
@@ -863,6 +889,7 @@ __all__ = [
     "detect_ref",
     "detect_repository_url",
     "index_project",
+    "mathlib_module_name",
     "project_source_revision",
     "snapshot_project_sources",
 ]

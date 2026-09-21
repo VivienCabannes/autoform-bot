@@ -127,10 +127,13 @@ mathematics.
    a prerequisite the proof needs but the statement does not. Keep roadmap,
    coverage, and source links under other headings.
 7. Search the pinned Mathlib checkout before planning new work. Set
-   `mathlib: true` only for an exact verified upstream result; record partial or
+   `mathlib: true` only for an exact verified upstream result, and record both
+   its compiled name in `mathlib_declaration` and its canonical defining source
+   such as `mathlib_file: Mathlib/Data/Nat/Prime/Defs.lean`. Record partial or
    uncertain candidates as notes, never as formalization status. The generated
-   local artifact gate rejects `mathlib: true` until a separate Mathlib
-   verification gate is installed.
+   local artifact gate binds these claims to the manifest revision, Lake artifacts,
+   and kernel ownership. It trusts local Mathlib artifacts and traces against
+   coordinated fabrication. It is not cryptographic or hostile-cache attestation.
 8. Reconcile every page whose claims this work has just invalidated. That means
    the coarse milestone pages and the coverage contract, and also the two
    landing pages Setup wrote before any scope existed: `blueprint/README.md`

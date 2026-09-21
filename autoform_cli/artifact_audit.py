@@ -1,9 +1,14 @@
-"""Bind local blueprint claims to the root-package artifacts checked by CI.
+"""Bind blueprint claims to the Lean and Mathlib artifacts checked by CI.
 
-The verifier retains bounded snapshots across its build and kernel audit.  It
-detects observable repository races, but it is not a sandbox: repository-owned
-Lake code and a malicious same-user process capable of an exact ABA restoration
-are outside this gate's threat boundary.
+The verifier retains bounded snapshots across its build and kernel audit. For
+Mathlib claims it verifies the canonical Git revision and source blob, asks
+Lake to rehash the selected build, checks the trace's output descriptors, and
+binds the declaration and loaded OLean path in the kernel. This is an integrity
+check within a boundary that trusts pinned Lean/Lake/Git/GitHub/TLS and trusts
+local Mathlib artifacts and traces against coordinated fabrication. It is not
+cryptographic or hostile-cache attestation. Repository-owned Lake code and a
+malicious same-user process capable of exact ABA restoration are also outside
+the boundary.
 """
 
 from __future__ import annotations
@@ -22,9 +27,10 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path, PurePosixPath
 
 from ._directory_binding import RetainedDirectory, lexical_absolute_path, open_directory
@@ -36,7 +42,7 @@ from ._tree_snapshot import (
     TreeSnapshotError,
 )
 from .graph import GraphValidationError, load_graph
-from .lean import declaration_kind, declaration_names
+from .lean import declaration_kind, declaration_names, mathlib_module_name
 
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -51,13 +57,25 @@ _MAX_ARCHIVE_NAME_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 100_000
 _MAX_ROOT_MODULES = 100_000
 _MAX_TARGETS = 100_000
+_MAX_MATHLIB_MODULES = 4_096
+_MAX_MANIFEST_PACKAGES = 10_000
 _MAX_DIRECTORY_ENTRIES = 100_000
 _MAX_PROJECT_INPUT_BYTES = 256 * 1024 * 1024
+_MAX_MATHLIB_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_REMOTE_REPOSITORY_BYTES = 256 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_NAME_LENGTH = 1024
 _DEFAULT_DEADLINE_SECONDS = 110 * 60
 _QUERY_BATCH_SIZE = 128
+_HASH_BATCH_SIZE = 64
 _TOP_LEVEL_NAME = re.compile(r'^name\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$')
+_FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
+_LAKE_HASH = re.compile(r"[0-9a-f]{16}")
+_MANIFEST_VERSION = re.compile(r"(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)(?:-.+)?")
+_CANONICAL_MATHLIB_URL = "https://github.com/leanprover-community/mathlib4.git"
+_CANONICAL_MATHLIB_URLS = frozenset(
+    {_CANONICAL_MATHLIB_URL, _CANONICAL_MATHLIB_URL.removesuffix(".git")}
+)
 _FILE_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_NOFOLLOW", 0)
@@ -125,6 +143,9 @@ class BlueprintTarget:
     article_path: str
     name: str
     expected_kind: str
+    owner: str = "root"
+    expected_module: str | None = None
+    source_file: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,11 +155,13 @@ class ArtifactAuditSummary:
     root_package: str
     root_modules: tuple[str, ...]
     target_count: int
+    mathlib_modules: tuple[str, ...] = ()
 
     def message(self) -> str:
         return (
             f"artifact audit clean: {len(self.root_modules)} root-package module(s), "
-            f"{self.target_count} local blueprint declaration claim(s)"
+            f"{self.target_count} blueprint declaration claim(s), "
+            f"{len(self.mathlib_modules)} Mathlib module(s)"
         )
 
 
@@ -219,7 +242,20 @@ class _ArchiveSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _ProjectInputSnapshot:
+    manifest: bytes
     files: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MathlibManifest:
+    packages_dir: PurePosixPath
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MathlibArtifactEvidence:
+    olean_paths: tuple[tuple[str, str], ...]
+    snapshot: _ArtifactSetSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +319,7 @@ def modules_from_archive(archive: Path, root_package: str) -> tuple[str, ...]:
 
 
 def targets_from_blueprint(blueprint: Path) -> tuple[BlueprintTarget, ...]:
-    """Load bounded local declaration claims from a valid graph."""
+    """Load bounded local and Mathlib declaration claims from a valid graph."""
 
     try:
         graph = load_graph(blueprint)
@@ -298,17 +334,24 @@ def targets_from_blueprint(blueprint: Path) -> tuple[BlueprintTarget, ...]:
         except ValueError as exc:
             raise AuditInputError(f"{node_id}: article path escapes the blueprint") from exc
 
-        if node.mathlib:
-            raise AuditInputError(
-                f"{article_path}: Mathlib verification gate is not installed; "
-                "cannot verify mathlib: true"
-            )
         local_names = declaration_names(node.lean or "")
+        mathlib_names = declaration_names(node.mathlib_declaration or "") if node.mathlib else ()
         if (node.statement_formalized or node.proof_formalized) and not local_names and not node.mathlib:
             raise AuditInputError(
                 f"{article_path}: formalized local work has no lean declaration target"
             )
-        if not local_names:
+        if node.mathlib and not mathlib_names:
+            raise AuditInputError(
+                f"{article_path}: mathlib is true but mathlib_declaration is missing"
+            )
+        mathlib_module = None
+        if node.mathlib:
+            mathlib_module = mathlib_module_name(node.mathlib_file or "")
+            if mathlib_module is None:
+                raise AuditInputError(
+                    f"{article_path}: mathlib_file must be a canonical Mathlib/**/*.lean source path"
+                )
+        if not local_names and not mathlib_names:
             continue
 
         expected_kind = declaration_kind(node.declaration)
@@ -319,6 +362,18 @@ def targets_from_blueprint(blueprint: Path) -> tuple[BlueprintTarget, ...]:
         for name in local_names:
             _validate_lean_name(name, article_path)
             targets.append(BlueprintTarget(article_path, name, expected_kind))
+        for name in mathlib_names:
+            _validate_lean_name(name, article_path)
+            targets.append(
+                BlueprintTarget(
+                    article_path,
+                    name,
+                    expected_kind,
+                    owner="mathlib",
+                    expected_module=mathlib_module,
+                    source_file=node.mathlib_file,
+                )
+            )
         if len(targets) > _MAX_TARGETS:
             raise AuditInputError(f"blueprint exceeds declaration target limit {_MAX_TARGETS}")
 
@@ -327,8 +382,10 @@ def targets_from_blueprint(blueprint: Path) -> tuple[BlueprintTarget, ...]:
             targets,
             key=lambda target: (
                 target.article_path,
+                target.owner,
                 target.name,
                 target.expected_kind,
+                target.expected_module or "",
             ),
         )
     )
@@ -356,17 +413,47 @@ def preflight_blueprint(blueprint: Path) -> int:
 def render_probe(
     modules: tuple[str, ...],
     targets: tuple[BlueprintTarget, ...] = (),
+    mathlib_oleans: Mapping[str, str] | None = None,
 ) -> str:
     """Render the Lean kernel probe for root declarations and roadmap claims."""
 
     if not modules:
         raise AuditInputError("refusing to render an empty kernel-trust audit")
-    imports = "\n".join(f"import {module}" for module in modules)
+    olean_paths = dict(mathlib_oleans or {})
+    required_mathlib_modules = {
+        target.expected_module
+        for target in targets
+        if target.owner == "mathlib" and target.expected_module is not None
+    }
+    missing_mathlib_modules = required_mathlib_modules - set(olean_paths)
+    if missing_mathlib_modules:
+        missing = ", ".join(sorted(missing_mathlib_modules))
+        raise AuditInputError(
+            "Mathlib blueprint modules lack validated build artifacts: " + missing
+        )
+    unexpected_mathlib_modules = set(olean_paths) - required_mathlib_modules
+    if unexpected_mathlib_modules:
+        unexpected = ", ".join(sorted(unexpected_mathlib_modules))
+        raise AuditInputError("unexpected validated Mathlib build artifacts: " + unexpected)
+    imports = "\n".join(
+        f"import {module}" for module in sorted(set(modules) | required_mathlib_modules)
+    )
     root_names = ", ".join(_lean_name(module) for module in modules)
     local_targets = ", ".join(
         f"({json.dumps(target.article_path, ensure_ascii=False)}, {_lean_name(target.name)}, "
         f"{json.dumps(target.expected_kind)})"
         for target in targets
+        if target.owner == "root"
+    )
+    mathlib_targets = ", ".join(
+        f"({json.dumps(target.article_path, ensure_ascii=False)}, {_lean_name(target.name)}, "
+        f"{json.dumps(target.expected_kind)}, {_lean_name(target.expected_module or '')})"
+        for target in targets
+        if target.owner == "mathlib"
+    )
+    mathlib_artifacts = ", ".join(
+        f"({_lean_name(module)}, {json.dumps(path, ensure_ascii=False)})"
+        for module, path in sorted(olean_paths.items())
     )
     probe = f"""{imports}
 import Lean.Util.CollectAxioms
@@ -375,6 +462,7 @@ import Lean.Meta.Instances
 import Lean.OriginalConstKind
 import Lean.Structure
 import Lean.Class
+import Lean.Util.Path
 
 open Lean Elab Command
 
@@ -406,6 +494,8 @@ private def matchesDeclarationKind
 run_cmd do
   let rootModules : List Name := [{root_names}]
   let localTargets : List (String × Name × String) := [{local_targets}]
+  let mathlibTargets : List (String × Name × String × Name) := [{mathlib_targets}]
+  let mathlibArtifacts : List (Name × String) := [{mathlib_artifacts}]
   let allowed : List Name := [``propext, ``Classical.choice, ``Quot.sound]
   let env ← getEnv
   let mut badTargets := false
@@ -425,6 +515,31 @@ run_cmd do
       unless matchesDeclarationKind env declName expectedKind do
         badTargets := true
         logError m!"{{article}}: declaration {{declName}} does not have expected kind {{expectedKind}}"
+  for (article, declName, expectedKind, expectedModule) in mathlibTargets do
+    if env.find? declName |>.isNone then
+      badTargets := true
+      logError m!"{{article}}: Mathlib declaration does not exist: {{declName}}"
+    else
+      match declaringModule? env declName with
+      | none =>
+          badTargets := true
+          logError m!"{{article}}: Mathlib declaration has no declaring module: {{declName}}"
+      | some moduleName =>
+          if rootModules.contains moduleName then
+            badTargets := true
+            logError m!"{{article}}: Mathlib declaration {{declName}} is owned by root module {{moduleName}}"
+          if moduleName != expectedModule then
+            badTargets := true
+            logError m!"{{article}}: Mathlib declaration {{declName}} belongs to {{moduleName}}, not {{expectedModule}}"
+      unless matchesDeclarationKind env declName expectedKind do
+        badTargets := true
+        logError m!"{{article}}: declaration {{declName}} does not have expected kind {{expectedKind}}"
+  for (moduleName, expectedPath) in mathlibArtifacts do
+    let actualPath ← IO.FS.realPath (← Lean.findOLean moduleName)
+    let expectedPath ← IO.FS.realPath expectedPath
+    unless actualPath.normalize == expectedPath.normalize do
+      badTargets := true
+      logError m!"Mathlib module {{moduleName}} loaded from {{actualPath}}, not validated artifact {{expectedPath}}"
   let mut checked : Nat := 0
   let mut badSafety : Array Name := #[]
   let mut badAxioms : Array (Name × Name) := #[]
@@ -507,6 +622,55 @@ def _run_artifact_audit(
             project = _open_project_tree(lean_root)
             stack.callback(project.close)
             project_inputs = _capture_project_inputs(project)
+            mathlib_targets = tuple(target for target in targets if target.owner == "mathlib")
+            mathlib_modules = tuple(
+                sorted(
+                    {
+                        target.expected_module
+                        for target in mathlib_targets
+                        if target.expected_module is not None
+                    }
+                )
+            )
+            if len(mathlib_modules) > _MAX_MATHLIB_MODULES:
+                raise AuditInputError(
+                    f"blueprint exceeds Mathlib module limit {_MAX_MATHLIB_MODULES}"
+                )
+            mathlib_manifest: _MathlibManifest | None = None
+            mathlib_checkout: BoundDirectoryTree | None = None
+            mathlib_sources: _ArtifactSetSnapshot | None = None
+            mathlib_build_roots: tuple[PurePosixPath, ...] = ()
+            if mathlib_modules:
+                mathlib_manifest = _mathlib_manifest_from_bytes(project_inputs.manifest)
+                mathlib_checkout = _open_mathlib_checkout(project, mathlib_manifest)
+                stack.callback(mathlib_checkout.close)
+                _validate_mathlib_checkout(
+                    mathlib_checkout,
+                    mathlib_manifest,
+                    deadline,
+                    environment=environment,
+                )
+                _verify_canonical_mathlib_revision(
+                    private,
+                    mathlib_manifest.revision,
+                    deadline,
+                    environment=environment,
+                )
+                mathlib_sources = _capture_mathlib_sources(
+                    mathlib_checkout,
+                    tuple(
+                        sorted(
+                            {
+                                target.source_file
+                                for target in mathlib_targets
+                                if target.source_file is not None
+                            }
+                        )
+                    ),
+                    mathlib_manifest.revision,
+                    deadline,
+                    environment=environment,
+                )
 
             config_path = private / "lake-config.toml"
             _checked_command(
@@ -571,11 +735,44 @@ def _run_artifact_audit(
                 root_package,
                 environment=environment,
             )
+            mathlib_evidence: _MathlibArtifactEvidence | None = None
+            if mathlib_checkout is not None:
+                mathlib_paths = _query_mathlib_artifact_paths(
+                    project.root,
+                    mathlib_checkout.root,
+                    mathlib_modules,
+                    deadline,
+                    environment=environment,
+                )
+                mathlib_build_roots = _mathlib_build_roots(
+                    mathlib_checkout.root,
+                    mathlib_paths,
+                )
+                _validate_mathlib_checkout(
+                    mathlib_checkout,
+                    mathlib_manifest,
+                    deadline,
+                    environment=environment,
+                    allowed_build_roots=mathlib_build_roots,
+                )
+                mathlib_evidence = _inspect_mathlib_artifacts(
+                    mathlib_checkout,
+                    mathlib_paths,
+                    mathlib_targets,
+                    private,
+                    project.root,
+                    deadline,
+                    environment=environment,
+                )
 
             probe = private / "probe.lean"
             _write_private_file(
                 probe,
-                render_probe(archive_snapshot.modules, targets).encode("utf-8"),
+                render_probe(
+                    archive_snapshot.modules,
+                    targets,
+                    dict(mathlib_evidence.olean_paths) if mathlib_evidence else {},
+                ).encode("utf-8"),
             )
             probe_evidence = _open_bound_file(
                 probe,
@@ -605,6 +802,39 @@ def _run_artifact_audit(
                 )
                 if final_artifacts != root_evidence:
                     raise AuditInputError("root-package artifacts changed during artifact validation")
+                if mathlib_checkout is not None:
+                    assert mathlib_manifest is not None
+                    assert mathlib_sources is not None
+                    assert mathlib_evidence is not None
+                    _validate_mathlib_checkout(
+                        mathlib_checkout,
+                        mathlib_manifest,
+                        deadline,
+                        environment=environment,
+                        allowed_build_roots=mathlib_build_roots,
+                    )
+                    final_mathlib_sources = _capture_mathlib_sources(
+                        mathlib_checkout,
+                        tuple(path for path, _digest in mathlib_sources.digests),
+                        mathlib_manifest.revision,
+                        deadline,
+                        environment=environment,
+                    )
+                    if final_mathlib_sources != mathlib_sources:
+                        raise AuditInputError(
+                            "Mathlib source modules changed during artifact validation"
+                        )
+                    final_mathlib_artifacts = _capture_artifact_set(
+                        mathlib_checkout,
+                        tuple(path for path, _digest in mathlib_evidence.snapshot.digests),
+                        expected_digests=dict(mathlib_evidence.snapshot.digests),
+                        label="Mathlib",
+                        maximum_total_bytes=_MAX_MATHLIB_ARTIFACT_BYTES,
+                    )
+                    if final_mathlib_artifacts != mathlib_evidence.snapshot:
+                        raise AuditInputError(
+                            "Mathlib artifacts changed during artifact validation"
+                        )
                 final_blueprint = _capture_blueprint(blueprint_tree)
                 if final_blueprint.generation_revision != blueprint_snapshot.generation_revision:
                     raise AuditInputError("blueprint changed during artifact validation")
@@ -615,6 +845,7 @@ def _run_artifact_audit(
             root_package=root_package,
             root_modules=archive_snapshot.modules,
             target_count=len(targets),
+            mathlib_modules=mathlib_modules,
         )
 
 
@@ -626,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if len(arguments) == 2 and arguments[0] == "preflight":
             count = preflight_blueprint(Path(arguments[1]))
-            print(f"artifact preflight clean: {count} local blueprint declaration claim(s)")
+            print(f"artifact preflight clean: {count} blueprint declaration claim(s)")
             return 0
         if len(arguments) == 3 and arguments[0] == "verify":
             summary = run_artifact_audit(*(Path(value) for value in arguments[1:]))
@@ -1182,13 +1413,74 @@ def _open_project_tree(lean_root: Path) -> BoundDirectoryTree:
 
 
 def _capture_project_inputs(tree: BoundDirectoryTree) -> _ProjectInputSnapshot:
+    manifest_evidence = _open_bound_file(
+        tree.root / "lake-manifest.json",
+        "Lean project lake-manifest.json",
+        _MAX_MANIFEST_BYTES,
+        collect=True,
+    )
+    try:
+        if manifest_evidence.data is None:
+            raise AuditInputError("Lean project lake-manifest.json was not captured")
+        manifest_bytes = manifest_evidence.data
+        packages_dir = _manifest_packages_dir(manifest_bytes)
+
+        def inside_packages(path: PurePosixPath) -> bool:
+            return path == packages_dir or packages_dir in path.parents
+
+        snapshot = _capture_project_tree(tree, inside_packages=inside_packages)
+        manifest_evidence.verify()
+    finally:
+        manifest_evidence.close()
+    files = dict(snapshot.files)
+    if files.get("lake-manifest.json") != manifest_bytes:
+        raise AuditInputError("Lean project lake-manifest.json changed while inputs were captured")
+    aliases = _snapshot_aliases(snapshot)
+    for path in files:
+        _require_canonical_snapshot_path(aliases, path, f"Lean project input {path}")
+    control_limits = {
+        "lean-toolchain": _MAX_TOOLCHAIN_BYTES,
+        "lake-manifest.json": _MAX_MANIFEST_BYTES,
+        "lakefile.lean": _MAX_CONFIG_BYTES,
+        "lakefile.toml": _MAX_CONFIG_BYTES,
+    }
+    for name, maximum in control_limits.items():
+        if name in files and len(files[name]) > maximum:
+            raise AuditInputError(f"Lean project {name} exceeds {maximum} bytes")
+    for name in ("lean-toolchain", "lake-manifest.json"):
+        _require_snapshot_file(snapshot, aliases, name, f"Lean project {name}")
+    lakefiles = [name for name in ("lakefile.lean", "lakefile.toml") if name in files]
+    if len(lakefiles) != 1:
+        raise AuditInputError("Lean project must contain exactly one regular lakefile.lean or lakefile.toml")
+    _require_snapshot_file(snapshot, aliases, lakefiles[0], "Lean project lakefile")
+    if not files["lean-toolchain"].strip():
+        raise AuditInputError("Lean project lean-toolchain is empty")
+    _reject_file_aliases(tuple(files))
+    return _ProjectInputSnapshot(
+        manifest=manifest_bytes,
+        files=tuple(
+            (path, hashlib.sha256(data).hexdigest())
+            for path, data in sorted(snapshot.files)
+        ),
+    )
+
+
+def _capture_project_tree(
+    tree: BoundDirectoryTree,
+    *,
+    inside_packages: Callable[[PurePosixPath], bool],
+) -> TreeSnapshot:
     def included(path: PurePosixPath, _mode: int) -> bool:
         return (
             len(path.parts) == 1 and path.name in _PROJECT_CONTROL_FILES
         ) or path.suffix == ".lean"
 
     def descended(path: PurePosixPath) -> bool:
-        return bool(path.parts) and path.parts[0] not in _PROJECT_IGNORED_DIRECTORIES
+        return (
+            bool(path.parts)
+            and path.parts[0] not in _PROJECT_IGNORED_DIRECTORIES
+            and not inside_packages(path)
+        )
 
     def byte_limit(path: PurePosixPath) -> int:
         if path.name == "lean-toolchain" and len(path.parts) == 1:
@@ -1214,37 +1506,473 @@ def _capture_project_inputs(tree: BoundDirectoryTree) -> _ProjectInputSnapshot:
     if issues:
         path, reason = issues[0]
         raise AuditInputError(f"unsafe Lean project input {path}: {reason}")
-    files = dict(snapshot.files)
-    aliases = _snapshot_aliases(snapshot)
-    for path in files:
-        _require_canonical_snapshot_path(aliases, path, f"Lean project input {path}")
-    control_limits = {
-        "lean-toolchain": _MAX_TOOLCHAIN_BYTES,
-        "lake-manifest.json": _MAX_MANIFEST_BYTES,
-        "lakefile.lean": _MAX_CONFIG_BYTES,
-        "lakefile.toml": _MAX_CONFIG_BYTES,
-    }
-    for name, maximum in control_limits.items():
-        if name in files and len(files[name]) > maximum:
-            raise AuditInputError(f"Lean project {name} exceeds {maximum} bytes")
-    for name in ("lean-toolchain", "lake-manifest.json"):
-        _require_snapshot_file(snapshot, aliases, name, f"Lean project {name}")
-    lakefiles = [name for name in ("lakefile.lean", "lakefile.toml") if name in files]
-    if len(lakefiles) != 1:
-        raise AuditInputError("Lean project must contain exactly one regular lakefile.lean or lakefile.toml")
-    _require_snapshot_file(snapshot, aliases, lakefiles[0], "Lean project lakefile")
-    if not files["lean-toolchain"].strip():
-        raise AuditInputError("Lean project lean-toolchain is empty")
-    manifest = _decode_json(files["lake-manifest.json"], "Lake manifest", "lake-manifest.json")
+    return snapshot
+
+
+def _manifest_packages_dir(data: bytes) -> PurePosixPath:
+    manifest = _decode_json(data, "Lake manifest", "lake-manifest.json")
     if not isinstance(manifest, dict):
         raise AuditInputError("Lake manifest must be a JSON object")
-    _reject_file_aliases(tuple(files))
-    return _ProjectInputSnapshot(
-        tuple(
-            (path, hashlib.sha256(data).hexdigest())
-            for path, data in sorted(snapshot.files)
+    return _safe_manifest_path(manifest.get("packagesDir", ".lake/packages"), "Lake packagesDir")
+
+
+def _mathlib_manifest_from_bytes(data: bytes) -> _MathlibManifest:
+    manifest = _decode_json(data, "Lake manifest", "lake-manifest.json")
+    if not isinstance(manifest, dict):
+        raise AuditInputError("Lake manifest must be a JSON object")
+    version_fields = [
+        (field, manifest[field])
+        for field in ("version", "schemaVersion")
+        if field in manifest
+    ]
+    if len(version_fields) != 1:
+        raise AuditInputError(
+            "Lake manifest must contain exactly one version or schemaVersion field"
         )
+    _field, version = version_fields[0]
+    if not isinstance(version, str):
+        raise AuditInputError("Lake manifest schema version must be a semantic version")
+    match = _MANIFEST_VERSION.fullmatch(version)
+    if match is None:
+        raise AuditInputError("Lake manifest schema version must be a semantic version")
+    major = int(match.group("major"))
+    minor = int(match.group("minor"))
+    if not ((major == 0 and minor >= 7) or major == 1):
+        raise AuditInputError(f"unsupported Lake manifest schema version {version!r}")
+
+    packages = manifest.get("packages")
+    if not isinstance(packages, list):
+        raise AuditInputError("Lake manifest must contain a package list")
+    if len(packages) > _MAX_MANIFEST_PACKAGES:
+        raise AuditInputError(
+            f"Lake manifest exceeds package limit {_MAX_MANIFEST_PACKAGES}"
+        )
+    if any(not isinstance(entry, dict) for entry in packages):
+        raise AuditInputError("Lake manifest package entries must be JSON objects")
+    entries = [entry for entry in packages if entry.get("name") == "mathlib"]
+    if len(entries) != 1:
+        raise AuditInputError("Lake manifest must contain exactly one mathlib package entry")
+    entry = entries[0]
+    if entry.get("type") != "git":
+        raise AuditInputError("Lake manifest Mathlib entry must be a Git dependency")
+    if entry.get("scope") not in {None, "", "leanprover-community"}:
+        raise AuditInputError("Lake manifest Mathlib entry has an unsupported package scope")
+    if entry.get("url") not in _CANONICAL_MATHLIB_URLS:
+        raise AuditInputError(
+            "Lake manifest Mathlib URL must identify the canonical mathlib4 repository"
+        )
+    revision = entry.get("rev")
+    if not isinstance(revision, str) or _FULL_GIT_REVISION.fullmatch(revision) is None:
+        raise AuditInputError("Lake manifest Mathlib revision must be a full lowercase 40-hex commit")
+    if entry.get("subDir") is not None:
+        raise AuditInputError("Lake manifest Mathlib dependency must not select a subdirectory")
+    packages_dir = _manifest_packages_dir(data)
+    return _MathlibManifest(packages_dir=packages_dir, revision=revision)
+
+
+def _safe_manifest_path(value: object, label: str) -> PurePosixPath:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        raise AuditInputError(f"{label} must be a nonempty confined relative path")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or any(
+            part in {"", ".", ".."}
+            or not _is_nfc_text(part)
+            or not _portable_component(part)
+            for part in path.parts
+        )
+    ):
+        raise AuditInputError(f"{label} must be a canonical confined relative path")
+    return path
+
+
+def _open_mathlib_checkout(
+    project: BoundDirectoryTree,
+    manifest: _MathlibManifest,
+) -> BoundDirectoryTree:
+    project.verify()
+    checkout_path = project.root.joinpath(*manifest.packages_dir.parts, "mathlib")
+    try:
+        binding = open_directory(checkout_path)
+    except OSError as exc:
+        raise AuditInputError("cannot retain the manifest-selected Mathlib checkout") from exc
+    try:
+        project_parts = project.root.parts
+        checkout_parts = checkout_path.parts
+        if checkout_parts[: len(project_parts)] != project_parts:
+            raise AuditInputError("Mathlib checkout escapes the Lean project")
+        root_index = len(project_parts) - 1
+        if binding.identities[root_index] != project.identity:
+            raise AuditInputError("Mathlib checkout is not below the retained Lean project")
+        for index in range(len(project_parts), len(checkout_parts)):
+            _require_canonical_name(
+                binding.descriptors[index - 1],
+                checkout_parts[index],
+                "Mathlib checkout",
+            )
+        identity = binding.identity
+    finally:
+        binding.close()
+    try:
+        checkout = BoundDirectoryTree(checkout_path, expected_identity=identity)
+    except TreeSnapshotError as exc:
+        raise AuditInputError(f"cannot retain Mathlib checkout: {exc}") from exc
+    project.verify()
+    return checkout
+
+
+def _validate_mathlib_checkout(
+    checkout: BoundDirectoryTree,
+    manifest: _MathlibManifest,
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+    allowed_build_roots: tuple[PurePosixPath, ...] | None = None,
+) -> None:
+    checkout.verify()
+    try:
+        git_directory = open_directory(checkout.root / ".git")
+    except OSError as exc:
+        raise AuditInputError("Mathlib checkout .git must be a real directory") from exc
+    git_directory.close()
+
+    config = _git_command(
+        checkout.root,
+        ("config", "--local", "--name-only", "--list", "-z"),
+        deadline,
+        "Mathlib local Git configuration",
+        environment=environment,
+    ).stdout
+    try:
+        config_keys = [value.decode("utf-8").casefold() for value in config.split(b"\0") if value]
+    except UnicodeError as exc:
+        raise AuditInputError("Mathlib local Git configuration is not UTF-8") from exc
+    unsafe_config = sorted(
+        key
+        for key in config_keys
+        if key.startswith(("filter.", "include.", "includeif."))
+        or key
+        in {
+            "core.attributesfile",
+            "core.fsmonitor",
+            "core.fsmonitorhookversion",
+            "core.hookspath",
+            "extensions.worktreeconfig",
+        }
     )
+    if unsafe_config:
+        raise AuditInputError(
+            "Mathlib checkout has unsafe local Git configuration: "
+            + ", ".join(unsafe_config)
+        )
+    attributes = checkout.root / ".git/info/attributes"
+    try:
+        attributes_status = os.lstat(attributes)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise AuditInputError("cannot inspect Mathlib private attributes file") from exc
+    else:
+        if not stat.S_ISREG(attributes_status.st_mode) or attributes_status.st_size:
+            raise AuditInputError("Mathlib checkout has a private attributes file")
+
+    top = _git_text(
+        checkout.root,
+        ("rev-parse", "--show-toplevel"),
+        deadline,
+        "Mathlib Git top level",
+        environment=environment,
+    )
+    if lexical_absolute_path(top) != checkout.root:
+        raise AuditInputError("Mathlib package directory is not the Git checkout root")
+    head = _git_text(
+        checkout.root,
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        deadline,
+        "Mathlib checkout HEAD",
+        environment=environment,
+    )
+    if head != manifest.revision:
+        raise AuditInputError(
+            f"Mathlib checkout HEAD {head!r} does not match manifest revision {manifest.revision!r}"
+        )
+    status = _git_command(
+        checkout.root,
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+        deadline,
+        "Mathlib checkout status",
+        environment=environment,
+    ).stdout
+    if status:
+        raise AuditInputError("Mathlib checkout has tracked or visible untracked changes")
+    if allowed_build_roots is not None:
+        untracked = _git_command(
+            checkout.root,
+            ("ls-files", "--others", "-z"),
+            deadline,
+            "Mathlib untracked-file inventory",
+            environment=environment,
+        ).stdout
+        try:
+            untracked_paths = tuple(
+                PurePosixPath(value.decode("utf-8"))
+                for value in untracked.split(b"\0")
+                if value
+            )
+        except UnicodeError as exc:
+            raise AuditInputError("Mathlib untracked-file inventory is not UTF-8") from exc
+        allowed_roots = (PurePosixPath(".lake"), *allowed_build_roots)
+        for path in untracked_paths:
+            if not any(path == root or root in path.parents for root in allowed_roots):
+                raise AuditInputError("Mathlib checkout has untracked files outside build roots")
+    flags = _git_command(
+        checkout.root,
+        ("ls-files", "-v", "-z"),
+        deadline,
+        "Mathlib index flags",
+        environment=environment,
+    ).stdout
+    if any(not record.startswith(b"H ") for record in flags.split(b"\0") if record):
+        raise AuditInputError("Mathlib checkout uses nonstandard Git index flags")
+    checkout.verify()
+
+
+def _git_command(
+    checkout: Path,
+    arguments: Sequence[str],
+    deadline: _Deadline,
+    label: str,
+    *,
+    environment: Mapping[str, str] | None,
+) -> _CommandResult:
+    return _checked_command(
+        ["git", *arguments],
+        cwd=checkout,
+        deadline=deadline,
+        label=label,
+        environment=environment,
+    )
+
+
+def _git_text(
+    checkout: Path,
+    arguments: Sequence[str],
+    deadline: _Deadline,
+    label: str,
+    *,
+    environment: Mapping[str, str] | None,
+) -> str:
+    value = _git_command(
+        checkout,
+        arguments,
+        deadline,
+        label,
+        environment=environment,
+    ).stdout
+    try:
+        text = value.decode("utf-8").strip()
+    except UnicodeError as exc:
+        raise AuditInputError(f"{label} is not UTF-8") from exc
+    if "\x00" in text:
+        raise AuditInputError(f"{label} contains a null byte")
+    return text
+
+
+def _verify_canonical_mathlib_revision(
+    private: Path,
+    revision: str,
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+) -> None:
+    if _FULL_GIT_REVISION.fullmatch(revision) is None:
+        raise AuditInputError("canonical Mathlib revision is not a full lowercase commit")
+    repository = private / "canonical-mathlib.git"
+    _checked_command(
+        ["git", "init", "--bare", "--quiet", str(repository)],
+        cwd=private,
+        deadline=deadline,
+        label="private canonical Mathlib repository initialization",
+        environment=environment,
+    )
+    _git_command(
+        repository,
+        (
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--depth=1",
+            "--filter=blob:none",
+            _CANONICAL_MATHLIB_URL,
+            revision,
+        ),
+        deadline,
+        "canonical Mathlib revision fetch",
+        environment=environment,
+    )
+    fetched = _git_text(
+        repository,
+        ("rev-parse", "--verify", "FETCH_HEAD^{commit}"),
+        deadline,
+        "canonical Mathlib fetched revision",
+        environment=environment,
+    )
+    if fetched != revision:
+        raise AuditInputError("canonical Mathlib fetch did not resolve the manifest revision")
+    _validate_private_repository_size(repository)
+
+
+def _validate_private_repository_size(repository: Path) -> None:
+    selection = TreeSelection(
+        include=lambda _path, mode: not stat.S_ISREG(mode),
+        descend=lambda _path: True,
+        placeholder=lambda _path, mode: stat.S_ISREG(mode),
+        record_omitted=False,
+        limits=_PROJECT_INPUT_LIMITS,
+    )
+    try:
+        tree = BoundDirectoryTree(repository, selection=selection)
+        before = tree.capture()
+    except TreeSnapshotError as exc:
+        raise AuditInputError(f"canonical Mathlib fetch exceeds repository limits: {exc}") from exc
+    try:
+        issues = before.unsupported_entries()
+        if issues:
+            path, reason = issues[0]
+            raise AuditInputError(f"unsafe canonical Mathlib repository entry {path}: {reason}")
+        total = 0
+        for relative in before.placeholders:
+            try:
+                metadata = os.lstat(repository.joinpath(*PurePosixPath(relative).parts))
+            except OSError as exc:
+                raise AuditInputError("canonical Mathlib repository changed during inspection") from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                raise AuditInputError("canonical Mathlib repository changed during inspection")
+            total += metadata.st_size
+            if total > _MAX_REMOTE_REPOSITORY_BYTES:
+                raise AuditInputError(
+                    "canonical Mathlib repository exceeds "
+                    f"{_MAX_REMOTE_REPOSITORY_BYTES} bytes"
+                )
+        after = tree.capture()
+        if after.generation_revision != before.generation_revision:
+            raise AuditInputError("canonical Mathlib repository changed during inspection")
+    finally:
+        tree.close()
+
+
+def _capture_mathlib_sources(
+    checkout: BoundDirectoryTree,
+    source_files: tuple[str, ...],
+    revision: str,
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+) -> _ArtifactSetSnapshot:
+    targets = {PurePosixPath(path) for path in source_files}
+    prefixes = {
+        PurePosixPath(*path.parts[:length])
+        for path in targets
+        for length in range(1, len(path.parts))
+    }
+    target_keys = {
+        tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
+        for path in targets
+    }
+    prefix_keys = {
+        tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
+        for path in prefixes
+    }
+    selected_keys = target_keys | prefix_keys
+
+    def normalized(path: PurePosixPath) -> tuple[str, ...]:
+        return tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
+
+    selection = TreeSelection(
+        include=lambda path, _mode: normalized(path) in selected_keys,
+        descend=lambda path: normalized(path) in prefix_keys,
+        byte_limit=lambda _path: _MAX_SOURCE_BYTES,
+        record_omitted=False,
+        limits=_PROJECT_INPUT_LIMITS,
+    )
+    try:
+        snapshot = checkout.capture(selection=selection)
+    except TreeSnapshotError as exc:
+        raise AuditInputError(f"cannot capture Mathlib source modules: {exc}") from exc
+    issues = snapshot.unsupported_entries()
+    if issues:
+        path, reason = issues[0]
+        raise AuditInputError(f"unsafe Mathlib source entry {path}: {reason}")
+    aliases = _snapshot_aliases(snapshot)
+    files = dict(snapshot.files)
+    for path in sorted(source_files):
+        _require_snapshot_file(snapshot, aliases, path, f"Mathlib source {path}")
+    blobs = _mathlib_tree_blobs(
+        checkout.root,
+        source_files,
+        revision,
+        deadline,
+        environment=environment,
+    )
+    digests: list[tuple[str, str]] = []
+    for path in sorted(source_files):
+        data = files[path]
+        git_blob = hashlib.sha1(
+            b"blob " + str(len(data)).encode("ascii") + b"\0" + data
+        ).hexdigest()
+        if blobs.get(path) != git_blob:
+            raise AuditInputError(
+                f"Mathlib source {path} does not match its blob at revision {revision}"
+            )
+        digests.append((path, hashlib.sha256(data).hexdigest()))
+    return _ArtifactSetSnapshot(snapshot.generation_revision, tuple(digests))
+
+
+def _mathlib_tree_blobs(
+    checkout: Path,
+    source_files: tuple[str, ...],
+    revision: str,
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for start in range(0, len(source_files), _QUERY_BATCH_SIZE):
+        batch = source_files[start : start + _QUERY_BATCH_SIZE]
+        output = _git_command(
+            checkout,
+            ("ls-tree", "-rz", "--full-tree", revision, "--", *batch),
+            deadline,
+            "Mathlib revision source inventory",
+            environment=environment,
+        ).stdout
+        for record in output.split(b"\0"):
+            if not record:
+                continue
+            try:
+                header, raw_path = record.split(b"\t", 1)
+                mode, kind, oid = header.decode("ascii").split(" ")
+                path = raw_path.decode("utf-8")
+            except (UnicodeError, ValueError) as exc:
+                raise AuditInputError("Git returned malformed Mathlib source metadata") from exc
+            if (
+                mode not in {"100644", "100755"}
+                or kind != "blob"
+                or _FULL_GIT_REVISION.fullmatch(oid) is None
+                or path not in batch
+                or path in result
+            ):
+                raise AuditInputError("Git returned ambiguous Mathlib source metadata")
+            result[path] = oid
+        missing = set(batch) - set(result)
+        if missing:
+            raise AuditInputError(
+                "manifest revision does not contain claimed Mathlib source: "
+                + ", ".join(sorted(missing))
+            )
+    return result
 
 
 def _snapshot_paths(snapshot: TreeSnapshot) -> tuple[str, ...]:
@@ -1404,7 +2132,9 @@ def _capture_artifact_set(
     project: BoundDirectoryTree,
     paths: tuple[str, ...],
     *,
-    expected_digests: Mapping[str, str],
+    expected_digests: Mapping[str, str] | None,
+    label: str = "root-package",
+    maximum_total_bytes: int | None = None,
 ) -> _ArtifactSetSnapshot:
     targets = {PurePosixPath(path) for path in paths}
     prefixes = {
@@ -1422,15 +2152,16 @@ def _capture_artifact_set(
     try:
         before = project.capture(selection=selection)
     except TreeSnapshotError as exc:
-        raise AuditInputError(f"cannot capture root-package artifacts: {exc}") from exc
+        raise AuditInputError(f"cannot capture {label} artifacts: {exc}") from exc
     issues = before.unsupported_entries()
     if issues:
         path, reason = issues[0]
-        raise AuditInputError(f"unsafe root-package artifact {path}: {reason}")
+        raise AuditInputError(f"unsafe {label} artifact {path}: {reason}")
     aliases = _snapshot_aliases(before)
     digests: list[tuple[str, str]] = []
+    total_bytes = 0
     for relative in sorted(paths):
-        _require_snapshot_placeholder(before, aliases, relative)
+        _require_snapshot_placeholder(before, aliases, relative, label=label)
         suffix = PurePosixPath(relative).suffix
         maximum = {
             ".ilean": _MAX_ILEAN_BYTES,
@@ -1438,28 +2169,37 @@ def _capture_artifact_set(
             ".trace": _MAX_TRACE_BYTES,
         }.get(suffix)
         if maximum is None:
-            raise AuditInputError(f"unsupported root-package artifact extension: {relative}")
+            raise AuditInputError(f"unsupported {label} artifact extension: {relative}")
         evidence = _open_bound_file(
             project.root.joinpath(*PurePosixPath(relative).parts),
-            f"root-package {suffix[1:].upper()} artifact {relative}",
+            f"{label} {suffix[1:].upper()} artifact {relative}",
             maximum,
             collect=False,
             require_canonical=False,
         )
         try:
             digest = evidence.digest
+            total_bytes += evidence.signature.size
+            if maximum_total_bytes is not None and total_bytes > maximum_total_bytes:
+                raise AuditInputError(
+                    f"{label} artifacts exceed {maximum_total_bytes} bytes"
+                )
         finally:
             evidence.close()
-        expected = expected_digests.get(relative)
-        if expected is None or digest != expected:
-            raise AuditInputError(f"live root-package artifact does not match packed bytes: {relative}")
+        if expected_digests is not None:
+            expected = expected_digests.get(relative)
+            if expected is None or digest != expected:
+                detail = "packed bytes" if label == "root-package" else "expected bytes"
+                raise AuditInputError(
+                    f"live {label} artifact does not match {detail}: {relative}"
+                )
         digests.append((relative, digest))
     try:
         after = project.capture(selection=selection)
     except TreeSnapshotError as exc:
-        raise AuditInputError(f"cannot revalidate root-package artifacts: {exc}") from exc
+        raise AuditInputError(f"cannot revalidate {label} artifacts: {exc}") from exc
     if after.generation_revision != before.generation_revision:
-        raise AuditInputError("root-package artifacts changed while they were inspected")
+        raise AuditInputError(f"{label} artifacts changed while they were inspected")
     return _ArtifactSetSnapshot(before.generation_revision, tuple(digests))
 
 
@@ -1467,10 +2207,302 @@ def _require_snapshot_placeholder(
     snapshot: TreeSnapshot,
     aliases: Mapping[tuple[str, ...], tuple[str, ...]],
     relative: str,
+    *,
+    label: str = "root-package",
 ) -> None:
-    _require_canonical_snapshot_path(aliases, relative, "root-package artifact")
+    _require_canonical_snapshot_path(aliases, relative, f"{label} artifact")
     if relative not in snapshot.placeholders:
-        raise AuditInputError(f"root-package artifact is missing, aliased, or not regular: {relative}")
+        raise AuditInputError(
+            f"{label} artifact is missing, aliased, or not regular: {relative}"
+        )
+
+
+def _query_mathlib_artifact_paths(
+    project: Path,
+    checkout: Path,
+    modules: tuple[str, ...],
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+) -> dict[str, tuple[Path, Path]]:
+    if len(modules) > _MAX_MATHLIB_MODULES:
+        raise AuditInputError(
+            f"blueprint exceeds Mathlib module limit {_MAX_MATHLIB_MODULES}"
+        )
+    results: dict[str, tuple[Path, Path]] = {}
+    for start in range(0, len(modules), _QUERY_BATCH_SIZE):
+        batch = modules[start : start + _QUERY_BATCH_SIZE]
+        targets = [
+            f"@mathlib/+{module}:{extension}"
+            for module in batch
+            for extension in ("ilean", "olean")
+        ]
+        completed = _checked_command(
+            ["lake", "--rehash", "--json", "query", *targets],
+            cwd=project,
+            deadline=deadline,
+            label="Lake Mathlib artifact query",
+            environment=environment,
+        )
+        try:
+            lines = completed.stdout.decode("utf-8").splitlines()
+        except UnicodeError as exc:
+            raise AuditInputError("Lake returned non-UTF-8 Mathlib artifact metadata") from exc
+        if len(lines) != len(targets):
+            raise AuditInputError("Lake returned an unexpected number of Mathlib artifact paths")
+        for index, module in enumerate(batch):
+            paths: list[Path] = []
+            for offset, extension in enumerate(("ilean", "olean")):
+                value = _decode_json(
+                    lines[index * 2 + offset].encode("utf-8"),
+                    "Lake Mathlib artifact query",
+                    module,
+                )
+                if not isinstance(value, str) or "\x00" in value:
+                    raise AuditInputError(f"Lake returned no Mathlib {extension} for {module!r}")
+                candidate = Path(value)
+                if any(part in {"", ".", ".."} for part in candidate.parts):
+                    raise AuditInputError(
+                        f"Lake returned a noncanonical Mathlib artifact path for {module!r}"
+                    )
+                candidate = lexical_absolute_path(
+                    candidate if candidate.is_absolute() else project / candidate
+                )
+                parts = _module_parts(module, module)
+                _require_within(candidate, checkout, f"Mathlib {extension} artifact")
+                suffix = ("lib", "lean", *parts[:-1], f"{parts[-1]}.{extension}")
+                if len(candidate.parts) < len(suffix) or candidate.parts[-len(suffix) :] != suffix:
+                    raise AuditInputError(
+                        f"Mathlib {extension} path does not match module {module!r}"
+                    )
+                paths.append(candidate)
+            if paths[1] != paths[0].with_suffix(".olean") or module in results:
+                raise AuditInputError(f"Lake returned ambiguous Mathlib artifacts for {module!r}")
+            results[module] = (paths[0], paths[1])
+    return results
+
+
+def _mathlib_build_roots(
+    checkout: Path,
+    artifact_paths: Mapping[str, tuple[Path, Path]],
+) -> tuple[PurePosixPath, ...]:
+    roots: set[PurePosixPath] = set()
+    for module, (ilean, _olean) in artifact_paths.items():
+        relative = PurePosixPath(ilean.relative_to(checkout).as_posix())
+        parts = _module_parts(module, module)
+        suffix = ("lib", "lean", *parts[:-1], f"{parts[-1]}.ilean")
+        root_parts = relative.parts[: -len(suffix)]
+        if not root_parts:
+            raise AuditInputError(f"Mathlib build root is empty for module {module!r}")
+        roots.add(PurePosixPath(*root_parts))
+    if len(roots) != 1:
+        raise AuditInputError("Mathlib modules resolve through multiple build roots")
+    return tuple(sorted(roots, key=lambda path: path.as_posix()))
+
+
+def _inspect_mathlib_artifacts(
+    checkout: BoundDirectoryTree,
+    artifact_paths: Mapping[str, tuple[Path, Path]],
+    targets: tuple[BlueprintTarget, ...],
+    private: Path,
+    project: Path,
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+) -> _MathlibArtifactEvidence:
+    claimed: dict[str, set[str]] = {}
+    for target in targets:
+        if target.owner != "mathlib" or target.expected_module is None:
+            continue
+        claimed.setdefault(target.expected_module, set()).add(target.name)
+    if set(artifact_paths) != set(claimed):
+        raise AuditInputError("Mathlib artifact set does not match blueprint modules")
+
+    relative_paths: list[str] = []
+    for module, (ilean, olean) in sorted(artifact_paths.items()):
+        for artifact in (ilean, olean, ilean.with_suffix(".trace")):
+            _require_within(artifact, checkout.root, "Mathlib build artifact")
+            relative_paths.append(artifact.relative_to(checkout.root).as_posix())
+    if len(set(relative_paths)) != len(relative_paths):
+        raise AuditInputError("multiple Mathlib modules resolve to the same build artifact")
+    initial = _capture_artifact_set(
+        checkout,
+        tuple(sorted(relative_paths)),
+        expected_digests=None,
+        label="Mathlib",
+        maximum_total_bytes=_MAX_MATHLIB_ARTIFACT_BYTES,
+    )
+
+    lake_hashes: dict[Path, str] = {}
+    olean_paths: list[tuple[str, str]] = []
+    for module, (ilean, olean) in sorted(artifact_paths.items()):
+        trace_path = ilean.with_suffix(".trace")
+        ilean_evidence = _open_bound_file(
+            ilean,
+            f"Mathlib ILean artifact for {module}",
+            _MAX_ILEAN_BYTES,
+            collect=True,
+            require_canonical=False,
+        )
+        trace_evidence = _open_bound_file(
+            trace_path,
+            f"Mathlib Lake trace for {module}",
+            _MAX_TRACE_BYTES,
+            collect=True,
+            require_canonical=False,
+        )
+        try:
+            metadata = _decode_json(ilean_evidence.data or b"", "Mathlib ILean", str(ilean))
+            actual_module = _module_from_metadata(metadata, ilean.parts, str(ilean))
+            if actual_module != module:
+                raise AuditInputError(
+                    f"Mathlib ILean identifies module {actual_module!r}, not {module!r}"
+                )
+            assert isinstance(metadata, dict)
+            declarations = metadata["decls"]
+            assert isinstance(declarations, dict)
+            missing = claimed[module] - set(declarations)
+            if missing:
+                raise AuditInputError(
+                    f"Mathlib ILean for {module!r} lacks claimed declaration(s): "
+                    + ", ".join(sorted(missing))
+                )
+            trace = _decode_json(
+                trace_evidence.data or b"",
+                "Mathlib Lake trace",
+                str(trace_path),
+            )
+            ilean_hash, olean_hash = _mathlib_trace_hashes(trace, module, str(trace_path))
+            lake_hashes[ilean] = ilean_hash
+            lake_hashes[olean] = olean_hash
+        finally:
+            trace_evidence.close()
+            ilean_evidence.close()
+        olean_paths.append((module, str(olean)))
+
+    helper = private / "lake-content-hash.lean"
+    _write_private_file(helper, _lake_hash_helper_source())
+    observed_hashes = _lake_content_hashes(
+        project,
+        helper,
+        tuple(sorted(lake_hashes, key=str)),
+        deadline,
+        environment=environment,
+    )
+    for path, expected in lake_hashes.items():
+        if observed_hashes.get(path) != expected:
+            raise AuditInputError(
+                f"Mathlib artifact content does not match Lake trace descriptor: {path}"
+            )
+    final = _capture_artifact_set(
+        checkout,
+        tuple(sorted(relative_paths)),
+        expected_digests=dict(initial.digests),
+        label="Mathlib",
+        maximum_total_bytes=_MAX_MATHLIB_ARTIFACT_BYTES,
+    )
+    if final != initial:
+        raise AuditInputError("Mathlib artifacts changed during provenance validation")
+    return _MathlibArtifactEvidence(
+        olean_paths=tuple(olean_paths),
+        snapshot=initial,
+    )
+
+
+def _mathlib_trace_hashes(trace: object, module: str, display: str) -> tuple[str, str]:
+    if not isinstance(trace, dict):
+        raise AuditInputError(f"invalid Mathlib Lake trace metadata: {display}")
+    schema = trace.get("schemaVersion")
+    dep_hash = trace.get("depHash")
+    outputs = trace.get("outputs")
+    if not isinstance(schema, str):
+        raise AuditInputError(f"invalid Mathlib Lake trace metadata: {display}")
+    try:
+        date.fromisoformat(schema)
+    except ValueError as exc:
+        raise AuditInputError(f"invalid Mathlib Lake trace metadata: {display}") from exc
+    if (
+        not isinstance(dep_hash, str)
+        or _LAKE_HASH.fullmatch(dep_hash) is None
+        or not isinstance(outputs, dict)
+    ):
+        raise AuditInputError(f"invalid Mathlib Lake trace metadata: {display}")
+    ilean_output = outputs.get("i")
+    olean_outputs = outputs.get("o")
+    if (
+        not isinstance(ilean_output, str)
+        or re.fullmatch(r"[0-9a-f]{16}\.ilean", ilean_output) is None
+        or not isinstance(olean_outputs, list)
+        or len(olean_outputs) > 64
+        or any(not isinstance(value, str) for value in olean_outputs)
+    ):
+        raise AuditInputError(f"invalid Mathlib Lake trace outputs: {display}")
+    primary_olean = [
+        value
+        for value in olean_outputs
+        if re.fullmatch(r"[0-9a-f]{16}\.olean", value) is not None
+    ]
+    if len(primary_olean) != 1:
+        raise AuditInputError(f"invalid Mathlib Lake trace outputs: {display}")
+    if "synthetic" in trace and trace.get("synthetic") is not False:
+        raise AuditInputError(f"invalid Mathlib Lake trace metadata: {display}")
+    if "inputs" in trace:
+        if not isinstance(trace["inputs"], list):
+            raise AuditInputError(f"invalid Mathlib Lake trace inputs: {display}")
+        strings = set(_json_strings(trace["inputs"]))
+        if f"Module.name: {module}" not in strings:
+            raise AuditInputError(f"Mathlib Lake trace does not identify module {module!r}")
+        if "Package.id?: (some mathlib)" not in strings:
+            raise AuditInputError("Mathlib Lake trace does not identify package id 'mathlib'")
+    return ilean_output[:16], primary_olean[0][:16]
+
+
+def _lake_hash_helper_source() -> bytes:
+    return """import Lake.Build.Trace
+
+open Lake
+
+def main (args : List String) : IO UInt32 := do
+  for path in args do
+    IO.println (toString (← computeFileHash path))
+  return 0
+""".encode("utf-8")
+
+
+def _lake_content_hashes(
+    project: Path,
+    helper: Path,
+    paths: tuple[Path, ...],
+    deadline: _Deadline,
+    *,
+    environment: Mapping[str, str] | None,
+) -> dict[Path, str]:
+    hashes: dict[Path, str] = {}
+    for start in range(0, len(paths), _HASH_BATCH_SIZE):
+        batch = paths[start : start + _HASH_BATCH_SIZE]
+        result = _checked_command(
+            [
+                "lake",
+                "env",
+                "lean",
+                "--trust=0",
+                "--run",
+                str(helper),
+                *(str(path) for path in batch),
+            ],
+            cwd=project,
+            deadline=deadline,
+            label="independent Lake content-hash verification",
+            environment=environment,
+        )
+        try:
+            lines = result.stdout.decode("ascii").splitlines()
+        except UnicodeError as exc:
+            raise AuditInputError("Lake content-hash helper returned non-ASCII output") from exc
+        if len(lines) != len(batch) or any(_LAKE_HASH.fullmatch(line) is None for line in lines):
+            raise AuditInputError("Lake content-hash helper returned malformed output")
+        hashes.update(zip(batch, lines))
+    return hashes
 
 
 def _query_ilean_paths(

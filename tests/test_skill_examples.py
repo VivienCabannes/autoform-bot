@@ -568,7 +568,15 @@ def test_setup_and_roadmap_explain_the_artifact_gate(repo_root: Path) -> None:
     assert "before rendering" in setup
     assert "before installing elan" in setup
     assert "local artifact gate" in roadmap
-    assert "rejects `mathlib: true`" in roadmap
+    for required in (
+        "mathlib_declaration",
+        "mathlib_file: Mathlib/Data/Nat/Prime/Defs.lean",
+        "local Mathlib artifacts and traces",
+        "not cryptographic or hostile-cache attestation",
+    ):
+        assert required in roadmap
+    assert "mathlib_declaration" in setup
+    assert "mathlib_file" in setup
 
 
 def test_verification_gate_is_reused_and_retriggers_on_all_evidence(repo_root: Path) -> None:

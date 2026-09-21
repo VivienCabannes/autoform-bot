@@ -10,6 +10,7 @@ import sys
 import tarfile
 import time
 from pathlib import Path
+from pathlib import PurePosixPath
 from types import ModuleType
 
 import pytest
@@ -223,7 +224,7 @@ def test_blueprint_targets_bind_every_local_claim(helper: ModuleType, tmp_path: 
     assert helper.preflight_blueprint(blueprint) == 2
 
 
-def test_mathlib_claim_fails_closed_until_its_gate_is_installed(
+def test_mathlib_claim_is_bound_to_its_declared_source_module(
     helper: ModuleType, tmp_path: Path
 ) -> None:
     blueprint = _blueprint(tmp_path)
@@ -233,14 +234,554 @@ def test_mathlib_claim_fails_closed_until_its_gate_is_installed(
         "declaration: theorem",
         "mathlib: true",
         "mathlib_declaration: Nat.Prime",
+        "mathlib_file: Mathlib/Data/Nat/Prime/Defs.lean",
     )
 
-    with pytest.raises(helper.AuditInputError, match="Mathlib verification gate is not installed"):
-        helper.targets_from_blueprint(blueprint)
-    with pytest.raises(helper.AuditInputError, match="Mathlib verification gate is not installed"):
-        helper.preflight_blueprint(blueprint)
-    with pytest.raises(helper.AuditInputError, match="Mathlib verification gate is not installed"):
+    targets = helper.targets_from_blueprint(blueprint)
+
+    assert targets == (
+        helper.BlueprintTarget(
+            "roadmap/upstream.md",
+            "Nat.Prime",
+            "theorem",
+            owner="mathlib",
+            expected_module="Mathlib.Data.Nat.Prime.Defs",
+            source_file="Mathlib/Data/Nat/Prime/Defs.lean",
+        ),
+    )
+    assert helper.preflight_blueprint(blueprint) == 1
+    with pytest.raises(helper.AuditInputError, match="Lean project root"):
         helper.run_artifact_audit(blueprint, tmp_path / "missing-project")
+
+
+@pytest.mark.parametrize(
+    ("version_field", "scope", "url"),
+    [
+        ("version", "", "https://github.com/leanprover-community/mathlib4.git"),
+        ("version", "leanprover-community", "https://github.com/leanprover-community/mathlib4"),
+        ("schemaVersion", None, "https://github.com/leanprover-community/mathlib4.git"),
+    ],
+)
+def test_mathlib_manifest_accepts_official_modern_variants(
+    helper: ModuleType,
+    version_field: str,
+    scope: str | None,
+    url: str,
+) -> None:
+    entry: dict[str, object] = {
+        "name": "mathlib",
+        "type": "git",
+        "url": url,
+        "rev": "a" * 40,
+        "subDir": None,
+    }
+    if scope is not None:
+        entry["scope"] = scope
+    manifest = {
+        version_field: "1.2.0" if version_field == "version" else "0.7.1",
+        "packagesDir": ".lake/packages",
+        "packages": [entry],
+    }
+
+    parsed = helper._mathlib_manifest_from_bytes(json.dumps(manifest).encode())
+
+    assert parsed.packages_dir.as_posix() == ".lake/packages"
+    assert parsed.revision == "a" * 40
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("legacy-version", "unsupported Lake manifest schema version"),
+        ("two-versions", "exactly one version or schemaVersion"),
+        ("path", "Git dependency"),
+        ("mirror", "canonical mathlib4 repository"),
+        ("uppercase-revision", "full lowercase 40-hex commit"),
+        ("subdirectory", "must not select a subdirectory"),
+        ("scope", "unsupported package scope"),
+        ("duplicate", "exactly one mathlib"),
+        ("packages-escape", "canonical confined relative path"),
+    ],
+)
+def test_mathlib_manifest_rejects_ambiguous_or_noncanonical_provenance(
+    helper: ModuleType,
+    mutation: str,
+    message: str,
+) -> None:
+    entry: dict[str, object] = {
+        "name": "mathlib",
+        "type": "git",
+        "url": "https://github.com/leanprover-community/mathlib4",
+        "rev": "a" * 40,
+        "subDir": None,
+        "scope": "leanprover-community",
+    }
+    manifest: dict[str, object] = {
+        "version": "1.2.0",
+        "packagesDir": ".lake/packages",
+        "packages": [entry],
+    }
+    if mutation == "legacy-version":
+        manifest["version"] = "0.6.0"
+    elif mutation == "two-versions":
+        manifest["schemaVersion"] = "1.2.0"
+    elif mutation == "path":
+        entry["type"] = "path"
+    elif mutation == "mirror":
+        entry["url"] = "https://example.invalid/mathlib4.git"
+    elif mutation == "uppercase-revision":
+        entry["rev"] = "A" * 40
+    elif mutation == "subdirectory":
+        entry["subDir"] = "Mathlib"
+    elif mutation == "scope":
+        entry["scope"] = "counterfeit"
+    elif mutation == "duplicate":
+        manifest["packages"] = [entry, dict(entry)]
+    elif mutation == "packages-escape":
+        manifest["packagesDir"] = "../packages"
+
+    with pytest.raises(helper.AuditInputError, match=message):
+        helper._mathlib_manifest_from_bytes(json.dumps(manifest).encode())
+
+
+def test_project_input_capture_prunes_custom_manifest_packages_directory(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project"
+    _write(project_path / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
+    _write(project_path / "lakefile.toml", 'name = "Fixture"\n')
+    _write(project_path / "Root.lean", "theorem Root.claim : True := by trivial\n")
+    manifest = {
+        "version": "1.2.0",
+        "packagesDir": "vendor/packages",
+        "packages": [],
+    }
+    _write(project_path / "lake-manifest.json", json.dumps(manifest))
+    _write(
+        project_path / "vendor/packages/mathlib/Counterfeit.lean",
+        "theorem Counterfeit.claim : False := by sorry\n",
+    )
+    _write(project_path / "vendor/packages/mathlib/.git/objects/large", "x" * 1024)
+    project = helper._open_project_tree(project_path)
+    try:
+        snapshot = helper._capture_project_inputs(project)
+    finally:
+        project.close()
+
+    assert {path for path, _digest in snapshot.files} == {
+        "Root.lean",
+        "lake-manifest.json",
+        "lakefile.toml",
+        "lean-toolchain",
+    }
+
+
+def test_mathlib_checkout_and_source_are_bound_to_manifest_commit(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project"
+    checkout_path = project_path / ".lake/packages/mathlib"
+    _write(checkout_path / ".gitignore", "/.lake/\n")
+    _write(
+        checkout_path / "Mathlib/Provenance.lean",
+        "theorem Mathlib.Provenance.claim : True := by trivial\n",
+    )
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.name", "Autoform Test"),
+        ("git", "config", "user.email", "autoform@example.invalid"),
+        ("git", "add", ".gitignore", "Mathlib/Provenance.lean"),
+        ("git", "commit", "-q", "-m", "fixture"),
+    ):
+        result = _run(checkout_path, *command)
+        assert result.returncode == 0, result.stdout + result.stderr
+    revision = _run(checkout_path, "git", "rev-parse", "HEAD").stdout.strip()
+    manifest = helper._MathlibManifest(PurePosixPath(".lake/packages"), revision)
+    project = helper._open_project_tree(project_path)
+    checkout = helper._open_mathlib_checkout(project, manifest)
+    try:
+        helper._validate_mathlib_checkout(
+            checkout,
+            manifest,
+            helper._Deadline.after(10),
+            environment=os.environ,
+        )
+        snapshot = helper._capture_mathlib_sources(
+            checkout,
+            ("Mathlib/Provenance.lean",),
+            revision,
+            helper._Deadline.after(10),
+            environment=os.environ,
+        )
+        assert snapshot.digests[0][0] == "Mathlib/Provenance.lean"
+        _write(checkout_path / ".lake/build/cache-entry", "generated\n")
+        after_build_output = helper._capture_mathlib_sources(
+            checkout,
+            ("Mathlib/Provenance.lean",),
+            revision,
+            helper._Deadline.after(10),
+            environment=os.environ,
+        )
+        assert after_build_output == snapshot
+
+        _write(
+            checkout_path / "Mathlib/Provenance.lean",
+            "theorem Mathlib.Provenance.counterfeit : False := by sorry\n",
+        )
+        with pytest.raises(helper.AuditInputError, match="does not match its blob"):
+            helper._capture_mathlib_sources(
+                checkout,
+                ("Mathlib/Provenance.lean",),
+                revision,
+                helper._Deadline.after(10),
+                environment=os.environ,
+            )
+        with pytest.raises(helper.AuditInputError, match="tracked or visible untracked changes"):
+            helper._validate_mathlib_checkout(
+                checkout,
+                manifest,
+                helper._Deadline.after(10),
+                environment=os.environ,
+            )
+        restored = _run(checkout_path, "git", "checkout", "--", "Mathlib/Provenance.lean")
+        assert restored.returncode == 0, restored.stderr
+        _write(checkout_path / ".git/info/exclude", "Mathlib/Hidden.lean\n")
+        _write(checkout_path / "Mathlib/Hidden.lean", "theorem hidden : True := by trivial\n")
+        with pytest.raises(helper.AuditInputError, match="outside build roots"):
+            helper._validate_mathlib_checkout(
+                checkout,
+                manifest,
+                helper._Deadline.after(10),
+                environment=os.environ,
+                allowed_build_roots=(PurePosixPath(".lake/build"),),
+            )
+    finally:
+        checkout.close()
+        project.close()
+
+
+def test_mathlib_checkout_rejects_unsafe_git_configuration_before_status(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project"
+    checkout_path = project_path / ".lake/packages/mathlib"
+    _write(checkout_path / "Mathlib/Provenance.lean", "theorem claim : True := by trivial\n")
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.name", "Autoform Test"),
+        ("git", "config", "user.email", "autoform@example.invalid"),
+        ("git", "add", "Mathlib/Provenance.lean"),
+        ("git", "commit", "-q", "-m", "fixture"),
+        ("git", "config", "filter.counterfeit.clean", "false"),
+    ):
+        result = _run(checkout_path, *command)
+        assert result.returncode == 0, result.stdout + result.stderr
+    revision = _run(checkout_path, "git", "rev-parse", "HEAD").stdout.strip()
+    project = helper._open_project_tree(project_path)
+    checkout = helper._open_mathlib_checkout(
+        project,
+        helper._MathlibManifest(PurePosixPath(".lake/packages"), revision),
+    )
+    try:
+        with pytest.raises(helper.AuditInputError, match="unsafe local Git configuration"):
+            helper._validate_mathlib_checkout(
+                checkout,
+                helper._MathlibManifest(PurePosixPath(".lake/packages"), revision),
+                helper._Deadline.after(10),
+                environment=os.environ,
+            )
+    finally:
+        checkout.close()
+        project.close()
+
+
+def test_canonical_revision_fetch_is_shallow_filtered_and_hard_coded(
+    helper: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "a" * 40
+    commands: list[tuple[str, ...]] = []
+
+    def completed(arguments, **kwargs):
+        command = tuple(str(value) for value in arguments)
+        commands.append(command)
+        if command[:3] == ("git", "init", "--bare"):
+            Path(command[-1]).mkdir()
+        stdout = (revision + "\n").encode() if "rev-parse" in command else b""
+        return helper._CommandResult(command, 0, stdout, b"")
+
+    monkeypatch.setattr(helper, "_checked_command", completed)
+
+    helper._verify_canonical_mathlib_revision(
+        tmp_path,
+        revision,
+        helper._Deadline.after(10),
+        environment=os.environ,
+    )
+
+    fetch = next(command for command in commands if "fetch" in command)
+    assert "--depth=1" in fetch
+    assert "--filter=blob:none" in fetch
+    assert "https://github.com/leanprover-community/mathlib4.git" in fetch
+    assert revision in fetch
+
+    wrong_private = tmp_path / "wrong"
+    wrong_private.mkdir()
+
+    def wrong_revision(arguments, **kwargs):
+        command = tuple(str(value) for value in arguments)
+        if command[:3] == ("git", "init", "--bare"):
+            Path(command[-1]).mkdir()
+        stdout = ("b" * 40 + "\n").encode() if "rev-parse" in command else b""
+        return helper._CommandResult(command, 0, stdout, b"")
+
+    monkeypatch.setattr(helper, "_checked_command", wrong_revision)
+    with pytest.raises(helper.AuditInputError, match="did not resolve the manifest revision"):
+        helper._verify_canonical_mathlib_revision(
+            wrong_private,
+            revision,
+            helper._Deadline.after(10),
+            environment=os.environ,
+        )
+
+
+def test_mathlib_query_is_batched_rehashed_and_package_qualified(
+    helper: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    checkout = project / ".lake/packages/mathlib"
+    modules = ("Mathlib.Alpha", "Mathlib.Beta")
+    outputs = []
+    for module in modules:
+        stem = checkout / ".lake/build/lib/lean" / Path(*module.split("."))
+        outputs.extend((json.dumps(str(stem.with_suffix(".ilean"))), json.dumps(str(stem.with_suffix(".olean")))))
+    commands: list[tuple[str, ...]] = []
+
+    def completed(arguments, **kwargs):
+        command = tuple(str(value) for value in arguments)
+        commands.append(command)
+        return helper._CommandResult(command, 0, ("\n".join(outputs) + "\n").encode(), b"")
+
+    monkeypatch.setattr(helper, "_checked_command", completed)
+
+    paths = helper._query_mathlib_artifact_paths(
+        project,
+        checkout,
+        modules,
+        helper._Deadline.after(10),
+        environment=os.environ,
+    )
+
+    assert tuple(paths) == modules
+    assert commands == [
+        (
+            "lake",
+            "--rehash",
+            "--json",
+            "query",
+            "@mathlib/+Mathlib.Alpha:ilean",
+            "@mathlib/+Mathlib.Alpha:olean",
+            "@mathlib/+Mathlib.Beta:ilean",
+            "@mathlib/+Mathlib.Beta:olean",
+        )
+    ]
+
+    outputs[0] = json.dumps(str(tmp_path / "outside/Mathlib/Alpha.ilean"))
+    with pytest.raises(helper.AuditInputError, match="escapes its owning directory"):
+        helper._query_mathlib_artifact_paths(
+            project,
+            checkout,
+            modules,
+            helper._Deadline.after(10),
+            environment=os.environ,
+        )
+
+
+def test_mathlib_modules_must_share_one_query_derived_build_root(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    checkout = tmp_path / "mathlib"
+    paths = {
+        "Mathlib.Alpha": (
+            checkout / "first/lib/lean/Mathlib/Alpha.ilean",
+            checkout / "first/lib/lean/Mathlib/Alpha.olean",
+        ),
+        "Mathlib.Beta": (
+            checkout / "second/lib/lean/Mathlib/Beta.ilean",
+            checkout / "second/lib/lean/Mathlib/Beta.olean",
+        ),
+    }
+
+    with pytest.raises(helper.AuditInputError, match="multiple build roots"):
+        helper._mathlib_build_roots(checkout, paths)
+
+
+def test_mathlib_cached_trace_requires_exact_primary_content_descriptors(
+    helper: ModuleType
+) -> None:
+    trace = {
+        "schemaVersion": "2025-09-10",
+        "depHash": "1" * 16,
+        "outputs": {
+            "i": "2" * 16 + ".ilean",
+            "o": ["3" * 16 + ".olean", "4" * 16 + ".olean.server"],
+        },
+    }
+
+    assert helper._mathlib_trace_hashes(trace, "Mathlib.Provenance", "trace") == (
+        "2" * 16,
+        "3" * 16,
+    )
+
+    trace["outputs"]["o"].append("5" * 16 + ".olean")
+    with pytest.raises(helper.AuditInputError, match="trace outputs"):
+        helper._mathlib_trace_hashes(trace, "Mathlib.Provenance", "trace")
+
+
+def test_mathlib_full_trace_requires_module_and_package_ownership(helper: ModuleType) -> None:
+    trace = {
+        "synthetic": False,
+        "schemaVersion": "2025-09-10",
+        "depHash": "1" * 16,
+        "outputs": {"i": "2" * 16 + ".ilean", "o": ["3" * 16 + ".olean"]},
+        "inputs": [
+            ["Module.name: Mathlib.Provenance", "hash"],
+            ["Package.id?: (some mathlib)", "hash"],
+        ],
+    }
+    assert helper._mathlib_trace_hashes(trace, "Mathlib.Provenance", "trace") == (
+        "2" * 16,
+        "3" * 16,
+    )
+
+    trace["inputs"][1][0] = "Package.id?: (some counterfeit)"
+    with pytest.raises(helper.AuditInputError, match="package id 'mathlib'"):
+        helper._mathlib_trace_hashes(trace, "Mathlib.Provenance", "trace")
+
+
+def test_mathlib_artifacts_bind_ilean_declaration_trace_and_olean(
+    helper: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout_path = tmp_path / "mathlib"
+    stem = checkout_path / ".lake/build/lib/lean/Mathlib/Provenance"
+    ilean = stem.with_suffix(".ilean")
+    olean = stem.with_suffix(".olean")
+    _write(
+        ilean,
+        _metadata(
+            "Mathlib.Provenance",
+            declarations={"Mathlib.Provenance.claim": []},
+        ).decode(),
+    )
+    _write(olean, "olean bytes")
+    _write(
+        stem.with_suffix(".trace"),
+        json.dumps(
+            {
+                "schemaVersion": "2025-09-10",
+                "depHash": "1" * 16,
+                "outputs": {
+                    "i": "2" * 16 + ".ilean",
+                    "o": ["3" * 16 + ".olean"],
+                },
+            }
+        ),
+    )
+    target = helper.BlueprintTarget(
+        "roadmap/upstream.md",
+        "Mathlib.Provenance.claim",
+        "theorem",
+        owner="mathlib",
+        expected_module="Mathlib.Provenance",
+        source_file="Mathlib/Provenance.lean",
+    )
+
+    def hashes(_project, _helper_path, paths, _deadline, **_kwargs):
+        return {
+            path: ("2" * 16 if path.suffix == ".ilean" else "3" * 16)
+            for path in paths
+        }
+
+    monkeypatch.setattr(helper, "_lake_content_hashes", hashes)
+    checkout = helper.BoundDirectoryTree(checkout_path)
+    try:
+        (tmp_path / "first").mkdir()
+        evidence = helper._inspect_mathlib_artifacts(
+            checkout,
+            {"Mathlib.Provenance": (ilean, olean)},
+            (target,),
+            tmp_path / "first",
+            tmp_path,
+            helper._Deadline.after(10),
+            environment=os.environ,
+        )
+        assert evidence.olean_paths == (("Mathlib.Provenance", str(olean)),)
+
+        _write(ilean, _metadata("Mathlib.Provenance", declarations={}).decode())
+        (tmp_path / "missing").mkdir()
+        with pytest.raises(helper.AuditInputError, match="lacks claimed declaration"):
+            helper._inspect_mathlib_artifacts(
+                checkout,
+                {"Mathlib.Provenance": (ilean, olean)},
+                (target,),
+                tmp_path / "missing",
+                tmp_path,
+                helper._Deadline.after(10),
+                environment=os.environ,
+            )
+
+        _write(
+            ilean,
+            _metadata(
+                "Mathlib.Provenance",
+                declarations={"Mathlib.Provenance.claim": []},
+            ).decode(),
+        )
+
+        def tamper(_project, _helper_path, paths, _deadline, **_kwargs):
+            _write(olean, "changed after hashing")
+            return hashes(_project, _helper_path, paths, _deadline, **_kwargs)
+
+        monkeypatch.setattr(helper, "_lake_content_hashes", tamper)
+        (tmp_path / "tampered").mkdir()
+        with pytest.raises(helper.AuditInputError, match="does not match expected bytes"):
+            helper._inspect_mathlib_artifacts(
+                checkout,
+                {"Mathlib.Provenance": (ilean, olean)},
+                (target,),
+                tmp_path / "tampered",
+                tmp_path,
+                helper._Deadline.after(10),
+                environment=os.environ,
+            )
+    finally:
+        checkout.close()
+
+
+def test_probe_requires_and_embeds_exact_mathlib_olean_path(helper: ModuleType) -> None:
+    target = helper.BlueprintTarget(
+        "roadmap/upstream.md",
+        "Nat.prime_def_lt",
+        "theorem",
+        owner="mathlib",
+        expected_module="Mathlib.Data.Nat.Prime.Defs",
+        source_file="Mathlib/Data/Nat/Prime/Defs.lean",
+    )
+    with pytest.raises(helper.AuditInputError, match="lack validated build artifacts"):
+        helper.render_probe(("Fixture",), (target,))
+
+    probe = helper.render_probe(
+        ("Fixture",),
+        (target,),
+        {
+            "Mathlib.Data.Nat.Prime.Defs": (
+                "/checkout/.lake/build/lib/lean/Mathlib/Data/Nat/Prime/Defs.olean"
+            )
+        },
+    )
+    assert "import Mathlib.Data.Nat.Prime.Defs" in probe
+    assert "Lean.findOLean moduleName" in probe
+    assert "/checkout/.lake/build/lib/lean/Mathlib/Data/Nat/Prime/Defs.olean" in probe
+    assert "belongs to {moduleName}, not {expectedModule}" in probe
 
 
 def test_archive_rejects_aliases_special_members_and_named_limits(
@@ -775,6 +1316,194 @@ srcDir = "app-src"
     assert translated.returncode == 0, translated.stdout + translated.stderr
     summary = helper.run_artifact_audit(blueprint, project)
     assert summary.root_modules == ("Chosen.Entry", "Chosen.Helper", "Main")
+
+
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
+def test_real_lake_hash_and_kernel_probe_bind_exact_olean(
+    helper: ModuleType, tmp_path: Path
+) -> None:
+    project = tmp_path / "probe-project"
+    project.mkdir()
+    _write(project / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
+    _write(
+        project / "lakefile.toml",
+        'name = "ProbeFixture"\nversion = "0.1.0"\n'
+        'defaultTargets = ["Dependency", "Root"]\n\n'
+        '[[lean_lib]]\nname = "Dependency"\n\n'
+        '[[lean_lib]]\nname = "Root"\n',
+    )
+    _write(project / "Dependency.lean", "theorem Dependency.claim : True := by trivial\n")
+    _write(
+        project / "Root.lean",
+        "theorem Root.claim : True := by trivial\n",
+    )
+    built = _run(project, "lake", "build")
+    assert built.returncode == 0, built.stdout + built.stderr
+    olean = project / ".lake/build/lib/lean/Dependency.olean"
+
+    hash_helper = tmp_path / "lake-content-hash.lean"
+    hash_helper.write_bytes(helper._lake_hash_helper_source())
+    first = helper._lake_content_hashes(
+        project,
+        hash_helper,
+        (olean,),
+        helper._Deadline.after(30),
+        environment=os.environ,
+    )
+    assert len(first[olean]) == 16
+    _write(olean.with_suffix(".olean.hash"), "0" * 16)
+    second = helper._lake_content_hashes(
+        project,
+        hash_helper,
+        (olean,),
+        helper._Deadline.after(30),
+        environment=os.environ,
+    )
+    assert second == first
+
+    target = helper.BlueprintTarget(
+        "roadmap/dependency.md",
+        "Dependency.claim",
+        "theorem",
+        owner="mathlib",
+        expected_module="Dependency",
+        source_file="Mathlib/Dependency.lean",
+    )
+    probe = project / "probe.lean"
+    probe.write_text(
+        helper.render_probe(("Root",), (target,), {"Dependency": str(olean)}),
+        encoding="utf-8",
+    )
+    audited = _run(project, "lake", "env", "lean", "--trust=0", str(probe))
+    assert audited.returncode == 0, audited.stdout + audited.stderr
+
+    wrong_probe = project / "wrong-probe.lean"
+    wrong_probe.write_text(
+        helper.render_probe(
+            ("Root",),
+            (target,),
+            {"Dependency": str(project / ".lake/build/lib/lean/Root.olean")},
+        ),
+        encoding="utf-8",
+    )
+    rejected = _run(project, "lake", "env", "lean", "--trust=0", str(wrong_probe))
+    assert rejected.returncode != 0
+    assert "not validated artifact" in rejected.stdout + rejected.stderr
+
+
+@pytest.mark.parametrize("mutation", [None, "source", "artifact"])
+@pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")
+def test_real_gate_builds_and_verifies_claimed_mathlib_module_not_imported_by_root(
+    helper: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str | None,
+) -> None:
+    project = tmp_path / "project"
+    checkout = project / ".lake/packages/mathlib"
+    checkout.mkdir(parents=True)
+    _write(checkout / ".gitignore", "/.lake/\n/custom-output/\n")
+    _write(
+        checkout / "lakefile.lean",
+        '''import Lake
+open Lake DSL
+package mathlib where
+  buildDir := "custom-output"
+@[default_target]
+lean_lib Mathlib
+''',
+    )
+    _write(
+        checkout / "Mathlib/Provenance.lean",
+        "theorem Mathlib.Provenance.claim : True := by trivial\n",
+    )
+    for command in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.name", "Autoform Test"),
+        ("git", "config", "user.email", "autoform@example.invalid"),
+        ("git", "add", ".gitignore", "lakefile.lean", "Mathlib/Provenance.lean"),
+        ("git", "commit", "-q", "-m", "fixture"),
+    ):
+        result = _run(checkout, *command)
+        assert result.returncode == 0, result.stdout + result.stderr
+    revision = _run(checkout, "git", "rev-parse", "HEAD").stdout.strip()
+
+    _write(project / "lean-toolchain", "leanprover/lean4:v4.32.2\n")
+    _write(
+        project / "lakefile.toml",
+        'name = "Fixture"\nversion = "0.1.0"\ndefaultTargets = ["Root"]\n\n'
+        '[[lean_lib]]\nname = "Root"\n\n'
+        '[[require]]\nname = "mathlib"\n'
+        'git = "https://github.com/leanprover-community/mathlib4.git"\n'
+        f'rev = "{revision}"\n',
+    )
+    _write(project / "Root.lean", "theorem Root.claim : True := by trivial\n")
+    manifest = {
+        "version": "1.2.0",
+        "packagesDir": ".lake/packages",
+        "packages": [
+            {
+                "url": "https://github.com/leanprover-community/mathlib4.git",
+                "type": "git",
+                "subDir": None,
+                "scope": "",
+                "rev": revision,
+                "name": "mathlib",
+                "manifestFile": "lake-manifest.json",
+                "inputRev": revision,
+                "inherited": False,
+                "configFile": "lakefile.lean",
+            }
+        ],
+        "name": "Fixture",
+        "lakeDir": ".lake",
+    }
+    _write(project / "lake-manifest.json", json.dumps(manifest, sort_keys=True) + "\n")
+    blueprint = _blueprint(project)
+    _article(blueprint, "root", "declaration: theorem", "lean: Root.claim")
+    _article(
+        blueprint,
+        "upstream",
+        "declaration: theorem",
+        "mathlib: true",
+        "mathlib_declaration: Mathlib.Provenance.claim",
+        "mathlib_file: Mathlib/Provenance.lean",
+    )
+    claimed_olean = checkout / "custom-output/lib/lean/Mathlib/Provenance.olean"
+    assert "Mathlib" not in (project / "Root.lean").read_text(encoding="utf-8")
+    assert not claimed_olean.exists()
+    monkeypatch.setattr(helper, "_verify_canonical_mathlib_revision", lambda *_args, **_kwargs: None)
+    original_command = helper._checked_command
+
+    def mutate_after_probe(arguments, **kwargs):
+        result = original_command(arguments, **kwargs)
+        if kwargs.get("label") == "Lean artifact probe":
+            if mutation == "source":
+                _write(
+                    checkout / "Mathlib/Provenance.lean",
+                    "theorem Mathlib.Provenance.changed : True := by trivial\n",
+                )
+            elif mutation == "artifact":
+                with claimed_olean.open("ab") as stream:
+                    stream.write(b"changed")
+        return result
+
+    monkeypatch.setattr(helper, "_checked_command", mutate_after_probe)
+
+    if mutation is not None:
+        with pytest.raises(
+            helper.AuditInputError,
+            match="tracked or visible untracked changes|does not match expected bytes",
+        ):
+            helper.run_artifact_audit(blueprint, project)
+        return
+
+    summary = helper.run_artifact_audit(blueprint, project)
+
+    assert summary.root_modules == ("Root",)
+    assert summary.mathlib_modules == ("Mathlib.Provenance",)
+    assert summary.target_count == 2
+    assert claimed_olean.is_file()
 
 
 @pytest.mark.skipif(shutil.which("lake") is None, reason="Lake is not installed")

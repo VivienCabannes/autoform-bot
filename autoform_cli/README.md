@@ -80,6 +80,8 @@ An article asserts only facts a human or agent verified:
 | `statement: formalized` | The Lean statement exists and compiles. |
 | `proof: formalized` | The Lean proof is complete. |
 | `mathlib: true` | The result is upstreamed into Mathlib. |
+| `mathlib_declaration: Ns.decl` | Exact upstream declaration name(s). |
+| `mathlib_file: Mathlib/Path.lean` | Canonical Mathlib source that defines them. |
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
@@ -167,10 +169,13 @@ retains bounded project-input snapshots while rebuilding the root package,
 requires complete packed `.ilean`/`.olean`/`.trace` triples, and runs Lean at
 trust level zero. Every `lean:` claim must have the declared kind and belong to
 a root module; unfinished, unsafe, partial, and unexpected-axiom dependencies
-fail. The gate rejects `mathlib: true` until a separate Mathlib verifier is
-installed, and Pages reuses the same gate before publishing. The snapshots
-detect ordinary concurrent changes; they do not sandbox malicious Lake code or
-same-user processes capable of exact ABA restoration.
+fail. A `mathlib: true` claim must name its exact declaration and canonical
+source file. The gate binds those to the manifest revision, Lake artifacts, and
+kernel ownership before Pages publishes. This is an integrity check that trusts
+local Mathlib artifacts and traces against coordinated fabrication; it is not
+cryptographic or hostile-cache attestation. The snapshots detect ordinary
+concurrent changes, but do not sandbox malicious Lake code or same-user
+processes capable of exact ABA restoration.
 
 The contract is read as published Markdown and fails closed. A table inside an
 HTML comment, a fenced block, or a four-space-indented block is documentation

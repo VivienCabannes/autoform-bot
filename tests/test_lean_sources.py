@@ -1210,6 +1210,25 @@ def test_declaration_intent_aliases_have_one_shared_normalization() -> None:
     assert declaration_keywords("proposition") == frozenset({"lemma", "theorem"})
 
 
+def test_mathlib_file_maps_only_canonical_source_paths() -> None:
+    assert lean_module.mathlib_module_name("Mathlib.lean") == "Mathlib"
+    assert (
+        lean_module.mathlib_module_name("Mathlib/Data/Nat/Prime/Defs.lean")
+        == "Mathlib.Data.Nat.Prime.Defs"
+    )
+    for invalid in (
+        "",
+        "/Mathlib/Result.lean",
+        "Mathlib//Result.lean",
+        "Mathlib/../Result.lean",
+        "Mathlib\\Result.lean",
+        "Mathlib/Result",
+        "Other/Result.lean",
+        "Mathlib/bad-name.lean",
+    ):
+        assert lean_module.mathlib_module_name(invalid) is None
+
+
 def test_permalink_pins_the_commit(tmp_path: Path) -> None:
     linker = SourceLinker(
         index=_index(tmp_path),

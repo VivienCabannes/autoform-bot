@@ -21,6 +21,7 @@ from .lean import (
     declaration_keywords,
     declaration_names,
     index_project,
+    mathlib_module_name,
 )
 from .markdown import FENCE as _FENCE
 from .markdown import frontmatter_end as _frontmatter_end
@@ -190,6 +191,22 @@ def audit_graph(
                     article_path,
                     "mathlib-without-declaration",
                     "mathlib is true but mathlib_declaration metadata is missing",
+                )
+            )
+        if node.mathlib and not node.mathlib_file:
+            findings.append(
+                AuditFinding(
+                    article_path,
+                    "mathlib-without-file",
+                    "mathlib is true but mathlib_file metadata is missing",
+                )
+            )
+        elif node.mathlib and mathlib_module_name(node.mathlib_file or "") is None:
+            findings.append(
+                AuditFinding(
+                    article_path,
+                    "invalid-mathlib-file",
+                    "mathlib_file must be a canonical Mathlib/**/*.lean source path",
                 )
             )
 
