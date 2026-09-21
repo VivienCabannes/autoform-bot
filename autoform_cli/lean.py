@@ -42,6 +42,37 @@ _DECLARATION = re.compile(
     r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+"
     r"([^\s:(){}\[\]⦃⦄,]+)"
 )
+
+# Lean erases the source-level distinction between theorem, lemma, corollary,
+# and proposition.  Keep this normalization shared by the source audit and the
+# kernel-backed CI probe so an authored declaration intent has one meaning.
+DECLARATION_KIND_ALIASES = {
+    "abbrev": "abbrev",
+    "axiom": "axiom",
+    "class": "class",
+    "corollary": "theorem",
+    "def": "def",
+    "definition": "def",
+    "inductive": "inductive",
+    "instance": "instance",
+    "lemma": "theorem",
+    "opaque": "opaque",
+    "proposition": "theorem",
+    "structure": "structure",
+    "theorem": "theorem",
+}
+
+_DECLARATION_KEYWORDS = {
+    "abbrev": frozenset({"abbrev"}),
+    "axiom": frozenset({"axiom"}),
+    "class": frozenset({"class"}),
+    "def": frozenset({"def"}),
+    "inductive": frozenset({"inductive"}),
+    "instance": frozenset({"instance"}),
+    "opaque": frozenset({"opaque"}),
+    "structure": frozenset({"structure"}),
+    "theorem": frozenset({"lemma", "theorem"}),
+}
 _IGNORED_DIRECTORIES = frozenset(
     {
         ".direnv",
@@ -713,6 +744,21 @@ def declaration_names(lean: str) -> list[str]:
     return [name.strip() for name in lean.replace(",", " ").split() if name.strip()]
 
 
+def declaration_kind(intent: str | None) -> str | None:
+    """Return the kernel-checkable kind represented by authored intent."""
+
+    if intent is None:
+        return None
+    return DECLARATION_KIND_ALIASES.get(intent.strip().casefold())
+
+
+def declaration_keywords(intent: str | None) -> frozenset[str] | None:
+    """Return source keywords accepted for authored declaration intent."""
+
+    kind = declaration_kind(intent)
+    return _DECLARATION_KEYWORDS.get(kind) if kind is not None else None
+
+
 @dataclass(frozen=True, slots=True)
 class SourceLinker:
     """Build permalinks into the project's Lean sources."""
@@ -805,11 +851,14 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 
 
 __all__ = [
+    "DECLARATION_KIND_ALIASES",
     "IndexedSourceSnapshot",
     "Declaration",
     "SourceIndex",
     "SourceLinker",
     "build_linker",
+    "declaration_kind",
+    "declaration_keywords",
     "declaration_names",
     "detect_ref",
     "detect_repository_url",

@@ -128,7 +128,9 @@ mathematics.
    coverage, and source links under other headings.
 7. Search the pinned Mathlib checkout before planning new work. Set
    `mathlib: true` only for an exact verified upstream result; record partial or
-   uncertain candidates as notes, never as formalization status.
+   uncertain candidates as notes, never as formalization status. The generated
+   local artifact gate rejects `mathlib: true` until a separate Mathlib
+   verification gate is installed.
 8. Reconcile every page whose claims this work has just invalidated. That means
    the coarse milestone pages and the coverage contract, and also the two
    landing pages Setup wrote before any scope existed: `blueprint/README.md`
