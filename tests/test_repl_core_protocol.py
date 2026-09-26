@@ -883,6 +883,7 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
         repl_core.LeanReplConfig(
             allowed_imports=frozenset({"Mathlib"}),
             warmup_imports=frozenset(),
+            header_deps_command=_fake_header_deps("/lib\n/lib/Unsafe.olean\n"),
         )
     )
     repl.process = object()
@@ -907,55 +908,82 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
 
 
 
-@pytest.mark.parametrize(
-    ("code", "expected"),
-    [
-        ("import Mathlib\n#check Nat", ["Mathlib"]),
-        ("/- note -/\nimport Unsafe\n", ["Unsafe"]),
-        ("import Mathlib.Tactic import Unsafe\n", ["Mathlib.Tactic", "Unsafe"]),
-        ("/- a /- nested -/ b -/ import Unsafe", ["Unsafe"]),
-        ("-- c\nimport Mathlib -- t\nimport Aesop/- x -/import Unsafe", ["Mathlib", "Aesop", "Unsafe"]),
-        ("private theorem t : True := trivial\nimport Unsafe", []),
-        ("import Mathlib\nprivate def f := 1", ["Mathlib"]),
-        ("theorem importUnsafe : True := trivial", []),
-    ],
-)
-def test_header_scan_reads_imports_as_lean_parses_them(code, expected):
-    assert repl_core._header_import_modules(code) == expected
+def _fake_header_deps(stdout: str, returncode: int = 0, stderr: str = "") -> list[str]:
+    """Stand in for ``lake env ... lean --stdin --deps`` with fixed output."""
+    script = (
+        "import sys; sys.stdin.read(); "
+        f"sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); "
+        f"sys.exit({returncode})"
+    )
+    return [sys.executable, "-c", script]
+
+
+def _header_modules(command: list[str], deadline: float | None = None) -> list[str]:
+    return repl_core._lean_header_modules(
+        command,
+        "import Mathlib",
+        cwd=None,
+        env=dict(os.environ),
+        deadline=time.monotonic() + 10 if deadline is None else deadline,
+    )
+
+
+def test_header_check_maps_resolved_paths_back_to_module_names():
+    command = _fake_header_deps(
+        "/pkg/lib:/toolchain/lib\n"
+        "/toolchain/lib/Init.olean\n"
+        "/toolchain/lib/Init.olean\n"
+        "/pkg/lib/Mathlib/Tactic.olean\n"
+        "/toolchain/lib/Init/Data.olean\n"
+    )
+
+    assert _header_modules(command) == ["Mathlib.Tactic", "Init.Data"]
 
 
 @pytest.mark.parametrize(
-    "code",
+    ("command", "message"),
     [
-        "public import Unsafe",
-        "meta import Unsafe",
-        "/- c -/ public /- d -/ import Unsafe",
-        "module\nimport Unsafe",
-        "prelude\nimport Unsafe",
-        "import all Unsafe",
-        "import «Unterminated",
+        (
+            _fake_header_deps("", 1, "unknown module prefix 'Unsafe'\nmore"),
+            "unknown module prefix 'Unsafe'",
+        ),
+        (_fake_header_deps("", 3), "exit status 3"),
+        (_fake_header_deps("/pkg/lib\n/other/Unsafe.olean\n"), "outside the Lean search path"),
+        (_fake_header_deps("/pkg/lib\n/pkg/lib/Unsafe.ilean\n"), "outside the Lean search path"),
     ],
 )
-def test_header_scan_rejects_header_syntax_it_does_not_model(code):
-    with pytest.raises(ValueError):
-        repl_core._header_import_modules(code)
+def test_header_check_fails_closed(command, message):
+    with pytest.raises(ValueError, match=message):
+        _header_modules(command)
+
+
+def test_header_check_kills_a_command_that_outlives_the_deadline():
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        _header_modules(command, deadline=started + 0.2)
+
+    assert time.monotonic() - started < 5
 
 
 @pytest.mark.parametrize(
-    ("code", "expected_error"),
+    ("deps_output", "returncode", "expected_error"),
     [
-        ("/- note -/\nimport Unsafe\n#check Nat", "Disallowed imports: Unsafe"),
-        ("import Mathlib.Tactic import Unsafe\n#check Nat", "Disallowed imports: Unsafe"),
-        ("public import Unsafe\n#check Nat", "Rejected Lean header"),
+        ("/lib\n/lib/Mathlib.olean\n/lib/Unsafe.olean\n", 0, "Disallowed imports: Unsafe"),
+        ("", 1, "Rejected Lean header: unknown module"),
     ],
 )
-def test_run_disposable_rejects_imports_hidden_from_a_line_scan(
-    monkeypatch, code, expected_error
+def test_run_disposable_rejects_what_lean_reports_before_starting(
+    monkeypatch, deps_output, returncode, expected_error
 ):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
             allowed_imports=frozenset({"Mathlib"}),
             warmup_imports=frozenset(),
+            header_deps_command=_fake_header_deps(
+                deps_output, returncode, "unknown module prefix 'Unsafe'"
+            ),
         )
     )
     monkeypatch.setattr(
@@ -964,10 +992,30 @@ def test_run_disposable_rejects_imports_hidden_from_a_line_scan(
         lambda *args, **kwargs: pytest.fail("invalid input must not start Lean"),
     )
 
-    response = repl.run_disposable(code)
+    response = repl.run_disposable("import Mathlib\n#check Nat")
 
     assert expected_error in response["repl_error"]
     assert repl.process is None
+
+
+def test_run_disposable_checks_the_header_after_adding_warmup_imports(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset({"Mathlib"}),
+        )
+    )
+    checked = []
+
+    def header_modules(command, code, **kwargs):
+        checked.append(code)
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(repl_core, "_lean_header_modules", header_modules)
+
+    repl.run_disposable("/- note -/ import Unsafe\n#check Nat")
+
+    assert checked == ["import Mathlib\n/- note -/ import Unsafe\n#check Nat"]
 
 
 class _PipeProcess:

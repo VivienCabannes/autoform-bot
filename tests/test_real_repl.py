@@ -36,3 +36,38 @@ def test_disposable_call_matches_the_pinned_repl_protocol():
     assert "env" not in response
     assert all("proofState" not in sorry for sorry in response["sorries"])
     assert repl.is_clean()
+
+
+@pytest.mark.skipif(
+    os.environ.get("AUTOFORM_RUN_REAL_REPL_TESTS") != "1",
+    reason="set AUTOFORM_RUN_REAL_REPL_TESTS=1 to run the pinned REPL integration",
+)
+@pytest.mark.parametrize(
+    ("warmup", "code", "expected_error"),
+    [
+        ((), "/- note -/\nimport Init.Data\n#check Nat", "Disallowed imports: Init"),
+        ((), "import REPL import Init.Data\n#check Nat", "Disallowed imports: Init"),
+        ((), "module\npublic import Init.Data\n", "Disallowed imports: Init"),
+        (("REPL",), "/- note -/ import Init.Data\n#check Nat", "Disallowed imports: Init"),
+        ((), "import NotAllowlisted.Mod\n", "Rejected Lean header"),
+        ((), "import «REPL\n", "Rejected Lean header"),
+        ((), "import REPL\ntheorem autoform_header_probe : True := trivial", None),
+    ],
+)
+def test_disposable_imports_are_checked_by_lean_itself(warmup, code, expected_error):
+    repl = LeanRepl(
+        LeanReplConfig(
+            cwd=str(REPL_FIXTURE),
+            repl_command=["lake", "exe", "repl"],
+            allowed_imports=frozenset({"REPL"}),
+            warmup_imports=frozenset(warmup),
+        )
+    )
+
+    response = repl.run_disposable(code, timeout=180)
+
+    if expected_error is None:
+        assert "repl_error" not in response
+    else:
+        assert expected_error in response["repl_error"]
+    assert repl.is_clean()

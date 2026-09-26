@@ -290,111 +290,59 @@ def _validate_command_response(
     return environment, messages
 
 
-# Keywords valid only at the start of a file, and words that modify an import.
-_HEADER_ONLY_KEYWORDS = ("prelude", "module")
-_IMPORT_MODIFIERS = ("public", "private", "meta")
+def _lean_header_modules(
+    command: list[str],
+    code: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    deadline: float,
+) -> list[str]:
+    """Return every module the Lean header of ``code`` imports, read by Lean itself.
 
-
-def _header_import_modules(code: str) -> list[str]:
-    """Return every module the Lean header imports, as Lean would parse it.
-
-    Unlike ``_split_imports_and_body``, this skips line and nested block comments
-    and reads several imports on one line, because a request sent without an
-    environment has its whole header processed by Lean. Header syntax this
-    scanner does not model raises ``ValueError`` so validation fails closed.
+    ``command`` prints the Lean search path on its first line, then runs
+    ``lean --stdin --deps``, which parses the header with Lean's own parser and
+    prints one resolved ``.olean`` path per import. Each path is mapped back to
+    its module name. A header Lean rejects, an import it cannot resolve, or a
+    path outside the search path raises ``ValueError`` so validation fails closed.
     """
-    position = 0
-    length = len(code)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("timed out before checking the Lean header")
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(code.encode(), timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _kill_subprocesses(process, process.pid)
+        raise TimeoutError("timed out checking the Lean header") from None
+    except BaseException:
+        _kill_subprocesses(process, process.pid)
+        raise
+    if process.returncode != 0:
+        detail = stderr.decode(errors="replace").strip().splitlines()
+        raise ValueError(detail[0] if detail else f"exit status {process.returncode}")
+
+    search_path, *paths = stdout.decode(errors="replace").splitlines() or [""]
+    roots = [os.path.normpath(entry) for entry in search_path.split(os.pathsep) if entry]
     modules: list[str] = []
-
-    def skip_trivia() -> None:
-        nonlocal position
-        while position < length:
-            if code[position].isspace():
-                position += 1
-            elif code.startswith("--", position):
-                newline = code.find("\n", position)
-                position = length if newline < 0 else newline + 1
-            elif code.startswith("/-", position):
-                depth = 0
-                while position < length:
-                    if code.startswith("/-", position):
-                        depth += 1
-                        position += 2
-                    elif code.startswith("-/", position):
-                        depth -= 1
-                        position += 2
-                        if depth == 0:
-                            break
-                    else:
-                        position += 1
-            else:
-                return
-
-    def keyword_at(word: str) -> bool:
-        if not code.startswith(word, position):
-            return False
-        end = position + len(word)
-        return (
-            end >= length
-            or code[end].isspace()
-            or code[end] == "«"
-            or code.startswith("--", end)
-            or code.startswith("/-", end)
-        )
-
-    def import_modifier_at() -> str | None:
-        """Return a modifier word only when a chain of them leads to import."""
-        nonlocal position
-        start = position
-        first: str | None = None
-        try:
-            while True:
-                word = next(
-                    (w for w in _IMPORT_MODIFIERS if keyword_at(w)),
-                    None,
-                )
-                if word is None:
-                    return first if first is not None and keyword_at("import") else None
-                first = first or word
-                position += len(word)
-                skip_trivia()
-        finally:
-            position = start
-
-    while True:
-        skip_trivia()
-        for keyword in _HEADER_ONLY_KEYWORDS:
-            if keyword_at(keyword):
-                raise ValueError(f"Unsupported Lean header keyword {keyword!r}.")
-        modifier = import_modifier_at()
-        if modifier is not None:
-            raise ValueError(f"Unsupported Lean header keyword {modifier!r}.")
-        if not keyword_at("import"):
-            return modules
-        position += len("import")
-        skip_trivia()
-        start = position
-        while position < length:
-            if code[position] == "«":
-                closing = code.find("»", position + 1)
-                if closing < 0:
-                    raise ValueError("Unterminated module name in Lean header.")
-                position = closing + 1
-            elif (
-                code[position].isspace()
-                or code.startswith("--", position)
-                or code.startswith("/-", position)
-            ):
-                break
-            else:
-                position += 1
-        module = code[start:position]
-        if not module:
-            raise ValueError("Missing module name after import.")
-        if module == "all":
-            raise ValueError("Unsupported Lean header keyword 'all'.")
-        modules.append(module)
+    for path in paths:
+        path = os.path.normpath(path)
+        root = next((r for r in roots if path.startswith(r + os.sep)), None)
+        if root is None or not path.endswith(".olean"):
+            raise ValueError(f"import resolved outside the Lean search path: {path}")
+        module = path[len(root) + 1 : -len(".olean")].replace(os.sep, ".")
+        # Every file imports Init implicitly, so importing it grants nothing.
+        if module != "Init":
+            modules.append(module)
+    return modules
 
 
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
@@ -445,6 +393,12 @@ class LeanReplConfig:
     warmup_imports: frozenset[str] = WARMUP_IMPORTS
 
     repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
+    # Prints LEAN_PATH, then Lean's own resolution of the submitted header.
+    header_deps_command: list[str] = field(
+        default_factory=lambda: [
+            "lake", "env", "sh", "-c", 'printenv LEAN_PATH && exec lean --stdin --deps'
+        ]
+    )
 
     # stdout is capped per response. stderr has no protocol framing, so its
     # ceiling applies to the entire process generation and resets on restart.
@@ -883,14 +837,28 @@ class LeanRepl:
             try:
                 self.close(deadline=deadline)
                 imports, _, _ = _split_imports_and_body(code)
+                added_imports = tuple(
+                    root
+                    for root in sorted(self.config.warmup_imports)
+                    if root not in imports
+                )
+                prefix = "\n".join(f"import {root}" for root in added_imports)
+                command = f"{prefix}\n{code}" if prefix else code
                 if (
                     self.config.validate_imports
                     and self._allowed_import_roots is not None
                 ):
-                    # The whole header reaches Lean here, so validate it as Lean
-                    # parses it rather than line by line.
+                    # The whole header reaches Lean here, so let Lean parse it.
+                    env = _inherit_clean_env()
+                    env.update(self.config.env)
                     try:
-                        header_modules = _header_import_modules(code)
+                        header_modules = _lean_header_modules(
+                            self.config.header_deps_command,
+                            command,
+                            cwd=self.cwd,
+                            env=env,
+                            deadline=deadline,
+                        )
                     except ValueError as error:
                         result = {"repl_error": f"Rejected Lean header: {error}"}
                         header_modules = []
@@ -907,13 +875,6 @@ class LeanRepl:
                             )
                         }
                 if result is None:
-                    added_imports = tuple(
-                        root
-                        for root in sorted(self.config.warmup_imports)
-                        if root not in imports
-                    )
-                    prefix = "\n".join(f"import {root}" for root in added_imports)
-                    command = f"{prefix}\n{code}" if prefix else code
                     self.start(deadline=deadline, warmup_imports=())
                     response = self._run(
                         code=command,
