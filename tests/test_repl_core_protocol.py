@@ -906,6 +906,70 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
     assert repl.process is None
 
 
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("import Mathlib\n#check Nat", ["Mathlib"]),
+        ("/- note -/\nimport Unsafe\n", ["Unsafe"]),
+        ("import Mathlib.Tactic import Unsafe\n", ["Mathlib.Tactic", "Unsafe"]),
+        ("/- a /- nested -/ b -/ import Unsafe", ["Unsafe"]),
+        ("-- c\nimport Mathlib -- t\nimport Aesop/- x -/import Unsafe", ["Mathlib", "Aesop", "Unsafe"]),
+        ("private theorem t : True := trivial\nimport Unsafe", []),
+        ("import Mathlib\nprivate def f := 1", ["Mathlib"]),
+        ("theorem importUnsafe : True := trivial", []),
+    ],
+)
+def test_header_scan_reads_imports_as_lean_parses_them(code, expected):
+    assert repl_core._header_import_modules(code) == expected
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "public import Unsafe",
+        "meta import Unsafe",
+        "/- c -/ public /- d -/ import Unsafe",
+        "module\nimport Unsafe",
+        "prelude\nimport Unsafe",
+        "import all Unsafe",
+        "import «Unterminated",
+    ],
+)
+def test_header_scan_rejects_header_syntax_it_does_not_model(code):
+    with pytest.raises(ValueError):
+        repl_core._header_import_modules(code)
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_error"),
+    [
+        ("/- note -/\nimport Unsafe\n#check Nat", "Disallowed imports: Unsafe"),
+        ("import Mathlib.Tactic import Unsafe\n#check Nat", "Disallowed imports: Unsafe"),
+        ("public import Unsafe\n#check Nat", "Rejected Lean header"),
+    ],
+)
+def test_run_disposable_rejects_imports_hidden_from_a_line_scan(
+    monkeypatch, code, expected_error
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset(),
+        )
+    )
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda *args, **kwargs: pytest.fail("invalid input must not start Lean"),
+    )
+
+    response = repl.run_disposable(code)
+
+    assert expected_error in response["repl_error"]
+    assert repl.process is None
+
+
 class _PipeProcess:
     def __init__(self, stack: ExitStack, stdout_chunks: list[bytes], stderr: bytes = b""):
         stdin_read, stdin_write = os.pipe()

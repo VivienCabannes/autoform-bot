@@ -290,6 +290,113 @@ def _validate_command_response(
     return environment, messages
 
 
+# Keywords valid only at the start of a file, and words that modify an import.
+_HEADER_ONLY_KEYWORDS = ("prelude", "module")
+_IMPORT_MODIFIERS = ("public", "private", "meta")
+
+
+def _header_import_modules(code: str) -> list[str]:
+    """Return every module the Lean header imports, as Lean would parse it.
+
+    Unlike ``_split_imports_and_body``, this skips line and nested block comments
+    and reads several imports on one line, because a request sent without an
+    environment has its whole header processed by Lean. Header syntax this
+    scanner does not model raises ``ValueError`` so validation fails closed.
+    """
+    position = 0
+    length = len(code)
+    modules: list[str] = []
+
+    def skip_trivia() -> None:
+        nonlocal position
+        while position < length:
+            if code[position].isspace():
+                position += 1
+            elif code.startswith("--", position):
+                newline = code.find("\n", position)
+                position = length if newline < 0 else newline + 1
+            elif code.startswith("/-", position):
+                depth = 0
+                while position < length:
+                    if code.startswith("/-", position):
+                        depth += 1
+                        position += 2
+                    elif code.startswith("-/", position):
+                        depth -= 1
+                        position += 2
+                        if depth == 0:
+                            break
+                    else:
+                        position += 1
+            else:
+                return
+
+    def keyword_at(word: str) -> bool:
+        if not code.startswith(word, position):
+            return False
+        end = position + len(word)
+        return (
+            end >= length
+            or code[end].isspace()
+            or code[end] == "«"
+            or code.startswith("--", end)
+            or code.startswith("/-", end)
+        )
+
+    def import_modifier_at() -> str | None:
+        """Return a modifier word only when a chain of them leads to import."""
+        nonlocal position
+        start = position
+        first: str | None = None
+        try:
+            while True:
+                word = next(
+                    (w for w in _IMPORT_MODIFIERS if keyword_at(w)),
+                    None,
+                )
+                if word is None:
+                    return first if first is not None and keyword_at("import") else None
+                first = first or word
+                position += len(word)
+                skip_trivia()
+        finally:
+            position = start
+
+    while True:
+        skip_trivia()
+        for keyword in _HEADER_ONLY_KEYWORDS:
+            if keyword_at(keyword):
+                raise ValueError(f"Unsupported Lean header keyword {keyword!r}.")
+        modifier = import_modifier_at()
+        if modifier is not None:
+            raise ValueError(f"Unsupported Lean header keyword {modifier!r}.")
+        if not keyword_at("import"):
+            return modules
+        position += len("import")
+        skip_trivia()
+        start = position
+        while position < length:
+            if code[position] == "«":
+                closing = code.find("»", position + 1)
+                if closing < 0:
+                    raise ValueError("Unterminated module name in Lean header.")
+                position = closing + 1
+            elif (
+                code[position].isspace()
+                or code.startswith("--", position)
+                or code.startswith("/-", position)
+            ):
+                break
+            else:
+                position += 1
+        module = code[start:position]
+        if not module:
+            raise ValueError("Missing module name after import.")
+        if module == "all":
+            raise ValueError("Unsupported Lean header keyword 'all'.")
+        modules.append(module)
+
+
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
     """Split Lean code into import statements and body.
 
@@ -780,8 +887,15 @@ class LeanRepl:
                     self.config.validate_imports
                     and self._allowed_import_roots is not None
                 ):
+                    # The whole header reaches Lean here, so validate it as Lean
+                    # parses it rather than line by line.
+                    try:
+                        header_modules = _header_import_modules(code)
+                    except ValueError as error:
+                        result = {"repl_error": f"Rejected Lean header: {error}"}
+                        header_modules = []
                     submitted_roots = {
-                        statement.split(".")[0] for statement in imports
+                        module.split(".")[0] for module in header_modules
                     }
                     disallowed = submitted_roots - self._allowed_import_roots
                     if disallowed:
