@@ -33,6 +33,8 @@ def test_start_owns_a_posix_process_group(monkeypatch):
         captured.update(kwargs)
         return process
 
+    for name in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LAKE_CONFIG", "PYTHONPATH"):
+        monkeypatch.setenv(name, "poisoned")
     monkeypatch.setattr(repl_core.subprocess, "Popen", popen)
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -44,6 +46,10 @@ def test_start_owns_a_posix_process_group(monkeypatch):
     repl.start()
 
     assert captured["start_new_session"] is True
+    assert all(
+        name not in captured["env"]
+        for name in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LAKE_CONFIG", "PYTHONPATH")
+    )
     assert repl._process_group_id == process.pid
     repl.process = None
     repl._process_group_id = None
@@ -58,12 +64,12 @@ def test_start_does_not_spawn_after_environment_setup_exhausts_deadline(monkeypa
         )
     )
 
-    def clean_environment():
+    def clean_environment(project_dir, **kwargs):
         now[0] = 102.0
         return {}
 
     monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(repl_core, "_inherit_clean_env", clean_environment)
+    monkeypatch.setattr(repl_core, "clean_lake_environment", clean_environment)
     monkeypatch.setattr(
         repl_core.subprocess,
         "Popen",
@@ -74,6 +80,100 @@ def test_start_does_not_spawn_after_environment_setup_exhausts_deadline(monkeypa
 
     with pytest.raises(TimeoutError, match="startup timed out"):
         repl.start(startup_timeout=1)
+
+
+def test_start_requires_elan_for_the_default_bare_lake_command(monkeypatch):
+    captured = {}
+
+    class Process:
+        pid = 999_999_999
+
+    def clean_environment(project_dir, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(repl_core, "clean_lake_environment", clean_environment)
+    monkeypatch.setattr(
+        repl_core.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    repl.start()
+
+    assert captured["require_elan_proxy"] is True
+    repl.process = None
+    repl._process_group_id = None
+
+
+def test_start_honors_explicit_environment_over_broken_ambient_project_config(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lean-toolchain").write_text("")
+    captured = {}
+
+    class Process:
+        pid = 999_999_999
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr(repl_core.subprocess, "Popen", popen)
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            env={"ELAN_TOOLCHAIN": "leanprover/lean4:v4.32.0", "PATH": "/custom"},
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    repl.start()
+
+    assert captured["env"]["ELAN_TOOLCHAIN"] == "leanprover/lean4:v4.32.0"
+    assert captured["env"]["PATH"] == "/custom"
+    repl.process = None
+    repl._process_group_id = None
+
+
+def test_run_disposable_fences_the_effective_explicit_toolchain(
+    tmp_path,
+    monkeypatch,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text('[package]\nname = "Test"\n')
+    (project / "lean-toolchain").symlink_to(project / "missing-toolchain")
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            env={"ELAN_TOOLCHAIN": "leanprover/lean4:v4.32.0", "PATH": "/custom"},
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: {"env": 1, "messages": [], "sorries": []},
+    )
+
+    assert repl.run_disposable("#check Nat") == {
+        "messages": [],
+        "sorries": [],
+    }
 
 
 def test_start_rejects_unsupported_platform_before_spawning(monkeypatch):
@@ -740,6 +840,201 @@ def test_run_disposable_sends_one_frame_and_removes_process_handles(monkeypatch)
     assert len([event for event in events if event[0] == "frame"]) == 1
     assert response == {"messages": [], "sorries": [{"goal": "False"}]}
     assert repl.process is None
+
+
+@pytest.mark.parametrize("materialize_during", ["start", "run"])
+def test_run_disposable_accepts_only_initial_manifest_creation(
+    tmp_path, monkeypatch, materialize_during
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text('[package]\nname = "Test"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+
+    def start(*args, **kwargs):
+        if materialize_during == "start":
+            (project / "lake-manifest.json").write_text('{"version": "1.1.0"}\n')
+
+    def run_frame(*args, **kwargs):
+        if materialize_during == "run":
+            (project / "lake-manifest.json").write_text('{"version": "1.1.0"}\n')
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    assert repl.run_disposable("#check Nat") == {
+        "messages": [],
+        "sorries": [],
+    }
+
+
+def test_run_disposable_rejects_a_pre_dispatch_project_change_determinately(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    lakefile = project / "lakefile.toml"
+    lakefile.write_text('[package]\nname = "Test"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+
+    def start(*args, **kwargs):
+        lakefile.write_text('[package]\nname = "Changed"\n')
+
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("stale project must not be dispatched"),
+    )
+
+    response = repl.run_disposable("#check Nat")
+
+    assert "changed before REPL dispatch" in response["repl_error"]
+    assert "outcome_unknown" not in response
+
+
+def test_run_disposable_preserves_a_proven_pre_send_failure(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    lakefile = project / "lakefile.toml"
+    lakefile.write_text('[package]\nname = "Test"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+
+    def fail_before_send(*args, **kwargs):
+        lakefile.write_text('[package]\nname = "Changed"\n')
+        raise repl_core.ReplProcessExited("request was not sent")
+
+    monkeypatch.setattr(repl, "_run", fail_before_send)
+
+    response = repl.run_disposable("#check Nat")
+
+    assert response == {"repl_error": "request was not sent"}
+
+
+@pytest.mark.parametrize("branch", ["success", "command_error", "stderr_backlog"])
+def test_run_disposable_fences_every_response_after_dispatch(
+    tmp_path, monkeypatch, branch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    lakefile = project / "lakefile.toml"
+    lakefile.write_text('[package]\nname = "Test"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+
+    def run_frame(*args, **kwargs):
+        lakefile.write_text('[package]\nname = "Changed"\n')
+        if branch == "command_error":
+            return {"message": "Lean rejected the command"}
+        response = {"env": 1, "messages": [], "sorries": []}
+        if branch == "stderr_backlog":
+            raise repl_core.ReplStderrBacklog("stderr remained readable", response)
+        return response
+
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    response = repl.run_disposable("#check Nat")
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+
+
+def test_run_disposable_treats_post_dispatch_stat_failure_as_unknown(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text('[package]\nname = "Test"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    real_fingerprint = repl_core.lean_project_fingerprint
+    calls = 0
+
+    def fingerprint(path, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("project disappeared")
+        return real_fingerprint(path, **kwargs)
+
+    monkeypatch.setattr(repl_core, "lean_project_fingerprint", fingerprint)
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: {"env": 1, "messages": [], "sorries": []},
+    )
+
+    response = repl.run_disposable("#check Nat")
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
+
+
+def test_run_disposable_treats_post_dispatch_deadline_expiry_as_unknown(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "lakefile.toml").write_text('[package]\nname = "Test"\n')
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            cwd=str(project),
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+    now = [100.0]
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl, "close", lambda *, deadline=None: None)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+
+    def run_frame(*args, **kwargs):
+        now[0] = 103.0
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    response = repl.run_disposable("#check Nat", timeout=3)
+
+    assert response["outcome_unknown"] is True
+    assert "freshness changed" in response["repl_error"]
 
 
 def test_run_disposable_reserves_cleanup_time_after_command_deadline(monkeypatch):

@@ -56,7 +56,11 @@ uid-specific directory in `/tmp`; the rotating runtime log is beside it.
 `AUTOFORM_RUNTIME_DIR` overrides that location. Node-wide limits are controlled
 by `AUTOFORM_REPL_TOTAL_WORKERS`, `AUTOFORM_REPL_WORKERS_PER_PROJECT`,
 `AUTOFORM_MAX_LEAN_PROJECTS`, and `AUTOFORM_LEAN_IDLE_SECONDS`. The first
-process to start the runtime supplies those settings until it is stopped.
+process to start the runtime supplies those settings, `PATH`, and `ELAN_HOME`
+until it is stopped. Bare `lake` commands require a verified Elan proxy for a
+pinned project; an explicit custom command is treated as a trusted provider.
+Stop the runtime after changing that environment or Elan state, including
+defaults, directory overrides, links, and mutable channels.
 `get_repl_status` reports a project pool as `warm` when its admission slots are
 cached; it does not mean a Lean REPL child is resident between calls.
 `AUTOFORM_RUNTIME_RESPONSE_TIMEOUT` can raise the client/daemon response budget

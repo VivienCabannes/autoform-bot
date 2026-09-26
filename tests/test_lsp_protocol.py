@@ -48,7 +48,15 @@ def test_json_rpc_error_response_raises_protocol_error(monkeypatch):
 
 def test_start_aborts_process_when_initialize_fails(monkeypatch):
     process = _FakeProcess()
-    monkeypatch.setattr(lsp.subprocess, "Popen", lambda *args, **kwargs: process)
+    captured = {}
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    for name in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LAKE_CONFIG", "PYTHONPATH"):
+        monkeypatch.setenv(name, "poisoned")
+    monkeypatch.setattr(lsp.subprocess, "Popen", popen)
 
     session = lsp.LeanLspSession(lsp.LspConfig())
 
@@ -63,6 +71,10 @@ def test_start_aborts_process_when_initialize_fails(monkeypatch):
     assert process.killed is True
     assert process.waited is True
     assert session.process is None
+    assert all(
+        name not in captured["env"]
+        for name in ("ELAN_TOOLCHAIN", "LEAN_PATH", "LAKE_CONFIG", "PYTHONPATH")
+    )
 
 
 def test_diagnostics_wait_through_initial_quiet_period(monkeypatch):

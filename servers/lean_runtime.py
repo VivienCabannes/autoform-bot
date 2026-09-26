@@ -25,7 +25,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from servers import resolve_lean_file, resolve_lean_project_dir
+from servers import (
+    ProjectFingerprint,
+    is_initial_manifest_materialization,
+    lean_project_fingerprint,
+    resolve_lean_file,
+    resolve_lean_project_dir,
+)
 from servers.lean_client import (
     BUILD_GENERATION,
     DEFAULT_REPL_REQUEST_TIMEOUT,
@@ -297,24 +303,10 @@ class LeanRuntimeConfig:
         }
 
 
-def lean_project_fingerprint(project_dir: Path) -> tuple[tuple[str, int, int], ...]:
-    """Return the project metadata that makes a resident Lean process stale."""
-    files = ("lean-toolchain", "lake-manifest.json", "lakefile.toml", "lakefile.lean")
-    fingerprint: list[tuple[str, int, int]] = []
-    for name in files:
-        path = project_dir / name
-        try:
-            info = path.stat()
-        except FileNotFoundError:
-            continue
-        fingerprint.append((name, info.st_mtime_ns, info.st_size))
-    return tuple(fingerprint)
-
-
 @dataclass
 class _CacheEntry(Generic[T]):
     resource: T
-    fingerprint: tuple[tuple[str, int, int], ...]
+    fingerprint: ProjectFingerprint
     last_used: float
     active: int = 0
     invalid: bool = False
@@ -702,19 +694,45 @@ class ProjectResourceCache(Generic[T]):
                 self._condition.notify_all()
             raise
 
-        close_created = False
+        skip_generation_probe = deadline is not None and self._clock() >= deadline
+        startup_error: ProjectResourceBusyError | None = None
+        created_fingerprint = fingerprint
+        if not skip_generation_probe:
+            try:
+                created_fingerprint = lean_project_fingerprint(root)
+            except OSError as error:
+                startup_error = ProjectResourceBusyError(
+                    f"shared Lean project changed during startup: {root}"
+                )
+                startup_error.__cause__ = error
+            if (
+                startup_error is None
+                and created_fingerprint != fingerprint
+                and not is_initial_manifest_materialization(
+                    fingerprint, created_fingerprint
+                )
+            ):
+                startup_error = ProjectResourceBusyError(
+                    f"shared Lean project changed during startup: {root}"
+                )
+
+        close_created = startup_error is not None or skip_generation_probe
         startup_expired = False
         with self._condition:
             self._creating.discard(root)
             if self._closed:
                 close_created = True
-            elif deadline is not None and self._clock() >= deadline:
+            elif startup_error is not None:
+                pass
+            elif skip_generation_probe or (
+                deadline is not None and self._clock() >= deadline
+            ):
                 close_created = True
                 startup_expired = True
             else:
                 self._entries[root] = _CacheEntry(
                     resource=created,
-                    fingerprint=fingerprint,
+                    fingerprint=created_fingerprint,
                     last_used=self._clock(),
                     active=1,
                 )
@@ -732,6 +750,8 @@ class ProjectResourceCache(Generic[T]):
                 raise ProjectResourceBusyError(
                     f"shared Lean project startup exceeded its response budget: {root}"
                 )
+            if startup_error is not None:
+                raise startup_error
             raise RuntimeError("project resource cache closed during startup")
         return created
 
