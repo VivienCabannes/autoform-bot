@@ -15,9 +15,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging import getLogger
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fastmcp.server import FastMCP
+if TYPE_CHECKING:
+    from fastmcp.server import FastMCP
 
 from servers import resolve_lean_project_dir
 from servers.lean_client import LeanRuntimeClient
@@ -555,6 +556,8 @@ def format_lsp_diagnostics(diagnostics: list[dict]) -> str:
 
 def create_lsp_server(runtime: LeanRuntimeClient) -> FastMCP:
     """Create the public LSP MCP adapter for the shared Lean runtime."""
+    from fastmcp.server import FastMCP
+
     server = FastMCP(name="autoform-lsp")
 
     @server.tool

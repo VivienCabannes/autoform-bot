@@ -49,6 +49,33 @@ def test_start_owns_a_posix_process_group(monkeypatch):
     repl._process_group_id = None
 
 
+def test_start_does_not_spawn_after_environment_setup_exhausts_deadline(monkeypatch):
+    now = [100.0]
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    def clean_environment():
+        now[0] = 102.0
+        return {}
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl_core, "_inherit_clean_env", clean_environment)
+    monkeypatch.setattr(
+        repl_core.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail(
+            "an expired startup deadline must not spawn a Lean process"
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="startup timed out"):
+        repl.start(startup_timeout=1)
+
+
 def test_start_rejects_unsupported_platform_before_spawning(monkeypatch):
     monkeypatch.setattr(repl_core.os, "name", "nt")
     monkeypatch.setattr(
@@ -99,8 +126,7 @@ def test_start_retires_process_if_group_publication_is_interrupted(monkeypatch):
         repl.start()
 
     assert retired == [(process, 4321)]
-    assert repl.process is None
-    assert repl._process_group_id is None
+    assert repl.is_clean() is True
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process groups require POSIX")
@@ -669,6 +695,217 @@ def test_additive_response_fields_are_tolerated_but_not_exported():
     }
 
 
+def test_run_disposable_sends_one_frame_and_removes_process_handles(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            validate_imports=False,
+            warmup_imports=frozenset({"Mathlib"}),
+        )
+    )
+    repl.process = object()
+    events = []
+
+    def close(*, deadline=None):
+        events.append(("close", repl._process_lock.locked()))
+        repl.process = None
+
+    def start(startup_timeout=None, *, deadline=None, warmup_imports=None):
+        events.append(("start", startup_timeout, deadline, warmup_imports))
+        repl.process = object()
+
+    def run_frame(code, env_id, timeout, *, deadline=None):
+        events.append(("frame", code, env_id, timeout, deadline, repl.process))
+        return {
+            "env": 7,
+            "messages": [],
+            "sorries": [{"goal": "False", "proofState": 9}],
+        }
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", start)
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    response = repl.run_disposable("#check Nat", timeout=3)
+
+    assert events[0] == ("close", True)
+    assert events[1][0] == "start"
+    assert events[1][1] is None
+    assert events[1][2] is not None
+    assert events[1][3] == ()
+    assert events[2][0:3] == ("frame", "import Mathlib\n#check Nat", None)
+    assert 0 < events[2][3] <= 3
+    assert events[2][4] == events[1][2]
+    assert events[2][5] is not None
+    assert events[3] == ("close", True)
+    assert len([event for event in events if event[0] == "frame"]) == 1
+    assert response == {"messages": [], "sorries": [{"goal": "False"}]}
+    assert repl.process is None
+
+
+def test_run_disposable_reserves_cleanup_time_after_command_deadline(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    now = [100.0]
+    close_deadlines = []
+
+    def close(*, deadline=None):
+        close_deadlines.append(deadline)
+
+    def run_frame(*args, **kwargs):
+        now[0] = 102.999
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(repl, "_run", run_frame)
+
+    assert repl.run_disposable("#check Nat", timeout=3) == {
+        "messages": [],
+        "sorries": [],
+    }
+    assert close_deadlines == [
+        103.0,
+        102.999 + repl_core.DEFAULT_REPL_CLEANUP_SECONDS,
+    ]
+
+
+def test_run_disposable_closes_after_frame_error(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    close_calls = []
+    monkeypatch.setattr(
+        repl,
+        "close",
+        lambda *, deadline=None: close_calls.append(True),
+    )
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
+    )
+
+    assert repl.run_disposable("#check Nat") == {"repl_error": "failed"}
+
+    assert close_calls == [True, True]
+
+
+def test_run_disposable_does_not_swallow_cleanup_cancellation(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    close_calls = 0
+
+    def close(*, deadline=None):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: {"env": 1, "messages": [], "sorries": []},
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        repl.run_disposable("#check Nat")
+
+    assert close_calls == 2
+
+
+def test_run_disposable_preserves_request_cancellation_when_cleanup_also_cancels(
+    monkeypatch,
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    close_calls = 0
+
+    def close(*, deadline=None):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 2:
+            raise asyncio.CancelledError("cleanup")
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt("request")),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="request") as raised:
+        repl.run_disposable("#check Nat")
+
+    if hasattr(raised.value, "add_note"):
+        assert raised.value.__notes__ == [
+            "Lean REPL process cleanup also failed: cleanup"
+        ]
+    assert close_calls == 2
+
+
+def test_run_disposable_never_returns_success_before_verified_cleanup(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(validate_imports=False, warmup_imports=frozenset())
+    )
+    close_calls = 0
+
+    def close(*, deadline=None):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 2:
+            raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: {"env": 1, "messages": [], "sorries": []},
+    )
+
+    with pytest.raises(repl_core.ReplCleanupError) as raised:
+        repl.run_disposable("#check Nat")
+
+    assert raised.value.result == {"messages": [], "sorries": []}
+    assert close_calls == 2
+
+
+def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset(),
+        )
+    )
+    repl.process = object()
+    close_calls = []
+
+    def close(*, deadline=None):
+        close_calls.append(True)
+        repl.process = None
+
+    monkeypatch.setattr(repl, "close", close)
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda *args, **kwargs: pytest.fail("invalid input must not start Lean"),
+    )
+
+    response = repl.run_disposable("import Unsafe\n#check Nat")
+
+    assert "Disallowed imports: Unsafe" in response["repl_error"]
+    assert close_calls == [True, True]
+    assert repl.process is None
+
+
 class _PipeProcess:
     def __init__(self, stack: ExitStack, stdout_chunks: list[bytes], stderr: bytes = b""):
         stdin_read, stdin_write = os.pipe()
@@ -737,6 +974,28 @@ def _patch_pipe_reads(monkeypatch, process: _PipeProcess):
     monkeypatch.setattr(repl_core.select, "select", fake_select)
 
 
+def test_run_forwards_absolute_deadline_to_wire(monkeypatch):
+    now = [100.0]
+    observed = []
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+
+    def run_io(code, env_id, timeout, mark_sent, *, deadline=None):
+        now[0] = 104.0
+        observed.append((timeout, deadline))
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl, "_run_io", run_io)
+
+    assert repl._run("#check Nat", None, 5, deadline=105.0)["env"] == 1
+    assert observed == [(5.0, 105.0)]
+
+
 def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -760,7 +1019,7 @@ def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
         lambda timeout=None: pytest.fail("a sent request must not be retried"),
     )
 
-    def fail_after_send(code, env_id, timeout, mark_sent):
+    def fail_after_send(code, env_id, timeout, mark_sent, *, deadline=None):
         calls.append((code, env_id))
         mark_sent()
         raise TimeoutError("response timed out")
@@ -797,7 +1056,7 @@ def test_cleanup_failure_after_full_write_preserves_unknown_outcome(monkeypatch)
         close_calls += 1
         raise RuntimeError("cleanup failed")
 
-    def fail_after_send(code, env_id, timeout, mark_sent):
+    def fail_after_send(code, env_id, timeout, mark_sent, *, deadline=None):
         mark_sent()
         raise TimeoutError("response timed out")
 
@@ -820,7 +1079,7 @@ def test_run_closes_and_reraises_cancellation(monkeypatch, request_sent):
     repl.process = object()
     retired = []
 
-    def cancel(code, env_id, timeout, mark_sent):
+    def cancel(code, env_id, timeout, mark_sent, *, deadline=None):
         if request_sent:
             mark_sent()
         raise asyncio.CancelledError
@@ -1667,9 +1926,7 @@ def test_request_timeout_reaps_a_slow_to_exit_process_without_cleanup_failure(
 
         assert response.get("outcome_unknown") is True
         assert "cleanup also failed" not in response["repl_error"]
-        assert repl.process is None
-        assert repl._process_group_id is None
-        assert repl._retire_pending is False
+        assert repl.is_clean()
     finally:
         repl.close()
 

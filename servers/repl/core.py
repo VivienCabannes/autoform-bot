@@ -530,6 +530,14 @@ class ReplStderrBacklog(RuntimeError):
         self.response = response
 
 
+class ReplCleanupError(RuntimeError):
+    """A disposable call produced a result but its process was not reaped."""
+
+    def __init__(self, message: str, result: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 class LeanRepl:
     """Lean REPL process manager.
 
@@ -566,15 +574,27 @@ class LeanRepl:
     def start(
         self,
         startup_timeout: float | None = None,
+        *,
+        deadline: float | None = None,
+        warmup_imports: frozenset[str] | tuple[str, ...] | None = None,
     ) -> None:
         """Start and warm the Lean REPL within one startup deadline."""
         if os.name != "posix":
             raise RuntimeError("Lean REPL transport requires a POSIX platform")
-        timeout = self.config.startup_timeout if startup_timeout is None else min(
-            self.config.startup_timeout,
-            startup_timeout,
-        )
-        deadline = time.monotonic() + timeout
+        if startup_timeout is not None and deadline is not None:
+            raise TypeError("pass startup_timeout or deadline, not both")
+        started = time.monotonic()
+        configured_deadline = started + self.config.startup_timeout
+        if deadline is None:
+            timeout = (
+                self.config.startup_timeout
+                if startup_timeout is None
+                else min(self.config.startup_timeout, startup_timeout)
+            )
+            deadline = started + timeout
+        else:
+            deadline = min(deadline, configured_deadline)
+            timeout = max(0.0, deadline - started)
 
         def remaining() -> float:
             value = deadline - time.monotonic()
@@ -586,6 +606,7 @@ class LeanRepl:
         env.update(self.config.env)
 
         try:
+            remaining()
             self.process = subprocess.Popen(
                 self.config.repl_command,
                 cwd=self.cwd,
@@ -600,15 +621,20 @@ class LeanRepl:
             self._stderr_bytes = 0
             self._stderr_tail.clear()
 
-            if self.config.warmup_imports:
-                header = "\n".join(
-                    f"import {root}" for root in self.config.warmup_imports
+            startup_imports = (
+                self.config.warmup_imports
+                if warmup_imports is None
+                else warmup_imports
+            )
+            if startup_imports:
+                header = "\n".join(f"import {root}" for root in startup_imports)
+                logger.info("Loading imports at startup: %s", startup_imports)
+                resp = self._run(
+                    code=header,
+                    env_id=None,
+                    timeout=remaining(),
+                    deadline=deadline,
                 )
-                logger.info(
-                    "Loading imports at startup: %s",
-                    self.config.warmup_imports,
-                )
-                resp = self._run(code=header, env_id=None, timeout=remaining())
                 environment, messages = _validate_command_response(
                     resp,
                     context="startup imports",
@@ -625,6 +651,7 @@ class LeanRepl:
                     code="#check Nat",
                     env_id=self._base_env_id,
                     timeout=min(DEFAULT_SMOKE_TEST_TIMEOUT, remaining()),
+                    deadline=deadline,
                 )
                 _, smoke_messages = _validate_command_response(
                     smoke,
@@ -685,6 +712,14 @@ class LeanRepl:
             self._stderr_bytes = 0
             self._stderr_tail.clear()
 
+    def close_with_deadline(self, deadline: float) -> None:
+        """Close using an absolute deadline shared by a pool shutdown."""
+        self.close(deadline=deadline)
+
+    def is_clean(self) -> bool:
+        """Return whether this wrapper owns no live or unreaped process group."""
+        return self.process is None and self._process_group_id is None
+
     def restart(self, timeout: float | None = None) -> None:
         """Restart the Lean REPL process within an optional total timeout."""
         deadline = time.monotonic() + timeout if timeout is not None else None
@@ -712,6 +747,133 @@ class LeanRepl:
     def get_memory_usage(self) -> float:
         """Return memory usage in GB."""
         return _get_process_memory_gb(self.process)
+
+    def run_disposable(
+        self,
+        code: str,
+        timeout: float | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Run one public call as the only frame sent to a fresh process."""
+        if timeout is not None and deadline is not None:
+            raise TypeError("pass timeout or deadline, not both")
+        if deadline is None:
+            timeout = self.request_timeout if timeout is None else timeout
+            deadline = time.monotonic() + timeout
+        else:
+            timeout = max(0.0, deadline - time.monotonic())
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError(f"REPL command timed out after {timeout:g} seconds")
+            return value
+
+        with self._process_lock:
+            result: dict[str, Any] | None = None
+            request_error: BaseException | None = None
+            try:
+                self.close(deadline=deadline)
+                imports, _, _ = _split_imports_and_body(code)
+                if (
+                    self.config.validate_imports
+                    and self._allowed_import_roots is not None
+                ):
+                    submitted_roots = {
+                        statement.split(".")[0] for statement in imports
+                    }
+                    disallowed = submitted_roots - self._allowed_import_roots
+                    if disallowed:
+                        result = {
+                            "repl_error": (
+                                f"Disallowed imports: {', '.join(sorted(disallowed))}. "
+                                "Allowed roots: "
+                                f"{', '.join(sorted(self._allowed_import_roots))}."
+                            )
+                        }
+                if result is None:
+                    added_imports = tuple(
+                        root
+                        for root in sorted(self.config.warmup_imports)
+                        if root not in imports
+                    )
+                    prefix = "\n".join(f"import {root}" for root in added_imports)
+                    command = f"{prefix}\n{code}" if prefix else code
+                    self.start(deadline=deadline, warmup_imports=())
+                    response = self._run(
+                        code=command,
+                        env_id=None,
+                        timeout=remaining(),
+                        deadline=deadline,
+                    )
+                    _validate_command_response(
+                        response,
+                        context="the requested command",
+                        require_environment=True,
+                    )
+                    _adjust_line_numbers(response, -len(added_imports))
+                    result = _without_process_handles(response)
+            except ReplStderrBacklog as error:
+                try:
+                    _validate_command_response(
+                        error.response,
+                        context="the requested command",
+                        require_environment=True,
+                    )
+                except ReplCommandError as command_error:
+                    result = {"repl_error": str(command_error)}
+                except ReplProtocolError as protocol_error:
+                    result = {
+                        "repl_error": str(protocol_error),
+                        "outcome_unknown": True,
+                    }
+                else:
+                    response = _without_process_handles(error.response)
+                    _adjust_line_numbers(response, -len(added_imports))
+                    result = response
+            except ReplCommandError as error:
+                result = {"repl_error": str(error)}
+            except ReplProtocolError as error:
+                result = {"repl_error": str(error), "outcome_unknown": True}
+            except ReplOutcomeUnknown as error:
+                result = {"repl_error": str(error), "outcome_unknown": True}
+            except (ReplProcessExited, TimeoutError, RuntimeError) as error:
+                result = {"repl_error": str(error)}
+            except BaseException as error:
+                request_error = error
+            finally:
+                try:
+                    self.close(
+                        deadline=time.monotonic() + DEFAULT_REPL_CLEANUP_SECONDS
+                    )
+                except BaseException as cleanup_error:
+                    logger.exception(
+                        "failed to retire disposable Lean REPL process; "
+                        "the worker must not be reused"
+                    )
+                    if request_error is not None:
+                        note = f"Lean REPL process cleanup also failed: {cleanup_error}"
+                        add_note = getattr(request_error, "add_note", None)
+                        if add_note is not None:
+                            add_note(note)
+                        else:  # pragma: no cover - Python 3.10 compatibility
+                            logger.error("%s", note)
+                    elif not isinstance(cleanup_error, Exception):
+                        raise
+                    elif result is not None:
+                        raise ReplCleanupError(
+                            "Disposable Lean REPL process cleanup failed after a "
+                            "result was produced; the result must not be replayed: "
+                            f"{cleanup_error}",
+                            result,
+                        ) from cleanup_error
+
+            if request_error is not None:
+                raise request_error.with_traceback(request_error.__traceback__)
+            if result is None:
+                raise RuntimeError("disposable Lean REPL call produced no result")
+            return result
 
     def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
         """Send code to the REPL within one deadline across recovery attempts."""
@@ -886,17 +1048,36 @@ class LeanRepl:
         except Exception:
             logger.warning("Memory check failed, continuing", exc_info=True)
 
-    def _run(self, code: str, env_id: int | None, timeout: float) -> dict[str, Any]:
+    def _run(
+        self,
+        code: str,
+        env_id: int | None,
+        timeout: float,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Run one frame and distinguish safe pre-send failures from unknown outcomes."""
         request_sent = False
-        cleanup_deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        cleanup_deadline = started + timeout
+        if deadline is not None:
+            cleanup_deadline = min(cleanup_deadline, deadline)
+        remaining = cleanup_deadline - started
+        if remaining <= 0:
+            raise TimeoutError(f"REPL command timed out after {timeout:g} seconds")
 
         def mark_sent() -> None:
             nonlocal request_sent
             request_sent = True
 
         try:
-            return self._run_io(code, env_id, timeout, mark_sent)
+            return self._run_io(
+                code,
+                env_id,
+                remaining,
+                mark_sent,
+                deadline=cleanup_deadline,
+            )
         except ReplOutcomeUnknown as error:
             message = str(error)
             try:
@@ -939,6 +1120,8 @@ class LeanRepl:
         env_id: int | None,
         timeout: float,
         mark_sent: Callable[[], None],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         """Send code to the REPL via stdin JSON-RPC, read response via non-blocking I/O."""
         cmd_obj: dict[str, Any] = {"cmd": code}
@@ -955,7 +1138,7 @@ class LeanRepl:
         ):
             raise ReplProcessExited("REPL process is not running.")
 
-        end_time = time.monotonic() + timeout
+        end_time = time.monotonic() + timeout if deadline is None else deadline
         stdin_fd = self.process.stdin.fileno()
         stdout_fd = self.process.stdout.fileno()
         stderr_fd = self.process.stderr.fileno()
