@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
-from fastmcp.server import FastMCP
+if TYPE_CHECKING:
+    from fastmcp.server import FastMCP
 
 from servers.lean_client import LeanRuntimeClient
 
 
 def create_repl_server(runtime: LeanRuntimeClient) -> FastMCP:
     """Create the public REPL MCP adapter for the shared Lean runtime."""
+    from fastmcp.server import FastMCP
+
     server = FastMCP(name="autoform-repl")
 
     @server.tool
     def run_lean_code(project_dir: str, code: str, timeout: float | None = None) -> str:
-        """Compile a Lean snippet in a project's persistent REPL.
+        """Compile a Lean snippet in a fresh project-scoped REPL process.
 
         Args:
             project_dir: Absolute path to the Lake project root.

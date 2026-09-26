@@ -573,16 +573,26 @@ class LeanRepl:
         self,
         startup_timeout: float | None = None,
         *,
+        deadline: float | None = None,
         warmup_imports: frozenset[str] | tuple[str, ...] | None = None,
     ) -> None:
         """Start and warm the Lean REPL within one startup deadline."""
         if os.name != "posix":
             raise RuntimeError("Lean REPL transport requires a POSIX platform")
-        timeout = self.config.startup_timeout if startup_timeout is None else min(
-            self.config.startup_timeout,
-            startup_timeout,
-        )
-        deadline = time.monotonic() + timeout
+        if startup_timeout is not None and deadline is not None:
+            raise TypeError("pass startup_timeout or deadline, not both")
+        started = time.monotonic()
+        configured_deadline = started + self.config.startup_timeout
+        if deadline is None:
+            timeout = (
+                self.config.startup_timeout
+                if startup_timeout is None
+                else min(self.config.startup_timeout, startup_timeout)
+            )
+            deadline = started + timeout
+        else:
+            deadline = min(deadline, configured_deadline)
+            timeout = max(0.0, deadline - started)
 
         def remaining() -> float:
             value = deadline - time.monotonic()
@@ -594,6 +604,7 @@ class LeanRepl:
         env.update(self.config.env)
 
         try:
+            remaining()
             self.process = subprocess.Popen(
                 self.config.repl_command,
                 cwd=self.cwd,
@@ -615,7 +626,12 @@ class LeanRepl:
             if startup_imports:
                 header = "\n".join(f"import {root}" for root in startup_imports)
                 logger.info("Loading imports at startup: %s", startup_imports)
-                resp = self._run(code=header, env_id=None, timeout=remaining())
+                resp = self._run(
+                    code=header,
+                    env_id=None,
+                    timeout=remaining(),
+                    deadline=deadline,
+                )
                 environment, messages = _validate_command_response(
                     resp,
                     context="startup imports",
@@ -632,6 +648,7 @@ class LeanRepl:
                     code="#check Nat",
                     env_id=self._base_env_id,
                     timeout=min(DEFAULT_SMOKE_TEST_TIMEOUT, remaining()),
+                    deadline=deadline,
                 )
                 _, smoke_messages = _validate_command_response(
                     smoke,
@@ -717,10 +734,17 @@ class LeanRepl:
         self,
         code: str,
         timeout: float | None = None,
+        *,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         """Run one public call as the only frame sent to a fresh process."""
-        timeout = self.request_timeout if timeout is None else timeout
-        deadline = time.monotonic() + timeout
+        if timeout is not None and deadline is not None:
+            raise TypeError("pass timeout or deadline, not both")
+        if deadline is None:
+            timeout = self.request_timeout if timeout is None else timeout
+            deadline = time.monotonic() + timeout
+        else:
+            timeout = max(0.0, deadline - time.monotonic())
 
         def remaining() -> float:
             value = deadline - time.monotonic()
@@ -758,11 +782,12 @@ class LeanRepl:
                     )
                     prefix = "\n".join(f"import {root}" for root in added_imports)
                     command = f"{prefix}\n{code}" if prefix else code
-                    self.start(startup_timeout=remaining(), warmup_imports=())
+                    self.start(deadline=deadline, warmup_imports=())
                     response = self._run(
                         code=command,
                         env_id=None,
                         timeout=remaining(),
+                        deadline=deadline,
                     )
                     _validate_command_response(
                         response,
@@ -1005,17 +1030,36 @@ class LeanRepl:
         except Exception:
             logger.warning("Memory check failed, continuing", exc_info=True)
 
-    def _run(self, code: str, env_id: int | None, timeout: float) -> dict[str, Any]:
+    def _run(
+        self,
+        code: str,
+        env_id: int | None,
+        timeout: float,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Run one frame and distinguish safe pre-send failures from unknown outcomes."""
         request_sent = False
-        cleanup_deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        cleanup_deadline = started + timeout
+        if deadline is not None:
+            cleanup_deadline = min(cleanup_deadline, deadline)
+        remaining = cleanup_deadline - started
+        if remaining <= 0:
+            raise TimeoutError(f"REPL command timed out after {timeout:g} seconds")
 
         def mark_sent() -> None:
             nonlocal request_sent
             request_sent = True
 
         try:
-            return self._run_io(code, env_id, timeout, mark_sent)
+            return self._run_io(
+                code,
+                env_id,
+                remaining,
+                mark_sent,
+                deadline=cleanup_deadline,
+            )
         except ReplOutcomeUnknown as error:
             message = str(error)
             try:
@@ -1058,6 +1102,8 @@ class LeanRepl:
         env_id: int | None,
         timeout: float,
         mark_sent: Callable[[], None],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         """Send code to the REPL via stdin JSON-RPC, read response via non-blocking I/O."""
         cmd_obj: dict[str, Any] = {"cmd": code}
@@ -1074,7 +1120,7 @@ class LeanRepl:
         ):
             raise ReplProcessExited("REPL process is not running.")
 
-        end_time = time.monotonic() + timeout
+        end_time = time.monotonic() + timeout if deadline is None else deadline
         stdin_fd = self.process.stdin.fileno()
         stdout_fd = self.process.stdout.fileno()
         stderr_fd = self.process.stderr.fileno()

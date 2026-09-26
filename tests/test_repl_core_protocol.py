@@ -49,6 +49,33 @@ def test_start_owns_a_posix_process_group(monkeypatch):
     repl._process_group_id = None
 
 
+def test_start_does_not_spawn_after_environment_setup_exhausts_deadline(monkeypatch):
+    now = [100.0]
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            validate_imports=False,
+            warmup_imports=frozenset(),
+        )
+    )
+
+    def clean_environment():
+        now[0] = 102.0
+        return {}
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl_core, "_inherit_clean_env", clean_environment)
+    monkeypatch.setattr(
+        repl_core.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail(
+            "an expired startup deadline must not spawn a Lean process"
+        ),
+    )
+
+    with pytest.raises(TimeoutError, match="startup timed out"):
+        repl.start(startup_timeout=1)
+
+
 def test_start_rejects_unsupported_platform_before_spawning(monkeypatch):
     monkeypatch.setattr(repl_core.os, "name", "nt")
     monkeypatch.setattr(
@@ -682,12 +709,12 @@ def test_run_disposable_sends_one_frame_and_removes_process_handles(monkeypatch)
         events.append(("close", repl._process_lock.locked()))
         repl.process = None
 
-    def start(startup_timeout=None, *, warmup_imports=None):
-        events.append(("start", startup_timeout, warmup_imports))
+    def start(startup_timeout=None, *, deadline=None, warmup_imports=None):
+        events.append(("start", startup_timeout, deadline, warmup_imports))
         repl.process = object()
 
-    def run_frame(code, env_id, timeout):
-        events.append(("frame", code, env_id, timeout, repl.process))
+    def run_frame(code, env_id, timeout, *, deadline=None):
+        events.append(("frame", code, env_id, timeout, deadline, repl.process))
         return {
             "env": 7,
             "messages": [],
@@ -702,11 +729,13 @@ def test_run_disposable_sends_one_frame_and_removes_process_handles(monkeypatch)
 
     assert events[0] == ("close", True)
     assert events[1][0] == "start"
-    assert 0 < events[1][1] <= 3
-    assert events[1][2] == ()
+    assert events[1][1] is None
+    assert events[1][2] is not None
+    assert events[1][3] == ()
     assert events[2][0:3] == ("frame", "import Mathlib\n#check Nat", None)
     assert 0 < events[2][3] <= 3
-    assert events[2][4] is not None
+    assert events[2][4] == events[1][2]
+    assert events[2][5] is not None
     assert events[3] == ("close", True)
     assert len([event for event in events if event[0] == "frame"]) == 1
     assert response == {"messages": [], "sorries": [{"goal": "False"}]}
@@ -945,6 +974,28 @@ def _patch_pipe_reads(monkeypatch, process: _PipeProcess):
     monkeypatch.setattr(repl_core.select, "select", fake_select)
 
 
+def test_run_forwards_absolute_deadline_to_wire(monkeypatch):
+    now = [100.0]
+    observed = []
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            validate_imports=False,
+        )
+    )
+
+    def run_io(code, env_id, timeout, mark_sent, *, deadline=None):
+        now[0] = 104.0
+        observed.append((timeout, deadline))
+        return {"env": 1, "messages": [], "sorries": []}
+
+    monkeypatch.setattr(repl_core.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(repl, "_run_io", run_io)
+
+    assert repl._run("#check Nat", None, 5, deadline=105.0)["env"] == 1
+    assert observed == [(5.0, 105.0)]
+
+
 def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -968,7 +1019,7 @@ def test_response_timeout_after_full_write_is_not_retried(monkeypatch):
         lambda timeout=None: pytest.fail("a sent request must not be retried"),
     )
 
-    def fail_after_send(code, env_id, timeout, mark_sent):
+    def fail_after_send(code, env_id, timeout, mark_sent, *, deadline=None):
         calls.append((code, env_id))
         mark_sent()
         raise TimeoutError("response timed out")
@@ -1005,7 +1056,7 @@ def test_cleanup_failure_after_full_write_preserves_unknown_outcome(monkeypatch)
         close_calls += 1
         raise RuntimeError("cleanup failed")
 
-    def fail_after_send(code, env_id, timeout, mark_sent):
+    def fail_after_send(code, env_id, timeout, mark_sent, *, deadline=None):
         mark_sent()
         raise TimeoutError("response timed out")
 
@@ -1028,7 +1079,7 @@ def test_run_closes_and_reraises_cancellation(monkeypatch, request_sent):
     repl.process = object()
     retired = []
 
-    def cancel(code, env_id, timeout, mark_sent):
+    def cancel(code, env_id, timeout, mark_sent, *, deadline=None):
         if request_sent:
             mark_sent()
         raise asyncio.CancelledError
