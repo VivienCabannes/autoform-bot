@@ -90,6 +90,41 @@ def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch):
         pool.shutdown()
 
 
+def test_pool_keeps_using_the_stateful_repl_path(monkeypatch):
+    calls = []
+
+    class FakeRepl:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def run(self, code, **kwargs):
+            calls.append((code, kwargs))
+            return {"messages": []}
+
+        def run_disposable(self, code, **kwargs):
+            raise AssertionError("the disposable path is not public yet")
+
+    monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
+    pool = repl_pool.LeanReplPool(
+        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+    )
+    try:
+        assert pool.run("#check Nat", timeout=1) == {"messages": []}
+    finally:
+        pool.shutdown()
+
+    assert len(calls) == 1
+    code, kwargs = calls[0]
+    assert code == "#check Nat"
+    assert 0 < kwargs["timeout"] <= 1
+
+
 def test_repl_retry_recovery_uses_the_original_deadline(monkeypatch):
     clock = {"now": 0.0}
     repl = repl_core.LeanRepl(
@@ -105,7 +140,7 @@ def test_repl_retry_recovery_uses_the_original_deadline(monkeypatch):
     monkeypatch.setattr(repl_core.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(repl, "is_alive", lambda: True)
     monkeypatch.setattr(repl, "_check_memory_and_maybe_restart", lambda timeout: None)
-    monkeypatch.setattr(repl, "close", lambda: closed.append(True))
+    monkeypatch.setattr(repl, "close", lambda **kwargs: closed.append(True))
 
     def consume_deadline(code, env_id, timeout):
         calls.append(timeout)
@@ -122,6 +157,8 @@ def test_repl_retry_recovery_uses_the_original_deadline(monkeypatch):
 
 def test_repl_request_write_uses_the_operation_deadline():
     read_fd, write_fd = os.pipe()
+    stdout_read_fd, stdout_write_fd = os.pipe()
+    stderr_read_fd, stderr_write_fd = os.pipe()
     os.set_blocking(write_fd, False)
     while True:
         try:
@@ -142,8 +179,8 @@ def test_repl_request_write_uses_the_operation_deadline():
     process.stdin = stdin
     # These streams are checked before the bounded write but never read in
     # this test because the deliberately full stdin pipe times out first.
-    process.stdout = object()
-    process.stderr = object()
+    process.stdout = os.fdopen(stdout_read_fd, "rb", buffering=0)
+    process.stderr = os.fdopen(stderr_read_fd, "rb", buffering=0)
 
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
@@ -157,4 +194,8 @@ def test_repl_request_write_uses_the_operation_deadline():
             repl._run("#check Nat", env_id=None, timeout=0.02)
     finally:
         stdin.close()
+        process.stdout.close()
+        process.stderr.close()
         os.close(read_fd)
+        os.close(stdout_write_fd)
+        os.close(stderr_write_fd)
