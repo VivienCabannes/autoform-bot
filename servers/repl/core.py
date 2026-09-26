@@ -17,7 +17,15 @@ import threading
 import time
 from dataclasses import dataclass, field
 from logging import getLogger
+from pathlib import Path
 from typing import Any, Callable
+
+from servers import (
+    ProjectFingerprint,
+    clean_lake_environment,
+    is_initial_manifest_materialization,
+    lean_project_fingerprint,
+)
 
 logger = getLogger(__name__)
 
@@ -163,13 +171,6 @@ def _kill_subprocesses(
         parent_reaped = _wait_for_process(process, kill_deadline)
     if not parent_reaped:
         raise RuntimeError("timed out reaping the Lean REPL process")
-
-
-def _inherit_clean_env() -> dict[str, str]:
-    """Return a copy of the current environment without PYTHONPATH noise."""
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    return env
 
 
 def _is_natural_number(value: Any) -> bool:
@@ -600,8 +601,11 @@ class LeanRepl:
                 raise TimeoutError(f"REPL startup timed out after {timeout:g} seconds")
             return value
 
-        env = _inherit_clean_env()
-        env.update(self.config.env)
+        env = clean_lake_environment(
+            self.cwd,
+            overrides=self.config.env,
+            require_elan_proxy=self.config.repl_command[0] == "lake",
+        )
 
         try:
             remaining()
@@ -782,12 +786,28 @@ class LeanRepl:
                     )
                     prefix = "\n".join(f"import {root}" for root in added_imports)
                     command = f"{prefix}\n{code}" if prefix else code
+                    remaining()
+                    project_identity = Path(self.cwd).resolve()
+                    try:
+                        dispatch_fingerprint = lean_project_fingerprint(
+                            project_identity,
+                            environment_overrides=self.config.env,
+                        )
+                    except OSError as error:
+                        raise RuntimeError(
+                            "Lean project changed before REPL startup"
+                        ) from error
                     self.start(deadline=deadline, warmup_imports=())
-                    response = self._run(
+                    dispatch_fingerprint = self._assert_project_current_before_dispatch(
+                        deadline,
+                        project_identity,
+                        dispatch_fingerprint,
+                    )
+                    response = self._run_disposable_frame(
                         code=command,
-                        env_id=None,
-                        timeout=remaining(),
                         deadline=deadline,
+                        project_identity=project_identity,
+                        dispatch_fingerprint=dispatch_fingerprint,
                     )
                     _validate_command_response(
                         response,
@@ -856,6 +876,92 @@ class LeanRepl:
             if result is None:
                 raise RuntimeError("disposable Lean REPL call produced no result")
             return result
+
+    def _run_disposable_frame(
+        self,
+        *,
+        code: str,
+        deadline: float,
+        project_identity: Path,
+        dispatch_fingerprint: ProjectFingerprint,
+    ) -> Any:
+        """Run one frame and fence every normal response or failure."""
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("REPL command deadline exceeded before dispatch")
+            return value
+
+        request_timeout = remaining()
+        try:
+            response = self._run(
+                code=code,
+                env_id=None,
+                timeout=request_timeout,
+                deadline=deadline,
+            )
+        except (ReplOutcomeUnknown, ReplStderrBacklog):
+            self._assert_project_unchanged_after_dispatch(
+                deadline,
+                project_identity,
+                dispatch_fingerprint,
+            )
+            raise
+        self._assert_project_unchanged_after_dispatch(
+            deadline,
+            project_identity,
+            dispatch_fingerprint,
+        )
+        return response
+
+    def _assert_project_current_before_dispatch(
+        self,
+        deadline: float,
+        project_identity: Path,
+        expected: ProjectFingerprint,
+    ) -> ProjectFingerprint:
+        """Reject a process started from a project generation that is stale."""
+        if deadline - time.monotonic() <= 0:
+            raise TimeoutError("REPL command deadline exceeded before dispatch")
+        try:
+            current = lean_project_fingerprint(
+                project_identity,
+                environment_overrides=self.config.env,
+            )
+        except OSError as error:
+            raise RuntimeError("Lean project changed before REPL dispatch") from error
+        if current == expected:
+            return expected
+        if is_initial_manifest_materialization(expected, current):
+            return current
+        raise RuntimeError("Lean project changed before REPL dispatch")
+
+    def _assert_project_unchanged_after_dispatch(
+        self,
+        deadline: float,
+        project_identity: Path,
+        expected: ProjectFingerprint,
+    ) -> None:
+        """Reject every response if its project generation changed in flight."""
+        try:
+            if deadline - time.monotonic() <= 0:
+                raise TimeoutError("REPL command deadline exceeded after dispatch")
+            current = lean_project_fingerprint(
+                project_identity,
+                environment_overrides=self.config.env,
+            )
+            if deadline - time.monotonic() <= 0:
+                raise TimeoutError("REPL command deadline exceeded after dispatch")
+            if current != expected and not is_initial_manifest_materialization(
+                expected, current
+            ):
+                raise RuntimeError("Lean project changed after REPL dispatch")
+        except (OSError, TimeoutError, RuntimeError) as error:
+            raise ReplOutcomeUnknown(
+                "Lean project freshness changed while the requested command was "
+                "executing; its outcome is unknown"
+            ) from error
 
     def run(self, code: str, env_id: int | None = None, timeout: float | None = None) -> dict[str, Any]:
         """Send code to the REPL within one deadline across recovery attempts."""
