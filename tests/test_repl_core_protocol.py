@@ -909,7 +909,7 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
 
 
 def _fake_header_deps(stdout: str, returncode: int = 0, stderr: str = "") -> list[str]:
-    """Stand in for ``lake env lean --deps-json /dev/stdin`` with fixed output."""
+    """Stand in for the toolchain's ``lean --deps-json`` with fixed output."""
     script = (
         "import sys; sys.stdin.read(); "
         f"sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); "
@@ -928,13 +928,19 @@ def _deps_json(*modules: str, errors: tuple[str, ...] = ()) -> str:
     return json.dumps({"imports": [entry]})
 
 
-def _header_modules(command: list[str], deadline: float | None = None) -> list[str]:
+def _header_modules(
+    command: list[str],
+    deadline: float | None = None,
+    *,
+    max_output_bytes: int = 1024 * 1024,
+) -> list[str]:
     return repl_core._lean_header_modules(
         command,
         "import Mathlib",
         cwd=None,
         env=dict(os.environ),
         deadline=time.monotonic() + 10 if deadline is None else deadline,
+        max_output_bytes=max_output_bytes,
     )
 
 
@@ -944,6 +950,64 @@ def test_header_check_returns_the_modules_lean_reports():
     )
 
     assert _header_modules(command) == ["Mathlib.Tactic", "«Mathlib.X»", "Init.Data"]
+
+
+def test_header_check_accepts_the_legacy_lean_schema():
+    output = json.dumps(
+        {
+            "imports": [
+                {
+                    "errors": [],
+                    "imports": [
+                        {"module": "Init", "importAll": False},
+                        {"module": "Mathlib.Tactic", "importAll": False},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert _header_modules(_fake_header_deps(output)) == ["Mathlib.Tactic"]
+
+
+def test_default_header_parser_selects_lean_from_the_lake_toolchain():
+    command = repl_core.LeanReplConfig().header_deps_command
+
+    assert command[:3] == ["lake", "env", sys.executable]
+    assert "LEAN_SYSROOT" in command[-1]
+
+
+def test_header_parser_launcher_ignores_a_path_shadow(tmp_path):
+    trusted_bin = tmp_path / "toolchain" / "bin"
+    shadow_bin = tmp_path / "shadow"
+    trusted_bin.mkdir(parents=True)
+    shadow_bin.mkdir()
+
+    def write_parser(path, module):
+        path.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "sys.stdin.read()\n"
+            f"sys.stdout.write({_deps_json(module)!r})\n"
+        )
+        path.chmod(0o755)
+
+    write_parser(trusted_bin / "lean", "Mathlib")
+    write_parser(shadow_bin / "lean", "Unsafe")
+    env = dict(os.environ)
+    env["LEAN_SYSROOT"] = str(trusted_bin.parent)
+    env["PATH"] = f"{shadow_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    modules = repl_core._lean_header_modules(
+        [sys.executable, "-c", repl_core._LEAN_HEADER_LAUNCHER],
+        "import Mathlib",
+        cwd=None,
+        env=env,
+        deadline=time.monotonic() + 10,
+        max_output_bytes=1024 * 1024,
+    )
+
+    assert modules == ["Mathlib"]
 
 
 @pytest.mark.parametrize(
@@ -958,6 +1022,20 @@ def test_header_check_returns_the_modules_lean_reports():
         (_fake_header_deps("not json"), "unrecognized output"),
         (_fake_header_deps('{"imports": []}'), "unrecognized output"),
         (_fake_header_deps('{"imports": [{"errors": [], "result": {}}]}'), "unrecognized output"),
+        (
+            _fake_header_deps(
+                '{"imports": [{"errors": null, "result": {"imports": []}}]}'
+            ),
+            "unrecognized output",
+        ),
+        (
+            _fake_header_deps(
+                '{"imports": [{"errors": [], "result": {"imports": {}}}]}'
+            ),
+            "unrecognized output",
+        ),
+        (_fake_header_deps('{"imports": [], "imports": []}'), "duplicate JSON key"),
+        (_fake_header_deps('{"imports": NaN}'), "nonstandard JSON constant"),
         (_fake_header_deps(_deps_json("")), "unrecognized output"),
     ],
 )
@@ -974,6 +1052,130 @@ def test_header_check_kills_a_command_that_outlives_the_deadline():
         _header_modules(command, deadline=started + 0.2)
 
     assert time.monotonic() - started < 5
+
+
+def test_header_check_rejects_output_over_the_configured_limit():
+    command = _fake_header_deps("x" * 1025)
+
+    with pytest.raises(ValueError, match="output exceeded 1024 bytes"):
+        _header_modules(command, max_output_bytes=1024)
+
+
+def test_header_check_verifies_descendant_cleanup_after_success(tmp_path):
+    process_record = tmp_path / "processes.json"
+    script = (
+        "import json, os, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)'], stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL); "
+        f"open({str(process_record)!r}, 'w').write(json.dumps("
+        "{'child': child.pid, 'group': os.getpgrp()})); "
+        "sys.stdin.read(); "
+        f"sys.stdout.write({_deps_json('Mathlib')!r})"
+    )
+
+    assert _header_modules([sys.executable, "-c", script]) == ["Mathlib"]
+    process_ids = json.loads(process_record.read_text())
+    assert not repl_core._process_group_has_live_members(process_ids["group"])
+
+
+def test_run_disposable_adopts_header_process_when_cleanup_must_be_retried(
+    monkeypatch,
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            header_deps_command=_fake_header_deps(_deps_json("Mathlib")),
+        )
+    )
+    real_kill_subprocesses = repl_core._kill_subprocesses
+    cleanup_calls = 0
+
+    def fail_once(process, process_group_id, deadline=None):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise RuntimeError("injected cleanup failure")
+        return real_kill_subprocesses(process, process_group_id, deadline)
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", fail_once)
+    monkeypatch.setattr(
+        repl,
+        "start",
+        lambda *args, **kwargs: pytest.fail("cleanup failure must not start Lean"),
+    )
+
+    response = repl.run_disposable("import Mathlib\n#check Nat")
+
+    assert "header parser cleanup failed" in response["repl_error"]
+    assert cleanup_calls == 2
+    assert repl.is_clean()
+
+
+def test_run_disposable_preserves_header_cleanup_cancellation(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            header_deps_command=_fake_header_deps(_deps_json("Mathlib")),
+        )
+    )
+    real_kill_subprocesses = repl_core._kill_subprocesses
+    cleanup_calls = 0
+
+    def cancel_once(process, process_group_id, deadline=None):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise asyncio.CancelledError("cancel header cleanup")
+        return real_kill_subprocesses(process, process_group_id, deadline)
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", cancel_once)
+
+    with pytest.raises(asyncio.CancelledError, match="cancel header cleanup"):
+        repl.run_disposable("import Mathlib\n#check Nat")
+
+    assert cleanup_calls == 2
+    assert repl.is_clean()
+
+
+def test_run_disposable_preserves_header_request_cancellation_when_cleanup_cancels(
+    monkeypatch,
+):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            warmup_imports=frozenset(),
+            header_deps_command=[sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+    )
+    real_kill_subprocesses = repl_core._kill_subprocesses
+    cleanup_calls = 0
+
+    monkeypatch.setattr(
+        repl_core,
+        "_communicate_bounded",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("cancel header request")
+        ),
+    )
+
+    def cancel_once(process, process_group_id, deadline=None):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise asyncio.CancelledError("cancel header cleanup")
+        return real_kill_subprocesses(process, process_group_id, deadline)
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", cancel_once)
+
+    with pytest.raises(KeyboardInterrupt, match="cancel header request") as raised:
+        repl.run_disposable("import Mathlib\n#check Nat")
+
+    if hasattr(raised.value, "add_note"):
+        assert raised.value.__notes__ == [
+            "Lean header parser cleanup failed: cancel header cleanup"
+        ]
+    assert cleanup_calls == 2
+    assert repl.is_clean()
 
 
 @pytest.mark.parametrize(
@@ -1006,7 +1208,29 @@ def test_run_disposable_rejects_what_lean_reports_before_starting(
     assert repl.process is None
 
 
-def test_run_disposable_checks_the_header_after_adding_warmup_imports(monkeypatch):
+def test_run_disposable_checks_warmup_import_roots(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            allowed_imports=frozenset({"Mathlib"}),
+            warmup_imports=frozenset({"Mathlib.Tactic"}),
+            header_deps_command=_fake_header_deps(_deps_json()),
+        )
+    )
+    monkeypatch.setattr(repl, "start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repl,
+        "_run",
+        lambda *args, **kwargs: {"env": 1, "messages": [], "sorries": []},
+    )
+
+    response = repl.run_disposable("#check Nat")
+
+    assert "repl_error" not in response
+
+
+def test_run_disposable_checks_the_submitted_header_before_adding_warmup_imports(
+    monkeypatch,
+):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
             allowed_imports=frozenset({"Mathlib"}),
@@ -1023,7 +1247,7 @@ def test_run_disposable_checks_the_header_after_adding_warmup_imports(monkeypatc
 
     repl.run_disposable("/- note -/ import Unsafe\n#check Nat")
 
-    assert checked == ["import Mathlib\n/- note -/ import Unsafe\n#check Nat"]
+    assert checked == ["/- note -/ import Unsafe\n#check Nat"]
 
 
 class _PipeProcess:

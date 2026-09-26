@@ -45,7 +45,10 @@ manifest is included, but Muse installation is not covered here.
 ## Quick start
 
 Work from an existing Lean repository. First scaffold the blueprint and site
-configuration from an Autoform checkout:
+configuration from an Autoform checkout. The project must declare
+`leanprover-community/repl` at an immutable revision compatible with its Lean
+toolchain; verify it first with `lake build @repl/repl` (the Setup skill selects
+and checks this pin):
 
 ```bash
 uv run autoform init /path/to/lean-project \

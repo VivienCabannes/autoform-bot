@@ -2,6 +2,7 @@ name: tests
 
 on:
   push:
+    branches: [main, execution]
   pull_request:
 
 permissions:
@@ -38,7 +39,7 @@ jobs:
         with:
           auto-config: false
           build: true
-          build-args: repl
+          build-args: "Mathlib @repl/repl"
           lake-package-directory: tests/fixtures/repl-smoke
       - run: uv sync --extra dev --extra repl
       - run: uv run pytest -q tests/test_real_repl.py

@@ -25,6 +25,12 @@ the runtime does not stop it; after a crash, the next tool call starts it again.
 Runtime sockets include a code fingerprint, so an in-place upgrade gracefully
 replaces the older build.
 
+Each consumer Lake project must declare `leanprover-community/repl` at an
+immutable revision compatible with its Lean toolchain. Autoform invokes the
+qualified target with `lake exe @repl/repl`, so a same-named executable in the
+root project cannot shadow the pinned dependency. `lake build @repl/repl`
+checks this contract when the toolchain or dependency revision changes.
+
 Lean subprocesses remain lazy. A REPL call stays pending while its fresh child
 starts, and the first LSP call stays pending while its session starts, so no
 `/repl-start`, `/lsp-start`, or model-side sleep is needed. Idle project slots
@@ -47,9 +53,9 @@ request frame is dispatched. Once the final frame delimiter may have reached
 Lean, replay could execute the command twice, so Autoform retires the process
 and reports that the outcome is unknown instead of retrying.
 The REPL per-call timeout starts before the shared daemon is connected or
-started, then covers project admission, fresh child startup, idle-worker wait,
-and Lean execution. Verified process cleanup and response delivery get a
-separate bounded grace period before the RPC returns.
+started, then covers project admission, header validation, fresh child startup,
+idle-worker wait, and Lean execution. Verified process cleanup and response
+delivery get a separate bounded grace period before the RPC returns.
 
 `LEAN_REPL_CMD` is a trusted local command. Its descendants must remain in the
 dedicated process group Autoform creates; a command that deliberately detaches

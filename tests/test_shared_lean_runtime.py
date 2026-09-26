@@ -47,7 +47,7 @@ def runtime_config(**overrides):
         "total_repl_workers": 2,
         "repl_workers_per_project": 1,
         "repl_project_limit": 2,
-        "repl_command": ("lake", "exe", "repl"),
+        "repl_command": ("lake", "exe", "@repl/repl"),
         "lsp_command": ("lake", "serve"),
         "lsp_timeout": 60.0,
         "max_lsp_request_seconds": 600.0,
@@ -1949,6 +1949,16 @@ def test_runtime_response_rejects_invalid_utf8_as_unknown_outcome(
         _runtime_response(client, monkeypatch, b"\xff\n")
 
     assert isinstance(caught.value.__cause__, LeanRuntimeProtocolError)
+
+
+def test_default_repl_command_uses_the_declared_dependency(monkeypatch):
+    monkeypatch.delenv("LEAN_REPL_CMD", raising=False)
+
+    assert LeanRuntimeConfig.from_environment().repl_command == (
+        "lake",
+        "exe",
+        "@repl/repl",
+    )
 
 
 @pytest.mark.parametrize(

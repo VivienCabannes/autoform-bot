@@ -117,10 +117,40 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert (example / "src/CabannesThesis.lean").is_file()
     assert (example / "src/CabannesThesis/Basic.lean").is_file()
     toolchain = (example / "lean-toolchain").read_text(encoding="utf-8").strip()
-    manifest = tomllib.loads((example / "lakefile.toml").read_text(encoding="utf-8"))
+    lakefile = tomllib.loads((example / "lakefile.toml").read_text(encoding="utf-8"))
     assert toolchain == "leanprover/lean4:v4.32.2"
-    assert manifest["require"][0]["rev"] == "v4.32.2"
-    assert manifest["lean_lib"][0]["srcDir"] == "src"
+    requirements = {
+        requirement["name"]: requirement for requirement in lakefile["require"]
+    }
+    assert requirements["mathlib"]["rev"] == "v4.32.2"
+    assert requirements["repl"] == {
+        "name": "repl",
+        "git": "https://github.com/leanprover-community/repl.git",
+        "rev": "68a3b3a059787a7db44fb1e6281e4a657efee470",
+    }
+    assert lakefile["lean_lib"][0]["srcDir"] == "src"
+    manifest = json.loads(
+        (example / "lake-manifest.json").read_text(encoding="utf-8")
+    )
+    repl_package = next(
+        package for package in manifest["packages"] if package["name"] == "repl"
+    )
+    assert repl_package["rev"] == requirements["repl"]["rev"]
+
+    fixture = repo_root / "tests/fixtures/repl-smoke"
+    assert (
+        (fixture / "lean-toolchain").read_text(encoding="utf-8").strip()
+        == toolchain
+    )
+    fixture_lakefile = tomllib.loads(
+        (fixture / "lakefile.toml").read_text(encoding="utf-8")
+    )
+    fixture_repl = next(
+        requirement
+        for requirement in fixture_lakefile["require"]
+        if requirement["name"] == "repl"
+    )
+    assert fixture_repl["rev"] == requirements["repl"]["rev"]
 
 
 def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> None:

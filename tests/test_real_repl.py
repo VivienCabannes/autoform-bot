@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
+from servers.lean_client import LeanRuntimeClient, LeanRuntimeUnavailable
 from servers.repl.core import LeanRepl, LeanReplConfig
-from servers.repl.pool import LeanReplPool, LeanReplPoolConfig
 
 
 REPL_FIXTURE = Path(__file__).parent / "fixtures" / "repl-smoke"
@@ -22,7 +23,7 @@ def test_disposable_call_matches_the_pinned_repl_protocol():
     repl = LeanRepl(
         LeanReplConfig(
             cwd=str(REPL_FIXTURE),
-            repl_command=["lake", "exe", "repl"],
+            repl_command=["lake", "exe", "@repl/repl"],
             warmup_imports=frozenset(),
             validate_imports=False,
         )
@@ -49,18 +50,19 @@ def test_disposable_call_matches_the_pinned_repl_protocol():
         ((), "/- note -/\nimport Init.Data\n#check Nat", "Disallowed imports: Init"),
         ((), "import REPL import Init.Data\n#check Nat", "Disallowed imports: Init"),
         ((), "module\npublic import Init.Data\n", "Disallowed imports: Init"),
+        (("REPL",), "module\npublic import Init.Data\n", "Disallowed imports: Init"),
         (("REPL",), "/- note -/ import Init.Data\n#check Nat", "Disallowed imports: Init"),
         ((), "import NotAllowlisted.Mod\n", "Disallowed imports: NotAllowlisted"),
         ((), "import «REPL.X»\n", "Disallowed imports: «REPL"),
         ((), "import «REPL\n", "Rejected Lean header"),
-        ((), "import REPL\ntheorem autoform_header_probe : True := trivial", None),
+        ((), "import REPL.Frontend\n#check Nat", None),
     ],
 )
 def test_disposable_imports_are_checked_by_lean_itself(warmup, code, expected_error):
     repl = LeanRepl(
         LeanReplConfig(
             cwd=str(REPL_FIXTURE),
-            repl_command=["lake", "exe", "repl"],
+            repl_command=["lake", "exe", "@repl/repl"],
             allowed_imports=frozenset({"REPL"}),
             warmup_imports=frozenset(warmup),
         )
@@ -70,6 +72,10 @@ def test_disposable_imports_are_checked_by_lean_itself(warmup, code, expected_er
 
     if expected_error is None:
         assert "repl_error" not in response
+        assert not any(
+            message["severity"] == "error"
+            for message in response.get("messages", [])
+        )
     else:
         assert expected_error in response["repl_error"]
     assert repl.is_clean()
@@ -79,22 +85,30 @@ def test_disposable_imports_are_checked_by_lean_itself(warmup, code, expected_er
     os.environ.get("AUTOFORM_RUN_REAL_REPL_TESTS") != "1",
     reason="set AUTOFORM_RUN_REAL_REPL_TESTS=1 to run the pinned REPL integration",
 )
-def test_pool_calls_do_not_share_lean_state():
-    pool = LeanReplPool(
-        LeanReplPoolConfig(
-            cwd=str(REPL_FIXTURE),
-            repl_command=["lake", "exe", "repl"],
-            allowed_imports=frozenset({"REPL"}),
-            warmup_imports=frozenset(),
-            num_repls=1,
-        )
+def test_runtime_calls_do_not_share_lean_state(runtime_dir, monkeypatch):
+    monkeypatch.setenv("AUTOFORM_REPL_TOTAL_WORKERS", "1")
+    monkeypatch.setenv("AUTOFORM_REPL_WORKERS_PER_PROJECT", "1")
+    client = LeanRuntimeClient(
+        socket_path=runtime_dir / "real-repl.sock",
+        response_timeout=300,
+        startup_timeout=30,
     )
-    declaration = "theorem autoform_isolation_probe : True := trivial"
+    declaration = "theorem autoform_isolation_probe : True := True.intro"
     try:
-        responses = [pool.run(declaration, timeout=180) for _ in range(2)]
+        responses = [
+            client.request(
+                "repl.run",
+                {
+                    "project_dir": str(REPL_FIXTURE),
+                    "code": declaration,
+                    "timeout": 180,
+                },
+            )
+            for _ in range(2)
+        ]
     finally:
-        pool.shutdown()
+        with suppress(LeanRuntimeUnavailable):
+            client.stop()
 
     for response in responses:
-        assert "repl_error" not in response
-        assert not any(m["severity"] == "error" for m in response.get("messages", []))
+        assert response == "Compiles successfully"

@@ -1,4 +1,4 @@
-"""Lean REPL backend: one session managing a ``lake exe repl`` subprocess.
+"""Lean REPL backend: one session managing a ``lake exe @repl/repl`` subprocess.
 
 Provides LeanRepl with non-blocking I/O, a preloaded import environment,
 memory monitoring, automatic restart, and multi-snippet chaining.
@@ -13,6 +13,7 @@ import random
 import select
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -34,6 +35,11 @@ _VALID_DIAGNOSTIC_SEVERITIES = frozenset({"trace", "info", "warning", "error"})
 _STDERR_TAIL_BYTES = 200
 _PUBLIC_DIAGNOSTIC_FIELDS = frozenset({"severity", "data", "pos", "endPos"})
 _PUBLIC_SORRY_FIELDS = frozenset({"goal", "pos", "endPos"})
+_LEAN_HEADER_LAUNCHER = (
+    "import os; "
+    "lean = os.path.join(os.environ['LEAN_SYSROOT'], 'bin', 'lean'); "
+    "os.execv(lean, [lean, '--deps-json', '/dev/stdin'])"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +296,197 @@ def _validate_command_response(
     return environment, messages
 
 
+class _HeaderProcessCleanupError(RuntimeError):
+    """Header validation ended without verified ownership cleanup."""
+
+    def __init__(
+        self,
+        message: str,
+        process: subprocess.Popen[bytes],
+        original_error: BaseException | None,
+        cleanup_error: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.process = process
+        self.original_error = original_error
+        self.cleanup_error = cleanup_error
+
+
+def _communicate_bounded(
+    process: subprocess.Popen[bytes],
+    input_bytes: bytes,
+    *,
+    deadline: float,
+    max_output_bytes: int,
+) -> tuple[bytes, bytes]:
+    """Exchange bytes with a child without allowing unbounded pipe buffering."""
+    if max_output_bytes < 1:
+        raise ValueError("header parser output limit must be positive")
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        raise RuntimeError("header parser pipes are unavailable")
+
+    stdin_fd = process.stdin.fileno()
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    for fd in (stdin_fd, stdout_fd, stderr_fd):
+        os.set_blocking(fd, False)
+
+    pending = memoryview(input_bytes)
+    offset = 0
+    stdin_open = True
+    stdout_open = True
+    stderr_open = True
+    stdout = bytearray()
+    stderr = bytearray()
+
+    def close_stdin() -> None:
+        nonlocal stdin_open
+        if not stdin_open:
+            return
+        stdin_open = False
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+
+    while stdin_open or stdout_open or stderr_open:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out checking the Lean header")
+        readable_fds: list[int] = []
+        if stdout_open:
+            readable_fds.append(stdout_fd)
+        if stderr_open:
+            readable_fds.append(stderr_fd)
+        writable_fds = [stdin_fd] if stdin_open else []
+        try:
+            readable, writable, _ = select.select(
+                readable_fds,
+                writable_fds,
+                [],
+                remaining,
+            )
+        except InterruptedError:
+            continue
+        if not readable and not writable:
+            raise TimeoutError("timed out checking the Lean header")
+
+        for fd, target in ((stdout_fd, stdout), (stderr_fd, stderr)):
+            if fd not in readable:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if fd == stdout_fd:
+                    stdout_open = False
+                else:
+                    stderr_open = False
+                continue
+            if len(stdout) + len(stderr) + len(chunk) > max_output_bytes:
+                raise ValueError(
+                    f"Lean header parser output exceeded {max_output_bytes} bytes"
+                )
+            target.extend(chunk)
+
+        if stdin_fd in writable:
+            try:
+                written = os.write(stdin_fd, pending[offset : offset + 65536])
+            except BlockingIOError:
+                continue
+            except BrokenPipeError:
+                close_stdin()
+            else:
+                if written <= 0:
+                    close_stdin()
+                else:
+                    offset += written
+                    if offset == len(pending):
+                        close_stdin()
+
+    close_stdin()
+    if process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out checking the Lean header")
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("timed out checking the Lean header") from None
+    return bytes(stdout), bytes(stderr)
+
+
+def _decode_header_modules(stdout: bytes) -> list[str]:
+    """Decode the strict schemas emitted by Lean's fast import parser."""
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"nonstandard JSON constant {value!r}")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            stdout.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+        if not isinstance(payload, dict) or set(payload) != {"imports"}:
+            raise ValueError
+        entries = payload["imports"]
+        if not isinstance(entries, list) or len(entries) != 1:
+            raise ValueError
+        entry = entries[0]
+        if not isinstance(entry, dict):
+            raise ValueError
+        errors = entry.get("errors")
+        if not isinstance(errors, list) or not all(
+            isinstance(error, str) and error for error in errors
+        ):
+            raise ValueError
+        if errors:
+            raise ValueError(errors[0])
+
+        has_result = "result" in entry
+        has_imports = "imports" in entry
+        if has_result == has_imports:
+            raise ValueError
+        if has_result:
+            result = entry["result"]
+            if not isinstance(result, dict):
+                raise ValueError
+            imports = result.get("imports")
+        else:
+            imports = entry["imports"]
+        if not isinstance(imports, list):
+            raise ValueError
+
+        modules: list[str] = []
+        for item in imports:
+            if not isinstance(item, dict):
+                raise ValueError
+            module = item.get("module")
+            if not isinstance(module, str) or not module:
+                raise ValueError
+            if module != "Init":
+                modules.append(module)
+        return modules
+    except UnicodeDecodeError:
+        raise ValueError("unrecognized output from lean --deps-json") from None
+    except (TypeError, KeyError, json.JSONDecodeError):
+        raise ValueError("unrecognized output from lean --deps-json") from None
+    except ValueError as error:
+        if str(error):
+            raise
+        raise ValueError("unrecognized output from lean --deps-json") from None
+
+
 def _lean_header_modules(
     command: list[str],
     code: str,
@@ -297,6 +494,7 @@ def _lean_header_modules(
     cwd: str | None,
     env: dict[str, str],
     deadline: float,
+    max_output_bytes: int,
 ) -> list[str]:
     """Return every module the Lean header of ``code`` imports, read by Lean itself.
 
@@ -318,30 +516,44 @@ def _lean_header_modules(
         env=env,
         start_new_session=True,
     )
+    original_error: BaseException | None = None
+    stdout = b""
+    stderr = b""
     try:
-        stdout, stderr = process.communicate(code.encode(), timeout=remaining)
-    except subprocess.TimeoutExpired:
-        _kill_subprocesses(process, process.pid)
-        raise TimeoutError("timed out checking the Lean header") from None
-    except BaseException:
-        _kill_subprocesses(process, process.pid)
-        raise
+        stdout, stderr = _communicate_bounded(
+            process,
+            code.encode(),
+            deadline=deadline,
+            max_output_bytes=max_output_bytes,
+        )
+    except BaseException as error:
+        original_error = error
+    try:
+        _kill_subprocesses(
+            process,
+            process.pid,
+            time.monotonic() + DEFAULT_REPL_CLEANUP_SECONDS,
+        )
+    except BaseException as cleanup_error:
+        raise _HeaderProcessCleanupError(
+            f"Lean header parser cleanup failed: {cleanup_error}",
+            process,
+            original_error,
+            cleanup_error,
+        ) from cleanup_error
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+    if original_error is not None:
+        raise original_error.with_traceback(original_error.__traceback__)
     if process.returncode != 0:
         detail = stderr.decode(errors="replace").strip().splitlines()
         raise ValueError(detail[0] if detail else f"exit status {process.returncode}")
-
-    try:
-        (entry,) = json.loads(stdout)["imports"]
-        errors = entry["errors"]
-        modules = [] if errors else [item["module"] for item in entry["result"]["imports"]]
-    except (ValueError, TypeError, KeyError):
-        raise ValueError("unrecognized output from lean --deps-json") from None
-    if errors:
-        raise ValueError(str(errors[0]))
-    if not all(isinstance(module, str) and module for module in modules):
-        raise ValueError("unrecognized output from lean --deps-json")
-    # Every file imports Init implicitly, so importing it grants nothing.
-    return [module for module in modules if module != "Init"]
+    return _decode_header_modules(stdout)
 
 
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
@@ -391,10 +603,18 @@ class LeanReplConfig:
     allowed_imports: frozenset[str] = ALLOWED_IMPORTS
     warmup_imports: frozenset[str] = WARMUP_IMPORTS
 
-    repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
+    repl_command: list[str] = field(
+        default_factory=lambda: ["lake", "exe", "@repl/repl"]
+    )
     # Reports the imports of the submitted header, parsed by Lean itself.
     header_deps_command: list[str] = field(
-        default_factory=lambda: ["lake", "env", "lean", "--deps-json", "/dev/stdin"]
+        default_factory=lambda: [
+            "lake",
+            "env",
+            sys.executable,
+            "-c",
+            _LEAN_HEADER_LAUNCHER,
+        ]
     )
 
     # stdout is capped per response. stderr has no protocol framing, so its
@@ -599,7 +819,7 @@ class ReplCleanupError(RuntimeError):
 class LeanRepl:
     """Lean REPL process manager.
 
-    Manages a ``lake exe repl`` subprocess with non-blocking I/O,
+    Manages a ``lake exe @repl/repl`` subprocess with non-blocking I/O,
     a preloaded import environment, and automatic restart on failure.
     """
 
@@ -852,25 +1072,57 @@ class LeanRepl:
                     self.config.validate_imports
                     and self._allowed_import_roots is not None
                 ):
-                    # The whole header reaches Lean here, so let Lean parse it.
+                    # Validate the submitted header before adding warmup imports.
+                    # Prefixing a `module` or `prelude` header changes what Lean
+                    # recognizes as a header and could otherwise hide imports.
                     env = _inherit_clean_env()
                     env.update(self.config.env)
                     try:
                         header_modules = _lean_header_modules(
                             self.config.header_deps_command,
-                            command,
+                            code,
                             cwd=self.cwd,
                             env=env,
                             deadline=deadline,
+                            max_output_bytes=self.config.max_buffer_bytes,
                         )
+                    except _HeaderProcessCleanupError as error:
+                        self.process = error.process
+                        self._process_group_id = error.process.pid
+                        self._retire_pending = True
+                        original_error = error.original_error
+                        cleanup_error = error.cleanup_error
+                        if original_error is not None and not isinstance(
+                            original_error, Exception
+                        ):
+                            note = str(error)
+                            add_note = getattr(original_error, "add_note", None)
+                            if add_note is not None:
+                                add_note(note)
+                            raise original_error.with_traceback(
+                                original_error.__traceback__
+                            )
+                        if not isinstance(cleanup_error, Exception):
+                            if original_error is not None:
+                                note = (
+                                    f"Header validation also failed: {original_error}"
+                                )
+                                add_note = getattr(cleanup_error, "add_note", None)
+                                if add_note is not None:
+                                    add_note(note)
+                            raise cleanup_error.with_traceback(
+                                cleanup_error.__traceback__
+                            )
+                        raise
                     except ValueError as error:
                         result = {"repl_error": f"Rejected Lean header: {error}"}
                         header_modules = []
                     submitted_roots = {
-                        module.split(".")[0] for module in header_modules
+                        module.split(".")[0]
+                        for module in (*header_modules, *added_imports)
                     }
                     disallowed = submitted_roots - self._allowed_import_roots
-                    if disallowed:
+                    if disallowed and result is None:
                         result = {
                             "repl_error": (
                                 f"Disallowed imports: {', '.join(sorted(disallowed))}. "
