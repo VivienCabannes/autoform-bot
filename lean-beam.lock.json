@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/leanprover/lean-beam.git",
+  "commit": "d5dc8fe9d3928899bf55968a93d9e309d9fad1bc",
+  "version": "0.2.0-beta",
+  "mcp_protocol": "2026-07-28",
+  "tested_toolchains": [
+    "leanprover/lean4:v4.32.2",
+    "leanprover/lean4:v4.33.0"
+  ],
+  "development_only": true
+}

@@ -20,7 +20,49 @@ jobs:
           version: "0.12.1"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
-      - run: uv sync --extra dev --extra repl
-      - run: uv run ruff check autoform_cli servers tests
+      - run: uv sync --extra dev
+      - run: uv run ruff check autoform_cli tests
       - run: uv run pytest -q
       - run: make check-example
+
+  lean-beam:
+    name: lean-beam (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: [leanprover/lean4:v4.32.2, leanprover/lean4:v4.33.0]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: leanprover/lean-beam
+          ref: d5dc8fe9d3928899bf55968a93d9e309d9fad1bc
+          path: .lean-beam-source
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+          python-version: "3.13"
+          enable-cache: true
+      - uses: leanprover/lean-action@50fcf42d2e460296f1a34b402e990d1b24f8b596 # v1
+        with:
+          auto-config: false
+          build: false
+          lake-package-directory: .lean-beam-source
+      - run: elan toolchain install "${{ matrix.toolchain }}"
+      - name: Install pinned Lean Beam
+        run: >-
+          ./.lean-beam-source/scripts/install-beam.sh --dont-ask
+          --toolchain "${{ matrix.toolchain }}"
+        env:
+          BEAM_BIN_HOME: ${{ runner.temp }}/autoform-beam/bin
+          BEAM_INSTALL_ROOT: ${{ runner.temp }}/autoform-beam/runtime
+      - run: uv sync --extra dev
+      - name: Exercise the public Lean Beam session contract
+        run: uv run pytest -q tests/test_real_lean_beam.py
+        env:
+          AUTOFORM_RUN_REAL_LEAN_BEAM_TESTS: "1"
+          AUTOFORM_REAL_LEAN_TOOLCHAIN: ${{ matrix.toolchain }}
+          AUTOFORM_LEAN_BEAM_MCP: ${{ runner.temp }}/autoform-beam/bin/lean-beam-mcp

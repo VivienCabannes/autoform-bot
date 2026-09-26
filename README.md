@@ -7,8 +7,8 @@ CLI use the identifier `autoform`; the canonical repository is
 [`facebookresearch/autoform-bot`](https://github.com/facebookresearch/autoform-bot).
 
 The default `main` branch provides repository setup, roadmap planning,
-publication, human and agent review, and shared Lean LSP/REPL tools. It does
-**not** include autonomous orchestration.
+publication, human and agent review, and an opt-in Lean Beam integration
+preview. It does **not** include autonomous orchestration.
 
 Autonomous execution is an opt-in overlay on the
 [`execution`](https://github.com/facebookresearch/autoform-bot/tree/execution)
@@ -39,8 +39,15 @@ codex plugin marketplace add facebookresearch/autoform-bot --ref main
 codex plugin add autoform@autoform
 ```
 
-Start a new agent session so the skills and MCP servers reload. A native Muse
+Start a new agent session so the skills reload. A native Muse
 manifest is included, but Muse installation is not covered here.
+
+The Lean Beam integration is a development preview because a compatible tagged
+release does not exist yet. Autoform does not bundle or register the server.
+Opt-in users install the exact revision in `lean-beam.lock.json` and let Beam's
+own installer register its canonical `lean-beam` MCP server before restarting
+the agent host. Lean tooling in the preview is not yet available through the
+native Muse plugin. See [the integration contract](docs/lean-beam.md).
 
 ## Quick start
 
@@ -134,7 +141,7 @@ deploys from `main` only after GitHub Pages is enabled in repository settings.
 
 - [Cabannes thesis example](skills/setup/assets/cabannes-thesis-project/README.md)
 - [Roadmap example](skills/roadmap/references/cabannes-thesis-roadmap.md)
-- [Lean server architecture and operations](servers/README.md)
+- [Lean Beam integration and session model](docs/lean-beam.md)
 
 ## Development
 

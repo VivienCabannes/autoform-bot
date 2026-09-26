@@ -34,6 +34,31 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
     assert "VivienCabannes/autoform-bot" not in readme
 
 
+def test_setup_requires_the_pinned_explicit_lean_beam_contract(repo_root: Path) -> None:
+    setup = (repo_root / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+    integration = (repo_root / "docs" / "lean-beam.md").read_text(encoding="utf-8")
+    agent_review = (
+        repo_root / "skills" / "agent-review" / "references" / "mathlib-style.md"
+    ).read_text(encoding="utf-8")
+    normalized_setup = " ".join(setup.split())
+    normalized_integration = " ".join(integration.split())
+
+    assert "lean-beam.lock.json" in setup
+    assert "beam_version" in setup
+    assert "absolute `workspace.root`" in setup
+    assert "opaque snapshot" in normalized_setup
+    assert "Do not use `lean_save` or `lean_close_save`" in normalized_setup
+    assert "When the user explicitly opts into the Lean Beam preview" in normalized_setup
+    assert "If the user does not opt in" in normalized_setup
+    assert "There is no Autoform session id" in integration
+    assert "Do not automatically retry" in integration
+    assert "clean external `lake build`" in integration
+    assert "not a filesystem authorization boundary" in normalized_integration
+    assert "workflow rule rather than a technical filter" in normalized_integration
+    assert "../../../docs/lean-beam.md" in agent_review
+    assert "do not use `lean_save` or `lean_close_save`" in agent_review
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"
@@ -101,6 +126,8 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert ".obsidian/" in ignored
     assert "dependencies.md" in ignored
     assert "structure.md" not in ignored
+    project_ignored = (example / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".beam/" in project_ignored
 
     overview = (blueprint / "README.md").read_text(encoding="utf-8")
     assert "kind: blueprint" in overview
