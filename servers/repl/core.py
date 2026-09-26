@@ -300,11 +300,11 @@ def _lean_header_modules(
 ) -> list[str]:
     """Return every module the Lean header of ``code`` imports, read by Lean itself.
 
-    ``command`` prints the Lean search path on its first line, then runs
-    ``lean --stdin --deps``, which parses the header with Lean's own parser and
-    prints one resolved ``.olean`` path per import. Each path is mapped back to
-    its module name. A header Lean rejects, an import it cannot resolve, or a
-    path outside the search path raises ``ValueError`` so validation fails closed.
+    ``command`` runs ``lean --deps-json /dev/stdin``, which parses the header with
+    Lean's own parser and reports each import's module name as Lean spells it,
+    so a quoted name such as ``«Mathlib.X»`` keeps its quotes and root. A header
+    Lean rejects, a failed command, or output in an unknown shape raises
+    ``ValueError`` so validation fails closed.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -330,19 +330,18 @@ def _lean_header_modules(
         detail = stderr.decode(errors="replace").strip().splitlines()
         raise ValueError(detail[0] if detail else f"exit status {process.returncode}")
 
-    search_path, *paths = stdout.decode(errors="replace").splitlines() or [""]
-    roots = [os.path.normpath(entry) for entry in search_path.split(os.pathsep) if entry]
-    modules: list[str] = []
-    for path in paths:
-        path = os.path.normpath(path)
-        root = next((r for r in roots if path.startswith(r + os.sep)), None)
-        if root is None or not path.endswith(".olean"):
-            raise ValueError(f"import resolved outside the Lean search path: {path}")
-        module = path[len(root) + 1 : -len(".olean")].replace(os.sep, ".")
-        # Every file imports Init implicitly, so importing it grants nothing.
-        if module != "Init":
-            modules.append(module)
-    return modules
+    try:
+        (entry,) = json.loads(stdout)["imports"]
+        errors = entry["errors"]
+        modules = [] if errors else [item["module"] for item in entry["result"]["imports"]]
+    except (ValueError, TypeError, KeyError):
+        raise ValueError("unrecognized output from lean --deps-json") from None
+    if errors:
+        raise ValueError(str(errors[0]))
+    if not all(isinstance(module, str) and module for module in modules):
+        raise ValueError("unrecognized output from lean --deps-json")
+    # Every file imports Init implicitly, so importing it grants nothing.
+    return [module for module in modules if module != "Init"]
 
 
 def _split_imports_and_body(code: str) -> tuple[list[str], str, int]:
@@ -393,11 +392,9 @@ class LeanReplConfig:
     warmup_imports: frozenset[str] = WARMUP_IMPORTS
 
     repl_command: list[str] = field(default_factory=lambda: ["lake", "exe", "repl"])
-    # Prints LEAN_PATH, then Lean's own resolution of the submitted header.
+    # Reports the imports of the submitted header, parsed by Lean itself.
     header_deps_command: list[str] = field(
-        default_factory=lambda: [
-            "lake", "env", "sh", "-c", 'printenv LEAN_PATH && exec lean --stdin --deps'
-        ]
+        default_factory=lambda: ["lake", "env", "lean", "--deps-json", "/dev/stdin"]
     )
 
     # stdout is capped per response. stderr has no protocol framing, so its
@@ -748,6 +745,9 @@ class LeanRepl:
         """
         if deadline is not None:
             deadline = max(deadline, time.monotonic() + DEFAULT_REPL_CLEANUP_SECONDS)
+        self._close(deadline)
+
+    def _close(self, deadline: float | None) -> None:
         process = self.process
         process_group_id = self._process_group_id
         try:
@@ -774,8 +774,12 @@ class LeanRepl:
             self._stderr_tail.clear()
 
     def close_with_deadline(self, deadline: float) -> None:
-        """Close using an absolute deadline shared by a pool shutdown."""
-        self.close(deadline=deadline)
+        """Close within an absolute deadline shared by a pool shutdown.
+
+        Unlike close(), this never extends the deadline, so closing several
+        workers in turn cannot outlast the pool's cleanup budget.
+        """
+        self._close(deadline)
 
     def is_clean(self) -> bool:
         """Return whether this wrapper owns no live or unreaped process group."""

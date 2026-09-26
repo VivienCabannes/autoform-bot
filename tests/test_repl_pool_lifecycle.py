@@ -27,7 +27,7 @@ def test_pool_construction_keeps_every_worker_cold(monkeypatch):
             self.closed = True
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
-    config = repl_pool.LeanReplPoolConfig(num_repls=3, startup_stagger=0)
+    config = repl_pool.LeanReplPoolConfig(num_repls=3)
 
     pool = repl_pool.LeanReplPool(config)
 
@@ -54,7 +54,7 @@ def test_shutdown_closes_every_worker_and_drains_idle_queue(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=2, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=2)
     )
 
     pool.shutdown()
@@ -79,7 +79,7 @@ def test_shutdown_shares_one_cleanup_deadline_across_workers(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=3, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=3)
     )
 
     pool.shutdown()
@@ -101,7 +101,7 @@ def test_request_timeout_includes_waiting_for_an_idle_worker(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
     borrowed = pool._idle.get_nowait()
     try:
@@ -128,7 +128,7 @@ def test_pool_closes_a_worker_before_requeue_after_request_exception(monkeypatch
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
     try:
         with pytest.raises(OSError, match="stdout failed"):
@@ -156,7 +156,7 @@ def test_pool_closes_a_worker_before_requeue_after_success(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     try:
@@ -186,7 +186,7 @@ def test_pool_reserves_cleanup_time_after_request_deadline(monkeypatch):
     monkeypatch.setattr(repl_pool.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     try:
@@ -217,7 +217,7 @@ def test_pool_forwards_absolute_deadline_without_resetting_it(monkeypatch):
     monkeypatch.setattr(repl_pool.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     try:
@@ -249,7 +249,7 @@ def test_pool_never_requeues_a_worker_that_failed_to_close(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     response = pool.run("#check Nat")
@@ -286,7 +286,7 @@ def test_pool_returns_captured_response_after_cleanup_retry_succeeds(monkeypatch
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     try:
@@ -311,7 +311,7 @@ def test_pool_preserves_cancellation_when_cleanup_also_fails(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     with pytest.raises(KeyboardInterrupt) as raised:
@@ -340,7 +340,7 @@ def test_shutdown_retains_and_retries_a_worker_that_failed_to_close(monkeypatch)
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
@@ -378,7 +378,7 @@ def test_shutdown_never_requeues_a_borrowed_worker(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
     first = threading.Thread(target=pool.run, args=("first",))
     first.start()
@@ -435,7 +435,7 @@ def test_concurrent_shutdown_closes_each_worker_once(monkeypatch):
 
     monkeypatch.setattr(repl_pool, "LeanRepl", FakeRepl)
     pool = repl_pool.LeanReplPool(
-        repl_pool.LeanReplPoolConfig(num_repls=1, startup_stagger=0)
+        repl_pool.LeanReplPoolConfig(num_repls=1)
     )
 
     first = threading.Thread(target=pool.shutdown)

@@ -20,7 +20,6 @@ logger = getLogger(__name__)
 
 DEFAULT_PORT = 8990
 DEFAULT_RAM_FRACTION = 0.5
-DEFAULT_STARTUP_STAGGER_SECONDS = 2.0
 DEFAULT_POOL_CLEANUP_SECONDS = DEFAULT_REPL_CLEANUP_SECONDS
 
 
@@ -37,7 +36,6 @@ class LeanReplPoolConfig(LeanReplConfig):
     """Configuration for a pool of Lean REPL instances."""
 
     num_repls: int | None = None
-    startup_stagger: float = DEFAULT_STARTUP_STAGGER_SECONDS
 
     def __post_init__(self) -> None:
         if self.num_repls is None:

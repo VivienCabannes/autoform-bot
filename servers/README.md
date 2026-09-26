@@ -15,11 +15,15 @@ project. Every public REPL call starts a fresh child and reaps it before
 returning, so environments, proof states, and stream contents cannot cross
 independent successful calls. If cleanup cannot be confirmed, Autoform returns
 an explicit no-replay error, quarantines that project pool, and blocks its
-replacement until cleanup succeeds. LSP sessions remain resident because their
-protocol is explicitly stateful. Closing the session that started the runtime
-does not stop it; after a crash, the next tool call starts it again. Runtime
-sockets include a code fingerprint, so an in-place upgrade gracefully replaces
-the older build.
+replacement until cleanup succeeds. Before a child starts, Lean itself parses
+the submitted header (`lean --deps-json`) and imports outside the allowed roots
+(`Mathlib`, `Aesop`, `Batteries`, `LeanSearchClient` by default) are rejected.
+This keeps calls on known libraries; it is not a security sandbox, because the
+submitted Lean code can still run arbitrary `IO`. LSP sessions remain resident
+because their protocol is explicitly stateful. Closing the session that started
+the runtime does not stop it; after a crash, the next tool call starts it again.
+Runtime sockets include a code fingerprint, so an in-place upgrade gracefully
+replaces the older build.
 
 Lean subprocesses remain lazy. A REPL call stays pending while its fresh child
 starts, and the first LSP call stays pending while its session starts, so no

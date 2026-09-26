@@ -883,7 +883,7 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
         repl_core.LeanReplConfig(
             allowed_imports=frozenset({"Mathlib"}),
             warmup_imports=frozenset(),
-            header_deps_command=_fake_header_deps("/lib\n/lib/Unsafe.olean\n"),
+            header_deps_command=_fake_header_deps(_deps_json("Unsafe")),
         )
     )
     repl.process = object()
@@ -909,13 +909,23 @@ def test_run_disposable_closes_before_rejecting_an_import(monkeypatch):
 
 
 def _fake_header_deps(stdout: str, returncode: int = 0, stderr: str = "") -> list[str]:
-    """Stand in for ``lake env ... lean --stdin --deps`` with fixed output."""
+    """Stand in for ``lake env lean --deps-json /dev/stdin`` with fixed output."""
     script = (
         "import sys; sys.stdin.read(); "
         f"sys.stdout.write({stdout!r}); sys.stderr.write({stderr!r}); "
         f"sys.exit({returncode})"
     )
     return [sys.executable, "-c", script]
+
+
+def _deps_json(*modules: str, errors: tuple[str, ...] = ()) -> str:
+    entry: dict = {"errors": list(errors)}
+    if not errors:
+        entry["result"] = {
+            "imports": [{"module": module, "importAll": False} for module in modules],
+            "isModule": False,
+        }
+    return json.dumps({"imports": [entry]})
 
 
 def _header_modules(command: list[str], deadline: float | None = None) -> list[str]:
@@ -928,28 +938,27 @@ def _header_modules(command: list[str], deadline: float | None = None) -> list[s
     )
 
 
-def test_header_check_maps_resolved_paths_back_to_module_names():
+def test_header_check_returns_the_modules_lean_reports():
     command = _fake_header_deps(
-        "/pkg/lib:/toolchain/lib\n"
-        "/toolchain/lib/Init.olean\n"
-        "/toolchain/lib/Init.olean\n"
-        "/pkg/lib/Mathlib/Tactic.olean\n"
-        "/toolchain/lib/Init/Data.olean\n"
+        _deps_json("Init", "Init", "Mathlib.Tactic", "«Mathlib.X»", "Init.Data")
     )
 
-    assert _header_modules(command) == ["Mathlib.Tactic", "Init.Data"]
+    assert _header_modules(command) == ["Mathlib.Tactic", "«Mathlib.X»", "Init.Data"]
 
 
 @pytest.mark.parametrize(
     ("command", "message"),
     [
         (
-            _fake_header_deps("", 1, "unknown module prefix 'Unsafe'\nmore"),
-            "unknown module prefix 'Unsafe'",
+            _fake_header_deps(_deps_json(errors=("<stdin>:2:0: unterminated identifier escape",))),
+            "unterminated identifier escape",
         ),
+        (_fake_header_deps("", 1, "lake: unknown\nmore"), "lake: unknown"),
         (_fake_header_deps("", 3), "exit status 3"),
-        (_fake_header_deps("/pkg/lib\n/other/Unsafe.olean\n"), "outside the Lean search path"),
-        (_fake_header_deps("/pkg/lib\n/pkg/lib/Unsafe.ilean\n"), "outside the Lean search path"),
+        (_fake_header_deps("not json"), "unrecognized output"),
+        (_fake_header_deps('{"imports": []}'), "unrecognized output"),
+        (_fake_header_deps('{"imports": [{"errors": [], "result": {}}]}'), "unrecognized output"),
+        (_fake_header_deps(_deps_json("")), "unrecognized output"),
     ],
 )
 def test_header_check_fails_closed(command, message):
@@ -968,22 +977,21 @@ def test_header_check_kills_a_command_that_outlives_the_deadline():
 
 
 @pytest.mark.parametrize(
-    ("deps_output", "returncode", "expected_error"),
+    ("deps_output", "expected_error"),
     [
-        ("/lib\n/lib/Mathlib.olean\n/lib/Unsafe.olean\n", 0, "Disallowed imports: Unsafe"),
-        ("", 1, "Rejected Lean header: unknown module"),
+        (_deps_json("Mathlib", "Unsafe.Mod"), "Disallowed imports: Unsafe"),
+        (_deps_json("«Mathlib.X»"), "Disallowed imports: «Mathlib"),
+        (_deps_json(errors=("bad header",)), "Rejected Lean header: bad header"),
     ],
 )
 def test_run_disposable_rejects_what_lean_reports_before_starting(
-    monkeypatch, deps_output, returncode, expected_error
+    monkeypatch, deps_output, expected_error
 ):
     repl = repl_core.LeanRepl(
         repl_core.LeanReplConfig(
             allowed_imports=frozenset({"Mathlib"}),
             warmup_imports=frozenset(),
-            header_deps_command=_fake_header_deps(
-                deps_output, returncode, "unknown module prefix 'Unsafe'"
-            ),
+            header_deps_command=_fake_header_deps(deps_output),
         )
     )
     monkeypatch.setattr(
@@ -2017,6 +2025,25 @@ def test_close_after_an_expired_deadline_still_reserves_cleanup_time(monkeypatch
     repl.close(deadline=before - 5)
 
     assert deadlines[0] >= before + repl_core.DEFAULT_REPL_CLEANUP_SECONDS
+
+
+def test_close_with_deadline_keeps_a_shared_pool_deadline_exact(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset(), validate_imports=False)
+    )
+    repl.process = object()
+    repl._process_group_id = 1234
+    deadlines = []
+    monkeypatch.setattr(
+        repl_core,
+        "_kill_subprocesses",
+        lambda process, process_group_id, deadline=None: deadlines.append(deadline),
+    )
+
+    shared_deadline = time.monotonic() - 5
+    repl.close_with_deadline(shared_deadline)
+
+    assert deadlines == [shared_deadline]
 
 
 def test_request_timeout_reaps_a_slow_to_exit_process_without_cleanup_failure(

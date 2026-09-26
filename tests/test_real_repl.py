@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from servers.repl.core import LeanRepl, LeanReplConfig
+from servers.repl.pool import LeanReplPool, LeanReplPoolConfig
 
 
 REPL_FIXTURE = Path(__file__).parent / "fixtures" / "repl-smoke"
@@ -49,7 +50,8 @@ def test_disposable_call_matches_the_pinned_repl_protocol():
         ((), "import REPL import Init.Data\n#check Nat", "Disallowed imports: Init"),
         ((), "module\npublic import Init.Data\n", "Disallowed imports: Init"),
         (("REPL",), "/- note -/ import Init.Data\n#check Nat", "Disallowed imports: Init"),
-        ((), "import NotAllowlisted.Mod\n", "Rejected Lean header"),
+        ((), "import NotAllowlisted.Mod\n", "Disallowed imports: NotAllowlisted"),
+        ((), "import «REPL.X»\n", "Disallowed imports: «REPL"),
         ((), "import «REPL\n", "Rejected Lean header"),
         ((), "import REPL\ntheorem autoform_header_probe : True := trivial", None),
     ],
@@ -71,3 +73,28 @@ def test_disposable_imports_are_checked_by_lean_itself(warmup, code, expected_er
     else:
         assert expected_error in response["repl_error"]
     assert repl.is_clean()
+
+
+@pytest.mark.skipif(
+    os.environ.get("AUTOFORM_RUN_REAL_REPL_TESTS") != "1",
+    reason="set AUTOFORM_RUN_REAL_REPL_TESTS=1 to run the pinned REPL integration",
+)
+def test_pool_calls_do_not_share_lean_state():
+    pool = LeanReplPool(
+        LeanReplPoolConfig(
+            cwd=str(REPL_FIXTURE),
+            repl_command=["lake", "exe", "repl"],
+            allowed_imports=frozenset({"REPL"}),
+            warmup_imports=frozenset(),
+            num_repls=1,
+        )
+    )
+    declaration = "theorem autoform_isolation_probe : True := trivial"
+    try:
+        responses = [pool.run(declaration, timeout=180) for _ in range(2)]
+    finally:
+        pool.shutdown()
+
+    for response in responses:
+        assert "repl_error" not in response
+        assert not any(m["severity"] == "error" for m in response.get("messages", []))
