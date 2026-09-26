@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastmcp.server import FastMCP
 
-from servers import resolve_lean_project_dir
+from servers import clean_lake_environment, resolve_lean_project_dir
 from servers.lean_client import LeanRuntimeClient
 
 logger = getLogger(__name__)
@@ -62,15 +62,15 @@ class LeanLspSession:
 
     def start(self) -> None:
         """Start the language server process."""
-        env = os.environ.copy()
-        env.pop("PYTHONPATH", None)
-
         self.process = subprocess.Popen(
             self.config.lake_command,
             cwd=self.config.cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            env=env,
+            env=clean_lake_environment(
+                self.config.cwd,
+                require_elan_proxy=self.config.lake_command[0] == "lake",
+            ),
         )
 
         try:
