@@ -47,6 +47,12 @@ def test_setup_requires_the_pinned_explicit_lean_beam_contract(repo_root: Path) 
     assert "beam_version" in setup
     assert "absolute `workspace.root`" in setup
     assert "opaque snapshot" in normalized_setup
+    assert "tool_timeout_sec" in setup
+    assert "explicit finite tool deadline" in normalized_setup
+    assert "not a filesystem sandbox" in normalized_setup
+    assert "request cancellation" in normalized_setup
+    assert "call `lean_drop_workspace` under a finite host deadline" in normalized_setup
+    assert "host-level timeout without confirmed MCP cancellation" in normalized_setup
     assert "Do not use `lean_save` or `lean_close_save`" in normalized_setup
     assert "When the user explicitly opts into the Lean Beam preview" in normalized_setup
     assert "If the user does not opt in" in normalized_setup
@@ -54,6 +60,9 @@ def test_setup_requires_the_pinned_explicit_lean_beam_contract(repo_root: Path) 
     assert "Do not automatically retry" in integration
     assert "clean external `lake build`" in integration
     assert "not a filesystem authorization boundary" in normalized_integration
+    assert "official Codex MCP configuration reference" in integration
+    assert "currently lists a 60-second default" in normalized_integration
+    assert "Integration CI covers cooperative MCP cancellation" in normalized_integration
     assert "workflow rule rather than a technical filter" in normalized_integration
     assert "../../../docs/lean-beam.md" in agent_review
     assert "do not use `lean_save` or `lean_close_save`" in agent_review

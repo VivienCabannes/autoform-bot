@@ -28,6 +28,7 @@ class McpClient:
         self._next_id = 0
         self._stderr = TemporaryFile(mode="w+t", encoding="utf-8")
         self._stdout_buffer = b""
+        self._responses: dict[int | str, dict] = {}
         self.process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -68,14 +69,25 @@ class McpClient:
         finally:
             selector.close()
 
-    def request(self, method: str, params: dict | None = None) -> dict:
-        self._next_id += 1
-        request_id = self._next_id
+    def send_request(
+        self,
+        method: str,
+        params: dict | None = None,
+        *,
+        request_id: int | str | None = None,
+    ) -> int | str:
+        if request_id is None:
+            self._next_id += 1
+            request_id = self._next_id
         message = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
         self._send(message)
+        return request_id
 
+    def read_response(self, request_id: int | str) -> dict:
+        if response := self._responses.pop(request_id, None):
+            return response
         deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
         while True:
             response = self._read_message(deadline)
@@ -83,6 +95,10 @@ class McpClient:
                 continue
             if response.get("id") == request_id:
                 return response
+            self._responses[response.get("id")] = response
+
+    def request(self, method: str, params: dict | None = None) -> dict:
+        return self.read_response(self.send_request(method, params))
 
     def notify(self, method: str, params: dict | None = None) -> None:
         message = {"jsonrpc": "2.0", "method": method}
@@ -91,6 +107,15 @@ class McpClient:
         self._send(message)
 
     def modern_request(self, method: str, params: dict | None = None) -> dict:
+        return self.read_response(self.send_modern_request(method, params))
+
+    def send_modern_request(
+        self,
+        method: str,
+        params: dict | None = None,
+        *,
+        request_id: int | str | None = None,
+    ) -> int | str:
         params = dict(params or {})
         params["_meta"] = {
             "io.modelcontextprotocol/protocolVersion": MODERN_MCP_VERSION,
@@ -100,7 +125,13 @@ class McpClient:
                 "version": "0",
             },
         }
-        return self.request(method, params)
+        return self.send_request(method, params, request_id=request_id)
+
+    def response_ready(self, request_id: int | str) -> bool:
+        return request_id in self._responses
+
+    def forget_request(self, request_id: int | str) -> None:
+        self._responses.pop(request_id, None)
 
     def discover(self) -> None:
         response = self.modern_request("server/discover")
@@ -173,29 +204,81 @@ def assert_success(result: dict, structured: dict) -> None:
     assert structured.get("success") is True, structured
 
 
+def wait_for_file(path: Path) -> None:
+    deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
 def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) -> None:
     beam_command = os.environ["AUTOFORM_LEAN_BEAM_MCP"]
     toolchain = os.environ.get("AUTOFORM_REAL_LEAN_TOOLCHAIN", "leanprover/lean4:v4.33.0")
+    external_project = tmp_path / "beam-dep"
+    external_project.mkdir()
+    (external_project / "lean-toolchain").write_text(f"{toolchain}\n", encoding="utf-8")
+    (external_project / "lakefile.toml").write_text(
+        'name = "beamDep"\ndefaultTargets = ["BeamDep"]\n\n[[lean_lib]]\nname = "BeamDep"\n',
+        encoding="utf-8",
+    )
+    external_source = external_project / "BeamDep.lean"
+    external_source.write_text("def externalValue : Nat := 7\n", encoding="utf-8")
+
     project = tmp_path / "project"
     project.mkdir()
     (project / "lean-toolchain").write_text(f"{toolchain}\n", encoding="utf-8")
     (project / "lakefile.toml").write_text(
-        'name = "BeamSmoke"\ndefaultTargets = ["BeamSmoke"]\n\n[[lean_lib]]\nname = "BeamSmoke"\n',
+        'name = "BeamSmoke"\n'
+        'defaultTargets = ["BeamSmoke"]\n\n'
+        '[[require]]\nname = "beamDep"\npath = "../beam-dep"\n\n'
+        '[[lean_lib]]\nname = "BeamSmoke"\n',
         encoding="utf-8",
     )
     source = project / "BeamSmoke.lean"
     source.write_text(
+        "import BeamDep\n"
         "import BeamSmoke.A\n\n"
-        "def answer : Nat := dependencyValue\n\n"
+        "def answer : Nat := dependencyValue + externalValue\n\n"
         "set_option linter.unusedVariables true in\n"
         "theorem warnOnly (n : Nat) : True := by\n"
         "  trivial\n\n"
         '#check ("😀", Nat)\n',
         encoding="utf-8",
     )
+    smoke_lines = source.read_text(encoding="utf-8").splitlines()
+    runtime_line = smoke_lines.index("def answer : Nat := dependencyValue + externalValue") - 1
+    declaration_line = smoke_lines.index("set_option linter.unusedVariables true in") - 1
+    hover_line = smoke_lines.index('#check ("😀", Nat)')
     (project / "BeamSmoke").mkdir()
     dependency_source = project / "BeamSmoke" / "A.lean"
     dependency_source.write_text("def dependencyValue : Nat := 42\n", encoding="utf-8")
+    cancellation_source = project / "BeamCancellation.lean"
+    cancellation_source.write_text(
+        "import Lean\n\n"
+        "open Lean Elab Tactic\n\n"
+        "private partial def waitForAutoformCancelGate (path : System.FilePath) : TacticM Unit := do\n"
+        "  if ← path.pathExists then\n"
+        "    pure ()\n"
+        "  else\n"
+        "    IO.sleep 20\n"
+        "    if let some tk := (← readThe Core.Context).cancelTk? then\n"
+        "      if ← tk.isSet then\n"
+        "        throwInterruptException\n"
+        "    waitForAutoformCancelGate path\n\n"
+        'elab "autoform_cancel_gate" : tactic => do\n'
+        '  let some startedText ← IO.getEnv "AUTOFORM_BEAM_CANCEL_STARTED"\n'
+        '    | throwError "missing AUTOFORM_BEAM_CANCEL_STARTED"\n'
+        '  let some releaseText ← IO.getEnv "AUTOFORM_BEAM_CANCEL_RELEASE"\n'
+        '    | throwError "missing AUTOFORM_BEAM_CANCEL_RELEASE"\n'
+        '  IO.FS.writeFile (System.FilePath.mk startedText) "started\\n"\n'
+        "  waitForAutoformCancelGate (System.FilePath.mk releaseText)\n"
+        "  evalTactic (← `(tactic| exact trivial))\n\n"
+        "example : True := by\n"
+        "  trivial -- autoform cancellation target\n",
+        encoding="utf-8",
+    )
     initial_build = subprocess.run(
         ["lake", "build"],
         cwd=project,
@@ -207,10 +290,15 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
 
     assert Path(beam_command).is_absolute()
     assert os.access(beam_command, os.X_OK)
+    cancel_started = tmp_path / "cancel-started"
+    cancel_release = tmp_path / "cancel-release"
+    beam_env = dict(os.environ)
+    beam_env["AUTOFORM_BEAM_CANCEL_STARTED"] = str(cancel_started)
+    beam_env["AUTOFORM_BEAM_CANCEL_RELEASE"] = str(cancel_release)
     client = McpClient(
         [beam_command],
         cwd=repo_root,
-        env=dict(os.environ),
+        env=beam_env,
     )
     try:
         lock = json.loads((repo_root / "lean-beam.lock.json").read_text(encoding="utf-8"))
@@ -225,8 +313,140 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
         assert identity["runtime_current"] is True
         assert "runtime_error" not in identity
         assert identity.get("source_dirty") is not True
+        assert identity["runtime_active"] is False
+
+        missing_root = tmp_path / "missing-project"
+        file_root = tmp_path / "not-a-directory"
+        file_root.write_text("not a project directory\n", encoding="utf-8")
+        empty_root = tmp_path / "not-a-project"
+        empty_root.mkdir()
+        invalid_roots = (
+            ("relative/project", "workspace root must be an absolute path"),
+            (str(missing_root), "workspace root does not resolve:"),
+            (str(file_root), "workspace root is not a directory:"),
+            (str(empty_root), "workspace root is not a Lean/Lake project:"),
+        )
+        for root, expected_message in invalid_roots:
+            result, rejected = client.call_tool(
+                "lean_sync",
+                {
+                    "workspace": {"root": root},
+                    "path": "BeamSmoke.lean",
+                },
+            )
+            assert result["isError"] is True
+            assert rejected["code"] == "invalidInput"
+            assert expected_message in rejected["message"]
+
+        _, inactive_stats = client.call_tool("beam_stats")
+        assert inactive_stats["workspaces"] == {}
 
         descriptor = workspace(project)
+        alias = tmp_path / "project-alias"
+        alias.symlink_to(project, target_is_directory=True)
+        alias_result, alias_sync = client.call_tool(
+            "lean_sync",
+            {
+                "workspace": {"root": str(alias.absolute())},
+                "path": "BeamSmoke.lean",
+                "diagnostic_scope": "all",
+                "diagnostics_in_result": True,
+            },
+        )
+        assert alias_result.get("isError") is not True
+        assert alias_sync["workspace"] == descriptor
+        _, alias_stats = client.call_tool("beam_stats")
+        assert set(alias_stats["workspaces"]) == {f"local:{project.resolve()}"}
+
+        external_result, external_sync = client.call_tool(
+            "lean_sync",
+            {
+                "workspace": descriptor,
+                "path": str(external_source.resolve()),
+            },
+        )
+        assert external_result.get("isError") is not True
+        assert external_sync["workspace"] == descriptor
+        assert external_sync["path"] == external_source.resolve().as_uri()
+        relative_external_result, relative_external_sync = client.call_tool(
+            "lean_sync",
+            {
+                "workspace": descriptor,
+                "path": "../beam-dep/BeamDep.lean",
+            },
+        )
+        assert relative_external_result.get("isError") is not True
+        assert relative_external_sync["workspace"] == descriptor
+        assert relative_external_sync["path"] == external_source.resolve().as_uri()
+
+        cancellation_result, cancellation_sync = client.call_tool(
+            "lean_sync",
+            {
+                "workspace": descriptor,
+                "path": "BeamCancellation.lean",
+            },
+        )
+        assert cancellation_result.get("isError") is not True
+        cancellation_snapshot = cancellation_sync["snapshot"]
+        cancellation_line = cancellation_source.read_text(encoding="utf-8").splitlines().index(
+            "  trivial -- autoform cancellation target"
+        )
+        cancelled_id = client.send_modern_request(
+            "tools/call",
+            {
+                "name": "lean_run_at",
+                "arguments": {
+                    "workspace": descriptor,
+                    "path": "BeamCancellation.lean",
+                    "snapshot": cancellation_snapshot,
+                    "line": cancellation_line,
+                    "character": 2,
+                    "text": "autoform_cancel_gate",
+                },
+            },
+            request_id="autoform-cancelled-run-at",
+        )
+        wait_for_file(cancel_started)
+        client.notify(
+            "notifications/cancelled",
+            {
+                "requestId": cancelled_id,
+                "reason": "integration deadline expired",
+            },
+        )
+        drop_result, dropped = client.call_tool(
+            "lean_drop_workspace",
+            {"workspace": descriptor},
+        )
+        assert drop_result.get("isError") is not True
+        assert dropped["workspace"] == descriptor
+        assert dropped["dropped"] is True
+        assert dropped["invalidated_handles"] is True
+        assert not client.response_ready(cancelled_id)
+        client.forget_request(cancelled_id)
+
+        recovery_result, recovered = client.call_tool(
+            "lean_sync",
+            {
+                "workspace": descriptor,
+                "path": "BeamCancellation.lean",
+            },
+        )
+        assert recovery_result.get("isError") is not True
+        assert recovered["snapshot"] != cancellation_snapshot
+        post_cancel_result, post_cancel = client.call_tool(
+            "lean_run_at",
+            {
+                "workspace": descriptor,
+                "path": "BeamCancellation.lean",
+                "snapshot": recovered["snapshot"],
+                "line": cancellation_line,
+                "character": 2,
+                "text": "exact trivial",
+            },
+        )
+        assert_success(post_cancel_result, post_cancel)
+
         sync_result, synced = client.call_tool(
             "lean_sync",
             {
@@ -259,7 +479,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": snapshot,
-                "line": 1,
+                "line": runtime_line,
                 "character": 0,
                 "text": "#eval Lean.versionString",
             },
@@ -277,7 +497,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": snapshot,
-                "line": 8,
+                "line": hover_line,
                 "character": 14,
             },
         )
@@ -290,7 +510,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": snapshot,
-                "line": 3,
+                "line": declaration_line,
                 "character": 0,
                 "text": "def transient : Nat := answer + 1",
             },
@@ -339,7 +559,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": snapshot,
-                "line": 3,
+                "line": declaration_line,
                 "character": 0,
                 "text": "#check transient",
             },
@@ -404,7 +624,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": snapshot,
-                "line": 3,
+                "line": declaration_line,
                 "character": 0,
                 "text": "def staleAfterEdit : Nat := answer",
             },
@@ -427,7 +647,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": snapshot,
-                "line": 1,
+                "line": runtime_line,
                 "character": 0,
                 "text": "#check answer",
             },
@@ -455,7 +675,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": updated["snapshot"],
-                "line": 3,
+                "line": declaration_line,
                 "character": 0,
                 "text": "def invalidatedAfterDrop : Nat := answer",
             },
@@ -514,7 +734,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": updated["snapshot"],
-                "line": 1,
+                "line": runtime_line,
                 "character": 0,
                 "text": "#check answer",
             },
@@ -530,7 +750,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": resynced["snapshot"],
-                "line": 1,
+                "line": runtime_line,
                 "character": 0,
                 "text": "#check availableAfterExternalBuild",
             },
@@ -543,7 +763,7 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
                 "workspace": descriptor,
                 "path": "BeamSmoke.lean",
                 "snapshot": resynced["snapshot"],
-                "line": 3,
+                "line": declaration_line,
                 "character": 0,
                 "text": "def liveAtEof : Nat := answer",
             },
@@ -551,4 +771,5 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
         assert_success(eof_handle_result, eof_handle)
         assert isinstance(eof_handle["next_handle"], dict)
     finally:
+        cancel_release.write_text("release\n", encoding="utf-8")
         client.close()

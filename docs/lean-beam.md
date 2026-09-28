@@ -33,6 +33,21 @@ afterward. The setup workflow and CI verify the running process through the
 typed `beam_version` tool; a caller that skips that check has not established
 provenance.
 
+Keep a finite caller-visible tool deadline. Codex documents
+`[mcp_servers.lean-beam].tool_timeout_sec` as the per-server tool deadline and
+currently lists a 60-second default. Configure an explicit finite value from
+measured consumer evidence rather than relying on a client-version default.
+That setting bounds the caller's wait; it does not by itself prove that the host
+sends MCP cancellation or terminates the server. See the
+[official Codex MCP configuration reference](https://learn.chatgpt.com/docs/extend/mcp#other-configuration-options).
+The Beam-validated Codex 0.147.0 source instead uses a
+[300-second implementation default](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/codex-mcp/src/rmcp_client.rs#L90-L92),
+so an explicit value also avoids that documentation/version mismatch. Codex
+0.155.1 still sends the tool request
+[without request cancellation options](https://github.com/openai/codex/blob/be2951ea34f0d295ed0becf97079f92fa5f6950e/codex-rs/rmcp-client/src/tool_input.rs#L39-L55)
+and applies its deadline outside the MCP request. Expiry therefore does not
+establish Beam cancellation or stdio-process teardown.
+
 Lean Beam does not yet publish a Muse MCP registration path. Autoform's native
 Muse skills remain available, but Lean tooling in this preview is unsupported
 there; do not silently substitute the removed Autoform servers.
@@ -84,12 +99,15 @@ edit, document close, backend or MCP restart, or workspace drop; synchronize
 again instead of carrying either token across those boundaries.
 
 The workspace descriptor routes a request; it is not a filesystem
-authorization boundary. Beam permits absolute paths outside that root so it
-can inspect dependency sources. Autoform adds no policy proxy, so use the
-preview only where the MCP process and caller already share a trusted local
-filesystem. Before release, Autoform's older project-root admission requirement
-must either be revised explicitly or implemented upstream as a public Beam
-policy.
+authorization boundary. Beam requires an absolute, existing Lean/Lake project
+root, but relative source paths may leave it through `..` or symlinks, and
+absolute paths may inspect dependency sources outside it. The integration test
+records that behavior so a consumer cannot mistake the root for containment.
+Autoform has not yet adopted it as the release policy: the older project-root
+admission requirement remains an open gate. Use the preview only where the MCP
+owner process already runs inside an adequate operating-system or container
+sandbox; the agent host's command sandbox does not imply that its MCP process is
+confined.
 
 `lean_run_at` accepts one top-level command or one tactic block. It is not a
 replacement for the old arbitrary multi-command `run_lean_code` call, and it
@@ -106,9 +124,13 @@ metaprogramming can still perform arbitrary IO; this is not an operating-system
 sandbox.
 
 Beam cancellation is cooperative. Autoform does not supervise the Beam
-process or add a timeout or retry layer. An MCP host that needs a hard deadline
-must terminate the Beam MCP process itself if cancellation does not settle;
-doing so invalidates every handle owned by that process.
+process or add a timeout or retry layer. After sending cancellation, call
+`lean_drop_workspace` under a finite host deadline. A returned drop is the
+ordered fence proving that the earlier request settled and the workspace was
+evicted; discard its snapshots and handles, then synchronize again. If the drop
+does not return, it is waiting behind the stuck request and the MCP host must
+terminate and restart the Beam process instead. Doing so invalidates every
+handle owned by that process.
 
 Until the upstream save issues are closed, Autoform workflows use `lean_sync`
 for the interactive diagnostics barrier and a clean external `lake build` for
@@ -119,8 +141,10 @@ than a technical filter. Until `leanprover/lean-beam#256` is fixed, any external
 `lean_drop_workspace` before the next Beam operation; the next call recreates
 the workspace from disk.
 
-Before changing `development_only` to false, integration CI must also cover
-request cancellation followed by host-imposed hard process teardown, and the
-supported hosts must provide one caller-visible request deadline. These are
-release criteria, not properties inferred from the normal success-path smoke
-test.
+Integration CI covers cooperative MCP cancellation, post-cancellation eviction,
+fresh synchronization, and clean EOF teardown. Before changing
+`development_only` to false, each supported host must still prove that its
+configured deadline sends cancellation and tears down the process when
+cooperative cancellation does not settle. Server-level tests cannot establish
+host behavior. Until that is proven for a host, treat a host-level tool timeout
+as unknown execution state and restart the Beam MCP process before reuse.

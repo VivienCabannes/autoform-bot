@@ -97,14 +97,24 @@ When the user explicitly opts into the Lean Beam preview, verify the installed
 runtime before handing the repository to later skills. Its `beam_version`
 result must match the version, MCP protocol, and source commit in
 `<AUTOFORM_PLUGIN_ROOT>/lean-beam.lock.json`, report `runtime_current: true`,
-and contain no `runtime_error`. Then call `lean_sync` on one saved project file
-using an explicit absolute `workspace.root`; retain the returned opaque
-snapshot only for that file version. Do not use `lean_save` or
+and contain no `runtime_error`. Require an explicit finite tool deadline for
+the selected host; Codex exposes `tool_timeout_sec`, but choose its value from
+measured consumer evidence. If the host provides no verified finite deadline,
+leave the preview disabled and report that limitation. Then call `lean_sync`
+on one saved project file with an explicit absolute `workspace.root`; retain
+the returned opaque snapshot only for that file version. The root selects a
+trusted local Lean/Lake workspace,
+not a filesystem sandbox; relative paths can traverse outside it, and absolute
+dependency-source paths may also be outside it. Do not use `lean_save` or
 `lean_close_save` while the exclusions in
 `<AUTOFORM_PLUGIN_ROOT>/docs/lean-beam.md` remain open. The clean `lake build`
 above must precede this first Beam admission. If another external build runs
 afterward, call `lean_drop_workspace`, discard every retained snapshot and
-handle, and synchronize again before handing the repository off. If Beam is
+handle, and synchronize again before handing the repository off. After sending
+request cancellation, call `lean_drop_workspace` under a finite host deadline.
+If it returns, discard state and resynchronize; if it does not, terminate and
+restart Beam because the drop is waiting behind the stuck request. Treat a
+host-level timeout without confirmed MCP cancellation as unsettled. If Beam is
 absent or its identity differs from the pin, stop with the exact pinned-install
 instructions; do not fetch mutable `main` or silently substitute another build.
 If the user does not opt in, continue repository setup without Beam and report
