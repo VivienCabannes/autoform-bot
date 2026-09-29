@@ -47,9 +47,20 @@ def test_setup_requires_the_pinned_explicit_lean_beam_contract(repo_root: Path) 
     assert "beam_version" in setup
     assert "absolute `workspace.root`" in setup
     assert "opaque snapshot" in normalized_setup
+    assert "before the first `lean_sync`" in normalized_setup
+    assert "reason: notFound" in normalized_setup
     assert "tool_timeout_sec" in setup
     assert "explicit finite tool deadline" in normalized_setup
+    assert "technically denies `lean_save` and `lean_close_save`" in normalized_setup
+    assert "`disabled_tools`" in setup
     assert "not a filesystem sandbox" in normalized_setup
+    assert "Before any workspace-bound call" in normalized_setup
+    assert "Beam MCP owner and its Lean child processes" in normalized_setup
+    assert "leave the preview disabled" in normalized_setup
+    assert "project root `.gitignore` contains `.beam/`" in normalized_setup
+    assert "evaluate `Lean.versionString`" in normalized_setup
+    assert "compare it with `lake env lean --version`" in normalized_setup
+    assert "never overlap a build with Beam calls" in normalized_setup
     assert "request cancellation" in normalized_setup
     assert "call `lean_drop_workspace` under a finite host deadline" in normalized_setup
     assert "host-level timeout without confirmed MCP cancellation" in normalized_setup
@@ -58,12 +69,14 @@ def test_setup_requires_the_pinned_explicit_lean_beam_contract(repo_root: Path) 
     assert "If the user does not opt in" in normalized_setup
     assert "There is no Autoform session id" in integration
     assert "Do not automatically retry" in integration
-    assert "clean external `lake build`" in integration
+    assert "external `lake build`" in integration
     assert "not a filesystem authorization boundary" in normalized_integration
     assert "official Codex MCP configuration reference" in integration
-    assert "currently lists a 60-second default" in normalized_integration
+    assert "lists a 60-second default" in normalized_integration
+    assert "host approval policy must not rely on that annotation" in normalized_integration
     assert "Integration CI covers cooperative MCP cancellation" in normalized_integration
-    assert "workflow rule rather than a technical filter" in normalized_integration
+    assert 'disabled_tools = ["lean_save", "lean_close_save"]' in integration
+    assert "the host must enforce the denylist" in normalized_integration
     assert "../../../docs/lean-beam.md" in agent_review
     assert "do not use `lean_save` or `lean_close_save`" in agent_review
 

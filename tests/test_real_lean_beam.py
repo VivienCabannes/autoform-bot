@@ -342,6 +342,17 @@ def test_pinned_beam_explicit_session_contract(repo_root: Path, tmp_path: Path) 
         assert inactive_stats["workspaces"] == {}
 
         descriptor = workspace(project)
+        absent_drop_result, absent_drop = client.call_tool(
+            "lean_drop_workspace",
+            {"workspace": descriptor},
+        )
+        assert absent_drop_result.get("isError") is not True
+        assert absent_drop["dropped"] is False
+        assert absent_drop["invalidated_handles"] is False
+        assert absent_drop["reason"] == "notFound"
+        _, still_inactive_stats = client.call_tool("beam_stats")
+        assert still_inactive_stats["workspaces"] == {}
+
         alias = tmp_path / "project-alias"
         alias.symlink_to(project, target_is_directory=True)
         alias_result, alias_sync = client.call_tool(

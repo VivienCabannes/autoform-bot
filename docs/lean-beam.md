@@ -33,20 +33,28 @@ afterward. The setup workflow and CI verify the running process through the
 typed `beam_version` tool; a caller that skips that check has not established
 provenance.
 
+For Codex, add this denylist to the existing `[mcp_servers.lean-beam]` table:
+
+```toml
+disabled_tools = ["lean_save", "lean_close_save"]
+```
+
+Use a host's equivalent technical denylist when it has one. If the selected
+host cannot enforce the exclusion, leave the preview disabled until the
+upstream save defects are fixed.
+
+Run `autoform init` to append `.beam/` to an existing root `.gitignore`, or add
+the rule manually before first use. Beam's workspace state is derived local
+data and must not appear in commits.
+
 Keep a finite caller-visible tool deadline. Codex documents
 `[mcp_servers.lean-beam].tool_timeout_sec` as the per-server tool deadline and
-currently lists a 60-second default. Configure an explicit finite value from
+lists a 60-second default. Configure an explicit finite value from
 measured consumer evidence rather than relying on a client-version default.
 That setting bounds the caller's wait; it does not by itself prove that the host
-sends MCP cancellation or terminates the server. See the
+sends MCP cancellation or terminates the server, so expiry does not establish
+either. See the
 [official Codex MCP configuration reference](https://learn.chatgpt.com/docs/extend/mcp#other-configuration-options).
-The Beam-validated Codex 0.147.0 source instead uses a
-[300-second implementation default](https://github.com/openai/codex/blob/be6e8eac029b183056b7e4402879f15d2c85f61b/codex-rs/codex-mcp/src/rmcp_client.rs#L90-L92),
-so an explicit value also avoids that documentation/version mismatch. Codex
-0.155.1 still sends the tool request
-[without request cancellation options](https://github.com/openai/codex/blob/be2951ea34f0d295ed0becf97079f92fa5f6950e/codex-rs/rmcp-client/src/tool_input.rs#L39-L55)
-and applies its deadline outside the MCP request. Expiry therefore does not
-establish Beam cancellation or stdio-process teardown.
 
 Lean Beam does not yet publish a Muse MCP registration path. Autoform's native
 Muse skills remain available, but Lean tooling in this preview is unsupported
@@ -63,9 +71,13 @@ defects in
 that release. Setup also needs a public typed way to verify the selected
 workspace toolchain and bundle, tracked in
 [`#257`](https://github.com/leanprover/lean-beam/issues/257).
-Until then, CI additionally evaluates `Lean.versionString` inside each test
-workspace. That proves which compiler served the request, but it is not a
-typed workspace-identity API for agents.
+Release also requires accurate effect annotations. At this pin, `lean_run_at`
+is advertised as read-only even though Lean tactics and metaprograms can perform
+arbitrary IO; host approval policy must not rely on that annotation.
+Until then, CI and preview setup additionally evaluate `Lean.versionString`
+inside each workspace and compare it with `lake env lean --version`. That
+checks which compiler served the request, but it is not a typed
+workspace-identity API for agents.
 
 ## Explicit state model
 
@@ -100,9 +112,10 @@ again instead of carrying either token across those boundaries.
 
 The workspace descriptor routes a request; it is not a filesystem
 authorization boundary. Beam requires an absolute, existing Lean/Lake project
-root, but relative source paths may leave it through `..` or symlinks, and
-absolute paths may inspect dependency sources outside it. The integration test
+root, but relative source paths may leave it through `..`, and absolute paths
+may inspect dependency sources outside it. The integration test
 records that behavior so a consumer cannot mistake the root for containment.
+Source-path symlink behavior is not qualified by this preview.
 Autoform has not yet adopted it as the release policy: the older project-root
 admission requirement remains an open gate. Use the preview only where the MCP
 owner process already runs inside an adequate operating-system or container
@@ -133,10 +146,11 @@ terminate and restart the Beam process instead. Doing so invalidates every
 handle owned by that process.
 
 Until the upstream save issues are closed, Autoform workflows use `lean_sync`
-for the interactive diagnostics barrier and a clean external `lake build` for
-final verification. They do not call `lean_save` or `lean_close_save`; the
-direct Beam server still exposes those tools, so this is a workflow rule rather
-than a technical filter. Until `leanprover/lean-beam#256` is fixed, any external
+for the interactive diagnostics barrier and an external `lake build` for final
+verification. Do not overlap that build with any Beam call. Workflows do not
+call `lean_save` or `lean_close_save`; the direct Beam server still exposes
+those tools, so the host must enforce the denylist above. Until
+`leanprover/lean-beam#256` is fixed, any external
 `lake build` performed while the MCP process is alive must be followed by
 `lean_drop_workspace` before the next Beam operation; the next call recreates
 the workspace from disk.

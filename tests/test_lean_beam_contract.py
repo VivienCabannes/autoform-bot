@@ -21,6 +21,14 @@ def test_lean_beam_pin_is_immutable_and_explicit(repo_root: Path) -> None:
     workflow = (repo_root / ".github" / "workflows" / "tests.yml").read_text(
         encoding="utf-8"
     )
+    docs = (repo_root / "docs" / "lean-beam.md").read_text(encoding="utf-8")
+    gitignore_template = (repo_root / "autoform_cli" / "templates" / "gitignore").read_text(
+        encoding="utf-8"
+    )
     assert f"ref: {lock['commit']}" in workflow
+    assert lock["commit"] in docs
+    assert ".beam/" in docs
+    assert ".beam/" in gitignore_template.splitlines()
     for toolchain in lock["tested_toolchains"]:
         assert toolchain in workflow
+        assert toolchain in docs

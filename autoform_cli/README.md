@@ -116,8 +116,9 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform check blueprint --lean-root .
 ```
 
 Create a new project's vault, site configuration, and CI. The layout is fixed,
-so it is written rather than described; existing files are left alone, which
-makes the same command the repair path:
+so it is written rather than described. Existing files are left alone except
+that a missing `.beam/` rule is appended to the root `.gitignore`, which makes
+the same command the repair path:
 
 ```bash
 autoform init . --title "Finite Flat Group Schemes" \

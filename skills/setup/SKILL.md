@@ -50,8 +50,9 @@ For a new or incomplete repository:
 override, both workflows, and ignore rules. Do not hand-build any of it and do
 not copy the bundled example: the layout is fixed, and a chapter written as a
 sibling file instead of `<chapter>/README.md` still validates while publishing
-a book with no chapters. `init` never overwrites an existing file, so it is
-also the repair path; it reports what it left alone. See the
+a book with no chapters. `init` never replaces an existing file. It only
+appends a missing `.beam/` rule to the root `.gitignore`; all other existing
+files are left alone and reported. That makes it the repair path. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
 `init` pins the generated workflows to the Autoform commit that ran it, but it
@@ -100,18 +101,35 @@ result must match the version, MCP protocol, and source commit in
 and contain no `runtime_error`. Require an explicit finite tool deadline for
 the selected host; Codex exposes `tool_timeout_sec`, but choose its value from
 measured consumer evidence. If the host provides no verified finite deadline,
-leave the preview disabled and report that limitation. Then call `lean_sync`
-on one saved project file with an explicit absolute `workspace.root`; retain
-the returned opaque snapshot only for that file version. The root selects a
-trusted local Lean/Lake workspace,
-not a filesystem sandbox; relative paths can traverse outside it, and absolute
-dependency-source paths may also be outside it. Do not use `lean_save` or
+leave the preview disabled and report that limitation. Before the first
+workspace call, verify that the host technically denies `lean_save` and
+`lean_close_save`; for Codex, require both names in the server's
+`disabled_tools`. If the host cannot enforce that exclusion, leave the preview
+disabled. Before any workspace-bound call, verify that the Beam MCP owner and
+its Lean child processes run inside an operating-system or container sandbox
+whose filesystem, process, and network permissions match the intended trust
+boundary. The agent host's command sandbox does not establish that. If
+confinement cannot be verified, leave the preview disabled and report the gate.
+Ensure the project root `.gitignore` contains `.beam/`; add the missing line
+without replacing existing ignore rules.
+After the external `lake build` and before the first `lean_sync`, call
+`lean_drop_workspace` with an explicit absolute `workspace.root`, even if this
+workflow has not used Beam yet.
+Treat `dropped: false` with `reason: notFound` as a successful eviction; the
+call does not create a runtime. Discard retained snapshots and handles, then
+call `lean_sync` on one saved project file and retain the returned opaque
+snapshot only for that file version. The root selects a trusted local Lean/Lake
+workspace, not a filesystem sandbox; relative paths can traverse outside it,
+and absolute dependency-source paths may also be outside it. After
+synchronization, use `lean_run_at` to evaluate `Lean.versionString` and compare it with
+`lake env lean --version` from the same workspace. A mismatch disables the
+preview; this compiler check is temporary until Beam exposes the typed workspace
+provenance required by `docs/lean-beam.md`. Do not use `lean_save` or
 `lean_close_save` while the exclusions in
-`<AUTOFORM_PLUGIN_ROOT>/docs/lean-beam.md` remain open. The clean `lake build`
-above must precede this first Beam admission. If another external build runs
-afterward, call `lean_drop_workspace`, discard every retained snapshot and
-handle, and synchronize again before handing the repository off. After sending
-request cancellation, call `lean_drop_workspace` under a finite host deadline.
+`<AUTOFORM_PLUGIN_ROOT>/docs/lean-beam.md` remain open. Repeat the eviction after
+every later external build, and never overlap a build with Beam calls. After
+sending request cancellation, call `lean_drop_workspace` under a finite host
+deadline.
 If it returns, discard state and resynchronize; if it does not, terminate and
 restart Beam because the drop is waiting behind the stuck request. Treat a
 host-level timeout without confirmed MCP cancellation as unsettled. If Beam is
