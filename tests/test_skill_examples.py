@@ -55,6 +55,16 @@ def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> Non
     assert "report as advisory" in normalized
 
 
+def test_setup_guidance_uses_the_offline_atomic_project_creator(repo_root: Path) -> None:
+    setup = (repo_root / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+    normalized = " ".join(setup.split())
+
+    assert "autoform project new <TARGET>" in normalized
+    assert "never overwrites an existing target" in normalized
+    assert "without running Git, Lake, Lean, or network operations" in normalized
+    assert "fails closed" in normalized and "including Windows" in normalized
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"

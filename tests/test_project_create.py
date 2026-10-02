@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -107,6 +108,40 @@ def test_creation_with_an_explicit_pin_stays_offline(tmp_path: Path, monkeypatch
     assert result.workflows_pinned
 
 
+def test_unsafe_local_templates_use_the_project_error_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    (templates / "escape").symlink_to(tmp_path / "missing")
+    target = tmp_path / "Project"
+    monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-validation-failed"
+    assert not target.exists()
+    assert not list(tmp_path.glob(".autoform-new-*"))
+
+
+def test_incomplete_local_templates_are_not_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = tmp_path / "templates"
+    shutil.copytree(create_module._TEMPLATES, templates)
+    (templates / "theme/main.html").unlink()
+    target = tmp_path / "Project"
+    monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-validation-failed"
+    assert not target.exists()
+    assert not list(tmp_path.glob(".autoform-new-*"))
+
+
 def test_creates_complete_supported_project(tmp_path: Path) -> None:
     target = tmp_path / "FiniteFlat"
     result = create_project(target, package="FiniteFlat", release_id=_RELEASE)
@@ -170,6 +205,10 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
         "Prop",
         "Init",
         "Mathlib",
+        "MATHLIB",
+        "MathLib",
+        "LEAN",
+        "STD",
     ],
 )
 def test_rejects_invalid_package_before_writing(tmp_path: Path, package: str) -> None:
@@ -242,6 +281,14 @@ def test_embedded_nul_target_uses_the_stable_error_contract(tmp_path: Path, caps
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-target-invalid"
 
 
+@pytest.mark.parametrize("target", ["", ".", "..", "/"])
+def test_target_must_name_a_directory(target: str) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-target-invalid"
+
+
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken-symlink"])
 def test_never_overwrites_existing_target(tmp_path: Path, kind: str) -> None:
     target = tmp_path / "project"
@@ -283,8 +330,6 @@ def test_normal_macos_tmp_alias_is_supported() -> None:
         create_project(target, package="Project", release_id=_RELEASE)
         assert inspect_project(parent.resolve() / "Project").ok
     finally:
-        import shutil
-
         shutil.rmtree(parent, ignore_errors=True)
 
 
@@ -295,6 +340,23 @@ def test_rejects_nonsticky_shared_parent(tmp_path: Path) -> None:
     with pytest.raises(ProjectCreateError) as raised:
         create_project(parent / "Project", package="Project", release_id=_RELEASE)
     assert raised.value.code == "project-parent-unsafe"
+
+
+def test_rechecks_parent_mode_on_the_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "shared"
+    parent.mkdir(mode=0o777)
+    parent.chmod(0o777)
+    target = parent / "Project"
+    monkeypatch.setattr(create_module, "_validate_target", lambda _target: target)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-parent-unsafe"
+    assert not target.exists()
+    assert not list(parent.glob(".autoform-new-*"))
 
 
 def test_missing_directory_capability_uses_stable_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,6 +490,35 @@ def test_fsync_failure_after_publish_reports_that_the_target_exists(
 
     monkeypatch.setattr(create_module, "_rename_noreplace", publish)
     monkeypatch.setattr(create_module.os, "fsync", fail_after_publish)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-commit-uncertain"
+    assert inspect_project(target).ok
+    assert not list(tmp_path.glob(".autoform-new-*"))
+
+
+def test_interrupt_after_publish_reports_that_the_target_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "project"
+    original_rename = create_module._rename_noreplace
+    original_fsync = create_module.os.fsync
+    published = False
+
+    def publish(*args):
+        nonlocal published
+        original_rename(*args)
+        published = True
+
+    def interrupt_after_publish(descriptor):
+        if published:
+            raise KeyboardInterrupt
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(create_module, "_rename_noreplace", publish)
+    monkeypatch.setattr(create_module.os, "fsync", interrupt_after_publish)
 
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)

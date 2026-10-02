@@ -16,6 +16,7 @@ from ..graph import _parse_node
 from ..provenance import normalize_git_source
 from ..scaffold import (
     DEFAULT_AUTOFORM_SOURCE,
+    ScaffoldError,
     _TEMPLATES,
     _ScaffoldFile,
     _filesystem_template_snapshot,
@@ -117,7 +118,7 @@ def create_project(
         )
         _plan_tree(plan)
         _validate_roadmap_plan(plan)
-    except (OSError, UnicodeError):
+    except (OSError, ScaffoldError, UnicodeError):
         raise ProjectCreateError(
             "project-create-validation-failed",
             "The generated project did not satisfy Autoform's project contracts.",
@@ -187,6 +188,13 @@ def create_project(
         if stage_name is not None:
             message = _with_preserved_stage(message)
         raise ProjectCreateError("project-create-failed", message) from None
+    except BaseException:
+        if published:
+            raise ProjectCreateError(
+                "project-create-commit-uncertain",
+                _COMMIT_UNCERTAIN_MESSAGE,
+            ) from None
+        raise
     finally:
         publication_uncertain = (
             not published
@@ -251,7 +259,7 @@ def _validate_package_for_release(package: str, release: SupportedRelease) -> No
             "project-release-unknown",
             "The requested release lacks a bundled module-collision contract.",
         )
-    if package in roots:
+    if package.casefold() in {root.casefold() for root in roots}:
         raise ProjectCreateError(
             "project-name-invalid",
             "Project name must not shadow a Lean module root used by the selected release.",
@@ -285,7 +293,10 @@ def _validate_target(target: str | Path | None) -> Path:
         encoded = os.fspath(target)
         if not isinstance(encoded, str) or "\0" in encoded:
             raise ValueError
-        raw = Path(encoded).expanduser().absolute()
+        selected = Path(encoded).expanduser()
+        if not selected.parts or selected.name in {"", ".", ".."}:
+            raise ValueError
+        raw = selected.absolute()
     except (OSError, RuntimeError, TypeError, ValueError):
         raise ProjectCreateError("project-target-invalid", "The project target cannot be resolved safely.") from None
     if raw.name in {"", ".", ".."}:
@@ -299,8 +310,7 @@ def _validate_target(target: str | Path | None) -> Path:
         metadata = parent.stat()
     except OSError:
         raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.") from None
-    writable_by_others = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    if writable_by_others and not metadata.st_mode & stat.S_ISVTX:
+    if _unsafe_parent_mode(metadata.st_mode):
         raise ProjectCreateError(
             "project-parent-unsafe",
             "The target parent must not be group- or world-writable unless it is sticky.",
@@ -310,6 +320,10 @@ def _validate_target(target: str | Path | None) -> Path:
     except (OSError, RuntimeError, ValueError):
         raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.") from None
     return canonical_parent / raw.name
+
+
+def _unsafe_parent_mode(mode: int) -> bool:
+    return bool(mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX)
 
 
 def _open_parent(parent: Path) -> int:
@@ -334,6 +348,11 @@ def _open_parent(parent: Path) -> int:
                 child = os.open(part, flags, dir_fd=descriptor)
                 os.close(descriptor)
                 descriptor = child
+            if _unsafe_parent_mode(os.fstat(descriptor).st_mode):
+                raise ProjectCreateError(
+                    "project-parent-unsafe",
+                    "The target parent must not be group- or world-writable unless it is sticky.",
+                )
         except BaseException:
             os.close(descriptor)
             raise

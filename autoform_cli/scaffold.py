@@ -46,6 +46,23 @@ _MAX_TEMPLATE_ENTRIES = 1_024
 _MAX_TEMPLATE_FILE_BYTES = 4 * 1024 * 1024
 _MAX_TEMPLATE_TOTAL_BYTES = 16 * 1024 * 1024
 _MAX_TEMPLATE_DEPTH = 32
+_REQUIRED_TEMPLATE_PATHS = frozenset(
+    {
+        "README.md",
+        "blueprint/README.md",
+        "blueprint/coverage/README.md",
+        "blueprint/gitignore",
+        "blueprint/javascripts/mathjax.js",
+        "blueprint/roadmap/README.md",
+        "blueprint/sources/README.md",
+        "github/autoform_audit.py",
+        "github/workflows/autoform-verify.yml",
+        "github/workflows/blueprint-pages.yml",
+        "gitignore",
+        "mkdocs.yml",
+        "theme/main.html",
+    }
+)
 
 
 def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -> str | None:
@@ -229,6 +246,11 @@ def _scaffold_plan(
     autoform_source: str,
     autoform_ref: str,
 ) -> tuple[tuple[_ScaffoldFile, ...], tuple[str, ...]]:
+    template_paths = [relative for relative, _content, _mode in template_snapshot]
+    if len(template_paths) != len(set(template_paths)) or not _REQUIRED_TEMPLATE_PATHS.issubset(
+        template_paths
+    ):
+        raise ScaffoldError(["the Autoform template tree is incomplete"])
     substitutions = {
         "PROJECT_TITLE_YAML": _yaml_scalar(title),
         "REPO_URL_YAML": _yaml_scalar(repository_url),
@@ -249,7 +271,11 @@ def _scaffold_plan(
         if Path(relative).suffix in {".js", ".html"} or relative.endswith("gitignore"):
             content = template_content
         else:
-            content = _render(template_content.decode("utf-8"), substitutions).encode("utf-8")
+            try:
+                text = template_content.decode("utf-8")
+            except UnicodeError:
+                raise ScaffoldError(["the Autoform template tree contains invalid text"]) from None
+            content = _render(text, substitutions).encode("utf-8")
         files.append(
             _ScaffoldFile(
                 relative=destination,
@@ -267,7 +293,9 @@ def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
     has hard links: ``--force`` must not modify another path to the old inode.
     """
 
-    descriptor, temporary_name = tempfile.mkstemp(dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as output:
@@ -335,7 +363,9 @@ def scaffold_project(
     if autoform_source:
         normalized = _normalize_autoform_source(autoform_source)
         if normalized is None:
-            issues.append("--autoform-source must be a safe credential-free HTTPS Git URL ending in .git")
+            issues.append(
+                "--autoform-source must be a safe credential-free HTTPS Git URL ending in .git"
+            )
         else:
             given_source = normalized
     if issues:
@@ -385,7 +415,9 @@ def scaffold_project(
         for part in Path(planned_file.relative).parts:
             probe = probe / part
             if probe.is_symlink() or (probe.exists() and not _within(probe, root)):
-                raise ScaffoldError([f"refusing to write outside the project through a link: {probe}"])
+                raise ScaffoldError(
+                    [f"refusing to write outside the project through a link: {probe}"]
+                )
         if destination.exists() and not force:
             skipped.append(planned_file.relative)
             continue

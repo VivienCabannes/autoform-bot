@@ -156,6 +156,8 @@ creations leave no partial target, and exactly one concurrent creator can win.
 The command does not run Git, Lake, Lean, subprocesses, or network operations.
 Pass both provenance flags to include pinned CI workflows; without them the
 local project is complete but the workflows are omitted.
+It fails closed where POSIX descriptor traversal, advisory locking, directory
+sync, or atomic no-replace rename is unavailable, including on Windows.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and

@@ -79,7 +79,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
-    project = subparsers.add_parser("project", help="inspect local project configuration and releases")
+    project = subparsers.add_parser(
+        "project", help="create or inspect local projects and supported releases"
+    )
     project_subparsers = project.add_subparsers(dest="project_command", required=True)
     project_new = project_subparsers.add_parser(
         "new", help="atomically create a complete Lean and Autoform project"
