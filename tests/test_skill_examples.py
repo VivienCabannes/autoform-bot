@@ -34,6 +34,27 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
     assert "VivienCabannes/autoform-bot" not in readme
 
 
+def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path) -> None:
+    development = (repo_root / "skills" / "develop-plugin" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(development.split())
+
+    assert "private declaration safety as fail-closed evidence" in normalized
+    assert "official user name" in normalized
+    assert "by source coordinates" in normalized
+
+
+def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
+    review = (repo_root / "skills" / "agent-review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(review.split())
+
+    assert "not reviewer authentication or an approval key" in normalized
+    assert "report as advisory" in normalized
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"
@@ -284,14 +305,16 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "https://github.com/facebookresearch/autoform-bot" in theme
     assert '<a href="{{ config.repo_url }}">Formalization source</a>.' in theme
     workflow = (example / ".github/workflows/blueprint-pages.yml").read_text(encoding="utf-8")
-    assert "autoform check blueprint --lean-root ." in workflow
-    assert "autoform render blueprint" in workflow
+    assert '"$AUTOFORM_DIR" check blueprint --lean-root .' in workflow
+    assert '"$AUTOFORM_DIR" render blueprint' in workflow
+    assert 'runpy.run_module("autoform_cli",run_name="__main__")' in workflow
     assert "--require-declarations" in workflow
     assert "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128" in workflow
     assert "@main" not in workflow
 
     verify = (example / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
-    assert "autoform check blueprint" in verify
+    assert '"$AUTOFORM_DIR" check blueprint' in verify
+    assert 'runpy.run_module("autoform_cli",run_name="__main__")' in verify
     assert 'lake clean "$root_package"' in verify
     assert "lake build" in verify
     assert "Reject kernel-check bypass options" in verify
@@ -374,6 +397,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert "autoform init" in setup
     assert "references/thesis-review-case.md" in agent_review
     assert "references/roadmap-quality.md" in agent_review
+    assert "stale-build refusal" in agent_review
+    assert "drift checksum" in agent_review
     assert "autoform-visualize" in human_review
     assert "`approve`, `revise`, or\n`block`" in human_review
     for required in (
@@ -415,6 +440,8 @@ def test_setup_skill_uses_verified_plugin_provenance(repo_root: Path) -> None:
     assert "autoform project provenance --json" in setup
     assert "--autoform-source <VERIFIED_HTTPS_GIT_SOURCE>" in setup
     assert "--autoform-ref <VERIFIED_40_CHAR_SHA>" in setup
+    assert "template capture and installed-tree verification" in setup
+    assert "require POSIX descriptor" in setup
     assert "plain directory copy" not in setup
     assert "scripts/workspace_inspector.py" not in setup
     assert "scripts/make_project.sh" not in setup
@@ -553,8 +580,8 @@ def test_example_workflows_match_the_scaffold_templates(repo_root: Path) -> None
     """The executable example differs only by its concrete immutable pin."""
 
     substitutions = {
-        "{{AUTOFORM_SOURCE_YAML}}": '"https://github.com/VivienCabannes/autoform-bot.git"',
-        "{{AUTOFORM_REF_YAML}}": '"43097b2c07e68df899d6b8bca7849d091c294754"',
+        "{{AUTOFORM_SOURCE_YAML}}": '"https://github.com/facebookresearch/autoform-bot.git"',
+        "{{AUTOFORM_REF_YAML}}": '"45ca2ecff4c86c0cbcf82c3471dac27ebb956a89"',
     }
     template_dir = repo_root / "autoform_cli/templates/github/workflows"
     example_dir = repo_root / _EXAMPLE / ".github/workflows"

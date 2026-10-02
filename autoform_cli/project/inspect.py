@@ -8,6 +8,8 @@ import json
 import os
 import re
 import stat
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -37,6 +39,21 @@ _LAKE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[^ \t\r\n]+)?")
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 _LEAN_ID_BEGIN_ESCAPE = "«"
 _LEAN_ID_END_ESCAPE = "»"
+_SNAPSHOT_ATTEMPTS = 2
+_DECISION_FILES = {
+    "lakefile.toml": ("lake-config", "error"),
+    "lakefile.lean": ("lake-config", "error"),
+    "lean-toolchain": ("lean-toolchain", "error"),
+    "lake-manifest.json": ("lake-manifest", "warning"),
+}
+_DECISION_NODES = (
+    *_DECISION_FILES,
+    ".git",
+    "blueprint",
+    "mkdocs.yml",
+    ".github/workflows/autoform-verify.yml",
+    ".github/workflows/blueprint-pages.yml",
+)
 
 
 class _InvalidLakeField(ValueError):
@@ -51,10 +68,21 @@ class _DuplicateMathlibRequirement(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _SnapshotEntry:
+    status: str
+    content: bytes | None
+    identity: tuple[int, ...] | None
+
+
 def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None) -> ProjectInspection:
     release_catalog = catalog or load_release_catalog()
     diagnostics: list[ProjectDiagnostic] = []
-    root_descriptor = _discover_root(target, diagnostics)
+    try:
+        root_descriptor = _discover_root(target, diagnostics)
+    except (UnicodeError, ValueError):
+        _issue(diagnostics, "error", "target-unreadable", "The inspection target cannot be resolved.")
+        root_descriptor = None
     if root_descriptor is None:
         return _inspection(diagnostics, release_catalog)
     try:
@@ -67,11 +95,16 @@ def _inspect_project_root(root_descriptor: int, release_catalog: ReleaseCatalog)
     """Inspect an already-bound project root without taking ownership of it."""
 
     diagnostics: list[ProjectDiagnostic] = []
-    lake, mathlib = _inspect_lake(root_descriptor, diagnostics)
-    lean = _inspect_toolchain(root_descriptor, diagnostics)
-    manifest_path, manifest_digest = _optional_digest(root_descriptor, "lake-manifest.json", diagnostics)
-    autoform = _inspect_autoform(root_descriptor, diagnostics)
-    git_path = _inspect_git(root_descriptor, diagnostics)
+    snapshot = _snapshot_project(root_descriptor, diagnostics)
+    if snapshot is None:
+        return _inspection(diagnostics, release_catalog)
+    lake, mathlib = _inspect_lake(snapshot, diagnostics)
+    lean = _inspect_toolchain(snapshot, diagnostics)
+    manifest_path, manifest_digest = _optional_digest(
+        snapshot, "lake-manifest.json", diagnostics
+    )
+    autoform = _inspect_autoform(snapshot, diagnostics)
+    git_path = _inspect_git(snapshot, diagnostics)
     compatibility = _compatibility(release_catalog, lean, mathlib, diagnostics)
     return ProjectInspection(
         schema=PROJECT_INSPECTION_SCHEMA,
@@ -123,8 +156,17 @@ def _discover_root(target: str | Path, diagnostics: list[ProjectDiagnostic]) -> 
     if not _secure_inspection_available(diagnostics):
         return None
     try:
-        candidate = Path(target).expanduser().absolute()
-    except (OSError, RuntimeError, ValueError):
+        raw_target = os.fspath(target)
+        if not isinstance(raw_target, str):
+            raise ValueError("target must be text")
+        if raw_target.startswith("~") and not (
+            raw_target == "~"
+            or raw_target.startswith("~/")
+            or raw_target.startswith("~\\")
+        ):
+            raise ValueError("named-user home expansion is not inspected")
+        candidate = Path(raw_target).expanduser().absolute()
+    except (OSError, RuntimeError, UnicodeError, ValueError):
         _issue(diagnostics, "error", "target-unreadable", "The inspection target cannot be resolved.")
         return None
 
@@ -252,33 +294,216 @@ def _entry_status(parent_descriptor: int, name: str) -> str:
     return "other"
 
 
-def _inspect_lake(
+def _snapshot_project(
     root_descriptor: int, diagnostics: list[ProjectDiagnostic]
+) -> dict[str, _SnapshotEntry] | None:
+    """Capture every decision-bearing node from one stable filesystem generation."""
+    for _attempt in range(_SNAPSHOT_ATTEMPTS):
+        attempt_diagnostics: list[ProjectDiagnostic] = []
+        snapshot: dict[str, _SnapshotEntry] = {}
+        changed = False
+        lean_config_status, lean_config_metadata = _relative_info(
+            root_descriptor, "lakefile.lean"
+        )
+        lean_config_generation = (
+            lean_config_status,
+            _metadata_identity(lean_config_metadata),
+        )
+        lean_config_present = lean_config_status != "missing"
+        for relative in _DECISION_NODES:
+            kind, severity = _DECISION_FILES.get(relative, ("project-path", "error"))
+            status, metadata = _relative_info(root_descriptor, relative)
+            identity = _metadata_identity(metadata)
+            ignored_toml = relative == "lakefile.toml" and lean_config_present
+            if relative in _DECISION_FILES and status == "file" and not ignored_toml:
+                entry, changed_while_reading = _capture_file(
+                    root_descriptor,
+                    relative,
+                    kind,
+                    attempt_diagnostics,
+                    severity=severity,
+                    expected_identity=identity,
+                )
+                snapshot[relative] = entry
+                changed = changed or changed_while_reading
+            else:
+                if (
+                    relative in _DECISION_FILES
+                    and not ignored_toml
+                    and status not in {"missing", "file"}
+                ):
+                    _file_status_issue(
+                        attempt_diagnostics, kind, severity, relative, status
+                    )
+                snapshot[relative] = _SnapshotEntry(status, None, identity)
+
+        lean_config_entry = snapshot["lakefile.lean"]
+        if (lean_config_entry.status, lean_config_entry.identity) != lean_config_generation:
+            changed = True
+        for relative, entry in snapshot.items():
+            status, metadata = _relative_info(root_descriptor, relative)
+            if (status, _metadata_identity(metadata)) != (entry.status, entry.identity):
+                changed = True
+                break
+        if not changed:
+            diagnostics.extend(attempt_diagnostics)
+            return snapshot
+
+    _issue(
+        diagnostics,
+        "error",
+        "project-changed-during-inspection",
+        "Project configuration changed while it was being inspected.",
+    )
+    return None
+
+
+def _capture_file(
+    root_descriptor: int,
+    relative: str,
+    kind: str,
+    diagnostics: list[ProjectDiagnostic],
+    *,
+    severity: str,
+    expected_identity: tuple[int, ...] | None,
+) -> tuple[_SnapshotEntry, bool]:
+    """Read a pre-validated regular file and return its opened-file identity."""
+    try:
+        parent, name = _open_parent_descriptor(root_descriptor, relative)
+    except OSError:
+        _issue(
+            diagnostics,
+            severity,
+            f"{kind}-is-symlink",
+            "A decision-bearing project path cannot be traversed safely.",
+            relative,
+        )
+        return _SnapshotEntry("unreadable", None, None), False
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        exact = _exact_entry_exists(parent, name)
+        if exact is None:
+            _issue(
+                diagnostics,
+                severity,
+                f"{kind}-unreadable",
+                "A project configuration file cannot be read.",
+                relative,
+            )
+            return _SnapshotEntry("unreadable", None, None), False
+        if not exact:
+            return _SnapshotEntry("missing", None, None), True
+        descriptor = os.open(name, flags, dir_fd=parent)
+    except OSError as error:
+        code = (
+            f"{kind}-is-symlink"
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}
+            else f"{kind}-unreadable"
+        )
+        message = (
+            "A decision-bearing project file cannot be opened without following links."
+            if code.endswith("-is-symlink")
+            else "A project configuration file cannot be read."
+        )
+        _issue(diagnostics, severity, code, message, relative)
+        return _SnapshotEntry("unreadable", None, None), False
+    finally:
+        os.close(parent)
+
+    try:
+        before = os.fstat(descriptor)
+        before_identity = _metadata_identity(before)
+        if not stat.S_ISREG(before.st_mode):
+            _file_status_issue(diagnostics, kind, severity, relative, "other")
+            return _SnapshotEntry("other", None, before_identity), False
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read(_MAX_CONFIG_BYTES + 1)
+        after_identity = _metadata_identity(os.fstat(descriptor))
+        changed = before_identity != expected_identity or before_identity != after_identity
+        if len(content) > _MAX_CONFIG_BYTES:
+            _issue(
+                diagnostics,
+                severity,
+                f"{kind}-too-large",
+                "A project configuration file exceeds the inspection limit.",
+                relative,
+            )
+            content = None
+        return _SnapshotEntry("file", content, after_identity), changed
+    except OSError:
+        _issue(
+            diagnostics,
+            severity,
+            f"{kind}-unreadable",
+            "A project configuration file cannot be read.",
+            relative,
+        )
+        return _SnapshotEntry("unreadable", None, None), False
+    finally:
+        os.close(descriptor)
+
+
+def _file_status_issue(
+    diagnostics: list[ProjectDiagnostic],
+    kind: str,
+    severity: str,
+    relative: str,
+    status: str,
+) -> None:
+    if status == "symlink":
+        _issue(
+            diagnostics,
+            severity,
+            f"{kind}-is-symlink",
+            "A decision-bearing project path cannot be inspected safely.",
+            relative,
+        )
+    elif status == "unreadable":
+        _issue(
+            diagnostics,
+            severity,
+            f"{kind}-unreadable",
+            "A project configuration file cannot be read.",
+            relative,
+        )
+    else:
+        _issue(
+            diagnostics,
+            severity,
+            f"{kind}-not-regular",
+            "A decision-bearing project path is not a regular file.",
+            relative,
+        )
+
+
+def _metadata_identity(metadata: os.stat_result | None) -> tuple[int, ...] | None:
+    if metadata is None:
+        return None
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _inspect_lake(
+    snapshot: dict[str, _SnapshotEntry], diagnostics: list[ProjectDiagnostic]
 ) -> tuple[LakeProject | None, MathlibProject | None]:
-    toml_status = _relative_status(root_descriptor, "lakefile.toml")
-    lean_status = _relative_status(root_descriptor, "lakefile.lean")
+    toml_status = snapshot["lakefile.toml"].status
+    lean_status = snapshot["lakefile.lean"].status
     if toml_status != "missing" and lean_status != "missing":
         _issue(
             diagnostics,
-            "error",
-            "conflicting-lake-configs",
-            "Both lakefile.toml and lakefile.lean exist.",
+            "warning",
+            "unused-lakefile-toml",
+            "lakefile.toml is ignored because lakefile.lean takes precedence.",
+            "lakefile.toml",
         )
-        return None, None
-    if toml_status != "missing":
-        content = _read_file(root_descriptor, "lakefile.toml", "lake-config", diagnostics)
-        if content is None:
-            return None, None
-        try:
-            text = content.decode("utf-8")
-            payload = loads_bounded_toml(text, max_depth=_MAX_STRUCTURAL_DEPTH)
-        except (UnicodeError, BoundedTomlError):
-            _issue(diagnostics, "error", "invalid-lake-toml", "lakefile.toml is not valid UTF-8 TOML.", "lakefile.toml")
-            return None, None
-        lake = _parse_lake_toml(payload, content, diagnostics)
-        return lake, _parse_mathlib(payload, diagnostics) if lake is not None else None
     if lean_status != "missing":
-        content = _read_file(root_descriptor, "lakefile.lean", "lake-config", diagnostics)
+        content = snapshot["lakefile.lean"].content
         if content is None:
             return None, None
         _issue(
@@ -298,6 +523,18 @@ def _inspect_lake(
             package_src_dir=None,
             targets=(),
         ), None
+    if toml_status != "missing":
+        content = snapshot["lakefile.toml"].content
+        if content is None:
+            return None, None
+        try:
+            text = content.decode("utf-8")
+            payload = loads_bounded_toml(text, max_depth=_MAX_STRUCTURAL_DEPTH)
+        except (UnicodeError, BoundedTomlError):
+            _issue(diagnostics, "error", "invalid-lake-toml", "lakefile.toml is not valid UTF-8 TOML.", "lakefile.toml")
+            return None, None
+        lake = _parse_lake_toml(payload, content, diagnostics)
+        return lake, _parse_mathlib(payload, diagnostics) if lake is not None else None
     _issue(diagnostics, "error", "missing-lake-config", "The project has no Lake source configuration.")
     return None, None
 
@@ -392,11 +629,13 @@ def _parse_lake_toml(
     )
 
 
-def _inspect_toolchain(root_descriptor: int, diagnostics: list[ProjectDiagnostic]) -> LeanProject | None:
-    if _relative_status(root_descriptor, "lean-toolchain") == "missing":
+def _inspect_toolchain(
+    snapshot: dict[str, _SnapshotEntry], diagnostics: list[ProjectDiagnostic]
+) -> LeanProject | None:
+    if snapshot["lean-toolchain"].status == "missing":
         _issue(diagnostics, "error", "missing-lean-toolchain", "The project has no lean-toolchain file.")
         return None
-    content = _read_file(root_descriptor, "lean-toolchain", "lean-toolchain", diagnostics)
+    content = snapshot["lean-toolchain"].content
     if content is None:
         return None
     try:
@@ -407,7 +646,7 @@ def _inspect_toolchain(root_descriptor: int, diagnostics: list[ProjectDiagnostic
     if (
         not text
         or decoded not in {text, f"{text}\n", f"{text}\r\n"}
-        or any(ord(character) < 32 or ord(character) == 127 for character in text)
+        or _has_forbidden_unicode(text)
     ):
         _issue(
             diagnostics,
@@ -441,6 +680,11 @@ def _open_parent_descriptor(root_descriptor: int, relative: str) -> tuple[int, s
     current = os.dup(root_descriptor)
     try:
         for part in parts[:-1]:
+            exact = _exact_entry_exists(current, part)
+            if exact is None:
+                raise OSError(errno.EACCES, "directory entries cannot be read")
+            if not exact:
+                raise FileNotFoundError(errno.ENOENT, "path component spelling differs")
             next_descriptor = _open_directory(part, current)
             os.close(current)
             current = next_descriptor
@@ -450,33 +694,53 @@ def _open_parent_descriptor(root_descriptor: int, relative: str) -> tuple[int, s
         raise
 
 
-def _relative_status(root_descriptor: int, relative: str) -> str:
+def _exact_entry_exists(parent_descriptor: int, name: str) -> bool | None:
+    try:
+        return name in os.listdir(parent_descriptor)
+    except OSError:
+        return None
+
+
+def _relative_info(
+    root_descriptor: int, relative: str
+) -> tuple[str, os.stat_result | None]:
     try:
         parent, name = _open_parent_descriptor(root_descriptor, relative)
     except FileNotFoundError:
-        return "missing"
-    except OSError:
-        return "unsafe"
+        return "missing", None
+    except (OSError, UnicodeError, ValueError):
+        return "unreadable", None
     try:
+        exact = _exact_entry_exists(parent, name)
+        if exact is None:
+            return "unreadable", None
+        if not exact:
+            return "missing", None
         metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
-        return "missing"
-    except OSError:
-        return "unsafe"
+        return "missing", None
+    except (OSError, UnicodeError, ValueError):
+        return "unreadable", None
     finally:
         os.close(parent)
     if stat.S_ISLNK(metadata.st_mode):
-        return "unsafe"
+        return "symlink", metadata
     if stat.S_ISDIR(metadata.st_mode):
-        return "directory"
+        return "directory", metadata
     if stat.S_ISREG(metadata.st_mode):
-        return "file"
-    return "unsafe"
+        return "file", metadata
+    return "other", metadata
 
 
-def _inspect_git(root_descriptor: int, diagnostics: list[ProjectDiagnostic]) -> str | None:
-    status = _relative_status(root_descriptor, ".git")
-    if status == "unsafe":
+def _relative_status(root_descriptor: int, relative: str) -> str:
+    return _relative_info(root_descriptor, relative)[0]
+
+
+def _inspect_git(
+    snapshot: dict[str, _SnapshotEntry], diagnostics: list[ProjectDiagnostic]
+) -> str | None:
+    status = snapshot[".git"].status
+    if status in {"symlink", "unreadable"}:
         _issue(
             diagnostics,
             "error",
@@ -488,7 +752,9 @@ def _inspect_git(root_descriptor: int, diagnostics: list[ProjectDiagnostic]) -> 
     return ".git" if status in {"file", "directory"} else None
 
 
-def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]) -> AutoformProject:
+def _inspect_autoform(
+    snapshot: dict[str, _SnapshotEntry], diagnostics: list[ProjectDiagnostic]
+) -> AutoformProject:
     paths = {
         "blueprint_path": ("blueprint", "directory"),
         "mkdocs_path": ("mkdocs.yml", "file"),
@@ -497,8 +763,8 @@ def _inspect_autoform(root_descriptor: int, diagnostics: list[ProjectDiagnostic]
     }
     values: dict[str, str | None] = {}
     for field, (relative, expected) in paths.items():
-        status = _relative_status(root_descriptor, relative)
-        if status == "unsafe":
+        status = snapshot[relative].status
+        if status in {"symlink", "unreadable"}:
             _issue(
                 diagnostics,
                 "error",
@@ -577,11 +843,13 @@ def _compatibility(
 
 
 def _optional_digest(
-    root_descriptor: int, relative: str, diagnostics: list[ProjectDiagnostic]
+    snapshot: dict[str, _SnapshotEntry],
+    relative: str,
+    diagnostics: list[ProjectDiagnostic],
 ) -> tuple[str | None, str | None]:
-    if _relative_status(root_descriptor, relative) == "missing":
+    if snapshot[relative].status == "missing":
         return None, None
-    content = _read_file(root_descriptor, relative, "lake-manifest", diagnostics, severity="warning")
+    content = snapshot[relative].content
     if content is None:
         return None, None
     try:
@@ -593,75 +861,6 @@ def _optional_digest(
         _issue(diagnostics, "warning", "invalid-lake-manifest", "lake-manifest.json is not valid UTF-8 JSON.", relative)
         return relative, hashlib.sha256(content).hexdigest()
     return relative, hashlib.sha256(content).hexdigest()
-
-
-def _read_file(
-    root_descriptor: int,
-    relative: str,
-    kind: str,
-    diagnostics: list[ProjectDiagnostic],
-    *,
-    severity: str = "error",
-) -> bytes | None:
-    try:
-        parent, name = _open_parent_descriptor(root_descriptor, relative)
-    except OSError:
-        _issue(
-            diagnostics,
-            severity,
-            f"{kind}-is-symlink",
-            "A decision-bearing project path cannot be traversed safely.",
-            relative,
-        )
-        return None
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent)
-    except OSError as error:
-        code = f"{kind}-is-symlink" if error.errno in {errno.ELOOP, errno.ENOTDIR} else f"{kind}-unreadable"
-        message = (
-            "A decision-bearing project file cannot be opened without following links."
-            if code.endswith("-is-symlink")
-            else "A project configuration file cannot be read."
-        )
-        _issue(diagnostics, severity, code, message, relative)
-        os.close(parent)
-        return None
-    os.close(parent)
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            _issue(
-                diagnostics,
-                severity,
-                f"{kind}-not-regular",
-                "A decision-bearing project path is not a regular file.",
-                relative,
-            )
-            return None
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            content = stream.read(_MAX_CONFIG_BYTES + 1)
-        if len(content) > _MAX_CONFIG_BYTES:
-            _issue(
-                diagnostics,
-                severity,
-                f"{kind}-too-large",
-                "A project configuration file exceeds the inspection limit.",
-                relative,
-            )
-            return None
-        return content
-    except OSError:
-        _issue(
-            diagnostics,
-            severity,
-            f"{kind}-unreadable",
-            "A project configuration file cannot be read.",
-            relative,
-        )
-        return None
-    finally:
-        os.close(descriptor)
 
 
 def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
@@ -681,7 +880,7 @@ def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
     if len(matches) > 1:
         raise _DuplicateMathlibRequirement("duplicate mathlib")
     for entry in matches:
-        if "scope" in entry:
+        if "scope" in entry and entry["scope"] != "":
             _required_string(entry["scope"], "mathlib.scope")
         if "rev" in entry:
             _required_string(entry["rev"], "mathlib.rev")
@@ -799,10 +998,14 @@ def _required_string(value: Any, field: str) -> str:
         not isinstance(value, str)
         or not value
         or value != value.strip()
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or _has_forbidden_unicode(value)
     ):
         raise _InvalidLakeField(field)
     return value
+
+
+def _has_forbidden_unicode(value: str) -> bool:
+    return any(unicodedata.category(character) in {"Cc", "Cs"} for character in value)
 
 
 def _lake_version(value: Any) -> str | None:

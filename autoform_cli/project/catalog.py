@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from importlib.resources import files
 from typing import Any
@@ -18,6 +19,9 @@ from .model import (
 
 class ProjectCatalogError(ValueError):
     """The bundled release catalog is missing or invalid."""
+
+
+_LEAN_TOOLCHAIN = re.compile(r"leanprover/lean4:(v[0-9]+\.[0-9]+\.[0-9]+)")
 
 
 def load_release_catalog() -> ReleaseCatalog:
@@ -63,11 +67,16 @@ def _parse_release(entry: Any) -> SupportedRelease:
         raise ProjectCatalogError("release recommendation must be boolean")
     lean = _object(entry["lean"], {"toolchain", "version"}, "Lean release")
     mathlib = _object(entry["mathlib"], {"git", "revision"}, "Mathlib release")
+    lean_toolchain = _string(lean["toolchain"])
+    lean_version = _string(lean["version"])
+    match = _LEAN_TOOLCHAIN.fullmatch(lean_toolchain)
+    if match is None or match.group(1) != lean_version:
+        raise ProjectCatalogError("Lean release toolchain and version disagree")
     return SupportedRelease(
         id=release_id,
         channel=channel,
         recommended=recommended,
-        lean=LeanRelease(toolchain=_string(lean["toolchain"]), version=_string(lean["version"])),
+        lean=LeanRelease(toolchain=lean_toolchain, version=lean_version),
         mathlib=MathlibRelease(git=_string(mathlib["git"]), revision=_string(mathlib["revision"])),
     )
 

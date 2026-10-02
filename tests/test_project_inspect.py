@@ -117,6 +117,30 @@ def test_release_catalog_rejects_invalid_contract() -> None:
         )
 
 
+def test_release_catalog_rejects_a_toolchain_version_mismatch() -> None:
+    with pytest.raises(ProjectCatalogError, match="toolchain and version disagree"):
+        parse_release_catalog(
+            {
+                "schema": RELEASE_CATALOG_SCHEMA,
+                "releases": [
+                    {
+                        "id": "contradictory",
+                        "channel": "stable",
+                        "recommended": True,
+                        "lean": {
+                            "toolchain": "leanprover/lean4:v4.32.2",
+                            "version": "v9.9.9",
+                        },
+                        "mathlib": {
+                            "git": "https://github.com/leanprover-community/mathlib4.git",
+                            "revision": "v4.32.2",
+                        },
+                    }
+                ],
+            }
+        )
+
+
 @pytest.mark.parametrize("value", ["line\nbreak", "escape\x1bsequence", "surrogate\ud800"])
 def test_release_catalog_rejects_unprintable_strings(value: str) -> None:
     with pytest.raises(ProjectCatalogError):
@@ -550,6 +574,22 @@ def test_supported_mathlib_dependency_forms_match_catalog(
     assert result.compatibility.status == "supported"
 
 
+def test_explicit_empty_scope_is_lakes_default_scope(tmp_path: Path) -> None:
+    recommended = load_release_catalog().recommended
+    root = _project(tmp_path)
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\n[[require]]\nname = "mathlib"\nscope = ""\n'
+        f'git = "{recommended.mathlib.git}"\n'
+        f'rev = "{recommended.mathlib.revision}"\n',
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "supported"
+
+
 def test_lake_generated_scope_requirement_is_indeterminate_offline(tmp_path: Path) -> None:
     """Reservoir scope metadata is not proof of an exact Git source."""
     recommended = load_release_catalog().recommended
@@ -803,6 +843,20 @@ def test_lakefile_lean_is_never_executed(tmp_path: Path, monkeypatch: pytest.Mon
     assert not marker.exists()
 
 
+def test_lakefile_lean_takes_precedence_over_toml(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "lakefile.lean").write_text("package Example\n", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.lake is not None and result.lake.format == "lean"
+    assert any(
+        diagnostic.code == "unused-lakefile-toml"
+        for diagnostic in result.diagnostics
+    )
+
+
 def test_fifo_lakefile_fails_without_blocking(tmp_path: Path) -> None:
     if not hasattr(os, "mkfifo"):
         pytest.skip("FIFOs are unavailable")
@@ -812,6 +866,33 @@ def test_fifo_lakefile_fails_without_blocking(tmp_path: Path) -> None:
     result = inspect_project(root)
     assert not result.ok
     assert any(diagnostic.code == "lake-config-not-regular" for diagnostic in result.diagnostics)
+
+
+def test_known_fifo_is_rejected_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs are unavailable")
+    from autoform_cli.project import inspect as inspect_module
+
+    root = _project(tmp_path)
+    (root / "lakefile.toml").unlink()
+    os.mkfifo(root / "lakefile.toml")
+    original_capture = inspect_module._capture_file
+
+    def guarded_capture(*args, **kwargs):
+        if args[1] == "lakefile.toml":
+            raise AssertionError("inspection opened a known nonregular node")
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(inspect_module, "_capture_file", guarded_capture)
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert any(
+        diagnostic.code == "lake-config-not-regular"
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_rejects_broken_symlinked_lakefile(tmp_path: Path) -> None:
@@ -947,6 +1028,79 @@ def test_scaffold_paths_require_their_expected_node_type(
     )
 
 
+def test_blueprint_detection_requires_exact_directory_spelling(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "Blueprint").mkdir()
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.autoform.detected is False
+    assert result.autoform.blueprint_path is None
+
+
+def test_decision_files_come_from_one_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent two-file update must not synthesize a supported release."""
+    from autoform_cli.project import inspect as inspect_module
+
+    root = _project(tmp_path)
+    (root / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.31.0\n", encoding="utf-8"
+    )
+    original_capture = inspect_module._capture_file
+    swapped = False
+
+    def swapping_capture(*args, **kwargs):
+        nonlocal swapped
+        entry = original_capture(*args, **kwargs)
+        if args[1] == "lakefile.toml" and not swapped:
+            swapped = True
+            lakefile = root / "lakefile.toml"
+            lakefile.write_text(
+                lakefile.read_text(encoding="utf-8").replace("v4.32.2", "v4.31.0"),
+                encoding="utf-8",
+            )
+            (root / "lean-toolchain").write_text(
+                "leanprover/lean4:v4.32.2\n", encoding="utf-8"
+            )
+        return entry
+
+    monkeypatch.setattr(inspect_module, "_capture_file", swapping_capture)
+    result = inspect_project(root)
+
+    assert swapped
+    assert result.compatibility.status == "unlisted"
+    assert result.compatibility.release is None
+
+
+def test_lakefile_precedence_comes_from_the_same_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli.project import inspect as inspect_module
+
+    root = _project(tmp_path)
+    (root / "lakefile.lean").write_text("package Example\n", encoding="utf-8")
+    original_info = inspect_module._relative_info
+    removed = False
+
+    def removing_info(descriptor: int, relative: str):
+        nonlocal removed
+        info = original_info(descriptor, relative)
+        if relative == "lakefile.lean" and not removed:
+            removed = True
+            (root / "lakefile.lean").unlink()
+        return info
+
+    monkeypatch.setattr(inspect_module, "_relative_info", removing_info)
+    result = inspect_project(root)
+
+    assert removed
+    assert result.lake is not None
+    assert result.lake.format == "toml"
+
+
 def test_root_discovery_stays_bound_to_the_directory_it_opened(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1062,10 +1216,69 @@ def test_toolchain_control_characters_are_rejected(
     )
 
 
+def test_c1_toolchain_control_character_is_rejected(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "lean-toolchain").write_text(
+        "leanprover/lean4:v4.32.2\u009b\n", encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.lean is None
+    assert any(
+        diagnostic.code == "invalid-lean-toolchain"
+        for diagnostic in result.diagnostics
+    )
+
+
 def test_tilde_expansion_failure_is_a_stable_diagnostic() -> None:
     result = inspect_project("~autoform-user-that-does-not-exist/project")
     assert not result.ok
     assert result.diagnostics[0].code == "target-unreadable"
+
+
+def test_named_user_home_is_rejected_without_account_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("pwd is POSIX-only")
+    import pwd
+
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("inspection performed account-service lookup")
+        ),
+    )
+
+    result = inspect_project("~autoform-account-service-user/project")
+
+    assert not result.ok
+    assert result.diagnostics[0].code == "target-unreadable"
+
+
+@pytest.mark.parametrize("target", ["\0", "\ud800"])
+def test_malformed_target_is_a_stable_diagnostic(target: str) -> None:
+    result = inspect_project(target)
+
+    assert not result.ok
+    assert result.diagnostics[0].code == "target-unreadable"
+
+
+def test_platform_without_descriptor_hardening_fails_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli.project import inspect as inspect_module
+
+    root = _project(tmp_path)
+    monkeypatch.setattr(inspect_module.os, "supports_dir_fd", set())
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.diagnostics[0].code == "secure-file-inspection-unavailable"
 
 
 def test_reports_git_metadata_without_invoking_git(

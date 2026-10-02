@@ -14,7 +14,13 @@ from pathlib import Path, PurePosixPath
 
 from ..graph import _parse_node
 from ..provenance import normalize_git_source
-from ..scaffold import DEFAULT_AUTOFORM_SOURCE, _ScaffoldFile, _scaffold_plan
+from ..scaffold import (
+    DEFAULT_AUTOFORM_SOURCE,
+    _TEMPLATES,
+    _ScaffoldFile,
+    _filesystem_template_snapshot,
+    _scaffold_plan,
+)
 from .catalog import load_release_catalog
 from .inspect import _inspect_project_root
 from .model import SupportedRelease
@@ -450,6 +456,7 @@ def _build_project_plan(
         ),
     ]
     scaffold_files, _ = _scaffold_plan(
+        _filesystem_template_snapshot(_TEMPLATES),
         title=package,
         repository_url="",
         autoform_source=autoform_source or DEFAULT_AUTOFORM_SOURCE,
