@@ -149,10 +149,11 @@ autoform project provenance --json
 ```
 
 `project new` requires an absent target and an explicit release ID. It builds a
-complete Lean shell, blueprint, and site in a private sibling directory,
-validates the staged project, then publishes the directory with an atomic
-no-replace rename. It never overwrites an existing path. Failed and concurrent
-creations leave no partial target, and exactly one concurrent creator can win.
+complete Lean shell with the release's Lake-generated resolved dependency
+manifest, blueprint, and site in a private sibling directory, validates the
+staged project, then publishes the directory with an atomic no-replace rename.
+It never overwrites an existing path. Failed and concurrent creations leave no
+partial target, and exactly one concurrent creator can win.
 The command does not run Git, Lake, Lean, subprocesses, or network operations.
 Pass both provenance flags to include pinned CI workflows; without them the
 local project is complete but the workflows are omitted.

@@ -10,6 +10,7 @@ import re
 import secrets
 import stat
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path, PurePosixPath
 
 from ..graph import _parse_node
@@ -52,6 +53,9 @@ _RELEASE_MODULE_ROOTS = {
             "Std",
         }
     )
+}
+_RELEASE_MANIFEST_FILES = {
+    "lean-v4.32.2-mathlib-v4.32.2": "release-manifest-lean-v4.32.2-mathlib-v4.32.2.json"
 }
 _STAGE_ATTEMPTS = 32
 _COMMIT_UNCERTAIN_MESSAGE = "Project publication may have occurred; inspect the target before retrying."
@@ -491,27 +495,46 @@ def _build_project_plan(
 
 
 def _lake_manifest(package: str, release: SupportedRelease) -> bytes:
-    payload = {
-        "version": "1.2.0",
-        "packagesDir": ".lake/packages",
-        "packages": [
-            {
-                "url": release.mathlib.git,
-                "type": "git",
-                "subDir": release.mathlib.subdirectory,
-                "scope": "",
-                "rev": release.mathlib.resolved_revision,
-                "name": release.mathlib.name,
-                "manifestFile": "lake-manifest.json",
-                "inputRev": release.mathlib.revision,
-                "inherited": False,
-                "configFile": "lakefile.lean",
-            }
-        ],
-        "name": package,
-        "lakeDir": ".lake",
-        "fixedToolchain": False,
-    }
+    filename = _RELEASE_MANIFEST_FILES.get(release.id)
+    if filename is None:
+        raise ProjectCreateError(
+            "project-release-unknown",
+            "The requested release lacks a bundled Lake manifest.",
+        )
+    try:
+        payload = json.loads(
+            files("autoform_cli.project").joinpath(filename).read_text(encoding="utf-8")
+        )
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError, MemoryError):
+        raise ProjectCreateError(
+            "project-create-validation-failed",
+            "The bundled release manifest is invalid.",
+        ) from None
+    if type(payload) is not dict:
+        raise ProjectCreateError(
+            "project-create-validation-failed",
+            "The bundled release manifest is invalid.",
+        )
+    packages = payload.get("packages")
+    direct = (
+        [entry for entry in packages if type(entry) is dict and entry.get("inherited") is False]
+        if type(packages) is list
+        else []
+    )
+    if (
+        payload.get("name") != ""
+        or len(direct) != 1
+        or direct[0].get("name") != release.mathlib.name
+        or direct[0].get("url") != release.mathlib.git
+        or direct[0].get("inputRev") != release.mathlib.revision
+        or direct[0].get("rev") != release.mathlib.resolved_revision
+        or direct[0].get("subDir") != release.mathlib.subdirectory
+    ):
+        raise ProjectCreateError(
+            "project-create-validation-failed",
+            "The bundled release manifest does not match the release catalog.",
+        )
+    payload["name"] = package
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 

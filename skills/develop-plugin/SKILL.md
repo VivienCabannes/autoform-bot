@@ -19,6 +19,13 @@ Ensure future agents need less steering.
 Preserve the insight, not the transcript or consumer choice.
 Add a focused test and acceptance assertion in `tests/test_skill_examples.py`.
 
+When adding a supported Lean/Mathlib release, update the release catalog, its
+module-root collision contract, and its complete Lake-generated manifest
+artifact together. Generate the manifest with `lake update` and validate a
+fresh `lake build`; a manifest containing only the direct Mathlib package is
+structurally plausible but Lake rejects it when inherited dependencies are
+missing.
+
 Implement reusable plugin behavior. Keep Cabannes-specific facts in the example
 and references; demonstrate outcomes without special-casing them.
 

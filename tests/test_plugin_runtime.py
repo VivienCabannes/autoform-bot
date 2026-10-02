@@ -95,6 +95,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/probes/skeleton_probe.lean",
             "autoform_cli/visualize.py",
             "autoform_cli/project/create.py",
+            "autoform_cli/project/release-manifest-lean-v4.32.2-mathlib-v4.32.2.json",
             "autoform_cli/project/releases.json",
             "servers/lean_client.py",
             "servers/lean_runtime.py",

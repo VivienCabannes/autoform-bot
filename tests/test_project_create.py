@@ -142,6 +142,24 @@ def test_incomplete_local_templates_are_not_published(
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
+def test_missing_release_manifest_is_not_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "Project"
+    monkeypatch.setattr(
+        create_module,
+        "_RELEASE_MANIFEST_FILES",
+        {_RELEASE: "missing-release-manifest.json"},
+    )
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-validation-failed"
+    assert not target.exists()
+    assert not list(tmp_path.glob(".autoform-new-*"))
+
+
 def test_creates_complete_supported_project(tmp_path: Path) -> None:
     target = tmp_path / "FiniteFlat"
     result = create_project(target, package="FiniteFlat", release_id=_RELEASE)
@@ -165,20 +183,21 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
     manifest = json.loads((target / "lake-manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "1.2.0"
     assert manifest["name"] == "FiniteFlat"
-    assert manifest["packages"] == [
-        {
-            "configFile": "lakefile.lean",
-            "inherited": False,
-            "inputRev": "v4.32.2",
-            "manifestFile": "lake-manifest.json",
-            "name": "mathlib",
-            "rev": "905b95818eb32af7874a58b427f50c1711a5e96c",
-            "scope": "",
-            "subDir": None,
-            "type": "git",
-            "url": "https://github.com/leanprover-community/mathlib4",
-        }
-    ]
+    assert {entry["name"]: entry["rev"] for entry in manifest["packages"]} == {
+        "Cli": "88679d088c9720c27ebdf2ba4dafe17341747f94",
+        "LeanSearchClient": "c5d5b8fe6e5158def25cd28eb94e4141ad97c843",
+        "Qq": "38d591e778f100aec9762bb582f9c7f55f50e9dc",
+        "aesop": "a7dbf0c63b694e47f425f3dcddbc0e178bb432d3",
+        "batteries": "023ce7d62a0531e22a5331e20b587817a80d49ff",
+        "importGraph": "7e9612bf0b9ee66db3cb5b9988a35afc706f5a12",
+        "mathlib": "905b95818eb32af7874a58b427f50c1711a5e96c",
+        "plausible": "e12c1910fe855cbfc38803cd4e55543906d5fa62",
+        "proofwidgets": "6e311e2a844da9b2cc3971187df2fe0066947b93",
+    }
+    direct = [entry for entry in manifest["packages"] if not entry["inherited"]]
+    assert len(direct) == 1
+    assert direct[0]["name"] == "mathlib"
+    assert direct[0]["inputRev"] == "v4.32.2"
     assert (target / "src/FiniteFlat.lean").read_text(encoding="utf-8") == (
         "import Mathlib\n\n"
         "namespace FiniteFlat\n\n"
@@ -239,8 +258,10 @@ def test_rejects_invalid_package_before_writing(tmp_path: Path, package: str) ->
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
-def test_every_release_has_a_module_collision_contract() -> None:
-    assert set(create_module._RELEASE_MODULE_ROOTS) == {release.id for release in load_release_catalog().releases}
+def test_every_release_has_creation_contracts() -> None:
+    release_ids = {release.id for release in load_release_catalog().releases}
+    assert set(create_module._RELEASE_MODULE_ROOTS) == release_ids
+    assert set(create_module._RELEASE_MANIFEST_FILES) == release_ids
 
 
 def test_rejects_non_string_package_before_writing(tmp_path: Path) -> None:

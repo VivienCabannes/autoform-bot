@@ -43,6 +43,9 @@ def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path)
     assert "private declaration safety as fail-closed evidence" in normalized
     assert "official user name" in normalized
     assert "by source coordinates" in normalized
+    assert "complete Lake-generated manifest artifact" in normalized
+    assert "manifest containing only the direct Mathlib package" in normalized
+    assert "Generate the manifest with `lake update`" in development
 
 
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
