@@ -156,12 +156,29 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
         'defaultTargets = ["FiniteFlat"]\n\n'
         "[[require]]\n"
         'name = "mathlib"\n'
-        'git = "https://github.com/leanprover-community/mathlib4.git"\n'
+        'git = "https://github.com/leanprover-community/mathlib4"\n'
         'rev = "v4.32.2"\n\n'
         "[[lean_lib]]\n"
         'name = "FiniteFlat"\n'
         'srcDir = "src"\n'
     )
+    manifest = json.loads((target / "lake-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == "1.2.0"
+    assert manifest["name"] == "FiniteFlat"
+    assert manifest["packages"] == [
+        {
+            "configFile": "lakefile.lean",
+            "inherited": False,
+            "inputRev": "v4.32.2",
+            "manifestFile": "lake-manifest.json",
+            "name": "mathlib",
+            "rev": "905b95818eb32af7874a58b427f50c1711a5e96c",
+            "scope": "",
+            "subDir": None,
+            "type": "git",
+            "url": "https://github.com/leanprover-community/mathlib4",
+        }
+    ]
     assert (target / "src/FiniteFlat.lean").read_text(encoding="utf-8") == (
         "import Mathlib\n\n"
         "namespace FiniteFlat\n\n"
@@ -173,6 +190,8 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
     assert inspection.ok
     assert inspection.compatibility.status == "supported"
     assert inspection.compatibility.release == _RELEASE
+    assert inspection.mathlib is not None
+    assert inspection.mathlib.resolved_revision == "905b95818eb32af7874a58b427f50c1711a5e96c"
     assert set(load_graph(target / "blueprint").nodes) == {"roadmap"}
     assert stat.S_IMODE(target.stat().st_mode) == 0o755
     assert not list(tmp_path.glob(".autoform-new-*"))

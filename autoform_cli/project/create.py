@@ -463,6 +463,11 @@ def _build_project_plan(
             0o644,
         ),
         _ScaffoldFile(
+            "lake-manifest.json",
+            _lake_manifest(package, release),
+            0o644,
+        ),
+        _ScaffoldFile(
             f"src/{package}.lean",
             (
                 "import Mathlib\n\n"
@@ -483,6 +488,31 @@ def _build_project_plan(
     )
     files.extend(scaffold_files)
     return tuple(sorted(files, key=lambda item: item.relative)), bool(autoform_ref)
+
+
+def _lake_manifest(package: str, release: SupportedRelease) -> bytes:
+    payload = {
+        "version": "1.2.0",
+        "packagesDir": ".lake/packages",
+        "packages": [
+            {
+                "url": release.mathlib.git,
+                "type": "git",
+                "subDir": release.mathlib.subdirectory,
+                "scope": "",
+                "rev": release.mathlib.resolved_revision,
+                "name": release.mathlib.name,
+                "manifestFile": "lake-manifest.json",
+                "inputRev": release.mathlib.revision,
+                "inherited": False,
+                "configFile": "lakefile.lean",
+            }
+        ],
+        "name": package,
+        "lakeDir": ".lake",
+        "fixedToolchain": False,
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _plan_tree(plan: tuple[_ScaffoldFile, ...]) -> dict[str, object]:
