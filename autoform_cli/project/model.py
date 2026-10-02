@@ -33,10 +33,13 @@ class LeanRelease:
 class MathlibRelease:
     name: str
     scope: str
+    package_type: str
     git: str
-    revision: str
+    input_revision: str
     resolved_revision: str
     subdirectory: str | None
+    config_file: str
+    manifest_file: str
 
     def as_dict(self) -> dict[str, str | None]:
         return asdict(self)
@@ -136,11 +139,15 @@ class LeanProject:
 class MathlibProject:
     name: str
     scope: str
+    package_type: str
     git: str | None
-    revision: str | None
+    input_revision: str | None
     resolved_revision: str | None
     declared_revision: str | None
     subdirectory: str | None
+    config_file: str
+    manifest_file: str | None
+    path: str | None
     source: str
 
     def as_dict(self) -> dict[str, str | None]:
@@ -178,6 +185,8 @@ class ProjectInspection:
     lake: LakeProject | None
     lake_manifest_path: str | None
     lake_manifest_sha256: str | None
+    package_overrides_path: str | None
+    package_overrides_sha256: str | None
     lean: LeanProject | None
     mathlib: MathlibProject | None
     autoform: AutoformProject
@@ -197,6 +206,8 @@ class ProjectInspection:
             "lake": self.lake.as_dict() if self.lake is not None else None,
             "lake_manifest_path": self.lake_manifest_path,
             "lake_manifest_sha256": self.lake_manifest_sha256,
+            "package_overrides_path": self.package_overrides_path,
+            "package_overrides_sha256": self.package_overrides_sha256,
             "lean": self.lean.as_dict() if self.lean is not None else None,
             "mathlib": self.mathlib.as_dict() if self.mathlib is not None else None,
             "ok": self.ok,

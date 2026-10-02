@@ -70,7 +70,17 @@ def _parse_release(entry: Any) -> SupportedRelease:
     lean = _object(entry["lean"], {"toolchain", "version"}, "Lean release")
     mathlib = _object(
         entry["mathlib"],
-        {"git", "name", "resolved_revision", "revision", "scope", "subdirectory"},
+        {
+            "config_file",
+            "git",
+            "input_revision",
+            "manifest_file",
+            "name",
+            "package_type",
+            "resolved_revision",
+            "scope",
+            "subdirectory",
+        },
         "Mathlib release",
     )
     lean_toolchain = _string(lean["toolchain"])
@@ -86,10 +96,13 @@ def _parse_release(entry: Any) -> SupportedRelease:
         mathlib=MathlibRelease(
             name=_mathlib_name(mathlib["name"]),
             scope=_string(mathlib["scope"]),
+            package_type=_mathlib_package_type(mathlib["package_type"]),
             git=_mathlib_git(mathlib["git"]),
-            revision=_string(mathlib["revision"]),
+            input_revision=_string(mathlib["input_revision"]),
             resolved_revision=_resolved_revision(mathlib["resolved_revision"]),
             subdirectory=_optional_string(mathlib["subdirectory"]),
+            config_file=_string(mathlib["config_file"]),
+            manifest_file=_string(mathlib["manifest_file"]),
         ),
     )
 
@@ -116,6 +129,13 @@ def _mathlib_name(value: Any) -> str:
     if name != "mathlib":
         raise ProjectCatalogError("Mathlib release name must be mathlib")
     return name
+
+
+def _mathlib_package_type(value: Any) -> str:
+    package_type = _string(value)
+    if package_type != "git":
+        raise ProjectCatalogError("Mathlib release package type must be git")
+    return package_type
 
 
 def _optional_string(value: Any) -> str | None:

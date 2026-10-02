@@ -459,7 +459,7 @@ def _build_project_plan(
                 "[[require]]\n"
                 'name = "mathlib"\n'
                 f'git = "{release.mathlib.git}"\n'
-                f'rev = "{release.mathlib.revision}"\n\n'
+                f'rev = "{release.mathlib.input_revision}"\n\n'
                 "[[lean_lib]]\n"
                 f'name = "{package}"\n'
                 'srcDir = "src"\n'
@@ -526,7 +526,7 @@ def _lake_manifest(package: str, release: SupportedRelease) -> bytes:
         or len(direct) != 1
         or direct[0].get("name") != release.mathlib.name
         or direct[0].get("url") != release.mathlib.git
-        or direct[0].get("inputRev") != release.mathlib.revision
+        or direct[0].get("inputRev") != release.mathlib.input_revision
         or direct[0].get("rev") != release.mathlib.resolved_revision
         or direct[0].get("subDir") != release.mathlib.subdirectory
     ):

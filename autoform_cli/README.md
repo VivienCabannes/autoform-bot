@@ -164,26 +164,39 @@ sync, or atomic no-replace rename is unavailable, including on Windows.
 nearest project root; parses bounded `lakefile.toml`, `lake-manifest.json`,
 `lean-toolchain`, and known Autoform paths; records configuration hashes; and
 reports whether the resolved Lean/Mathlib pair exactly matches the bundled
-catalog. The Lake configuration records requested intent; the manifest's
-direct Mathlib entry is authoritative for the URL, input revision, and commit
-Lake actually builds. A missing manifest makes compatibility indeterminate; an
-invalid manifest fails inspection; disagreement with the current requirement
-is reported as stale. Decision-bearing files are read from one validated
+catalog's material source identity. That identity consists of the Lean
+toolchain and Mathlib package name, source kind, canonical Git URL, resolved
+commit, subdirectory, configuration file, and manifest file. Scope and input
+revision are recorded as descriptive aliases; input-revision differences and
+nonempty scope differences produce warnings when the material identity still
+matches. The Lake configuration records
+requested intent; the manifest's
+effective selected Mathlib lock entry is authoritative for the URL, input
+revision, and commit Lake is instructed to materialize under the default
+invocation, unless `.lake/package-overrides.json` replaces it. An active
+Mathlib override is reported and becomes the effective source; a local path
+override is necessarily outside the release catalog. A missing manifest
+makes compatibility indeterminate; an invalid manifest or override file fails
+inspection; disagreement with the current requirement is reported as stale.
+This is the effective lock entry for Lake's default invocation, not a claim
+about a dirty materialized checkout, `LAKE_PKG_URL_MAP`, or command-line
+`--packages` overrides that are not recorded in the project files.
+Decision-bearing files are read from one validated
 filesystem generation. It does not run Lake, Lean, Git, subprocesses, network
 operations, or named-user home-directory lookup. A `lakefile.lean` is reported
 as present but unevaluated and takes precedence over `lakefile.toml`, matching
-Lake. Case aliases, symlinked configuration, and malformed consumed fields
-fail inspection.
+Lake. Case aliases of decision-bearing paths, symlinked configuration, and
+malformed consumed fields fail inspection.
 Reports contain only project-relative paths, never the host's absolute project
 location. Secure inspection currently requires POSIX directory-descriptor and
 no-follow support; unsupported platforms, including Windows, return
 `secure-file-inspection-unavailable` without reading project configuration.
 
 `project versions` reads the catalog packaged with the installed wheel. Each
-entry binds a Lean toolchain to Mathlib's scope/name, canonical Git URL, input
-revision, and resolved commit. The catalog is an explicit known-good allowlist,
-not a resolver. The command never contacts a registry, selects a version, or
-mutates a project.
+entry binds a Lean toolchain to Mathlib's material source identity and records
+its usual scope and input revision. The catalog is an explicit known-good
+allowlist, not a resolver. The command never contacts a registry, selects a
+version, or mutates a project.
 
 `project provenance` is the online step. It reads an exact plugin-root checkout,
 a bounded Codex installer record, or bounded Claude installation and marketplace
