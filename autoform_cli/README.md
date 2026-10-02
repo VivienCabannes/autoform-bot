@@ -169,8 +169,7 @@ toolchain and Mathlib package name, source kind, canonical Git URL, resolved
 commit, subdirectory, configuration file, and manifest file. Scope and input
 revision are recorded as descriptive aliases; input-revision differences and
 nonempty scope differences produce warnings when the material identity still
-matches. The Lake configuration records
-requested intent; the manifest's
+matches. The Lake configuration records requested intent; the manifest's
 effective selected Mathlib lock entry is authoritative for the URL, input
 revision, and commit Lake is instructed to materialize under the default
 invocation, unless `.lake/package-overrides.json` replaces it. An active
@@ -181,22 +180,26 @@ inspection; disagreement with the current requirement is reported as stale.
 This is the effective lock entry for Lake's default invocation, not a claim
 about a dirty materialized checkout, `LAKE_PKG_URL_MAP`, or command-line
 `--packages` overrides that are not recorded in the project files.
-Decision-bearing files are read from one validated
-filesystem generation. It does not run Lake, Lean, Git, subprocesses, network
+Decision-bearing files are read from one validated filesystem generation. It
+does not run Lake, Lean, Git, subprocesses, network
 operations, or named-user home-directory lookup. A `lakefile.lean` is reported
 as present but unevaluated and takes precedence over `lakefile.toml`, matching
-Lake. Case aliases of decision-bearing paths, symlinked configuration, and
-malformed consumed fields fail inspection.
-Reports contain only project-relative paths, never the host's absolute project
-location. Secure inspection currently requires POSIX directory-descriptor and
-no-follow support; unsupported platforms, including Windows, return
-`secure-file-inspection-unavailable` without reading project configuration.
+Lake. Case aliases of Lake configuration, toolchain, manifest, and override
+paths fail inspection. Optional Autoform scaffold paths count only at their
+exact portable spellings, so a Lean library named `Blueprint` is not mistaken
+for the lowercase vault. Symlinked configuration and malformed consumed fields
+fail inspection. Human reports escape control, format, surrogate, and line-
+separator characters and contain only project-relative paths, never the host's
+absolute project location. Secure inspection currently requires POSIX
+directory-descriptor and no-follow support; unsupported platforms, including
+Windows, return `secure-file-inspection-unavailable` without reading project
+configuration.
 
 `project versions` reads the catalog packaged with the installed wheel. Each
-entry binds a Lean toolchain to Mathlib's material source identity and records
-its usual scope and input revision. The catalog is an explicit known-good
-allowlist, not a resolver. The command never contacts a registry, selects a
-version, or mutates a project.
+entry binds a Lean toolchain to one canonical, unique Mathlib material source
+identity and records its usual scope and input revision. The catalog is an
+explicit known-good allowlist, not a resolver. The command never contacts a
+registry, selects a version, or mutates a project.
 
 `project provenance` is the online step. It reads an exact plugin-root checkout,
 a bounded Codex installer record, or bounded Claude installation and marketplace

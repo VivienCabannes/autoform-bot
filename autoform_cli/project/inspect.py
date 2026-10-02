@@ -13,10 +13,15 @@ from dataclasses import dataclass
 from decimal import Decimal, DecimalException
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
-from urllib.parse import urlsplit
 
 from ..bounded_toml import BoundedTomlError, loads_bounded_toml
 from .catalog import load_release_catalog
+from .identity import (
+    MathlibGitError,
+    canonical_mathlib_git,
+    canonical_package_path,
+    material_identity_key,
+)
 from .model import (
     PROJECT_INSPECTION_SCHEMA,
     AutoformProject,
@@ -60,16 +65,7 @@ _DECISION_NODES = (
     ".github/workflows/autoform-verify.yml",
     ".github/workflows/blueprint-pages.yml",
 )
-_CASE_SENSITIVE_NODES = tuple(
-    dict.fromkeys(
-        (
-            *_DECISION_NODES,
-            ".lake",
-            ".github",
-            ".github/workflows",
-        )
-    )
-)
+_CASE_SENSITIVE_NODES = (*_DECISION_FILES, ".lake")
 
 
 class _InvalidLakeField(ValueError):
@@ -371,11 +367,12 @@ def _has_project_marker(descriptor: int) -> bool:
     for marker in _PROJECT_MARKERS:
         if _relative_status(descriptor, marker) != "missing":
             return True
-        try:
-            if _case_aliases(descriptor, marker):
+        if marker != "blueprint":
+            try:
+                if _case_aliases(descriptor, marker):
+                    return True
+            except OSError:
                 return True
-        except OSError:
-            return True
     return False
 
 
@@ -998,19 +995,31 @@ def _compatibility(
     )
     if lean is not None and resolved:
         assert mathlib is not None
+        project_key = material_identity_key(
+            lean.toolchain,
+            mathlib.name,
+            mathlib.package_type,
+            mathlib.git,
+            _git_revision_identity(mathlib.resolved_revision),
+            mathlib.subdirectory,
+            mathlib.config_file,
+            mathlib.manifest_file,
+        )
         matched = next(
             (
                 release
                 for release in catalog.releases
-                if release.lean.toolchain == lean.toolchain
-                and release.mathlib.name == mathlib.name
-                and release.mathlib.package_type == mathlib.package_type
-                and release.mathlib.git == mathlib.git
-                and release.mathlib.resolved_revision
-                == _git_revision_identity(mathlib.resolved_revision)
-                and release.mathlib.subdirectory == mathlib.subdirectory
-                and release.mathlib.config_file == mathlib.config_file
-                and release.mathlib.manifest_file == mathlib.manifest_file
+                if material_identity_key(
+                    release.lean.toolchain,
+                    release.mathlib.name,
+                    release.mathlib.package_type,
+                    release.mathlib.git,
+                    release.mathlib.resolved_revision,
+                    release.mathlib.subdirectory,
+                    release.mathlib.config_file,
+                    release.mathlib.manifest_file,
+                )
+                == project_key
             ),
             None,
         )
@@ -1231,26 +1240,10 @@ def _manifest_path(
         if optional:
             return None
         raise _InvalidJson
-    text = _manifest_string(value)
-    posix = PurePosixPath(text)
-    windows = PureWindowsPath(text)
-    if (
-        "\\" in text
-        or posix.is_absolute()
-        or windows.is_absolute()
-        or windows.drive
-        or windows.root
-        or ".." in posix.parts
-    ):
+    try:
+        return canonical_package_path(value, root_is_none=root_is_none)
+    except ValueError:
         raise _InvalidJson
-    normalized = posix.as_posix()
-    if normalized != text:
-        raise _InvalidJson
-    if normalized == ".":
-        if root_is_none:
-            return None
-        raise _InvalidJson
-    return normalized
 
 
 def _resolved_mathlib(
@@ -1556,55 +1549,26 @@ def _normalize_mathlib_git(
     path: str,
 ) -> str | None:
     try:
-        parsed = urlsplit(git)
-        port = parsed.port
-    except ValueError:
+        return canonical_mathlib_git(git)
+    except MathlibGitError as error:
+        code = (
+            "credentialed-mathlib-url"
+            if error.reason == "credentialed"
+            else "invalid-mathlib-url"
+        )
+        message = {
+            "credentialed": "The direct Mathlib Git URL must not contain credentials.",
+            "transport": "The direct Mathlib Git URL must be credential-free HTTPS.",
+            "repository": "The direct Mathlib Git URL must identify a repository.",
+        }.get(error.reason, "The direct Mathlib Git URL is invalid.")
         _issue(
             diagnostics,
             "error",
-            "invalid-mathlib-url",
-            "The direct Mathlib Git URL is invalid.",
+            code,
+            message,
             path,
         )
         return None
-    if parsed.username is not None or parsed.password is not None:
-        _issue(
-            diagnostics,
-            "error",
-            "credentialed-mathlib-url",
-            "The direct Mathlib Git URL must not contain credentials.",
-            path,
-        )
-        return None
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or port is not None
-        or parsed.query
-        or parsed.fragment
-        or parsed.netloc.lower() != parsed.hostname.lower()
-    ):
-        _issue(
-            diagnostics,
-            "error",
-            "invalid-mathlib-url",
-            "The direct Mathlib Git URL must be credential-free HTTPS.",
-            path,
-        )
-        return None
-    normalized_path = parsed.path.rstrip("/")
-    if normalized_path.endswith(".git"):
-        normalized_path = normalized_path[:-4]
-    if not normalized_path:
-        _issue(
-            diagnostics,
-            "error",
-            "invalid-mathlib-url",
-            "The direct Mathlib Git URL must identify a repository.",
-            path,
-        )
-        return None
-    return f"https://{parsed.hostname.lower()}{normalized_path}"
 
 
 def _validate_dependency_source(value: Any) -> None:

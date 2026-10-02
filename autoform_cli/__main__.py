@@ -439,11 +439,14 @@ def _project(args: argparse.Namespace) -> int:
 
 def _print_project_inspection(result) -> None:
     if result.project_root is not None:
-        print(f"Project: {result.project_root}")
+        print(f"Project: {_human_text(result.project_root)}")
     if result.lake is not None:
         package = result.lake.name or "unknown package"
         version = f" {result.lake.version}" if result.lake.version else ""
-        print(f"Lake: {package}{version} ({result.lake.path})")
+        print(
+            "Lake: "
+            + _human_text(f"{package}{version} ({result.lake.path})")
+        )
         for target in result.lake.targets:
             source_parts = [
                 part
@@ -453,9 +456,14 @@ def _print_project_inspection(result) -> None:
             source = PurePosixPath(*source_parts).as_posix() if source_parts else "."
             modules = target.roots or ((target.root,) if target.root is not None else ())
             module_note = f", roots: {', '.join(modules)}" if modules else ""
-            print(f"  {target.kind} {target.name} (srcDir: {source}{module_note})")
+            print(
+                "  "
+                + _human_text(
+                    f"{target.kind} {target.name} (srcDir: {source}{module_note})"
+                )
+            )
     if result.lean is not None:
-        print(f"Lean: {result.lean.toolchain}")
+        print(f"Lean: {_human_text(result.lean.toolchain)}")
     if result.mathlib is not None:
         identity = (
             f"{result.mathlib.scope}/{result.mathlib.name}"
@@ -479,20 +487,46 @@ def _print_project_inspection(result) -> None:
             f"manifestFile={result.mathlib.manifest_file or 'none'}"
         )
         print(
-            f"Mathlib: {identity} {result.mathlib.input_revision or 'none'}"
-            f" @ {result.mathlib.resolved_revision or 'none'}{declared}"
-            f" ({location}; {load_identity})"
+            "Mathlib: "
+            + _human_text(
+                f"{identity} {result.mathlib.input_revision or 'none'}"
+                f" @ {result.mathlib.resolved_revision or 'none'}{declared}"
+                f" ({location}; {load_identity})"
+            )
         )
     print(
-        f"Compatibility: {result.compatibility.status}"
-        + (f" ({result.compatibility.release})" if result.compatibility.release else "")
+        f"Compatibility: {_human_text(result.compatibility.status)}"
+        + (
+            f" ({_human_text(result.compatibility.release)})"
+            if result.compatibility.release
+            else ""
+        )
     )
     for diagnostic in result.diagnostics:
-        location = f" {diagnostic.path}" if diagnostic.path else ""
+        location = f" {_human_text(diagnostic.path)}" if diagnostic.path else ""
         print(
-            f"{diagnostic.severity}[{diagnostic.code}]{location}: {diagnostic.message}",
+            f"{_human_text(diagnostic.severity)}[{_human_text(diagnostic.code)}]"
+            f"{location}: "
+            f"{_human_text(diagnostic.message)}",
             file=sys.stderr,
         )
+
+
+def _human_text(value: object) -> str:
+    """Keep untrusted report fields on one physical terminal line."""
+
+    rendered: list[str] = []
+    for character in str(value):
+        if not character.isprintable():
+            codepoint = ord(character)
+            rendered.append(
+                f"\\u{codepoint:04x}"
+                if codepoint <= 0xFFFF
+                else f"\\U{codepoint:08x}"
+            )
+        else:
+            rendered.append(character)
+    return "".join(rendered)
 
 
 def _claim(args: argparse.Namespace) -> int:

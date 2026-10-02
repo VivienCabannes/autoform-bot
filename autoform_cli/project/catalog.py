@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from importlib.resources import files
 from typing import Any
-from urllib.parse import urlsplit
 
+from .identity import (
+    MathlibGitError,
+    canonical_mathlib_git,
+    canonical_package_path,
+    material_identity_key,
+)
 from .model import (
     RELEASE_CATALOG_SCHEMA,
     LeanRelease,
@@ -53,6 +57,21 @@ def parse_release_catalog(payload: Any) -> ReleaseCatalog:
         raise ProjectCatalogError("release catalog is not canonically ordered")
     if len({release.id for release in releases}) != len(releases):
         raise ProjectCatalogError("release catalog has duplicate release ids")
+    material_keys = [
+        material_identity_key(
+            release.lean.toolchain,
+            release.mathlib.name,
+            release.mathlib.package_type,
+            release.mathlib.git,
+            release.mathlib.resolved_revision,
+            release.mathlib.subdirectory,
+            release.mathlib.config_file,
+            release.mathlib.manifest_file,
+        )
+        for release in releases
+    ]
+    if len(set(material_keys)) != len(material_keys):
+        raise ProjectCatalogError("release catalog has duplicate material identities")
     if sum(release.recommended for release in releases) != 1:
         raise ProjectCatalogError("release catalog must have exactly one recommended release")
     return ReleaseCatalog(RELEASE_CATALOG_SCHEMA, tuple(releases))
@@ -100,9 +119,9 @@ def _parse_release(entry: Any) -> SupportedRelease:
             git=_mathlib_git(mathlib["git"]),
             input_revision=_string(mathlib["input_revision"]),
             resolved_revision=_resolved_revision(mathlib["resolved_revision"]),
-            subdirectory=_optional_string(mathlib["subdirectory"]),
-            config_file=_string(mathlib["config_file"]),
-            manifest_file=_string(mathlib["manifest_file"]),
+            subdirectory=_catalog_subdirectory(mathlib["subdirectory"]),
+            config_file=_catalog_path(mathlib["config_file"]),
+            manifest_file=_catalog_path(mathlib["manifest_file"]),
         ),
     )
 
@@ -118,7 +137,7 @@ def _string(value: Any) -> str:
         not isinstance(value, str)
         or not value
         or value != value.strip()
-        or any(unicodedata.category(character) in {"Cc", "Cs"} for character in value)
+        or any(not character.isprintable() for character in value)
     ):
         raise ProjectCatalogError("release catalog strings must be nonempty and trimmed")
     return value
@@ -138,8 +157,27 @@ def _mathlib_package_type(value: Any) -> str:
     return package_type
 
 
-def _optional_string(value: Any) -> str | None:
-    return None if value is None else _string(value)
+def _catalog_subdirectory(value: Any) -> str | None:
+    if value is None:
+        return None
+    raw = _string(value)
+    try:
+        normalized = canonical_package_path(raw, root_is_none=True)
+    except ValueError as error:
+        raise ProjectCatalogError("Mathlib release subdirectory is invalid") from error
+    if normalized is None:
+        raise ProjectCatalogError("Mathlib release root subdirectory must be null")
+    return normalized
+
+
+def _catalog_path(value: Any) -> str:
+    raw = _string(value)
+    try:
+        normalized = canonical_package_path(raw)
+    except ValueError as error:
+        raise ProjectCatalogError("Mathlib release package path is invalid") from error
+    assert normalized is not None
+    return normalized
 
 
 def _resolved_revision(value: Any) -> str:
@@ -150,24 +188,7 @@ def _resolved_revision(value: Any) -> str:
 
 
 def _mathlib_git(value: Any) -> str:
-    raw = _string(value)
     try:
-        parsed = urlsplit(raw)
-        port = parsed.port
-    except ValueError as error:
+        return canonical_mathlib_git(value)
+    except MathlibGitError as error:
         raise ProjectCatalogError("Mathlib release Git source is invalid") from error
-    path = parsed.path.rstrip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-        or parsed.query
-        or parsed.fragment
-        or not path
-    ):
-        raise ProjectCatalogError("Mathlib release Git source is invalid")
-    return f"https://{parsed.hostname.lower()}{path}"

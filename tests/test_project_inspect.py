@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from autoform_cli.__main__ import main
+from autoform_cli.__main__ import _human_text, main
 from autoform_cli.project import (
     PROJECT_INSPECTION_SCHEMA,
     RELEASE_CATALOG_SCHEMA,
@@ -187,6 +187,8 @@ def test_release_catalog_v1_serialization_contract() -> None:
     [
         ("file:///tmp/mathlib", "9" * 40),
         ("https://user@example.test/mathlib.git", "9" * 40),
+        (" https://github.com/leanprover-community/mathlib4", "9" * 40),
+        ("https://github.com/leanprover-community/math\tlib4", "9" * 40),
         ("https://github.com/leanprover-community/mathlib4", "v4.32.2"),
     ],
 )
@@ -385,6 +387,40 @@ def test_release_catalog_rejects_unprintable_strings(value: str) -> None:
                 ],
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("subdirectory", "."),
+        ("subdirectory", "../Mathlib"),
+        ("config_file", "./lakefile.lean"),
+        ("config_file", "lakefile.lean/"),
+        ("manifest_file", "../lake-manifest.json"),
+    ],
+)
+def test_release_catalog_rejects_unmatchable_package_paths(
+    field: str, value: str
+) -> None:
+    payload = json.loads(load_release_catalog().to_json())
+    payload["releases"][0]["mathlib"][field] = value
+
+    with pytest.raises(ProjectCatalogError):
+        parse_release_catalog(payload)
+
+
+def test_release_catalog_rejects_duplicate_material_identities() -> None:
+    payload = json.loads(load_release_catalog().to_json())
+    first = payload["releases"][0]
+    first["id"] = "a"
+    first["recommended"] = False
+    second = json.loads(json.dumps(first))
+    second["id"] = "b"
+    second["recommended"] = True
+    payload["releases"] = [first, second]
+
+    with pytest.raises(ProjectCatalogError, match="duplicate material identities"):
+        parse_release_catalog(payload)
 
 
 def test_inspects_bundled_example_without_host_paths(repo_root: Path) -> None:
@@ -1626,6 +1662,81 @@ def test_invalid_mathlib_sources_are_rejected_and_redacted(
     assert any(diagnostic.code == "invalid-mathlib-url" for diagnostic in result.diagnostics)
 
 
+@pytest.mark.parametrize(
+    ("git_source", "message"),
+    [
+        ("https://example.com", "must identify a repository"),
+        ("http://example.com/mathlib4", "must be credential-free HTTPS"),
+    ],
+)
+def test_invalid_mathlib_url_diagnostics_identify_the_failure(
+    git_source: str, message: str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    lakefile = root / "lakefile.toml"
+    lakefile.write_text(
+        lakefile.read_text(encoding="utf-8").replace(
+            "https://github.com/leanprover-community/mathlib4.git", git_source
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert any(
+        diagnostic.code == "invalid-mathlib-url"
+        and message in diagnostic.message
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize("source", ["manifest", "override"])
+@pytest.mark.parametrize(
+    "raw_url",
+    [
+        " https://github.com/leanprover-community/mathlib4",
+        "https://github.com/leanprover-community/math\tlib4",
+        "https://github.com/leanprover-community/mathlib4\n",
+    ],
+)
+def test_unsafe_manifest_urls_cannot_normalize_into_catalog_matches(
+    source: str, raw_url: str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    if source == "override":
+        _write_mathlib_git_override(root)
+        manifest = root / ".lake/package-overrides.json"
+    else:
+        manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"][0]["url"] = raw_url
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "invalid-mathlib-url"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_other_canonical_mathlib_url_is_unlisted(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"][0]["url"] = "https://example.com/mathlib4"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "unlisted"
+
+
 def test_unlisted_release_is_advisory(tmp_path: Path) -> None:
     root = _project(tmp_path, revision="v4.31.0")
     result = inspect_project(root)
@@ -1672,6 +1783,41 @@ def test_human_output_composes_package_and_target_source_dirs(
         "subDir=., configFile=lakefile.lean, manifestFile=lake-manifest.json"
         in captured.out
     )
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "escaped"),
+    [("\u2028", "\\u2028"), ("\u202e", "\\u202e")],
+)
+def test_human_output_escapes_line_and_direction_controls(
+    unsafe: str,
+    escaped: str,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"][0]["scope"] = f"trusted{unsafe}warning[fake]"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert main(["project", "inspect", str(root)]) == 0
+    captured = capsys.readouterr()
+
+    assert unsafe not in captured.out
+    assert unsafe not in captured.err
+    assert f"trusted{escaped}warning[fake]/mathlib" in captured.out
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "escaped"),
+    [("\u0890", "\\u0890"), ("\U0001343f", "\\U0001343f")],
+)
+def test_human_output_escapes_nonprintable_codepoints_across_unicode_versions(
+    unsafe: str,
+    escaped: str,
+) -> None:
+    assert _human_text(f"before{unsafe}after") == f"before{escaped}after"
 
 
 def test_lakefile_lean_is_never_executed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1797,18 +1943,30 @@ def test_case_variant_root_decision_files_are_rejected(
     )
 
 
-def test_case_variant_autoform_decision_file_is_rejected(tmp_path: Path) -> None:
+def test_case_variant_autoform_scaffold_file_is_ignored(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "MkDocs.yml").write_text("site_name: Example\n", encoding="utf-8")
 
     result = inspect_project(root)
 
-    assert not result.ok
-    assert any(
+    assert result.ok
+    assert result.autoform.mkdocs_path is None
+    assert not any(
         diagnostic.code == "project-path-case-alias"
-        and diagnostic.path == "MkDocs.yml"
         for diagnostic in result.diagnostics
     )
+
+
+def test_case_variant_autoform_workflow_is_ignored(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    workflow = root / ".github/workflows/Autoform-Verify.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: ignored\n", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.autoform.verification_workflow_path is None
 
 
 @pytest.mark.parametrize(
@@ -2020,14 +2178,28 @@ def test_blueprint_detection_requires_exact_directory_spelling(tmp_path: Path) -
 
     result = inspect_project(root)
 
-    assert not result.ok
+    assert result.ok
     assert result.autoform.detected is False
     assert result.autoform.blueprint_path is None
-    assert any(
+    assert not any(
         diagnostic.code == "project-path-case-alias"
-        and diagnostic.path == "Blueprint"
         for diagnostic in result.diagnostics
     )
+
+
+def test_case_variant_blueprint_is_not_a_nested_project_marker(
+    tmp_path: Path,
+) -> None:
+    root = _project(tmp_path)
+    lean_library = root / "nested/Blueprint"
+    lean_library.mkdir(parents=True)
+
+    result = inspect_project(lean_library)
+
+    assert result.ok
+    assert result.lake is not None
+    assert result.lake.name == "Example"
+    assert result.autoform.detected is False
 
 
 def test_decision_files_come_from_one_generation(
