@@ -76,6 +76,10 @@ class _InvalidJson(ValueError):
     pass
 
 
+class _UnsupportedManifest(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class _SnapshotEntry:
     status: str
@@ -964,6 +968,15 @@ def _inspect_manifest(
             raise _InvalidJson
         payload = json.loads(text, object_pairs_hook=_unique_json_object)
         mathlib = _resolved_mathlib(payload, declared, diagnostics)
+    except _UnsupportedManifest:
+        _issue(
+            diagnostics,
+            "warning",
+            "unsupported-lake-manifest",
+            "Lake accepts this legacy manifest, but offline compatibility inspection does not decode it.",
+            relative,
+        )
+        return relative, digest, None
     except (UnicodeError, ValueError, RecursionError, MemoryError, _InvalidJson):
         _issue(
             diagnostics,
@@ -987,8 +1000,10 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _manifest_version(value: object) -> tuple[int, int, int]:
     if type(value) is int:
-        if value < 7:
+        if value < 5:
             raise _InvalidJson
+        if value < 7:
+            raise _UnsupportedManifest
         return 0, value, 0
     if type(value) is not str:
         raise _InvalidJson
@@ -996,8 +1011,10 @@ def _manifest_version(value: object) -> tuple[int, int, int]:
     if match is None:
         raise _InvalidJson
     version = tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
-    if version[0] > 1 or version < (0, 7, 0):
+    if version[0] > 1 or version < (0, 5, 0):
         raise _InvalidJson
+    if version < (0, 7, 0):
+        raise _UnsupportedManifest
     return version
 
 

@@ -54,7 +54,7 @@ def _write_mathlib_manifest(
     resolved_revision: str = "905b95818eb32af7874a58b427f50c1711a5e96c",
     scope: str = "leanprover-community",
     subdirectory: str | None = None,
-    version: str = "1.2.0",
+    version: str | int = "1.2.0",
 ) -> None:
     (root / "lake-manifest.json").write_text(
         json.dumps(
@@ -778,6 +778,23 @@ def test_unsupported_lake_manifest_schema_blocks_compatibility(tmp_path: Path) -
     assert result.compatibility.status == "indeterminate"
     assert any(
         diagnostic.code == "invalid-lake-manifest"
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize("version", [5, 6, "0.6.0"])
+def test_lake_supported_legacy_manifest_is_advisory(
+    version: int | str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_manifest(root, version=version)
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "unsupported-lake-manifest"
         for diagnostic in result.diagnostics
     )
 
