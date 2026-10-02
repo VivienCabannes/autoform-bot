@@ -31,10 +31,14 @@ class LeanRelease:
 
 @dataclass(frozen=True, slots=True)
 class MathlibRelease:
+    name: str
+    scope: str
     git: str
     revision: str
+    resolved_revision: str
+    subdirectory: str | None
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, str | None]:
         return asdict(self)
 
 
@@ -130,8 +134,13 @@ class LeanProject:
 
 @dataclass(frozen=True, slots=True)
 class MathlibProject:
+    name: str
+    scope: str
     git: str | None
     revision: str | None
+    resolved_revision: str | None
+    declared_revision: str | None
+    subdirectory: str | None
     source: str
 
     def as_dict(self) -> dict[str, str | None]:

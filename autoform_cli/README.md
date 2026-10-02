@@ -160,22 +160,29 @@ It fails closed where POSIX descriptor traversal, advisory locking, directory
 sync, or atomic no-replace rename is unavailable, including on Windows.
 
 `project inspect` is deterministic, local, and read-only. It discovers the
-nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and
-known Autoform paths; records configuration
-hashes; and reports whether the configured Lean/Mathlib pair exactly matches
-the bundled catalog. Decision-bearing files are read from one validated
+nearest project root; parses bounded `lakefile.toml`, `lake-manifest.json`,
+`lean-toolchain`, and known Autoform paths; records configuration hashes; and
+reports whether the resolved Lean/Mathlib pair exactly matches the bundled
+catalog. The Lake configuration records requested intent; the manifest's
+direct Mathlib entry is authoritative for the URL, input revision, and commit
+Lake actually builds. A missing manifest makes compatibility indeterminate; an
+invalid manifest fails inspection; disagreement with the current requirement
+is reported as stale. Decision-bearing files are read from one validated
 filesystem generation. It does not run Lake, Lean, Git, subprocesses, network
 operations, or named-user home-directory lookup. A `lakefile.lean` is reported
 as present but unevaluated and takes precedence over `lakefile.toml`, matching
-Lake. Symlinked decision-bearing configuration and malformed consumed fields fail inspection.
+Lake. Case aliases, symlinked configuration, and malformed consumed fields
+fail inspection.
 Reports contain only project-relative paths, never the host's absolute project
 location. Secure inspection currently requires POSIX directory-descriptor and
 no-follow support; unsupported platforms, including Windows, return
 `secure-file-inspection-unavailable` without reading project configuration.
 
-`project versions` reads the catalog packaged with the installed wheel. The
-catalog is an explicit known-good allowlist, not a resolver. The command never
-contacts a registry, selects a version, or mutates a project.
+`project versions` reads the catalog packaged with the installed wheel. Each
+entry binds a Lean toolchain to Mathlib's scope/name, canonical Git URL, input
+revision, and resolved commit. The catalog is an explicit known-good allowlist,
+not a resolver. The command never contacts a registry, selects a version, or
+mutates a project.
 
 `project provenance` is the online step. It reads an exact plugin-root checkout,
 a bounded Codex installer record, or bounded Claude installation and marketplace

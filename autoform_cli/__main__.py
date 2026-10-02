@@ -454,7 +454,22 @@ def _print_project_inspection(result) -> None:
     if result.lean is not None:
         print(f"Lean: {result.lean.toolchain}")
     if result.mathlib is not None:
-        print(f"Mathlib: {result.mathlib.revision or 'none'} ({result.mathlib.git or 'none'})")
+        identity = (
+            f"{result.mathlib.scope}/{result.mathlib.name}"
+            if result.mathlib.scope
+            else result.mathlib.name
+        )
+        declared = (
+            f", declared {result.mathlib.declared_revision}"
+            if result.mathlib.declared_revision
+            and result.mathlib.declared_revision != result.mathlib.revision
+            else ""
+        )
+        print(
+            f"Mathlib: {identity} {result.mathlib.revision or 'none'}"
+            f" @ {result.mathlib.resolved_revision or 'none'}{declared}"
+            f" ({result.mathlib.git or 'none'})"
+        )
     print(
         f"Compatibility: {result.compatibility.status}"
         + (f" ({result.compatibility.release})" if result.compatibility.release else "")

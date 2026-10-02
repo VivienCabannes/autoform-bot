@@ -36,6 +36,10 @@ _TOOLCHAIN = re.compile(r"leanprover/lean4:(?P<version>v[0-9]+\.[0-9]+\.[0-9]+)"
 # Lake's StdVer: a major.minor.patch triple with an optional `-` suffix that
 # runs to the end of the string.
 _LAKE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[^ \t\r\n]+)?")
+_MANIFEST_VERSION = re.compile(
+    r"(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)(?:-[^ \t\r\n]+)?"
+)
+_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 _LEAN_ID_BEGIN_ESCAPE = "«"
 _LEAN_ID_END_ESCAPE = "»"
@@ -44,7 +48,7 @@ _DECISION_FILES = {
     "lakefile.toml": ("lake-config", "error"),
     "lakefile.lean": ("lake-config", "error"),
     "lean-toolchain": ("lean-toolchain", "error"),
-    "lake-manifest.json": ("lake-manifest", "warning"),
+    "lake-manifest.json": ("lake-manifest", "error"),
 }
 _DECISION_NODES = (
     *_DECISION_FILES,
@@ -68,11 +72,25 @@ class _DuplicateMathlibRequirement(ValueError):
     pass
 
 
+class _InvalidJson(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class _SnapshotEntry:
     status: str
     content: bytes | None
     identity: tuple[int, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _MathlibRequirement:
+    name: str
+    scope: str
+    git: str | None
+    revision: str | None
+    source_kind: str
+    subdirectory: str | None
 
 
 def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None) -> ProjectInspection:
@@ -98,11 +116,16 @@ def _inspect_project_root(root_descriptor: int, release_catalog: ReleaseCatalog)
     snapshot = _snapshot_project(root_descriptor, diagnostics)
     if snapshot is None:
         return _inspection(diagnostics, release_catalog)
-    lake, mathlib = _inspect_lake(snapshot, diagnostics)
+    lake, declared_mathlib = _inspect_lake(snapshot, diagnostics)
     lean = _inspect_toolchain(snapshot, diagnostics)
-    manifest_path, manifest_digest = _optional_digest(
-        snapshot, "lake-manifest.json", diagnostics
+    manifest_path, manifest_digest, mathlib = _inspect_manifest(
+        snapshot,
+        declared_mathlib,
+        diagnostics,
     )
+    if any(diagnostic.code == "lake-config-case-alias" for diagnostic in diagnostics):
+        lake = None
+        mathlib = None
     autoform = _inspect_autoform(snapshot, diagnostics)
     git_path = _inspect_git(snapshot, diagnostics)
     compatibility = _compatibility(release_catalog, lean, mathlib, diagnostics)
@@ -245,9 +268,7 @@ def _discover_root(target: str | Path, diagnostics: list[ProjectDiagnostic]) -> 
             return None
 
         for descriptor in reversed(descriptors):
-            if any(
-                _relative_status(descriptor, marker) != "missing" for marker in _PROJECT_MARKERS
-            ):
+            if _has_project_marker(descriptor):
                 chosen = descriptor
                 return chosen
         _issue(diagnostics, "error", "project-not-found", "No enclosing Lean or Autoform project was found.")
@@ -272,6 +293,19 @@ def _secure_inspection_available(diagnostics: list[ProjectDiagnostic]) -> bool:
         "secure-file-inspection-unavailable",
         "This platform cannot safely inspect project files without following links.",
     )
+    return False
+
+
+def _has_project_marker(descriptor: int) -> bool:
+    for marker in _PROJECT_MARKERS:
+        if _relative_status(descriptor, marker) != "missing":
+            return True
+        if marker in {"lakefile.lean", "lakefile.toml"}:
+            try:
+                if _case_aliases(descriptor, marker):
+                    return True
+            except OSError:
+                return True
     return False
 
 
@@ -306,6 +340,28 @@ def _snapshot_project(
         attempt_diagnostics: list[ProjectDiagnostic] = []
         snapshot: dict[str, _SnapshotEntry] = {}
         changed = False
+        try:
+            config_aliases = {
+                relative: _case_aliases(root_descriptor, relative)
+                for relative in ("lakefile.lean", "lakefile.toml")
+            }
+        except OSError:
+            _issue(
+                diagnostics,
+                "error",
+                "project-root-unreadable",
+                "The project root cannot be inspected safely.",
+            )
+            return None
+        for expected, aliases in config_aliases.items():
+            for alias in aliases:
+                _issue(
+                    attempt_diagnostics,
+                    "error",
+                    "lake-config-case-alias",
+                    f"{alias} differs in case from the portable Lake name {expected}.",
+                    alias,
+                )
         lean_config_status, lean_config_metadata = _relative_info(
             root_descriptor, "lakefile.lean"
         )
@@ -313,7 +369,9 @@ def _snapshot_project(
             lean_config_status,
             _metadata_identity(lean_config_metadata),
         )
-        lean_config_present = lean_config_status != "missing"
+        lean_config_present = (
+            lean_config_status != "missing" or bool(config_aliases["lakefile.lean"])
+        )
         for relative in _DECISION_NODES:
             kind, severity = _DECISION_FILES.get(relative, ("project-path", "error"))
             status, metadata = _relative_info(root_descriptor, relative)
@@ -344,6 +402,14 @@ def _snapshot_project(
         lean_config_entry = snapshot["lakefile.lean"]
         if (lean_config_entry.status, lean_config_entry.identity) != lean_config_generation:
             changed = True
+        try:
+            if any(
+                _case_aliases(root_descriptor, relative) != aliases
+                for relative, aliases in config_aliases.items()
+            ):
+                changed = True
+        except OSError:
+            changed = True
         for relative, entry in snapshot.items():
             status, metadata = _relative_info(root_descriptor, relative)
             if (status, _metadata_identity(metadata)) != (entry.status, entry.identity):
@@ -360,6 +426,16 @@ def _snapshot_project(
         "Project configuration changed while it was being inspected.",
     )
     return None
+
+
+def _case_aliases(root_descriptor: int, expected: str) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            name
+            for name in os.listdir(root_descriptor)
+            if name != expected and name.casefold() == expected.casefold()
+        )
+    )
 
 
 def _capture_file(
@@ -382,7 +458,7 @@ def _capture_file(
             "A decision-bearing project path cannot be traversed safely.",
             relative,
         )
-        return _SnapshotEntry("unreadable", None, None), False
+        return _SnapshotEntry("file", None, expected_identity), False
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     try:
         exact = _exact_entry_exists(parent, name)
@@ -394,7 +470,7 @@ def _capture_file(
                 "A project configuration file cannot be read.",
                 relative,
             )
-            return _SnapshotEntry("unreadable", None, None), False
+            return _SnapshotEntry("file", None, expected_identity), False
         if not exact:
             return _SnapshotEntry("missing", None, None), True
         descriptor = os.open(name, flags, dir_fd=parent)
@@ -410,7 +486,7 @@ def _capture_file(
             else "A project configuration file cannot be read."
         )
         _issue(diagnostics, severity, code, message, relative)
-        return _SnapshotEntry("unreadable", None, None), False
+        return _SnapshotEntry("file", None, expected_identity), False
     finally:
         os.close(parent)
 
@@ -442,7 +518,7 @@ def _capture_file(
             "A project configuration file cannot be read.",
             relative,
         )
-        return _SnapshotEntry("unreadable", None, None), False
+        return _SnapshotEntry("file", None, expected_identity), False
     finally:
         os.close(descriptor)
 
@@ -495,7 +571,7 @@ def _metadata_identity(metadata: os.stat_result | None) -> tuple[int, ...] | Non
 
 def _inspect_lake(
     snapshot: dict[str, _SnapshotEntry], diagnostics: list[ProjectDiagnostic]
-) -> tuple[LakeProject | None, MathlibProject | None]:
+) -> tuple[LakeProject | None, _MathlibRequirement | None]:
     toml_status = snapshot["lakefile.toml"].status
     lean_status = snapshot["lakefile.lean"].status
     if toml_status != "missing" and lean_status != "missing":
@@ -538,7 +614,7 @@ def _inspect_lake(
             _issue(diagnostics, "error", "invalid-lake-toml", "lakefile.toml is not valid UTF-8 TOML.", "lakefile.toml")
             return None, None
         lake = _parse_lake_toml(payload, content, diagnostics)
-        return lake, _parse_mathlib(payload, diagnostics) if lake is not None else None
+        return lake, _parse_mathlib_requirement(payload, diagnostics) if lake is not None else None
     _issue(diagnostics, "error", "missing-lake-config", "The project has no Lake source configuration.")
     return None, None
 
@@ -818,21 +894,31 @@ def _compatibility(
     diagnostics: list[ProjectDiagnostic],
 ) -> ProjectCompatibility:
     matched = None
-    if lean is not None and mathlib is not None:
+    resolved = (
+        mathlib is not None
+        and mathlib.revision is not None
+        and mathlib.resolved_revision is not None
+    )
+    if lean is not None and resolved:
+        assert mathlib is not None
         matched = next(
             (
                 release
                 for release in catalog.releases
                 if release.lean.toolchain == lean.toolchain
+                and release.mathlib.name == mathlib.name
                 and release.mathlib.git == mathlib.git
                 and release.mathlib.revision == mathlib.revision
+                and release.mathlib.resolved_revision == mathlib.resolved_revision
+                and release.mathlib.subdirectory == mathlib.subdirectory
+                and mathlib.scope in {"", release.mathlib.scope}
             ),
             None,
         )
     if matched is not None:
         status = "supported"
         release_id = matched.id
-    elif lean is not None and mathlib is not None:
+    elif lean is not None and resolved:
         status = "unlisted"
         release_id = None
         _issue(
@@ -853,25 +939,170 @@ def _compatibility(
     return ProjectCompatibility(catalog.schema, status, release_id, catalog.recommended.id)
 
 
-def _optional_digest(
+def _inspect_manifest(
     snapshot: dict[str, _SnapshotEntry],
-    relative: str,
+    declared: _MathlibRequirement | None,
     diagnostics: list[ProjectDiagnostic],
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, MathlibProject | None]:
+    relative = "lake-manifest.json"
     if snapshot[relative].status == "missing":
-        return None, None
+        _issue(
+            diagnostics,
+            "warning",
+            "missing-lake-manifest",
+            "The project has no resolved Lake manifest; dependency compatibility is indeterminate.",
+            relative,
+        )
+        return None, None, None
     content = snapshot[relative].content
     if content is None:
-        return None, None
+        return relative, None, None
+    digest = hashlib.sha256(content).hexdigest()
     try:
         text = content.decode("utf-8")
         if _json_nesting_exceeds(text, _MAX_STRUCTURAL_DEPTH):
-            raise ValueError("JSON nesting limit exceeded")
-        json.loads(text)
-    except (UnicodeError, ValueError, RecursionError, MemoryError):
-        _issue(diagnostics, "warning", "invalid-lake-manifest", "lake-manifest.json is not valid UTF-8 JSON.", relative)
-        return relative, hashlib.sha256(content).hexdigest()
-    return relative, hashlib.sha256(content).hexdigest()
+            raise _InvalidJson
+        payload = json.loads(text, object_pairs_hook=_unique_json_object)
+        mathlib = _resolved_mathlib(payload, declared, diagnostics)
+    except (UnicodeError, ValueError, RecursionError, MemoryError, _InvalidJson):
+        _issue(
+            diagnostics,
+            "error",
+            "invalid-lake-manifest",
+            "lake-manifest.json is not a supported Lake manifest.",
+            relative,
+        )
+        return relative, digest, None
+    return relative, digest, mathlib
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _InvalidJson
+        result[key] = value
+    return result
+
+
+def _manifest_version(value: object) -> tuple[int, int, int]:
+    if type(value) is int:
+        if value < 7:
+            raise _InvalidJson
+        return 0, value, 0
+    if type(value) is not str:
+        raise _InvalidJson
+    match = _MANIFEST_VERSION.fullmatch(value)
+    if match is None:
+        raise _InvalidJson
+    version = tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
+    if version[0] > 1 or version < (0, 7, 0):
+        raise _InvalidJson
+    return version
+
+
+def _manifest_string(value: object, *, empty: bool = False) -> str:
+    if (
+        type(value) is not str
+        or (not empty and not value)
+        or _has_forbidden_unicode(value)
+    ):
+        raise _InvalidJson
+    return value
+
+
+def _resolved_mathlib(
+    payload: object,
+    declared: _MathlibRequirement | None,
+    diagnostics: list[ProjectDiagnostic],
+) -> MathlibProject | None:
+    if type(payload) is not dict:
+        raise _InvalidJson
+    _manifest_version(payload.get("version", payload.get("schemaVersion")))
+    if "name" in payload:
+        _manifest_string(payload["name"], empty=True)
+    if "lakeDir" in payload:
+        _manifest_string(payload["lakeDir"])
+    if "fixedToolchain" in payload and type(payload["fixedToolchain"]) is not bool:
+        raise _InvalidJson
+    if "packagesDir" in payload and payload["packagesDir"] is not None:
+        _manifest_string(payload["packagesDir"])
+    packages = payload.get("packages", [])
+    if type(packages) is not list:
+        raise _InvalidJson
+    matches: list[tuple[str, str, str, str | None, str | None]] = []
+    direct_path_mathlib = False
+    for package in packages:
+        if type(package) is not dict:
+            raise _InvalidJson
+        name = _canonical_module_name(_manifest_string(package.get("name")))
+        if name is None:
+            raise _InvalidJson
+        scope = _manifest_string(package.get("scope", ""), empty=True)
+        inherited = package.get("inherited")
+        source_type = package.get("type")
+        if type(inherited) is not bool or source_type not in {"git", "path"}:
+            raise _InvalidJson
+        _manifest_string(package.get("configFile", "lakefile.lean"))
+        manifest_file = package.get("manifestFile", "lake-manifest.json")
+        if manifest_file is not None:
+            _manifest_string(manifest_file)
+        if source_type == "path":
+            _manifest_string(package.get("dir"))
+            if name == "mathlib" and not inherited:
+                direct_path_mathlib = True
+            continue
+        git = _normalize_mathlib_git(
+            _manifest_string(package.get("url")),
+            diagnostics,
+            "lake-manifest.json",
+        )
+        if git is None:
+            raise _InvalidJson
+        revision = _manifest_string(package.get("rev"))
+        if _GIT_REVISION.fullmatch(revision) is None:
+            raise _InvalidJson
+        input_revision = package.get("inputRev")
+        if input_revision is not None:
+            input_revision = _manifest_string(input_revision)
+        subdirectory = package.get("subDir")
+        if subdirectory not in (None, "", "."):
+            subdirectory = _manifest_string(subdirectory)
+        else:
+            subdirectory = None
+        if name == "mathlib" and not inherited:
+            matches.append((scope, git, revision, input_revision, subdirectory))
+    if len(matches) + int(direct_path_mathlib) > 1:
+        raise _InvalidJson
+    if direct_path_mathlib:
+        return None
+    if not matches:
+        return None
+    scope, git, resolved_revision, input_revision, subdirectory = matches[0]
+    if declared is not None and (
+        (declared.revision is not None and declared.revision != input_revision)
+        or (declared.git is not None and declared.git != git)
+        or (declared.scope and declared.scope != scope)
+        or declared.source_kind == "path"
+        or declared.subdirectory != subdirectory
+    ):
+        _issue(
+            diagnostics,
+            "warning",
+            "mathlib-manifest-stale",
+            "The resolved Mathlib manifest does not match the current Lake requirement.",
+            "lake-manifest.json",
+        )
+    return MathlibProject(
+        name="mathlib",
+        scope=scope,
+        git=git,
+        revision=input_revision,
+        resolved_revision=resolved_revision,
+        declared_revision=declared.revision if declared is not None else None,
+        subdirectory=subdirectory,
+        source="lake-manifest.json",
+    )
 
 
 def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
@@ -907,9 +1138,9 @@ def _validate_mathlib_requirements(payload: dict[str, Any]) -> None:
             _validate_dependency_source(entry["source"])
 
 
-def _parse_mathlib(
+def _parse_mathlib_requirement(
     payload: dict[str, Any], diagnostics: list[ProjectDiagnostic]
-) -> MathlibProject | None:
+) -> _MathlibRequirement | None:
     requirements = payload.get("require", [])
     if not isinstance(requirements, list):
         return None
@@ -923,18 +1154,83 @@ def _parse_mathlib(
     if len(matches) != 1:
         return None
     entry = matches[0]
-    if (
-        "path" in entry
-        or "source" in entry
-        or entry.get("subDir") not in (None, "", ".")
-    ):
+    name = _canonical_target_name(entry["name"])
+    scope = entry.get("scope", "")
+    if not isinstance(scope, str):
         return None
     revision = entry.get("rev")
-    if not isinstance(revision, str):
+    if revision is not None and not isinstance(revision, str):
+        return None
+    raw_subdirectory = entry.get("subDir")
+    subdirectory = (
+        None
+        if raw_subdirectory in (None, "", ".")
+        else raw_subdirectory if isinstance(raw_subdirectory, str) else None
+    )
+    if "path" in entry:
+        return _MathlibRequirement(name, scope, None, revision, "path", subdirectory)
+    if "source" in entry:
+        source = entry["source"]
+        if not isinstance(source, dict):
+            return None
+        source_type = source.get("type")
+        if source_type == "path":
+            return _MathlibRequirement(name, scope, None, revision, "path", subdirectory)
+        if source_type == "git":
+            raw_git = source.get("url")
+            if not isinstance(raw_git, str):
+                return None
+            source_revision = source.get("rev", revision)
+            if source_revision is not None and not isinstance(source_revision, str):
+                return None
+            source_subdirectory = source.get("subDir", raw_subdirectory)
+            subdirectory = (
+                None
+                if source_subdirectory in (None, "", ".")
+                else source_subdirectory if isinstance(source_subdirectory, str) else None
+            )
+            git = _normalize_mathlib_git(raw_git, diagnostics, "lakefile.toml")
+            return (
+                None
+                if git is None
+                else _MathlibRequirement(
+                    name,
+                    scope,
+                    git,
+                    source_revision,
+                    "git",
+                    subdirectory,
+                )
+            )
         return None
     git = _mathlib_git_source(entry)
     if git is None:
+        return _MathlibRequirement(
+            name,
+            scope,
+            None,
+            revision,
+            "reservoir",
+            subdirectory,
+        )
+    normalized_git = _normalize_mathlib_git(git, diagnostics, "lakefile.toml")
+    if normalized_git is None:
         return None
+    return _MathlibRequirement(
+        name,
+        scope,
+        normalized_git,
+        revision,
+        "git",
+        subdirectory,
+    )
+
+
+def _normalize_mathlib_git(
+    git: str,
+    diagnostics: list[ProjectDiagnostic],
+    path: str,
+) -> str | None:
     try:
         parsed = urlsplit(git)
         port = parsed.port
@@ -944,7 +1240,7 @@ def _parse_mathlib(
             "error",
             "invalid-mathlib-url",
             "The direct Mathlib Git URL is invalid.",
-            "lakefile.toml",
+            path,
         )
         return None
     if parsed.username is not None or parsed.password is not None:
@@ -953,7 +1249,7 @@ def _parse_mathlib(
             "error",
             "credentialed-mathlib-url",
             "The direct Mathlib Git URL must not contain credentials.",
-            "lakefile.toml",
+            path,
         )
         return None
     if (
@@ -969,10 +1265,22 @@ def _parse_mathlib(
             "error",
             "invalid-mathlib-url",
             "The direct Mathlib Git URL must be credential-free HTTPS.",
-            "lakefile.toml",
+            path,
         )
         return None
-    return MathlibProject(git=git, revision=revision, source="lakefile.toml")
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path.endswith(".git"):
+        normalized_path = normalized_path[:-4]
+    if not normalized_path:
+        _issue(
+            diagnostics,
+            "error",
+            "invalid-mathlib-url",
+            "The direct Mathlib Git URL must identify a repository.",
+            path,
+        )
+        return None
+    return f"https://{parsed.hostname.lower()}{normalized_path}"
 
 
 def _validate_dependency_source(value: Any) -> None:

@@ -7,6 +7,7 @@ import re
 import unicodedata
 from importlib.resources import files
 from typing import Any
+from urllib.parse import urlsplit
 
 from .model import (
     RELEASE_CATALOG_SCHEMA,
@@ -22,6 +23,7 @@ class ProjectCatalogError(ValueError):
 
 
 _LEAN_TOOLCHAIN = re.compile(r"leanprover/lean4:(v[0-9]+\.[0-9]+\.[0-9]+)")
+_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
 
 
 def load_release_catalog() -> ReleaseCatalog:
@@ -66,7 +68,11 @@ def _parse_release(entry: Any) -> SupportedRelease:
     if not isinstance(recommended, bool):
         raise ProjectCatalogError("release recommendation must be boolean")
     lean = _object(entry["lean"], {"toolchain", "version"}, "Lean release")
-    mathlib = _object(entry["mathlib"], {"git", "revision"}, "Mathlib release")
+    mathlib = _object(
+        entry["mathlib"],
+        {"git", "name", "resolved_revision", "revision", "scope", "subdirectory"},
+        "Mathlib release",
+    )
     lean_toolchain = _string(lean["toolchain"])
     lean_version = _string(lean["version"])
     match = _LEAN_TOOLCHAIN.fullmatch(lean_toolchain)
@@ -77,7 +83,14 @@ def _parse_release(entry: Any) -> SupportedRelease:
         channel=channel,
         recommended=recommended,
         lean=LeanRelease(toolchain=lean_toolchain, version=lean_version),
-        mathlib=MathlibRelease(git=_string(mathlib["git"]), revision=_string(mathlib["revision"])),
+        mathlib=MathlibRelease(
+            name=_mathlib_name(mathlib["name"]),
+            scope=_string(mathlib["scope"]),
+            git=_mathlib_git(mathlib["git"]),
+            revision=_string(mathlib["revision"]),
+            resolved_revision=_resolved_revision(mathlib["resolved_revision"]),
+            subdirectory=_optional_string(mathlib["subdirectory"]),
+        ),
     )
 
 
@@ -96,3 +109,45 @@ def _string(value: Any) -> str:
     ):
         raise ProjectCatalogError("release catalog strings must be nonempty and trimmed")
     return value
+
+
+def _mathlib_name(value: Any) -> str:
+    name = _string(value)
+    if name != "mathlib":
+        raise ProjectCatalogError("Mathlib release name must be mathlib")
+    return name
+
+
+def _optional_string(value: Any) -> str | None:
+    return None if value is None else _string(value)
+
+
+def _resolved_revision(value: Any) -> str:
+    revision = _string(value)
+    if _GIT_REVISION.fullmatch(revision) is None:
+        raise ProjectCatalogError("Mathlib resolved revision must be a full lowercase Git SHA")
+    return revision
+
+
+def _mathlib_git(value: Any) -> str:
+    raw = _string(value)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as error:
+        raise ProjectCatalogError("Mathlib release Git source is invalid") from error
+    path = parsed.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or not path
+    ):
+        raise ProjectCatalogError("Mathlib release Git source is invalid")
+    return f"https://{parsed.hostname.lower()}{path}"

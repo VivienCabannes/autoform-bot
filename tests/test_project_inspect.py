@@ -34,7 +34,54 @@ def _project(tmp_path: Path, *, revision: str = "v4.32.2") -> Path:
         encoding="utf-8",
     )
     (root / "lean-toolchain").write_text("leanprover/lean4:v4.32.2\n", encoding="utf-8")
+    _write_mathlib_manifest(
+        root,
+        input_revision=revision,
+        resolved_revision=(
+            "905b95818eb32af7874a58b427f50c1711a5e96c"
+            if revision == "v4.32.2"
+            else "2" * 40
+        ),
+        scope="",
+    )
     return root
+
+
+def _write_mathlib_manifest(
+    root: Path,
+    *,
+    input_revision: str = "v4.32.2",
+    resolved_revision: str = "905b95818eb32af7874a58b427f50c1711a5e96c",
+    scope: str = "leanprover-community",
+    subdirectory: str | None = None,
+    version: str = "1.2.0",
+) -> None:
+    (root / "lake-manifest.json").write_text(
+        json.dumps(
+            {
+                "version": version,
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {
+                        "url": "https://github.com/leanprover-community/mathlib4",
+                        "type": "git",
+                        "subDir": subdirectory,
+                        "scope": scope,
+                        "rev": resolved_revision,
+                        "name": "mathlib",
+                        "manifestFile": "lake-manifest.json",
+                        "inputRev": input_revision,
+                        "inherited": False,
+                        "configFile": "lakefile.lean",
+                    }
+                ],
+                "name": "Example",
+                "lakeDir": ".lake",
+                "fixedToolchain": False,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_release_catalog_is_canonical() -> None:
@@ -51,7 +98,50 @@ def test_recommended_release_matches_the_shipped_example() -> None:
     catalog = load_release_catalog()
     assert catalog.recommended.lean.toolchain == "leanprover/lean4:v4.32.2"
     assert catalog.recommended.mathlib.revision == "v4.32.2"
+    assert catalog.recommended.mathlib.scope == "leanprover-community"
+    assert catalog.recommended.mathlib.name == "mathlib"
+    assert catalog.recommended.mathlib.resolved_revision == (
+        "905b95818eb32af7874a58b427f50c1711a5e96c"
+    )
     assert len(catalog.releases) == 1
+
+
+@pytest.mark.parametrize(
+    ("git", "resolved_revision"),
+    [
+        ("file:///tmp/mathlib", "9" * 40),
+        ("https://user@example.test/mathlib.git", "9" * 40),
+        ("https://github.com/leanprover-community/mathlib4", "v4.32.2"),
+    ],
+)
+def test_release_catalog_rejects_unverifiable_mathlib_identity(
+    git: str, resolved_revision: str
+) -> None:
+    with pytest.raises(ProjectCatalogError):
+        parse_release_catalog(
+            {
+                "schema": RELEASE_CATALOG_SCHEMA,
+                "releases": [
+                    {
+                        "id": "bad",
+                        "channel": "stable",
+                        "recommended": True,
+                        "lean": {
+                            "toolchain": "leanprover/lean4:v4.32.2",
+                            "version": "v4.32.2",
+                        },
+                        "mathlib": {
+                            "name": "mathlib",
+                            "scope": "leanprover-community",
+                            "git": git,
+                            "revision": "v4.32.2",
+                            "resolved_revision": resolved_revision,
+                            "subdirectory": None,
+                        },
+                    }
+                ],
+            }
+        )
 
 
 def test_recommended_release_matches_a_project_pinned_to_it(tmp_path: Path) -> None:
@@ -64,6 +154,7 @@ def test_recommended_release_matches_a_project_pinned_to_it(tmp_path: Path) -> N
         encoding="utf-8",
     )
     (root / "lean-toolchain").write_text(f"{recommended.lean.toolchain}\n", encoding="utf-8")
+    _write_mathlib_manifest(root, scope="")
 
     result = inspect_project(root)
     assert result.ok
@@ -132,8 +223,12 @@ def test_release_catalog_rejects_a_toolchain_version_mismatch() -> None:
                             "version": "v9.9.9",
                         },
                         "mathlib": {
-                            "git": "https://github.com/leanprover-community/mathlib4.git",
+                            "name": "mathlib",
+                            "scope": "leanprover-community",
+                            "git": "https://github.com/leanprover-community/mathlib4",
                             "revision": "v4.32.2",
+                            "resolved_revision": "905b95818eb32af7874a58b427f50c1711a5e96c",
+                            "subdirectory": None,
                         },
                     }
                 ],
@@ -185,8 +280,12 @@ def test_inspects_bundled_example_without_host_paths(repo_root: Path) -> None:
         }
     ]
     assert payload["lean"]["version"] == "v4.32.2"
-    assert payload["mathlib"]["revision"] == "v4.32.2"
-    assert payload["compatibility"]["status"] == "supported"
+    assert payload["mathlib"] is None
+    assert payload["compatibility"]["status"] == "indeterminate"
+    assert any(
+        diagnostic.code == "missing-lake-manifest"
+        for diagnostic in result.diagnostics
+    )
     assert payload["autoform"]["detected"] is True
     assert str(repo_root) not in result.to_json()
 
@@ -622,6 +721,67 @@ def test_lake_generated_scope_requirement_is_indeterminate_offline(tmp_path: Pat
     assert result.compatibility.release is None
 
 
+def test_scoped_mathlib_requirement_uses_the_resolved_manifest(tmp_path: Path) -> None:
+    recommended = load_release_catalog().recommended
+    root = _project(tmp_path)
+    (root / "lakefile.toml").write_text(
+        'name = "Example"\n[[require]]\nname = "mathlib"\n'
+        'scope = "leanprover-community"\n'
+        f'rev = "{recommended.mathlib.revision}"\n',
+        encoding="utf-8",
+    )
+    _write_mathlib_manifest(root)
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.mathlib.resolved_revision == "905b95818eb32af7874a58b427f50c1711a5e96c"
+    assert result.compatibility.status == "supported"
+
+
+def test_stale_mathlib_manifest_controls_actual_compatibility(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_manifest(
+        root,
+        input_revision="v4.31.0",
+        resolved_revision="2" * 40,
+    )
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status != "supported"
+    assert any(
+        diagnostic.code == "mathlib-manifest-stale"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_mathlib_manifest_subdirectory_is_not_the_catalog_release(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_manifest(root, scope="", subdirectory="Mathlib")
+
+    result = inspect_project(root)
+
+    assert result.mathlib is not None
+    assert result.mathlib.subdirectory == "Mathlib"
+    assert result.compatibility.status == "unlisted"
+
+
+def test_unsupported_lake_manifest_schema_blocks_compatibility(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_manifest(root, version="2.0.0")
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "invalid-lake-manifest"
+        for diagnostic in result.diagnostics
+    )
+
+
 @pytest.mark.parametrize("root_path", ["", "."])
 def test_optional_lake_root_paths_mean_the_project_root(
     tmp_path: Path, root_path: str
@@ -648,6 +808,7 @@ def test_optional_lake_root_paths_mean_the_project_root(
 
 def test_unusable_mathlib_scope_is_valid_but_indeterminate(tmp_path: Path) -> None:
     root = _project(tmp_path)
+    (root / "lake-manifest.json").unlink()
     (root / "lakefile.toml").write_text(
         'name = "Example"\n[[require]]\nname = "mathlib"\n'
         'scope = "not a scope/../elsewhere"\nrev = "v4.32.2"\n',
@@ -670,6 +831,7 @@ def test_generic_mathlib_sources_are_valid_but_indeterminate(
     tmp_path: Path, source: str
 ) -> None:
     root = _project(tmp_path)
+    (root / "lake-manifest.json").unlink()
     (root / "lakefile.toml").write_text(
         f'name = "Example"\n[[require]]\nname = "mathlib"\n{source}\n',
         encoding="utf-8",
@@ -682,6 +844,7 @@ def test_generic_mathlib_sources_are_valid_but_indeterminate(
 
 def test_mathlib_git_subdirectory_is_valid_but_indeterminate(tmp_path: Path) -> None:
     root = _project(tmp_path)
+    (root / "lake-manifest.json").unlink()
     (root / "lakefile.toml").write_text(
         'name = "Example"\n[[require]]\nname = "mathlib"\n'
         'git = "https://github.com/leanprover-community/mathlib4.git"\n'
@@ -728,6 +891,7 @@ def test_missing_package_name_is_rejected(tmp_path: Path) -> None:
 
 def test_path_precedes_mathlib_git_and_is_indeterminate(tmp_path: Path) -> None:
     root = _project(tmp_path)
+    (root / "lake-manifest.json").unlink()
     (root / "lakefile.toml").write_text(
         'name = "Example"\n[[require]]\nname = "mathlib"\n'
         'path = "vendor/mathlib"\n'
@@ -752,7 +916,7 @@ def test_credentialed_mathlib_url_is_rejected_and_redacted(tmp_path: Path) -> No
     )
     result = inspect_project(root)
     assert not result.ok
-    assert result.mathlib is None
+    assert result.mathlib is not None
     assert "secret" not in result.to_json()
     assert any(diagnostic.code == "credentialed-mathlib-url" for diagnostic in result.diagnostics)
 
@@ -778,7 +942,7 @@ def test_invalid_mathlib_sources_are_rejected_and_redacted(
     )
     result = inspect_project(root)
     assert not result.ok
-    assert result.mathlib is None
+    assert result.mathlib is not None
     assert secret not in result.to_json()
     assert any(diagnostic.code == "invalid-mathlib-url" for diagnostic in result.diagnostics)
 
@@ -798,13 +962,13 @@ def test_copied_projects_have_identical_json(tmp_path: Path) -> None:
     assert inspect_project(first).to_json() == inspect_project(second).to_json()
 
 
-def test_deep_lake_manifest_is_a_stable_warning(tmp_path: Path) -> None:
+def test_deep_lake_manifest_is_a_stable_error(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "lake-manifest.json").write_text(
         "[" * 1500 + "0" + "]" * 1500, encoding="utf-8"
     )
     result = inspect_project(root)
-    assert result.ok
+    assert not result.ok
     assert any(diagnostic.code == "invalid-lake-manifest" for diagnostic in result.diagnostics)
     assert str(tmp_path) not in result.to_json()
 
@@ -821,6 +985,7 @@ def test_human_output_composes_package_and_target_source_dirs(
     assert main(["project", "inspect", str(root)]) == 0
     captured = capsys.readouterr()
     assert "srcDir: pkg/lib, roots: A" in captured.out
+    assert "Mathlib: mathlib v4.32.2 @ 905b95818eb32af7874a58b427f50c1711a5e96c" in captured.out
 
 
 def test_lakefile_lean_is_never_executed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -855,6 +1020,70 @@ def test_lakefile_lean_takes_precedence_over_toml(tmp_path: Path) -> None:
         diagnostic.code == "unused-lakefile-toml"
         for diagnostic in result.diagnostics
     )
+
+
+def test_case_variant_lakefile_lean_is_rejected(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "Lakefile.lean").write_text("package Example\n", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "lake-config-case-alias"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_case_variant_lakefile_alone_still_selects_the_project_root(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "Lakefile.lean").write_text("package Example\n", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.project_root == "."
+    assert any(
+        diagnostic.code == "lake-config-case-alias"
+        for diagnostic in result.diagnostics
+    )
+    assert not any(
+        diagnostic.code == "project-not-found"
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative", "code"),
+    [
+        ("lake-manifest.json", "lake-manifest-unreadable"),
+        ("lean-toolchain", "lean-toolchain-unreadable"),
+        ("lakefile.toml", "lake-config-unreadable"),
+    ],
+)
+def test_stable_unreadable_files_are_not_reported_as_changing(
+    relative: str,
+    code: str,
+    tmp_path: Path,
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root can read mode-zero files")
+    root = _project(tmp_path)
+    if relative == "lake-manifest.json":
+        _write_mathlib_manifest(root)
+    target = root / relative
+    target.chmod(0)
+    try:
+        result = inspect_project(root)
+    finally:
+        target.chmod(0o644)
+
+    assert not any(
+        diagnostic.code == "project-changed-during-inspection"
+        for diagnostic in result.diagnostics
+    )
+    assert any(diagnostic.code == code for diagnostic in result.diagnostics)
 
 
 def test_fifo_lakefile_fails_without_blocking(tmp_path: Path) -> None:
@@ -1071,8 +1300,11 @@ def test_decision_files_come_from_one_generation(
     result = inspect_project(root)
 
     assert swapped
-    assert result.compatibility.status == "unlisted"
-    assert result.compatibility.release is None
+    assert result.compatibility.status == "supported"
+    assert any(
+        diagnostic.code == "mathlib-manifest-stale"
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_lakefile_precedence_comes_from_the_same_generation(

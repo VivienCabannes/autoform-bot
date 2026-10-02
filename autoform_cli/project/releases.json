@@ -10,8 +10,12 @@
         "version": "v4.32.2"
       },
       "mathlib": {
-        "git": "https://github.com/leanprover-community/mathlib4.git",
-        "revision": "v4.32.2"
+        "name": "mathlib",
+        "scope": "leanprover-community",
+        "git": "https://github.com/leanprover-community/mathlib4",
+        "revision": "v4.32.2",
+        "resolved_revision": "905b95818eb32af7874a58b427f50c1711a5e96c",
+        "subdirectory": null
       }
     }
   ]
