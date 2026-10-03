@@ -1392,6 +1392,26 @@ def test_final_config_drift_blocks_noop_and_dry_run_success(
     assert raised.value.written == ()
 
 
+def test_config_change_before_inspection_reads_it_is_a_race_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    original = repair_module.inspect_project
+
+    def change_then_inspect(target):
+        with (root / "lakefile.toml").open("a", encoding="utf-8") as lakefile:
+            lakefile.write("# same project, different bytes\n")
+        return original(target)
+
+    monkeypatch.setattr(repair_module, "inspect_project", change_then_inspect)
+    with pytest.raises(ProjectRepairError) as raised:
+        repair_project(root)
+
+    assert raised.value.code == "project-repair-race-conflict"
+    assert raised.value.conflicts[0].path == "lakefile.toml"
+    assert raised.value.written == ()
+
+
 def test_final_config_pathname_swap_blocks_noop_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

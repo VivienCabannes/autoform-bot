@@ -34,6 +34,7 @@ PROJECT_REPAIR_SCHEMA = "autoform-project-repair/v1"
 _RENDER_REF = "0" * 40
 _MAX_DIRECTORY_ENTRIES = 100_000
 _MAX_INSPECTION_FILE_BYTES = 2 * 1024 * 1024
+_CONFIG_FILES = ("lakefile.toml", "lean-toolchain")
 _MAX_MANAGED_FILE_BYTES = 32 * 1024 * 1024
 _REQUIRED_INPUTS = {
     "README.md": ("title",),
@@ -183,6 +184,7 @@ def repair_project(
         root_identity = _descriptor_identity(root_descriptor)
         _require_root_identity(root_descriptor, root_identity, root)
         _require_private_directory(root_descriptor, ".")
+        config = _config_identity(root_descriptor)
         inspection = inspect_project(root)
         _require_root_identity(root_descriptor, root_identity, root)
         conflicts = _inspection_conflicts(inspection)
@@ -191,7 +193,7 @@ def repair_project(
         assert inspection.lake is not None
         assert inspection.lake.name is not None
         assert inspection.compatibility.release is not None
-        _require_config_identity(root_descriptor, inspection)
+        _require_config_identity(root_descriptor, config)
 
         try:
             desired = _render_overlay(
@@ -213,7 +215,7 @@ def repair_project(
                 code="project-repair-failed",
             ) from None
         _require_root_identity(root_descriptor, root_identity, root)
-        _require_config_identity(root_descriptor, inspection)
+        _require_config_identity(root_descriptor, config)
         provided_inputs = frozenset(
             name
             for name, value in (
@@ -249,7 +251,7 @@ def repair_project(
         for item in planned:
             _validate_parent_chain(root_descriptor, item.path)
         _require_root_identity(root_descriptor, root_identity, root)
-        _require_config_identity(root_descriptor, inspection)
+        _require_config_identity(root_descriptor, config)
         _require_observed_paths(root_descriptor, tuple(observations.values()))
         if dry_run or not planned:
             return ProjectRepairResult(
@@ -263,14 +265,14 @@ def repair_project(
         for item in planned:
             try:
                 _require_root_identity(root_descriptor, root_identity, root)
-                _require_config_identity(root_descriptor, inspection)
+                _require_config_identity(root_descriptor, config)
                 _require_observed_paths(root_descriptor, tuple(observations.values()))
                 published_observation = _publish(
                     root,
                     root_descriptor,
                     root_identity,
                     item,
-                    inspection,
+                    config,
                     tuple(
                         observation
                         for path, observation in observations.items()
@@ -300,7 +302,7 @@ def repair_project(
             observations[item.path] = published_observation
         try:
             _require_root_identity(root_descriptor, root_identity, root)
-            _require_config_identity(root_descriptor, inspection)
+            _require_config_identity(root_descriptor, config)
             _require_observed_paths(root_descriptor, tuple(observations.values()))
         except ProjectRepairError as error:
             raise ProjectRepairError(
@@ -439,24 +441,28 @@ def _project_root(target: str | Path) -> Path:
     return root
 
 
-def _require_config_identity(root_descriptor: int, inspection) -> None:
-    assert inspection.lake is not None
-    assert inspection.lean is not None
-    expected = {
-        inspection.lake.path: inspection.lake.sha256,
-        inspection.lean.path: inspection.lean.sha256,
-    }
-    for relative, digest in expected.items():
+def _config_identity(root_descriptor: int) -> dict[str, str | None]:
+    """Hash the configuration files inspection decides on; None marks one that cannot be observed."""
+
+    identity: dict[str, str | None] = {}
+    for relative in _CONFIG_FILES:
         try:
-            observation = _observe_regular_file(
+            identity[relative] = _observe_regular_file(
                 root_descriptor,
                 relative,
                 relative,
                 max_bytes=_MAX_INSPECTION_FILE_BYTES,
-            )
+            ).sha256
         except OSError:
-            raise _race_conflict(relative, "Project configuration changed during repair.") from None
-        if observation.sha256 != digest:
+            identity[relative] = None
+    return identity
+
+
+def _require_config_identity(root_descriptor: int, expected: dict[str, str | None]) -> None:
+    """Require the configuration observed before inspection, so the inspection read these bytes."""
+
+    for relative, digest in _config_identity(root_descriptor).items():
+        if digest is None or digest != expected[relative]:
             raise _race_conflict(relative, "Project configuration changed during repair.")
 
 
@@ -1096,7 +1102,7 @@ def _publish(
     root_descriptor: int,
     root_identity: tuple[int, int],
     item: _PlannedFile,
-    inspection,
+    config: dict[str, str | None],
     observations: tuple[_ObservedPath, ...],
 ) -> _ObservedPath:
     root_device = os.fstat(root_descriptor).st_dev
@@ -1129,7 +1135,7 @@ def _publish(
             tuple(parent_chain),
             parts[-1],
             item,
-            inspection,
+            config,
             observations,
         )
         return outcome
@@ -1296,7 +1302,7 @@ def _publish_file(
     parent_chain: tuple[_ParentIdentity, ...],
     name: str,
     item: _PlannedFile,
-    inspection,
+    config: dict[str, str | None],
     observations: tuple[_ObservedPath, ...],
 ) -> _ObservedPath:
     temporary = f".{name}.autoform-repair-{secrets.token_hex(8)}"
@@ -1324,7 +1330,7 @@ def _publish_file(
         os.fchmod(descriptor, item.mode)
         os.fsync(descriptor)
         _require_root_identity(root_descriptor, root_identity, root)
-        _require_config_identity(root_descriptor, inspection)
+        _require_config_identity(root_descriptor, config)
         _require_parent_chain(root_descriptor, parent_chain)
         _require_observed_paths(root_descriptor, observations)
         _require_root_identity(root_descriptor, root_identity, root)
@@ -1340,7 +1346,7 @@ def _publish_file(
             )
             try:
                 _require_root_identity(root_descriptor, root_identity, root)
-                _require_config_identity(root_descriptor, inspection)
+                _require_config_identity(root_descriptor, config)
                 _require_parent_chain(root_descriptor, parent_chain)
                 _require_observed_paths(root_descriptor, observations)
                 _require_root_identity(root_descriptor, root_identity, root)
@@ -1398,7 +1404,7 @@ def _publish_file(
                 parent_descriptor, name, descriptor, temporary_identity, item
             )
             _require_root_identity(root_descriptor, root_identity, root)
-            _require_config_identity(root_descriptor, inspection)
+            _require_config_identity(root_descriptor, config)
             _require_parent_chain(root_descriptor, parent_chain)
             _require_observed_paths(root_descriptor, observations)
         except ProjectRepairError as error:
@@ -1442,7 +1448,7 @@ def _publish_file(
             ) from None
         try:
             _require_root_identity(root_descriptor, root_identity, root)
-            _require_config_identity(root_descriptor, inspection)
+            _require_config_identity(root_descriptor, config)
             _require_parent_chain(root_descriptor, parent_chain)
             _require_observed_paths(root_descriptor, observations)
             _require_root_identity(root_descriptor, root_identity, root)
