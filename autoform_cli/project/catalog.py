@@ -1,194 +1,93 @@
-"""Load Autoform's bundled known-good Lean and Mathlib releases."""
+"""Autoform's bundled list of known-good Lean and Mathlib release pairs."""
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import asdict, dataclass
 from importlib.resources import files
-from typing import Any
 
-from .identity import (
-    MathlibGitError,
-    canonical_mathlib_git,
-    canonical_package_path,
-    material_identity_key,
-)
-from .model import (
-    RELEASE_CATALOG_SCHEMA,
-    LeanRelease,
-    MathlibRelease,
-    ReleaseCatalog,
-    SupportedRelease,
-)
+RELEASE_CATALOG_SCHEMA = "autoform-project-release-catalog/v1"
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 class ProjectCatalogError(ValueError):
-    """The bundled release catalog is missing or invalid."""
+    """The bundled release catalog is missing or malformed."""
 
 
-_LEAN_TOOLCHAIN = re.compile(r"leanprover/lean4:(v[0-9]+\.[0-9]+\.[0-9]+)")
-_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
+@dataclass(frozen=True, slots=True)
+class SupportedRelease:
+    id: str
+    recommended: bool
+    lean_toolchain: str
+    mathlib_git: str
+    mathlib_rev: str
+    mathlib_commit: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseCatalog:
+    releases: tuple[SupportedRelease, ...]
+
+    @property
+    def recommended(self) -> SupportedRelease:
+        return next(release for release in self.releases if release.recommended)
+
+    def match(self, lean_toolchain: str, mathlib_git: str | None, mathlib_commit: str | None) -> SupportedRelease | None:
+        commit = None if mathlib_commit is None else mathlib_commit.lower()  # Git reads either case
+        return next(
+            (
+                release
+                for release in self.releases
+                if release.lean_toolchain == lean_toolchain
+                and release.mathlib_commit == commit
+                and canonical_git_url(release.mathlib_git) == canonical_git_url(mathlib_git)
+            ),
+            None,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {"releases": [asdict(release) for release in self.releases], "schema": RELEASE_CATALOG_SCHEMA}
+
+    def to_json(self) -> str:
+        return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def canonical_git_url(url: str | None) -> str | None:
+    """Drop the trailing `/` and `.git`, which do not change the repository a URL names."""
+
+    return None if url is None else url.rstrip("/").removesuffix(".git")
 
 
 def load_release_catalog() -> ReleaseCatalog:
     try:
-        text = files("autoform_cli.project").joinpath("releases.json").read_text(encoding="utf-8")
-    except (OSError, TypeError, UnicodeError):
-        raise ProjectCatalogError("bundled project release catalog is unavailable") from None
-    try:
-        payload = json.loads(text)
-    except (TypeError, ValueError, RecursionError, MemoryError):
-        raise ProjectCatalogError("bundled project release catalog is invalid") from None
+        payload = json.loads(files(__package__).joinpath("releases.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ProjectCatalogError("the bundled release catalog is unreadable") from error
     return parse_release_catalog(payload)
 
 
-def parse_release_catalog(payload: Any) -> ReleaseCatalog:
-    if not isinstance(payload, dict) or set(payload) != {"schema", "releases"}:
-        raise ProjectCatalogError("release catalog has invalid fields")
-    if payload["schema"] != RELEASE_CATALOG_SCHEMA or not isinstance(payload["releases"], list):
-        raise ProjectCatalogError("release catalog has an invalid schema")
-
-    releases: list[SupportedRelease] = []
-    for entry in payload["releases"]:
-        releases.append(_parse_release(entry))
-    if not releases:
-        raise ProjectCatalogError("release catalog is empty")
-    if tuple(release.id for release in releases) != tuple(sorted(release.id for release in releases)):
-        raise ProjectCatalogError("release catalog is not canonically ordered")
-    if len({release.id for release in releases}) != len(releases):
-        raise ProjectCatalogError("release catalog has duplicate release ids")
-    material_keys = [
-        material_identity_key(
-            release.lean.toolchain,
-            release.mathlib.name,
-            release.mathlib.package_type,
-            release.mathlib.git,
-            release.mathlib.resolved_revision,
-            release.mathlib.subdirectory,
-            release.mathlib.config_file,
-            release.mathlib.manifest_file,
-        )
-        for release in releases
-    ]
-    if len(set(material_keys)) != len(material_keys):
-        raise ProjectCatalogError("release catalog has duplicate material identities")
-    if sum(release.recommended for release in releases) != 1:
-        raise ProjectCatalogError("release catalog must have exactly one recommended release")
-    return ReleaseCatalog(RELEASE_CATALOG_SCHEMA, tuple(releases))
-
-
-def _parse_release(entry: Any) -> SupportedRelease:
-    expected = {"id", "channel", "recommended", "lean", "mathlib"}
-    if not isinstance(entry, dict) or set(entry) != expected:
-        raise ProjectCatalogError("release entry has invalid fields")
-    release_id = _string(entry["id"])
-    channel = _string(entry["channel"])
-    recommended = entry["recommended"]
-    if not isinstance(recommended, bool):
-        raise ProjectCatalogError("release recommendation must be boolean")
-    lean = _object(entry["lean"], {"toolchain", "version"}, "Lean release")
-    mathlib = _object(
-        entry["mathlib"],
-        {
-            "config_file",
-            "git",
-            "input_revision",
-            "manifest_file",
-            "name",
-            "package_type",
-            "resolved_revision",
-            "scope",
-            "subdirectory",
-        },
-        "Mathlib release",
-    )
-    lean_toolchain = _string(lean["toolchain"])
-    lean_version = _string(lean["version"])
-    match = _LEAN_TOOLCHAIN.fullmatch(lean_toolchain)
-    if match is None or match.group(1) != lean_version:
-        raise ProjectCatalogError("Lean release toolchain and version disagree")
-    return SupportedRelease(
-        id=release_id,
-        channel=channel,
-        recommended=recommended,
-        lean=LeanRelease(toolchain=lean_toolchain, version=lean_version),
-        mathlib=MathlibRelease(
-            name=_mathlib_name(mathlib["name"]),
-            scope=_string(mathlib["scope"]),
-            package_type=_mathlib_package_type(mathlib["package_type"]),
-            git=_mathlib_git(mathlib["git"]),
-            input_revision=_string(mathlib["input_revision"]),
-            resolved_revision=_resolved_revision(mathlib["resolved_revision"]),
-            subdirectory=_catalog_subdirectory(mathlib["subdirectory"]),
-            config_file=_catalog_path(mathlib["config_file"]),
-            manifest_file=_catalog_path(mathlib["manifest_file"]),
-        ),
-    )
-
-
-def _object(value: Any, fields: set[str], name: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != fields:
-        raise ProjectCatalogError(f"{name} has invalid fields")
-    return value
-
-
-def _string(value: Any) -> str:
+def parse_release_catalog(payload: object) -> ReleaseCatalog:
+    try:
+        if payload["schema"] != RELEASE_CATALOG_SCHEMA:
+            raise ProjectCatalogError("the release catalog has an unsupported schema")
+        releases = tuple(SupportedRelease(**entry) for entry in payload["releases"])
+    except (KeyError, TypeError) as error:
+        raise ProjectCatalogError("the release catalog is malformed") from error
+    for release in releases:
+        strings = (release.id, release.lean_toolchain, release.mathlib_git, release.mathlib_rev, release.mathlib_commit)
+        if (
+            not all(isinstance(value, str) and value for value in strings)
+            or not isinstance(release.recommended, bool)
+            or not _COMMIT.fullmatch(release.mathlib_commit)
+        ):
+            raise ProjectCatalogError(f"release {release.id!r} is malformed")
+    pairs = {(release.lean_toolchain, release.mathlib_commit) for release in releases}
     if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or any(not character.isprintable() for character in value)
+        not releases
+        or len({release.id for release in releases}) != len(releases)
+        or len(pairs) != len(releases)
+        or sum(release.recommended for release in releases) != 1
     ):
-        raise ProjectCatalogError("release catalog strings must be nonempty and trimmed")
-    return value
-
-
-def _mathlib_name(value: Any) -> str:
-    name = _string(value)
-    if name != "mathlib":
-        raise ProjectCatalogError("Mathlib release name must be mathlib")
-    return name
-
-
-def _mathlib_package_type(value: Any) -> str:
-    package_type = _string(value)
-    if package_type != "git":
-        raise ProjectCatalogError("Mathlib release package type must be git")
-    return package_type
-
-
-def _catalog_subdirectory(value: Any) -> str | None:
-    if value is None:
-        return None
-    raw = _string(value)
-    try:
-        normalized = canonical_package_path(raw, root_is_none=True)
-    except ValueError as error:
-        raise ProjectCatalogError("Mathlib release subdirectory is invalid") from error
-    if normalized is None:
-        raise ProjectCatalogError("Mathlib release root subdirectory must be null")
-    return normalized
-
-
-def _catalog_path(value: Any) -> str:
-    raw = _string(value)
-    try:
-        normalized = canonical_package_path(raw)
-    except ValueError as error:
-        raise ProjectCatalogError("Mathlib release package path is invalid") from error
-    assert normalized is not None
-    return normalized
-
-
-def _resolved_revision(value: Any) -> str:
-    revision = _string(value)
-    if _GIT_REVISION.fullmatch(revision) is None:
-        raise ProjectCatalogError("Mathlib resolved revision must be a full lowercase Git SHA")
-    return revision
-
-
-def _mathlib_git(value: Any) -> str:
-    try:
-        return canonical_mathlib_git(value)
-    except MathlibGitError as error:
-        raise ProjectCatalogError("Mathlib release Git source is invalid") from error
+        raise ProjectCatalogError("releases need unique ids and pairs, with exactly one recommended")
+    return ReleaseCatalog(releases)

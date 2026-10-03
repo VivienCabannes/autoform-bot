@@ -10,7 +10,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from . import status
 from .article_identity import plan_article_ids
@@ -349,6 +349,27 @@ def _doctor(args: argparse.Namespace) -> int:
 
 
 def _project(args: argparse.Namespace) -> int:
+    if args.project_command == "provenance":
+        try:
+            result = verify_plugin_provenance()
+        except ProvenanceError as error:
+            if args.json:
+                print(
+                    json.dumps(
+                        {"error": {"code": error.code, "message": error.message}, "ok": False},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+        else:
+            print(f"Source: {result.source}")
+            print(f"Revision: {result.revision}")
+        return 0
     try:
         if args.project_command == "new":
             result = create_project(
@@ -365,168 +386,67 @@ def _project(args: argparse.Namespace) -> int:
                 if not result.workflows_pinned:
                     print("warning: workflows were omitted because no immutable Autoform pin was available")
             return 0
-        if args.project_command == "inspect":
-            result = inspect_project(args.target)
-            if args.json:
-                print(result.to_json())
-            else:
-                _print_project_inspection(result)
-            return 0 if result.ok else 1
-        if args.project_command == "versions":
-            catalog = load_release_catalog()
-            if args.json:
-                print(catalog.to_json())
-            else:
-                print("Supported Lean/Mathlib releases:")
-                for release in catalog.releases:
-                    suffix = " [recommended]" if release.recommended else ""
-                    print(f"  {release.id}{suffix}")
-                    print(f"    Lean: {release.lean.toolchain}")
-                    print(
-                        f"    Mathlib: {release.mathlib.input_revision}"
-                        f" @ {release.mathlib.resolved_revision} ({release.mathlib.git})"
-                    )
-            return 0
-        if args.project_command == "provenance":
-            result = verify_plugin_provenance()
-            if args.json:
-                print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
-            else:
-                print(f"Source: {result.source}")
-                print(f"Revision: {result.revision}")
-            return 0
+        catalog = load_release_catalog()
     except ProjectCreateError as error:
-        if getattr(args, "json", False):
+        if args.json:
             print(error.to_json())
         else:
             print(f"error[{error.code}]: {error.message}", file=sys.stderr)
         return 1
-    except ProjectCatalogError:
-        if getattr(args, "json", False):
-            print(
-                json.dumps(
-                    {
-                        "error": {
-                            "code": "project-catalog-invalid",
-                            "message": "The bundled project release catalog is invalid.",
-                        },
-                        "ok": False,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
+    except ProjectCatalogError as error:
+        if args.json:
+            print(json.dumps({"error": {"code": "project-catalog-invalid", "message": str(error)}, "ok": False}))
         else:
-            print("error: bundled project release catalog is invalid", file=sys.stderr)
+            print(f"error: {error}", file=sys.stderr)
         return 1
-    except ProvenanceError as error:
-        if getattr(args, "json", False):
-            print(
-                json.dumps(
-                    {
-                        "error": {"code": error.code, "message": error.message},
-                        "ok": False,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-        else:
-            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
-        return 1
-    return 2
+    if args.project_command == "versions":
+        if args.json:
+            print(catalog.to_json())
+            return 0
+        print("Known-good Lean/Mathlib releases:")
+        for release in catalog.releases:
+            print(f"  {release.id}{' [recommended]' if release.recommended else ''}")
+            print(f"    Lean: {release.lean_toolchain}")
+            print(f"    Mathlib: {release.mathlib_rev} @ {release.mathlib_commit} ({release.mathlib_git})")
+        return 0
+    result = inspect_project(args.target, catalog=catalog)
+    if args.json:
+        print(result.to_json())
+    else:
+        _print_project_inspection(result)
+    return 0 if result.ok else 1
 
 
 def _print_project_inspection(result) -> None:
     if result.project_root is not None:
-        print(f"Project: {_human_text(result.project_root)}")
+        print(f"Project root: {_human_text(result.project_root)}")
     if result.lake is not None:
-        package = result.lake.name or "unknown package"
         version = f" {result.lake.version}" if result.lake.version else ""
-        print(
-            "Lake: "
-            + _human_text(f"{package}{version} ({result.lake.path})")
-        )
+        print(f"Lake: {_human_text((result.lake.name or 'unknown package') + version)} ({result.lake.config})")
         for target in result.lake.targets:
-            source_parts = [
-                part
-                for part in (result.lake.package_src_dir, target.src_dir)
-                if part is not None
-            ]
-            source = PurePosixPath(*source_parts).as_posix() if source_parts else "."
-            modules = target.roots or ((target.root,) if target.root is not None else ())
-            module_note = f", roots: {', '.join(modules)}" if modules else ""
-            print(
-                "  "
-                + _human_text(
-                    f"{target.kind} {target.name} (srcDir: {source}{module_note})"
-                )
-            )
-    if result.lean is not None:
-        print(f"Lean: {_human_text(result.lean.toolchain)}")
+            print(f"  {target.kind} {_human_text(target.name)}")
+    if result.lean_toolchain is not None:
+        print(f"Lean: {_human_text(result.lean_toolchain)}")
     if result.mathlib is not None:
-        identity = (
-            f"{result.mathlib.scope}/{result.mathlib.name}"
-            if result.mathlib.scope
-            else result.mathlib.name
-        )
-        declared = (
-            f", declared {result.mathlib.declared_revision}"
-            if result.mathlib.declared_revision
-            and result.mathlib.declared_revision != result.mathlib.input_revision
-            else ""
-        )
-        location = (
-            f"path {result.mathlib.path}"
-            if result.mathlib.path is not None
-            else result.mathlib.git or "none"
-        )
-        load_identity = (
-            f"subDir={result.mathlib.subdirectory or '.'}, "
-            f"configFile={result.mathlib.config_file}, "
-            f"manifestFile={result.mathlib.manifest_file or 'none'}"
-        )
-        print(
-            "Mathlib: "
-            + _human_text(
-                f"{identity} {result.mathlib.input_revision or 'none'}"
-                f" @ {result.mathlib.resolved_revision or 'none'}{declared}"
-                f" ({location}; {load_identity})"
-            )
-        )
-    print(
-        f"Compatibility: {_human_text(result.compatibility.status)}"
-        + (
-            f" ({_human_text(result.compatibility.release)})"
-            if result.compatibility.release
-            else ""
-        )
-    )
+        mathlib = result.mathlib
+        where = mathlib.dir if mathlib.type == "path" else f"{mathlib.input_rev} @ {mathlib.rev} ({mathlib.url})"
+        print(f"Mathlib: {_human_text(where)} [{mathlib.source}]")
+    if result.autoform_paths:
+        print(f"Autoform: {', '.join(result.autoform_paths)}")
+    release = f" ({result.compatibility.release})" if result.compatibility.release else ""
+    print(f"Compatibility: {result.compatibility.status}{release}")
     for diagnostic in result.diagnostics:
-        location = f" {_human_text(diagnostic.path)}" if diagnostic.path else ""
-        print(
-            f"{_human_text(diagnostic.severity)}[{_human_text(diagnostic.code)}]"
-            f"{location}: "
-            f"{_human_text(diagnostic.message)}",
-            file=sys.stderr,
-        )
+        location = f" {diagnostic.path}" if diagnostic.path else ""
+        print(f"{diagnostic.severity}[{diagnostic.code}]{location}: {diagnostic.message}", file=sys.stderr)
 
 
 def _human_text(value: object) -> str:
-    """Keep untrusted report fields on one physical terminal line."""
+    """Escape nonprintable characters so project files cannot forge report lines."""
 
-    rendered: list[str] = []
-    for character in str(value):
-        if not character.isprintable():
-            codepoint = ord(character)
-            rendered.append(
-                f"\\u{codepoint:04x}"
-                if codepoint <= 0xFFFF
-                else f"\\U{codepoint:08x}"
-            )
-        else:
-            rendered.append(character)
-    return "".join(rendered)
+    return "".join(
+        character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
+        for character in str(value)
+    )
 
 
 def _claim(args: argparse.Namespace) -> int:

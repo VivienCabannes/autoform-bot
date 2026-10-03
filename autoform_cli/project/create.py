@@ -23,9 +23,8 @@ from ..scaffold import (
     _filesystem_template_snapshot,
     _scaffold_plan,
 )
-from .catalog import load_release_catalog
-from .inspect import _inspect_project_root
-from .model import SupportedRelease
+from .catalog import SupportedRelease, load_release_catalog
+from .inspect import inspect_project
 
 _PACKAGE_NAME = re.compile(r"[A-Z][A-Za-z0-9]*")
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
@@ -144,7 +143,7 @@ def create_project(
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         _materialize_project(stage_descriptor, plan)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
-        _validate_staged_project(stage_descriptor, plan, release)
+        _validate_staged_project(parent / stage_name, stage_descriptor, plan, release)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         os.fchmod(stage_descriptor, 0o755)
         os.fsync(stage_descriptor)
@@ -449,7 +448,7 @@ def _build_project_plan(
     autoform_ref: str,
 ) -> tuple[tuple[_ScaffoldFile, ...], bool]:
     files = [
-        _ScaffoldFile("lean-toolchain", f"{release.lean.toolchain}\n".encode(), 0o644),
+        _ScaffoldFile("lean-toolchain", f"{release.lean_toolchain}\n".encode(), 0o644),
         _ScaffoldFile(
             "lakefile.toml",
             (
@@ -458,8 +457,8 @@ def _build_project_plan(
                 f'defaultTargets = ["{package}"]\n\n'
                 "[[require]]\n"
                 'name = "mathlib"\n'
-                f'git = "{release.mathlib.git}"\n'
-                f'rev = "{release.mathlib.input_revision}"\n\n'
+                f'git = "{release.mathlib_git}"\n'
+                f'rev = "{release.mathlib_rev}"\n\n'
                 "[[lean_lib]]\n"
                 f'name = "{package}"\n'
                 'srcDir = "src"\n'
@@ -524,11 +523,11 @@ def _lake_manifest(package: str, release: SupportedRelease) -> bytes:
     if (
         payload.get("name") != ""
         or len(direct) != 1
-        or direct[0].get("name") != release.mathlib.name
-        or direct[0].get("url") != release.mathlib.git
-        or direct[0].get("inputRev") != release.mathlib.input_revision
-        or direct[0].get("rev") != release.mathlib.resolved_revision
-        or direct[0].get("subDir") != release.mathlib.subdirectory
+        or direct[0].get("name") != "mathlib"
+        or direct[0].get("url") != release.mathlib_git
+        or direct[0].get("inputRev") != release.mathlib_rev
+        or direct[0].get("rev") != release.mathlib_commit
+        or direct[0].get("subDir") is not None  # releases load Mathlib from its repository root
     ):
         raise ProjectCreateError(
             "project-create-validation-failed",
@@ -707,14 +706,22 @@ def _verify_project_plan(
 
 
 def _validate_staged_project(
+    stage_path: Path,
     stage_descriptor: int,
     plan: tuple[_ScaffoldFile, ...],
     release: SupportedRelease,
 ) -> None:
     _verify_project_plan(stage_descriptor, plan)
-    inspection = _inspect_project_root(stage_descriptor, load_release_catalog())
+    inspection = inspect_project(stage_path)
+    # Inspection reads by path, so bind its answer to the directory held open here.
+    try:
+        inspected = os.stat(stage_path, follow_symlinks=False)
+        inspected_stage = (inspected.st_dev, inspected.st_ino) == _descriptor_identity(stage_descriptor)
+    except OSError:
+        inspected_stage = False
     if (
-        not inspection.ok
+        not inspected_stage
+        or not inspection.ok
         or inspection.compatibility.status != "supported"
         or inspection.compatibility.release != release.id
         or inspection.lake is None

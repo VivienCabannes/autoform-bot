@@ -210,7 +210,7 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
     assert inspection.compatibility.status == "supported"
     assert inspection.compatibility.release == _RELEASE
     assert inspection.mathlib is not None
-    assert inspection.mathlib.resolved_revision == "905b95818eb32af7874a58b427f50c1711a5e96c"
+    assert inspection.mathlib.rev == "905b95818eb32af7874a58b427f50c1711a5e96c"
     assert set(load_graph(target / "blueprint").nodes) == {"roadmap"}
     assert stat.S_IMODE(target.stat().st_mode) == 0o755
     assert not list(tmp_path.glob(".autoform-new-*"))
@@ -690,6 +690,23 @@ def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeyp
     assert raised.value.code == "project-create-failed"
     assert not target.exists()
     assert any(path.name == "FOREIGN" for path in tmp_path.rglob("FOREIGN"))
+
+
+def test_inspection_of_a_substituted_stage_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "project"
+    original = create_module.inspect_project
+
+    def substitute(stage: Path, **kwargs):
+        owned = stage.with_name(f"{stage.name}-owned")
+        stage.rename(owned)
+        shutil.copytree(owned, stage)  # a valid project, but not the directory held open
+        return original(stage, **kwargs)
+
+    monkeypatch.setattr(create_module, "inspect_project", substitute)
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+    assert raised.value.code == "project-create-validation-failed"
+    assert not target.exists()
 
 
 def test_stage_path_substitution_never_writes_to_symlink_target(
